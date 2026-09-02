@@ -9,10 +9,13 @@ Each page builds from a broad structural query to narrower filters and exclusion
 
 Hierarchy recipes return only declarations indexed by the fixture's analyzer. Real projects may expose usages of library types whose declarations are not indexed; those library declarations remain outside the query result until library indexing can be targeted explicitly.
 
+[Library Integration](./library-integration/) is the odd one out: instead of teaching more query vocabulary, it runs one canonical query through the Rust and Python libraries and shows how an embedder reads the result's completeness signals.
+
 All language pages below are marked with the date of their last successful end-to-end verification.
 
 ## Tutorials
 
+- [Library Integration](./library-integration/)
 - [Import Traversal Across Languages](./import-traversal/)
 - [Typed Set Composition](./set-composition/)
 - [Reference Traversal Across Languages](./reference-traversal/)

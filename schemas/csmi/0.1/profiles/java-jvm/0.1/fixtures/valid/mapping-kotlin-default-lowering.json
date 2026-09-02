@@ -1,0 +1,15 @@
+{
+  "$profileSchema": "java-jvm-mapping",
+  "profileVersion": "0.1",
+  "resolution": "established",
+  "sourceSymbol": "kotlin-greet",
+  "binarySymbols": ["jvm-greet", "jvm-greet-default"],
+  "mappingKind": "lowered",
+  "evidence": [
+    {
+      "kind": "language-metadata",
+      "producer": "https://kotlinlang.org/",
+      "digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    }
+  ]
+}

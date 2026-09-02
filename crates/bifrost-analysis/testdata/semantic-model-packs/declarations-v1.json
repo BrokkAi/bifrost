@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "pack_id": "acme.widget",
   "version": "1.2.0",
   "producer": { "name": "artifact-scanner", "version": "2.0.0" },

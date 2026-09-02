@@ -1,0 +1,68 @@
+{
+  "documentType": "semantic-document",
+  "schema": "https://csmi.brokk.ai/schema/0.1/schema.json",
+  "semanticModelVersion": "0.1",
+  "serializationVersion": "0.1-json",
+  "provenanceRecords": [
+    {
+      "id": "fixture",
+      "producer": {
+        "identifier": "https://csmi.brokk.ai/conformance/javascript-typescript-node",
+        "version": "0.1.0"
+      },
+      "generationMethod": "manual-authoring"
+    }
+  ],
+  "defaultProvenance": "fixture",
+  "semanticModels": [
+    {
+      "artifactSelectors": [
+        { "purl": "pkg:npm/example@1.0.0" }
+      ],
+      "vocabularyUses": [
+        {
+          "identifier": "csmi.javascript-typescript",
+          "version": "0.1.0",
+          "schema": "https://csmi.brokk.ai/schema/profiles/javascript-typescript/0.1/schema.json",
+          "requirement": "required",
+          "affects": [
+            {
+              "kind": "attachment",
+              "attachmentPoint": "module-binding",
+              "target": { "symbol": "normalize" }
+            }
+          ]
+        }
+      ],
+      "symbols": [
+        {
+          "id": "normalize",
+          "scheme": "csmi.javascript-runtime",
+          "schemeVersion": "0.1.0",
+          "stability": "portable",
+          "descriptors": [
+            { "role": "namespace", "name": "." },
+            { "role": "callable", "name": "normalize" }
+          ],
+          "extensions": [
+            {
+              "vocabulary": "csmi.javascript-typescript",
+              "version": "0.1.0",
+              "payload": {
+                "kind": "module-binding",
+                "canonicalModule": "./other",
+                "exportName": "normalize",
+                "acceptedSpecifiers": [
+                  { "form": "esm-named", "value": "example" }
+                ]
+              }
+            }
+          ]
+        }
+      ],
+      "declarations": [
+        { "symbol": "normalize", "category": "callable" }
+      ]
+    }
+  ]
+}

@@ -6,9 +6,9 @@ use crate::analyzer::semantic::{
     CandidateCoverage, ControlEdgeId, DeclarationLocator, DeclarationSegmentKind,
     DispatchBoundaryKind, EvidenceCompleteness, GuardFact, IcfgEdgeKind, MemoryLocationKind,
     ObjectCardinality, ProcedureHandle, ProcedureSemantics, ProgramPointHandle, ProgramPointId,
-    ProofStatus, SemanticArtifact, SemanticArtifactKey, SemanticEffect, SemanticGapImpact,
-    SemanticGapKind, SemanticGapSubject, SemanticLocator, SemanticValueKind, ValueFlowRelationKind,
-    ValueFlowSnapshot,
+    ProofStatus, SemanticArtifact, SemanticArtifactKey, SemanticCapability, SemanticEffect,
+    SemanticGapHandle, SemanticGapImpact, SemanticGapKind, SemanticGapSubject, SemanticLocator,
+    SemanticValueKind, ValueFlowRelationKind, ValueFlowSnapshot, ValueTransfer,
 };
 use crate::dataflow::{
     CuratedCallModel, CuratedCallModelFingerprint, ExternalSemanticSummarySet,
@@ -106,6 +106,7 @@ pub(crate) struct LocalFlowRule {
     pub point: ProgramPointHandle,
     pub event_index: u32,
     pub kind: ValueFlowRelationKind,
+    pub transfer: Option<ValueTransfer>,
     pub source: ValueFlowCarrierId,
     pub target: ValueFlowCarrierId,
     pub proof: ProofStatus,
@@ -121,6 +122,7 @@ pub(crate) struct LocalRuleView {
     pub source: ValueFlowCarrierId,
     pub target: ValueFlowCarrierId,
     pub kind: ValueFlowRelationKind,
+    pub transfer: Option<ValueTransfer>,
     /// The rule's own evidence is proven and complete.
     pub complete: bool,
     /// The store this rule publishes overwrites `target` outright (#2444).
@@ -139,6 +141,7 @@ pub(crate) struct ValueFlowLocalSummaryRule {
     point: ProgramPointId,
     event_index: u32,
     kind: ValueFlowRelationKind,
+    transfer: Option<ValueTransfer>,
     source: ValueFlowCarrierKey,
     target: ValueFlowCarrierKey,
     proof: ProofStatus,
@@ -292,23 +295,26 @@ fn completeness_heap_bytes(completeness: &EvidenceCompleteness) -> usize {
     }
 }
 
-/// Classify a snapshot's residual openness (#1952). `None` when a relevant
-/// gap or a needed-but-unavailable capability keeps the snapshot honestly
-/// open. `Some(residual)` when every relevant gap is either an implicit
-/// abort gap discharged because no abort path runs user code, a call-target
-/// refinement gap, or a gap `snapshot` itself already proved discharged
-/// while it was materialized (#2545); `residual` lists the refinement calls
-/// that do not carry a complete binding in this plan (empty when the plan's
+/// Classify a snapshot's residual openness (#1952). `Blocked(Some(...))`
+/// retains the first relevant producer gap; `Blocked(None)` means a required
+/// capability is unavailable without one scoped gap. `Refinable(residual)`
+/// means every relevant gap is either discharged or a call-target refinement
+/// gap, and lists the calls without complete bindings (empty when the plan's
 /// own bindings answer them all).
+enum SnapshotOpenness {
+    Refinable(Vec<CallSiteHandle>),
+    Blocked(Option<(SemanticGapHandle, SemanticCapability)>),
+}
+
 fn classify_snapshot_openness(
     snapshot: &ValueFlowSnapshot,
     binding_complete: &HashMap<CallSiteHandle, bool>,
     sources: &[ValueFlowSourceSpec],
     sinks: &[ValueFlowSinkSpec],
-) -> Option<Vec<CallSiteHandle>> {
+) -> SnapshotOpenness {
     let procedure = snapshot.procedure();
     if crate::analyzer::semantic::workspace_oracle::value_flow_capabilities_are_open(procedure) {
-        return None;
+        return SnapshotOpenness::Blocked(None);
     }
     let abort_user_code = crate::analyzer::semantic::workspace_oracle::abort_paths_run_user_code(
         procedure.semantics(),
@@ -360,10 +366,15 @@ fn classify_snapshot_openness(
             // unchanged.
             None if snapshot.gap_is_discharged(gap.id) => {}
             None if value_call_gap_is_local_dead_end(snapshot, gap, &relevant_value_gaps) => {}
-            None => return None,
+            None => {
+                let handle = procedure
+                    .gap_handle(gap.id)
+                    .expect("a snapshot gap remains live in its procedure");
+                return SnapshotOpenness::Blocked(Some((handle, gap.capability)));
+            }
         }
     }
-    Some(residual)
+    SnapshotOpenness::Refinable(residual)
 }
 
 /// The value carriers whose incomplete semantics can affect a selected source
@@ -630,13 +641,6 @@ impl ValueFlowCuratedCallModel {
     }
 }
 
-/// The first discovery input, in the plan's deterministic input order
-/// (sorted snapshots, then sorted bindings, then sources, then sinks), that
-/// prevented `discovery_complete` (#1952).
-///
-/// The cause keeps the typed `SemanticInputStatus`, so a downstream client can
-/// distinguish a missing capability from an unproven or budget-limited input
-/// instead of collapsing every incomplete run into one generic reason.
 /// How one snapshot input participates in discovery completeness (#1952).
 ///
 /// `Refinable` records a snapshot left `Unknown` only by call-target
@@ -648,10 +652,21 @@ impl ValueFlowCuratedCallModel {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum SnapshotDiscovery {
     Complete,
-    Refinable { calls: Box<[CallSiteHandle]> },
-    Incomplete,
+    Refinable {
+        calls: Box<[CallSiteHandle]>,
+    },
+    Incomplete {
+        gap: Option<(SemanticGapHandle, SemanticCapability)>,
+    },
 }
 
+/// The first discovery input, in the plan's deterministic input order
+/// (sorted snapshots, then sorted bindings, then sources, then sinks), that
+/// prevented `discovery_complete` (#1952).
+///
+/// The cause keeps the typed `SemanticInputStatus`, so a downstream client can
+/// distinguish a missing capability from an unproven or budget-limited input
+/// instead of collapsing every incomplete run into one generic reason.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ValueFlowIncompleteCause {
     Snapshot {
@@ -660,6 +675,23 @@ pub enum ValueFlowIncompleteCause {
     },
     SnapshotCoverage {
         procedure: ProcedureHandle,
+    },
+    /// The snapshot retained usable local relations, but one exact producer
+    /// gap still blocks a complete verdict. Keeping the gap handle and its
+    /// capability prevents access-path, control-flow, and other semantic
+    /// blockers from being flattened into an "unknown snapshot" diagnosis.
+    SemanticGap {
+        gap: SemanticGapHandle,
+        capability: SemanticCapability,
+        status: SemanticInputStatus,
+    },
+    /// The snapshot's local relations are usable, but one call-target
+    /// refinement gap has no complete binding in this plan. The execution
+    /// layer may still close this boundary with a complete model; until then
+    /// the run remains typed incomplete.
+    CallResolution {
+        call: CallSiteHandle,
+        status: SemanticInputStatus,
     },
     CallBinding {
         call: CallSiteHandle,
@@ -686,7 +718,10 @@ pub enum ValueFlowIncompleteCause {
 impl ValueFlowIncompleteCause {
     pub const fn status(&self) -> Option<SemanticInputStatus> {
         match self {
-            Self::Snapshot { status, .. } | Self::CallBinding { status, .. } => Some(*status),
+            Self::Snapshot { status, .. }
+            | Self::SemanticGap { status, .. }
+            | Self::CallResolution { status, .. }
+            | Self::CallBinding { status, .. } => Some(*status),
             Self::SnapshotCoverage { .. }
             | Self::CallBindingCoverage { .. }
             | Self::UnenteredProcedure { .. }
@@ -700,6 +735,8 @@ impl ValueFlowIncompleteCause {
             Self::Snapshot { procedure, .. }
             | Self::SnapshotCoverage { procedure }
             | Self::UnenteredProcedure { procedure } => procedure,
+            Self::SemanticGap { gap, .. } => gap.procedure(),
+            Self::CallResolution { call, .. } => call.procedure(),
             Self::CallBinding { callee, .. } | Self::CallBindingCoverage { callee, .. } => callee,
             Self::SourceEvidence { point } | Self::SinkEvidence { point } => point.procedure(),
         }
@@ -709,6 +746,13 @@ impl ValueFlowIncompleteCause {
         match self {
             Self::Snapshot { .. } => "procedure value-flow snapshot",
             Self::SnapshotCoverage { .. } => "procedure value-flow coverage",
+            Self::SemanticGap { capability, .. } => match capability {
+                SemanticCapability::FieldMemory | SemanticCapability::IndexMemory => {
+                    "access-path resolution"
+                }
+                _ => "procedure semantics",
+            },
+            Self::CallResolution { .. } => "call resolution",
             Self::CallBinding { .. } => "call binding",
             Self::CallBindingCoverage { .. } => "call binding coverage",
             Self::UnenteredProcedure { .. } => "procedure entry",
@@ -1157,14 +1201,16 @@ impl ValueFlowPlan {
             {
                 match classify_snapshot_openness(input.value(), &binding_complete, &sources, &sinks)
                 {
-                    Some(residual) if residual.is_empty() => SnapshotDiscovery::Complete,
-                    Some(residual) => SnapshotDiscovery::Refinable {
+                    SnapshotOpenness::Refinable(residual) if residual.is_empty() => {
+                        SnapshotDiscovery::Complete
+                    }
+                    SnapshotOpenness::Refinable(residual) => SnapshotDiscovery::Refinable {
                         calls: residual.into_boxed_slice(),
                     },
-                    None => SnapshotDiscovery::Incomplete,
+                    SnapshotOpenness::Blocked(gap) => SnapshotDiscovery::Incomplete { gap },
                 }
             } else {
-                SnapshotDiscovery::Incomplete
+                SnapshotDiscovery::Incomplete { gap: None }
             };
             let refined = discovery == SnapshotDiscovery::Complete && !input.status().is_complete();
             let complete = discovery == SnapshotDiscovery::Complete;
@@ -1172,16 +1218,41 @@ impl ValueFlowPlan {
                 discovery_status = discovery_status.merge(input.status());
             }
             if first_incomplete_cause.is_none() && !complete {
-                if !input.status().is_complete() {
-                    first_incomplete_cause = Some(ValueFlowIncompleteCause::Snapshot {
-                        procedure: input.value().procedure().clone(),
+                first_incomplete_cause = Some(match &discovery {
+                    SnapshotDiscovery::Refinable { calls } => {
+                        let call = calls
+                            .first()
+                            .expect("a non-complete refinable snapshot retains a residual call")
+                            .clone();
+                        ValueFlowIncompleteCause::CallResolution {
+                            call,
+                            status: input.status(),
+                        }
+                    }
+                    SnapshotDiscovery::Incomplete {
+                        gap: Some((gap, capability)),
+                    } => ValueFlowIncompleteCause::SemanticGap {
+                        gap: gap.clone(),
+                        capability: *capability,
                         status: input.status(),
-                    });
-                } else {
-                    first_incomplete_cause = Some(ValueFlowIncompleteCause::SnapshotCoverage {
-                        procedure: input.value().procedure().clone(),
-                    });
-                }
+                    },
+                    SnapshotDiscovery::Incomplete { gap: None }
+                        if !input.status().is_complete() =>
+                    {
+                        ValueFlowIncompleteCause::Snapshot {
+                            procedure: input.value().procedure().clone(),
+                            status: input.status(),
+                        }
+                    }
+                    SnapshotDiscovery::Incomplete { gap: None } => {
+                        ValueFlowIncompleteCause::SnapshotCoverage {
+                            procedure: input.value().procedure().clone(),
+                        }
+                    }
+                    SnapshotDiscovery::Complete => {
+                        unreachable!("a complete snapshot discovery cannot be incomplete")
+                    }
+                });
             }
             snapshot_discoveries.push(discovery);
             discovery_complete &= complete;
@@ -1292,6 +1363,7 @@ impl ValueFlowPlan {
                     point: relation.point().clone(),
                     event_index: relation.event_index(),
                     kind: relation.kind,
+                    transfer: relation.transfer,
                     source: lookup_carrier(&carrier_ids, &relation.source)?,
                     target: lookup_carrier(&carrier_ids, &relation.target)?,
                     proof: relation.proof.clone(),
@@ -1446,7 +1518,8 @@ impl ValueFlowPlan {
         }
         if let Some(cause) = &self.first_incomplete_cause {
             visit(cause.procedure().artifact());
-            if let ValueFlowIncompleteCause::CallBinding { call, .. }
+            if let ValueFlowIncompleteCause::CallResolution { call, .. }
+            | ValueFlowIncompleteCause::CallBinding { call, .. }
             | ValueFlowIncompleteCause::CallBindingCoverage { call, .. } = cause
             {
                 visit(call.procedure().artifact());
@@ -1703,6 +1776,7 @@ impl ValueFlowPlan {
             rule.point.hash(state);
             rule.event_index.hash(state);
             rule.kind.hash(state);
+            rule.transfer.hash(state);
             self.carrier_keys[rule.source.index()].hash(state);
             self.carrier_keys[rule.target.index()].hash(state);
             rule.proof.hash(state);
@@ -2107,7 +2181,7 @@ impl ValueFlowPlan {
                 .iter()
                 .all(|discovery| match discovery {
                     SnapshotDiscovery::Complete => true,
-                    SnapshotDiscovery::Incomplete => false,
+                    SnapshotDiscovery::Incomplete { .. } => false,
                     SnapshotDiscovery::Refinable { calls } => calls.iter().all(|call| {
                         self.call_boundaries_are_fully_modeled(result, call, requirement)
                     }),
@@ -2299,7 +2373,12 @@ impl ValueFlowPlan {
                 SummaryProofRequirement::Derived => {
                     matches!(boundary.proof(), Some(ProofStatus::Proven)) && authored_complete
                 }
-                SummaryProofRequirement::AcceptAuthoredComplete => authored_complete,
+                // A retained canonical callee from an unresolved lookup can
+                // select and contribute an authored model, but the model is
+                // not proof that the unresolved target set was complete.
+                SummaryProofRequirement::AcceptAuthoredComplete => {
+                    matches!(boundary.proof(), Some(ProofStatus::Proven)) && authored_complete
+                }
             };
         }
         if matches!(kind, DispatchBoundaryKind::Unresolved)
@@ -2562,6 +2641,7 @@ impl ValueFlowPlan {
                     point: rule.point.id(),
                     event_index: rule.event_index,
                     kind: rule.kind,
+                    transfer: rule.transfer,
                     source: self.carrier_keys[rule.source.index()].clone(),
                     target: self.carrier_keys[rule.target.index()].clone(),
                     proof: rule.proof.clone(),
@@ -3178,6 +3258,7 @@ impl ValueFlowPlan {
             source: rule.source,
             target: rule.target,
             kind: rule.kind,
+            transfer: rule.transfer,
             complete: matches!(rule.proof, ProofStatus::Proven)
                 && matches!(rule.completeness, EvidenceCompleteness::Complete),
             strong_update: rule.strong_update,
@@ -3204,6 +3285,7 @@ impl ValueFlowPlan {
                     source: rule.source,
                     target: rule.target,
                     kind: rule.kind,
+                    transfer: rule.transfer,
                     complete: matches!(rule.proof, ProofStatus::Proven)
                         && matches!(rule.completeness, EvidenceCompleteness::Complete),
                     strong_update: rule.strong_update,
@@ -3344,11 +3426,6 @@ fn carrierless_summary_input_is_vacuous(
 }
 
 #[cfg(test)]
-#[allow(clippy::duplicate_mod)]
-#[path = "../../../../test-support/inline_project.rs"]
-mod inline_project;
-
-#[cfg(test)]
 mod tests {
     use std::hash::Hasher;
 
@@ -3357,8 +3434,8 @@ mod tests {
     };
     use crate::analyzer::{AnalyzerConfig, Language};
 
-    use super::inline_project::InlineTestProject;
     use super::*;
+    use crate::inline_project::InlineTestProject;
 
     #[derive(Default)]
     struct HashTrace(Vec<u8>);
@@ -3488,6 +3565,182 @@ func run(input string) string {
             propagation_hash_trace(&changed),
             "the compatibility hash must partition every distinction enforced by exact compatibility"
         );
+    }
+
+    #[test]
+    fn first_incomplete_cause_retains_the_blocking_semantic_gap() {
+        const SOURCE: &str = r#"package fixture
+
+type leaf struct { value string }
+type branch struct { leaf leaf }
+
+func run(input string) string {
+    holder := branch{leaf: leaf{value: "clean"}}
+    holder.leaf.value = input
+    return holder.leaf.value
+}
+"#;
+
+        let project = InlineTestProject::with_language(Language::Go)
+            .file("flow.go", SOURCE)
+            .build();
+        let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+        let cancellation = CancellationToken::default();
+        let mut budget = SemanticBudget::default();
+        let artifact = workspace
+            .materialize_program_semantics(
+                &project.file("flow.go"),
+                &mut SemanticRequest::new(&mut budget, &cancellation),
+            )
+            .expect("fixture semantics materialize")
+            .available_value()
+            .cloned()
+            .expect("fixture semantics remain available");
+        let procedure = artifact
+            .procedures()
+            .iter()
+            .find(|procedure| {
+                procedure
+                    .locator()
+                    .declaration()
+                    .segments()
+                    .last()
+                    .and_then(|segment| segment.name())
+                    == Some("run")
+            })
+            .expect("fixture declares run");
+        let root = artifact
+            .procedure_handle(procedure.id())
+            .expect("fixture procedure remains live");
+        let mut budget = SemanticBudget::default();
+        let snapshot_outcome = workspace
+            .semantic_oracle_provider()
+            .procedure_relations(
+                &root,
+                &OracleCallContext::empty(),
+                &mut SemanticRequest::new(&mut budget, &cancellation),
+            )
+            .expect("fixture value-flow snapshot materializes");
+        let status = SemanticInputStatus::from_outcome(&snapshot_outcome);
+        let snapshot = snapshot_outcome
+            .available_value()
+            .cloned()
+            .expect("fixture value-flow snapshot remains available");
+        let plan = ValueFlowPlan::try_new(
+            root,
+            vec![ValueFlowInput::new(snapshot, status)],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        )
+        .expect("fixture value-flow plan");
+
+        assert!(
+            matches!(
+                plan.first_incomplete_cause(),
+                Some(ValueFlowIncompleteCause::SemanticGap {
+                    capability: SemanticCapability::FieldMemory,
+                    status: SemanticInputStatus::Unknown,
+                    ..
+                })
+            ),
+            "the generic plan must retain the exact structured blocker: {:?}",
+            plan.first_incomplete_cause()
+        );
+        assert_eq!(
+            plan.first_incomplete_cause()
+                .expect("incomplete fixture has a cause")
+                .label(),
+            "access-path resolution"
+        );
+    }
+
+    #[test]
+    fn transfer_metadata_changes_propagation_compatibility_hash() {
+        use crate::analyzer::semantic::{
+            TransferKind, TransferOperation, ValuePreservation, ValueTransfer,
+        };
+
+        let project = InlineTestProject::with_language(Language::Go)
+            .file(
+                "flow.go",
+                r#"package fixture
+func run() [1]int {
+    first := [1]int{}
+    second := first
+    return second
+}
+"#,
+            )
+            .build();
+        let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+        let cancellation = CancellationToken::default();
+        let mut budget = SemanticBudget::default();
+        let artifact = workspace
+            .materialize_program_semantics(
+                &project.file("flow.go"),
+                &mut SemanticRequest::new(&mut budget, &cancellation),
+            )
+            .expect("fixture semantics materialize")
+            .available_value()
+            .cloned()
+            .expect("fixture semantics remain available");
+        let root = artifact
+            .procedures()
+            .iter()
+            .find(|procedure| {
+                procedure
+                    .locator()
+                    .declaration()
+                    .segments()
+                    .last()
+                    .and_then(|segment| segment.name())
+                    == Some("run")
+            })
+            .and_then(|procedure| artifact.procedure_handle(procedure.id()))
+            .expect("fixture declares run");
+        let mut budget = SemanticBudget::default();
+        let snapshot_outcome = workspace
+            .semantic_oracle_provider()
+            .procedure_relations(
+                &root,
+                &OracleCallContext::empty(),
+                &mut SemanticRequest::new(&mut budget, &cancellation),
+            )
+            .expect("fixture value-flow snapshot materializes");
+        let status = SemanticInputStatus::from_outcome(&snapshot_outcome);
+        let snapshot = snapshot_outcome
+            .available_value()
+            .cloned()
+            .expect("fixture value-flow snapshot remains available");
+        let mut plan = ValueFlowPlan::try_new(
+            root,
+            vec![ValueFlowInput::new(snapshot, status)],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        )
+        .expect("fixture value-flow plan");
+        let transfer = plan
+            .local_rules
+            .iter()
+            .position(|rule| rule.transfer.is_some())
+            .expect("array copy publishes transfer metadata");
+        let mut changed = plan.clone();
+        changed.local_rules[transfer].transfer = Some(ValueTransfer {
+            kind: TransferKind::Conversion {
+                preservation: ValuePreservation::Changing,
+            },
+            operation: TransferOperation::None,
+        });
+
+        assert!(!plan.has_same_propagation_semantics(&changed));
+        assert_ne!(
+            propagation_hash_trace(&plan),
+            propagation_hash_trace(&changed)
+        );
+        plan.local_rules[transfer].transfer = changed.local_rules[transfer].transfer;
+        assert!(plan.has_same_propagation_semantics(&changed));
     }
 }
 
@@ -4096,6 +4349,44 @@ fn compare_local_rules(left: &LocalFlowRule, right: &LocalFlowRule) -> Ordering 
         .then_with(|| left.source.cmp(&right.source))
         .then_with(|| left.target.cmp(&right.target))
         .then_with(|| relation_kind_rank(left.kind).cmp(&relation_kind_rank(right.kind)))
+        .then_with(|| transfer_rank(left.transfer).cmp(&transfer_rank(right.transfer)))
+}
+
+fn transfer_rank(transfer: Option<ValueTransfer>) -> (u8, u8, u32) {
+    use crate::analyzer::semantic::{
+        MoveInvalidation, TransferKind, TransferOperation, ValuePreservation,
+    };
+
+    let Some(transfer) = transfer else {
+        return (0, 0, 0);
+    };
+    let (operation, call_site) = match transfer.operation {
+        TransferOperation::None => (0, 0),
+        TransferOperation::CallSite(call) => (1, call.get()),
+        TransferOperation::Unknown => (2, 0),
+    };
+    let kind = match transfer.kind {
+        TransferKind::Copy => 1,
+        TransferKind::AggregateCopy => 2,
+        TransferKind::Move {
+            invalidation: MoveInvalidation::Invalidated,
+        } => 3,
+        TransferKind::Move {
+            invalidation: MoveInvalidation::Unknown,
+        } => 4,
+        TransferKind::Conversion {
+            preservation: ValuePreservation::Identity,
+        } => 5,
+        TransferKind::Conversion {
+            preservation: ValuePreservation::Preserving,
+        } => 6,
+        TransferKind::Conversion {
+            preservation: ValuePreservation::Changing,
+        } => 7,
+        TransferKind::Boxing => 8,
+        TransferKind::Unboxing => 9,
+    };
+    (kind, operation, call_site)
 }
 
 fn same_local_rules(left: &ValueFlowPlan, right: &ValueFlowPlan) -> bool {
@@ -4108,6 +4399,7 @@ fn same_local_rules(left: &ValueFlowPlan, right: &ValueFlowPlan) -> bool {
                 left_rule.point == right_rule.point
                     && left_rule.event_index == right_rule.event_index
                     && left_rule.kind == right_rule.kind
+                    && left_rule.transfer == right_rule.transfer
                     && left.carrier_keys[left_rule.source.index()]
                         == right.carrier_keys[right_rule.source.index()]
                     && left.carrier_keys[left_rule.target.index()]

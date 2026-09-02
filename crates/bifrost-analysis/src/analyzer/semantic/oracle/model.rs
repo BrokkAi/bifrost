@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use super::super::ids::{MemoryLocationId, SemanticLocator, SemanticRole, SourceMappingId};
 use super::super::ir::{
-    AllocationHandle, CallSiteHandle, EvidenceCompleteness, FormalMultiplicity,
+    AllocationHandle, CallSiteHandle, EvidenceCompleteness, ExecutionTiming, FormalMultiplicity,
     MemoryLocationHandle, MemoryLocationKind, ProcedureHandle, ProgramPointHandle, ProofStatus,
     SemanticArtifact, SemanticEffect, SemanticValueKind, ValueFlowKind, ValueHandle,
 };
@@ -617,6 +617,11 @@ impl AccessPathRoot {
 pub enum IndexSelector {
     /// An exact index value scoped to the procedure that computes it.
     Exact(ValueHandle),
+    /// An exact non-negative integer index independent of one value handle.
+    ///
+    /// Constant selectors can be shifted while resolving a backing-store
+    /// view, which is impossible when only the source occurrence survives.
+    Constant(u128),
     /// A structured wildcard used when a precise index cannot be established.
     Any,
 }
@@ -731,7 +736,8 @@ impl AccessPath {
                 AccessSelector::Index(IndexSelector::Exact(index)) => {
                     require_same_procedure(index.procedure(), procedure)?;
                 }
-                AccessSelector::Index(IndexSelector::Any) => {}
+                AccessSelector::Index(IndexSelector::Constant(_))
+                | AccessSelector::Index(IndexSelector::Any) => {}
             }
         }
         match &self.root {
@@ -1423,18 +1429,30 @@ fn access_path_matches_memory_location(
         MemoryLocationKind::Index {
             base: expected_base,
             index,
+            constant_index,
+            identity,
         } => base.is_some_and(|base| {
-            base.value().id() == *expected_base
-                && path.selectors().len() == 1
-                && access_root_matches_value(path.root(), base.value())
-                && (matches!(
+            let selector_matches = match identity {
+                crate::analyzer::semantic::IndexedLocationIdentity::Aggregate => {
+                    matches!(path.selectors().first(), Some(AccessSelector::Index(_)))
+                }
+                crate::analyzer::semantic::IndexedLocationIdentity::Element => matches!(
                     (index, path.selectors().first()),
                     (Some(expected), Some(AccessSelector::Index(IndexSelector::Exact(actual))))
                         if actual.procedure() == location.procedure() && actual.id() == *expected
                 ) || matches!(
+                    (constant_index, path.selectors().first()),
+                    (Some(expected), Some(AccessSelector::Index(IndexSelector::Constant(actual))))
+                        if actual == expected
+                ) || matches!(
                     (index, path.selectors().first()),
                     (None, Some(AccessSelector::Index(IndexSelector::Any)))
-                ))
+                ),
+            };
+            base.value().id() == *expected_base
+                && path.selectors().len() == 1
+                && access_root_matches_value(path.root(), base.value())
+                && selector_matches
         }),
         MemoryLocationKind::LexicalCell { .. } => {
             base.is_none()
@@ -1554,111 +1572,6 @@ impl DispatchBoundaryKind {
             | Self::Deferred { target, .. } => Some(target),
             Self::External(None) | Self::Unresolved | Self::Truncated => None,
         }
-    }
-}
-
-/// When the target of a semantic relation is evaluated, relative to the
-/// evaluation of its source (issue #2446).
-///
-/// This is the analyzer's execution-timing vocabulary. It exists because
-/// "lexically inside" is not "executes now": a statement in a callback body
-/// sits inside the enclosing function's source range and does not run during
-/// that function's evaluation. Every timing claim must come from evidence
-/// about how the runtime schedules the target -- a lowered control edge, a
-/// modeled callable, or a declared framework contract. A component that only
-/// knows one site encloses another knows nothing about timing and must say
-/// [`ExecutionTiming::Unknown`].
-///
-/// The vocabulary is frozen here as a whole so that later slices which add
-/// asynchronous edges extend the producers rather than the labels. Nothing in
-/// this slice publishes an asynchronous label; the synchronous labels and
-/// `Unknown` are the ones in use.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum ExecutionTiming {
-    /// The source and the target are evaluated by one indivisible step of the
-    /// procedure: they belong to the same program point's event sequence, so
-    /// no other program point can be evaluated between them.
-    SameEvaluation,
-    /// The target is evaluated later in the same synchronous activation of the
-    /// procedure that evaluated the source. Control may pass through other
-    /// program points and other procedures in between, but it never leaves
-    /// this activation record and never returns to a scheduler.
-    SameInvocation,
-    /// The target is evaluated after the source in the same cooperative turn
-    /// (event-loop tick, coroutine step) but in a different activation, so
-    /// nothing else that the same turn owns can interleave.
-    LaterSameTurn,
-    /// The target is evaluated after the procedure suspended and resumed:
-    /// arbitrary other work of the same task may have run in between, and the
-    /// resumption may occur on a different underlying thread.
-    AfterSuspension,
-    /// The target is evaluated by a different task of the same runtime. The
-    /// two evaluations are unordered unless a separate synchronization
-    /// relation orders them.
-    DifferentTask,
-    /// The target is evaluated by a different thread. The two evaluations are
-    /// unordered and may overlap, so state read on one side needs its own
-    /// memory-model argument.
-    DifferentThread,
-    /// The target is the body of a callable that was handed to another
-    /// component, which decides whether and when to invoke it. The evaluation
-    /// may never happen, may happen once, or may happen many times.
-    DeferredCallback,
-    /// The target is evaluated when a suspended generator or iterator is
-    /// resumed by its consumer. Between the source and the target the consumer
-    /// ran arbitrary code and may abandon the generator entirely.
-    GeneratorResume,
-    /// The target is evaluated while an activation is being unwound or
-    /// cancelled: a finally body, a destructor, or a cancellation handler. It
-    /// runs on abnormal completion paths that the normal successor edges do
-    /// not describe.
-    CancellationCleanup,
-    /// The evidence does not establish when the target is evaluated. This is
-    /// the answer whenever the only available fact is that one site encloses
-    /// another.
-    Unknown,
-}
-
-impl ExecutionTiming {
-    /// The value domain every `timing` field fed by this vocabulary publishes
-    /// (issue #2515).
-    pub const LABELS: &'static [&'static str] = &[
-        "same_evaluation",
-        "same_invocation",
-        "later_same_turn",
-        "after_suspension",
-        "different_task",
-        "different_thread",
-        "deferred_callback",
-        "generator_resume",
-        "cancellation_cleanup",
-        "unknown",
-    ];
-
-    /// The stable public spelling of this timing.
-    pub const fn label(self) -> &'static str {
-        match self {
-            Self::SameEvaluation => "same_evaluation",
-            Self::SameInvocation => "same_invocation",
-            Self::LaterSameTurn => "later_same_turn",
-            Self::AfterSuspension => "after_suspension",
-            Self::DifferentTask => "different_task",
-            Self::DifferentThread => "different_thread",
-            Self::DeferredCallback => "deferred_callback",
-            Self::GeneratorResume => "generator_resume",
-            Self::CancellationCleanup => "cancellation_cleanup",
-            Self::Unknown => "unknown",
-        }
-    }
-
-    /// Whether this timing keeps the target inside the source's own
-    /// synchronous activation, so a caller may treat the two evaluations as
-    /// ordered without any scheduling model.
-    ///
-    /// `Unknown` is deliberately not synchronous: an unestablished timing is
-    /// never permission to assume one.
-    pub const fn is_synchronous(self) -> bool {
-        matches!(self, Self::SameEvaluation | Self::SameInvocation)
     }
 }
 

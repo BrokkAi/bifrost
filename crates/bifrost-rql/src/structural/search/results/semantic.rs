@@ -273,6 +273,11 @@ pub enum CodeQueryFlowSelectorSymbol {
     ExactIndex {
         index: Box<CodeQueryFlowCarrierSymbol>,
     },
+    ConstantIndex {
+        /// Decimal magnitude. A string preserves every IR-supported `u128`
+        /// value across JSON implementations without precision loss.
+        index: String,
+    },
     AnyIndex,
 }
 

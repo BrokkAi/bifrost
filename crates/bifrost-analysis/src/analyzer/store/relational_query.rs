@@ -12,7 +12,7 @@ use super::{
     AnalyzerStore, CandidateRow, CandidateRowContainer, FqIdentityHeader, GenerationId,
     HydratedCandidateRow, RelationalUnitFq, Result, StoreError, WorkspaceSnapshots,
     candidate_row_from_row, candidate_row_from_row_at, hydrate_candidate_rows, hydrate_unit_fq,
-    require_generation_map, signature_metadata_from_row,
+    require_generation_map, signature_metadata_from_row, signature_metadata_value_columns_sql,
 };
 use crate::analyzer::tree_sitter_analyzer::LanguageAdapter;
 use crate::analyzer::{CodeUnit, ProjectFile, sort_units};
@@ -1187,25 +1187,19 @@ fn callable_values<A: LanguageAdapter>(
         "live_definition_exact_names",
         "names.prefix = ?2 AND names.exact_parent_tail = ?3 AND names.identifier = ?4",
     );
-    let fact_sql = "SELECT facts.ordinal, facts.text,
-                facts.label, facts.parameters, facts.return_type_text,
-                facts.return_type_identity, facts.underlying_type_identity,
-                facts.declaration_only, facts.callable_arity_required,
-                facts.callable_arity_total, facts.callable_arity_repeated,
-                facts.type_parameters, facts.bare_return_type_parameter,
-                facts.callable_linkage, facts.dispatch_extensibility,
-                facts.extension_receiver_type, facts.extension_receiver_type_identity,
-                facts.extension_receiver_is_unconstrained, facts.field_is_static,
-                facts.field_is_final, facts.field_has_initializer,
-                facts.cpp_field_linkage, facts.companion_object,
-                facts.callable_is_static, facts.callable_is_constructor,
-                facts.callable_declared_visibility, facts.callable_modifiers_recorded,
-                facts.callable_parameter_types, facts.callable_is_native,
-                facts.class_like_is_interface, facts.class_like_is_static
+    // The metadata projection comes from the one shared column list, not a
+    // second copy of it: `signature_metadata_from_row` decodes positionally
+    // from that order, so a column added to the schema and forgotten here
+    // makes every read of this relation fail at run time rather than at
+    // compile time.
+    let metadata_columns = signature_metadata_value_columns_sql("facts");
+    let fact_sql = format!(
+        "SELECT facts.ordinal, facts.text, {metadata_columns}
          FROM live_callable_facts AS facts
          WHERE facts.blob_id = (SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = ?2)
            AND facts.unit_key = ?3
-         ORDER BY facts.ordinal";
+         ORDER BY facts.ordinal"
+    );
     let mut facts = Vec::new();
     for lang in storage_languages {
         let candidates =
@@ -1221,7 +1215,7 @@ fn callable_values<A: LanguageAdapter>(
             if declaration.fq() != &request.name.full_name() {
                 continue;
             }
-            let mut statement = tx.prepare_cached(fact_sql)?;
+            let mut statement = tx.prepare_cached(&fact_sql)?;
             let rows = statement.query_map(params![locator.0, locator.1, locator.2], |row| {
                 Ok((
                     row.get::<_, i64>(0)?,
@@ -1845,7 +1839,7 @@ mod tests {
         // through the same two lean views with an added `rel_path`
         // predicate.
         let file = ProjectFile::new(
-            std::path::PathBuf::from("/workspace"),
+            std::env::current_dir().expect("test working directory must be available"),
             "demo/Widget.java".to_string(),
         );
         for (case_name, name, query) in [

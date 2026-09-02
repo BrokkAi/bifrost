@@ -12,13 +12,14 @@ use crate::analyzer::jvm::scala_artifact::ScalaSourceJarPackProducer;
 use crate::analyzer::semantic::{LengthDelimitedDigest, StableDigest};
 use crate::analyzer::semantic_model::{
     ActivationSelector, ArtifactProducerLimits, ArtifactProduction, ArtifactProductionRequest,
-    AuthoredPayload, AuthoredSemanticModelPack, CatalogCoordinate, Compatibility, Completeness,
-    DependencyArtifactRole, DependencyDiscoveryOutcome, DependencyDiscoveryProfile,
-    DependencyPackAdapter, DependencyPackDiagnostic, DependencyPackDiagnosticSeverity,
-    DependencyPackLimits, DependencyPackProduction, DependencyProvenance, ExactDependencyArtifact,
-    ExternalArtifactKind, ExternalArtifactPackProducer, HierarchyFact, Locator, MemberFact,
-    MemberKind, NameSelector, Producer, ProducerDiagnostic, ProducerDiagnosticSeverity, Provenance,
-    ResolvedDependency, ResolvedDependencyArtifact, Safety, SemanticModelActivationEvidence,
+    AuthoredPayload, AuthoredSemanticModelPack, BoundedDependencyDiagnostics, CatalogCoordinate,
+    Compatibility, Completeness, DependencyArtifactRole, DependencyDiscoveryOutcome,
+    DependencyDiscoveryProfile, DependencyPackAdapter, DependencyPackDiagnostic,
+    DependencyPackDiagnosticSeverity, DependencyPackLimits, DependencyPackProduction,
+    DependencyProvenance, ExactDependencyArtifact, ExternalArtifactKind,
+    ExternalArtifactPackProducer, HierarchyFact, Locator, MemberFact, MemberKind, NameSelector,
+    Producer, ProducerDiagnostic, ProducerDiagnosticSeverity, Provenance, ResolvedDependency,
+    ResolvedDependencyArtifact, Safety, SemanticModelActivationEvidence, SuppressedDiagnostics,
     TypeFact, TypeKind, TypeRef, Visibility, normalize_artifact_locator_paths,
     read_exact_artifact_while,
 };
@@ -38,7 +39,8 @@ use std::ffi::OsString;
 use std::fs::{self, File};
 use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock};
+use std::str::FromStr;
+use std::sync::{Arc, Mutex, OnceLock};
 use tree_sitter::Parser;
 use zip::ZipArchive;
 
@@ -78,6 +80,7 @@ const MAX_ARTIFACT_MEMBERS: usize = 32_768;
 /// and this bounds the work of a wide but acyclic hierarchy as well.
 const MAX_MEMBER_SURFACE_OWNERS: usize = 64;
 const JVM_EXTERNAL_DISPATCH_BEHAVIOR_DOMAIN: &[u8] = b"bifrost-jvm-external-dispatch-behavior/v1";
+const JVM_EXTERNAL_INDEX_MEMO_DOMAIN: &[u8] = b"bifrost-jvm-external-index-memo/v1";
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct JvmExternalDeclarationIndex {
@@ -316,7 +319,10 @@ impl JvmDependencyPackAdapter {
     /// Build the exact JDK source dependency used by the runtime resolver.
     /// Release tooling uses this constructor so its production key includes
     /// the same evidence and provenance as a locally discovered JDK.
-    pub fn jdk_source_dependency(version: Version, source_archive: PathBuf) -> ResolvedDependency {
+    pub fn jdk_source_dependency(
+        version: JdkVersion,
+        source_archive: PathBuf,
+    ) -> ResolvedDependency {
         resolved_jdk_dependency(version, Some(source_archive))
     }
 }
@@ -375,8 +381,12 @@ pub fn resolve_jvm_semantic_pack_dependencies(
             });
         }
     }
-    let mut suppressed_diagnostics = resolved.len().saturating_sub(limits.max_dependencies);
-    let dependency_limit_hit = suppressed_diagnostics > 0;
+    // Dependencies dropped by the dependency limit are not diagnostics.
+    let mut suppressed_diagnostics = SuppressedDiagnostics {
+        warnings: resolved.len().saturating_sub(limits.max_dependencies),
+        errors: 0,
+    };
+    let dependency_limit_hit = suppressed_diagnostics.total() > 0;
     let mut resolved_artifacts = resolved;
     resolved_artifacts.truncate(limits.max_dependencies);
     let mut resolved = Vec::with_capacity(resolved_artifacts.len());
@@ -441,8 +451,9 @@ pub fn resolve_jvm_semantic_pack_dependencies(
         });
     }
     if resolved.len() > limits.max_dependencies {
-        suppressed_diagnostics =
-            suppressed_diagnostics.saturating_add(resolved.len() - limits.max_dependencies);
+        suppressed_diagnostics.warnings = suppressed_diagnostics
+            .warnings
+            .saturating_add(resolved.len() - limits.max_dependencies);
         resolved.truncate(limits.max_dependencies);
         if !dependency_limit_hit {
             diagnostics.push(DependencyPackDiagnostic {
@@ -457,11 +468,15 @@ pub fn resolve_jvm_semantic_pack_dependencies(
             });
         }
     }
-    if diagnostics.len() > limits.max_diagnostics {
-        suppressed_diagnostics =
-            suppressed_diagnostics.saturating_add(diagnostics.len() - limits.max_diagnostics);
-        diagnostics.truncate(limits.max_diagnostics);
+    // JVM discovery mixes warnings (incomplete Kotlin classification) with the
+    // errors that decide the outcome, so bound it through the shared collector
+    // instead of truncating: an error must keep a slot.
+    let mut bounded = BoundedDependencyDiagnostics::new(limits);
+    for diagnostic in diagnostics {
+        bounded.push(diagnostic);
     }
+    let (diagnostics, bounded_suppressed) = bounded.finish();
+    suppressed_diagnostics += bounded_suppressed;
     DependencyDiscoveryOutcome {
         profile: DependencyDiscoveryProfile {
             metadata_inputs_considered,
@@ -471,7 +486,7 @@ pub fn resolve_jvm_semantic_pack_dependencies(
         complete: !diagnostics
             .iter()
             .any(|diagnostic| diagnostic.severity == DependencyPackDiagnosticSeverity::Error)
-            && suppressed_diagnostics == 0,
+            && suppressed_diagnostics.total() == 0,
         diagnostics,
         suppressed_diagnostics,
         cancelled: false,
@@ -488,7 +503,7 @@ fn cancelled_discovery(message: &str) -> DependencyDiscoveryOutcome {
             location: None,
             message: message.to_owned(),
         }],
-        suppressed_diagnostics: 0,
+        suppressed_diagnostics: SuppressedDiagnostics::default(),
         complete: false,
         cancelled: true,
         profile: DependencyDiscoveryProfile::default(),
@@ -664,7 +679,67 @@ fn discover_jdk_jmods(home: &Path) -> Result<Option<Vec<PathBuf>>, String> {
     Ok((!paths.is_empty()).then_some(paths))
 }
 
-fn read_jdk_release_version(home: &Path) -> Result<Version, String> {
+/// A JDK `JAVA_VERSION` exactly as the `release` file spells it: one to four
+/// dotted decimal components (`21`, `21.0.8`, `21.0.12.1`). Temurin patch
+/// releases carry the fourth component, which is not semver, so the raw
+/// spelling is the dependency identity and the semver view exists only for
+/// catalog toolchain comparisons (#2874).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct JdkVersion {
+    raw: String,
+    components: Vec<u64>,
+}
+
+impl JdkVersion {
+    /// `feature.interim.update.patch` (JEP 322) is the longest version string
+    /// a JDK `release` file declares.
+    const MAX_COMPONENTS: usize = 4;
+
+    pub fn parse(raw: &str) -> Result<Self, String> {
+        let mut components = Vec::with_capacity(Self::MAX_COMPONENTS);
+        for component in raw.split('.') {
+            // `u64::from_str` accepts a leading `+`, and a JDK 8 spelling such
+            // as `1.8.0_392` must stay rejected, so the digits are checked
+            // before the conversion.
+            if component.is_empty() || !component.bytes().all(|byte| byte.is_ascii_digit()) {
+                return Err(format!("{component:?} is not a decimal component"));
+            }
+            if components.len() == Self::MAX_COMPONENTS {
+                return Err(format!(
+                    "more than {} dotted components",
+                    Self::MAX_COMPONENTS
+                ));
+            }
+            components.push(u64::from_str(component).map_err(|error| {
+                format!("component {component:?} does not fit in 64 bits: {error}")
+            })?);
+        }
+        debug_assert!(
+            !components.is_empty(),
+            "split('.') yields at least one component, and an empty one is rejected above"
+        );
+        Ok(Self {
+            raw: raw.to_owned(),
+            components,
+        })
+    }
+
+    /// The three-component view the catalog's semver toolchain coordinate
+    /// compares against. A fourth component is a JDK patch release, which is
+    /// below semver's resolution, and missing components are zero.
+    fn semver(&self) -> Version {
+        let component = |index: usize| self.components.get(index).copied().unwrap_or(0);
+        Version::new(component(0), component(1), component(2))
+    }
+}
+
+impl std::fmt::Display for JdkVersion {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.raw)
+    }
+}
+
+fn read_jdk_release_version(home: &Path) -> Result<JdkVersion, String> {
     const MAX_RELEASE_BYTES: u64 = 64 * 1024;
 
     let release_path = home.join("release");
@@ -696,13 +771,12 @@ fn read_jdk_release_version(home: &Path) -> Result<Version, String> {
     if values.next().is_some() {
         return Err("JDK release file declares JAVA_VERSION more than once".to_owned());
     }
-    Version::parse(raw).map_err(|error| {
-        format!("JDK JAVA_VERSION {raw:?} is not an exact semantic version: {error}")
-    })
+    JdkVersion::parse(raw)
+        .map_err(|error| format!("JDK JAVA_VERSION {raw:?} is not a dotted JDK version: {error}"))
 }
 
 fn resolved_jdk_dependency(
-    version: Version,
+    version: JdkVersion,
     source_archive: Option<PathBuf>,
 ) -> ResolvedDependency {
     ResolvedDependency {
@@ -714,7 +788,7 @@ fn resolved_jdk_dependency(
             module: None,
             toolchain: Some(CatalogCoordinate {
                 name: "jdk".to_owned(),
-                version: Some(version.clone()),
+                version: Some(version.semver()),
             }),
             target: Some("jvm".to_owned()),
             configuration: None,
@@ -740,7 +814,7 @@ fn resolved_jdk_dependency(
 }
 
 fn resolved_jdk_jmod_dependency(
-    version: Version,
+    version: JdkVersion,
     home: PathBuf,
     relative_paths: Vec<PathBuf>,
 ) -> ResolvedDependency {
@@ -791,7 +865,7 @@ impl DependencyPackAdapter for JvmDependencyPackAdapter {
     ) -> DependencyPackProduction {
         let request = jvm_dependency_production_request(dependency);
         let mut diagnostics = Vec::new();
-        let mut suppressed_diagnostics = 0usize;
+        let mut suppressed_diagnostics = SuppressedDiagnostics::default();
         let mut source_pack = None;
         let mut binary_pack = None;
         let mut partial = false;
@@ -843,6 +917,7 @@ impl DependencyPackAdapter for JvmDependencyPackAdapter {
                 kind => ArtifactProduction::failed(
                     ProducerDiagnostic {
                         severity: ProducerDiagnosticSeverity::Error,
+                        source_entry: None,
                         code: "artifact.kind".to_owned(),
                         location: Some(artifact.path().to_string_lossy().into_owned()),
                         declaration: None,
@@ -857,8 +932,7 @@ impl DependencyPackAdapter for JvmDependencyPackAdapter {
             );
             partial |= production.completeness == Completeness::Partial;
             diagnostics.extend(production.diagnostics);
-            suppressed_diagnostics =
-                suppressed_diagnostics.saturating_add(production.suppressed_diagnostics);
+            suppressed_diagnostics += production.suppressed_diagnostics;
             match (artifact.role(), production.pack) {
                 (DependencyArtifactRole::Sources, Some(pack)) => source_pack = Some(pack),
                 (DependencyArtifactRole::Binary, Some(mut pack)) => {
@@ -870,6 +944,7 @@ impl DependencyPackAdapter for JvmDependencyPackAdapter {
                 }
                 (_, Some(_)) => diagnostics.push(ProducerDiagnostic {
                     severity: ProducerDiagnosticSeverity::Error,
+                    source_entry: None,
                     code: "artifact.role".to_owned(),
                     location: Some(artifact.path().to_string_lossy().into_owned()),
                     declaration: None,
@@ -888,7 +963,7 @@ impl DependencyPackAdapter for JvmDependencyPackAdapter {
         let mut pack = pack;
         if let Some(pack) = pack.as_mut() {
             pack.producer = self.producer();
-            if partial || !diagnostics.is_empty() || suppressed_diagnostics > 0 {
+            if partial || !diagnostics.is_empty() || suppressed_diagnostics.total() > 0 {
                 pack.completeness = Completeness::Partial;
             }
         }
@@ -1182,7 +1257,7 @@ fn merge_java_dependency_packs(
     source: Option<AuthoredSemanticModelPack>,
     binary: Option<AuthoredSemanticModelPack>,
     diagnostics: &mut Vec<ProducerDiagnostic>,
-    suppressed_diagnostics: &mut usize,
+    suppressed_diagnostics: &mut SuppressedDiagnostics,
     limits: &ArtifactProducerLimits,
 ) -> Option<AuthoredSemanticModelPack> {
     let (mut pack, secondary) = match (source, binary) {
@@ -1282,21 +1357,114 @@ fn equivalent_java_member_fact(left: &MemberFact, right: &MemberFact) -> bool {
 
 fn push_java_merge_conflict(
     diagnostics: &mut Vec<ProducerDiagnostic>,
-    suppressed_diagnostics: &mut usize,
+    suppressed_diagnostics: &mut SuppressedDiagnostics,
     limits: &ArtifactProducerLimits,
     declaration_id: &str,
 ) {
-    if diagnostics.len() < limits.max_diagnostics {
-        diagnostics.push(ProducerDiagnostic {
-            severity: ProducerDiagnosticSeverity::Warning,
-            code: "java.source_binary_conflict".to_owned(),
-            location: Some(declaration_id.to_owned()),
-            declaration: None,
-            message: "source and binary facts disagree; deterministic source facts were kept"
-                .to_owned(),
+    if diagnostics.len() >= limits.max_diagnostics {
+        suppressed_diagnostics.warnings = suppressed_diagnostics.warnings.saturating_add(1);
+        return;
+    }
+    diagnostics.push(ProducerDiagnostic {
+        severity: ProducerDiagnosticSeverity::Warning,
+        source_entry: None,
+        code: "java.source_binary_conflict".to_owned(),
+        location: Some(declaration_id.to_owned()),
+        declaration: None,
+        message: "source and binary facts disagree; deterministic source facts were kept"
+            .to_owned(),
+    });
+}
+
+/// Process-wide memo of built external declaration indexes, keyed by the
+/// dependency-discovery evidence digest from [`external_index_memo_key`].
+///
+/// Entries are retained for the life of the process. The set of distinct
+/// dependency universes a process observes is small -- it grows only when a
+/// dependency jar set actually changes -- and each retained index is the
+/// bounded product of `build_from_artifacts`, so retention is the same cost a
+/// long-lived server already pays through its analyzers' `OnceLock` cells.
+fn external_index_memo() -> &'static Mutex<HashMap<StableDigest, Arc<JvmExternalDeclarationIndex>>>
+{
+    static MEMO: OnceLock<Mutex<HashMap<StableDigest, Arc<JvmExternalDeclarationIndex>>>> =
+        OnceLock::new();
+    MEMO.get_or_init(|| Mutex::new(HashMap::default()))
+}
+
+/// Digest of everything [`JvmExternalDeclarationIndex::build_for_project`]'s
+/// result is a function of, past the discovery step it always runs.
+///
+/// That is the ordered resolved artifact files -- their paths plus the length
+/// and mtime evidence that the bytes behind each path are unchanged -- and the
+/// discovery diagnostics the built index appends verbatim. Coordinates,
+/// provenance, and scope are deliberately absent: `build_from_artifacts` never
+/// reads them, so two discoveries that resolve the same files must share one
+/// index.
+fn external_index_memo_key(
+    artifacts: &[ResolvedJvmArtifact],
+    diagnostics: &[ProducerDiagnostic],
+) -> StableDigest {
+    let mut digest = LengthDelimitedDigest::new(JVM_EXTERNAL_INDEX_MEMO_DOMAIN);
+    digest.push(&(artifacts.len() as u64).to_le_bytes());
+    for artifact in artifacts {
+        push_artifact_file_evidence(&mut digest, &artifact.artifact_path);
+        match artifact.source_artifact_path.as_deref() {
+            Some(path) => push_artifact_file_evidence(&mut digest, path),
+            None => digest.push(b"no-sources"),
+        }
+    }
+    digest.push(&(diagnostics.len() as u64).to_le_bytes());
+    for diagnostic in diagnostics {
+        digest.push(match diagnostic.severity {
+            ProducerDiagnosticSeverity::Warning => b"warning",
+            ProducerDiagnosticSeverity::Error => b"error",
         });
-    } else {
-        *suppressed_diagnostics = (*suppressed_diagnostics).saturating_add(1);
+        digest.push(diagnostic.code.as_bytes());
+        push_optional_evidence(&mut digest, diagnostic.source_entry.as_deref());
+        push_optional_evidence(&mut digest, diagnostic.location.as_deref());
+        push_optional_evidence(&mut digest, diagnostic.declaration.as_deref());
+        digest.push(diagnostic.message.as_bytes());
+    }
+    digest.finish()
+}
+
+fn push_optional_evidence(digest: &mut LengthDelimitedDigest, value: Option<&str>) {
+    match value {
+        Some(value) => {
+            digest.push(b"some");
+            digest.push(value.as_bytes());
+        }
+        None => digest.push(b"none"),
+    }
+}
+
+/// Push one artifact file's identity: its path and, when the file is
+/// readable, the length and mtime that stand in for its bytes. A missing or
+/// unreadable file is its own evidence -- the index built from it records the
+/// read failure, so it must not collide with a readable file at the same path.
+fn push_artifact_file_evidence(digest: &mut LengthDelimitedDigest, path: &Path) {
+    digest.push(path.as_os_str().as_encoded_bytes());
+    let Ok(metadata) = fs::metadata(path) else {
+        digest.push(b"unreadable");
+        return;
+    };
+    digest.push(&metadata.len().to_le_bytes());
+    match metadata
+        .modified()
+        .map(|mtime| mtime.duration_since(std::time::UNIX_EPOCH))
+    {
+        Ok(Ok(since_epoch)) => {
+            digest.push(b"mtime");
+            digest.push(&since_epoch.as_secs().to_le_bytes());
+            digest.push(&since_epoch.subsec_nanos().to_le_bytes());
+        }
+        Ok(Err(before_epoch)) => {
+            let duration = before_epoch.duration();
+            digest.push(b"mtime-before-epoch");
+            digest.push(&duration.as_secs().to_le_bytes());
+            digest.push(&duration.subsec_nanos().to_le_bytes());
+        }
+        Err(_) => digest.push(b"no-mtime"),
     }
 }
 
@@ -1307,26 +1475,54 @@ impl JvmExternalDeclarationIndex {
         Self::build_from_artifacts(artifacts)
     }
 
-    pub(crate) fn build_for_project(config: &JvmAnalyzerConfig, project: &dyn Project) -> Self {
+    /// Build the jar-backed external declaration surface the discovery
+    /// evidence names, through a process-wide memo.
+    ///
+    /// Discovery itself runs on every call: it reads the project's build
+    /// manifests, which are exactly what changes between workspaces. The
+    /// expensive step -- reading and parsing every resolved dependency jar --
+    /// is a pure function of the resolved artifact files and the discovery
+    /// diagnostics that get appended to the result, so identical evidence
+    /// (same artifact paths with the same length and mtime, same diagnostics)
+    /// reuses the index already built by any analyzer in this process. A
+    /// long-lived server always amortized this through each analyzer's
+    /// `OnceLock`; the memo extends the same amortization to short-lived
+    /// processes that rebuild workspaces over an unchanged dependency
+    /// universe.
+    pub(crate) fn build_for_project(
+        config: &JvmAnalyzerConfig,
+        project: &dyn Project,
+    ) -> Arc<Self> {
         let discovery = resolve_jvm_semantic_pack_dependencies(
             config,
             project,
             &DependencyPackLimits::default(),
             None,
         );
-        let artifacts = discovery
+        let artifacts: Vec<ResolvedJvmArtifact> = discovery
             .dependencies
             .iter()
             .filter_map(jvm_artifact_from_dependency)
             .collect();
+        let diagnostics: Vec<ProducerDiagnostic> = discovery
+            .diagnostics
+            .into_iter()
+            .map(discovery_producer_diagnostic)
+            .collect();
+        let key = external_index_memo_key(&artifacts, &diagnostics);
+        let memo = external_index_memo();
+        if let Some(index) = memo.lock().expect("external index memo poisoned").get(&key) {
+            return Arc::clone(index);
+        }
         let mut index = Self::build_from_artifacts(artifacts);
-        index.production_diagnostics.extend(
-            discovery
-                .diagnostics
-                .into_iter()
-                .map(discovery_producer_diagnostic),
-        );
-        index
+        index.production_diagnostics.extend(diagnostics);
+        let index = Arc::new(index);
+        Arc::clone(
+            memo.lock()
+                .expect("external index memo poisoned")
+                .entry(key)
+                .or_insert(index),
+        )
     }
 
     fn build_from_artifacts(artifacts: Vec<ResolvedJvmArtifact>) -> Self {
@@ -1886,6 +2082,7 @@ impl JvmExternalDeclarationIndex {
         if skipped_entries > 0 {
             self.production_diagnostics.push(ProducerDiagnostic {
                 severity: ProducerDiagnosticSeverity::Warning,
+                    source_entry: None,
                 code: "jvm.index.unread_entries".to_owned(),
                 location: Some(artifact_path.to_string_lossy().into_owned()),
                 declaration: None,
@@ -1897,6 +2094,7 @@ impl JvmExternalDeclarationIndex {
         if member_budget.exhausted {
             self.production_diagnostics.push(ProducerDiagnostic {
                 severity: ProducerDiagnosticSeverity::Warning,
+                    source_entry: None,
                 code: "limit.artifact_members".to_owned(),
                 location: Some(artifact_path.to_string_lossy().into_owned()),
                 declaration: None,
@@ -2091,6 +2289,7 @@ fn discovery_producer_diagnostic(diagnostic: DependencyPackDiagnostic) -> Produc
         },
         code: diagnostic.code,
         location: diagnostic.location,
+        source_entry: None,
         declaration: None,
         message: diagnostic.message,
     }
@@ -4045,6 +4244,135 @@ mod tests {
         assert_eq!(discovered.diagnostics[0].code, "jdk.home.invalid");
     }
 
+    /// Writes the smallest JDK home automatic discovery accepts: a `release`
+    /// file that declares one `JAVA_VERSION`.
+    fn write_jdk_release(root: &Path, java_version: &str) -> PathBuf {
+        let home = root.join("jdk");
+        fs::create_dir_all(&home).unwrap();
+        fs::write(
+            home.join("release"),
+            format!("JAVA_VERSION=\"{java_version}\"\n"),
+        )
+        .unwrap();
+        home
+    }
+
+    #[test]
+    fn four_part_temurin_version_keeps_its_exact_spelling() {
+        let root = tempfile::tempdir().unwrap();
+        let home = write_jdk_release(root.path(), "21.0.12.1");
+
+        let discovered = discover_jdk_semantic_pack_dependencies(
+            &JvmAnalyzerConfig::default(),
+            root.path(),
+            Some(home.as_os_str().to_owned()),
+        );
+
+        assert!(
+            discovered.diagnostics.is_empty(),
+            "{:#?}",
+            discovered.diagnostics
+        );
+        assert_eq!(discovered.dependencies.len(), 1);
+        let dependency = &discovered.dependencies[0];
+        // The fourth component names a distinct source archive, so it must
+        // stay in the dependency identity and the provenance (#2874).
+        assert_eq!(dependency.id, "jdk:21.0.12.1");
+        assert_eq!(
+            dependency
+                .evidence
+                .toolchain
+                .as_ref()
+                .and_then(|coordinate| coordinate.version.as_ref()),
+            Some(&Version::parse("21.0.12").unwrap())
+        );
+        assert_eq!(
+            dependency.provenance,
+            vec![DependencyProvenance {
+                key: "version".to_owned(),
+                value: "21.0.12.1".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn configured_jdk_home_accepts_a_four_part_version() {
+        use crate::analyzer::JvmStandardLibraryDiscoveryConfig;
+
+        let root = tempfile::tempdir().unwrap();
+        let home = write_jdk_release(root.path(), "21.0.12.1");
+        let config = JvmAnalyzerConfig {
+            standard_library_discovery: JvmStandardLibraryDiscoveryConfig {
+                jdk_homes: vec![home],
+                discover_java_home: false,
+            },
+            ..JvmAnalyzerConfig::default()
+        };
+
+        let discovered = discover_jdk_semantic_pack_dependencies(&config, root.path(), None);
+
+        assert!(
+            discovered.diagnostics.is_empty(),
+            "{:#?}",
+            discovered.diagnostics
+        );
+        assert_eq!(discovered.dependencies.len(), 1);
+        assert_eq!(discovered.dependencies[0].id, "jdk:21.0.12.1");
+    }
+
+    #[test]
+    fn feature_only_jdk_version_fills_the_missing_semver_components() {
+        let root = tempfile::tempdir().unwrap();
+        let home = write_jdk_release(root.path(), "21");
+
+        let discovered = discover_jdk_semantic_pack_dependencies(
+            &JvmAnalyzerConfig::default(),
+            root.path(),
+            Some(home.as_os_str().to_owned()),
+        );
+
+        assert!(
+            discovered.diagnostics.is_empty(),
+            "{:#?}",
+            discovered.diagnostics
+        );
+        assert_eq!(discovered.dependencies.len(), 1);
+        assert_eq!(discovered.dependencies[0].id, "jdk:21");
+        assert_eq!(
+            discovered.dependencies[0]
+                .evidence
+                .toolchain
+                .as_ref()
+                .and_then(|coordinate| coordinate.version.as_ref()),
+            Some(&Version::parse("21.0.0").unwrap())
+        );
+    }
+
+    #[test]
+    fn undotted_and_overlong_jdk_versions_stay_invalid() {
+        for java_version in ["1.8.0_392", "21.0.12.1.7"] {
+            let root = tempfile::tempdir().unwrap();
+            let home = write_jdk_release(root.path(), java_version);
+
+            let discovered = discover_jdk_semantic_pack_dependencies(
+                &JvmAnalyzerConfig::default(),
+                root.path(),
+                Some(home.as_os_str().to_owned()),
+            );
+
+            assert!(
+                discovered.dependencies.is_empty(),
+                "{java_version}: {:#?}",
+                discovered.dependencies
+            );
+            assert_eq!(discovered.diagnostics.len(), 1, "{java_version}");
+            assert_eq!(
+                discovered.diagnostics[0].code, "jdk.home.invalid",
+                "{java_version}"
+            );
+        }
+    }
+
     #[test]
     fn java_external_declaration_indexes_coordinate_and_prefers_source_jar() {
         let Some(fixture) = ExternalJarFixture::new(true) else {
@@ -4635,6 +4963,7 @@ mod tests {
         );
     }
 
+    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
     #[test]
     fn java_dependency_discovery_indexes_exact_maven_pom_coordinate() {
         let Some(fixture) = ExternalJarFixture::new(true) else {
@@ -4754,6 +5083,7 @@ mod tests {
         assert!(index.is_empty());
     }
 
+    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
     #[test]
     fn java_dependency_discovery_disabled_keeps_metadata_out_of_index() {
         let Some(fixture) = ExternalJarFixture::new(false) else {
@@ -4903,6 +5233,7 @@ mod tests {
         assert!(java.is_known_type_name_in_file(token, None, &app, "ExternalService"));
     }
 
+    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
     #[test]
     fn java_external_declaration_indexes_explicit_source_artifact_path() {
         let Some(fixture) = ExternalJarFixture::new(true) else {
@@ -5323,6 +5654,69 @@ mod tests {
                 .unwrap()
                 .iter()
                 .all(|file| !file.rel_path().to_string_lossy().contains(".jar"))
+        );
+    }
+
+    /// Two workspaces over one unchanged dependency universe share one built
+    /// index through the process-wide memo; changing a resolved artifact's
+    /// bytes changes the evidence and rebuilds.
+    #[test]
+    fn build_for_project_memoizes_on_dependency_discovery_evidence() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let repo_dir = root.join("m2").join(GROUP_PATH);
+        fs::create_dir_all(&repo_dir).unwrap();
+        for workspace in ["workspace-a", "workspace-b"] {
+            fs::create_dir_all(root.join(workspace)).unwrap();
+        }
+        probe_class_jar(&repo_dir.join(BINARY_JAR));
+        let config = JvmAnalyzerConfig {
+            external_dependencies: JvmExternalDependencies {
+                coordinates: vec![JvmMavenCoordinate::new(
+                    "com.example",
+                    "external-lib",
+                    "1.2.3",
+                )],
+                repository_roots: vec![root.join("m2")],
+                ..JvmExternalDependencies::default()
+            },
+            ..JvmAnalyzerConfig::default()
+        };
+        let first = JvmExternalDeclarationIndex::build_for_project(
+            &config,
+            &TestProject::new(root.join("workspace-a"), Language::Java),
+        );
+        let second = JvmExternalDeclarationIndex::build_for_project(
+            &config,
+            &TestProject::new(root.join("workspace-b"), Language::Java),
+        );
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "identical dependency-discovery evidence must share one built index"
+        );
+
+        write_test_class_jar(
+            &repo_dir.join(BINARY_JAR),
+            &[TestClassFile {
+                internal_name: "com/example/probe/Replaced",
+                super_internal_name: "java/lang/Object",
+                methods: &[],
+                private_nested: false,
+            }],
+        );
+        let third = JvmExternalDeclarationIndex::build_for_project(
+            &config,
+            &TestProject::new(root.join("workspace-a"), Language::Java),
+        );
+        assert!(
+            !Arc::ptr_eq(&first, &third),
+            "a changed resolved artifact must rebuild the index"
+        );
+        assert!(
+            third
+                .resolve_qualified_name("com.example.probe.Replaced", "")
+                .is_some(),
+            "the rebuilt index must read the replaced artifact"
         );
     }
 

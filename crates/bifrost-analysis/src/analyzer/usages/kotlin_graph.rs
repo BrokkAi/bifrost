@@ -65,7 +65,7 @@ use crate::analyzer::usages::traits::{UsageQueryResolver, UsageScanScope};
 use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile};
 use crate::hash::HashSet;
 use brokk_bifrost_jvm::kotlin::graph::KotlinGraphSource;
-use brokk_bifrost_jvm::kotlin::graph::extractor::{ScanState, scan_file};
+use brokk_bifrost_jvm::kotlin::graph::extractor::{ScanState, scan_parsed_file};
 use brokk_bifrost_jvm::kotlin::graph::resolver::TargetSpec;
 
 #[cfg(test)]
@@ -78,7 +78,6 @@ fn kotlin_graph_source<'a>(
     KotlinGraphSource {
         index: analyzer,
         hierarchy: analyzer.type_hierarchy_provider(),
-        type_alias: analyzer.type_alias_provider(),
         imports: analyzer.import_analysis_provider(),
         relational_definitions,
     }
@@ -126,60 +125,87 @@ pub(super) fn kotlin_target_spec_replayable(
     })
 }
 
-pub(super) fn scan_kotlin_file_replayable(
+/// A candidate file read and parsed once, so the barrier scan below replays
+/// only resolution work when a file's frontier discovers a new dependency
+/// layer.
+pub(super) struct PreparedKotlinScanFile {
+    pub(super) file: ProjectFile,
+    pub(super) parsed: crate::analyzer::usages::parsed_tree::ParsedTreeFile,
+}
+
+/// Read and parse each candidate once, preferring the indexed overlay text
+/// over the on-disk text exactly as the per-file scan did. Unreadable and
+/// empty files scan as nothing, so they prepare as nothing.
+pub(super) fn prepare_kotlin_scan_files(
+    analyzer: &dyn IAnalyzer,
+    files: &[ProjectFile],
+) -> Vec<PreparedKotlinScanFile> {
+    use crate::analyzer::usages::parsed_tree::{ParseSpec, parse_tree_sitter_source};
+    let language = brokk_bifrost_jvm::kotlin::language::LANGUAGE.into();
+    files
+        .iter()
+        .filter_map(|file| {
+            let source = analyzer
+                .indexed_source(file)
+                .or_else(|| analyzer.project().read_source(file).ok())?;
+            let parsed = parse_tree_sitter_source(source, ParseSpec::whole(&language))?;
+            Some(PreparedKotlinScanFile {
+                file: file.clone(),
+                parsed,
+            })
+        })
+        .collect()
+}
+
+/// One file's owned scan result: proven hits, unproven hits, the raw match
+/// count, and whether this file alone exceeded the usage limit.
+pub(super) type KotlinFileScanOutput = (
+    std::collections::BTreeSet<crate::analyzer::usages::model::UsageHit>,
+    std::collections::BTreeSet<crate::analyzer::usages::model::UsageHit>,
+    usize,
+    bool,
+);
+
+/// Scan every prepared file against `spec` over immutable frontier snapshots.
+///
+/// The per-file sequential loop this replaces converged each file's frontier
+/// on its own -- one SQL barrier per newly discovered layer per file, all on
+/// the caller thread -- so a whole-workspace Kotlin scan paid hundreds of
+/// serial batches and zero file concurrency. Item barriers evaluate files in
+/// parallel, deduplicate every pass's missing questions into one batch, and
+/// replay only the files that observed a miss (#2886 scan-path milestone).
+pub(super) fn scan_kotlin_files_replayable(
     relational_session: &crate::analyzer::relational_frontier::RelationalFrontierSession<'_>,
     analyzer: &dyn IAnalyzer,
     token: QueryToken<'_>,
-    file: &ProjectFile,
+    prepared: &[PreparedKotlinScanFile],
     spec: &TargetSpec,
-    state: &mut ScanState<'_>,
-) -> crate::analyzer::RelationalFrontierOutcome<()> {
-    let initial_hits = state.hits.clone();
-    let initial_unproven_hits = state.unproven_hits.clone();
-    let initial_raw_match_count = *state.raw_match_count;
-    let initial_limit_exceeded = *state.limit_exceeded;
-    let max_usages = state.max_usages;
-    let outcome = relational_session.resolve_owned("kotlin_file_scan", |frontier| {
-        let mut hits = initial_hits.clone();
-        let mut unproven_hits = initial_unproven_hits.clone();
-        let mut raw_match_count = initial_raw_match_count;
-        let mut limit_exceeded = initial_limit_exceeded;
-        let mut provisional = ScanState {
+    max_usages: usize,
+) -> crate::analyzer::relational_frontier::RelationalItemFrontierOutcome<KotlinFileScanOutput> {
+    relational_session.resolve_owned_items("kotlin_file_scan", prepared, |prepared, frontier| {
+        let mut hits = std::collections::BTreeSet::new();
+        let mut unproven_hits = std::collections::BTreeSet::new();
+        let mut raw_match_count = 0usize;
+        let mut limit_exceeded = false;
+        let mut state = ScanState {
             max_usages,
             hits: &mut hits,
             unproven_hits: &mut unproven_hits,
             raw_match_count: &mut raw_match_count,
             limit_exceeded: &mut limit_exceeded,
         };
-        scan_file(
+        scan_parsed_file(
             &kotlin_graph_source(analyzer, frontier.as_ref()),
             token,
-            file,
+            &prepared.file,
+            &prepared.parsed.source,
+            &prepared.parsed.line_starts,
+            prepared.parsed.tree.root_node(),
             spec,
-            &mut provisional,
+            &mut state,
         );
         (hits, unproven_hits, raw_match_count, limit_exceeded)
-    });
-    match outcome {
-        crate::analyzer::RelationalFrontierOutcome::Complete((
-            hits,
-            unproven_hits,
-            raw_match_count,
-            limit_exceeded,
-        )) => {
-            *state.hits = hits;
-            *state.unproven_hits = unproven_hits;
-            *state.raw_match_count = raw_match_count;
-            *state.limit_exceeded = limit_exceeded;
-            crate::analyzer::RelationalFrontierOutcome::Complete(())
-        }
-        crate::analyzer::RelationalFrontierOutcome::Cancelled => {
-            crate::analyzer::RelationalFrontierOutcome::Cancelled
-        }
-        crate::analyzer::RelationalFrontierOutcome::Failed(error) => {
-            crate::analyzer::RelationalFrontierOutcome::Failed(error)
-        }
-    }
+    })
 }
 
 /// Whether `unit` is a Kotlin `companion object`.
@@ -191,17 +217,6 @@ pub(super) fn scan_kotlin_file_replayable(
 pub(crate) fn is_companion_object(analyzer: &dyn IAnalyzer, unit: &CodeUnit) -> bool {
     with_kotlin_graph_source(analyzer, |graph| {
         brokk_bifrost_jvm::kotlin::graph::resolver::is_companion_object(&graph, unit)
-    })
-}
-
-/// Whether `unit` is a Kotlin `typealias`.
-///
-/// The same wrapping as [`is_companion_object`]: the definition ladder (#1238)
-/// asks this from a `&dyn IAnalyzer`, and the alias marker itself lives behind
-/// the graph source's type-alias provider (#2696).
-pub(crate) fn is_kotlin_type_alias(analyzer: &dyn IAnalyzer, unit: &CodeUnit) -> bool {
-    with_kotlin_graph_source(analyzer, |graph| {
-        brokk_bifrost_jvm::kotlin::graph::resolver::is_kotlin_type_alias(&graph, unit)
     })
 }
 
@@ -397,6 +412,69 @@ mod tests {
         );
     }
 
+    /// Cost pin for #2883. A relational batch merges the file states that
+    /// override persisted rows, which is the workspace's open overlays. With no
+    /// overlay open it must materialize none of them, however many file states
+    /// the analyzer has cached -- the walk used to visit every cached state and
+    /// deep-clone the survivors, so a warm scan cost more than a cold one.
+    #[test]
+    fn kotlin_warm_scan_materializes_no_cached_file_states() {
+        const CANDIDATE_COUNT: usize = 12;
+
+        let fixture = (0..CANDIDATE_COUNT)
+            .fold(
+                inline_project::InlineTestProject::with_language(Language::Kotlin).file(
+                    "Service.kt",
+                    "package api\n\nclass Service { fun run() {} }\n",
+                ),
+                |fixture, index| {
+                    fixture.file(
+                        format!("Consumer{index}.kt"),
+                        format!(
+                            "package app\n\nimport api.Service\n\n\
+                         class Consumer{index} {{\n\
+                             private val service = Service()\n\n\
+                             fun call() {{ service.run() }}\n\
+                         }}\n"
+                        ),
+                    )
+                },
+            )
+            .build();
+        let analyzer = KotlinAnalyzer::new(fixture.project_arc());
+        let target = analyzer
+            .get_all_declarations()
+            .into_iter()
+            .find(|unit| unit.fq_name() == "api.Service.run")
+            .expect("fixture declares Service.run");
+        let candidates = (0..CANDIDATE_COUNT)
+            .map(|index| ProjectFile::new(fixture.root(), format!("Consumer{index}.kt")))
+            .collect::<HashSet<_>>();
+        let scan_scope = UsageScanScope::new(&candidates);
+        let scan = || {
+            KotlinUsageGraphStrategy::new()
+                .find_graph_usages(&analyzer, std::slice::from_ref(&target), &scan_scope, 1000)
+                .into_fuzzy_result()
+        };
+
+        // The first scan is what warms the file-state caches with every
+        // candidate; the second is the warm request the pin is about.
+        assert_eq!(scan().all_hits_including_imports().len(), CANDIDATE_COUNT);
+        analyzer.reset_authoritative_file_state_reads_for_test();
+        let outcome = scan();
+
+        assert_eq!(
+            outcome.all_hits_including_imports().len(),
+            CANDIDATE_COUNT,
+            "the warm scan must still find every reference: {outcome:?}"
+        );
+        assert_eq!(
+            analyzer.authoritative_file_state_reads_for_test(),
+            0,
+            "a workspace with no overlay open must materialize no file state to answer a relational batch"
+        );
+    }
+
     #[test]
     fn kotlin_inverted_type_and_member_resolution_uses_relational_lookup() {
         let temp = tempfile::tempdir().expect("temp dir");
@@ -536,6 +614,7 @@ mod tests {
     /// needs the per-declaration facts to be readable out of the bulk states,
     /// which is recorded as a follow-up in
     /// `.agents/plans/kotlin-usage-graph-1239.md`.
+    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
     #[test]
     fn kotlin_usage_graph_bulk_fetch_hydrates_each_file_at_most_once() {
         const FILE_COUNT: usize = 132;

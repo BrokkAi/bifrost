@@ -1,0 +1,134 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://csmi.brokk.ai/schema/profiles/java-jvm/0.1/jvm-binary-identity.schema.json",
+  "title": "CSMI csmi.jvm-binary-identity 0.1 payload",
+  "description": "Deterministic JVM class-file identity using internal names and JVM descriptors, with variant and compiler-origin facts kept explicit.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["profileVersion", "owner", "binaryEntity", "variant"],
+  "properties": {
+    "profileVersion": { "const": "0.1" },
+    "module": { "$ref": "#/$defs/moduleName" },
+    "owner": { "$ref": "#/$defs/internalName" },
+    "binaryEntity": { "$ref": "#/$defs/binaryEntity" },
+    "variant": { "$ref": "#/$defs/variant" },
+    "genericSignature": { "$ref": "#/$defs/genericSignature" },
+    "flags": { "$ref": "#/$defs/flags" },
+    "relocation": { "$ref": "#/$defs/relocation" }
+  },
+  "$defs": {
+    "moduleName": {
+      "type": "string",
+      "pattern": "^[^./;\\[\\]<>:]+(?:\\.[^./;\\[\\]<>:]+)*$"
+    },
+    "internalName": {
+      "type": "string",
+      "pattern": "^[^.;\\[/]+(?:/[^.;\\[/]+)*$"
+    },
+    "fieldDescriptor": {
+      "type": "string",
+      "pattern": "^(?:\\[)*(?:[BCDFIJSZ]|L[^.;\\[]+;)$"
+    },
+    "methodDescriptor": {
+      "type": "string",
+      "pattern": "^\\((?:(?:\\[)*(?:[BCDFIJSZ]|L[^.;\\[]+;))*\\)(?:(?:\\[)*(?:[BCDFIJSZ]|L[^.;\\[]+;)|V)$"
+    },
+    "genericSignature": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^[^\\r\\n]+$"
+    },
+    "binaryEntity": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind"],
+          "properties": { "kind": { "const": "class" } }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "name", "descriptor"],
+          "properties": {
+            "kind": { "const": "field" },
+            "name": { "type": "string", "pattern": "^[^.;\\[/]+$" },
+            "descriptor": { "$ref": "#/$defs/fieldDescriptor" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "name", "descriptor"],
+          "properties": {
+            "kind": { "const": "method" },
+            "name": { "type": "string", "pattern": "^(?:<init>|<clinit>|[^.;\\[/<>]+)$" },
+            "descriptor": { "$ref": "#/$defs/methodDescriptor" }
+          },
+          "allOf": [
+            {
+              "if": { "properties": { "name": { "const": "<init>" } }, "required": ["name"] },
+              "then": { "properties": { "descriptor": { "pattern": "^\\(.*\\)V$" } } }
+            },
+            {
+              "if": { "properties": { "name": { "const": "<clinit>" } }, "required": ["name"] },
+              "then": { "properties": { "descriptor": { "const": "()V" } } }
+            }
+          ]
+        }
+      ]
+    },
+    "variant": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["entryPath", "release"],
+      "properties": {
+        "entryPath": {
+          "type": "string",
+          "pattern": "^(?:META-INF/versions/[1-9][0-9]*/)?[^\\\\\\u0000]+\\.class$",
+          "not": { "pattern": "(?:^|/)\\.{1,2}(?:/|$)|//" }
+        },
+        "release": { "type": "integer", "minimum": 0 },
+        "classFileMajor": { "type": "integer", "minimum": 45 }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "release": { "minimum": 9 } }, "required": ["release"] },
+          "then": { "properties": { "entryPath": { "pattern": "^META-INF/versions/[1-9][0-9]*/" } } }
+        },
+        {
+          "if": { "properties": { "release": { "const": 0 } }, "required": ["release"] },
+          "then": { "properties": { "entryPath": { "not": { "pattern": "^META-INF/versions/" } } } }
+        },
+        {
+          "if": {
+            "properties": { "entryPath": { "pattern": "^META-INF/versions/" } },
+            "required": ["entryPath"]
+          },
+          "then": { "properties": { "release": { "minimum": 9 } } }
+        }
+      ]
+    },
+    "flags": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "bridge": { "type": "boolean" },
+        "synthetic": { "type": "boolean" },
+        "mandated": { "type": "boolean" },
+        "generated": { "type": "boolean" }
+      },
+      "minProperties": 1
+    },
+    "relocation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["originalOwner", "rule", "evidenceDigest"],
+      "properties": {
+        "originalOwner": { "$ref": "#/$defs/internalName" },
+        "rule": { "enum": ["shade-prefix", "shade-exact", "bytecode-rewrite"] },
+        "evidenceDigest": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+      }
+    }
+  }
+}

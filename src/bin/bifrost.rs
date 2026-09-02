@@ -15,20 +15,21 @@ use brokk_bifrost::mcp_registry::{
     resolve_server_spec, resolve_server_spec_for_render_options, searchtools_toolset_order,
 };
 use brokk_bifrost::policy::{
-    BuiltInPolicySelection, ExplanationCandidate, ExplanationLimits, ExplanationTarget,
-    HumanRenderColor, HumanRenderDetail, HumanRenderOptions, NearMissCandidates, POLICY_EXIT_CLEAN,
-    POLICY_EXIT_UNRELIABLE, PolicyBaselineDocument, PolicyBaselineOptions, PolicyBaselineSource,
-    PolicyBatchOutcome, PolicyEvaluationDate, PolicyEvaluationInput, PolicyEvaluationOptions,
-    PolicyFailOn, PolicyFindingId, PolicyRenderError, PolicyReportDocument, PolicyScopeOptions,
-    PolicyScopeSource, PolicySuppressionOptions, PolicySuppressionSource, SarifToolIdentity,
-    built_in_policy_catalog, escape_terminal_text, evaluate_policy_inputs, explain_policy_inputs,
-    rank_policy_near_misses, write_policy_human, write_policy_json, write_policy_sarif,
+    BuiltInPolicyCatalogManifest, BuiltInPolicySelection, ExplanationCandidate, ExplanationLimits,
+    ExplanationTarget, HumanRenderColor, HumanRenderDetail, HumanRenderOptions, NearMissCandidates,
+    POLICY_EXIT_CLEAN, POLICY_EXIT_UNRELIABLE, PolicyBaselineDocument, PolicyBaselineOptions,
+    PolicyBaselineSource, PolicyBatchOutcome, PolicyEvaluationDate, PolicyEvaluationInput,
+    PolicyEvaluationOptions, PolicyFailOn, PolicyFindingId, PolicyRenderError,
+    PolicyReportDocument, PolicyScopeOptions, PolicyScopeSource, PolicySuppressionOptions,
+    PolicySuppressionSource, SarifToolIdentity, built_in_policy_catalog, escape_terminal_text,
+    evaluate_policy_inputs, explain_policy_inputs, rank_policy_near_misses,
+    relation_schema_catalog, write_policy_human, write_policy_json, write_policy_sarif,
 };
 use brokk_bifrost::rmcp_host::{
     NamedWorkspace, run_named_workspace_stdio_server_with_build_identity,
     run_stdio_server_with_build_identity,
 };
-use brokk_bifrost::scoped_project::create_cli_tool_service;
+use brokk_bifrost::scoped_project::{create_cli_tool_service, create_scoped_service};
 use brokk_bifrost::searchtools_render::RenderOptions;
 use brokk_bifrost::tool_arguments::normalize_tool_arguments_for_cli;
 use brokk_bifrost::{CancellationToken, ToolOutput};
@@ -44,6 +45,46 @@ enum CliRunResult {
 struct CliRunError {
     message: String,
     policy_invocation: bool,
+}
+
+/// A listing flag answers a question about a shipped catalog instead of
+/// running a gate, so it refuses every option that selects or shapes an
+/// evaluation, and the listings refuse each other: two catalogs on one stdout
+/// would be neither document.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PolicyListing {
+    Policies,
+    RowSchemas,
+}
+
+impl PolicyListing {
+    const fn flag(self) -> &'static str {
+        match self {
+            Self::Policies => "--list-policies",
+            Self::RowSchemas => "--list-row-schemas",
+        }
+    }
+}
+
+/// Record the one listing this invocation asks for.
+fn select_listing(
+    current: &mut Option<PolicyListing>,
+    requested: PolicyListing,
+) -> Result<(), String> {
+    match *current {
+        Some(existing) if existing == requested => {
+            Err(format!("{} may only be provided once", requested.flag()))
+        }
+        Some(existing) => Err(format!(
+            "{} cannot be combined with {}",
+            requested.flag(),
+            existing.flag()
+        )),
+        None => {
+            *current = Some(requested);
+            Ok(())
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -81,6 +122,17 @@ fn main() -> ExitCode {
 
 fn run(args: impl Iterator<Item = String>) -> Result<CliRunResult, CliRunError> {
     let args = args.collect::<Vec<_>>();
+    // `scan` is a subcommand, recognized only in the first position so the
+    // flag surface stays untouched: everywhere else the word remains an
+    // unknown argument exactly as before the subcommand existed.
+    if args.first().map(String::as_str) == Some("scan") {
+        return run_scan(args.into_iter().skip(1)).map_err(|message| CliRunError {
+            message,
+            // A scan failure reports through the policy exit contract: its
+            // run is a policy evaluation, so its errors are unreliable runs.
+            policy_invocation: true,
+        });
+    }
     let policy_invocation = has_policy_syntax(&args);
     run_inner(args.into_iter(), policy_invocation).map_err(|message| CliRunError {
         message,
@@ -94,11 +146,14 @@ fn has_policy_syntax(args: &[String]) -> bool {
         let argument = args[index].as_str();
         if matches!(
             argument,
-            "--policy-file"
+            "--policy"
+                | "--no-builtin-policies"
+                | "--policy-file"
                 | "--policy-pack"
                 | "--policy-category"
                 | "--policy-id"
                 | "--list-policies"
+                | "--list-row-schemas"
                 | "--format"
                 | "--fail-on"
                 | "--suppressions-file"
@@ -107,6 +162,7 @@ fn has_policy_syntax(args: &[String]) -> bool {
                 | "--accept-current"
                 | "--evaluation-date"
                 | "--diff-base"
+                | "--no-incremental"
                 | "--output"
                 | "--color"
                 | "--verbose"
@@ -208,7 +264,9 @@ fn run_inner(
     let mut no_line_numbers_seen = false;
     let mut policy_files = Vec::new();
     let mut policy_selection = BuiltInPolicySelection::default();
-    let mut list_policies = false;
+    let mut policy_flag = false;
+    let mut no_builtin_policies = false;
+    let mut listing: Option<PolicyListing> = None;
     let mut policy_format = PolicyOutputFormat::Human;
     let mut policy_format_seen = false;
     let mut policy_fail_on = PolicyFailOn::Warning;
@@ -222,6 +280,9 @@ fn run_inner(
     let mut accept_current = false;
     let mut policy_evaluation_date = None;
     let mut policy_diff_base: Option<String> = None;
+    // Reuse is on by default; the switch exists to take it away for a run that
+    // needs to compare against the full dual-snapshot evaluation.
+    let mut policy_incremental = true;
     let mut policy_output: Option<PathBuf> = None;
     let mut policy_verbose = false;
     let mut policy_verbose_seen = false;
@@ -323,6 +384,18 @@ fn run_inner(
                     .ok_or_else(|| "--sources requires a path".to_string())?;
                 tool_sources.push(value);
             }
+            "--policy" => {
+                if policy_flag {
+                    return Err("--policy may only be provided once".to_string());
+                }
+                policy_flag = true;
+            }
+            "--no-builtin-policies" => {
+                if no_builtin_policies {
+                    return Err("--no-builtin-policies may only be provided once".to_string());
+                }
+                no_builtin_policies = true;
+            }
             "--policy-file" => {
                 let value = args
                     .next()
@@ -347,12 +420,8 @@ fn run_inner(
                     .ok_or_else(|| "--policy-id requires an id".to_string())?;
                 policy_selection.policy_ids.push(value);
             }
-            "--list-policies" => {
-                if list_policies {
-                    return Err("--list-policies may only be provided once".to_string());
-                }
-                list_policies = true;
-            }
+            "--list-policies" => select_listing(&mut listing, PolicyListing::Policies)?,
+            "--list-row-schemas" => select_listing(&mut listing, PolicyListing::RowSchemas)?,
             "--explain-finding" => {
                 let value = args.next().ok_or_else(|| {
                     "--explain-finding requires a finding id as run_policy reports it".to_string()
@@ -444,6 +513,12 @@ fn run_inner(
                 }
                 accept_current = true;
             }
+            "--no-incremental" => {
+                if !policy_incremental {
+                    return Err("--no-incremental may only be provided once".to_string());
+                }
+                policy_incremental = false;
+            }
             "--evaluation-date" => {
                 let value = args
                     .next()
@@ -504,6 +579,14 @@ fn run_inner(
             }
             "--version" | "-V" => {
                 println!("bifrost {}", env!("CARGO_PKG_VERSION"));
+                // The shipped policy catalog is part of the behavior a version
+                // names, so a catalog change must surface here as a version
+                // event rather than a silent behavior change. The first line
+                // keeps its exact historical shape for existing parsers.
+                let catalog = built_in_policy_catalog().map_err(|error| error.to_string())?;
+                for line in builtin_pack_witness_lines(catalog.document(), catalog.digest()) {
+                    println!("{line}");
+                }
                 return Ok(CliRunResult::Complete);
             }
             "--build-identity" => {
@@ -532,7 +615,6 @@ fn run_inner(
         if query_file.is_some()
             || tool_name.is_some()
             || tool_args_seen
-            || !tool_sources.is_empty()
             || run_lsp
             || run_repl
             || mcp_mode.is_some()
@@ -541,22 +623,24 @@ fn run_inner(
             || install
         {
             return Err(
-                "policy options cannot be combined with --install, --query-file, --tool, --args, --sources, --mcp, --lsp, or --repl, --no-line-numbers, or --diff-snapshot-object-dir"
+                "policy options cannot be combined with --install, --query-file, --tool, --args, --mcp, --lsp, or --repl, --no-line-numbers, or --diff-snapshot-object-dir"
                     .to_string(),
             );
         }
-        if list_policies {
+        if let Some(listing) = listing {
+            let flag = listing.flag();
             if explain_finding.is_some()
                 || explain_candidate.is_some()
                 || explain_near_misses.is_some()
             {
-                return Err(
-                    "--list-policies cannot be combined with --explain-finding, --explain-candidate, or --explain-near-misses"
-                        .to_string(),
-                );
+                return Err(format!(
+                    "{flag} cannot be combined with --explain-finding, --explain-candidate, or --explain-near-misses"
+                ));
             }
             if !policy_files.is_empty()
                 || !policy_selection.is_empty()
+                || policy_flag
+                || no_builtin_policies
                 || policy_format_seen
                 || policy_fail_on_seen
                 || policy_suppressions_seen
@@ -565,27 +649,43 @@ fn run_inner(
                 || accept_current
                 || policy_evaluation_date.is_some()
                 || policy_diff_base.is_some()
+                || !policy_incremental
                 || policy_output.is_some()
                 || policy_verbose_seen
                 || policy_color_seen
                 || require_explicit_schema_versions
+                || !tool_sources.is_empty()
             {
-                return Err(
-                    "--list-policies cannot be combined with policy selection or evaluation options"
-                        .to_string(),
-                );
+                return Err(format!(
+                    "{flag} cannot be combined with policy selection or evaluation options"
+                ));
             }
-            let catalog = built_in_policy_catalog().map_err(|error| error.to_string())?;
-            let encoded = serde_json::to_string_pretty(catalog.manifest())
-                .map_err(|error| format!("failed to serialize built-in policy catalog: {error}"))?;
+            let encoded = match listing {
+                PolicyListing::Policies => {
+                    let catalog = built_in_policy_catalog().map_err(|error| error.to_string())?;
+                    serde_json::to_string_pretty(catalog.document()).map_err(|error| {
+                        format!("failed to serialize built-in policy catalog: {error}")
+                    })?
+                }
+                PolicyListing::RowSchemas => {
+                    serde_json::to_string_pretty(&relation_schema_catalog()).map_err(|error| {
+                        format!("failed to serialize relation schema catalog: {error}")
+                    })?
+                }
+            };
             println!("{encoded}");
             return Ok(CliRunResult::Complete);
         }
-        if policy_files.is_empty() && policy_selection.is_empty() {
-            return Err(
-                "policy mode requires at least one --policy-file or built-in policy selector"
-                    .to_string(),
-            );
+        if no_builtin_policies {
+            if !policy_selection.is_empty() {
+                return Err(
+                    "--no-builtin-policies cannot be combined with --policy-pack, --policy-category, or --policy-id"
+                        .to_string(),
+                );
+            }
+            if policy_files.is_empty() {
+                return Err("--no-builtin-policies requires at least one --policy-file".to_string());
+            }
         }
         if policy_format != PolicyOutputFormat::Human && (policy_verbose_seen || policy_color_seen)
         {
@@ -619,16 +719,43 @@ fn run_inner(
                 || policy_diff_base.is_some()
                 || policy_verbose_seen
                 || policy_color_seen
+                || !tool_sources.is_empty()
             {
                 return Err(
-                    "--explain-finding, --explain-candidate, and --explain-near-misses cannot be combined with --format, --fail-on, --suppressions-file, --scope-file, --baseline-file, --accept-current, --evaluation-date, --diff-base, --verbose, or --color"
+                    "--explain-finding, --explain-candidate, and --explain-near-misses cannot be combined with --format, --fail-on, --suppressions-file, --scope-file, --baseline-file, --accept-current, --evaluation-date, --diff-base, --verbose, --color, or --sources"
                         .to_string(),
                 );
             }
         }
-        let mut policy_inputs = built_in_policy_catalog()
-            .map_err(|error| error.to_string())?
-            .select(&policy_selection)
+        // An explicit selection of any kind replaces the zero-configuration
+        // default; --no-builtin-policies asserts a controlled run stays free
+        // of shipped policies even when no explicit input survived.
+        let use_builtin_default =
+            policy_files.is_empty() && policy_selection.is_empty() && !no_builtin_policies;
+        if use_builtin_default && explain_mode.is_some() {
+            // An explanation is about exactly one policy, so the multi-policy
+            // shipped catalog can never be its implicit subject.
+            return Err(
+                "policy explanation requires an explicit --policy-file or built-in policy selector"
+                    .to_string(),
+            );
+        }
+        let catalog = built_in_policy_catalog().map_err(|error| error.to_string())?;
+        let effective_selection = if use_builtin_default {
+            BuiltInPolicySelection {
+                packs: catalog
+                    .document()
+                    .packs
+                    .iter()
+                    .map(|pack| pack.id.clone())
+                    .collect(),
+                ..BuiltInPolicySelection::default()
+            }
+        } else {
+            policy_selection
+        };
+        let mut policy_inputs = catalog
+            .select(&effective_selection)
             .map_err(|error| error.to_string())?
             .into_iter()
             .map(|policy| {
@@ -662,10 +789,12 @@ fn run_inner(
                 baseline: policy_baseline,
                 accept_current,
                 diff_base: policy_diff_base,
+                incremental: policy_incremental,
                 output: policy_output,
                 verbose: policy_verbose,
                 color: policy_color,
                 require_explicit_schema_versions,
+                sources: tool_sources,
             },
             &policy_inputs,
         );
@@ -801,6 +930,297 @@ fn run_inner(
         )
     }
     .map(|()| CliRunResult::Complete)
+}
+
+/// The `bifrost scan [PATH]` subcommand: the zero-configuration
+/// shipped-product entry point (issue #2882).
+///
+/// A scan activates every built-in policy pack the build ships against one
+/// project path -- no `--policy-file`, no selectors -- and witnesses the
+/// activated pack set on stderr in the same line shape `--version` prints, so
+/// an external evaluation can record exactly which shipped catalog decided.
+/// The subcommand is additive: the flag-based policy surface, which
+/// benchmark-controlled runs configure explicitly, is untouched.
+///
+/// A build that ships no packs is reported honestly: the witness records an
+/// empty activated pack set, the run evaluates nothing, and the exit status
+/// is clean rather than an error, so the surface exists before the shipped
+/// content does.
+fn run_scan(mut args: impl Iterator<Item = String>) -> Result<CliRunResult, String> {
+    let mut path: Option<PathBuf> = None;
+    let mut list_builtin = false;
+    let mut format = PolicyOutputFormat::Human;
+    let mut format_seen = false;
+    let mut fail_on = PolicyFailOn::Warning;
+    let mut fail_on_seen = false;
+    let mut evaluation_date = None;
+    let mut output: Option<PathBuf> = None;
+    let mut verbose = false;
+    let mut color = PolicyColorMode::Auto;
+    let mut color_seen = false;
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--list-builtin-policies" => {
+                if list_builtin {
+                    return Err("--list-builtin-policies may only be provided once".to_string());
+                }
+                list_builtin = true;
+            }
+            "--format" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| "--format requires human, json, or sarif".to_string())?;
+                if format_seen {
+                    return Err("--format may only be provided once".to_string());
+                }
+                format = parse_policy_format(&value)?;
+                format_seen = true;
+            }
+            "--fail-on" => {
+                let value = args.next().ok_or_else(|| {
+                    "--fail-on requires never, finding, note, warning, or error".to_string()
+                })?;
+                if fail_on_seen {
+                    return Err("--fail-on may only be provided once".to_string());
+                }
+                fail_on = parse_policy_fail_on(&value)?;
+                fail_on_seen = true;
+            }
+            "--evaluation-date" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| "--evaluation-date requires YYYY-MM-DD".to_string())?;
+                if evaluation_date.is_some() {
+                    return Err("--evaluation-date may only be provided once".to_string());
+                }
+                evaluation_date = Some(value.parse::<PolicyEvaluationDate>().map_err(|error| {
+                    format!("Invalid --evaluation-date value: {value}. {error}.")
+                })?);
+            }
+            "--output" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| "--output requires a path".to_string())?;
+                if output.replace(PathBuf::from(value)).is_some() {
+                    return Err("--output may only be provided once".to_string());
+                }
+            }
+            "--verbose" => {
+                if verbose {
+                    return Err("--verbose may only be provided once".to_string());
+                }
+                verbose = true;
+            }
+            "--color" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| "--color requires auto, always, or never".to_string())?;
+                if color_seen {
+                    return Err("--color may only be provided once".to_string());
+                }
+                color = parse_policy_color(&value)?;
+                color_seen = true;
+            }
+            "--help" | "-h" => {
+                print_scan_help();
+                return Ok(CliRunResult::Complete);
+            }
+            positional if !positional.starts_with('-') => {
+                if path.replace(PathBuf::from(positional)).is_some() {
+                    return Err("scan accepts at most one project path".to_string());
+                }
+            }
+            other => {
+                return Err(format!(
+                    "Unknown scan argument: {other}. Run `bifrost scan --help` for the scan options."
+                ));
+            }
+        }
+    }
+
+    if list_builtin {
+        // A listing answers what ships without running anything, so it
+        // refuses every option that would shape a run -- the same discipline
+        // the top-level catalog listings follow.
+        if path.is_some()
+            || format_seen
+            || fail_on_seen
+            || evaluation_date.is_some()
+            || output.is_some()
+            || verbose
+            || color_seen
+        {
+            return Err(
+                "--list-builtin-policies cannot be combined with a project path or evaluation options"
+                    .to_string(),
+            );
+        }
+        let catalog = built_in_policy_catalog().map_err(|error| error.to_string())?;
+        let encoded = serde_json::to_string_pretty(catalog.document())
+            .map_err(|error| format!("failed to serialize built-in policy catalog: {error}"))?;
+        println!("{encoded}");
+        return Ok(CliRunResult::Complete);
+    }
+
+    if format != PolicyOutputFormat::Human && (verbose || color_seen) {
+        return Err("--verbose and --color are only valid with --format human".to_string());
+    }
+
+    let root = match path {
+        Some(path) => path,
+        None => {
+            let current = env::current_dir()
+                .map_err(|error| format!("Failed to get current directory: {error}"))?;
+            eprintln!(
+                "bifrost scan: no project path supplied, scanning current directory: {}",
+                escape_terminal_text(current.to_string_lossy().as_ref())
+            );
+            current
+        }
+    };
+    if !root.is_dir() {
+        return Err(format!("scan path is not a directory: {}", root.display()));
+    }
+
+    let catalog = built_in_policy_catalog().map_err(|error| error.to_string())?;
+    let document = catalog.document();
+    // The witness surface: which shipped packs this run activates, in the
+    // exact line shape `--version` prints, followed by one activation
+    // summary. It goes to stderr so stdout stays a single machine document.
+    for line in builtin_pack_witness_lines(document, catalog.digest()) {
+        eprintln!("{line}");
+    }
+    eprintln!("{}", scan_activation_summary(document));
+
+    if document.packs.is_empty() {
+        // The honest empty-catalog run: the surface ships ahead of the pack
+        // wave, so a packless build completes cleanly with zero findings
+        // instead of erroring or fabricating a report it cannot evaluate.
+        return Ok(CliRunResult::PolicyStatus(POLICY_EXIT_CLEAN));
+    }
+
+    let selection = BuiltInPolicySelection {
+        packs: document.packs.iter().map(|pack| pack.id.clone()).collect(),
+        ..BuiltInPolicySelection::default()
+    };
+    let policy_inputs = catalog
+        .select(&selection)
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .map(|policy| PolicyEvaluationInput::embedded(policy.source_identity(), policy.source()))
+        .collect::<Vec<_>>();
+    let status = run_policy_mode(
+        PolicyModeRequest {
+            root,
+            format,
+            fail_on,
+            evaluation_date,
+            suppressions: PolicySuppressionOptions::default(),
+            scope: PolicyScopeOptions::default(),
+            baseline: PolicyBaselineOptions::default(),
+            accept_current: false,
+            diff_base: None,
+            // The scan entry point has no --no-incremental flag; the incremental
+            // diff-base review is on by default, as on the policy path.
+            incremental: true,
+            output,
+            verbose,
+            color,
+            require_explicit_schema_versions: false,
+            sources: Vec::new(),
+        },
+        &policy_inputs,
+    );
+    Ok(CliRunResult::PolicyStatus(status))
+}
+
+/// The pack-identity witness lines shared by `--version` and `scan`: one
+/// `builtin-policy-pack <id>@<version> policies=<count>` line per shipped
+/// pack, then the catalog digest. One shape on both surfaces, so a parser of
+/// either cannot drift from the other and a shipped-catalog change is the
+/// same visible event everywhere.
+fn builtin_pack_witness_lines(
+    document: &BuiltInPolicyCatalogManifest,
+    digest: &str,
+) -> Vec<String> {
+    let mut lines = Vec::with_capacity(document.packs.len() + 1);
+    for pack in &document.packs {
+        lines.push(format!(
+            "builtin-policy-pack {}@{} policies={}",
+            pack.id,
+            pack.version,
+            pack.policies.len()
+        ));
+    }
+    lines.push(format!("builtin-policy-catalog sha256={digest}"));
+    lines
+}
+
+/// One stderr summary of what a scan activated, honest about a build that
+/// ships nothing.
+fn scan_activation_summary(document: &BuiltInPolicyCatalogManifest) -> String {
+    let policies: usize = document.packs.iter().map(|pack| pack.policies.len()).sum();
+    if document.packs.is_empty() {
+        "bifrost scan: this build ships no built-in policy packs; nothing was evaluated and there are no findings"
+            .to_string()
+    } else {
+        format!(
+            "bifrost scan: activated {} built-in policy packs ({} policies)",
+            document.packs.len(),
+            policies
+        )
+    }
+}
+
+fn print_scan_help() {
+    println!(
+        "bifrost scan {} — evaluate every built-in policy pack on a project with zero configuration.",
+        env!("CARGO_PKG_VERSION")
+    );
+    let body = r#"
+USAGE:
+    bifrost scan [PATH] [OPTIONS]
+    bifrost scan --list-builtin-policies
+
+    PATH is the project root to scan (default: current directory).
+
+    A scan activates the complete shipped policy catalog -- no --policy-file,
+    no selectors -- and prints the activated pack identities, versions, and
+    the catalog SHA-256 to stderr before the report, in the same line shape
+    `bifrost --version` prints. Exit status follows the policy contract:
+    0 clean, 1 findings at or above the --fail-on threshold, 2 unreliable.
+    A build that ships no packs scans to a clean, empty result and says so.
+
+OPTIONS:
+    --list-builtin-policies
+                           Print the shipped built-in policy catalog as JSON and exit
+                           without scanning anything. Cannot be combined with a project
+                           path or evaluation options.
+    --format FORMAT        Report output: human, json, or sarif (default: human)
+    --fail-on THRESHOLD    Finding threshold: never, finding, note, warning, or error
+                           (default: warning; finding includes unrated findings)
+    --evaluation-date YYYY-MM-DD
+                           Evaluate suppression expiration on this UTC date (default: today)
+    --output PATH          Atomically write the report to PATH instead of stdout
+    --verbose              Include complete evidence and rule details in human output
+    --color MODE           Human output color: auto, always, or never (default: auto)
+    -h, --help             Show this help
+
+EXAMPLES:
+    # The shipped product, out of the box:
+    bifrost scan /path/to/project
+
+    # Machine-readable report with the pack witness on stderr:
+    bifrost scan /path/to/project --format json
+
+    # Discover what ships without running anything:
+    bifrost scan --list-builtin-policies
+
+For explicit policy selection, suppressions, baselines, and diff gating, use
+the policy options on the flag surface: see `bifrost --help`.
+"#;
+    print!("{body}");
 }
 
 fn validate_diff_snapshot_object_dir(path: PathBuf) -> Result<PathBuf, String> {
@@ -1069,10 +1489,12 @@ struct PolicyModeRequest {
     baseline: PolicyBaselineOptions,
     accept_current: bool,
     diff_base: Option<String>,
+    incremental: bool,
     output: Option<PathBuf>,
     verbose: bool,
     color: PolicyColorMode,
     require_explicit_schema_versions: bool,
+    sources: Vec<String>,
 }
 
 fn run_policy_mode(request: PolicyModeRequest, policy_inputs: &[PolicyEvaluationInput]) -> u8 {
@@ -1097,11 +1519,20 @@ fn run_policy_mode(request: PolicyModeRequest, policy_inputs: &[PolicyEvaluation
             .with_scope(request.scope.clone())
             .with_baseline(request.baseline.clone())
             .with_required_schema_versions(request.require_explicit_schema_versions)
-            .with_fail_on(request.fail_on);
+            .with_fail_on(request.fail_on)
+            .with_incremental(request.incremental);
     if let Some(revision) = request.diff_base.clone() {
         options = options.with_diff_base(revision);
     }
-    let outcome = match evaluate_policy_inputs(&request.root, policy_inputs, &options) {
+    let evaluation = if request.sources.is_empty() {
+        evaluate_policy_inputs(&request.root, policy_inputs, &options)
+            .map_err(|error| error.to_string())
+    } else {
+        create_scoped_service(request.root.clone(), &request.sources, None).and_then(|service| {
+            service.evaluate_policy_inputs(&request.root, policy_inputs, &options)
+        })
+    };
+    let outcome = match evaluation {
         Ok(outcome) => outcome,
         Err(error) => {
             eprintln!(
@@ -1460,6 +1891,9 @@ fn print_general_help() {
     // from the registry so it never drifts.
     let top = r#"
 USAGE:
+    bifrost scan [PATH]        Evaluate every built-in policy pack on a project with zero
+                               configuration, witnessing the activated pack set on stderr.
+                               Run `bifrost scan --help` for the scan options.
     bifrost                  Run an MCP server over stdio (default: --mcp searchtools)
     bifrost --mcp TOOLSETS     Run an MCP server over stdio (e.g. --mcp core)
     bifrost --lsp              Run a Language Server (LSP) over stdio
@@ -1467,8 +1901,10 @@ USAGE:
     bifrost --tool NAME        Run a single tool once, print JSON result, and exit
     bifrost --query-file PATH  Run a .rql or .json code query once, print JSON result, and exit
     bifrost --install          Register brokk with installed coding hosts and exit
+    bifrost --policy           Evaluate the built-in policy packs on the project and exit
     bifrost --policy-file PATH Evaluate workspace or built-in static-analysis policies and exit
-    bifrost --list-policies    Print the built-in policy-pack manifest and exit
+    bifrost --list-policies    Print the built-in policy catalog and exit
+    bifrost --list-row-schemas Print the row-relation field catalog and exit
     bifrost --version | --help [TOOL]
 
 OPTIONS:
@@ -1488,14 +1924,25 @@ OPTIONS:
                            Optional; omission supplies {}, which suits get_active_workspace and
                            the default diff-tool worktree comparison.
     --query-file PATH      Run a workspace-relative .rql or .json CodeQuery directly.
-    --sources PATH         Restrict one-shot --tool workspace construction to selected files,
-                           directories, or globs. Repeatable; valid only with --tool. Explicit
-                           sources override .bifrostignore.
+    --sources PATH         Restrict one-shot --tool or policy workspace construction to selected
+                           files, directories, or globs. Repeatable. Explicit sources override
+                           .bifrostignore.
+    --policy               Enter policy mode explicitly. A policy invocation with no
+                           --policy-file and no built-in selector evaluates every built-in
+                           policy pack; any explicit selection replaces that default.
+    --no-builtin-policies  Refuse the built-in default: evaluate only explicit --policy-file
+                           inputs. Requires at least one --policy-file and cannot be combined
+                           with --policy-pack, --policy-category, or --policy-id.
     --policy-file PATH     Evaluate a workspace-relative .rqlp policy. Repeatable.
     --policy-pack ID       Evaluate every built-in policy in a pack. Repeatable.
     --policy-category NAME Evaluate built-in policies in a category. Repeatable.
     --policy-id ID         Evaluate one built-in policy by stable id. Repeatable.
     --list-policies        Print the deterministic built-in policy catalog as JSON
+    --list-row-schemas     Print the deterministic bifrost_relation_schema/v1 catalog as JSON:
+                           every row domain a relational policy may bind, each field's scalar
+                           type, nullability, join-key status, and enum values, and the
+                           expansions admitted from the domain. The REPL's :doc <row-domain>
+                           prints one domain of the same catalog.
     --format FORMAT        Policy output: human, json, or sarif (default: human)
     --verbose              Include complete evidence, provenance, and rule details in human output
     --color MODE           Human output color: auto, always, or never (default: auto)
@@ -1518,6 +1965,10 @@ OPTIONS:
                            each finding as new or persisting against it, and fail only on new
                            findings. REV is any revision git rev-parse accepts; pass the pull
                            request's merge base in CI. An unresolvable base is unreliable (exit 2)
+    --no-incremental       Evaluate every policy in full instead of reusing per-unit results a
+                           previous run published in this repository's analyzer cache. Reuse is on
+                           by default and produces the same findings; this switch is for comparing
+                           against the full dual-snapshot evaluation when diagnosing a difference
     --require-explicit-schema-versions
                            Reject inferred policy and RQL schema versions
     --explain-finding ID   Explain why the selected policy's run produced the finding with this
@@ -1588,6 +2039,15 @@ EXAMPLES:
 
     # Evaluate two policy roots together and emit one canonical JSON report:
     bifrost --root /path/to/project --policy-file policies/security.rqlp --policy-file policies/correctness.rqlp --evaluation-date 2026-07-27 --format json
+
+    # Iterate on one policy against a small source subset:
+    bifrost --root /path/to/project --policy-file policies/security.rqlp --sources src/auth --sources 'tests/auth/**/*.rs'
+
+    # Evaluate every built-in policy pack with zero configuration:
+    bifrost --root /path/to/project --policy
+
+    # Discover the row domains, fields, and expansions a relational policy may bind:
+    bifrost --list-row-schemas
 
     # Discover and run the built-in code-smell pack:
     bifrost --list-policies
@@ -2048,8 +2508,165 @@ mod policy_explain_cli_tests {
         ] {
             let message = run_error(&question);
             assert!(
-                message.contains("policy mode requires at least one --policy-file"),
+                message.contains(
+                    "policy explanation requires an explicit --policy-file or built-in policy \
+                     selector"
+                ),
                 "{message}"
+            );
+        }
+    }
+}
+
+/// Flag-level coverage for the zero-configuration built-in default (issue
+/// 2853): the explicit policy-mode entry and the controlled-run opt-out.
+///
+/// Only refusals are exercised in-process; the default catalog run itself
+/// builds a workspace and lives in the workspace-level CLI suite.
+#[cfg(test)]
+mod builtin_default_cli_tests {
+    use super::{has_policy_syntax, run};
+
+    fn run_error(args: &[&str]) -> String {
+        match run(args.iter().map(|argument| (*argument).to_string())) {
+            Err(error) => {
+                assert!(error.policy_invocation, "{args:?} is a policy invocation");
+                error.message
+            }
+            Ok(_) => panic!("expected {args:?} to fail"),
+        }
+    }
+
+    #[test]
+    fn the_policy_entry_and_the_opt_out_are_policy_syntax() {
+        assert!(has_policy_syntax(&["--policy".to_string()]));
+        assert!(has_policy_syntax(&["--no-builtin-policies".to_string()]));
+    }
+
+    #[test]
+    fn the_opt_out_refuses_builtin_selectors_and_requires_a_policy_file() {
+        for selector in [
+            vec!["--policy-pack", "bifrost.code-smells"],
+            vec!["--policy-category", "correctness"],
+            vec!["--policy-id", "bifrost.correctness.dynamic-evaluation"],
+        ] {
+            let mut args = vec!["--no-builtin-policies"];
+            args.extend(selector.iter().copied());
+            let message = run_error(&args);
+            assert_eq!(
+                message,
+                "--no-builtin-policies cannot be combined with --policy-pack, \
+                 --policy-category, or --policy-id"
+            );
+        }
+        for args in [
+            vec!["--no-builtin-policies"],
+            vec!["--policy", "--no-builtin-policies"],
+        ] {
+            let message = run_error(&args);
+            assert_eq!(
+                message,
+                "--no-builtin-policies requires at least one --policy-file"
+            );
+        }
+    }
+
+    #[test]
+    fn listing_refuses_the_policy_entry_flags() {
+        for flag in ["--policy", "--no-builtin-policies"] {
+            let message = run_error(&["--list-policies", flag]);
+            assert!(
+                message.contains("--list-policies cannot be combined"),
+                "{message}"
+            );
+        }
+    }
+}
+
+/// Flag-level coverage for the row-schema listing (issue #2517).
+///
+/// The printed catalog itself is asserted end to end in the policy CLI suite,
+/// which can read the process's stdout; these cases pin the refusals, which is
+/// the part a caller cannot discover from the output.
+#[cfg(test)]
+mod row_schema_listing_cli_tests {
+    use super::{CliRunResult, has_policy_syntax, run};
+
+    fn run_error(args: &[&str]) -> String {
+        match run(args.iter().map(|argument| (*argument).to_string())) {
+            Err(error) => {
+                assert!(
+                    error.policy_invocation,
+                    "a listing flag is a policy invocation, so its failure exits 2"
+                );
+                error.message
+            }
+            Ok(_) => panic!("expected {args:?} to fail"),
+        }
+    }
+
+    #[test]
+    fn the_listing_flag_is_policy_syntax_and_needs_no_workspace() {
+        assert!(has_policy_syntax(&["--list-row-schemas".to_string()]));
+        match run(["--list-row-schemas".to_string()].into_iter()) {
+            Ok(CliRunResult::Complete) => {}
+            Ok(CliRunResult::PolicyStatus(status)) => {
+                panic!("a listing completes rather than gating, got status {status}")
+            }
+            Err(error) => panic!("{}", error.message),
+        }
+    }
+
+    #[test]
+    fn the_two_listings_exclude_each_other_and_repeat_once() {
+        assert_eq!(
+            run_error(&["--list-row-schemas", "--list-policies"]),
+            "--list-policies cannot be combined with --list-row-schemas"
+        );
+        assert_eq!(
+            run_error(&["--list-policies", "--list-row-schemas"]),
+            "--list-row-schemas cannot be combined with --list-policies"
+        );
+        assert_eq!(
+            run_error(&["--list-row-schemas", "--list-row-schemas"]),
+            "--list-row-schemas may only be provided once"
+        );
+        assert_eq!(
+            run_error(&["--list-policies", "--list-policies"]),
+            "--list-policies may only be provided once"
+        );
+    }
+
+    #[test]
+    fn the_listing_refuses_selection_evaluation_and_explanation_options() {
+        for options in [
+            vec!["--policy-file", "policies/p.rqlp"],
+            vec!["--policy-pack", "bifrost.code-smells"],
+            vec!["--policy"],
+            vec!["--format", "json"],
+            vec!["--fail-on", "error"],
+            vec!["--accept-current"],
+            vec!["--diff-base", "HEAD"],
+        ] {
+            let mut args = vec!["--list-row-schemas"];
+            args.extend(options.iter().copied());
+            assert_eq!(
+                run_error(&args),
+                "--list-row-schemas cannot be combined with policy selection or evaluation options",
+                "{options:?} must be refused beside the listing"
+            );
+        }
+        for question in [
+            vec!["--explain-candidate", "app.ts:0"],
+            vec!["--explain-near-misses", "5"],
+        ] {
+            let mut args = vec!["--list-row-schemas"];
+            args.extend(question.iter().copied());
+            assert_eq!(
+                run_error(&args),
+                "--list-row-schemas cannot be combined with --explain-finding, \
+                 --explain-candidate, or --explain-near-misses",
+                "{question:?} must be refused beside the listing"
             );
         }
     }
@@ -2179,5 +2796,148 @@ mod policy_explain_exit_status_tests {
             None,
         );
         assert_eq!(status, POLICY_EXIT_UNRELIABLE);
+    }
+}
+
+/// Flag-level coverage for the `scan` subcommand (issue #2882): parsing
+/// refusals, the witness/summary shape including the honest empty-catalog
+/// case, and the isolation of the flag surface. The zero-configuration run
+/// itself builds a workspace and lives in the workspace-level CLI suite.
+#[cfg(test)]
+mod scan_cli_tests {
+    use super::{
+        BuiltInPolicyCatalogManifest, built_in_policy_catalog, builtin_pack_witness_lines, run,
+        scan_activation_summary,
+    };
+
+    fn run_error(args: &[&str]) -> (String, bool) {
+        match run(args.iter().map(|argument| (*argument).to_string())) {
+            Err(error) => (error.message, error.policy_invocation),
+            Ok(_) => panic!("expected {args:?} to fail"),
+        }
+    }
+
+    fn empty_manifest() -> BuiltInPolicyCatalogManifest {
+        BuiltInPolicyCatalogManifest {
+            schema_version: 1,
+            packs: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_scan_failure_reports_through_the_policy_exit_contract() {
+        let (message, policy_invocation) = run_error(&["scan", "--format", "yaml"]);
+        assert!(message.contains("Invalid --format value"), "{message}");
+        assert!(
+            policy_invocation,
+            "a scan error is an unreliable policy run"
+        );
+    }
+
+    #[test]
+    fn scan_is_a_subcommand_only_in_the_first_position() {
+        // The flag surface is untouched: everywhere else `scan` and the
+        // scan-only listing flag remain unknown arguments, so no existing
+        // invocation can change behavior.
+        let (message, policy_invocation) = run_error(&["--root", "/tmp", "scan"]);
+        assert_eq!(message, "Unknown argument: scan");
+        assert!(!policy_invocation);
+        let (message, _) = run_error(&["--list-builtin-policies"]);
+        assert_eq!(message, "Unknown argument: --list-builtin-policies");
+    }
+
+    #[test]
+    fn scan_parsing_refuses_ambiguous_and_repeated_input() {
+        assert_eq!(
+            run_error(&["scan", "a", "b"]).0,
+            "scan accepts at most one project path"
+        );
+        assert_eq!(
+            run_error(&["scan", "--fail-on", "never", "--fail-on", "error"]).0,
+            "--fail-on may only be provided once"
+        );
+        let (message, _) = run_error(&["scan", "--policy-file", "p.rqlp"]);
+        assert!(
+            message.contains("Unknown scan argument: --policy-file"),
+            "explicit selection belongs to the flag surface, not to scan: {message}"
+        );
+        assert_eq!(
+            run_error(&["scan", "--format", "json", "--verbose"]).0,
+            "--verbose and --color are only valid with --format human"
+        );
+    }
+
+    #[test]
+    fn the_builtin_listing_answers_without_running_anything() {
+        for options in [
+            vec!["--list-builtin-policies", "some/path"],
+            vec!["--list-builtin-policies", "--format", "json"],
+            vec!["--list-builtin-policies", "--fail-on", "never"],
+            vec!["--list-builtin-policies", "--output", "out.json"],
+        ] {
+            let mut args = vec!["scan"];
+            args.extend(options.iter().copied());
+            assert_eq!(
+                run_error(&args).0,
+                "--list-builtin-policies cannot be combined with a project path or evaluation \
+                 options",
+                "{options:?} must be refused beside the listing"
+            );
+        }
+    }
+
+    #[test]
+    fn a_nonexistent_scan_path_is_refused_before_evaluation() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let missing = temp.path().join("absent");
+        let missing = missing.to_string_lossy().into_owned();
+        let (message, policy_invocation) = run_error(&["scan", &missing]);
+        assert!(
+            message.starts_with("scan path is not a directory:"),
+            "{message}"
+        );
+        assert!(policy_invocation);
+    }
+
+    #[test]
+    fn the_witness_records_an_empty_pack_set_honestly() {
+        let manifest = empty_manifest();
+        assert_eq!(
+            builtin_pack_witness_lines(&manifest, "0".repeat(64).as_str()),
+            vec![format!("builtin-policy-catalog sha256={}", "0".repeat(64))]
+        );
+        assert_eq!(
+            scan_activation_summary(&manifest),
+            "bifrost scan: this build ships no built-in policy packs; nothing was evaluated and \
+             there are no findings"
+        );
+    }
+
+    #[test]
+    fn the_witness_shares_the_version_line_shape_for_the_shipped_catalog() {
+        let catalog = built_in_policy_catalog().expect("valid built-in catalog");
+        let lines = builtin_pack_witness_lines(catalog.document(), catalog.digest());
+        assert_eq!(lines.len(), catalog.document().packs.len() + 1);
+        for (line, pack) in lines.iter().zip(&catalog.document().packs) {
+            assert_eq!(
+                line,
+                &format!(
+                    "builtin-policy-pack {}@{} policies={}",
+                    pack.id,
+                    pack.version,
+                    pack.policies.len()
+                )
+            );
+        }
+        assert_eq!(
+            lines.last().expect("digest line"),
+            &format!("builtin-policy-catalog sha256={}", catalog.digest())
+        );
+        let summary = scan_activation_summary(catalog.document());
+        assert!(
+            summary.starts_with("bifrost scan: activated ")
+                && summary.contains("built-in policy packs"),
+            "{summary}"
+        );
     }
 }

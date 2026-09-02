@@ -189,6 +189,7 @@ class Service {
         assert_eq!(value.types[0].definitions.len(), 1, "{value:#?}");
     }
 
+    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
     #[test]
     fn bounded_php_nominal_paths_resolve_alias_absolute_relative_and_allocation_forms() {
         let source = r#"<?php

@@ -11,8 +11,8 @@ use crate::analyzer::semantic_model::{
     Completeness, ExactArtifact, ExternalArtifactKind, ExternalArtifactPackProducer, HierarchyFact,
     HierarchyKind, Locator, MemberFact, MemberIdentity, MemberKind, Parameter, Producer,
     ProducerDiagnostic, ProducerDiagnosticSeverity, Signature, StructuredTypeExpression, TypeFact,
-    TypeIdentity, TypeKind, TypeRef, Visibility, carried_source_paths, member_declaration_id,
-    read_exact_artifact_while, type_declaration_id,
+    TypeIdentity, TypeKind, TypeRef, Visibility, carried_source_paths, is_canonical_relative_path,
+    member_declaration_id, read_exact_artifact_while, type_declaration_id,
 };
 use crate::analyzer::tree_sitter_analyzer::ParsedFile;
 use crate::analyzer::tree_walk::{first_named_child_of_kind, named_children};
@@ -245,7 +245,9 @@ impl KotlinSourceJarPackProducer {
             for name in parsed
                 .declarations()
                 .iter()
-                .filter(|unit| unit.is_class() || parsed.type_aliases.contains(*unit))
+                // A `typealias` is a `Class` unit like every other Kotlin type
+                // declaration (#2892), so the type namespace is one question.
+                .filter(|unit| unit.is_class())
                 .map(CodeUnit::fq_name)
                 .filter(|name| name.len() <= MAX_QUALIFIED_NAME_BYTES)
                 .take(available)
@@ -337,17 +339,19 @@ fn parse_entry(
         .expect("Kotlin language");
     let tree = parser.parse(source, None)?;
     if tree.root_node().has_error() {
-        diagnostics.warning(
+        diagnostics.warning_for_source_entry(
             "kotlin.source.parse",
             Some(name.to_owned()),
+            accountable_source_entry(name),
             "Kotlin source entry contains syntax unsupported by the pinned parser",
         );
         return None;
     }
     if !source_shape_within_limits(tree.root_node(), source) {
-        diagnostics.warning(
+        diagnostics.warning_for_source_entry(
             "kotlin.source.name_limit",
             Some(name.to_owned()),
+            accountable_source_entry(name),
             format!(
                 "Kotlin package, import, or declaration name exceeds {MAX_QUALIFIED_NAME_BYTES} bytes"
             ),
@@ -357,6 +361,11 @@ fn parse_entry(
     let file = ProjectFile::new(std::env::temp_dir(), "external.kt");
     let parsed = parse_kotlin_file(&file, source, &tree);
     Some((tree, parsed))
+}
+
+fn accountable_source_entry(name: &str) -> Option<String> {
+    (name.len() <= MAX_LOCATOR_PATH_BYTES && is_canonical_relative_path(name))
+        .then(|| name.to_owned())
 }
 
 fn source_shape_within_limits(root: Node<'_>, source: &str) -> bool {
@@ -454,11 +463,7 @@ fn entry_facts(
     {
         types.push(package_fact(entry, &parsed.package_name));
     }
-    for declaration in declarations
-        .iter()
-        .copied()
-        .filter(|unit| unit.is_class() || parsed.type_aliases.contains(*unit))
-    {
+    for declaration in declarations.iter().copied().filter(|unit| unit.is_class()) {
         let Some(visibility) = effective_visibility(tree, source, parsed, declaration, &parents)
         else {
             continue;
@@ -512,6 +517,7 @@ fn entry_facts(
                     })
                 })
                 .flatten(),
+            value_semantics: None,
             embedded_types: Vec::new(),
             hierarchy: parsed
                 .raw_supertypes
@@ -545,9 +551,10 @@ fn entry_facts(
     });
     let mut members = Vec::new();
     let mut cached_lexical_owners: Option<(usize, Vec<String>)> = None;
-    for declaration in declarations.into_iter().filter(|unit| {
-        (unit.is_function() || unit.is_field()) && !parsed.type_aliases.contains(*unit)
-    }) {
+    for declaration in declarations
+        .into_iter()
+        .filter(|unit| unit.is_function() || unit.is_field())
+    {
         if *remaining == 0 {
             *limit_hit = true;
             break;
@@ -693,6 +700,7 @@ fn entry_facts(
                 is_static,
                 is_abstract,
                 is_virtual: kind == MemberKind::Method && !is_static && explicitly_virtual,
+                implicit_operation: None,
                 callable_family_complete: false,
                 signature,
                 receiver: None,
@@ -726,6 +734,7 @@ fn package_fact(entry: &str, name: &str) -> TypeFact {
         type_parameters: Vec::new(),
         type_parameter_constraints: Vec::new(),
         underlying_type: None,
+        value_semantics: None,
         embedded_types: Vec::new(),
         hierarchy: Vec::new(),
         aliases: vec![KOTLIN_PACKAGE_MARKER.to_owned()],
@@ -858,6 +867,7 @@ fn signature(
                 }),
                 optional: parameter_is_optional(parameter_node),
                 variadic: parameter_is_variadic(parameter_node, source),
+                passing_mode: Default::default(),
             })
         })
         .collect();
@@ -1635,6 +1645,7 @@ fn failure(code: &str, message: &str, limits: &ArtifactProducerLimits) -> Artifa
     ArtifactProduction::failed(
         ProducerDiagnostic {
             severity: ProducerDiagnosticSeverity::Error,
+            source_entry: None,
             code: code.to_owned(),
             location: None,
             declaration: None,
@@ -1679,7 +1690,7 @@ fn finish(
         selector.artifact_sha256 = Some(digest.to_owned());
     }
     let (diagnostics, suppressed_diagnostics) = bounded.finish();
-    let completeness = if diagnostics.is_empty() && suppressed_diagnostics == 0 {
+    let completeness = if diagnostics.is_empty() && suppressed_diagnostics.total() == 0 {
         Completeness::Complete
     } else {
         Completeness::Partial
@@ -1725,7 +1736,8 @@ fn finish(
 mod tests {
     use super::*;
     use crate::analyzer::semantic_model::{
-        Compatibility, CompilerOptions, NameSelector, Provenance, Safety, compile_pack,
+        Compatibility, CompilerOptions, NameSelector, Provenance, Safety, SuppressedDiagnostics,
+        compile_pack,
     };
     use std::fs::File;
     use std::io::Write;
@@ -2012,6 +2024,33 @@ private fun hidden(): Unit = Unit
                 .diagnostics
                 .iter()
                 .any(|diagnostic| diagnostic.code == "kotlin.source.name_limit")
+        );
+    }
+
+    #[test]
+    fn parse_reject_carries_its_exact_artifact_source_entry() {
+        let mut diagnostics = BoundedProducerDiagnostics::new(&ArtifactProducerLimits::default());
+        assert!(
+            parse_entry(
+                "commonMain/kotlin/example.kt",
+                "class Example(",
+                &mut diagnostics
+            )
+            .is_none()
+        );
+        let (diagnostics, suppressed) = diagnostics.finish();
+
+        assert_eq!(suppressed, SuppressedDiagnostics::default());
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].code, "kotlin.source.parse");
+        assert_eq!(diagnostics[0].declaration, None);
+        assert_eq!(
+            diagnostics[0].location.as_deref(),
+            Some("commonMain/kotlin/example.kt")
+        );
+        assert_eq!(
+            diagnostics[0].source_entry.as_deref(),
+            Some("commonMain/kotlin/example.kt")
         );
     }
 

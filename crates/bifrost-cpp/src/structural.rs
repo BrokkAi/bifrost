@@ -44,6 +44,7 @@ pub const CPP_KIND_TABLE: &[(&str, NormalizedKind)] = &[
     ("struct_specifier", NormalizedKind::Class),
     ("union_specifier", NormalizedKind::Class),
     ("alias_declaration", NormalizedKind::Declaration),
+    ("namespace_definition", NormalizedKind::Module),
     ("assignment_expression", NormalizedKind::Assignment),
     ("init_declarator", NormalizedKind::Assignment),
     ("preproc_include", NormalizedKind::Import),
@@ -115,6 +116,19 @@ fn last_named_field_child<'tree>(node: Node<'tree>, field: &str) -> Option<Node<
     node.children_by_field_name(field, &mut cursor)
         .filter(|child| child.is_named())
         .last()
+}
+
+/// The declared name of a `namespace_definition`.
+///
+/// `namespace a::b { }` spells a `nested_namespace_specifier` that nests to
+/// the right, so the innermost specifier's last child is the terminal segment.
+/// An anonymous namespace has no `name` field at all and stays unnamed.
+fn namespace_name_node<'tree>(namespace: Node<'tree>) -> Option<Node<'tree>> {
+    let mut current = namespace.child_by_field_name("name")?;
+    while current.kind() == "nested_namespace_specifier" {
+        current = current.named_child(current.named_child_count().checked_sub(1)?)?;
+    }
+    Some(current)
 }
 
 fn declarator_name_node<'tree>(declarator: Node<'tree>) -> Option<Node<'tree>> {
@@ -470,6 +484,11 @@ impl StructuralSpec for CppStructuralSpec {
                     .child_by_field_name("declarator")
                     .and_then(declarator_name_node)
                 {
+                    sink.set_name(name);
+                }
+            }
+            NormalizedKind::Module => {
+                if let Some(name) = namespace_name_node(node) {
                     sink.set_name(name);
                 }
             }

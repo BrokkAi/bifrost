@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "pack_id": "bifrost.rust.getset",
   "version": "1.0.0",
   "producer": {

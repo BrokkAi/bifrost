@@ -48,7 +48,22 @@ use std::fmt;
 /// `declaration` subtype) and parameter decorator role edges (#2644).
 /// Version 12 adds JSX element/attribute facts, object-property facts, and
 /// structured tag, attribute, child, key, and value role edges (#2645).
-pub(crate) const STRUCTURAL_FACTS_VERSION: i64 = 12;
+/// Version 13 adds Rust `decorators` role edges from a declaration to the
+/// outer attributes written above it (#2518).
+/// Version 14 makes module and namespace declarations facts (`module`, a
+/// `declaration` subtype) in Rust, C#, C++, PHP, and Ruby, which also makes
+/// them containment parents of everything they enclose (#2518).
+/// Version 15 gives Scala occurrence-role classification, so Scala facts now
+/// carry per-node occurrence roles where version 14 carried none (#1597).
+/// Version 16 makes a Scala `type_definition` a class-kind fact, so a type
+/// alias's declaration name reports the type namespace instead of the value
+/// namespace it reported when the alias had no declaring fact (#2878).
+/// Version 17 does the same for Kotlin: a `type_alias` is a class-kind fact,
+/// and every Kotlin declaration name now carries the `declaration_name`
+/// occurrence role. The role was decided by a `name` AST field this grammar
+/// never spells, so version 16 reported every Kotlin class, object and function
+/// name as a plain value reference (#2892).
+pub(crate) const STRUCTURAL_FACTS_VERSION: i64 = 17;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StructuralFactsPersistenceError(String);
@@ -847,7 +862,7 @@ mod tests {
 
     #[test]
     fn relational_round_trip_reconstructs_identical_hot_facts() {
-        assert_eq!(STRUCTURAL_FACTS_VERSION, 12);
+        assert_eq!(STRUCTURAL_FACTS_VERSION, 17);
         let original = relational_fixture();
         let rows = original.persisted_rows().unwrap();
         assert_eq!(rows.source_bytes, original.source().len() as u32);

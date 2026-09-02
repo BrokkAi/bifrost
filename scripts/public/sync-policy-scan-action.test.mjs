@@ -248,16 +248,17 @@ test("the canonical action description fits the Marketplace limit", () => {
   );
 });
 
-test("the analyzer cache separates runner architectures and Bifrost versions", () => {
+test("the analyzer cache separates runner architectures, versions, and exact builds", () => {
   const action = fs.readFileSync(".github/actions/policy-scan/action.yml", "utf8");
   assert.match(
     action,
-    /key: bifrost-policy-cache-\$\{\{ runner\.os \}\}-\$\{\{ runner\.arch \}\}-\$\{\{ inputs\.version \}\}-\$\{\{ github\.run_id \}\}/u,
+    /identity=\$\("\$\{BIFROST_BIN\}" --build-identity\)/u,
   );
   assert.match(
     action,
-    /restore-keys: \|\n\s+bifrost-policy-cache-\$\{\{ runner\.os \}\}-\$\{\{ runner\.arch \}\}-\$\{\{ inputs\.version \}\}-/u,
+    /key: bifrost-policy-cache-\$\{\{ runner\.os \}\}-\$\{\{ runner\.arch \}\}-\$\{\{ inputs\.version \}\}-\$\{\{ steps\.analyzer-cache-identity\.outputs\.value \}\}/u,
   );
+  assert.doesNotMatch(action, /restore-keys:/u);
 });
 
 function gateScript() {

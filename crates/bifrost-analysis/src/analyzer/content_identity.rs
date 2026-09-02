@@ -123,6 +123,7 @@ impl WorkspaceContentIdentities {
     }
 
     /// The identity of exactly one language's analyzed file set.
+    #[cfg(test)]
     pub(crate) fn language(&self, language: Language) -> Option<WorkspaceContentIdentity> {
         self.scope(|candidate| candidate == language)
     }
@@ -150,7 +151,10 @@ impl WorkspaceContentIdentities {
         })
     }
 
-    #[cfg(test)]
+    /// The per-language digests this analyzer published, unfolded.
+    ///
+    /// A composite folds its delegates' entries once, at its own boundary, so
+    /// one fold means the same thing wherever a scope identity is produced.
     pub(crate) fn entries(&self) -> &[(Language, StableDigest)] {
         &self.entries
     }

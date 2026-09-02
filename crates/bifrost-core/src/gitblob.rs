@@ -445,6 +445,10 @@ pub struct WorkingTreeIdentity {
     tracked: HashMap<String, TrackedIdentity>,
     dirty: HashSet<String>,
     verified_clean_paths: Mutex<HashSet<String>>,
+    /// Paths a long-lived caller explicitly reported as changed after this
+    /// identity was captured. Their current bytes must be hashed even when an
+    /// editor or checkout preserved the size and mtime recorded in the index.
+    invalidated_paths: Mutex<HashSet<String>>,
 }
 
 /// A working-tree OID paired with the filesystem observation used to resolve
@@ -463,6 +467,19 @@ struct TrackedIdentity {
 }
 
 impl WorkingTreeIdentity {
+    /// Stop serving this snapshot's index identity for explicitly changed paths.
+    ///
+    /// Invalidations last for the lifetime of this repository-wide snapshot.
+    /// A later resolution hashes the visible bytes for these paths; replacing
+    /// the snapshot after a full refresh makes the current Git index eligible
+    /// again. Unnamed paths retain the clean-index fast path.
+    pub fn invalidate_paths(&self, rel_paths: impl IntoIterator<Item = String>) {
+        self.invalidated_paths
+            .lock()
+            .expect("working-tree identity invalidation mutex poisoned")
+            .extend(rel_paths);
+    }
+
     /// Index OID for `rel` when the file at `abs_path` still carries the
     /// bytes Git recorded: the path was clean at scan time and its current
     /// size and mtime match the index entry's cached stat. Dirty, untracked,
@@ -586,6 +603,14 @@ impl WorkingTreeIdentity {
     /// the path clean and the file still carries the recorded stat. One
     /// `metadata` call serves both callers above.
     fn stat_clean_entry(&self, rel: &str, abs_path: &Path) -> Option<(&TrackedIdentity, Metadata)> {
+        if self
+            .invalidated_paths
+            .lock()
+            .expect("working-tree identity invalidation mutex poisoned")
+            .contains(rel)
+        {
+            return None;
+        }
         if self.dirty.contains(rel) {
             return None;
         }
@@ -667,6 +692,7 @@ pub fn working_tree_identity(repo: &Repository) -> Result<WorkingTreeIdentity> {
         tracked,
         dirty,
         verified_clean_paths: Mutex::new(HashSet::new()),
+        invalidated_paths: Mutex::new(HashSet::new()),
     })
 }
 
@@ -1859,6 +1885,39 @@ mod tests {
             hash_calls(),
             2,
             "only dirty and untracked files should read visible bytes"
+        );
+    }
+
+    #[test]
+    fn invalidating_one_path_retains_other_clean_index_identities() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let repo = init_repo(temp.path());
+        std::fs::write(temp.path().join("changed.txt"), "before!\n").unwrap();
+        std::fs::write(temp.path().join("untouched.txt"), "stable\n").unwrap();
+        commit_all(&repo, "init");
+
+        let identity = working_tree_identity(&repo).unwrap();
+        identity.invalidate_paths(["changed.txt".to_string()]);
+        reset_hash_calls();
+        let resolved = identity
+            .resolve_with_metadata(
+                &repo,
+                &["changed.txt".to_string(), "untouched.txt".to_string()],
+            )
+            .unwrap();
+
+        assert_eq!(
+            resolved["changed.txt"].oid,
+            Oid::hash_object(ObjectType::Blob, b"before!\n").unwrap()
+        );
+        assert_eq!(
+            resolved["untouched.txt"].oid,
+            Oid::hash_object(ObjectType::Blob, b"stable\n").unwrap()
+        );
+        assert_eq!(
+            hash_calls(),
+            1,
+            "only the explicitly invalidated path should leave the index fast path"
         );
     }
 

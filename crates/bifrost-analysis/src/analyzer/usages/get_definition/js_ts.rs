@@ -4,8 +4,9 @@ use crate::analyzer::js_ts::providers::resolve_js_ts_source;
 use crate::analyzer::usages::js_ts_graph::{
     browser_global_property_shape, unbound_browser_global_property,
 };
+use crate::navigation::NavigationOperation;
 use brokk_bifrost_js_ts::imports::{
-    npm_package_of_module_specifier, require_call_module_specifier,
+    js_ts_module_identity, js_ts_module_specifier_probed_paths, require_call_module_specifier,
     resolve_js_ts_direct_import_candidates, resolve_js_ts_module_binding_candidates,
 };
 use brokk_bifrost_js_ts::providers::JsTsSource;
@@ -319,9 +320,10 @@ fn js_ts_alias_preference(unit: &CodeUnit) -> (usize, String) {
 ///
 /// Every admitted fact comes from the tree-sitter import binder, lexical
 /// binding index, and call-expression fields. The local callee spelling is not
-/// an identity: the returned proof names the import's module specifier and
-/// imported symbol, and only when the import is the one unshadowed,
-/// unreassigned program binding at this call site.
+/// an identity: the returned proof names the import's module specifier in its
+/// canonical spelling -- `node:child_process` and `child_process` are one
+/// module (#2609) -- and its imported symbol, and only when the import is the
+/// one unshadowed, unreassigned program binding at this call site.
 pub(super) fn exact_direct_named_import_call(
     source: &str,
     tree: &Tree,
@@ -352,7 +354,7 @@ pub(super) fn exact_direct_named_import_call(
         return None;
     }
     let imported_name = binding.imported_name.as_deref()?;
-    npm_package_of_module_specifier(&binding.module_specifier)?;
+    let module = js_ts_module_identity(&binding.module_specifier)?;
 
     let lexical_bindings = JsTsLexicalBindingIndex::build(root, source);
     if !lexical_bindings.is_program_binding_at(local_name, callee.start_byte(), root)
@@ -372,7 +374,7 @@ pub(super) fn exact_direct_named_import_call(
         u32::try_from(arguments.named_children(&mut cursor).count()).ok()?
     };
     Some(ExactExternalCallProof::js_ts_direct_named_import(
-        &binding.module_specifier,
+        module.specifier,
         imported_name,
         parameter_count,
     ))
@@ -632,6 +634,32 @@ pub(super) fn resolve_js_ts(
             value_position,
             before_byte: site.range.start_byte,
         };
+        if language == Language::TypeScript
+            && context.navigation_operation == Some(NavigationOperation::Definition)
+            && !imported_receiver_binding
+        {
+            let declared_receivers = ts_local_annotation_receiver_owners(
+                &dotted_lookup,
+                imports,
+                aliases,
+                &lexical_bindings,
+                site.focus_start_byte,
+            );
+            let mut declared_finds = JsTsMemberFinds::default();
+            let declared_members = ts_member_candidates(
+                analyzer,
+                host,
+                support,
+                declared_receivers,
+                name,
+                value_position,
+                &mut declared_finds,
+            );
+            if !declared_members.is_empty() {
+                declared_finds.stage();
+                return js_ts_candidates_outcome(analyzer, declared_members);
+            }
+        }
         let lexical_receiver_candidates = if imported_receiver_binding {
             Vec::new()
         } else {
@@ -1324,6 +1352,13 @@ fn resolve_js_ts_visible_namespace_bindings(
                 aliases,
             );
             if files.is_empty() {
+                record_unresolved_module_specifier(
+                    analyzer,
+                    file,
+                    language,
+                    &binding.module_specifier,
+                    aliases,
+                );
                 return gated_boundary(
                     || !is_bare_js_ts_specifier(&binding.module_specifier),
                     format!(
@@ -1638,6 +1673,32 @@ fn ts_global_object_receiver_type(receiver: &str) -> Option<&'static str> {
     }
 }
 
+/// Record the workspace paths one module specifier probed and did not find.
+///
+/// A specifier that resolves to a file makes the reader open it, and the file
+/// key names what it read. A specifier that resolves to nothing makes the
+/// reader return with no key at all, and yet the answer is about the
+/// workspace: the sibling could be added in the next commit. Naming each
+/// probed path is the exact form of that dependency -- one key per path the
+/// resolver stat'ed -- and the head answers it from its own path map.
+fn record_unresolved_module_specifier(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    language: Language,
+    module: &str,
+    aliases: Option<&AliasResolver>,
+) {
+    if !analyzer.read_ledger_attached() {
+        return;
+    }
+    for candidate in js_ts_module_specifier_probed_paths(file, module, language, aliases) {
+        analyzer.record_read(ReadKey::path_absent(
+            language,
+            rel_path_string(&candidate).as_str(),
+        ));
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn resolve_js_ts_module_binding(
     file: &ProjectFile,
@@ -1652,6 +1713,7 @@ fn resolve_js_ts_module_binding(
 ) -> DefinitionLookupOutcome {
     let files = crate::analyzer::resolve_js_ts_module_specifier(file, module, language, aliases);
     if files.is_empty() {
+        record_unresolved_module_specifier(analyzer, file, language, module, aliases);
         // Only a bare specifier (`react`, `lodash`) is a confident external
         // package boundary. A relative/absolute specifier (`./`, `../`, `/`)
         // that resolves to no file is an in-workspace path that did not land —
@@ -3269,6 +3331,61 @@ fn ts_local_receiver_owner_candidates(
         receiver,
         site.focus_start_byte,
     )
+}
+
+/// Exact dispatch follows runtime value evidence, but an explicit TypeScript
+/// annotation is the declaration users expect definition navigation to open.
+/// Prefer that declared owner until a later write invalidates it.
+fn ts_local_annotation_receiver_owners(
+    lookup: &JstsDottedLookup<'_, '_>,
+    imports: &JsTsImportBinder,
+    aliases: &AliasResolver,
+    lexical_bindings: &JsTsLexicalBindingIndex,
+    focus_start_byte: usize,
+) -> Vec<CodeUnit> {
+    if lexical_bindings.is_binding_reassigned_before_at(lookup.receiver, focus_start_byte) {
+        return Vec::new();
+    }
+    let mut owners = Vec::new();
+    for binding_range in
+        lexical_bindings.binding_identifier_ranges_at(lookup.receiver, focus_start_byte)
+    {
+        let Some(mut node) = smallest_named_node_covering(
+            lookup.root,
+            binding_range.start_byte,
+            binding_range.end_byte,
+        ) else {
+            continue;
+        };
+        loop {
+            if node.kind() == "variable_declarator" {
+                if let Some(type_node) = node.child_by_field_name("type")
+                    && let Some(resolved) = ts_resolve_type_node_to_property_owner_outcome(
+                        lookup.host,
+                        lookup.support,
+                        lookup.file,
+                        lookup.source,
+                        imports,
+                        aliases,
+                        type_node,
+                        0,
+                        ReceiverAnalysisBudget::default(),
+                    )
+                    .into_precise()
+                {
+                    owners.extend(resolved);
+                }
+                break;
+            }
+            let Some(parent) = node.parent() else {
+                break;
+            };
+            node = parent;
+        }
+    }
+    sort_units(&mut owners);
+    owners.dedup();
+    owners
 }
 
 /// Resolve a parameter receiver's annotation directly from its structured AST

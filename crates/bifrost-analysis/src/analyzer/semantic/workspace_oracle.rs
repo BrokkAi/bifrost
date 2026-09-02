@@ -15,11 +15,16 @@ pub(super) use dispatch::{
 pub(crate) use dispatch::{
     exact_source_for_procedure, external_constant_field_read_discharges_gap,
 };
-// Policy lowering resolves authored source ranges to procedures through these
-// two, so they are public where the rest of dispatch stays crate-internal.
-pub use dispatch::{ProcedureRangeLookupStatus, procedures_for_source_ranges};
+// Policy lowering resolves authored source ranges to procedures through these,
+// so they are public where the rest of dispatch stays crate-internal.
+pub use dispatch::{
+    ProcedureRangeLookupStatus, procedures_for_source_ranges, procedures_in_artifact,
+};
 #[doc(hidden)]
 pub use source::PreparedSourceDispatchSession;
+// Read-set verification replays dispatch on the head workspace and must fold
+// the answer with the same helper the recording used, never a second copy.
+pub(crate) use source::dispatch_answer_digest;
 pub use source::{SourceDispatchObservation, SourceDispatchResult, SourcePointsToResult};
 // The value-flow plan re-applies these relevance rules when it decides
 // whether a snapshot's residual openness was refined by its own complete

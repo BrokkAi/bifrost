@@ -47,9 +47,15 @@ const SOURCE_BYTES_PER_SCALED_FACT_NODE: u64 = 6;
 const SCALED_SCAN_HEADROOM: u64 = 2;
 // Semantic source work is charged for every exact source-backed semantic
 // request, so it is not the same quantity as the structural workspace scan.
-// Keep its calibration independent: a corpus measurement may raise this lane
-// without also widening structural scans or semantic graph traversal.
-const SCALED_SEMANTIC_SOURCE_WORK_PER_SOURCE_BYTE: u64 = 2;
+// Restic's Go nilness runs over approximately 2.37 MiB of audited source first
+// exhausted the 16 MiB floor, then exhausted 37,952,912- and 75,905,824-byte
+// scaled grants after reaching the accepted production row. The latter
+// establishes a lower bound of 32 work bytes per source byte. Sixty-four per
+// source byte is the bounded corpus calibration: it retains that row, while a
+// final replay also consumes the lane and honestly reports partial discovery.
+// Do not keep widening a demand-filling lane here; issue #2771 owns the
+// remaining whole-workspace work reduction.
+const SCALED_SEMANTIC_SOURCE_WORK_PER_SOURCE_BYTE: u64 = 64;
 const MAX_SEMANTIC_MATERIALIZED_FILES: usize = 256;
 const MAX_SEMANTIC_SOURCE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_SEMANTIC_ROWS_PER_DIMENSION: usize = 1_000_000;
@@ -110,36 +116,41 @@ const MAX_SEMANTIC_TRAVERSAL_STEPS_HARD_CAP: usize = 16 * MAX_SEMANTIC_TRAVERSAL
 // the grant itself stays one uniform quantity, which is what the measurement
 // above calibrates.
 //
-// The peak measured 9,187,328 rows, 0.79 rows per source byte.  Three rows per
-// two source bytes is 1.9x that, matching the ~1.8x headroom of the
-// `SOURCE_BYTES_PER_SCALED_FACT_NODE` precedent.  That precedent's divisor form
-// cannot express this density: Java runs to more than one row per source byte,
-// and the smallest whole divisor, 1, would leave only 1.27x.
+// The Java peak measured 9,187,328 rows, 0.79 rows per source byte. A later
+// production Go nilness run over Ghostferry measured a stricter lower bound:
+// its 735,750-byte workspace exhausted 1,103,625 rows (exactly 1.5 rows per
+// byte) before materialization completed. The row lane retains transient
+// traversal as well as artifact rows, so that exhausted value is only a lower
+// bound, not a complete density measurement. Three rows per source byte gives
+// the Go lower bound approximately 2x headroom. It remains independently
+// memory-bounded by retained bytes.
 //
-// On this corpus the requested 17,449,819 rows clamps to the 16,000,000 hard
-// cap, so the realized headroom over the measurement is 1.74x rather than 1.9x.
-// Anything denser than 1.38 rows per source byte clamps here, so the constant's
-// value only distinguishes other workspace sizes.
+// OWASP BenchmarkJava requests 34,899,639 rows under this density and therefore
+// retains the existing 16,000,000 hard cap, still 1.74x its measured peak.
 const SCALED_SEMANTIC_ROWS_PER_SOURCE_BYTES: u64 = 3;
-const SCALED_SEMANTIC_ROW_SOURCE_BYTES: u64 = 2;
+const SCALED_SEMANTIC_ROW_SOURCE_BYTES: u64 = 1;
 
-// The retention lane peaked at 159,599,751 owned text bytes, 13.7 per source
-// byte.  Owned text is dominated by locator paths and declaration segment names,
-// which repeat per procedure, memory location, call target, and source mapping.
-// 25 per source byte was 1.82x that measurement. The #2523 floor raise
-// (64 -> 256 MiB) moved the #1936 ratio model this density must dominate:
-// in the 2x-headroom regime the ratio slope is 2 * floor / 16 MiB = 32 per
-// source byte, so the density rises to match it, 2.33x the measurement and
-// still an only-raises change for every workspace.
-const SCALED_SEMANTIC_RETAINED_BYTES_PER_SOURCE_BYTE: u64 = 32;
+// The Java retention lane peaked at 159,599,751 owned text bytes, 13.7 per
+// source byte. Owned text is dominated by locator paths and declaration segment
+// names, which repeat per procedure, memory location, call target, and source
+// mapping. Restic Go nilness runs over 2,368,675 source bytes first exhausted
+// the 256 MiB floor and then a 540,057,900-byte scaled grant before producing
+// query rows. The latter establishes a stricter lower bound of 228 retained
+// bytes per source byte. Granting 456 bytes per source byte gives that measured
+// lower bound 2x headroom. The lane remains capped at 16 times its fixed floor
+// and this is an only-raises change for every workspace.
+const SCALED_SEMANTIC_RETAINED_BYTES_PER_SOURCE_BYTE: u64 = 456;
 
-// The traversal lane is deliberately not recalibrated.  It peaked at 386,156
-// steps, which its own fixed default of 1,000,000 already admits with 2.6x
-// headroom and its #1936 scaled value of 1,386,787 with 3.6x.  A measured
-// density for it (1 step per 30.1 source bytes, 1 per 15 with headroom) would
-// compute 775,547 here and therefore LOWER the lane to its floor.  Every budget
-// change in this area must only raise, because lowering a lane can turn a
-// decision into an abstention on a workspace that is not the one measured.
+// The Java traversal lane peaked at 386,156 steps, or one per 30.1 source
+// bytes, and remained below the fixed 1,000,000-step floor. Restic's Go
+// nilness run later exhausted that floor over 2,368,675 source bytes before
+// reaching its accepted production result-contract row. That establishes a
+// stricter lower bound of 0.42 steps per source byte. One step per source byte
+// gives that lower bound 2.37x headroom and only raises the lane. The final
+// candidate-filtered replay reaches this scaled lane after retaining the row,
+// so it remains an intentional bounded terminal pending #2771 rather than an
+// exhaustive whole-workspace grant.
+const SCALED_SEMANTIC_TRAVERSAL_STEPS_PER_SOURCE_BYTE: u64 = 1;
 
 const MAX_FINDINGS: usize = 1_000;
 
@@ -325,12 +336,8 @@ impl PolicyBudget {
     /// for one interactive query (#1936).  Semantic source work has a separate
     /// multiplier because one source file can be read by multiple exact
     /// semantic requests.  The row and retention lanes take their own measured
-    /// densities per source byte, from a corpus-scale run on OWASP BenchmarkJava;
-    /// see the constants above for the measurement and the headroom.  The
-    /// traversal lane keeps the historic 2x workspace-volume ratio from #1936,
-    /// independent of the semantic source-work multiplier: its measured peak
-    /// sits below even its fixed default, so a measured density would only lower
-    /// it.
+    /// densities per source byte, from corpus-scale Java and Go runs; see the
+    /// constants above for the measurements and headroom.
     ///
     /// The findings lane follows the audited file count for the same reason
     /// (#2471): it is one request's total output cap, so a fixed value makes a
@@ -395,26 +402,9 @@ impl PolicyBudget {
             .max_retained_bytes
             .max(scaled_semantic_retained_bytes)
             .min(MAX_SEMANTIC_RETAINED_BYTES_HARD_CAP);
-        // The traversal lane keeps #1936's historic 2x workspace-volume basis,
-        // not the semantic source-work lane.  This is how many default semantic
-        // byte budgets that basis spans, multiplied before dividing so a corpus
-        // between one and two budgets does not floor to 1.  Clamp the source
-        // basis to the semantic byte range so the ratio stays between 1 and 16,
-        // the u128 product cannot overflow, and the result respects the hard
-        // cap.  A future source-work calibration therefore cannot silently
-        // increase graph traversal.
-        let traversal_source_basis = scaled_scan_source_bytes.clamp(
-            MAX_SEMANTIC_SOURCE_BYTES,
-            MAX_SEMANTIC_SOURCE_BYTES_HARD_CAP,
+        let scaled_traversal_steps = saturating_usize(
+            total_source_bytes.saturating_mul(SCALED_SEMANTIC_TRAVERSAL_STEPS_PER_SOURCE_BYTE),
         );
-        let scaled_traversal_steps = {
-            let scaled = (MAX_SEMANTIC_TRAVERSAL_STEPS as u128)
-                .saturating_mul(traversal_source_basis as u128)
-                / (MAX_SEMANTIC_SOURCE_BYTES as u128);
-            usize::try_from(scaled)
-                .unwrap_or(usize::MAX)
-                .max(MAX_SEMANTIC_TRAVERSAL_STEPS)
-        };
         self.query.semantic.max_traversal_steps = self
             .query
             .semantic
@@ -1393,25 +1383,60 @@ mod tests {
         assert_eq!(query.max_scanned_source_bytes, MAX_SCANNED_SOURCE_BYTES);
         assert_eq!(query.max_scanned_files, MAX_SCANNED_FILES);
         assert_eq!(query.max_pipeline_rows, MAX_PIPELINE_ROWS);
-        // Four of the five semantic lanes stay at their defaults: 1MiB of source
-        // is below every one of those floors.
+        // Only the semantic file lane stays at its default: 1MiB of source is
+        // below that floor.
         let semantic = query.semantic;
         let default = CodeQuerySemanticLimits::default();
         assert_eq!(
             semantic.max_materialized_files,
             default.max_materialized_files
         );
-        assert_eq!(semantic.max_source_bytes, default.max_source_bytes);
-        assert_eq!(semantic.max_retained_bytes, default.max_retained_bytes);
-        assert_eq!(semantic.max_traversal_steps, default.max_traversal_steps);
-        // The row lane does rise, and this is the measurement changing the
-        // answer rather than the scaling overreaching.  The fixed 1,000,000
-        // default was set for one interactive query; the measured density of a
-        // Java taint compile is 0.79 rows per source byte, so 1MiB of source
-        // already charges ~828,000 rows and the default leaves only 1.2x.  At
-        // 1.5 rows per source byte the lane is 1,572,864 here.
-        assert_eq!(semantic.max_rows_per_dimension, 1024 * 1024 * 3 / 2);
+        // The row, retention, and traversal lanes rise. These are measured
+        // densities, not the ratio model overreaching.
+        assert_eq!(semantic.max_rows_per_dimension, 1024 * 1024 * 3);
         assert!(semantic.max_rows_per_dimension > default.max_rows_per_dimension);
+        assert_eq!(semantic.max_retained_bytes, 1024 * 1024 * 456);
+        assert!(semantic.max_retained_bytes > default.max_retained_bytes);
+        assert_eq!(semantic.max_traversal_steps, 1024 * 1024);
+        assert!(semantic.max_traversal_steps > default.max_traversal_steps);
+        assert_eq!(semantic.max_source_bytes, 64 * 1024 * 1024);
+        assert!(semantic.max_source_bytes > default.max_source_bytes);
+    }
+
+    #[test]
+    fn go_whole_workspace_semantics_has_headroom_over_the_measured_lower_bound() {
+        let semantic = PolicyBudget::default()
+            .scaled_for_workspace(735_750, 94)
+            .query_limits()
+            .semantic;
+        assert_eq!(semantic.max_rows_per_dimension, 2_207_250);
+        assert!(
+            semantic.max_rows_per_dimension > 1_103_625,
+            "the Ghostferry run exhausted this lower bound before completion"
+        );
+    }
+
+    #[test]
+    fn restic_whole_workspace_retention_has_headroom_over_the_measured_lower_bound() {
+        let semantic = PolicyBudget::default()
+            .scaled_for_workspace(2_368_675, 538)
+            .query_limits()
+            .semantic;
+        assert_eq!(semantic.max_retained_bytes, 1_080_115_800);
+        assert!(
+            semantic.max_retained_bytes >= 2 * 540_057_900,
+            "the Restic run exhausted the prior scaled retained-artifact grant before producing rows"
+        );
+        assert_eq!(semantic.max_traversal_steps, 2_368_675);
+        assert!(
+            semantic.max_traversal_steps > 2 * MAX_SEMANTIC_TRAVERSAL_STEPS,
+            "the Restic run exhausted the traversal floor before reaching its accepted result row"
+        );
+        assert_eq!(semantic.max_source_bytes, 151_595_200);
+        assert!(
+            semantic.max_source_bytes >= 2 * 75_797_600,
+            "the Restic run exhausted the prior semantic source-work grant after reaching its accepted result row"
+        );
     }
 
     #[test]
@@ -1426,30 +1451,23 @@ mod tests {
         assert!(semantic.max_materialized_files > MAX_SEMANTIC_MATERIALIZED_FILES);
         assert_eq!(
             semantic.max_source_bytes,
-            40_000_000 * SCALED_SEMANTIC_SOURCE_WORK_PER_SOURCE_BYTE as usize
+            MAX_SEMANTIC_SOURCE_BYTES_HARD_CAP
         );
         assert!(semantic.max_source_bytes > MAX_SEMANTIC_SOURCE_BYTES);
         // The row and retention lanes take their calibrated densities (the
-        // row lane clamps: 40MB of source at 1.5 rows per byte exceeds its
-        // hard cap; the retention lane's density is the ratio-model-dominating
-        // value derived at its constant).
+        // row and retention lanes clamp because their calibrated densities
+        // exceed the respective hard caps at this workspace size.
         assert_eq!(
             semantic.max_rows_per_dimension,
             MAX_SEMANTIC_ROWS_PER_DIMENSION_HARD_CAP
         );
         assert_eq!(
             semantic.max_retained_bytes,
-            40_000_000 * SCALED_SEMANTIC_RETAINED_BYTES_PER_SOURCE_BYTE as usize
+            MAX_SEMANTIC_RETAINED_BYTES_HARD_CAP
         );
-        assert!(semantic.max_retained_bytes < MAX_SEMANTIC_RETAINED_BYTES_HARD_CAP);
-        // The traversal lane keeps the historic 2x workspace-volume ratio,
-        // independent of the semantic source-work multiplier.  Flooring the
-        // ratio to whole default byte budgets left the first real corpus run
-        // (ratio 1.38) at its floor, and every category abstained (#1936).
         assert_eq!(
             semantic.max_traversal_steps,
-            (MAX_SEMANTIC_TRAVERSAL_STEPS as u128 * (40_000_000 * SCALED_SCAN_HEADROOM) as u128
-                / MAX_SEMANTIC_SOURCE_BYTES as u128) as usize
+            MAX_SEMANTIC_TRAVERSAL_STEPS_HARD_CAP
         );
 
         // The measured corpus itself: OWASP BenchmarkJava at 007786f86, 2770
@@ -1460,7 +1478,7 @@ mod tests {
         let corpus_semantic = corpus.query_limits().semantic;
         assert_eq!(
             corpus_semantic.max_rows_per_dimension, MAX_SEMANTIC_ROWS_PER_DIMENSION_HARD_CAP,
-            "1.5 rows per source byte requests 17_449_819 and clamps"
+            "3 rows per source byte requests 34_899_639 and clamps"
         );
         assert!(
             corpus_semantic.max_rows_per_dimension >= 9_187_328,
@@ -1468,8 +1486,8 @@ mod tests {
             corpus_semantic.max_rows_per_dimension
         );
         assert_eq!(
-            corpus_semantic.max_retained_bytes,
-            11_633_213 * SCALED_SEMANTIC_RETAINED_BYTES_PER_SOURCE_BYTE as usize
+            corpus_semantic.max_retained_bytes, MAX_SEMANTIC_RETAINED_BYTES_HARD_CAP,
+            "456 retained bytes per source byte requests 5_304_745_128 and clamps"
         );
         assert!(
             corpus_semantic.max_retained_bytes >= 159_599_751,

@@ -4,45 +4,49 @@
   :name "Expensive operation inside nested loops"
   :message "Review whether this lexically nested operation repeats across both loops"
   :severity note
-  :description "This operation is lexically nested under two loops. The structural prompt also includes deferred nested bodies; verify execution before hoisting invariants, batching work, or reducing the iteration space."
+  :description "This operation is lexically nested under two loops. The structural prompt also includes deferred nested bodies; verify execution before hoisting invariants, batching work, or reducing the iteration space. The prompt is withdrawn when the inner for-each loop's iterated expression provably resolves to a collection literal with at most eight elements, because a fixed small inner dimension makes the work linear in the outer loop rather than multiplicative; the proof covers declarator-established bindings (JS/TS const/let/var, Rust let, Java locals), so field-, assignment-, or call-produced iterables still report."
   :help-uri "https://bifrost.brokk.ai/static-analysis-policies/#built-in-code-smell-pack"
   :tags ["performance" "nested-loop" "io" "code-smell"]
   :analysis
     (analysis
-      :type match
-      :selector
+      :type assertion
+      :subject
         (rql
           :schema-version 1
           (union
             (language python
               (loop
                 (has
-                  (loop
+                  (loop :capture "region"
                     (has
-                      (call :callee (name "open")))))))
+                      (call :callee (name "open") :capture "smell"))))))
             (language java
               (loop
                 (has
-                  (loop
+                  (loop :capture "region"
                     (has
-                      (call :callee (name "readAllBytes")))))))
+                      (call :callee (name "readAllBytes") :capture "smell"))))))
             (language javascript
               (loop
                 (has
-                  (loop
+                  (loop :capture "region"
                     (has
-                      (call :callee (name "fetch")))))))
+                      (call :callee (name "fetch") :capture "smell"))))))
             (language typescript
               (loop
                 (has
-                  (loop
+                  (loop :capture "region"
                     (has
-                      (call :callee (name "parse")))))))
+                      (call :callee (name "parse") :capture "smell"))))))
             (language rust
               (loop
                 (has
-                  (loop
+                  (loop :capture "region"
                     (has
                       (call
                         :receiver (name "fs")
-                        :callee (name/regex "^(read|read_to_string)$")))))))))))
+                        :callee (name/regex "^(read|read_to_string)$") :capture "smell"))))))))
+      :asserts [
+        (assert-origin-shape :id small-literal-iterable :at "region" :anchor "smell"
+                             :role value_reference :shape collection-literal :max-elements 8)
+      ]))

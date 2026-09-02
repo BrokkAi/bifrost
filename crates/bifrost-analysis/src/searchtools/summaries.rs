@@ -144,6 +144,10 @@ pub struct MostRelevantFile {
 #[derive(Debug, Clone, Serialize)]
 pub struct MostRelevantFilesResult {
     pub files: Vec<MostRelevantFile>,
+    /// Present only when this session covers an explicitly named subset of the
+    /// workspace, in which case the ranking drew from that many files (#2770).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_subset: Option<SubsetCoverage>,
     pub not_found: Vec<NotFoundInput>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub ambiguous_paths: Vec<AmbiguousPathInput>,
@@ -1157,6 +1161,7 @@ pub fn most_relevant_files_with_cancellation(
     if !duplicates.is_empty() {
         return Ok(MostRelevantFilesResult {
             files: Vec::new(),
+            session_subset: session_subset(analyzer),
             not_found,
             ambiguous_paths,
             duplicates,
@@ -1231,6 +1236,7 @@ pub fn most_relevant_files_with_cancellation(
 
     Ok(MostRelevantFilesResult {
         files,
+        session_subset: session_subset(analyzer),
         not_found,
         ambiguous_paths,
         duplicates,
@@ -1286,6 +1292,7 @@ pub fn most_relevant_files_history_only(
     if !duplicates.is_empty() {
         return Ok(MostRelevantFilesResult {
             files: Vec::new(),
+            session_subset: session_subset(analyzer),
             not_found,
             ambiguous_paths,
             duplicates,
@@ -1322,6 +1329,7 @@ pub fn most_relevant_files_history_only(
 
     Ok(MostRelevantFilesResult {
         files,
+        session_subset: session_subset(analyzer),
         not_found,
         ambiguous_paths,
         duplicates,

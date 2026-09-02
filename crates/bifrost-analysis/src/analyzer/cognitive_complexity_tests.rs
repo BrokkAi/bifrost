@@ -89,11 +89,13 @@ fn java_score(method_body: &str, identifier: &str) -> u32 {
     score(&[(JAVA_FILE, source.as_str())], JAVA_FILE, identifier)
 }
 
+#[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
 #[test]
 fn java_simple_method_is_zero() {
     assert_eq!(java_score("    public void method() {}", "method"), 0);
 }
 
+#[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
 #[test]
 fn java_if_increment_is_one() {
     let body = "    public void method(boolean a) {\n        \
@@ -101,6 +103,7 @@ fn java_if_increment_is_one() {
     assert_eq!(java_score(body, "method"), 1);
 }
 
+#[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
 #[test]
 fn java_nested_if_picks_up_nesting() {
     let body = "    public void method(boolean a, boolean b) {\n        \
@@ -112,6 +115,7 @@ fn java_nested_if_picks_up_nesting() {
     assert_eq!(java_score(body, "method"), 3);
 }
 
+#[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
 #[test]
 fn java_else_if_flattens() {
     let body = "    public void method(int x) {\n        \
@@ -154,6 +158,7 @@ fn java_boolean_operator_sequences_count_distinct_runs() {
     assert_eq!(java_score(body, "method"), 3);
 }
 
+#[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
 #[test]
 fn java_labeled_break_and_continue_count_extra() {
     let body = "    public void method(boolean a) {\n        \
@@ -181,6 +186,7 @@ fn java_unlabeled_break_and_continue_are_free() {
     assert_eq!(java_score(body, "method"), 2);
 }
 
+#[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
 #[test]
 fn java_lambda_body_counts_inside_enclosing_method() {
     let body = "    public void method(boolean a) {\n        \
@@ -380,6 +386,7 @@ fn kotlin_when_if_loop_and_conjunction_score_plausibly() {
     assert_eq!(kotlin_score(body, "method"), 7);
 }
 
+#[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
 #[test]
 fn kotlin_labeled_break_counts_extra_but_unlabeled_is_free() {
     let labeled_body = "    fun method(x: Int): Int {\n        \
@@ -707,6 +714,7 @@ fn csharp_unbraced_nested_if_is_not_flattened_as_else_if() {
     assert_eq!(score(&[("Service.cs", src)], "Service.cs", "method"), 3);
 }
 
+#[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
 #[test]
 fn csharp_nested_loop_and_logical_operator_sequences_are_scored() {
     let src = r#"class Service {

@@ -117,6 +117,27 @@ impl<'budget> ProcedureInventoryBuilder<'budget> {
         0
     }
 
+    pub(crate) fn locator(
+        &self,
+        declaration_path: usize,
+        role: SemanticRole,
+        anchor: SourceAnchor,
+    ) -> Result<SemanticLocator, SemanticProviderError> {
+        let declaration = DeclarationLocator::new(collect_declaration_path(
+            &self.declaration_paths,
+            declaration_path,
+        ))
+        .map_err(|error| SemanticProviderError::invalid_identity(error.to_string()))?;
+        Ok(SemanticLocator::new(
+            self.mount,
+            self.path.clone(),
+            self.language,
+            declaration,
+            role,
+            anchor,
+        ))
+    }
+
     pub(crate) fn push_container(
         &mut self,
         parent: usize,

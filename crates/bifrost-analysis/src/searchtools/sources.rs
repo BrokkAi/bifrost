@@ -473,373 +473,325 @@ fn get_symbol_sources_with_budget(
         .collect();
 
     let _batch_scope = crate::profiling::scope("get_symbol_sources.batch_selector_resolution");
-    let mut outcomes: Vec<_> = selected_symbols
-        .into_par_iter()
-        .enumerate()
-        .map(|(index, symbol)| {
-            if source_budget.is_exceeded() {
-                return (index, SourceLookupOutcome::BudgetExceeded);
-            }
-            let keep_going = || !cancellation.is_some_and(crate::CancellationToken::is_cancelled);
-            if !keep_going() {
-                return (index, cancelled_source_outcome(&symbol));
-            }
-            if symbol.starts_with("bifrost-model://")
-                && let Some(outcome) =
-                    semantic_model_source_outcome(analyzer, token, &symbol, source_budget)
-            {
-                return if keep_going() {
-                    (index, outcome)
+    let outcomes = map_request_batch(selected_symbols, |symbol| {
+        if source_budget.is_exceeded() {
+            return SourceLookupOutcome::BudgetExceeded;
+        }
+        let keep_going = || !cancellation.is_some_and(crate::CancellationToken::is_cancelled);
+        if !keep_going() {
+            return cancelled_source_outcome(&symbol);
+        }
+        if symbol.starts_with("bifrost-model://")
+            && let Some(outcome) =
+                semantic_model_source_outcome(analyzer, token, &symbol, source_budget)
+        {
+            return if keep_going() {
+                outcome
+            } else {
+                cancelled_source_outcome(&symbol)
+            };
+        }
+        let file_anchored = matches!(
+            split_workspace_definition_selector(analyzer, &symbol),
+            DefinitionSelector::FileAnchored { .. }
+        );
+        // Exact fully-qualified lookup wins before file patterns, so a
+        // canonical symbol containing `/` (e.g. a Go import path) is never
+        // misrouted as a filesystem path, and real namespace symbols like
+        // `fmt::formatter` are never stolen by path-selector parsing.
+        let exact_scope = crate::profiling::scope(format!("get_symbol_sources.exact[{symbol}]"));
+        let exact =
+            resolve_selectable_definitions_bounded(analyzer, token, &symbol, |analyzer, lookup| {
+                exact_codeunit_resolution_bounded(analyzer, lookup, resolution_budget(&keep_going))
+            });
+        let exact = match exact {
+            Ok(resolution) => resolution,
+            Err(stop) => return stopped_source_outcome(&symbol, stop),
+        };
+        match exact {
+            SelectableDefinitionResolution::Resolved(code_units) => {
+                let sources = if file_anchored {
+                    source_blocks_for_resolved_units_with_budget(
+                        analyzer,
+                        token,
+                        &code_units,
+                        source_budget,
+                    )
                 } else {
-                    (index, cancelled_source_outcome(&symbol))
+                    preferred_source_blocks_for_resolved_units_with_budget(
+                        analyzer,
+                        token,
+                        &code_units,
+                        source_budget,
+                    )
+                };
+                let sources = match sources {
+                    Ok(sources) => sources,
+                    Err(_) => return SourceLookupOutcome::BudgetExceeded,
+                };
+                if !keep_going() {
+                    return cancelled_source_outcome(&symbol);
+                }
+                return if sources.is_empty() {
+                    SourceLookupOutcome::NotFound(renderable_not_found_input(symbol))
+                } else {
+                    SourceLookupOutcome::Found(sources)
                 };
             }
-            let file_anchored = matches!(
-                split_workspace_definition_selector(analyzer, &symbol),
-                DefinitionSelector::FileAnchored { .. }
-            );
-            // Exact fully-qualified lookup wins before file patterns, so a
-            // canonical symbol containing `/` (e.g. a Go import path) is never
-            // misrouted as a filesystem path, and real namespace symbols like
-            // `fmt::formatter` are never stolen by path-selector parsing.
-            let exact_scope =
-                crate::profiling::scope(format!("get_symbol_sources.exact[{symbol}]"));
-            let exact = resolve_selectable_definitions_bounded(
-                analyzer,
-                token,
-                &symbol,
-                |analyzer, lookup| {
-                    exact_codeunit_resolution_bounded(
+            SelectableDefinitionResolution::Ambiguous(item) => {
+                return SourceLookupOutcome::Ambiguous(item);
+            }
+            SelectableDefinitionResolution::NotFound(_) => {
+                if let DefinitionSelector::FileAnchored { anchor, lookup } =
+                    split_workspace_definition_selector(analyzer, &symbol)
+                    && let Some(outcome) = semantic_model_source_outcome_with_anchor(
                         analyzer,
+                        token,
                         lookup,
-                        resolution_budget(&keep_going),
+                        Some(&anchor),
+                        source_budget,
                     )
-                },
-            );
-            let exact = match exact {
-                Ok(resolution) => resolution,
-                Err(stop) => return (index, stopped_source_outcome(&symbol, stop)),
-            };
-            match exact {
-                SelectableDefinitionResolution::Resolved(code_units) => {
-                    let sources = if file_anchored {
-                        source_blocks_for_resolved_units_with_budget(
-                            analyzer,
-                            token,
-                            &code_units,
-                            source_budget,
-                        )
+                {
+                    return if keep_going() {
+                        outcome
                     } else {
-                        preferred_source_blocks_for_resolved_units_with_budget(
-                            analyzer,
-                            token,
-                            &code_units,
-                            source_budget,
-                        )
-                    };
-                    let sources = match sources {
-                        Ok(sources) => sources,
-                        Err(_) => return (index, SourceLookupOutcome::BudgetExceeded),
-                    };
-                    if !keep_going() {
-                        return (index, cancelled_source_outcome(&symbol));
-                    }
-                    return if sources.is_empty() {
-                        (
-                            index,
-                            SourceLookupOutcome::NotFound(renderable_not_found_input(symbol)),
-                        )
-                    } else {
-                        (index, SourceLookupOutcome::Found(sources))
+                        cancelled_source_outcome(&symbol)
                     };
                 }
-                SelectableDefinitionResolution::Ambiguous(item) => {
-                    return (index, SourceLookupOutcome::Ambiguous(item));
-                }
-                SelectableDefinitionResolution::NotFound(_) => {
-                    if let DefinitionSelector::FileAnchored { anchor, lookup } =
-                        split_workspace_definition_selector(analyzer, &symbol)
-                        && let Some(outcome) = semantic_model_source_outcome_with_anchor(
-                            analyzer,
-                            token,
-                            lookup,
-                            Some(&anchor),
-                            source_budget,
-                        )
-                    {
-                        return if keep_going() {
-                            (index, outcome)
-                        } else {
-                            (index, cancelled_source_outcome(&symbol))
-                        };
-                    }
-                    if !keep_going() {
-                        return (index, cancelled_source_outcome(&symbol));
-                    }
+                if !keep_going() {
+                    return cancelled_source_outcome(&symbol);
                 }
             }
+        }
 
-            drop(exact_scope);
+        drop(exact_scope);
 
-            let path_scope =
-                crate::profiling::scope(format!("get_symbol_sources.path_qualified[{symbol}]"));
-            match split_path_qualified_definition_selector(analyzer, &symbol) {
-                Some(PathQualifiedSelector::Resolved { anchor, lookup }) => {
-                    let outcome = resolve_file_anchored_symbol_sources(
-                        analyzer,
-                        token,
-                        &symbol,
-                        anchor,
-                        lookup,
-                        source_budget,
-                    );
-                    return if !keep_going() {
-                        (index, cancelled_source_outcome(&symbol))
-                    } else {
-                        (index, outcome)
-                    };
-                }
-                Some(PathQualifiedSelector::DottedGuess { anchor, lookup }) => {
-                    // The dotted-file fallback is a guess, not an explicit path
-                    // selector: when the guessed anchor names nothing, the input
-                    // is a dotted symbol spelling (a namespace path whose first
-                    // segment collides with a file's basename), so fall through
-                    // to the fuzzy symbol stage instead of reporting anchor
-                    // not-found (#2409).
-                    match resolve_file_anchored_symbol_sources(
-                        analyzer,
-                        token,
-                        &symbol,
-                        anchor,
-                        lookup,
-                        source_budget,
-                    ) {
-                        SourceLookupOutcome::NotFound(_) if keep_going() => {}
-                        SourceLookupOutcome::NotFound(_) => {
-                            return (index, cancelled_source_outcome(&symbol));
-                        }
-                        outcome => return (index, outcome),
-                    }
-                }
-                Some(PathQualifiedSelector::AmbiguousPath(item)) => {
-                    return (index, SourceLookupOutcome::AmbiguousPath(item));
-                }
-                None => {}
-            }
-
-            if analyzer.languages().contains(&Language::Go)
-                && looks_like_go_receiver_selector(&symbol)
-            {
-                match resolve_selectable_definitions(
+        let path_scope =
+            crate::profiling::scope(format!("get_symbol_sources.path_qualified[{symbol}]"));
+        match split_path_qualified_definition_selector(analyzer, &symbol) {
+            Some(PathQualifiedSelector::Resolved { anchor, lookup }) => {
+                let outcome = resolve_file_anchored_symbol_sources(
                     analyzer,
                     token,
                     &symbol,
-                    exact_then_fuzzy_codeunit_resolution,
-                ) {
-                    SelectableDefinitionResolution::Resolved(code_units) => {
-                        let sources = match source_blocks_for_resolved_units_with_budget(
-                            analyzer,
-                            token,
-                            &code_units,
-                            source_budget,
-                        ) {
-                            Ok(sources) => sources,
-                            Err(_) => return (index, SourceLookupOutcome::BudgetExceeded),
-                        };
-                        if !keep_going() {
-                            return (index, cancelled_source_outcome(&symbol));
-                        }
-                        return if sources.is_empty() {
-                            (
-                                index,
-                                SourceLookupOutcome::NotFound(renderable_not_found_input(symbol)),
-                            )
-                        } else {
-                            (index, SourceLookupOutcome::Found(sources))
-                        };
-                    }
-                    SelectableDefinitionResolution::Ambiguous(item) => {
-                        return (index, SourceLookupOutcome::Ambiguous(item));
-                    }
-                    SelectableDefinitionResolution::NotFound(_) => {
-                        if !keep_going() {
-                            return (index, cancelled_source_outcome(&symbol));
-                        }
-                    }
-                }
-            }
-
-            drop(path_scope);
-
-            let file_pattern_scope =
-                crate::profiling::scope(format!("get_symbol_sources.file_patterns[{symbol}]"));
-            let file_matches = resolve_file_patterns(
-                analyzer,
-                std::slice::from_ref(&symbol),
-                Some(max_files_per_target),
-            );
-            if let Some(item) = file_matches.ambiguous_paths.first() {
-                return (index, SourceLookupOutcome::AmbiguousPath(item.clone()));
-            }
-            if !keep_going() {
-                return (index, cancelled_source_outcome(&symbol));
-            }
-            // Over the fan-out cap: counted, not validated, not sourced (#1738).
-            if let Some(fanout) = file_matches.glob_overflow {
-                return (
-                    index,
-                    SourceLookupOutcome::TooBroad(
-                        fanout.too_broad_scope(&symbol, max_files_per_target),
-                    ),
+                    anchor,
+                    lookup,
+                    source_budget,
                 );
+                return if !keep_going() {
+                    cancelled_source_outcome(&symbol)
+                } else {
+                    outcome
+                };
             }
-            if !file_matches.files.is_empty() {
-                if file_matches.files.len() > max_files_per_target {
-                    return (
-                        index,
-                        SourceLookupOutcome::TooBroad(too_broad_scope(
-                            &symbol,
-                            &file_matches.files,
-                            max_files_per_target,
-                        )),
-                    );
-                }
-                let sources = match source_blocks_for_files_with_budget(
+            Some(PathQualifiedSelector::DottedGuess { anchor, lookup }) => {
+                // The dotted-file fallback is a guess, not an explicit path
+                // selector: when the guessed anchor names nothing, the input
+                // is a dotted symbol spelling (a namespace path whose first
+                // segment collides with a file's basename), so fall through
+                // to the fuzzy symbol stage instead of reporting anchor
+                // not-found (#2409).
+                match resolve_file_anchored_symbol_sources(
                     analyzer,
-                    file_matches.files,
+                    token,
+                    &symbol,
+                    anchor,
+                    lookup,
                     source_budget,
                 ) {
-                    Ok(sources) => sources,
-                    Err(_) => return (index, SourceLookupOutcome::BudgetExceeded),
-                };
-                if !keep_going() {
-                    return (index, cancelled_source_outcome(&symbol));
+                    SourceLookupOutcome::NotFound(_) if keep_going() => {}
+                    SourceLookupOutcome::NotFound(_) => {
+                        return cancelled_source_outcome(&symbol);
+                    }
+                    outcome => return outcome,
                 }
-                return if sources.is_empty() {
-                    (
-                        index,
-                        SourceLookupOutcome::NotFound(renderable_not_found_input(symbol)),
-                    )
-                } else {
-                    (index, SourceLookupOutcome::Found(sources))
-                };
             }
-
-            // Exact symbol lookup and literal/file-pattern resolution have
-            // already had precedence. An explicit source path that survived
-            // both cannot resolve, so do not send it through the workspace-wide
-            // fuzzy symbol fallback. Dotted symbol spellings such as
-            // `MetadataConfiguration.Properties` deliberately do not qualify;
-            // they still need fuzzy resolution (#1196).
-            if looks_like_explicit_source_file_target(&symbol) {
-                if !keep_going() {
-                    return (index, cancelled_source_outcome(&symbol));
-                }
-                if let Some(item) = unsupported_selector_shape_not_found_input(analyzer, &symbol) {
-                    return (index, SourceLookupOutcome::NotFound(item));
-                }
-                return (
-                    index,
-                    SourceLookupOutcome::NotFound(file_not_found_input(symbol)),
-                );
+            Some(PathQualifiedSelector::AmbiguousPath(item)) => {
+                return SourceLookupOutcome::AmbiguousPath(item);
             }
+            None => {}
+        }
 
-            // File *shape* only decides how an unresolvable target is
-            // reported; it must never gate symbol resolution. A real member
-            // name can end in a segment that also spells a file extension --
-            // Autofac's `Autofac.Builder.MetadataConfiguration.Properties`
-            // reads as a `.properties` file to `looks_like_file_target` -- so
-            // short-circuiting here reported "no workspace file matched" for a
-            // symbol that resolves perfectly well, and the strictly more
-            // specific spelling failed where the bare name was ambiguous
-            // (#1196). The file-shaped diagnostics now live in the not-found
-            // arm below, after resolution has had its say; `resolve_file_patterns`
-            // above has already ruled out every real file for this input, so
-            // the file reading is dead by the time we get here anyway.
-            drop(file_pattern_scope);
-
-            let _fuzzy_scope =
-                crate::profiling::scope(format!("get_symbol_sources.fuzzy[{symbol}]"));
-            let fuzzy = resolve_selectable_definitions_bounded(
+        if analyzer.languages().contains(&Language::Go) && looks_like_go_receiver_selector(&symbol)
+        {
+            match resolve_selectable_definitions(
                 analyzer,
                 token,
                 &symbol,
-                |analyzer, lookup| {
-                    resolve_codeunit_fuzzy_bounded(analyzer, lookup, resolution_budget(&keep_going))
-                },
-            );
-            let fuzzy = match fuzzy {
-                Ok(resolution) => resolution,
-                Err(stop) => return (index, stopped_source_outcome(&symbol, stop)),
-            };
-            match fuzzy {
+                exact_then_fuzzy_codeunit_resolution,
+            ) {
                 SelectableDefinitionResolution::Resolved(code_units) => {
-                    let sources = match preferred_source_blocks_for_resolved_units_with_budget(
+                    let sources = match source_blocks_for_resolved_units_with_budget(
                         analyzer,
                         token,
                         &code_units,
                         source_budget,
                     ) {
                         Ok(sources) => sources,
-                        Err(_) => return (index, SourceLookupOutcome::BudgetExceeded),
+                        Err(_) => return SourceLookupOutcome::BudgetExceeded,
                     };
                     if !keep_going() {
-                        return (index, cancelled_source_outcome(&symbol));
+                        return cancelled_source_outcome(&symbol);
                     }
-                    if sources.is_empty() {
-                        (
-                            index,
-                            SourceLookupOutcome::NotFound(renderable_not_found_input(symbol)),
-                        )
+                    return if sources.is_empty() {
+                        SourceLookupOutcome::NotFound(renderable_not_found_input(symbol))
                     } else {
-                        (index, SourceLookupOutcome::Found(sources))
-                    }
+                        SourceLookupOutcome::Found(sources)
+                    };
                 }
                 SelectableDefinitionResolution::Ambiguous(item) => {
-                    (index, SourceLookupOutcome::Ambiguous(item))
+                    return SourceLookupOutcome::Ambiguous(item);
                 }
-                SelectableDefinitionResolution::NotFound(target) => {
+                SelectableDefinitionResolution::NotFound(_) => {
                     if !keep_going() {
-                        return (index, cancelled_source_outcome(&symbol));
+                        return cancelled_source_outcome(&symbol);
                     }
-                    let _diagnostics_scope = crate::profiling::scope(format!(
-                        "get_symbol_sources.not_found_diagnostics[{symbol}]"
-                    ));
-                    if let Some(outcome) =
-                        semantic_model_source_outcome(analyzer, token, &symbol, source_budget)
-                    {
-                        return if keep_going() {
-                            (index, outcome)
-                        } else {
-                            (index, cancelled_source_outcome(&symbol))
-                        };
-                    }
-                    if !keep_going() {
-                        return (index, cancelled_source_outcome(&symbol));
-                    }
-                    if let Some(item) =
-                        unsupported_selector_shape_not_found_input(analyzer, &symbol)
-                    {
-                        return (index, SourceLookupOutcome::NotFound(item));
-                    }
-                    if !keep_going() {
-                        return (index, cancelled_source_outcome(&symbol));
-                    }
-                    if looks_like_file_target(&symbol) {
-                        return (
-                            index,
-                            SourceLookupOutcome::NotFound(file_not_found_input(symbol)),
-                        );
-                    }
-                    if !keep_going() {
-                        return (index, cancelled_source_outcome(&symbol));
-                    }
-                    (index, SourceLookupOutcome::NotFound(target))
                 }
             }
-        })
-        .collect();
-    outcomes.sort_by_key(|(index, _)| *index);
+        }
+
+        drop(path_scope);
+
+        let file_pattern_scope =
+            crate::profiling::scope(format!("get_symbol_sources.file_patterns[{symbol}]"));
+        let file_matches = resolve_file_patterns(
+            analyzer,
+            std::slice::from_ref(&symbol),
+            Some(max_files_per_target),
+        );
+        if let Some(item) = file_matches.ambiguous_paths.first() {
+            return SourceLookupOutcome::AmbiguousPath(item.clone());
+        }
+        if !keep_going() {
+            return cancelled_source_outcome(&symbol);
+        }
+        // Over the fan-out cap: counted, not validated, not sourced (#1738).
+        if let Some(fanout) = file_matches.glob_overflow {
+            return SourceLookupOutcome::TooBroad(
+                fanout.too_broad_scope(&symbol, max_files_per_target),
+            );
+        }
+        if !file_matches.files.is_empty() {
+            if file_matches.files.len() > max_files_per_target {
+                return SourceLookupOutcome::TooBroad(too_broad_scope(
+                    &symbol,
+                    &file_matches.files,
+                    max_files_per_target,
+                ));
+            }
+            let sources = match source_blocks_for_files_with_budget(
+                analyzer,
+                file_matches.files,
+                source_budget,
+            ) {
+                Ok(sources) => sources,
+                Err(_) => return SourceLookupOutcome::BudgetExceeded,
+            };
+            if !keep_going() {
+                return cancelled_source_outcome(&symbol);
+            }
+            return if sources.is_empty() {
+                SourceLookupOutcome::NotFound(renderable_not_found_input(symbol))
+            } else {
+                SourceLookupOutcome::Found(sources)
+            };
+        }
+
+        // Exact symbol lookup and literal/file-pattern resolution have
+        // already had precedence. An explicit source path that survived
+        // both cannot resolve, so do not send it through the workspace-wide
+        // fuzzy symbol fallback. Dotted symbol spellings such as
+        // `MetadataConfiguration.Properties` deliberately do not qualify;
+        // they still need fuzzy resolution (#1196).
+        if looks_like_explicit_source_file_target(&symbol) {
+            if !keep_going() {
+                return cancelled_source_outcome(&symbol);
+            }
+            if let Some(item) = unsupported_selector_shape_not_found_input(analyzer, &symbol) {
+                return SourceLookupOutcome::NotFound(item);
+            }
+            return SourceLookupOutcome::NotFound(file_not_found_input(symbol));
+        }
+
+        // File *shape* only decides how an unresolvable target is
+        // reported; it must never gate symbol resolution. A real member
+        // name can end in a segment that also spells a file extension --
+        // Autofac's `Autofac.Builder.MetadataConfiguration.Properties`
+        // reads as a `.properties` file to `looks_like_file_target` -- so
+        // short-circuiting here reported "no workspace file matched" for a
+        // symbol that resolves perfectly well, and the strictly more
+        // specific spelling failed where the bare name was ambiguous
+        // (#1196). The file-shaped diagnostics now live in the not-found
+        // arm below, after resolution has had its say; `resolve_file_patterns`
+        // above has already ruled out every real file for this input, so
+        // the file reading is dead by the time we get here anyway.
+        drop(file_pattern_scope);
+
+        let _fuzzy_scope = crate::profiling::scope(format!("get_symbol_sources.fuzzy[{symbol}]"));
+        let fuzzy =
+            resolve_selectable_definitions_bounded(analyzer, token, &symbol, |analyzer, lookup| {
+                resolve_codeunit_fuzzy_bounded(analyzer, lookup, resolution_budget(&keep_going))
+            });
+        let fuzzy = match fuzzy {
+            Ok(resolution) => resolution,
+            Err(stop) => return stopped_source_outcome(&symbol, stop),
+        };
+        match fuzzy {
+            SelectableDefinitionResolution::Resolved(code_units) => {
+                let sources = match preferred_source_blocks_for_resolved_units_with_budget(
+                    analyzer,
+                    token,
+                    &code_units,
+                    source_budget,
+                ) {
+                    Ok(sources) => sources,
+                    Err(_) => return SourceLookupOutcome::BudgetExceeded,
+                };
+                if !keep_going() {
+                    return cancelled_source_outcome(&symbol);
+                }
+                if sources.is_empty() {
+                    SourceLookupOutcome::NotFound(renderable_not_found_input(symbol))
+                } else {
+                    SourceLookupOutcome::Found(sources)
+                }
+            }
+            SelectableDefinitionResolution::Ambiguous(item) => SourceLookupOutcome::Ambiguous(item),
+            SelectableDefinitionResolution::NotFound(target) => {
+                if !keep_going() {
+                    return cancelled_source_outcome(&symbol);
+                }
+                let _diagnostics_scope = crate::profiling::scope(format!(
+                    "get_symbol_sources.not_found_diagnostics[{symbol}]"
+                ));
+                if let Some(outcome) =
+                    semantic_model_source_outcome(analyzer, token, &symbol, source_budget)
+                {
+                    return if keep_going() {
+                        outcome
+                    } else {
+                        cancelled_source_outcome(&symbol)
+                    };
+                }
+                if !keep_going() {
+                    return cancelled_source_outcome(&symbol);
+                }
+                if let Some(item) = unsupported_selector_shape_not_found_input(analyzer, &symbol) {
+                    return SourceLookupOutcome::NotFound(item);
+                }
+                if !keep_going() {
+                    return cancelled_source_outcome(&symbol);
+                }
+                if looks_like_file_target(&symbol) {
+                    return SourceLookupOutcome::NotFound(file_not_found_input(symbol));
+                }
+                if !keep_going() {
+                    return cancelled_source_outcome(&symbol);
+                }
+                SourceLookupOutcome::NotFound(target)
+            }
+        }
+    });
 
     drop(_batch_scope);
     let _result_scope = crate::profiling::scope("get_symbol_sources.result_collection");
@@ -849,7 +801,7 @@ fn get_symbol_sources_with_budget(
     let mut ambiguous_paths = Vec::new();
     let mut too_broad = Vec::new();
     let mut incomplete = Vec::new();
-    for (_, outcome) in outcomes {
+    for outcome in outcomes {
         match outcome {
             SourceLookupOutcome::Found(blocks) => sources.extend(dedup_source_blocks(blocks)),
             SourceLookupOutcome::NotFound(symbol) => not_found.push(symbol),
@@ -1300,12 +1252,15 @@ pub(super) fn module_file_listing_blocks(
     let mut seen = BTreeSet::new();
     let mut files = Vec::new();
     for code_unit in code_units {
+        // Every file that declares this module, which is what the outline
+        // lists. `definitions` cannot answer it: its definition ordering keeps
+        // one module per name on purpose. Scanning `all_declarations` for the
+        // name instead hydrated the whole workspace -- 1.7 s and 360k units on
+        // this repository -- to keep the handful that match (#2880).
         let mut definitions = analyzer
-            .all_declarations()
-            .filter(|definition| {
-                (definition.is_module() || is_scala_object_like(definition))
-                    && definition.fq_name() == code_unit.fq_name()
-            })
+            .declarations_sharing_name(code_unit)
+            .into_iter()
+            .filter(|definition| definition.is_module() || is_scala_object_like(definition))
             .collect::<Vec<_>>();
         if definitions.is_empty() {
             definitions.push(code_unit.clone());

@@ -50,6 +50,7 @@ const MCP_DYNAMIC_EVAL_POLICY: &str = include_str!("fixtures/policy-cli/dynamic-
 /// A stateful `2025-11-25` session over the server's whole advertised surface:
 /// handshake, tool discovery, the resource pair, a successful call, a
 /// protocol-level error, and a progress-reporting call.
+#[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
 #[test]
 fn legacy_2025_11_25_stateful_session_emits_schema_valid_wire() {
     let workspace = InlineTestProject::new()
@@ -209,6 +210,7 @@ fn discovery_2026_07_28_and_stateless_calls_emit_schema_valid_wire() {
 /// The MRTR roots binding flow on `2026-07-28`: an unbound stateless call is
 /// answered with an `input_required` result carrying a `roots/list` input
 /// request, and the retry that answers it completes.
+#[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
 #[test]
 fn mrtr_roots_2026_07_28_session_emits_schema_valid_wire() {
     let plugin_dir = TempDir::new().expect("plugin dir");
@@ -317,6 +319,7 @@ fn cache_hints_2026_07_28_session_emits_schema_valid_wire() {
 /// be undescribable, and it must be that result. Everything else in the session
 /// -- including every `tasks/get` exchange -- must validate, so new
 /// schema-invalid traffic fails this test.
+#[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
 #[test]
 fn tasks_2026_07_28_session_wire_is_schema_valid_outside_the_extension() {
     let workspace = InlineTestProject::with_language(Language::Python)
@@ -525,9 +528,6 @@ impl WireSession {
 
     fn spawn(revision: &'static str, mut command: Command) -> Self {
         // A wire-schema test asserts message shape, not cold-start latency.
-        // It must also not inherit dependency-pack work from the developer
-        // machine; controlled pack tests opt into their own fake JDK.
-        command.env_remove("JAVA_HOME");
         // Left at the production default, a first call made during the
         // workspace build is held to COLD_WORKSPACE_REQUEST_BUDGET (4.5s), so
         // suite saturation would fail a schema assertion for box load. Two

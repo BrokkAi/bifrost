@@ -34,6 +34,13 @@ enum WatcherBackend {
 
 impl ProjectChangeWatcher {
     pub fn start(project: Arc<dyn Project>) -> Result<Self, String> {
+        Self::start_with_claimed_files(project, &[])
+    }
+
+    pub(crate) fn start_with_claimed_files(
+        project: Arc<dyn Project>,
+        claimed_files: &[ProjectFile],
+    ) -> Result<Self, String> {
         let pending = Arc::new(Mutex::new(PendingChanges::default()));
         let mut watcher = recommended_watcher(event_handler(&project, &pending))
             .map_err(|err| format!("Failed to create project watcher: {err}"))?;
@@ -41,7 +48,7 @@ impl ProjectChangeWatcher {
         watcher
             .configure(Config::default())
             .map_err(|err| format!("Failed to configure project watcher: {err}"))?;
-        watch_project_paths(&mut watcher, project.as_ref())?;
+        watch_project_paths(&mut watcher, project.as_ref(), claimed_files)?;
 
         Ok(Self {
             _watcher: WatcherBackend::Recommended { _watcher: watcher },
@@ -51,6 +58,14 @@ impl ProjectChangeWatcher {
 
     #[doc(hidden)]
     pub fn start_polling_for_tests(project: Arc<dyn Project>) -> Result<Self, String> {
+        Self::start_polling_with_claimed_files_for_tests(project, &[])
+    }
+
+    #[doc(hidden)]
+    pub fn start_polling_with_claimed_files_for_tests(
+        project: Arc<dyn Project>,
+        claimed_files: &[ProjectFile],
+    ) -> Result<Self, String> {
         let pending = Arc::new(Mutex::new(PendingChanges::default()));
         let config = Config::default()
             .with_poll_interval(Duration::from_millis(20))
@@ -58,7 +73,7 @@ impl ProjectChangeWatcher {
         let mut watcher = PollWatcher::new(event_handler(&project, &pending), config)
             .map_err(|err| format!("Failed to create polling project watcher: {err}"))?;
 
-        watch_project_paths(&mut watcher, project.as_ref())?;
+        watch_project_paths(&mut watcher, project.as_ref(), claimed_files)?;
 
         Ok(Self {
             _watcher: WatcherBackend::Poll { _watcher: watcher },
@@ -320,8 +335,12 @@ fn mark_full_refresh(pending: &Arc<Mutex<PendingChanges>>) {
     state.requires_full_refresh = true;
 }
 
-fn watch_project_paths(watcher: &mut impl Watcher, project: &dyn Project) -> Result<(), String> {
-    let recursive_roots = watch_roots(project)?;
+fn watch_project_paths(
+    watcher: &mut impl Watcher,
+    project: &dyn Project,
+    claimed_files: &[ProjectFile],
+) -> Result<(), String> {
+    let recursive_roots = watch_roots(project, claimed_files)?;
     if !recursive_roots.iter().any(|path| path == project.root()) {
         watcher
             .watch(project.root(), RecursiveMode::NonRecursive)
@@ -366,7 +385,10 @@ fn watch_project_paths(watcher: &mut impl Watcher, project: &dyn Project) -> Res
     Ok(())
 }
 
-fn watch_roots(project: &dyn Project) -> Result<Vec<PathBuf>, String> {
+fn watch_roots(
+    project: &dyn Project,
+    claimed_files: &[ProjectFile],
+) -> Result<Vec<PathBuf>, String> {
     let mut directories = Vec::new();
     for language in project.analyzer_languages() {
         let files = project
@@ -380,6 +402,14 @@ fn watch_roots(project: &dyn Project) -> Result<Vec<PathBuf>, String> {
                 .unwrap_or_else(|| project.root().to_path_buf());
             directories.push(dir);
         }
+    }
+    for file in claimed_files {
+        let dir = file
+            .abs_path()
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| project.root().to_path_buf());
+        directories.push(dir);
     }
 
     let project_configuration = project.root().join(crate::gitblob::PROJECT_DIR_NAME);
@@ -422,7 +452,7 @@ mod tests {
     use std::time::Duration;
     use tempfile::TempDir;
 
-    fn project_with_files(paths: &[&str]) -> (TempDir, Arc<dyn Project>) {
+    pub(super) fn project_with_files(paths: &[&str]) -> (TempDir, Arc<dyn Project>) {
         let temp = TempDir::new().unwrap();
         let root = temp.path().canonicalize().unwrap();
         for path in paths {
@@ -440,7 +470,7 @@ mod tests {
     fn watch_roots_collapse_to_top_level_analyzed_dirs() {
         let (_temp, project) =
             project_with_files(&["src/main.rs", "src/nested/lib.rs", "tests/a.rs"]);
-        let roots = watch_roots(project.as_ref()).unwrap();
+        let roots = watch_roots(project.as_ref(), &[]).unwrap();
         let rels: Vec<_> = roots
             .iter()
             .map(|path| {
@@ -460,7 +490,7 @@ mod tests {
             ".bifrost/policies/example.rqlp",
             ".bifrost/suppressions.json",
         ]);
-        let roots = watch_roots(project.as_ref()).unwrap();
+        let roots = watch_roots(project.as_ref(), &[]).unwrap();
         let rels: Vec<_> = roots
             .iter()
             .map(|path| {
@@ -506,7 +536,7 @@ mod tests {
         fs::write(root.join(".gitignore"), "").unwrap();
         fs::create_dir_all(root.join("src")).unwrap();
         let project = FilesystemProject::new(root.clone()).unwrap();
-        let roots = watch_roots(&project).unwrap();
+        let roots = watch_roots(&project, &[]).unwrap();
         assert_eq!(roots, vec![root.normalize()]);
     }
 
@@ -952,6 +982,671 @@ mod tests {
         assert!(
             state.requires_full_refresh,
             "a coalesced Git event can invalidate files beyond the incremental source path"
+        );
+    }
+}
+
+/// Operation-sequence properties for the change accumulator.
+///
+/// `PendingChanges` is meant to be a commutative, idempotent monoid over
+/// (file set, full-refresh flag): set union on the files, sticky OR on the
+/// flag, and `take_changed_files` is its only drain. Everything the watcher
+/// does between a raw `notify::Event` and that pair -- the `.git` split that
+/// broke the #1848 feedback loop, the `.bifrostignore` short circuit, the
+/// internal-state exemption, the refresh fallback for paths the incremental
+/// update cannot name -- must preserve that algebra no matter what order the
+/// operating system delivers events in, or how often it repeats one.
+///
+/// The example-based tests above pin single events. These pin sequences: the
+/// properties generate an event script over the alphabet of path shapes the
+/// watcher classifies, then compare drains across permutation, duplication,
+/// and splitting.
+///
+/// Events are fed to the real `handle_event` synchronously against a real
+/// `FilesystemProject` over a temporary tree, and drained through the real
+/// `take_changed_files`. The watcher backend is a `PollWatcher` that watches
+/// no path at all, so the only events the accumulator ever sees are the
+/// generated ones: no watcher thread, no sleeps, no filesystem race. The tree
+/// is never mutated during a case, which is what makes classification a pure
+/// function of the path shape and the permutation property meaningful.
+#[cfg(test)]
+mod pending_changes_properties {
+    use super::tests::project_with_files;
+    use super::{ChangeDelta, PendingChanges, ProjectChangeWatcher, WatcherBackend, handle_event};
+    use crate::{Project, ProjectFile};
+    use notify::event::{AccessKind, CreateKind, DataChange, ModifyKind, RemoveKind, RenameMode};
+    use notify::{Config, Event, EventKind, PollWatcher};
+    use proptest::prelude::*;
+    use std::collections::BTreeSet;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    /// Cases per property. Classifying a tracked path costs two whole-workspace
+    /// walks (`is_bifrostignored` and `is_gitignored` each read the listing),
+    /// so the module's cost is dominated by real filesystem work rather than by
+    /// generation. This count keeps all five properties inside a few seconds;
+    /// `PROPTEST_CASES` raises it for a deliberate stress run.
+    const CASES: u32 = 64;
+
+    /// `ProptestConfig::with_cases` would pin the count and silently ignore
+    /// `PROPTEST_CASES`, so the documented stress knob is honoured explicitly:
+    /// the default is the cheap count above, and an operator asking for more
+    /// gets exactly what they asked for.
+    fn config() -> ProptestConfig {
+        let mut config = ProptestConfig::default();
+        if std::env::var_os("PROPTEST_CASES").is_none() {
+            config.cases = CASES;
+        }
+        config
+    }
+    /// Events per generated script. Long enough that permutation, duplication
+    /// and stickiness have something to say, short enough that a shrunk
+    /// counterexample stays readable.
+    const MAX_EVENTS: usize = 6;
+
+    /// Tracked source files: present on disk, present in the workspace
+    /// listing, so each one classifies as an incremental project file.
+    const SOURCE_RELATIVE_PATHS: [&str; 3] = ["src/main.rs", "src/lib.rs", "tests/it.rs"];
+    /// Tracked configuration: `.bifrost` project input that is *not* generated
+    /// state, plus a dotted directory that merely starts with `.git`.
+    const CONFIG_RELATIVE_PATHS: [&str; 3] = [
+        ".bifrost/suppressions.json",
+        ".bifrost/policies/example.rqlp",
+        ".github/workflows/ci.yml",
+    ];
+    /// Analyzer-owned SQLite state, in both the current and the legacy layout.
+    const INTERNAL_STATE_RELATIVE_PATHS: [&str; 3] = [
+        ".bifrost/cache/bifrost_cache.db",
+        ".bifrost/cache/bifrost_cache.db-wal",
+        ".bifrost/bifrost_cache.db-wal",
+    ];
+    /// `.bifrostignore` at the root and nested: the watcher matches on the
+    /// file name alone, so neither has to exist for the event to be real.
+    const BIFROST_IGNORE_RELATIVE_PATHS: [&str; 2] = [".bifrostignore", "src/.bifrostignore"];
+    /// Git bookkeeping the analyzer never reads (issue #1848).
+    const GIT_CHURN_RELATIVE_PATHS: [&str; 5] = [
+        ".git",
+        ".git/index",
+        ".git/index.lock",
+        ".git/objects/ab/cdef",
+        ".git/logs/HEAD",
+    ];
+    /// Git state that moves which blobs are live and which paths are tracked.
+    const GIT_REF_STATE_RELATIVE_PATHS: [&str; 5] = [
+        ".git/HEAD",
+        ".git/ORIG_HEAD",
+        ".git/MERGE_HEAD",
+        ".git/packed-refs",
+        ".git/refs/heads/main",
+    ];
+    /// Directory-level events, including the project root itself (the empty
+    /// relative path).
+    const DIRECTORY_RELATIVE_PATHS: [&str; 3] = ["", "src", "tests"];
+    const OUTSIDE_ROOT_FILE_NAME: &str = "outside-the-workspace.rs";
+
+    /// Everything the fixture materializes on disk. `.bifrostignore` and the
+    /// `.git` shapes are deliberately absent: the watcher decides both by path
+    /// alone, and creating a real `.git` here would turn the temporary tree
+    /// into a repository and change what the workspace listing reports.
+    fn fixture_relative_paths() -> Vec<&'static str> {
+        SOURCE_RELATIVE_PATHS
+            .iter()
+            .chain(CONFIG_RELATIVE_PATHS.iter())
+            .chain(INTERNAL_STATE_RELATIVE_PATHS.iter())
+            .copied()
+            .collect()
+    }
+
+    /// A real `ProjectChangeWatcher` whose backend watches nothing, so
+    /// `take_changed_files` under test is the shipped drain while the pending
+    /// state receives only the events a property feeds it.
+    fn accumulator() -> ProjectChangeWatcher {
+        let config = Config::default().with_poll_interval(Duration::from_secs(24 * 60 * 60));
+        let watcher = PollWatcher::new(|_: notify::Result<Event>| {}, config)
+            .expect("an unwatched poll watcher must start");
+        ProjectChangeWatcher {
+            _watcher: WatcherBackend::Poll { _watcher: watcher },
+            pending: Arc::new(Mutex::new(PendingChanges::default())),
+        }
+    }
+
+    /// The path shapes the watcher classifies differently from one another.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Target {
+        Source(usize),
+        Config(usize),
+        InternalState(usize),
+        BifrostIgnore(usize),
+        GitChurn(usize),
+        GitRefState(usize),
+        Directory(usize),
+        OutsideRoot,
+    }
+
+    impl Target {
+        fn abs_path(self, root: &Path) -> PathBuf {
+            match self {
+                Self::Source(index) => root.join(SOURCE_RELATIVE_PATHS[index]),
+                Self::Config(index) => root.join(CONFIG_RELATIVE_PATHS[index]),
+                Self::InternalState(index) => root.join(INTERNAL_STATE_RELATIVE_PATHS[index]),
+                Self::BifrostIgnore(index) => root.join(BIFROST_IGNORE_RELATIVE_PATHS[index]),
+                Self::GitChurn(index) => root.join(GIT_CHURN_RELATIVE_PATHS[index]),
+                Self::GitRefState(index) => root.join(GIT_REF_STATE_RELATIVE_PATHS[index]),
+                Self::Directory(index) => {
+                    let relative = DIRECTORY_RELATIVE_PATHS[index];
+                    if relative.is_empty() {
+                        root.to_path_buf()
+                    } else {
+                        root.join(relative)
+                    }
+                }
+                Self::OutsideRoot => root
+                    .parent()
+                    .expect("a temporary project root has a parent")
+                    .join(OUTSIDE_ROOT_FILE_NAME),
+            }
+        }
+
+        /// The project file this shape contributes to an incremental delta.
+        fn project_file(self, root: &Path) -> Option<ProjectFile> {
+            match self {
+                Self::Source(index) => Some(ProjectFile::new(
+                    root.to_path_buf(),
+                    SOURCE_RELATIVE_PATHS[index],
+                )),
+                Self::Config(index) => Some(ProjectFile::new(
+                    root.to_path_buf(),
+                    CONFIG_RELATIVE_PATHS[index],
+                )),
+                _ => None,
+            }
+        }
+    }
+
+    /// The `notify` event kinds the watcher distinguishes.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum EventShape {
+        CreateFile,
+        CreateFolder,
+        ModifyAny,
+        ModifyData,
+        ModifyName,
+        RemoveFile,
+        RemoveFolder,
+        AccessAny,
+        Any,
+        Other,
+    }
+
+    impl EventShape {
+        fn to_kind(self) -> EventKind {
+            match self {
+                Self::CreateFile => EventKind::Create(CreateKind::File),
+                Self::CreateFolder => EventKind::Create(CreateKind::Folder),
+                Self::ModifyAny => EventKind::Modify(ModifyKind::Any),
+                Self::ModifyData => EventKind::Modify(ModifyKind::Data(DataChange::Content)),
+                Self::ModifyName => EventKind::Modify(ModifyKind::Name(RenameMode::Any)),
+                Self::RemoveFile => EventKind::Remove(RemoveKind::File),
+                Self::RemoveFolder => EventKind::Remove(RemoveKind::Folder),
+                Self::AccessAny => EventKind::Access(AccessKind::Any),
+                Self::Any => EventKind::Any,
+                Self::Other => EventKind::Other,
+            }
+        }
+
+        /// Contract: reads never change anything, so the watcher drops them
+        /// before it looks at a single path.
+        fn is_read_only(self) -> bool {
+            matches!(self, Self::AccessAny)
+        }
+
+        /// Contract: an event kind that can invalidate more than the paths it
+        /// names, so a path the incremental update cannot represent forces a
+        /// whole-workspace refresh. Creations name exactly what they created;
+        /// modifications, removals and the unspecified kinds do not.
+        fn can_invalidate_beyond_its_paths(self) -> bool {
+            match self {
+                Self::CreateFile | Self::CreateFolder | Self::AccessAny => false,
+                Self::ModifyAny
+                | Self::ModifyData
+                | Self::ModifyName
+                | Self::RemoveFile
+                | Self::RemoveFolder
+                | Self::Any
+                | Self::Other => true,
+            }
+        }
+    }
+
+    /// One generated operation: a `notify` event carrying zero or more of the
+    /// classified path shapes. Zero paths is the backend's "I lost track,
+    /// rescan" report.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct GeneratedEvent {
+        shape: EventShape,
+        targets: Vec<Target>,
+    }
+
+    impl GeneratedEvent {
+        fn to_notify_event(&self, root: &Path) -> Event {
+            let mut event = Event::new(self.shape.to_kind());
+            for target in &self.targets {
+                event = event.add_path(target.abs_path(root));
+            }
+            event
+        }
+    }
+
+    /// One step of a generated script: the event plus the two knobs the
+    /// properties use to derive a second delivery of the same operations --
+    /// a sort key that produces a permutation, and a flag that repeats the
+    /// event where a coalescing backend would.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct ScriptStep {
+        event: GeneratedEvent,
+        order_key: u16,
+        repeated: bool,
+    }
+
+    fn event_shape() -> impl Strategy<Value = EventShape> {
+        prop_oneof![
+            Just(EventShape::CreateFile),
+            Just(EventShape::CreateFolder),
+            Just(EventShape::ModifyAny),
+            Just(EventShape::ModifyData),
+            Just(EventShape::ModifyName),
+            Just(EventShape::RemoveFile),
+            Just(EventShape::RemoveFolder),
+            Just(EventShape::AccessAny),
+            Just(EventShape::Any),
+            Just(EventShape::Other),
+        ]
+    }
+
+    /// Weighted so that ordinary tracked churn dominates: every shape that
+    /// forces a full refresh is a sequence absorber, and an alphabet made
+    /// mostly of absorbers would stop exercising the incremental file set.
+    fn target() -> impl Strategy<Value = Target> {
+        prop_oneof![
+            6 => (0..SOURCE_RELATIVE_PATHS.len()).prop_map(Target::Source),
+            4 => (0..CONFIG_RELATIVE_PATHS.len()).prop_map(Target::Config),
+            3 => (0..INTERNAL_STATE_RELATIVE_PATHS.len()).prop_map(Target::InternalState),
+            3 => (0..GIT_CHURN_RELATIVE_PATHS.len()).prop_map(Target::GitChurn),
+            2 => (0..GIT_REF_STATE_RELATIVE_PATHS.len()).prop_map(Target::GitRefState),
+            1 => (0..BIFROST_IGNORE_RELATIVE_PATHS.len()).prop_map(Target::BifrostIgnore),
+            1 => (0..DIRECTORY_RELATIVE_PATHS.len()).prop_map(Target::Directory),
+            1 => Just(Target::OutsideRoot),
+        ]
+    }
+
+    fn generated_event() -> impl Strategy<Value = GeneratedEvent> {
+        (
+            event_shape(),
+            prop_oneof![
+                9 => prop::collection::vec(target(), 1..=2),
+                1 => Just(Vec::new()),
+            ],
+        )
+            .prop_map(|(shape, targets)| GeneratedEvent { shape, targets })
+    }
+
+    fn event_script() -> impl Strategy<Value = Vec<ScriptStep>> {
+        prop::collection::vec(
+            (generated_event(), any::<u16>(), any::<bool>()).prop_map(
+                |(event, order_key, repeated)| ScriptStep {
+                    event,
+                    order_key,
+                    repeated,
+                },
+            ),
+            0..=MAX_EVENTS,
+        )
+    }
+
+    fn script_events(script: &[ScriptStep]) -> Vec<GeneratedEvent> {
+        script.iter().map(|step| step.event.clone()).collect()
+    }
+
+    /// The same operations in a generated order. Sorting by the generated key
+    /// (ties broken by position, so the result is deterministic) reaches every
+    /// permutation the shrinker can then simplify toward the identity one.
+    fn permuted_events(script: &[ScriptStep]) -> Vec<GeneratedEvent> {
+        let mut order: Vec<(u16, usize)> = script
+            .iter()
+            .enumerate()
+            .map(|(index, step)| (step.order_key, index))
+            .collect();
+        order.sort_unstable();
+        order
+            .into_iter()
+            .map(|(_, index)| script[index].event.clone())
+            .collect()
+    }
+
+    /// The same operations with a generated subsequence delivered twice, back
+    /// to back, the way a backend that fails to coalesce repeats them.
+    fn repeated_events(script: &[ScriptStep]) -> Vec<GeneratedEvent> {
+        let mut events = Vec::with_capacity(script.len() * 2);
+        for step in script {
+            events.push(step.event.clone());
+            if step.repeated {
+                events.push(step.event.clone());
+            }
+        }
+        events
+    }
+
+    fn apply(
+        project: &Arc<dyn Project>,
+        watcher: &ProjectChangeWatcher,
+        events: &[GeneratedEvent],
+    ) {
+        for event in events {
+            handle_event(
+                project,
+                &watcher.pending,
+                event.to_notify_event(project.root()),
+            );
+        }
+    }
+
+    /// The accumulator's intended value: a file set and a sticky flag.
+    #[derive(Debug, Default, Clone, PartialEq, Eq)]
+    struct ModelDelta {
+        files: BTreeSet<ProjectFile>,
+        requires_full_refresh: bool,
+    }
+
+    impl ModelDelta {
+        /// The watcher's contract, restated over the generated alphabet.
+        ///
+        /// This is written from what each path shape *means* rather than by
+        /// calling `classify_project_path`, `git_internal_disposition`,
+        /// `is_internal_state_path` or `triggers_refresh_fallback`: a model
+        /// built on those helpers would agree with the implementation by
+        /// construction and could only ever catch accumulation bugs. The one
+        /// place the model cannot be independent is the ignore state, and it
+        /// does not have to be: the fixture has no `.bifrostignore` file and
+        /// no repository, so nothing under the root is git- or
+        /// Bifrost-ignored and both probes are constant here.
+        fn apply(&mut self, root: &Path, event: &GeneratedEvent) {
+            if event.shape.is_read_only() {
+                return;
+            }
+            // A pathless report means the backend cannot say what changed.
+            if event.targets.is_empty() {
+                self.requires_full_refresh = true;
+                return;
+            }
+
+            // `.git` internals are never project files. Ref state still
+            // reaches the refresh decision because HEAD movement changes
+            // tracked membership; the rest is pure churn and costs nothing.
+            let mut git_ref_state_changed = false;
+            let mut remaining = Vec::with_capacity(event.targets.len());
+            for target in &event.targets {
+                match target {
+                    Target::GitRefState(_) => git_ref_state_changed = true,
+                    Target::GitChurn(_) => {}
+                    other => remaining.push(*other),
+                }
+            }
+            if git_ref_state_changed && event.shape.can_invalidate_beyond_its_paths() {
+                self.requires_full_refresh = true;
+            }
+            if remaining.is_empty() {
+                return;
+            }
+
+            // A `.bifrostignore` edit changes what the whole workspace
+            // analyzes, whatever else the event named and whatever kind it is.
+            if remaining
+                .iter()
+                .any(|target| matches!(target, Target::BifrostIgnore(_)))
+            {
+                self.requires_full_refresh = true;
+                return;
+            }
+
+            let mut saw_unrepresentable_path = false;
+            for target in remaining {
+                match target {
+                    Target::Source(_) | Target::Config(_) => {
+                        self.files.insert(
+                            target
+                                .project_file(root)
+                                .expect("tracked shapes name a project file"),
+                        );
+                    }
+                    // Generated analyzer state follows every analyzed change
+                    // and is never itself an input.
+                    Target::InternalState(_) => {}
+                    // A directory, the root itself, and anything outside the
+                    // root are all paths an incremental update cannot name.
+                    Target::Directory(_) | Target::OutsideRoot => saw_unrepresentable_path = true,
+                    Target::GitChurn(_) | Target::GitRefState(_) | Target::BifrostIgnore(_) => {
+                        unreachable!("handled above: {target:?}")
+                    }
+                }
+            }
+            if saw_unrepresentable_path && event.shape.can_invalidate_beyond_its_paths() {
+                self.requires_full_refresh = true;
+            }
+        }
+
+        fn fold(root: &Path, events: &[GeneratedEvent]) -> Self {
+            let mut model = Self::default();
+            for event in events {
+                model.apply(root, event);
+            }
+            model
+        }
+    }
+
+    fn as_model(delta: &ChangeDelta) -> ModelDelta {
+        ModelDelta {
+            files: delta.files.iter().cloned().collect(),
+            requires_full_refresh: delta.requires_full_refresh,
+        }
+    }
+
+    /// Property 1. The accumulator is a commutative monoid: the operating
+    /// system's delivery order is not part of the answer. This is the property
+    /// the `.git` split has to preserve -- a filter that ran only on the first
+    /// event of a batch, or that let one path's decision depend on an earlier
+    /// path's, would show up here and nowhere in the single-event tests.
+    #[test]
+    fn accumulating_an_event_sequence_is_order_independent() {
+        let (_temp, project) = project_with_files(&fixture_relative_paths());
+        let watcher = accumulator();
+        // Both deliveries agreeing proves nothing if the second is never a
+        // different order, so the run has to have reordered something.
+        let reordered_a_sequence = AtomicBool::new(false);
+
+        proptest!(config(), |(script in event_script())| {
+            let events = script_events(&script);
+            let shuffled = permuted_events(&script);
+            if shuffled != events {
+                reordered_a_sequence.store(true, Ordering::Relaxed);
+            }
+
+            apply(&project, &watcher, &events);
+            let in_order = watcher.take_changed_files();
+            apply(&project, &watcher, &shuffled);
+            let permuted = watcher.take_changed_files();
+
+            prop_assert_eq!(
+                in_order,
+                permuted,
+                "delivery order changed the delta for {:?}",
+                script
+            );
+        });
+
+        assert!(
+            reordered_a_sequence.load(Ordering::Relaxed),
+            "the generator never produced a reordered delivery"
+        );
+    }
+
+    /// Property 2. The accumulator is idempotent: a backend that repeats an
+    /// event -- every inotify batch that fans one write out into several, and
+    /// the poll backend's re-report of an unchanged file -- adds nothing.
+    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
+    #[test]
+    fn repeating_events_does_not_change_the_delta() {
+        let (_temp, project) = project_with_files(&fixture_relative_paths());
+        let watcher = accumulator();
+        let repeated_a_sequence = AtomicBool::new(false);
+
+        proptest!(config(), |(script in event_script())| {
+            let events = script_events(&script);
+            let repeated = repeated_events(&script);
+            if repeated != events {
+                repeated_a_sequence.store(true, Ordering::Relaxed);
+            }
+
+            apply(&project, &watcher, &events);
+            let once = watcher.take_changed_files();
+            apply(&project, &watcher, &repeated);
+            let twice = watcher.take_changed_files();
+
+            prop_assert_eq!(once, twice, "repeated delivery changed the delta for {:?}", script);
+        });
+
+        assert!(
+            repeated_a_sequence.load(Ordering::Relaxed),
+            "the generator never produced a repeated delivery"
+        );
+    }
+
+    /// Property 3. The full-refresh flag is a sticky OR over the sequence:
+    /// it is set exactly when some single event would set it on its own, it
+    /// never clears once set, and nothing delivered afterwards can take it
+    /// back. Stated against the implementation alone -- each event is also
+    /// applied by itself, so this holds without reference to the model.
+    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
+    #[test]
+    fn full_refresh_is_the_sticky_or_of_the_sequence() {
+        let (_temp, project) = project_with_files(&fixture_relative_paths());
+        let watcher = accumulator();
+
+        proptest!(config(), |(script in event_script())| {
+            let events = script_events(&script);
+
+            let mut any_alone = false;
+            for event in &events {
+                apply(&project, &watcher, std::slice::from_ref(event));
+                any_alone |= watcher.take_changed_files().requires_full_refresh;
+            }
+
+            let mut previously_set = false;
+            for event in &events {
+                apply(&project, &watcher, std::slice::from_ref(event));
+                let now_set = watcher
+                    .pending
+                    .lock()
+                    .expect("project watcher pending state poisoned")
+                    .requires_full_refresh;
+                prop_assert!(
+                    now_set || !previously_set,
+                    "a later event cleared the full-refresh flag in {:?}",
+                    script
+                );
+                previously_set = now_set;
+            }
+
+            let delta = watcher.take_changed_files();
+            prop_assert_eq!(
+                delta.requires_full_refresh,
+                previously_set,
+                "the drain disagreed with the accumulated flag for {:?}",
+                script
+            );
+            prop_assert_eq!(
+                delta.requires_full_refresh,
+                any_alone,
+                "the sequence flag is not the OR of the individual events for {:?}",
+                script
+            );
+        });
+    }
+
+    /// Property 4. The drained delta equals an independent fold of the same
+    /// sequence: union of the project files each event names, OR of the
+    /// refresh decisions.
+    #[test]
+    fn the_drained_delta_matches_an_independent_fold() {
+        let (_temp, project) = project_with_files(&fixture_relative_paths());
+        let watcher = accumulator();
+
+        proptest!(config(), |(script in event_script())| {
+            let events = script_events(&script);
+            let expected = ModelDelta::fold(project.root(), &events);
+
+            apply(&project, &watcher, &events);
+            let delta = watcher.take_changed_files();
+
+            prop_assert_eq!(
+                as_model(&delta),
+                expected,
+                "the accumulator disagreed with the contract for {:?}",
+                script
+            );
+        });
+    }
+
+    /// Property 5. The drain is a reset, not a peek: it leaves no residue, so
+    /// draining in the middle of a sequence splits the fold instead of
+    /// duplicating or dropping part of it.
+    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
+    #[test]
+    fn draining_resets_the_accumulator() {
+        let (_temp, project) = project_with_files(&fixture_relative_paths());
+        let watcher = accumulator();
+
+        proptest!(
+            config(),
+            |(script in event_script(), split in any::<prop::sample::Index>())| {
+                let events = script_events(&script);
+                apply(&project, &watcher, &events);
+                let first = watcher.take_changed_files();
+
+                prop_assert!(!watcher.has_pending(), "residue after a drain of {:?}", script);
+                apply(&project, &watcher, &[]);
+                prop_assert_eq!(
+                    watcher.take_changed_files(),
+                    ChangeDelta::default(),
+                    "a second drain reported a change for {:?}",
+                    script
+                );
+
+                // The same sequence, drained in two halves, must partition the
+                // single drain: nothing accumulated twice, nothing lost.
+                let boundary = split.index(events.len() + 1);
+                let (head, tail) = events.split_at(boundary);
+                apply(&project, &watcher, head);
+                let head_delta = watcher.take_changed_files();
+                apply(&project, &watcher, tail);
+                let tail_delta = watcher.take_changed_files();
+
+                let mut union = head_delta.files;
+                union.extend(tail_delta.files);
+                prop_assert_eq!(
+                    union,
+                    first.files,
+                    "a split drain lost or invented files for {:?}",
+                    script
+                );
+                prop_assert_eq!(
+                    head_delta.requires_full_refresh || tail_delta.requires_full_refresh,
+                    first.requires_full_refresh,
+                    "a split drain changed the refresh decision for {:?}",
+                    script
+                );
+            }
         );
     }
 }

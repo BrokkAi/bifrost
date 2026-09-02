@@ -3,13 +3,19 @@ title: Evidence and Evaluation Methodology
 description: Understand what Bifrost currently demonstrates and how to evaluate it rigorously.
 ---
 
-Bifrost's public documentation currently provides executable correctness examples, not a published aggregate accuracy or large-repository performance study. The distinction matters: an architecture designed to avoid permanently retaining every analysis graph is not evidence of a particular memory ceiling, and a passing language fixture is not a precision/recall measurement.
+Bifrost's public evidence includes executable correctness examples and two
+separately versioned benchmark projects. Their claim scopes remain deliberately
+narrow: an architecture designed to avoid permanently retaining every analysis
+graph is not evidence of a particular memory ceiling, and a passing language
+fixture is not a language-wide precision or recall measurement.
 
 ## What Is Publicly Reproducible Today
 
 | Evidence | What it establishes | What it does not establish |
 | --- | --- | --- |
 | [Ten-minute evaluation](/evaluate-bifrost/) | One checked-in Python fixture produces the same structural result through CLI JSON, saved RQL, agent MCP, and VS Code LSP. | Corpus-wide accuracy, dynamic call completeness, or large-repository performance. |
+| [UsageBench](https://brokkai.github.io/usagebench/) ([source](https://github.com/BrokkAi/usagebench); [immutable releases](https://github.com/BrokkAi/usagebench/releases)) | Versioned, analyzer-neutral evidence for the overlapping symbol-usage and reverse-navigation contract between Bifrost and mature language servers. Published evaluation and development populations remain separate. | Either product's complete feature surface, language-wide accuracy, data-flow behavior, or performance. |
+| [DataFlowBench](https://github.com/BrokkAi/dataflowbench) ([immutable releases](https://github.com/BrokkAi/dataflowbench/releases)) | Versioned, analyzer-neutral results for bounded value-flow, taint, typestate, witness, and performance tracks. Outcomes preserve `reached`, `not-reached`, `inconclusive`, `unsupported`, and runner errors instead of pooling them into one score. | Complete whole-program soundness, general path feasibility, every language feature, or representative real-project accuracy. |
 | [Language query tutorials](/code-query-tutorials/) | Checked-in source, query, and expected output remain executable across all supported languages. | Representative prevalence or accuracy across real-world repositories. |
 | [Receiver traversal cookbook](/code-query-tutorials/receiver-traversal/) | The shared outcome and provenance contract executes against exact cookbook output; adapter conformance regressions exercise proven forms and explicit uncertainty boundaries, while the cookbook also demonstrates reference-site and call-input composition. | Whole-program points-to completeness, general alias analysis, path feasibility, taint, or data-flow accuracy. |
 | Data-flow solver, adapter, and production-taint conformance suites | Bounded language-neutral ICFG scenarios agree with independent reference implementations; every direct-ready language has one exact helper-flow case across the direct solver, JSON CodeQuery, and RQL; production taint fixtures exercise retained report/projection parity and semantic summaries. | Representative real-project precision/recall, complete language-feature coverage, or externally reviewed accuracy. |
@@ -17,10 +23,12 @@ Bifrost's public documentation currently provides executable correctness example
 | Analyzer and service test suites | Specific resolution, proof, diagnostics, truncation, and language-regression contracts are exercised in the repository. | An independently sampled benchmark or an externally reviewed accuracy result. |
 | [Capability matrix](/capabilities/) | The implemented analysis surfaces and known hard boundaries are stated in one place. | A guarantee that every valid program within a language will resolve every edge. |
 
-There is not yet a public, versioned table of cold and warm data-flow timings,
-peak memory, pinned real-project flow expectations, or aggregate precision and
-recall. Until one exists, treat unqualified performance adjectives and global
-data-flow accuracy percentages as unsupported. The capability is documented as
+The benchmark projects publish results for their explicitly identified
+populations; they do not establish one global Bifrost score. There is not yet a
+representative, pinned real-project data-flow study combining cold and warm
+timings, peak memory, flow expectations, and aggregate precision and recall.
+Until one exists, treat unqualified performance adjectives and global data-flow
+accuracy percentages as unsupported. The capability is documented as
 experimental for this reason, not because the solver or policy evaluator is a
 placeholder.
 

@@ -702,6 +702,7 @@ mod tests {
             source: ValueFlowCarrierId::try_from_index(source).expect("source id"),
             target: ValueFlowCarrierId::try_from_index(target).expect("target id"),
             kind,
+            transfer: None,
             complete: true,
             strong_update,
         }

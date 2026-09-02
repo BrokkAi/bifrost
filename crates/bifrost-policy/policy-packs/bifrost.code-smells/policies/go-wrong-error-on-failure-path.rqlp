@@ -1,0 +1,37 @@
+; A reviewed Go result contract identifies both the result that reports failure
+; and the exact control-flow edge on which that failure is established. This
+; rule asks which error value a returned call consumes on that edge.
+;
+; `result-contract-failure-uses` performs the semantic proof. The structural
+; seed is only a cost firewall over the currently embedded result-contract
+; families; canonical dispatch still rejects local and unrelated same-named
+; calls. A finding requires a distinct error binding whose exact reaching value
+; is Go's zero value and an exact call argument whose enclosing call result is
+; returned. Correct condition results, independently established sentinels,
+; direct returns, statement-only calls, and incomplete origins do not match.
+(policy
+  :schema-version 1
+  :id "bifrost.correctness.go-wrong-error-on-failure-path"
+  :name "Go failure path returns the wrong error"
+  :message "this exact Go API failure path returns a call that consumes a different error binding whose reaching value is nil"
+  :severity error
+  :description "A reviewed Go API reports failure through one result, but a call returned from that exact failure path consumes a different error binding whose reaching value is proven to be Go's zero value. The rule does not infer intent from names: it requires canonical API identity, exact result and binding identity, exact failure-edge control, and exhaustive reaching-definition evidence."
+  :help-uri "https://bifrost.brokk.ai/static-analysis-policies/#built-in-code-smell-pack"
+  :tags ["correctness" "go" "error-handling" "zero-value"]
+  :analysis (analysis
+    :type assertion
+    (bind :name use
+      :query (rql :schema-version 1
+        (language go
+          (result-contract-failure-uses
+            :provenance [distinct-zero-binding]
+            :consumer [returned-call-argument]
+            (call-result-contracts
+              (result-contract-calls
+                (call-shape
+                  (inside (callable)
+                    (call :callee (name/regex "^(Open|OpenFile|Create|CreateTemp|Stat|Lstat|Dial|DialTimeout|Listen|Decode)$")
+                          :receiver (identifier))))))))))
+    (group :name by-use :by (use.id)
+      (aggregate :name violations :op count))
+    (assert :group by-use :value violations :cardinality (exactly 0))))

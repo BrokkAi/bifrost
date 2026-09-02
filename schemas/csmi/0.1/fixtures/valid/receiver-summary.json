@@ -1,0 +1,101 @@
+{
+  "documentType": "semantic-document",
+  "schema": "https://csmi.brokk.ai/schema/0.1/schema.json",
+  "semanticModelVersion": "0.1",
+  "serializationVersion": "0.1-json",
+  "provenanceRecords": [
+    {
+      "id": "manual",
+      "producer": {
+        "identifier": "https://example.org/processes/reviewed-models",
+        "version": "git:def456"
+      },
+      "generationMethod": "manual-authoring"
+    }
+  ],
+  "defaultProvenance": "manual",
+  "semanticModels": [
+    {
+      "artifactSelectors": [
+        { "purl": "pkg:maven/org.example/cache@3.1.0" }
+      ],
+      "symbols": [
+        {
+          "id": "cache",
+          "scheme": "org.example.java-source",
+          "schemeVersion": "0.1",
+          "stability": "portable",
+          "descriptors": [
+            { "role": "namespace", "name": "org" },
+            { "role": "namespace", "name": "example" },
+            { "role": "type", "name": "Cache" }
+          ]
+        },
+        {
+          "id": "identity",
+          "scheme": "org.example.java-source",
+          "schemeVersion": "0.1",
+          "stability": "portable",
+          "descriptors": [
+            { "role": "namespace", "name": "org" },
+            { "role": "namespace", "name": "example" },
+            { "role": "type", "name": "Cache" },
+            {
+              "role": "callable",
+              "name": "identity",
+              "disambiguator": "()->org.example.Cache"
+            }
+          ]
+        }
+      ],
+      "declarations": [
+        { "symbol": "cache", "category": "type" },
+        {
+          "symbol": "identity",
+          "category": "callable",
+          "owner": "cache",
+          "callable": {
+            "kind": "method",
+            "receiver": {
+              "kind": "instance",
+              "type": { "kind": "reference", "symbol": "cache" }
+            },
+            "parameters": [],
+            "results": [
+              {
+                "position": 0,
+                "type": { "kind": "reference", "symbol": "cache" }
+              }
+            ]
+          }
+        }
+      ],
+      "procedureSummaries": [
+        {
+          "callable": "identity",
+          "transfers": [
+            {
+              "source": {
+                "root": { "phase": "input", "role": "receiver" }
+              },
+              "destination": {
+                "root": {
+                  "phase": "output",
+                  "role": "result",
+                  "position": 0
+                }
+              }
+            }
+          ]
+        }
+      ],
+      "completenessStatements": [
+        {
+          "family": "procedure-summaries",
+          "scope": { "callable": "identity" },
+          "status": "complete"
+        }
+      ]
+    }
+  ]
+}

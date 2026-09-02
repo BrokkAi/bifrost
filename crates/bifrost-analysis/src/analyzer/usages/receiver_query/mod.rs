@@ -11,6 +11,10 @@ use crate::analyzer::semantic::{
     SemanticProviderError, SemanticRequest, SemanticWork, SourcePointsToResult,
     WorkspaceSemanticOracle,
 };
+use crate::analyzer::semantic_model::{
+    SemanticModelMemberTargetDisposition, SemanticModelProvenance, SemanticModelSymbol,
+    SemanticModelSymbolKind,
+};
 use crate::analyzer::store::LimitedQueryRows;
 use crate::analyzer::structural::FileFacts;
 use crate::analyzer::structural::provider::StructuralSyntaxLimitedOutcome;
@@ -28,7 +32,8 @@ use crate::analyzer::usages::get_type::{
 };
 use crate::analyzer::usages::receiver_analysis::{
     ReceiverAnalysisBudget, ReceiverAnalysisOutcome, ReceiverAnalysisReport, ReceiverAnalysisWork,
-    ReceiverBudgetLimit, ReceiverFileCtx, ReceiverFileFacts, ReceiverFileSetup, ReceiverValue,
+    ReceiverBudgetLimit, ReceiverFileCtx, ReceiverFileFacts, ReceiverFileSetup,
+    ReceiverIdentityProof, ReceiverValue,
 };
 use crate::analyzer::usages::receiver_sites::{
     ReceiverSiteIndex, ReceiverSiteIndexBuild, ReceiverSiteIndexLimit, ReceiverSiteInputMode,
@@ -47,6 +52,7 @@ use crate::hash::HashMap;
 use crate::path_utils::rel_path_string;
 use crate::text_utils::compute_line_starts;
 use std::cell::RefCell;
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use tree_sitter::Node;
 
@@ -90,7 +96,126 @@ pub struct ReceiverQuerySite {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ReceiverQueryAnalysis {
     Values(ReceiverAnalysisOutcome<ReceiverValue>),
-    MemberTargets(ReceiverAnalysisOutcome<CodeUnit>),
+    MemberTargets(ReceiverAnalysisOutcome<ReceiverMemberTarget>),
+}
+
+/// One exact static member target together with the exact receiver owner that
+/// justified it. A modeled member is retained as its active model record,
+/// never converted into a synthetic workspace declaration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReceiverMemberTarget {
+    Workspace {
+        receiver: Option<CodeUnit>,
+        member: CodeUnit,
+    },
+    SemanticModel {
+        receiver: Box<ModeledDeclarationIdentity>,
+        member: Box<ModeledDeclarationIdentity>,
+        receiver_proof: ReceiverIdentityProof,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModeledDeclarationIdentity {
+    pub id: String,
+    pub owner_id: Option<String>,
+    pub name: String,
+    pub qualified_name: String,
+    pub language: String,
+    pub kind: SemanticModelSymbolKind,
+    pub provenance: SemanticModelProvenance,
+}
+
+impl From<&SemanticModelSymbol> for ModeledDeclarationIdentity {
+    fn from(symbol: &SemanticModelSymbol) -> Self {
+        Self {
+            id: symbol.id.clone(),
+            owner_id: symbol.owner_id.clone(),
+            name: symbol.name.clone(),
+            qualified_name: symbol.qualified_name.clone(),
+            language: symbol.language.clone(),
+            kind: symbol.kind,
+            provenance: symbol.provenance.clone(),
+        }
+    }
+}
+
+impl Hash for ModeledDeclarationIdentity {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.id.hash(state);
+        self.provenance.active_model_set_hash.hash(state);
+    }
+}
+
+impl Hash for ReceiverMemberTarget {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        std::mem::discriminant(self).hash(state);
+        match self {
+            Self::Workspace { receiver, member } => {
+                receiver.hash(state);
+                member.hash(state);
+            }
+            Self::SemanticModel {
+                receiver, member, ..
+            } => {
+                receiver.hash(state);
+                member.hash(state);
+            }
+        }
+    }
+}
+
+impl ReceiverMemberTarget {
+    pub fn workspace_receiver(&self) -> Option<&CodeUnit> {
+        match self {
+            Self::Workspace { receiver, .. } => receiver.as_ref(),
+            Self::SemanticModel { .. } => None,
+        }
+    }
+
+    pub fn workspace_member(&self) -> Option<&CodeUnit> {
+        match self {
+            Self::Workspace { member, .. } => Some(member),
+            Self::SemanticModel { .. } => None,
+        }
+    }
+
+    pub fn receiver_identity_id(&self) -> Option<String> {
+        match self {
+            Self::Workspace { receiver, .. } => receiver
+                .as_ref()
+                .map(|receiver| receiver.declaration_id().to_string()),
+            Self::SemanticModel { receiver, .. } => Some(receiver.id.clone()),
+        }
+    }
+
+    pub fn member_identity_id(&self) -> String {
+        match self {
+            Self::Workspace { member, .. } => member.declaration_id().to_string(),
+            Self::SemanticModel { member, .. } => member.id.clone(),
+        }
+    }
+
+    pub fn member_name(&self) -> &str {
+        match self {
+            Self::Workspace { member, .. } => member.identifier(),
+            Self::SemanticModel { member, .. } => &member.name,
+        }
+    }
+
+    pub fn fq_name(&self) -> String {
+        match self {
+            Self::Workspace { member, .. } => member.fq_name(),
+            Self::SemanticModel { member, .. } => member.qualified_name.clone(),
+        }
+    }
+
+    pub fn receiver_proof(&self) -> Option<&ReceiverIdentityProof> {
+        match self {
+            Self::Workspace { .. } => None,
+            Self::SemanticModel { receiver_proof, .. } => Some(receiver_proof),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -98,6 +223,7 @@ pub struct ReceiverQueryReport {
     pub operation: ReceiverQueryOperation,
     pub site: ReceiverQuerySite,
     pub analysis: ReceiverQueryAnalysis,
+    pub member_range: Option<Range>,
     pub work: ReceiverAnalysisWork,
     pub candidates_truncated: bool,
     pub semantic_unsupported: Option<SemanticCapability>,
@@ -354,6 +480,19 @@ impl ReceiverWorkLedger {
 
     fn work(&self) -> ReceiverAnalysisWork {
         self.work
+    }
+}
+
+fn combined_receiver_work(
+    left: ReceiverAnalysisWork,
+    right: ReceiverAnalysisWork,
+) -> ReceiverAnalysisWork {
+    ReceiverAnalysisWork {
+        setup_nodes: left.setup_nodes.saturating_add(right.setup_nodes),
+        summary_expansions: left
+            .summary_expansions
+            .saturating_add(right.summary_expansions),
+        scope_nodes: left.scope_nodes.saturating_add(right.scope_nodes),
     }
 }
 
@@ -855,13 +994,38 @@ impl<'a> ReceiverQueryService<'a> {
                         ledger.remaining_budget(),
                     )
                     .expect("validated member expression remains supported by its provider");
+                let reference_site =
+                    structural_reference_site(file, source, member_report.receiver_range);
+                let resolution = resolve_js_ts_type_bounded(
+                    self.analyzer,
+                    &self.definitions,
+                    file,
+                    language,
+                    source,
+                    Some(tree),
+                    &reference_site,
+                    ledger.remaining_budget(),
+                    cancellation,
+                );
+                let type_outcome = match charge_bounded_resolution(&mut ledger, resolution)? {
+                    CompatibilityOutcome::Complete(outcome) => outcome,
+                    CompatibilityOutcome::Exceeded(limit) => {
+                        return Ok(budget_report(operation, gate_site, ledger.work(), limit));
+                    }
+                };
+                let modeled_receiver_proof = legacy_exact_modeled_receiver_proof(
+                    self.analyzer,
+                    &type_outcome,
+                    &member_report.receiver_analysis.outcome,
+                    &member_report.receiver_identity,
+                );
                 let site = site(
                     file,
                     language,
                     member_report.receiver_range,
                     source,
                     "receiver",
-                    Some(member_report.member_name),
+                    Some(member_report.member_name.clone()),
                 );
                 finalize_legacy_report(
                     self.analyzer,
@@ -869,9 +1033,32 @@ impl<'a> ReceiverQueryService<'a> {
                         operation,
                         site,
                         analysis: ReceiverQueryAnalysis::MemberTargets(
-                            member_report.analysis.outcome,
+                            if let Some(receiver_proof) = modeled_receiver_proof {
+                                resolved_member_targets(
+                                    self.analyzer,
+                                    &type_outcome,
+                                    &member_report.member_name,
+                                    member_report.analysis.outcome,
+                                    Some(receiver_proof),
+                                    ledger.remaining_budget(),
+                                )
+                            } else if let ReceiverAnalysisOutcome::ExceededBudget { limit } =
+                                member_report.receiver_identity.outcome
+                            {
+                                ReceiverAnalysisOutcome::ExceededBudget { limit }
+                            } else {
+                                legacy_member_targets(
+                                    member_report.receiver_analysis.outcome,
+                                    member_report.analysis.outcome,
+                                    ledger.remaining_budget(),
+                                )
+                            },
                         ),
-                        work: member_report.analysis.work,
+                        member_range: Some(member_report.member_range),
+                        work: combined_receiver_work(
+                            member_report.analysis.work,
+                            member_report.receiver_identity.work,
+                        ),
                         candidates_truncated: member_report.analysis.candidates_truncated,
                         semantic_unsupported: None,
                     },
@@ -1266,6 +1453,7 @@ impl<'a> ReceiverQueryService<'a> {
                 operation,
                 site: report_site,
                 analysis,
+                member_range: None,
                 work: ledger.work(),
                 candidates_truncated: projection.truncated,
                 semantic_unsupported: None,
@@ -1327,13 +1515,30 @@ impl<'a> ReceiverQueryService<'a> {
                     return Ok(budget_report(operation, report_site, ledger.work(), limit));
                 }
             };
-            let (outcome, resolution_truncated) =
+            let (workspace_outcome, resolution_truncated) =
                 definition_outcome(outcome, ledger.remaining_budget().max_targets);
+            let receiver_proof = if static_type_reference {
+                Some(ReceiverIdentityProof::ExactStaticTypeReference)
+            } else if evidence.supports_precise() {
+                Some(ReceiverIdentityProof::ExactValueAnalysis)
+            } else {
+                None
+            };
+            let outcome = resolved_member_targets(
+                self.analyzer,
+                &type_outcome,
+                report_site
+                    .member_name
+                    .as_deref()
+                    .expect("member target site has a static member name"),
+                workspace_outcome,
+                receiver_proof,
+                ledger.remaining_budget(),
+            );
             let mut analysis = ReceiverQueryAnalysis::MemberTargets(outcome);
             let statically_bound_data_member =
                 structural_member_is_statically_bound_data_member(language, &analysis);
-            let evidence_supports_precision =
-                evidence.supports_precise() || statically_bound_data_member;
+            let evidence_supports_precision = evidence.supports_precise();
             let mut dispatch_supports_precise = statically_bound_data_member;
             if !statically_bound_data_member
                 && analysis_is_precise(&analysis)
@@ -1365,6 +1570,7 @@ impl<'a> ReceiverQueryService<'a> {
                 operation,
                 site: report_site,
                 analysis,
+                member_range: Some(member_range),
                 work: ledger.work(),
                 candidates_truncated: evidence.is_truncated() || resolution_truncated,
                 semantic_unsupported: evidence.unsupported_capability(),
@@ -1448,6 +1654,7 @@ impl<'a> ReceiverQueryService<'a> {
             operation,
             site: report_site,
             analysis,
+            member_range: None,
             work: ledger.work(),
             candidates_truncated: evidence.is_truncated() || projection.truncated,
             semantic_unsupported: evidence.unsupported_capability(),
@@ -1744,7 +1951,8 @@ impl<'a> ReceiverQueryService<'a> {
             let (outcome, truncated) =
                 definition_outcome(outcome, ledger.remaining_budget().max_targets);
             candidates_truncated |= truncated;
-            let mut analysis = ReceiverQueryAnalysis::MemberTargets(outcome);
+            let mut analysis =
+                ReceiverQueryAnalysis::MemberTargets(unowned_workspace_member_targets(outcome));
             if !supports_precise || candidates_truncated {
                 neutral_incomplete(&mut analysis);
             }
@@ -1759,6 +1967,7 @@ impl<'a> ReceiverQueryService<'a> {
                     member_name,
                 ),
                 analysis,
+                member_range: Some(node_range(member_node)),
                 work: ledger.work(),
                 candidates_truncated,
                 semantic_unsupported,
@@ -1819,6 +2028,7 @@ impl<'a> ReceiverQueryService<'a> {
                 type_outcome.types.push(TypeLookupType {
                     fqn,
                     definitions: receiver_owners,
+                    semantic_model_id: None,
                 });
             }
         }
@@ -2004,6 +2214,7 @@ impl<'a> ReceiverQueryService<'a> {
                 member_name,
             ),
             analysis,
+            member_range: None,
             work: ledger.work(),
             candidates_truncated,
             semantic_unsupported,
@@ -2088,6 +2299,12 @@ fn structural_member_dispatch_supports_precise(
     let [target] = targets.as_slice() else {
         return Ok(CompatibilityOutcome::Complete(false));
     };
+    if matches!(target, ReceiverMemberTarget::SemanticModel { .. }) {
+        return Ok(CompatibilityOutcome::Complete(true));
+    }
+    let target = target
+        .workspace_member()
+        .expect("non-modeled member target has a workspace declaration");
     check_cancelled(cancellation)?;
     if structural_member_is_statically_bound_data_member(language, analysis) {
         return Ok(CompatibilityOutcome::Complete(true));
@@ -2128,8 +2345,21 @@ fn structural_member_is_statically_bound_data_member(
     else {
         return false;
     };
-    matches!(targets.as_slice(), [target] if target.is_field())
-        && matches!(language, Language::Cpp | Language::Go)
+    matches!(
+        targets.as_slice(),
+        [ReceiverMemberTarget::SemanticModel { member, .. }]
+            if matches!(
+                member.kind,
+                SemanticModelSymbolKind::Field | SemanticModelSymbolKind::Property
+            )
+                && !member.provenance.ambiguous
+                && member.provenance.completeness
+                    == crate::analyzer::semantic_model::SemanticModelCompleteness::Complete
+    ) || (matches!(language, Language::Cpp | Language::Go)
+        && matches!(
+            targets.as_slice(),
+            [ReceiverMemberTarget::Workspace { member, .. }] if member.is_field()
+        ))
 }
 
 fn finalize_legacy_report(
@@ -2169,7 +2399,10 @@ fn apply_semantic_gate(
             // from the adapter's global capability surface. Query-local
             // uncertainty (including disabled call context) remains
             // non-precise.
-            if !evidence.supports_precise() && !evidence.legacy_provider_can_close() {
+            if !evidence.supports_precise()
+                && !evidence.legacy_provider_can_close()
+                && !legacy_external_model_identity_is_precise(analyzer, &report.analysis)
+            {
                 neutral_incomplete(&mut report.analysis);
             }
         }
@@ -2207,6 +2440,26 @@ fn legacy_external_model_identity_is_precise(
     analyzer: &dyn IAnalyzer,
     analysis: &ReceiverQueryAnalysis,
 ) -> bool {
+    if let ReceiverQueryAnalysis::MemberTargets(ReceiverAnalysisOutcome::Precise(targets)) =
+        analysis
+    {
+        return matches!(
+            targets.as_slice(),
+            [ReceiverMemberTarget::SemanticModel {
+                receiver, member, ..
+            }]
+                if !receiver.provenance.ambiguous
+                    && receiver.provenance.completeness
+                        == crate::analyzer::semantic_model::SemanticModelCompleteness::Complete
+                    && !member.provenance.ambiguous
+                    && member.provenance.completeness
+                        == crate::analyzer::semantic_model::SemanticModelCompleteness::Complete
+                    && matches!(
+                        member.kind,
+                        SemanticModelSymbolKind::Field | SemanticModelSymbolKind::Property
+                    )
+        );
+    }
     let ReceiverQueryAnalysis::Values(ReceiverAnalysisOutcome::Precise(values)) = analysis else {
         return false;
     };
@@ -2230,6 +2483,57 @@ fn legacy_external_model_identity_is_precise(
                 && matched.records[0].provenance.completeness
                     == crate::analyzer::semantic_model::SemanticModelCompleteness::Complete
         })
+}
+
+fn legacy_exact_modeled_receiver_proof(
+    analyzer: &dyn IAnalyzer,
+    type_outcome: &TypeLookupOutcome,
+    receiver_outcome: &ReceiverAnalysisOutcome<ReceiverValue>,
+    receiver_identity: &ReceiverAnalysisReport<ReceiverIdentityProof>,
+) -> Option<ReceiverIdentityProof> {
+    if type_outcome.status != TypeLookupStatus::Resolved {
+        return None;
+    }
+    let [ty] = type_outcome.types.as_slice() else {
+        return None;
+    };
+    let model_id = ty.semantic_model_id.as_deref()?;
+    let overlay = analyzer.semantic_model_overlay()?;
+    let owners = overlay.symbols_with_id(model_id);
+    let [owner] = owners.records.as_slice() else {
+        return None;
+    };
+    if owner.provenance.ambiguous
+        || owner.provenance.completeness
+            != crate::analyzer::semantic_model::SemanticModelCompleteness::Complete
+    {
+        return None;
+    }
+    if receiver_identity.candidates_truncated {
+        return None;
+    }
+    let ReceiverAnalysisOutcome::Precise(proofs) = &receiver_identity.outcome else {
+        return None;
+    };
+    let [proof] = proofs.as_slice() else {
+        return None;
+    };
+    match proof {
+        ReceiverIdentityProof::ExactValueAnalysis
+            if !matches!(
+                receiver_outcome,
+                ReceiverAnalysisOutcome::Precise(values)
+                    if matches!(values.as_slice(), [value]
+                        if value.owner().is_synthetic()
+                            && value.owner().fq_name() == owner.qualified_name)
+            ) =>
+        {
+            None
+        }
+        ReceiverIdentityProof::ExactValueAnalysis
+        | ReceiverIdentityProof::ExactStaticTypeReference
+        | ReceiverIdentityProof::ImmutableBinding { .. } => Some(proof.clone()),
+    }
 }
 
 fn legacy_external_module_identity_is_precise(analysis: &ReceiverQueryAnalysis) -> bool {
@@ -3265,6 +3569,242 @@ fn definition_outcome(
     (outcome, truncated)
 }
 
+fn resolved_member_targets(
+    analyzer: &dyn IAnalyzer,
+    type_outcome: &TypeLookupOutcome,
+    member_name: &str,
+    workspace_outcome: ReceiverAnalysisOutcome<CodeUnit>,
+    receiver_proof: Option<ReceiverIdentityProof>,
+    budget: ReceiverAnalysisBudget,
+) -> ReceiverAnalysisOutcome<ReceiverMemberTarget> {
+    let mut model_type_ids = type_outcome
+        .types
+        .iter()
+        .filter_map(|ty| ty.semantic_model_id.clone())
+        .collect::<Vec<_>>();
+    model_type_ids.sort();
+    model_type_ids.dedup();
+    if !model_type_ids.is_empty() {
+        let Some(receiver_proof) = receiver_proof else {
+            return ReceiverAnalysisOutcome::Unknown;
+        };
+        let Some(overlay) = analyzer.semantic_model_overlay() else {
+            return ReceiverAnalysisOutcome::Unsupported {
+                reason: "semantic_model_member_unavailable",
+            };
+        };
+        let mut targets = Vec::new();
+        let mut exact =
+            type_outcome.status == TypeLookupStatus::Resolved && model_type_ids.len() == 1;
+        let mut exhaustive_absence = true;
+        for owner_id in model_type_ids {
+            let owners = overlay.symbols_with_id(&owner_id);
+            let [owner] = owners.records.as_slice() else {
+                exact = false;
+                exhaustive_absence = false;
+                continue;
+            };
+            let matched = overlay.member_target_on_owner(&owner_id, member_name);
+            match matched.disposition {
+                SemanticModelMemberTargetDisposition::Unique => {
+                    let [member] = matched.records.as_slice() else {
+                        unreachable!("unique modeled member resolution has one record");
+                    };
+                    targets.push(ReceiverMemberTarget::SemanticModel {
+                        receiver: Box::new(ModeledDeclarationIdentity::from(*owner)),
+                        member: Box::new(ModeledDeclarationIdentity::from(*member)),
+                        receiver_proof: receiver_proof.clone(),
+                    });
+                    exhaustive_absence = false;
+                }
+                SemanticModelMemberTargetDisposition::Absent => {}
+                SemanticModelMemberTargetDisposition::Incomplete => {
+                    exact = false;
+                    exhaustive_absence = false;
+                    for member in matched.records {
+                        targets.push(ReceiverMemberTarget::SemanticModel {
+                            receiver: Box::new(ModeledDeclarationIdentity::from(*owner)),
+                            member: Box::new(ModeledDeclarationIdentity::from(member)),
+                            receiver_proof: receiver_proof.clone(),
+                        });
+                    }
+                }
+                SemanticModelMemberTargetDisposition::Conflict => {
+                    exact = false;
+                    exhaustive_absence = false;
+                    for member in matched.records {
+                        targets.push(ReceiverMemberTarget::SemanticModel {
+                            receiver: Box::new(ModeledDeclarationIdentity::from(*owner)),
+                            member: Box::new(ModeledDeclarationIdentity::from(member)),
+                            receiver_proof: receiver_proof.clone(),
+                        });
+                    }
+                }
+            }
+        }
+        targets.sort_by(|left, right| modeled_member_key(left).cmp(&modeled_member_key(right)));
+        targets.dedup();
+        if targets.is_empty() {
+            return if exhaustive_absence {
+                ReceiverAnalysisOutcome::Unknown
+            } else {
+                ReceiverAnalysisOutcome::Unsupported {
+                    reason: "semantic_model_member_incomplete",
+                }
+            };
+        }
+        let mut outcome = ReceiverAnalysisOutcome::single_precise_or_ambiguous(targets, budget);
+        if !exact && let ReceiverAnalysisOutcome::Precise(values) = outcome {
+            outcome = ReceiverAnalysisOutcome::Ambiguous(values);
+        }
+        return outcome;
+    }
+
+    // One resolved `TypeLookupType` is one logical receiver identity even when
+    // the language publishes several physical declarations for it (for
+    // example, C# partial classes). Keep the same representative projection as
+    // `receiver_targets`; pairing every physical part with the same member
+    // would manufacture ambiguity from one exact type.
+    let mut receivers = projected_type_definitions(type_outcome)
+        .cloned()
+        .collect::<Vec<_>>();
+    receivers.sort();
+    receivers.dedup();
+    if receivers.is_empty() {
+        // Definition resolution can still prove the selected member when the
+        // receiver type has no projectable declaration, such as Kotlin `this`
+        // inside an extension function. Preserve that exact member without
+        // inventing a receiver identity; identity-sensitive projections remain
+        // incomplete until the receiver itself is proven.
+        return unowned_workspace_member_targets(workspace_outcome);
+    }
+    let source_precise = type_outcome.status == TypeLookupStatus::Resolved
+        && type_outcome.types.len() == 1
+        && receivers.len() == 1;
+    let member_precise = workspace_outcome.is_precise();
+    match workspace_outcome {
+        ReceiverAnalysisOutcome::Precise(members) | ReceiverAnalysisOutcome::Ambiguous(members) => {
+            let mut targets = Vec::new();
+            for receiver in &receivers {
+                for member in &members {
+                    targets.push(ReceiverMemberTarget::Workspace {
+                        receiver: Some(receiver.clone()),
+                        member: member.clone(),
+                    });
+                }
+            }
+            let mut outcome = ReceiverAnalysisOutcome::single_precise_or_ambiguous(targets, budget);
+            if !(source_precise && member_precise)
+                && let ReceiverAnalysisOutcome::Precise(values) = outcome
+            {
+                outcome = ReceiverAnalysisOutcome::Ambiguous(values);
+            }
+            outcome
+        }
+        ReceiverAnalysisOutcome::Unknown => ReceiverAnalysisOutcome::Unknown,
+        ReceiverAnalysisOutcome::Unsupported { reason } => {
+            ReceiverAnalysisOutcome::Unsupported { reason }
+        }
+        ReceiverAnalysisOutcome::ExceededBudget { limit } => {
+            ReceiverAnalysisOutcome::ExceededBudget { limit }
+        }
+    }
+}
+
+fn legacy_member_targets(
+    receiver_outcome: ReceiverAnalysisOutcome<ReceiverValue>,
+    member_outcome: ReceiverAnalysisOutcome<CodeUnit>,
+    budget: ReceiverAnalysisBudget,
+) -> ReceiverAnalysisOutcome<ReceiverMemberTarget> {
+    let receiver_precise = receiver_outcome.is_precise();
+    let member_precise = member_outcome.is_precise();
+    let Some(receiver_values) = receiver_outcome.values() else {
+        return match receiver_outcome {
+            ReceiverAnalysisOutcome::Unknown => ReceiverAnalysisOutcome::Unknown,
+            ReceiverAnalysisOutcome::Unsupported { reason } => {
+                ReceiverAnalysisOutcome::Unsupported { reason }
+            }
+            ReceiverAnalysisOutcome::ExceededBudget { limit } => {
+                ReceiverAnalysisOutcome::ExceededBudget { limit }
+            }
+            ReceiverAnalysisOutcome::Precise(_) | ReceiverAnalysisOutcome::Ambiguous(_) => {
+                unreachable!("value-carrying receiver outcome was handled above")
+            }
+        };
+    };
+    let Some(members) = member_outcome.values() else {
+        return match member_outcome {
+            ReceiverAnalysisOutcome::Unknown => ReceiverAnalysisOutcome::Unknown,
+            ReceiverAnalysisOutcome::Unsupported { reason } => {
+                ReceiverAnalysisOutcome::Unsupported { reason }
+            }
+            ReceiverAnalysisOutcome::ExceededBudget { limit } => {
+                ReceiverAnalysisOutcome::ExceededBudget { limit }
+            }
+            ReceiverAnalysisOutcome::Precise(_) | ReceiverAnalysisOutcome::Ambiguous(_) => {
+                unreachable!("value-carrying member outcome was handled above")
+            }
+        };
+    };
+    let mut targets = Vec::new();
+    for receiver in receiver_values {
+        for member in members {
+            targets.push(ReceiverMemberTarget::Workspace {
+                receiver: Some(receiver.owner().clone()),
+                member: member.clone(),
+            });
+        }
+    }
+    let mut outcome = ReceiverAnalysisOutcome::single_precise_or_ambiguous(targets, budget);
+    if !(receiver_precise && member_precise)
+        && let ReceiverAnalysisOutcome::Precise(values) = outcome
+    {
+        outcome = ReceiverAnalysisOutcome::Ambiguous(values);
+    }
+    outcome
+}
+
+fn unowned_workspace_member_targets(
+    outcome: ReceiverAnalysisOutcome<CodeUnit>,
+) -> ReceiverAnalysisOutcome<ReceiverMemberTarget> {
+    match outcome {
+        ReceiverAnalysisOutcome::Precise(values) => ReceiverAnalysisOutcome::Precise(
+            values
+                .into_iter()
+                .map(|member| ReceiverMemberTarget::Workspace {
+                    receiver: None,
+                    member,
+                })
+                .collect(),
+        ),
+        ReceiverAnalysisOutcome::Ambiguous(values) => ReceiverAnalysisOutcome::Ambiguous(
+            values
+                .into_iter()
+                .map(|member| ReceiverMemberTarget::Workspace {
+                    receiver: None,
+                    member,
+                })
+                .collect(),
+        ),
+        ReceiverAnalysisOutcome::Unknown => ReceiverAnalysisOutcome::Unknown,
+        ReceiverAnalysisOutcome::Unsupported { reason } => {
+            ReceiverAnalysisOutcome::Unsupported { reason }
+        }
+        ReceiverAnalysisOutcome::ExceededBudget { limit } => {
+            ReceiverAnalysisOutcome::ExceededBudget { limit }
+        }
+    }
+}
+
+fn modeled_member_key(target: &ReceiverMemberTarget) -> (&str, &str) {
+    match target {
+        ReceiverMemberTarget::SemanticModel {
+            receiver, member, ..
+        } => (&receiver.id, &member.id),
+        ReceiverMemberTarget::Workspace { .. } => ("", ""),
+    }
+}
+
 fn current_receiver_owners(
     workspace: &WorkspaceAnalyzer,
     points_to: &SourcePointsToResult,
@@ -3387,6 +3927,7 @@ fn java_unknown_report(
             member_name,
         ),
         analysis,
+        member_range: None,
         work: ReceiverAnalysisWork::default(),
         candidates_truncated: false,
         semantic_unsupported: None,
@@ -3415,6 +3956,7 @@ fn budget_report(
         operation,
         site,
         analysis,
+        member_range: None,
         work,
         candidates_truncated: false,
         semantic_unsupported: None,
@@ -3439,6 +3981,7 @@ fn unknown_report(
         operation,
         site,
         analysis,
+        member_range: None,
         work,
         candidates_truncated,
         semantic_unsupported: None,
@@ -3549,6 +4092,7 @@ fn values_report(
         operation,
         site: site(file, language, node_range(node), source, node.kind(), None),
         analysis: ReceiverQueryAnalysis::Values(analysis.outcome),
+        member_range: None,
         work: analysis.work,
         candidates_truncated: analysis.candidates_truncated,
         semantic_unsupported: None,
@@ -3585,6 +4129,7 @@ fn unsupported_report(
             member_name: None,
         },
         analysis,
+        member_range: None,
         work: ReceiverAnalysisWork::default(),
         candidates_truncated: false,
         semantic_unsupported: None,

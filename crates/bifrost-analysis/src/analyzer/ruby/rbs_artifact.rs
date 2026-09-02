@@ -3,8 +3,9 @@ use tree_sitter::{Node, Parser};
 use crate::CancellationToken;
 use crate::analyzer::semantic_model::{
     ArtifactProducerLimits, BoundedProducerDiagnostics, HierarchyFact, HierarchyKind, Locator,
-    MemberFact, MemberIdentity, MemberKind, Parameter, ProducerDiagnostic, Signature, TypeFact,
-    TypeIdentity, TypeKind, TypeRef, Visibility, member_declaration_id, type_declaration_id,
+    MemberFact, MemberIdentity, MemberKind, Parameter, ProducerDiagnostic, Signature,
+    SuppressedDiagnostics, TypeFact, TypeIdentity, TypeKind, TypeRef, Visibility,
+    member_declaration_id, type_declaration_id,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -12,7 +13,7 @@ pub(crate) struct RbsProjection {
     pub types: Vec<TypeFact>,
     pub members: Vec<MemberFact>,
     pub diagnostics: Vec<ProducerDiagnostic>,
-    pub suppressed_diagnostics: usize,
+    pub suppressed_diagnostics: SuppressedDiagnostics,
     pub complete: bool,
     pub aliases: Vec<RubyMemberAlias>,
 }
@@ -277,7 +278,7 @@ pub(crate) fn project_rbs(
     RbsProjection {
         types,
         members,
-        complete: !partial && suppressed_diagnostics == 0,
+        complete: !partial && suppressed_diagnostics.total() == 0,
         diagnostics,
         suppressed_diagnostics,
         aliases,
@@ -408,6 +409,7 @@ fn project_constant(
             type_parameters: Vec::new(),
             type_parameter_constraints: Vec::new(),
             underlying_type: None,
+            value_semantics: None,
             embedded_types: Vec::new(),
             hierarchy: Vec::new(),
             aliases: Vec::new(),
@@ -443,6 +445,7 @@ fn project_constant(
         is_static: true,
         is_abstract: false,
         is_virtual: false,
+        implicit_operation: None,
         callable_family_complete: false,
         signature: Some(signature),
         receiver: None,
@@ -730,6 +733,7 @@ fn project_type(
         type_parameters,
         type_parameter_constraints: Vec::new(),
         underlying_type: None,
+        value_semantics: None,
         embedded_types: Vec::new(),
         hierarchy,
         aliases: Vec::new(),
@@ -810,6 +814,7 @@ fn project_attribute(
         is_static,
         is_abstract: false,
         is_virtual: true,
+        implicit_operation: None,
         callable_family_complete: false,
         signature: Some(signature),
         receiver: None,
@@ -924,6 +929,7 @@ fn project_method(
             is_static,
             is_abstract: false,
             is_virtual: true,
+            implicit_operation: None,
             callable_family_complete: false,
             signature: Some(signature),
             receiver: None,
@@ -1017,6 +1023,7 @@ fn project_parameters(
                 r#type: simple_type("untyped"),
                 optional: true,
                 variadic: true,
+                passing_mode: Default::default(),
             }),
             _ => {}
         }
@@ -1052,6 +1059,7 @@ fn project_keywords(
                     r#type,
                     optional,
                     variadic: false,
+                    passing_mode: Default::default(),
                 });
             }
             "splat_keyword" => {
@@ -1090,6 +1098,7 @@ fn function_parameter(
         r#type,
         optional,
         variadic,
+        passing_mode: Default::default(),
     })
 }
 
@@ -1866,7 +1875,7 @@ end
                 projection.diagnostics
             );
             assert!(
-                !projection.complete || projection.suppressed_diagnostics == 0,
+                !projection.complete || projection.suppressed_diagnostics.total() == 0,
                 "{source:?}"
             );
         }

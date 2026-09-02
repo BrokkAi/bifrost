@@ -1,0 +1,11 @@
+{
+  "$profileSchema": "jvm-compatibility",
+  "profileVersion": "0.1",
+  "constraints": {
+    "javaRelease": { "minimum": 17, "maximum": 21 },
+    "classFileMajor": { "minimum": 61, "maximum": 65 },
+    "targetPlatform": "jvm",
+    "kotlinMetadataVersion": [2, 1, 0],
+    "multiReleaseSelection": 17
+  }
+}

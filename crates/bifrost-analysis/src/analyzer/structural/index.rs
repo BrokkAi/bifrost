@@ -11,7 +11,7 @@ use super::index_query::{
     supports_exact_role_name_posting,
 };
 use super::kinds::{NormalizedKind, Role};
-use super::provider::{StructuralFactProvider, StructuralFactsCacheOutcome};
+use super::provider::{StructuralFactProvider, StructuralFactsCacheOutcome, StructuralIndexCensus};
 use crate::ProjectFile;
 use crate::analyzer::complete_value_cache::{
     CompleteValueAcquisition, CompleteValueCache, CompleteValueWait,
@@ -37,7 +37,9 @@ use std::time::Instant;
 // change derived index content (#2644).
 // Version 4: JSX element/attribute and object-property facts plus their
 // tag/attribute/child/key/value role postings change derived index content (#2645).
-pub const STRUCTURAL_INDEX_REPRESENTATION_VERSION: u32 = 4;
+// Version 5: `module` facts for module and namespace declarations change
+// derived index content (#2518).
+pub const STRUCTURAL_INDEX_REPRESENTATION_VERSION: u32 = 5;
 const MAX_INDEX_FILES: usize = 1_000_000;
 const MAX_INDEX_FACT_NODES: u64 = 100_000_000;
 const MAX_INDEX_SOURCE_BYTES: u64 = 16 * 1024 * 1024 * 1024;
@@ -46,6 +48,49 @@ const SOURCE_CANCELLATION_BATCH: usize = 64 * 1024;
 const SOURCE_FILTER_WORDS_PER_FILE: usize = 64;
 const MIN_KIND_NAME_POSTING_ROWS: usize = 128;
 const BUILD_WORKING_BYTES_MULTIPLIER: u64 = 3;
+/// Retained index bytes charged per indexed source byte, and per indexed file.
+///
+/// The posting arrays, their name keys, and the per-file trigram filter are
+/// what a finished index retains, and all three grow with the source. Measured
+/// on this repository (release build, warm cache) by building every provider's
+/// index with the budget lifted; retained bytes per source byte, and the
+/// residual per file once two bytes per source byte are charged:
+///
+/// | language   | files | source bytes | retained bytes | per source byte |
+/// |------------|-------|--------------|----------------|-----------------|
+/// | Rust       |  1998 |   64_535_673 |    103_636_999 |            1.61 |
+/// | JavaScript |   104 |      999_921 |      2_115_675 |            2.12 |
+/// | Python     |    81 |      803_333 |      1_431_105 |            1.78 |
+/// | TypeScript |    62 |      423_586 |        859_208 |            2.03 |
+/// | Go         |    12 |       69_223 |        162_805 |            2.35 |
+/// | C#         |    10 |        7_241 |         26_310 |            3.63 |
+/// | Ruby       |    20 |        2_457 |         21_814 |            8.88 |
+///
+/// The small providers are dominated by their per-file cost, not by their
+/// source: one `StructuralIndexFile`, one hash-table slot per posting map, and
+/// 512 bytes of trigram filter. Two bytes per source byte plus four kilobytes
+/// per file bounds every language measured from above, most closely Go at
+/// 1.15x and Rust at 1.32x, so the estimate rejects only what really cannot be
+/// retained.
+const RETAINED_INDEX_BYTES_PER_SOURCE_BYTE: u64 = 2;
+const RETAINED_INDEX_BYTES_PER_FILE: u64 = 4096;
+/// The share of the memo budget one provider keeps even when its source is a
+/// rounding error of the workspace's.
+///
+/// The per-file term above dominates a provider with a handful of tiny files:
+/// Ruby's twenty files here cost 21_814 retained bytes for 2_457 source bytes,
+/// which is 0.004% of this workspace's source and would apportion to under ten
+/// kilobytes. A floor keeps a small provider indexed instead of scanning
+/// forever, and ten of them cost 10/64 of the memo budget, so the apportioned
+/// parts plus the floors stay near one budget rather than one budget per
+/// provider.
+const MINIMUM_INDEX_BUDGET_DIVISOR: u64 = 64;
+/// The share a provider gets when it cannot census itself at all.
+///
+/// This is the fixed share every provider used before the workspace could size
+/// them, kept for third-party providers and for a project whose listing cannot
+/// be read.
+const UNCENSUSED_INDEX_BUDGET_DIVISOR: u64 = 4;
 /// Files whose facts are acquired in parallel per assembly step during index
 /// construction; bounds the transient working set the parallel prefetch can
 /// hold beyond the provider's own facts cache.
@@ -619,10 +664,61 @@ pub enum StructuralIndexAcquisition {
 #[derive(Clone)]
 pub struct SnapshotStructuralIndexCache {
     complete: CompleteValueCache<StructuralIndexKey, SnapshotStructuralIndex>,
-    max_retained_bytes: u64,
+    /// The whole memo budget every structural provider apportions between
+    /// them. One provider's own budget is derived from it per acquisition,
+    /// because only the provider's census says how much of the workspace's
+    /// source this provider is.
+    memo_budget_bytes: u64,
     auto_reuse_content: Arc<Mutex<Option<WorkspaceContentIdentity>>>,
     rejected: Arc<Mutex<Option<StructuralIndexRejection>>>,
     verdicts: Arc<ArtifactVerdictLog>,
+}
+
+/// What one provider's posting index would cost, and what it is allowed to
+/// cost.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ProviderIndexBudget {
+    estimated_retained_bytes: u64,
+    max_retained_bytes: u64,
+}
+
+/// Size one provider's posting index against the workspace it indexes.
+///
+/// A fixed per-provider share made the budget wrong in both directions on this
+/// repository (#2879): 64 MiB was thirteen times what nine of the ten
+/// providers retained together, and two thirds of what the Rust provider
+/// needed, so the one index worth having was the one rejected.
+///
+/// The apportioned term gives a provider the share of the memo budget its own
+/// source is of the workspace's, so the apportioned parts sum to exactly one
+/// memo budget however many providers there are. The floor keeps a provider
+/// whose index costs per file rather than per byte from being apportioned out
+/// of existence, and adds at most one sixty-fourth of the budget per provider
+/// on top. The estimate caps both, because a provider is never handed more
+/// budget than its own index can use, so the retained total is bounded by the
+/// workspace's own size whenever that is the smaller number.
+fn provider_index_budget(
+    memo_budget_bytes: u64,
+    census: StructuralIndexCensus,
+) -> ProviderIndexBudget {
+    let estimated_retained_bytes = census
+        .source_bytes
+        .saturating_mul(RETAINED_INDEX_BYTES_PER_SOURCE_BYTE)
+        .saturating_add(census.files.saturating_mul(RETAINED_INDEX_BYTES_PER_FILE));
+    // A provider's own source is part of the workspace's, so the share is at
+    // most one even when a stale listing says otherwise; a workspace with no
+    // source at all apportions nothing and leaves the floor to decide.
+    let workspace_source_bytes = census
+        .workspace_source_bytes
+        .max(census.source_bytes)
+        .max(1);
+    let apportioned =
+        memo_budget_bytes.saturating_mul(census.source_bytes) / workspace_source_bytes;
+    ProviderIndexBudget {
+        estimated_retained_bytes,
+        max_retained_bytes: estimated_retained_bytes
+            .min(apportioned.max(memo_budget_bytes / MINIMUM_INDEX_BUDGET_DIVISOR)),
+    }
 }
 
 /// Request-scoped structural-index lifecycle shared by serial and parallel
@@ -697,13 +793,17 @@ struct StructuralIndexRejection {
 }
 
 impl SnapshotStructuralIndexCache {
-    pub fn new(max_retained_bytes: u64) -> Self {
+    /// The ready cache holds whatever the per-provider budgets admit, so its
+    /// own capacity is the whole memo budget those budgets are apportioned
+    /// from: a provider's index is never larger than its budget, and the
+    /// budgets are what bounds the total.
+    pub fn new(memo_budget_bytes: u64) -> Self {
         Self {
             complete: CompleteValueCache::<StructuralIndexKey, SnapshotStructuralIndex>::new(
-                max_retained_bytes,
+                memo_budget_bytes,
                 |_, index| index.retained_bytes().clamp(1, u32::MAX as u64) as u32,
             ),
-            max_retained_bytes,
+            memo_budget_bytes,
             auto_reuse_content: Arc::new(Mutex::new(None)),
             rejected: Arc::new(Mutex::new(None)),
             verdicts: Arc::new(ArtifactVerdictLog::default()),
@@ -806,10 +906,53 @@ impl SnapshotStructuralIndexCache {
                         artifact: key.artifact(),
                     },
                 ));
+                let mut files = provider.structural_files();
+                files.sort();
+                files.dedup();
+                // Size this provider's budget against the workspace it shares,
+                // and do not spend a whole-snapshot build on postings that
+                // budget could never retain. The census prices the same files
+                // the build would walk, so a provider whose index cannot fit
+                // is rejected here for zero build work rather than after the
+                // build measures the finished index (#2879).
+                let max_retained_bytes = match provider.structural_index_census(&files) {
+                    Some(census) => {
+                        let budget = provider_index_budget(self.memo_budget_bytes, census);
+                        crate::profiling::note_with(|| {
+                            format!(
+                                "structural-index preflight language={:?} census={census:?} \
+                                 budget={budget:?}",
+                                provider.structural_language()
+                            )
+                        });
+                        if budget.estimated_retained_bytes > budget.max_retained_bytes {
+                            let reason: Arc<str> = Arc::from(format!(
+                                "structural index estimated retained-byte limit exceeded: \
+                                 {} estimated for {} files and {} source bytes exceeds the {} \
+                                 byte budget this provider holds of {} shared bytes",
+                                budget.estimated_retained_bytes,
+                                census.files,
+                                census.source_bytes,
+                                budget.max_retained_bytes,
+                                self.memo_budget_bytes
+                            ));
+                            self.record_rejection(key, Arc::clone(&reason));
+                            permit.publish_rejected();
+                            return StructuralIndexAcquisition::Unavailable {
+                                reason,
+                                wait,
+                                build: StructuralIndexBuildMetrics::default(),
+                            };
+                        }
+                        budget.max_retained_bytes
+                    }
+                    None => self.memo_budget_bytes / UNCENSUSED_INDEX_BUDGET_DIVISOR,
+                };
                 match build_index(
                     provider,
+                    files,
                     cancellation,
-                    self.max_retained_bytes,
+                    max_retained_bytes,
                     key.content_identity,
                 ) {
                     Ok((_index, build)) if cancellation.is_cancelled() => {
@@ -888,6 +1031,34 @@ impl SnapshotStructuralIndexCache {
             .lock()
             .expect("structural index Auto reuse lock poisoned")
             == Some(content_identity)
+    }
+
+    /// Whether a build for exactly this content is already running.
+    ///
+    /// A request that asks this has a cheaper answer available -- the scan the
+    /// index would have accelerated -- so it takes the scan instead of parking
+    /// behind a whole-snapshot build it did not start (#2879).
+    pub fn build_in_flight(&self, content_identity: WorkspaceContentIdentity) -> bool {
+        self.complete
+            .build_in_flight(&StructuralIndexKey::new(content_identity))
+    }
+
+    /// Whether a structural query has asked this provider's index to be reused
+    /// and nothing has answered yet: no retained index, and no deterministic
+    /// rejection.
+    ///
+    /// This is what the background warm builds and what leaves an analyzer
+    /// generation not yet warm. It is deliberately not "has an index": a
+    /// provider nothing has queried has nothing outstanding, and a provider
+    /// whose index was rejected for its budget has been answered.
+    pub fn auto_build_outstanding(&self, content_identity: WorkspaceContentIdentity) -> bool {
+        let key = StructuralIndexKey::new(content_identity);
+        self.auto_reuse_observed(content_identity)
+            && self.rejection_for(key).is_none()
+            && self
+                .complete
+                .get_ready(&key, &CancellationToken::default())
+                .is_none()
     }
 
     fn record_auto_reuse_opportunity(&self, content_identity: WorkspaceContentIdentity) {
@@ -1008,16 +1179,17 @@ fn working_budget_exceeded(estimated_working_bytes: u64, max_retained_bytes: u64
     estimated_working_bytes > max_retained_bytes.saturating_mul(BUILD_WORKING_BYTES_MULTIPLIER)
 }
 
+/// Build one provider's postings over `files`, which the caller has already
+/// ordered and deduplicated for the preflight census.
 fn build_index(
     provider: &dyn StructuralFactProvider,
+    files: Vec<ProjectFile>,
     cancellation: &CancellationToken,
     max_retained_bytes: u64,
     content_identity: WorkspaceContentIdentity,
 ) -> Result<(SnapshotStructuralIndex, StructuralIndexBuildMetrics), BuildFailure> {
     let started = Instant::now();
-    let mut files = provider.structural_files();
-    files.sort();
-    files.dedup();
+    debug_assert!(files.windows(2).all(|pair| pair[0] < pair[1]));
     let mut metrics = StructuralIndexBuildMetrics::default();
     if files.len() > MAX_INDEX_FILES || u32::try_from(files.len()).is_err() {
         return Err(unavailable_failure(
@@ -1413,6 +1585,18 @@ fn build_index(
         return Err(cancelled_failure(started, metrics));
     };
     index.retained_bytes = retained_bytes;
+    metrics.elapsed_ns = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+    // The measured counterpart of the preflight estimate: what the finished
+    // index actually retains for the source it indexed. This pair is how the
+    // estimate's bytes-per-source-byte constants stay calibrated.
+    crate::profiling::note_with(|| {
+        format!(
+            "structural-index built language={:?} metrics={metrics:?} retained_bytes={} \
+             max_retained_bytes={max_retained_bytes}",
+            provider.structural_language(),
+            index.retained_bytes
+        )
+    });
     if index.retained_bytes > max_retained_bytes {
         return Err(unavailable_failure(
             started,
@@ -1423,7 +1607,6 @@ fn build_index(
     if cancellation.is_cancelled() {
         return Err(cancelled_failure(started, metrics));
     }
-    metrics.elapsed_ns = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
     Ok((index, metrics))
 }
 
@@ -1548,10 +1731,57 @@ mod tests {
     struct FakeProvider {
         files: Vec<ProjectFile>,
         facts: HashMap<ProjectFile, Arc<FileFacts>>,
+        /// What this provider reports before a build. `None` models a
+        /// third-party provider that cannot answer, which leaves the build
+        /// governed by its own construction limits.
+        census: Option<StructuralIndexCensus>,
+        /// Holds every facts lookup until the test releases it, so a test can
+        /// observe an index build while it is still in flight.
+        gate: Option<Arc<BuildGate>>,
+    }
+
+    /// A latch the test opens to let a stalled build finish.
+    #[derive(Default)]
+    struct BuildGate {
+        released: Mutex<bool>,
+        changed: std::sync::Condvar,
+    }
+
+    impl BuildGate {
+        fn wait(&self) {
+            let mut released = self.released.lock().expect("build gate poisoned");
+            while !*released {
+                released = self.changed.wait(released).expect("build gate poisoned");
+            }
+        }
+
+        fn release(&self) {
+            *self.released.lock().expect("build gate poisoned") = true;
+            self.changed.notify_all();
+        }
     }
 
     fn content(seed: u64) -> WorkspaceContentIdentity {
         WorkspaceContentIdentity::for_test(seed)
+    }
+
+    /// Order the provider's files the way [`SnapshotStructuralIndexCache`]
+    /// does before it censuses and builds them.
+    fn build_index_for_test(
+        provider: &dyn StructuralFactProvider,
+        max_retained_bytes: u64,
+        content_identity: WorkspaceContentIdentity,
+    ) -> Result<(SnapshotStructuralIndex, StructuralIndexBuildMetrics), BuildFailure> {
+        let mut files = provider.structural_files();
+        files.sort();
+        files.dedup();
+        build_index(
+            provider,
+            files,
+            &CancellationToken::default(),
+            max_retained_bytes,
+            content_identity,
+        )
     }
 
     impl StructuralFactProvider for FakeProvider {
@@ -1569,11 +1799,18 @@ mod tests {
             self.files.clone()
         }
 
+        fn structural_index_census(&self, _files: &[ProjectFile]) -> Option<StructuralIndexCensus> {
+            self.census
+        }
+
         fn structural_source(&self, file: &ProjectFile) -> Option<String> {
             self.facts.get(file).map(|facts| facts.source().to_string())
         }
 
         fn structural_facts(&self, file: &ProjectFile) -> Option<Arc<FileFacts>> {
+            if let Some(gate) = &self.gate {
+                gate.wait();
+            }
             self.facts.get(file).cloned()
         }
 
@@ -1665,6 +1902,8 @@ mod tests {
         FakeProvider {
             files: vec![file.clone()],
             facts: HashMap::from_iter([(file, Arc::new(facts))]),
+            census: None,
+            gate: None,
         }
     }
 
@@ -1710,19 +1949,16 @@ mod tests {
         FakeProvider {
             files: vec![file.clone()],
             facts: HashMap::from_iter([(file, Arc::new(facts))]),
+            census: None,
+            gate: None,
         }
     }
 
     #[test]
     fn exact_kind_and_name_postings_select_dense_addresses() {
         let provider = provider();
-        let (index, metrics) = build_index(
-            &provider,
-            &CancellationToken::default(),
-            1024 * 1024,
-            content(1),
-        )
-        .expect("index builds");
+        let (index, metrics) =
+            build_index_for_test(&provider, 1024 * 1024, content(1)).expect("index builds");
         let requirements = StructuralAccessRequirements::new_for_test(vec![
             StructuralPostingTerm::Kinds(vec![NormalizedKind::Declaration]),
             StructuralPostingTerm::ExactName(vec!["App".to_string()]),
@@ -1748,13 +1984,8 @@ mod tests {
     #[test]
     fn non_redundant_kind_name_posting_is_selected() {
         let provider = ambiguous_name_provider();
-        let (index, _) = build_index(
-            &provider,
-            &CancellationToken::default(),
-            1024 * 1024,
-            content(1),
-        )
-        .expect("index builds");
+        let (index, _) =
+            build_index_for_test(&provider, 1024 * 1024, content(1)).expect("index builds");
         let requirements = StructuralAccessRequirements::new_for_test(vec![
             StructuralPostingTerm::Kinds(vec![NormalizedKind::Class]),
             StructuralPostingTerm::ExactName(vec!["Shared".to_string()]),
@@ -1784,13 +2015,8 @@ mod tests {
     #[test]
     fn source_filter_has_no_false_negatives_and_short_anchors_verify() {
         let provider = provider();
-        let (index, _) = build_index(
-            &provider,
-            &CancellationToken::default(),
-            1024 * 1024,
-            content(1),
-        )
-        .expect("index builds");
+        let (index, _) =
+            build_index_for_test(&provider, 1024 * 1024, content(1)).expect("index builds");
         let file = &provider.files[0];
 
         assert_eq!(
@@ -2009,6 +2235,153 @@ mod tests {
     }
 
     #[test]
+    fn census_over_budget_rejects_before_any_build_work() {
+        let mut provider = provider();
+        // The whole workspace is this provider's, so it is apportioned the
+        // whole memo budget below and still needs far more than that.
+        provider.census = Some(StructuralIndexCensus {
+            files: 4_096,
+            source_bytes: 64 * 1024 * 1024,
+            workspace_source_bytes: 64 * 1024 * 1024,
+        });
+        let cache = SnapshotStructuralIndexCache::new(1024 * 1024);
+
+        let StructuralIndexAcquisition::Unavailable { reason, build, .. } =
+            cache.acquire(&provider, &CancellationToken::default())
+        else {
+            panic!("an index that cannot be retained must not be built")
+        };
+
+        assert!(
+            reason.contains("estimated retained-byte limit exceeded"),
+            "unexpected rejection reason: {reason}"
+        );
+        // The whole point: the rejection costs no fact acquisition, no
+        // posting assembly, and no measured build time.
+        assert_eq!(build, StructuralIndexBuildMetrics::default());
+        assert_eq!(build.elapsed_ns, 0);
+        assert_eq!(build.files, 0);
+        assert_eq!(cache.len_for_test(), 0);
+    }
+
+    #[test]
+    fn a_build_in_flight_is_visible_to_a_caller_that_can_scan_instead() {
+        let gate = Arc::new(BuildGate::default());
+        let mut provider = provider();
+        provider.gate = Some(Arc::clone(&gate));
+        let content_identity = provider
+            .structural_content_identity()
+            .expect("fake provider states its content");
+        let cache = SnapshotStructuralIndexCache::new(16 * 1024 * 1024);
+        let cancellation = CancellationToken::default();
+
+        assert!(!cache.build_in_flight(content_identity));
+
+        std::thread::scope(|scope| {
+            let builder = scope.spawn(|| cache.acquire(&provider, &CancellationToken::default()));
+
+            // The flight is claimed before any fact is acquired, so a request
+            // that arrives now sees a build it must not follow, and no index.
+            let deadline = Instant::now() + std::time::Duration::from_secs(30);
+            while !cache.build_in_flight(content_identity) {
+                assert!(
+                    Instant::now() < deadline,
+                    "the build never claimed a flight"
+                );
+                std::thread::yield_now();
+            }
+            assert!(
+                cache.get_ready(content_identity, &cancellation).is_none(),
+                "an in-flight build must not present a half-built index"
+            );
+
+            gate.release();
+            assert!(matches!(
+                builder.join().expect("the build thread must not panic"),
+                StructuralIndexAcquisition::Ready {
+                    lifecycle: StructuralIndexLifecycle::Built,
+                    ..
+                }
+            ));
+        });
+
+        assert!(!cache.build_in_flight(content_identity));
+        assert!(
+            cache.get_ready(content_identity, &cancellation).is_some(),
+            "the request after the build must find the index"
+        );
+    }
+
+    #[test]
+    fn census_within_budget_still_builds() {
+        let mut provider = provider();
+        provider.census = Some(StructuralIndexCensus {
+            files: 1,
+            source_bytes: 64 * 1024,
+            workspace_source_bytes: 64 * 1024,
+        });
+        let cache = SnapshotStructuralIndexCache::new(16 * 1024 * 1024);
+
+        assert!(matches!(
+            cache.acquire(&provider, &CancellationToken::default()),
+            StructuralIndexAcquisition::Ready {
+                lifecycle: StructuralIndexLifecycle::Built,
+                ..
+            }
+        ));
+        assert_eq!(cache.len_for_test(), 1);
+    }
+
+    #[test]
+    fn a_minority_language_keeps_a_floor_of_the_shared_budget() {
+        let memo_budget_bytes = 256 * 1024 * 1024;
+        // A handful of tiny files whose index costs per file, not per byte:
+        // the Ruby shape measured in #2879.
+        let minority = StructuralIndexCensus {
+            files: 20,
+            source_bytes: 2_457,
+            workspace_source_bytes: 66_925_413,
+        };
+        let budget = provider_index_budget(memo_budget_bytes, minority);
+
+        assert!(
+            budget.max_retained_bytes >= budget.estimated_retained_bytes,
+            "a minority language must not be apportioned out of existence: {budget:?}"
+        );
+        assert_eq!(
+            budget.max_retained_bytes, budget.estimated_retained_bytes,
+            "a provider is never handed more budget than its own index can use"
+        );
+    }
+
+    #[test]
+    fn a_dominant_language_is_apportioned_more_than_a_fixed_share() {
+        let memo_budget_bytes = 256 * 1024 * 1024;
+        // The Rust slice of this repository, whose index needed 103_636_999
+        // retained bytes and was rejected by the old fixed memo/4 share.
+        let dominant = StructuralIndexCensus {
+            files: 1_998,
+            source_bytes: 64_535_673,
+            workspace_source_bytes: 66_925_413,
+        };
+        let budget = provider_index_budget(memo_budget_bytes, dominant);
+
+        assert!(
+            budget.max_retained_bytes > memo_budget_bytes / 4,
+            "a language holding 96% of the workspace source must outgrow the \
+             old fixed share: {budget:?}"
+        );
+        assert!(
+            budget.max_retained_bytes >= 103_636_999,
+            "the measured Rust index must now fit its budget: {budget:?}"
+        );
+        assert!(
+            budget.max_retained_bytes <= memo_budget_bytes,
+            "no provider may claim more than the shared budget: {budget:?}"
+        );
+    }
+
+    #[test]
     fn deterministic_rejection_is_reused_without_rebuilding_the_generation() {
         let provider = provider();
         let cache = SnapshotStructuralIndexCache::new(1);
@@ -2069,15 +2442,12 @@ mod tests {
         let provider = FakeProvider {
             files: vec![file.clone()],
             facts: HashMap::from_iter([(file, Arc::new(facts))]),
+            census: None,
+            gate: None,
         };
 
-        let failure = build_index(
-            &provider,
-            &CancellationToken::default(),
-            32 * 1024,
-            content(1),
-        )
-        .expect_err("identifier key must be rejected by construction budget");
+        let failure = build_index_for_test(&provider, 32 * 1024, content(1))
+            .expect_err("identifier key must be rejected by construction budget");
         assert!(matches!(
             failure,
             BuildFailure::Unavailable { reason, .. }
@@ -2141,13 +2511,8 @@ mod tests {
     #[test]
     fn cancelled_candidate_selection_stops_without_rows() {
         let provider = ambiguous_name_provider();
-        let (index, _) = build_index(
-            &provider,
-            &CancellationToken::default(),
-            1024 * 1024,
-            content(1),
-        )
-        .expect("index builds");
+        let (index, _) =
+            build_index_for_test(&provider, 1024 * 1024, content(1)).expect("index builds");
         let requirements = StructuralAccessRequirements::new_for_test(vec![
             StructuralPostingTerm::Kinds(vec![NormalizedKind::Class]),
             StructuralPostingTerm::ExactName(vec!["Shared".to_string()]),
@@ -2167,20 +2532,10 @@ mod tests {
     fn retained_census_grows_with_posting_content() {
         let simple = provider();
         let ambiguous = ambiguous_name_provider();
-        let (simple, _) = build_index(
-            &simple,
-            &CancellationToken::default(),
-            1024 * 1024,
-            content(1),
-        )
-        .expect("simple index builds");
-        let (ambiguous, _) = build_index(
-            &ambiguous,
-            &CancellationToken::default(),
-            1024 * 1024,
-            content(2),
-        )
-        .expect("larger index builds");
+        let (simple, _) =
+            build_index_for_test(&simple, 1024 * 1024, content(1)).expect("simple index builds");
+        let (ambiguous, _) =
+            build_index_for_test(&ambiguous, 1024 * 1024, content(2)).expect("larger index builds");
 
         assert!(ambiguous.retained_bytes() > simple.retained_bytes());
     }

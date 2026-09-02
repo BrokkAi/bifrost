@@ -12,12 +12,13 @@ use super::ids::{
     ControlEdgeId, ProcedureId, SemanticArtifactKey, SemanticLocator, SourceRevision,
 };
 use super::ir::{
-    AllocationKind, AllocationSite, ArgumentDomain, BasicBlock, CallableTarget,
+    AllocationKind, AllocationSite, ArgumentDomain, BackingStoreOffset, BasicBlock, CallableTarget,
     CallableTargetResolution, CallableValue, CaptureBinding, CaptureSource, ControlContinuation,
     ControlEdge, Evidence, EvidenceCompleteness, FormalMultiplicity, MemoryLocation,
     MemoryLocationKind, ProcedureSemantics, ProgramPoint, ProofStatus, SemanticArtifact,
     SemanticCallSite, SemanticEffect, SemanticEvent, SemanticGap, SemanticGapSubject,
-    SemanticValue, SemanticValueKind, SourceMapping, ValueFlowKind,
+    SemanticValue, SemanticValueKind, SourceMapping, TransferKind, TransferOperation,
+    ValueFlowKind,
 };
 use super::{
     DispatchBoundaryKind, IcfgBoundary, IcfgBoundaryKind, IcfgEdge, IcfgLimitKind, IcfgNodeKey,
@@ -514,11 +515,18 @@ fn write_value(writer: &mut dyn fmt::Write, value: &SemanticValue) -> fmt::Resul
         SemanticValueKind::LanguageDefined(kind) => {
             write!(writer, " :language-kind {}", quoted(kind))?;
         }
+        SemanticValueKind::Boolean(value) => {
+            write!(writer, " :boolean-value {value}")?;
+        }
+        SemanticValueKind::UnsignedInteger(value) => {
+            write!(writer, " :unsigned-value {value}")?;
+        }
         SemanticValueKind::Local
         | SemanticValueKind::Receiver { .. }
         | SemanticValueKind::Return
         | SemanticValueKind::Temporary
         | SemanticValueKind::Address
+        | SemanticValueKind::Null
         | SemanticValueKind::Constant
         | SemanticValueKind::Exception
         | SemanticValueKind::Callable
@@ -568,14 +576,33 @@ fn write_memory_location(writer: &mut dyn fmt::Write, location: &MemoryLocation)
             write_locator(writer, member)?;
             writer.write_char(')')?;
         }
-        MemoryLocationKind::Index { base, index } => {
-            write!(writer, " :base {base} :index {}", optional_id(*index))?;
+        MemoryLocationKind::Index {
+            base,
+            index,
+            constant_index,
+            identity,
+        } => {
+            write!(
+                writer,
+                " :base {base} :index {} :indexed-identity {}",
+                optional_id(*index),
+                quoted(identity.label())
+            )?;
+            if let Some(index) = constant_index {
+                write!(writer, " :constant-index {index}")?;
+            }
         }
         MemoryLocationKind::LexicalCell { binding } => {
             write!(writer, " :binding-value {binding}")?;
         }
-        MemoryLocationKind::Capture { lexical_parent } => {
+        MemoryLocationKind::Capture {
+            lexical_parent,
+            binding,
+        } => {
             write!(writer, " :lexical-parent {lexical_parent}")?;
+            if let Some(binding) = binding {
+                write!(writer, " :binding-value {binding}")?;
+            }
         }
     }
     write!(
@@ -620,9 +647,11 @@ fn write_capture(writer: &mut dyn fmt::Write, capture: &CaptureBinding) -> fmt::
 fn write_call_site(writer: &mut dyn fmt::Write, call_site: &SemanticCallSite) -> fmt::Result {
     write!(
         writer,
-        "(call-site :id {} :point {} :callee {} :receiver {} :arguments ",
+        "(call-site :id {} :point {} :invocation-mode {} :execution-timing {} :callee {} :receiver {} :arguments ",
         call_site.id,
         call_site.point,
+        quoted(call_site.invocation_mode.label()),
+        quoted(call_site.execution_timing.label()),
         call_site.callee,
         optional_id(call_site.receiver),
     )?;
@@ -871,6 +900,41 @@ fn write_event(writer: &mut dyn fmt::Write, index: usize, event: &SemanticEvent)
             if let ValueFlowKind::IndexedReturn { ordinal } = kind {
                 write!(writer, " :result-index {ordinal}")?;
             }
+            if let ValueFlowKind::Transfer(transfer) = kind {
+                write!(writer, " :transfer-kind {}", quoted(transfer.kind.label()))?;
+                match transfer.kind {
+                    TransferKind::Move { invalidation } => {
+                        write!(writer, " :invalidation {}", quoted(invalidation.label()))?;
+                    }
+                    TransferKind::Conversion { preservation } => {
+                        write!(writer, " :preservation {}", quoted(preservation.label()))?;
+                    }
+                    TransferKind::Copy
+                    | TransferKind::AggregateCopy
+                    | TransferKind::Boxing
+                    | TransferKind::Unboxing => {}
+                }
+                match transfer.operation {
+                    TransferOperation::None => {}
+                    TransferOperation::CallSite(call_site) => {
+                        write!(writer, " :operation-call-site {call_site}")?;
+                    }
+                    TransferOperation::Unknown => {
+                        writer.write_str(" :operation \"unknown\"")?;
+                    }
+                }
+            }
+            if let ValueFlowKind::BackingStore { offset } = kind {
+                match offset {
+                    BackingStoreOffset::Zero => writer.write_str(" :element-offset 0")?,
+                    BackingStoreOffset::Constant(offset) => {
+                        write!(writer, " :element-offset {offset}")?;
+                    }
+                    BackingStoreOffset::Value(value) => {
+                        write!(writer, " :element-offset-value {value}")?;
+                    }
+                }
+            }
         }
         SemanticEffect::ValueUse { kind, value } => {
             write!(writer, " :use-kind {} :value {value}", quoted(kind.label()))?;
@@ -898,6 +962,13 @@ fn write_event(writer: &mut dyn fmt::Write, index: usize, event: &SemanticEvent)
                 writer,
                 " :access-kind {} :location {location} :value {value}",
                 quoted(kind.label())
+            )?;
+        }
+        SemanticEffect::Synchronization { operation, subject } => {
+            write!(
+                writer,
+                " :operation {} :subject {subject}",
+                quoted(operation.label())
             )?;
         }
         SemanticEffect::CallableCreation { result, callable }
@@ -1679,6 +1750,8 @@ mod tests {
         let call_site = SemanticCallSite {
             id: super::super::ids::CallSiteId::new(0),
             point: ProgramPointId::new(4),
+            invocation_mode: crate::analyzer::semantic::CallInvocationMode::Ordinary,
+            execution_timing: crate::analyzer::semantic::ExecutionTiming::SameEvaluation,
             callee: super::super::ids::ValueId::new(0),
             receiver: None,
             arguments: Box::new([super::super::ir::SemanticCallArgument::direct(
@@ -1699,6 +1772,8 @@ mod tests {
         };
         let mut call_rendered = String::new();
         write_call_site(&mut call_rendered, &call_site).unwrap();
+        assert!(call_rendered.contains(":invocation-mode \"ordinary\""));
+        assert!(call_rendered.contains(":execution-timing \"same_evaluation\""));
         assert!(call_rendered.contains(":declared-targets"));
         assert!(call_rendered.contains(":kind \"unmaterialized\""));
         assert!(call_rendered.contains(":target-evidence 7"));
@@ -1996,6 +2071,7 @@ mod tests {
             id: super::super::ids::MemoryLocationId::new(0),
             kind: MemoryLocationKind::Capture {
                 lexical_parent: ProcedureId::new(0),
+                binding: None,
             },
             source,
             evidence,

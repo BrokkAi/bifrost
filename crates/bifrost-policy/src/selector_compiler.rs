@@ -366,8 +366,10 @@ pub(super) struct PolicySelectedCallBinding {
     pub(super) formal_index: usize,
     pub(super) formal_name: String,
     pub(super) semantic_target_id: String,
-    pub(super) signature_id: String,
-    pub(super) model_id: String,
+    pub(super) model_callable_id: String,
+    pub(super) formal_layout_id: String,
+    pub(super) signature_id: Option<String>,
+    pub(super) model_id: Option<String>,
     pub(super) pack_id: Option<String>,
     pub(super) selector_proof: &'static str,
     pub(super) selector_summary_id: Option<String>,
@@ -383,13 +385,19 @@ impl PolicySelectedCallBinding {
         debug_assert!(!self.site_ast_id.is_empty());
         debug_assert!(!self.argument_id.is_empty());
         debug_assert!(!self.semantic_target_id.is_empty());
-        debug_assert!(!self.signature_id.is_empty());
-        debug_assert!(!self.model_id.is_empty());
+        debug_assert!(!self.model_callable_id.is_empty());
+        debug_assert!(!self.formal_layout_id.is_empty());
+        debug_assert!(self.signature_id.as_ref().is_none_or(|id| !id.is_empty()));
+        debug_assert!(self.model_id.as_ref().is_none_or(|id| !id.is_empty()));
         debug_assert!(self.pack_id.as_ref().is_none_or(|pack| !pack.is_empty()));
         debug_assert!(matches!(
             self.selector_proof,
             "declared" | "derived" | "authored_summary"
         ));
+        debug_assert!(
+            self.selector_proof != "declared"
+                || (self.signature_id.is_some() && self.model_id.is_some())
+        );
         debug_assert_eq!(
             self.selector_proof == "authored_summary",
             self.selector_summary_id.is_some()
@@ -1089,7 +1097,8 @@ impl<'a> PolicySelectorSession<'a> {
                             matches!(
                                 upstream.1.result.results.get(row.row).map(|item| &item.value),
                                 Some(CodeQueryResultValue::CallBinding { value })
-                                    if value.model_id.as_deref() == Some(expected.as_str())
+                                    if value.model_callable_id.as_deref() == Some(expected.as_str())
+                                        || value.model_id.as_deref() == Some(expected.as_str())
                             )
                         })
                     }));
@@ -1203,18 +1212,20 @@ impl<'a> PolicySelectorSession<'a> {
                                 selector.path
                             ))
                         })?,
-                        signature_id: value.signature_id.clone().ok_or_else(|| {
+                        model_callable_id: value.model_callable_id.clone().ok_or_else(|| {
                             PolicySelectorSessionError::Unavailable(format!(
-                                "selector `{}` selected a binding without signature identity",
+                                "selector `{}` selected a binding without callable-family identity",
                                 selector.path
                             ))
                         })?,
-                        model_id: value.model_id.clone().ok_or_else(|| {
+                        formal_layout_id: value.formal_layout_id.clone().ok_or_else(|| {
                             PolicySelectorSessionError::Unavailable(format!(
-                                "selector `{}` selected a binding without model identity",
+                                "selector `{}` selected a binding without formal-layout identity",
                                 selector.path
                             ))
                         })?,
+                        signature_id: value.signature_id.clone(),
+                        model_id: value.model_id.clone(),
                         pack_id: value.pack_id.clone(),
                         selector_proof: if declared_output {
                             "declared"
@@ -1766,6 +1777,38 @@ impl<'a> PolicySelectorSession<'a> {
                 PolicyWorkUnit::Count,
                 semantic_peaks.traversal_steps,
             ),
+            // The next three were once reported only when their counters had
+            // moved, so a compile that materialized no value-flow snapshot
+            // (#2284), saw no artifact-cache handle reuse (#2289), or took no
+            // result-contract lease was not given a permanent zero. That
+            // reasoning is reversed here, because the name set is not free.
+            // Retention accounting sums metric name capacities
+            // (`PolicyWorkReport::retained_size` feeds `PolicyRun`'s), and the
+            // evaluator's retention search decides how many findings a run
+            // keeps from that size. A name set that depends on the run's data
+            // therefore makes the *retained finding set* depend on it, which
+            // the incremental diff-base work
+            // (`.agents/plans/impact-sliced-diff-base.md`) cannot tolerate: it
+            // has to prove a reused-result report is byte-identical to a full
+            // one. Emitting them always makes the name set a function of the
+            // policy family and the `analysis` label alone, and #2659 already
+            // settled that a permanent zero is the honest signal -- it says
+            // the compile did none of this work, not that nothing was measured.
+            (
+                "semantic_snapshot_materializations",
+                PolicyWorkUnit::Count,
+                usize::try_from(self.semantic_snapshot_materializations).unwrap_or(usize::MAX),
+            ),
+            (
+                "semantic_handle_identity_reuses",
+                PolicyWorkUnit::Count,
+                usize::try_from(self.semantic_handle_identity_reuses).unwrap_or(usize::MAX),
+            ),
+            (
+                "semantic_result_contract_artifact_leases",
+                PolicyWorkUnit::Count,
+                self.result_contract_artifact_leases,
+            ),
         ]
         .into_iter()
         .filter_map(|(name, unit, value)| {
@@ -1776,50 +1819,6 @@ impl<'a> PolicySelectorSession<'a> {
             )
             .ok()
         })
-        // Reported only by an analysis that materializes value-flow snapshots,
-        // so an analysis that never does is not given a permanent zero (#2284).
-        .chain(
-            (self.semantic_snapshot_materializations > 0)
-                .then(|| {
-                    PolicyWorkMetric::try_new(
-                        format!("{analysis}.semantic_snapshot_materializations"),
-                        PolicyWorkUnit::Count,
-                        self.semantic_snapshot_materializations,
-                    )
-                    .ok()
-                })
-                .flatten(),
-        )
-        // Reported only when artifact-cache pressure actually presented one
-        // procedure through two materializations, so an ordinary compile is
-        // not given a permanent zero (#2289).
-        .chain(
-            (self.semantic_handle_identity_reuses > 0)
-                .then(|| {
-                    PolicyWorkMetric::try_new(
-                        format!("{analysis}.semantic_handle_identity_reuses"),
-                        PolicyWorkUnit::Count,
-                        self.semantic_handle_identity_reuses,
-                    )
-                    .ok()
-                })
-                .flatten(),
-        )
-        // Report only when a result-contract receipt actually contributes a
-        // new exact allocation. This distinguishes immediate bounded adoption
-        // from a later materialization that happens to retain the same file.
-        .chain(
-            (self.result_contract_artifact_leases > 0)
-                .then(|| {
-                    PolicyWorkMetric::try_new(
-                        format!("{analysis}.semantic_result_contract_artifact_leases"),
-                        PolicyWorkUnit::Count,
-                        u64::try_from(self.result_contract_artifact_leases).unwrap_or(u64::MAX),
-                    )
-                    .ok()
-                })
-                .flatten(),
-        )
         .collect();
         PolicyWorkReport::try_new(
             self.query_work.scanned_files,
@@ -2228,6 +2227,26 @@ pub(super) fn selected_site_quality(
                     )
                 },
             ),
+            CodeQueryResultValue::FieldWriteValue { value } => (
+                if value.proof == "precise" {
+                    ProofStatus::Proven
+                } else {
+                    ProofStatus::Unproven(
+                        format!("field-write proof is {}", value.proof).into(),
+                    )
+                },
+                if value.completeness == "complete" && value.coverage == "exhaustive" {
+                    EvidenceCompleteness::Complete
+                } else {
+                    EvidenceCompleteness::Partial(
+                        format!(
+                            "field-write evidence is completeness={}, coverage={}",
+                            value.completeness, value.coverage
+                        )
+                        .into(),
+                    )
+                },
+            ),
             // An edge row carries its own proof attribution, exactly as a
             // reference site does; set-level completeness is the query's
             // diagnostics' business (#1479).
@@ -2302,6 +2321,7 @@ pub(super) fn selected_site_quality(
                 rewrite_path_completeness(value.completeness, &value.uncovered_domains),
             ),
             CodeQueryResultValue::ReceiverAnalysis { .. }
+            | CodeQueryResultValue::MemberTargetAnalysis { .. }
             | CodeQueryResultValue::FlowEndpoint { .. }
             | CodeQueryResultValue::FlowWitness { .. } => (
                 ProofStatus::Unproven("selector evidence is not exact".into()),
@@ -2529,6 +2549,80 @@ pub(super) fn selected_site_quality(
                     )
                 },
             ),
+            CodeQueryResultValue::NilnessOperation { value } => (
+                if value.proof == "exact" {
+                    ProofStatus::Proven
+                } else {
+                    ProofStatus::Unproven(
+                        value.reason.unwrap_or("nilness proof is open").into(),
+                    )
+                },
+                if value.coverage == "exhaustive" {
+                    EvidenceCompleteness::Complete
+                } else {
+                    EvidenceCompleteness::Partial(
+                        value.reason.unwrap_or("nilness coverage is open").into(),
+                    )
+                },
+            ),
+            CodeQueryResultValue::SwitchCoverage { value } => (
+                if value.proof == "exact" {
+                    ProofStatus::Proven
+                } else {
+                    ProofStatus::Unproven(
+                        value.reason.unwrap_or("switch coverage proof is open").into(),
+                    )
+                },
+                if value.verdict == "unknown" {
+                    EvidenceCompleteness::Partial(
+                        value.reason.unwrap_or("switch coverage is unknown").into(),
+                    )
+                } else {
+                    EvidenceCompleteness::Complete
+                },
+            ),
+            CodeQueryResultValue::ConcurrentAccessConflict { value } => (
+                if value.proof == "proven" {
+                    ProofStatus::Proven
+                } else {
+                    ProofStatus::Unproven(
+                        value
+                            .reasons
+                            .first()
+                            .map(String::as_str)
+                            .unwrap_or("concurrent access proof is open")
+                            .into(),
+                    )
+                },
+                if value.coverage == "exhaustive" {
+                    EvidenceCompleteness::Complete
+                } else {
+                    EvidenceCompleteness::Partial(
+                        value
+                            .reasons
+                            .first()
+                            .map(String::as_str)
+                            .unwrap_or("concurrent access coverage is open")
+                            .into(),
+                    )
+                },
+            ),
+            CodeQueryResultValue::DetachedTaskTransfer { value } => (
+                if value.proof == "exact" {
+                    ProofStatus::Proven
+                } else {
+                    ProofStatus::Unproven(
+                        value.reason.unwrap_or("detached object identity is open").into(),
+                    )
+                },
+                if value.coverage == "exhaustive" {
+                    EvidenceCompleteness::Complete
+                } else {
+                    EvidenceCompleteness::Partial(
+                        value.reason.unwrap_or("detached object identity is open").into(),
+                    )
+                },
+            ),
             CodeQueryResultValue::StructuralMatch { .. }
             | CodeQueryResultValue::Declaration { .. }
             | CodeQueryResultValue::File { .. }
@@ -2708,7 +2802,7 @@ mod tests {
     use brokk_bifrost_rql::structural::CodeQuery;
 
     const EXACT_EXTERNAL_RECEIVER_MODEL: &str = r#"{
-  "schema_version": 1,
+  "schema_version": 2,
   "pack_id": "bifrost.test.go.external-receiver",
   "version": "1.0.0",
   "producer": { "name": "bifrost-test", "version": "1.0.0" },

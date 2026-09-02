@@ -5,6 +5,172 @@ analysis behavior, integrations, and release artifacts. It is curated from the
 complete private release range because the public open-core repository is a
 projection and its commit history does not contain every source commit.
 
+## [0.10.9] - 2026-09-03
+
+### Added
+
+- A `--diff-base` policy run now persists what it evaluated in the
+  repository's analyzer cache and reuses it. Each policy's per-file evaluation
+  units are stored with the exact inputs they read, and a completed base
+  evaluation is stored under the base subtree's git tree id, so a second run
+  against the same base neither exports nor builds the base revision and
+  recomputes only the units whose recorded inputs can have changed. The report
+  gains an additive `incremental` section reporting what was reused, what was
+  recomputed, and why any policy was evaluated in full; findings, identities,
+  diagnostics, completion tiers and exit status are unchanged. `bifrost
+  --no-incremental` and the `run_policy` MCP parameter `incremental: false`
+  force the full dual-snapshot evaluation for comparison.
+
+- CodeQuery/RQL gained the `module` normalized kind, a `declaration` subtype
+  that matches a module or namespace declaration and encloses everything
+  written inside it, so `(not-inside (module :name "tests") ...)` is now
+  expressible. Rust `mod`, C# block and file-scoped `namespace`, C++ and PHP
+  `namespace`, and Ruby `module` produce the kind; a Ruby `module` is
+  therefore no longer reported as a `class`. Languages whose module structure
+  is a file-level clause rather than a container keep reporting a capability
+  diagnostic.
+
+- The Rust CodeQuery/RQL adapter now answers the `decorators` role. An outer
+  attribute is a `decorator` edge on the declaration it annotates, so
+  `(function :decorators [(name "test")])` and
+  `(class :decorators [(name "derive")])` match instead of returning an
+  `unsupported_structural_feature` diagnostic.
+
+- Added the `bifrost scan [PATH]` subcommand: the zero-configuration
+  shipped-product entry point. A scan evaluates every built-in policy pack on
+  one project path (default: the current directory), witnesses the activated
+  pack identities, versions, and catalog SHA-256 on stderr in the same line
+  shape `--version` prints, and shares the policy exit contract.
+  `bifrost scan --list-builtin-policies` prints the shipped catalog without
+  running anything. The subcommand is additive: the flag-based policy
+  surface, which benchmark-controlled runs configure explicitly, is
+  unchanged, and a build that ships no packs scans to a clean, empty result
+  rather than erroring.
+
+- The standalone CLI now activates every built-in policy pack by default: a
+  policy invocation with no `--policy-file` and no built-in selector (plainly
+  `bifrost --policy`) evaluates the shipped catalog, an explicit selection
+  replaces that default, and `--no-builtin-policies` keeps controlled runs
+  free of shipped policies. `bifrost --version` now records each shipped
+  pack's id, version, and policy count plus a catalog SHA-256, so a
+  shipped-catalog change is a visible version event.
+
+- Added CSMI v0.1 logical-pack import, export, offline schema validation, and
+  RFC 8785 canonicalization for exact Maven/JVM declaration and procedure-
+  summary models. Artifact digests and callable identities remain exact, while
+  unsupported effects, locations, identity profiles, and required
+  vocabularies fail closed with typed diagnostics. The semantic-pack CLI can
+  now check standalone CSMI documents and manifest-relative logical packs with
+  stable human or JSON diagnostics.
+
+- Semantic-model call binding now resolves exact Python targets and Kotlin
+  external-dispatch identities, while ambiguous or unmodeled routes remain
+  explicit.
+
+- Added `bifrost.correctness.go-wrong-error-on-failure-path`, which reports a
+  call returned from an exact reviewed Go API failure edge when it consumes a
+  different error binding proven to still hold Go's zero value. Correct error
+  propagation, deliberate non-nil sentinels, unrelated same-named APIs, and
+  incomplete origins remain outside the finding set.
+
+### Changed
+
+- A policy run no longer forwards the CodeQuery `broad_query` advisory as a
+  policy diagnostic. The advisory is a measurement of the execution that raised
+  it -- its message renders that execution's own scanned-file and scanned-byte
+  counters, which the report's `work` section already carries -- and the advice
+  it gives, to add an anchor or a language filter, is for an interactive
+  `query_code` caller rather than for a policy that audits the whole workspace
+  by design. Keeping it also made a report's bytes and its retention boundary
+  depend on how a run was executed rather than on what the workspace contains.
+  Every other query diagnostic is forwarded unchanged.
+
+- JavaScript and TypeScript now treat Node's `node:` module scheme as spelling
+  rather than identity. `import fs from 'node:fs'` and `import fs from 'fs'`
+  name one module, so they mint one external owner, one package identity, and
+  one discovery evidence entry across import binding, receiver analysis,
+  external-callee owners, and semantic diagnostics. A semantic pack authored
+  for the bare builtin now binds both spellings, so the shipped JavaScript and
+  TypeScript golden summary packs (0.4.0) and the Node child-process
+  declaration packs (0.2.0) no longer duplicate every module entry per
+  spelling.
+
+- The MCP `query_code` structural search path now reads analyzed source blobs
+  without hydrating full file state when the query only needs source text,
+  substantially reducing warm whole-workspace query latency.
+
+- The built-in OWASP XSS policy now limits servlet response sinks to exact
+  `PrintWriter` calls, avoiding broader same-surface matches.
+
+- Upgraded `bifrost.code-smells` to 2.7.0 for the exact Go failure-path error
+  policy. Its initial scope is limited to arguments of calls whose result is
+  returned; direct returns and statement-only calls remain available through
+  RQL but are not yet built-in findings.
+
+### Fixed
+
+- Extension capability negotiation now derives from the same published
+  capability table as the extension workspace report, so clients can require
+  every capability the report marks as served.
+
+- C/C++ definition lookup now preserves structured preprocessor-guard context
+  across unrelated macro definitions, resolving guarded same-file typedef
+  parameters without a spurious include-boundary diagnostic.
+
+- CodeQuery/RQL now enforces every list role. The `elements`, `attributes`,
+  and `children` patterns were decoded and documented but never checked, so
+  `(collection_literal :elements [(numeric_literal)])` matched a literal of
+  strings and a JSX attribute or child list narrowed nothing. All five list
+  roles now read the same way, the rule `args` always used: each listed
+  pattern must match a distinct edge of that role in source order. That also
+  tightens `decorators`, which previously let two patterns match one
+  annotation and accepted any order.
+
+- `query_code` full-detail rows now carry their own source columns even when
+  an earlier row in the same answer resolved into their file. Rendering
+  hydrates a bounded set of sources, and a file that was consulted for a
+  nested reference target before its own rows were rendered was recorded as
+  having no source at all, so every row of that file reported column 1 for
+  both ends of its range while its lines stayed correct. Which rows were
+  affected depended on the order the answer happened to render, so the same
+  row could report different columns in a workspace-wide query and in a
+  path-scoped one.
+
+- When a `--diff-base` run repairs more than 256 base findings, the diff
+  review's `fixed` list now deterministically retains the 256 smallest
+  `(policy_id, finding_id)` identities in sorted order. Previously the
+  retained subset was taken in hash-map iteration order before sorting, so two
+  runs of the same build over the same inputs could report different entries
+  while agreeing on `fixed_count`.
+
+- The base revision of a `--diff-base` run is now analyzed with the same
+  analyzer configuration as the head, including a configuration a host such as
+  the MCP server or the LSP session supplied. The base previously built with
+  the analyzer defaults, so dependency discovery, dispatch expansion, and
+  per-language behavior could differ from the head whose findings it was joined
+  with.
+
+- The exported base revision of a `--diff-base` run now honors the
+  `.bifrostignore` file that revision commits, so a file the head excludes from
+  analysis no longer contributes base findings that the diff reports as fixed.
+  Ignored paths stay in the file view on both sides, as they always have.
+
+- Watched workspaces now keep overlays and linked-worktree updates coherent
+  across file deletion and other incremental changes, with background reads
+  anchored to the selected analyzer generation.
+
+- LSP position conversion and word lookup now handle CRLF and multibyte text
+  without offset errors, dropped blank snippet rows, or panics.
+
+- Semantic-pack activation retries transient catalog locks and reports rejected
+  source entries instead of silently treating them as usable pack input.
+
+- `bifrost.code-smells` 2.10.0 extends the small-fixed-literal exclusion to
+  serialization, regular-expression compilation, sleeps, network and database
+  calls, subprocess launches, expensive operations, and nested loops. The
+  policies now report as assertion findings, so their finding identities
+  changed and existing suppression records for them need re-keying.
+
 ## [0.10.8] - 2026-08-31
 
 ### Added

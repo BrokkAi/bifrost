@@ -389,6 +389,25 @@ pub fn kotlin_type_name_components(node: Node<'_>, source: &str) -> Option<Vec<S
     None
 }
 
+/// The type parameters `node` declares, in declaration order.
+///
+/// Read from the `type_parameters` child rather than from a field, because the
+/// grammar names no field for it. Both `class Box<T>` and `fun <T> f()` carry
+/// it, and a declaration without the child writes no parameters at all.
+pub fn kotlin_declared_type_parameter_names(node: Node<'_>, source: &str) -> Vec<String> {
+    let Some(parameters) = first_named_child_of_kind(node, "type_parameters") else {
+        return Vec::new();
+    };
+    named_children(parameters)
+        .into_iter()
+        .filter(|child| child.kind() == "type_parameter")
+        .filter_map(|parameter| first_named_child_of_kind(parameter, "type_identifier"))
+        .map(|name| name.utf8_text(source.as_bytes()).unwrap_or_default())
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
 pub fn kotlin_type_spelling(node: Node<'_>, source: &str) -> Option<String> {
     kotlin_type_name_components(node, source).map(|components| components.join("."))
 }

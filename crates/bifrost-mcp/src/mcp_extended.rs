@@ -109,6 +109,7 @@ fn query_step_input_variants() -> Vec<Value> {
                 && !op.allows_call_options()
                 && !op.allows_call_site_options()
                 && !op.allows_receiver_options()
+                && !op.allows_field_write_value_options()
                 && !op.allows_typestate_options()
                 && !op.allows_value_flow_options()
                 && !op.allows_taint_options()
@@ -155,6 +156,12 @@ fn query_step_input_variants() -> Vec<Value> {
         .iter()
         .copied()
         .filter(|op| op.allows_receiver_options())
+        .map(|op| op.label())
+        .collect::<Vec<_>>();
+    let field_write_value_steps = ALL_QUERY_STEP_OPS
+        .iter()
+        .copied()
+        .filter(|op| op.allows_field_write_value_options())
         .map(|op| op.label())
         .collect::<Vec<_>>();
     let typestate_steps = ALL_QUERY_STEP_OPS
@@ -269,6 +276,24 @@ fn query_step_input_variants() -> Vec<Value> {
                 "depth": { "type": "integer", "minimum": 1 }
             },
             "required": ["op", "depth"],
+            "additionalProperties": false
+        }),
+        json!({
+            "type": "object",
+            "properties": {
+                "op": { "type": "string", "enum": field_write_value_steps },
+                "receiver_identity_id": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": QueryStepField::ReceiverIdentityId.description()
+                },
+                "member_target_id": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": QueryStepField::MemberTargetId.description()
+                }
+            },
+            "required": ["op"],
             "additionalProperties": false
         }),
         json!({
@@ -1008,7 +1033,7 @@ pub(crate) fn extended_tool_descriptors() -> Vec<Value> {
         ),
         tool_descriptor(
             "list_policies",
-            "List the deterministic built-in policy-pack manifest, including stable policy ids, categories, supported languages, capabilities, and semantic hashes. Does not construct or query a workspace analyzer.",
+            "List the deterministic built-in policy catalog, including stable pack, policy, category, language, capability, and semantic-hash metadata. Does not construct or query a workspace analyzer.",
             json!({
                 "type": "object",
                 "properties": {},
@@ -1112,6 +1137,11 @@ pub(crate) fn extended_tool_descriptors() -> Vec<Value> {
                         "minLength": 1,
                         "maxLength": MAX_RUN_POLICY_DIFF_BASE_BYTES,
                         "description": "Optional git revision to diff against: the same policies also evaluate that commit's content, each finding is classified new or persisting, and only new findings gate. Any revision git rev-parse accepts."
+                    },
+                    "incremental": {
+                        "type": "boolean",
+                        "default": true,
+                        "description": "When false, every policy is evaluated in full instead of reusing per-unit results a previous run published in this repository's analyzer cache. Reuse produces the same findings; turn it off only to compare against the full dual-snapshot evaluation."
                     },
                     "include_stage_timings": {
                         "type": "boolean",
@@ -1513,6 +1543,7 @@ mod tests {
                 op.allows_call_options(),
                 op.allows_call_site_options(),
                 op.allows_receiver_options(),
+                op.allows_field_write_value_options(),
                 op.allows_typestate_options(),
                 op.allows_value_flow_options(),
                 op.allows_taint_options(),

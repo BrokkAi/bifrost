@@ -33,10 +33,13 @@ mod multi_analyzer;
 pub mod packs_document;
 mod php;
 mod python;
+pub mod read_ledger;
+pub mod read_verification;
 pub mod reference_candidates;
 pub(crate) mod relational_frontier;
 mod ruby;
 mod rust;
+pub(crate) use rust::crate_identity::RustOverlayCrates;
 mod scala;
 pub mod semantic;
 pub mod semantic_model;
@@ -122,7 +125,7 @@ pub use csharp::external::{
 // block's consumers with it. What remains is what the parked definition route
 // (`usages/get_definition/csharp.rs`, `usages/get_type/csharp.rs`) and the
 // framework hub still read.
-pub use analyzer_definition_lookup::AnalyzerDefinitionLookup;
+pub use analyzer_definition_lookup::{AnalyzerDefinitionLookup, DefinitionLookupMemo};
 pub(crate) use analyzer_definition_lookup::{ForwardQueryProvider, impl_forward_query_provider};
 pub(crate) use csharp::{
     csharp_attribute_name_node, csharp_attribute_type_names, csharp_callable_arity,
@@ -137,6 +140,12 @@ pub use fq_name::FqName;
 pub(crate) use brokk_bifrost_go::packages::{
     GO_MODULE_SCOPE_SEGMENT, GoModuleRoot, go_internal_import_allowed, go_module_roots,
 };
+/// The git object id a [`ReadKey::File`] and a policy unit's seed partition
+/// name their blob by.
+///
+/// Re-exported because those types are public and a consumer outside this
+/// crate cannot otherwise name the type of a field it holds.
+pub use git2::Oid;
 pub use go::{
     GoAnalyzer, GoDependencyPackAdapter, GoModulePackProducer, GoPinnedPackage,
     resolve_go_semantic_pack_dependencies,
@@ -158,7 +167,9 @@ pub use js_ts::{
     TypeScriptDeclarationPackProducer, TypeScriptLibraryActivationOutcome,
     resolve_js_ts_semantic_pack_dependencies, typescript_library_activation_evidence,
 };
-pub use jvm::external::{JvmDependencyPackAdapter, resolve_jvm_semantic_pack_dependencies};
+pub use jvm::external::{
+    JdkVersion, JvmDependencyPackAdapter, resolve_jvm_semantic_pack_dependencies,
+};
 pub use jvm::java_artifact::JavaJarPackProducer;
 pub use jvm::jdk_artifact::{JdkSourceArchiveLayout, JdkSourceArchivePackProducer};
 pub use jvm::kotlin_artifact::KotlinSourceJarPackProducer;
@@ -189,11 +200,14 @@ pub use php::{
     PhpAnalyzer, PhpUseAliases, parse_php_use_aliases, parse_php_use_aliases_by_kind,
     parse_php_use_aliases_from_source, php_namespace_to_fq,
 };
-pub(crate) use pool_memo::{KeyedPoolSafeMemo, PoolSafeMemo, spawn_on_dedicated_build_pool};
+pub(crate) use pool_memo::{
+    KeyedPoolSafeMemo, PoolSafeMemo, install_on_dedicated_build_pool, spawn_on_dedicated_build_pool,
+};
 pub use project::{
     BIFROST_IGNORE_FILE_NAME, DEFAULT_MAX_OVERLAY_BYTES, FileSetProject, FilesystemProject,
-    MultiRootProject, OverlayProject, OverlayRevision, Project, ProjectSourceOrigin,
-    ProjectSourceSnapshot, TestProject, WorkspaceFileListingCache, collect_workspace_files,
+    MultiRootProject, OverlayProject, OverlayRevision, Project, ProjectCoverage,
+    ProjectSourceOrigin, ProjectSourceSnapshot, SubsetCoverage, TestProject,
+    WorkspaceFileListingCache, collect_workspace_files,
 };
 pub(crate) use python::{
     ModuleBindingEventKind, ModuleBindingTimeline, resolve_fqn_candidates,
@@ -206,6 +220,13 @@ pub use python::{
         resolve_python_semantic_pack_dependencies,
     },
     parse_python_import_bindings, parse_python_import_infos,
+};
+pub use read_ledger::{
+    IndexFamily, LookupKind, LookupQuestion, ReadKey, ReadLedger, ReadSetDigest,
+};
+pub use read_verification::{
+    ChangedFacts, ChangedRead, HeadInputs, LookupMemo, LookupReplayLimits, ReadVerdict,
+    WorkspaceFactIndex, analysis_epoch_digest, replay_lookup, verify_read_set,
 };
 pub use ruby::RubyAnalyzer;
 pub use ruby::{

@@ -60,6 +60,7 @@ impl ScalaSourceJarPackProducer {
             return ArtifactProduction::failed(
                 ProducerDiagnostic {
                     severity: ProducerDiagnosticSeverity::Error,
+                    source_entry: None,
                     code: "artifact.kind".to_owned(),
                     location: None,
                     declaration: None,
@@ -88,6 +89,7 @@ impl ScalaSourceJarPackProducer {
             return ArtifactProduction::failed(
                 ProducerDiagnostic {
                     severity: ProducerDiagnosticSeverity::Error,
+                    source_entry: None,
                     code: "limit.archive_directory".to_owned(),
                     location: None,
                     declaration: None,
@@ -103,6 +105,7 @@ impl ScalaSourceJarPackProducer {
                 return ArtifactProduction::failed(
                     ProducerDiagnostic {
                         severity: ProducerDiagnosticSeverity::Error,
+                        source_entry: None,
                         code: "scala.archive.invalid".to_owned(),
                         location: None,
                         declaration: None,
@@ -367,6 +370,7 @@ fn scala_entry_facts(
             type_parameters,
             type_parameter_constraints: Vec::new(),
             underlying_type: None,
+            value_semantics: None,
             embedded_types: Vec::new(),
             hierarchy,
             aliases: Vec::new(),
@@ -493,6 +497,7 @@ fn scala_entry_facts(
             is_virtual: member_kind == MemberKind::Method
                 && !is_static
                 && !has_modifier(node, "final"),
+            implicit_operation: None,
             callable_family_complete: false,
             signature,
             receiver: None,
@@ -534,6 +539,7 @@ fn empty_constructor_fact(owner: &TypeFact, name: String) -> MemberFact {
         is_static: false,
         is_abstract: false,
         is_virtual: false,
+        implicit_operation: None,
         callable_family_complete: false,
         signature: Some(Signature {
             type_parameters: Vec::new(),
@@ -657,6 +663,7 @@ fn scala_signature(
                 r#type: scala_type_ref(path, &available_type_parameters),
                 optional: defaults[parameter_index],
                 variadic: repeated && parameter_index + 1 == paths.len(),
+                passing_mode: Default::default(),
             });
         }
     }
@@ -749,6 +756,7 @@ fn cancelled_production(limits: &ArtifactProducerLimits) -> ArtifactProduction {
     ArtifactProduction::failed(
         ProducerDiagnostic {
             severity: ProducerDiagnosticSeverity::Error,
+            source_entry: None,
             code: "artifact.cancelled".to_owned(),
             location: None,
             declaration: None,
@@ -785,7 +793,7 @@ fn finish_production(
         selector.artifact_sha256 = Some(artifact_sha256.to_owned());
     }
     let (diagnostics, suppressed_diagnostics) = diagnostics.finish();
-    let completeness = if diagnostics.is_empty() && suppressed_diagnostics == 0 {
+    let completeness = if diagnostics.is_empty() && suppressed_diagnostics.total() == 0 {
         Completeness::Complete
     } else {
         Completeness::Partial

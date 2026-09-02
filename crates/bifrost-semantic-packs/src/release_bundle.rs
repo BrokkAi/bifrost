@@ -34,6 +34,7 @@ use std::fmt::{self, Display, Formatter};
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 use std::time::Instant;
 
 use brokk_bifrost_analysis::CancellationToken;
@@ -43,29 +44,32 @@ use brokk_bifrost_analysis::analyzer::semantic_model::{
     CompiledSemanticModelPack, CompilerOptions, Completeness, DecodeLimits, DependencyArtifactRole,
     DependencyPackLimits, DurablePackSource, DurablePackSourceKind, ExactArtifact,
     ExactDependencyArtifact, ExternalArtifactKind, GENERATED_PRODUCTION_CACHE_VERSION,
-    GeneratedProductionKey, PackExtractionAccounting, PackExtractionGap, ProducerDiagnostic,
-    ProducerDiagnosticSeverity, Provenance, ResolvedActiveSemanticModels,
+    GeneratedProductionKey, PackExtractionAccounting, PackExtractionGap, PackExtractionSourceEntry,
+    ProducerDiagnostic, ProducerDiagnosticSeverity, Provenance, ResolvedActiveSemanticModels,
     SEMANTIC_MODEL_SCHEMA_VERSION, Safety, SemanticModelActivationControl,
     SemanticModelActivationEvidence, SemanticModelActivationRequest, SemanticModelControlAction,
     SemanticModelControlScope, SemanticModelPackSelector, SemanticModelResolutionOutcome,
-    SemanticPackCatalog, compile_exact_dependency_production, compile_pack, decode_manifest,
-    decode_shard_for_manifest, pack_rejects_are_warning_only, read_exact_artifact,
-    read_exact_source_set, resolve_active_semantic_models,
+    SemanticModelRuntimeOutcome, SemanticPackCatalog, acquire_active_semantic_models,
+    compile_exact_dependency_production, compile_pack, decode_manifest, decode_shard_for_manifest,
+    pack_rejects_are_warning_only, read_exact_artifact, read_exact_source_set,
+    resolve_active_semantic_models,
 };
 use brokk_bifrost_analysis::analyzer::{
-    CSharpAssemblyPackProducer, ComposerPackagePackProducer, ComposerPinnedAutoloadRule,
-    GoModulePackProducer, GoPinnedPackage as AnalysisGoPinnedPackage, JavaJarPackProducer,
-    JdkSourceArchiveLayout, JdkSourceArchivePackProducer, JvmDependencyPackAdapter,
-    KotlinSourceJarPackProducer, PythonArtifactPackProducer, RubyGemArchivePackProducer,
+    AnalyzerConfig, CSharpAssemblyPackProducer, ComposerPackagePackProducer,
+    ComposerPinnedAutoloadRule, FileSetProject, GoModulePackProducer,
+    GoPinnedPackage as AnalysisGoPinnedPackage, JavaJarPackProducer, JdkSourceArchiveLayout,
+    JdkSourceArchivePackProducer, JdkVersion, JvmDependencyPackAdapter,
+    KotlinSourceJarPackProducer, Language, PythonArtifactPackProducer, RubyGemArchivePackProducer,
     RustdocJsonPackProducer, ScalaSourceJarPackProducer, TypeScriptDeclarationPackProducer,
+    WorkspaceAnalyzer,
 };
 use semver::{Version, VersionReq};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tempfile::NamedTempFile;
+use tempfile::{NamedTempFile, tempdir};
 
 pub const PACK_SPEC_SCHEMA_VERSION: u32 = 1;
-pub const RELEASE_BUNDLE_SCHEMA_VERSION: u32 = 2;
+pub const RELEASE_BUNDLE_SCHEMA_VERSION: u32 = 3;
 
 fn current_release_generator() -> ReleaseGenerator {
     ReleaseGenerator {
@@ -411,6 +415,8 @@ pub struct ReleaseReject {
     pub code: String,
     pub location: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_entry: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub declaration: Option<String>,
     pub message: String,
 }
@@ -468,6 +474,8 @@ pub struct ReleasePackMeasurement {
     pub activation_candidate_count: u64,
     pub matcher_index_entries: u64,
     pub retained_model_bytes: u64,
+    pub overlay_publication_nanos: u64,
+    pub retained_overlay_bytes: u64,
     pub lookups: Vec<ReleaseLookupMeasurement>,
 }
 
@@ -489,6 +497,8 @@ struct RuntimeMeasurement {
     activation_candidate_count: u64,
     matcher_index_entries: u64,
     retained_model_bytes: u64,
+    overlay_publication_nanos: u64,
+    retained_overlay_bytes: u64,
     lookups: Vec<ReleaseLookupMeasurement>,
 }
 
@@ -707,12 +717,14 @@ fn generate_one(
                 },
                 code: diagnostic.code.clone(),
                 location: diagnostic.location.clone(),
+                source_entry: diagnostic.source_entry.as_deref().map(str::to_owned),
                 declaration: diagnostic.declaration.clone(),
                 message: diagnostic.message.clone(),
             })
             .collect(),
         suppressed_rejects: production
             .suppressed_diagnostics
+            .total()
             .try_into()
             .unwrap_or(u64::MAX),
     };
@@ -856,12 +868,13 @@ fn generate_jdk_production(
         rejects,
         suppressed_rejects: production
             .suppressed_diagnostics
+            .total()
             .try_into()
             .unwrap_or(u64::MAX),
     })
 }
 
-fn exact_jdk_version(spec: &PinnedPackSpec) -> Result<Version, BundleError> {
+fn exact_jdk_version(spec: &PinnedPackSpec) -> Result<JdkVersion, BundleError> {
     let selector = spec
         .activation
         .iter()
@@ -884,7 +897,7 @@ fn exact_jdk_version(spec: &PinnedPackSpec) -> Result<Version, BundleError> {
             spec.pack_id, spec.pack_version
         ))
     })?;
-    Version::parse(version).map_err(|error| {
+    JdkVersion::parse(version).map_err(|error| {
         BundleError::new(format!(
             "JDK spec {}@{} has invalid toolchain version {version:?}: {error}",
             spec.pack_id, spec.pack_version
@@ -941,6 +954,7 @@ fn release_reject(diagnostic: &ProducerDiagnostic) -> ReleaseReject {
         },
         code: diagnostic.code.clone(),
         location: diagnostic.location.clone(),
+        source_entry: diagnostic.source_entry.as_deref().map(str::to_owned),
         declaration: diagnostic.declaration.clone(),
         message: diagnostic.message.clone(),
     }
@@ -1554,6 +1568,8 @@ fn measurement(
         activation_candidate_count: runtime.activation_candidate_count,
         matcher_index_entries: runtime.matcher_index_entries,
         retained_model_bytes: runtime.retained_model_bytes,
+        overlay_publication_nanos: runtime.overlay_publication_nanos,
+        retained_overlay_bytes: runtime.retained_overlay_bytes,
         lookups: runtime.lookups,
     }
 }
@@ -1648,6 +1664,7 @@ fn measure_runtime(
         .map(|query| measure_lookup(active, query))
         .collect::<Result<Vec<_>, BundleError>>()?;
     let report = active.activation_report();
+    let overlay_measurement = measure_overlay_publication(&catalog, &request, cancellation)?;
     Ok(RuntimeMeasurement {
         activation_micros,
         activation_selection_nanos: report.phase_measurements.selection_nanos,
@@ -1657,7 +1674,57 @@ fn measure_runtime(
         activation_candidate_count: report.catalog_candidates.try_into().unwrap_or(u64::MAX),
         matcher_index_entries: report.index_entries.try_into().unwrap_or(u64::MAX),
         retained_model_bytes: active.retained_bytes(),
+        overlay_publication_nanos: overlay_measurement.publication_nanos,
+        retained_overlay_bytes: overlay_measurement.retained_bytes,
         lookups,
+    })
+}
+
+fn measure_overlay_publication(
+    catalog: &SemanticPackCatalog,
+    request: &SemanticModelActivationRequest,
+    cancellation: &CancellationToken,
+) -> Result<
+    brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelOverlayMeasurement,
+    BundleError,
+> {
+    let language_label = request
+        .evidence
+        .first()
+        .map(|evidence| evidence.language.as_str())
+        .ok_or_else(|| BundleError::new("measurement activation has no language evidence"))?;
+    let language = Language::from_config_label(language_label).ok_or_else(|| {
+        BundleError::new(format!(
+            "measurement activation uses unsupported language {language_label}"
+        ))
+    })?;
+    let root = tempdir()
+        .map_err(|error| BundleError::new(format!("create overlay measurement root: {error}")))?;
+    let extension = language.extensions().first().ok_or_else(|| {
+        BundleError::new(format!(
+            "measurement activation language {language_label} has no source extension"
+        ))
+    })?;
+    let measurement_source = PathBuf::from(format!("measurement.{extension}"));
+    fs::write(root.path().join(&measurement_source), b"")
+        .map_err(|error| BundleError::new(format!("write overlay measurement source: {error}")))?;
+    let project = Arc::new(FileSetProject::new(
+        root.path().to_path_buf(),
+        [measurement_source],
+    ));
+    let analyzer = WorkspaceAnalyzer::build_ephemeral_footgun(project, AnalyzerConfig::default())
+        .map_err(|error| {
+        BundleError::new(format!("build overlay measurement analyzer: {error}"))
+    })?;
+    let outcome =
+        acquire_active_semantic_models(analyzer.analyzer(), catalog, None, request, cancellation);
+    let SemanticModelRuntimeOutcome::Ready { snapshot, .. } = outcome else {
+        return Err(BundleError::new(format!(
+            "overlay measurement activation did not produce a ready model: {outcome:?}"
+        )));
+    };
+    snapshot.overlay_measurement().ok_or_else(|| {
+        BundleError::new("overlay measurement activation did not publish an overlay")
     })
 }
 
@@ -2135,33 +2202,37 @@ fn verify_generated_production(
             "generated production index metadata does not match its manifest",
         ));
     }
+    validate_release_reject_subjects(
+        &generated.pack_id,
+        &generated.pack_version,
+        &generated.rejects,
+    )?;
     let extraction = generated_extraction_accounting(generated);
     if !pack_rejects_are_warning_only(&extraction) {
         return Err(BundleError::new(
             "generated production has error-grade extraction rejects",
         ));
     }
-    // A generated production is never curated by hand, so a partial one must
-    // clear the same activation bar `warning_only_and_fully_accounted` gives
-    // installed packs at runtime (catalog/mod.rs `pack_is_activation_ready`):
-    // every reject accounted for by a named gap, nothing suppressed.
+    // A generated production must clear the same activation bar that release
+    // packs clear below: every reject has one typed subject, and nothing was
+    // suppressed. This keeps generated installation and runtime activation on
+    // the same fail-closed contract.
     // Otherwise the bundle ships a production that can never activate,
     // silently -- the way #2756 shipped 3,535 suppressed JDK rejects behind
-    // an empty diagnostics list. This hard gate applies only to generated
-    // productions; a curated pack can still ship with named-but-unaccounted
-    // rejects (tracked separately) because a human reviewed it.
+    // an empty diagnostics list.
     if generated.completeness == Completeness::Partial
         && !extraction.warning_only_and_fully_accounted()
     {
         return Err(BundleError::new(format!(
             "generated production {}@{} is not activation-ready: partial completeness requires \
              warning-only fully-accounted extraction (reject_count={}, suppressed_reject_count={}, \
-             named_gaps={})",
+             declaration_gaps={}, source_entries={})",
             generated.pack_id,
             generated.pack_version,
             extraction.reject_count,
             extraction.suppressed_reject_count,
-            extraction.gaps.len()
+            extraction.gaps.len(),
+            extraction.source_entries.len()
         )));
     }
     if extraction.reject_count != generated.rejects.len().try_into().unwrap_or(u64::MAX)
@@ -2211,6 +2282,7 @@ fn verify_rejects(
         ));
     }
     for (pack, pack_rejects) in index.packs.iter().zip(&rejects.packs) {
+        validate_release_reject_subjects(&pack.pack_id, &pack.pack_version, &pack_rejects.rejects)?;
         let extraction = release_extraction_accounting(pack_rejects);
         if !pack_rejects_are_warning_only(&extraction) {
             return Err(BundleError::new(format!(
@@ -2218,8 +2290,56 @@ fn verify_rejects(
                 pack.pack_id, pack.pack_version
             )));
         }
+        if pack.completeness == Completeness::Partial
+            && !extraction.warning_only_and_fully_accounted()
+        {
+            return Err(BundleError::new(format!(
+                "release pack {}@{} is not activation-ready: partial completeness requires \
+                 warning-only fully-accounted extraction (reject_count={}, \
+                 suppressed_reject_count={}, declaration_gaps={}, source_entries={})",
+                pack.pack_id,
+                pack.pack_version,
+                extraction.reject_count,
+                extraction.suppressed_reject_count,
+                extraction.gaps.len(),
+                extraction.source_entries.len()
+            )));
+        }
     }
     Ok(rejects)
+}
+
+fn validate_release_reject_subjects(
+    pack_id: &str,
+    pack_version: &str,
+    rejects: &[ReleaseReject],
+) -> Result<(), BundleError> {
+    for reject in rejects {
+        if reject.declaration.is_some() && reject.source_entry.is_some() {
+            return Err(BundleError::new(format!(
+                "release pack {pack_id}@{pack_version} reject {} has both declaration and \
+                 source-entry identities",
+                reject.code
+            )));
+        }
+        if let Some(source_entry) = &reject.source_entry {
+            require_canonical_source_entry(source_entry)?;
+        }
+    }
+    Ok(())
+}
+
+fn require_canonical_source_entry(source_entry: &str) -> Result<(), BundleError> {
+    if source_entry.contains('\\')
+        || source_entry.as_bytes().get(1) == Some(&b':')
+        || require_safe_relative(Path::new(source_entry)).is_err()
+    {
+        return Err(BundleError::new(format!(
+            "release reject source entry must be a canonical slash-separated relative path: \
+             {source_entry}"
+        )));
+    }
+    Ok(())
 }
 
 fn release_extraction_accounting(rejects: &ReleasePackRejects) -> PackExtractionAccounting {
@@ -2253,6 +2373,18 @@ fn extraction_accounting(
                     .as_ref()
                     .map(|declaration| PackExtractionGap {
                         declaration: declaration.clone(),
+                        reason: format!("{}: {}", reject.code, reject.message),
+                    })
+            })
+            .collect(),
+        source_entries: rejects
+            .iter()
+            .filter_map(|reject| {
+                reject
+                    .source_entry
+                    .as_ref()
+                    .map(|source_entry| PackExtractionSourceEntry {
+                        source_entry: source_entry.clone(),
                         reason: format!("{}: {}", reject.code, reject.message),
                     })
             })
@@ -2513,6 +2645,7 @@ fn read_measurements(
                     || measurement.record_count
                         != pack.shards.iter().map(|shard| shard.records).sum::<u64>()
                     || measurement.completeness != pack.completeness
+                    || measurement.retained_overlay_bytes == 0
                     || measurement.lookups.is_empty()
                     || measurement.lookups.iter().any(|lookup| lookup.records == 0)
                     || measurement
@@ -3004,6 +3137,10 @@ mod tests {
         let first_bundle = generate_release_bundle(&first, std::slice::from_ref(&input)).unwrap();
         let second_bundle = generate_release_bundle(&second, &[input]).unwrap();
         assert_deterministic_and_installable(&first, &second, &first_bundle, &second_bundle);
+        let measurements: ReleaseBundleMeasurements =
+            serde_json::from_slice(&fs::read(first.join("measurements.json")).unwrap()).unwrap();
+        assert!(measurements.packs[0].overlay_publication_nanos > 0);
+        assert!(measurements.packs[0].retained_overlay_bytes > 0);
 
         let generated = first_bundle
             .index
@@ -3037,7 +3174,7 @@ mod tests {
         // dependency identity and exact compiler seam, or a release asset
         // would never satisfy a local generated lookup.
         let runtime_dependency = JvmDependencyPackAdapter::jdk_source_dependency(
-            Version::parse(version).unwrap(),
+            JdkVersion::parse(version).unwrap(),
             artifact_path.clone(),
         );
         let runtime_artifact =
@@ -3079,8 +3216,9 @@ mod tests {
     }
 
     #[test]
-    fn generated_jdk_production_with_an_unnamed_reject_fails_the_activability_gate() {
-        // A warning that the JDK source producer cannot attach a declaration
+    fn partial_curated_pack_with_an_unnamed_reject_fails_the_activability_gate() {
+        // A warning that the JDK source producer cannot attach an accountable
+        // declaration or source-entry identity
         // to (an archive entry that is skipped for being oversized, not for
         // naming a specific type) is a real, non-error reject with no gap.
         // That is exactly the shape #2756 shipped silently: completeness is
@@ -3171,16 +3309,17 @@ mod tests {
         };
         let output = fixture.path().join("bundle");
         let error = generate_release_bundle(&output, std::slice::from_ref(&input))
-            .expect_err("a generated production with an unnamed reject must fail the bundle gate");
+            .expect_err("a curated partial pack with an unnamed reject must fail the bundle gate");
         let message = error.to_string();
         assert!(
-            message.contains("not activation-ready") && message.contains("bifrost.external.java"),
+            message.contains("not activation-ready") && message.contains("bifrost.jdk"),
             "{message}"
         );
         assert!(
             message.contains("reject_count=1")
                 && message.contains("suppressed_reject_count=0")
-                && message.contains("named_gaps=0"),
+                && message.contains("declaration_gaps=0")
+                && message.contains("source_entries=0"),
             "{message}"
         );
     }
@@ -4072,7 +4211,7 @@ mod tests {
     }
 
     #[test]
-    fn extraction_rejects_are_reported_structurally_and_checksummed() {
+    fn kotlin_source_entry_reject_verifies_installs_and_activates() {
         let fixture = tempdir().unwrap();
         let artifact = fixture.path().join("kotlin-fixture-sources.jar");
         write_zip(
@@ -4092,7 +4231,7 @@ mod tests {
             PinnedPackKind::KotlinSourceJar,
             PinnedArtifact {
                 file_name: "kotlin-fixture-sources.jar".to_owned(),
-                sha256: artifact_sha256,
+                sha256: artifact_sha256.clone(),
                 url: Some("https://example.invalid/kotlin-fixture-sources.jar".to_owned()),
                 container: None,
             },
@@ -4121,6 +4260,7 @@ mod tests {
                 severity: ReleaseRejectSeverity::Warning,
                 code: "kotlin.source.parse".to_owned(),
                 location: Some("kotlin/Bad.kt".to_owned()),
+                source_entry: Some("kotlin/Bad.kt".to_owned()),
                 declaration: None,
                 message: "Kotlin source entry contains syntax unsupported by the pinned parser"
                     .to_owned(),
@@ -4128,6 +4268,113 @@ mod tests {
         );
         assert_eq!(pack_rejects.suppressed_rejects, 0);
         assert_eq!(verify_release_bundle(&output).unwrap(), bundle);
+
+        let accounting = release_extraction_accounting(pack_rejects);
+        assert!(accounting.warning_only_and_fully_accounted());
+        assert!(accounting.gaps.is_empty());
+        assert_eq!(accounting.source_entries.len(), 1);
+        assert_eq!(accounting.source_entries[0].source_entry, "kotlin/Bad.kt");
+
+        let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
+        let first_install = install_release_bundle(&output, &catalog).unwrap();
+        let second_install = install_release_bundle(&output, &catalog).unwrap();
+        assert_eq!(first_install, second_install);
+        assert_eq!(first_install.len(), 1);
+        assert_eq!(
+            catalog
+                .extraction_accounting(&first_install[0].manifest_digest)
+                .unwrap(),
+            Some(accounting)
+        );
+
+        let SemanticModelResolutionOutcome::Ready(active) = resolve_active_semantic_models(
+            &catalog,
+            &SemanticModelActivationRequest {
+                bifrost_version: env!("CARGO_PKG_VERSION").parse().unwrap(),
+                evidence: vec![SemanticModelActivationEvidence {
+                    language: "kotlin".to_owned(),
+                    ecosystem: "maven".to_owned(),
+                    package: Some(CatalogCoordinate {
+                        name: "org.jetbrains.kotlin:kotlin-stdlib".to_owned(),
+                        version: Some(Version::parse("2.2.20").unwrap()),
+                    }),
+                    module: None,
+                    toolchain: Some(CatalogCoordinate {
+                        name: "kotlin".to_owned(),
+                        version: Some(Version::parse("2.2.20").unwrap()),
+                    }),
+                    target: None,
+                    configuration: None,
+                    artifact_sha256: Some(artifact_sha256),
+                }],
+                controls: Vec::new(),
+                limits: Default::default(),
+            },
+            &CancellationToken::default(),
+        ) else {
+            panic!("source-entry-accounted Kotlin release pack must activate");
+        };
+        assert_eq!(active.types_named("fixture.Good").records.len(), 1);
+        assert!(active.extraction_gaps().is_empty());
+        assert!(active.gapped("kotlin/Bad.kt").is_none());
+
+        let mut old_schema = bundle.rejects.clone();
+        old_schema.schema_version = 2;
+        fs::write(
+            output.join("rejects.json"),
+            json_bytes(&old_schema).unwrap(),
+        )
+        .unwrap();
+        fs::remove_file(output.join("SHA256SUMS")).unwrap();
+        write_checksums(&output, &bundle.index).unwrap();
+        let error = verify_release_bundle(&output).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported release rejects schema 2"),
+            "{error}"
+        );
+
+        let mut anonymous = bundle.rejects.clone();
+        anonymous.packs[0].rejects[0].source_entry = None;
+        fs::write(output.join("rejects.json"), json_bytes(&anonymous).unwrap()).unwrap();
+        fs::remove_file(output.join("SHA256SUMS")).unwrap();
+        write_checksums(&output, &bundle.index).unwrap();
+        let error = verify_release_bundle(&output).unwrap_err();
+        assert!(
+            error.to_string().contains("not activation-ready")
+                && error.to_string().contains("source_entries=0"),
+            "{error}"
+        );
+
+        let mut suppressed = bundle.rejects.clone();
+        suppressed.packs[0].suppressed_rejects = 1;
+        fs::write(
+            output.join("rejects.json"),
+            json_bytes(&suppressed).unwrap(),
+        )
+        .unwrap();
+        fs::remove_file(output.join("SHA256SUMS")).unwrap();
+        write_checksums(&output, &bundle.index).unwrap();
+        let error = verify_release_bundle(&output).unwrap_err();
+        assert!(
+            error.to_string().contains("not activation-ready")
+                && error.to_string().contains("suppressed_reject_count=1"),
+            "{error}"
+        );
+
+        let mut multiply_accounted = bundle.rejects.clone();
+        multiply_accounted.packs[0].rejects[0].declaration =
+            Some("fixture.NotARealDeclaration".to_owned());
+        fs::write(
+            output.join("rejects.json"),
+            json_bytes(&multiply_accounted).unwrap(),
+        )
+        .unwrap();
+        fs::remove_file(output.join("SHA256SUMS")).unwrap();
+        write_checksums(&output, &bundle.index).unwrap();
+        let error = verify_release_bundle(&output).unwrap_err();
+        assert!(error.to_string().contains("both declaration"), "{error}");
 
         // The burn-down report is part of the checksummed inventory: dropping
         // one reject from it must fail verification.

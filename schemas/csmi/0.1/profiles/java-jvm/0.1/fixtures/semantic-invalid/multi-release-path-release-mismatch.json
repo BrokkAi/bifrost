@@ -1,0 +1,11 @@
+{
+  "$profileSchema": "jvm-binary-identity",
+  "profileVersion": "0.1",
+  "owner": "org/example/RuntimeSupport",
+  "binaryEntity": { "kind": "class" },
+  "variant": {
+    "entryPath": "META-INF/versions/11/org/example/RuntimeSupport.class",
+    "release": 17,
+    "classFileMajor": 55
+  }
+}

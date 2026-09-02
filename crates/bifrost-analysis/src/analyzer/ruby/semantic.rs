@@ -8,7 +8,7 @@
 use brokk_bifrost_ruby::local_bindings::{LocalBindingBudget, LocalBindingTimeline};
 use tree_sitter::Node;
 
-use super::is_runtime_node;
+use super::{is_runtime_node, ruby_symbol_name};
 use crate::analyzer::lexical_definitions::formal_parameter_slots_for_owner;
 use crate::analyzer::semantic::cfg::{
     CleanupRegionId, CompletionKind, CompletionRequest, CompletionRoute, ProcedureCfgBuilder,
@@ -22,7 +22,7 @@ use crate::analyzer::tree_walk::named_children;
 use crate::analyzer::{Language, ProjectFile, RubyAnalyzer};
 use crate::hash::HashMap;
 
-const ADAPTER_VERSION: &[u8] = b"ruby-value-semantics-v4";
+const ADAPTER_VERSION: &[u8] = b"ruby-value-semantics-v5";
 
 impl_program_semantics_provider!(RubyAnalyzer, RubySemanticLowerer);
 
@@ -251,23 +251,143 @@ struct LocalBindingCollection {
     work: SemanticWork,
 }
 
+#[derive(Default)]
+struct RubyPropertyInventory {
+    declarations: HashMap<(Box<str>, Box<str>), RubyPropertyDeclaration>,
+}
+
+#[derive(Default)]
+struct RubyPropertyDeclaration {
+    reader: Option<SourceAnchor>,
+    writer: Option<SourceAnchor>,
+}
+
+struct RubyPropertyCollection {
+    inventory: RubyPropertyInventory,
+    work: SemanticWork,
+}
+
+impl RubyPropertyInventory {
+    fn complete_accessor(&self, class: &str, property: &str) -> Option<SourceAnchor> {
+        let declaration = self.declarations.get(&(class.into(), property.into()))?;
+        let reader = declaration.reader?;
+        declaration.writer.map(|_| reader)
+    }
+}
+
+fn collect_property_inventory(
+    root: Node<'_>,
+    source: &str,
+    budget: &SemanticBudget,
+    cancellation: &CancellationToken,
+) -> Result<RubyPropertyCollection, RubyLoweringError> {
+    let mut inventory = RubyPropertyInventory::default();
+    let mut adapter = SemanticTraversalBudget {
+        work: SemanticWork::default(),
+        budget,
+        cancellation,
+    };
+    for class in named_children(root) {
+        adapter.enter_node()?;
+        if class.kind() != "class" {
+            continue;
+        }
+        let Some(name) = class
+            .child_by_field_name("name")
+            .filter(|name| name.kind() == "constant")
+            .and_then(|name| node_text(source, name))
+        else {
+            continue;
+        };
+        let Some(body) = class.child_by_field_name("body") else {
+            continue;
+        };
+        let mut methods = Vec::new();
+        for call in runtime_statement_children(body) {
+            adapter.enter_node()?;
+            if call.kind() == "method" {
+                if let Some(method) = call
+                    .child_by_field_name("name")
+                    .and_then(|method| node_text(source, method))
+                {
+                    adapter.before_insert()?;
+                    adapter.charge_name(method)?;
+                    methods.push(method.to_owned());
+                }
+                continue;
+            }
+            if call.kind() != "call" {
+                continue;
+            }
+            let accessor = call
+                .child_by_field_name("method")
+                .and_then(|method| node_text(source, method));
+            if !matches!(
+                accessor,
+                Some("attr_accessor" | "attr_reader" | "attr_writer")
+            ) {
+                continue;
+            }
+            for argument in call_arguments(call) {
+                adapter.enter_node()?;
+                let Some(property) = ruby_symbol_name(argument, source) else {
+                    continue;
+                };
+                adapter.before_insert()?;
+                adapter.charge_name(name)?;
+                adapter.charge_name(&property)?;
+                let anchor = source_anchor(argument, 0).map_err(RubyLoweringError::Invalid)?;
+                let declaration = inventory
+                    .declarations
+                    .entry((name.into(), property.into_boxed_str()))
+                    .or_default();
+                match accessor {
+                    Some("attr_reader") => declaration.reader = Some(anchor),
+                    Some("attr_writer") => declaration.writer = Some(anchor),
+                    Some("attr_accessor") => {
+                        declaration.reader = Some(anchor);
+                        declaration.writer = Some(anchor);
+                    }
+                    _ => unreachable!("accessor calls were filtered above"),
+                }
+            }
+        }
+        for ((owner, property), declaration) in &mut inventory.declarations {
+            if owner.as_ref() != name {
+                continue;
+            }
+            let writer = format!("{property}=");
+            if methods
+                .iter()
+                .any(|method| method == property.as_ref() || method == &writer)
+            {
+                declaration.reader = None;
+                declaration.writer = None;
+            }
+        }
+    }
+    Ok(RubyPropertyCollection {
+        inventory,
+        work: adapter.work,
+    })
+}
+
 struct ProcedureBindings {
     timeline: LocalBindingTimeline,
     has_parameter_defaults: bool,
 }
 
-/// The semantic cost model for the shared local-binding walk: every traversal
+/// The semantic cost model for Ruby adapter-side tree walks: every traversal
 /// entry polls cancellation and charges one nested entry, every insertion
 /// point polls cancellation, and every newly owned name charges its bytes.
-/// On failure the error carries the work attempted so far, exactly as the
-/// walk did before it moved to `brokk_bifrost_ruby::local_bindings`.
-struct SemanticLocalBindingBudget<'request> {
+/// On failure the error carries the work attempted so far.
+struct SemanticTraversalBudget<'request> {
     work: SemanticWork,
     budget: &'request SemanticBudget,
     cancellation: &'request CancellationToken,
 }
 
-impl SemanticLocalBindingBudget<'_> {
+impl SemanticTraversalBudget<'_> {
     fn charge(&mut self, delta: SemanticWork) -> Result<(), RubyLoweringError> {
         let candidate = self.work.conservative_add(delta);
         if let Err(exceeded) = self.budget.check(candidate) {
@@ -285,7 +405,7 @@ impl SemanticLocalBindingBudget<'_> {
     }
 }
 
-impl LocalBindingBudget for SemanticLocalBindingBudget<'_> {
+impl LocalBindingBudget for SemanticTraversalBudget<'_> {
     type Error = RubyLoweringError;
 
     fn enter_node(&mut self) -> Result<(), RubyLoweringError> {
@@ -316,7 +436,7 @@ fn collect_local_bindings(
     budget: &SemanticBudget,
     cancellation: &CancellationToken,
 ) -> Result<LocalBindingCollection, RubyLoweringError> {
-    let mut adapter = SemanticLocalBindingBudget {
+    let mut adapter = SemanticTraversalBudget {
         work: SemanticWork::default(),
         budget,
         cancellation,
@@ -406,7 +526,7 @@ impl ProgramSemanticsLowerer for RubySemanticLowerer {
         budget: &SemanticBudget,
         cancellation: &CancellationToken,
     ) -> Result<SemanticOutcome<Vec<ProcedureSemanticsParts>>, SemanticProviderError> {
-        let (specs, initial_work, inventory_work) =
+        let (specs, mut initial_work, mut inventory_work) =
             match enumerate_procedures(file, prepared, budget, cancellation)? {
                 ProcedureEnumeration::Complete {
                     value,
@@ -427,6 +547,38 @@ impl ProgramSemanticsLowerer for RubySemanticLowerer {
                     });
                 }
             };
+
+        let mut staged_budget = budget.clone();
+        staged_budget
+            .charge(inventory_work)
+            .expect("complete procedure enumeration fits its source budget");
+        let properties = match collect_property_inventory(
+            prepared.tree().root_node(),
+            prepared.source(),
+            &staged_budget,
+            cancellation,
+        ) {
+            Ok(properties) => properties,
+            Err(RubyLoweringError::Cancelled(work)) => {
+                return Ok(SemanticOutcome::Cancelled {
+                    partial: None,
+                    work: sum_lowering_work(inventory_work, *work),
+                });
+            }
+            Err(RubyLoweringError::Budget(exceeded, work)) => {
+                return Ok(SemanticOutcome::ExceededBudget {
+                    partial: None,
+                    exceeded,
+                    work: sum_lowering_work(inventory_work, *work),
+                });
+            }
+            Err(RubyLoweringError::Invalid(detail)) => {
+                return Err(SemanticProviderError::internal(detail));
+            }
+        };
+        initial_work = sum_lowering_work(initial_work, properties.work);
+        inventory_work = sum_lowering_work(inventory_work, properties.work);
+        let property_inventory = properties.inventory;
 
         let mut bindings_by_procedure: Vec<ProcedureBindings> = Vec::with_capacity(specs.len());
         let mut binding_work = SemanticWork::default();
@@ -500,6 +652,7 @@ impl ProgramSemanticsLowerer for RubySemanticLowerer {
                 lower_procedure(
                     prepared,
                     spec,
+                    &property_inventory,
                     &local_bindings.timeline,
                     local_bindings.has_parameter_defaults,
                     staged_budget,
@@ -534,6 +687,8 @@ fn ruby_capabilities() -> SemanticCapabilities {
         SemanticCapability::CallableReferences,
         SemanticCapability::Values,
         SemanticCapability::Assignments,
+        SemanticCapability::FieldMemory,
+        SemanticCapability::IndexMemory,
         SemanticCapability::Allocations,
         SemanticCapability::LocalFlow,
         SemanticCapability::ParameterFlow,
@@ -948,6 +1103,12 @@ struct RubyControlFrame {
     callable_exit: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RubyLocalStorage {
+    Class(Box<str>),
+    Indexable,
+}
+
 struct LoweringContext<'tree, 'targets> {
     source: &'tree str,
     session: ProcedureLoweringSession<'targets>,
@@ -955,8 +1116,11 @@ struct LoweringContext<'tree, 'targets> {
     procedure_body_node_id: usize,
     procedure_runtime_body_node_id: usize,
     expression_values: HashMap<usize, ValueId>,
+    properties: &'targets RubyPropertyInventory,
     parameters: HashMap<Box<str>, ValueId>,
     locals: HashMap<Box<str>, ValueId>,
+    local_storage: HashMap<ValueId, RubyLocalStorage>,
+    constant_index_values: HashMap<u64, ValueId>,
     receiver: Option<ValueId>,
     reuse_first_statement_entry: bool,
     nonlocal_cleanup_label: Option<Box<str>>,
@@ -969,6 +1133,7 @@ struct LoweringContext<'tree, 'targets> {
 fn lower_procedure<'tree, 'request>(
     prepared: &'tree PreparedSyntaxTree,
     spec: &ProcedureSpec<'tree>,
+    properties: &'request RubyPropertyInventory,
     local_bindings: &'request LocalBindingTimeline,
     has_parameter_defaults: bool,
     budget: &SemanticBudget,
@@ -1003,8 +1168,11 @@ fn lower_procedure<'tree, 'request>(
         procedure_body_node_id: spec.body.id(),
         procedure_runtime_body_node_id: runtime_body.id(),
         expression_values: HashMap::default(),
+        properties,
         parameters: HashMap::default(),
         locals: HashMap::default(),
+        local_storage: HashMap::default(),
+        constant_index_values: HashMap::default(),
         receiver: None,
         reuse_first_statement_entry: matches!(
             spec.kind,
@@ -1340,6 +1508,148 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         Ok(value)
     }
 
+    fn assignment_is_direct_in_body(&self, node: Node<'tree>) -> bool {
+        let mut current = node;
+        while let Some(parent) = current.parent() {
+            if parent.id() == self.procedure_runtime_body_node_id {
+                return true;
+            }
+            if !matches!(parent.kind(), "body_statement" | "block_body" | "program") {
+                return false;
+            }
+            current = parent;
+        }
+        false
+    }
+
+    fn update_local_storage(
+        &mut self,
+        assignment: Node<'tree>,
+        left: Node<'tree>,
+        right: Node<'tree>,
+    ) {
+        if left.kind() != "identifier" {
+            return;
+        }
+        let Some(name) = node_text(self.source, left) else {
+            return;
+        };
+        let Some((target, _)) = self.binding_value(name) else {
+            return;
+        };
+        let storage = self
+            .assignment_is_direct_in_body(assignment)
+            .then(|| match right.kind() {
+                "array" | "hash" => Some(RubyLocalStorage::Indexable),
+                "identifier" => node_text(self.source, right)
+                    .and_then(|source| self.binding_value(source))
+                    .and_then(|(source, _)| self.local_storage.get(&source).cloned()),
+                "call" if ruby_constructor_call(right, self.source) => right
+                    .child_by_field_name("receiver")
+                    .filter(|receiver| receiver.kind() == "constant")
+                    .and_then(|receiver| node_text(self.source, receiver))
+                    .map(|class| RubyLocalStorage::Class(class.into())),
+                _ => None,
+            })
+            .flatten();
+        if let Some(storage) = storage {
+            self.local_storage.insert(target, storage);
+        } else {
+            self.local_storage.remove(&target);
+        }
+    }
+
+    fn property_member_locator(
+        &self,
+        receiver: Node<'tree>,
+        property: Node<'tree>,
+    ) -> Option<SemanticLocator> {
+        let receiver = node_text(self.source, receiver)?;
+        let (receiver, _) = self.binding_value(receiver)?;
+        let RubyLocalStorage::Class(class) = self.local_storage.get(&receiver)? else {
+            return None;
+        };
+        let property_name = node_text(self.source, property)?;
+        let anchor = self.properties.complete_accessor(class, property_name)?;
+        let procedure = self.session.locator();
+        Some(SemanticLocator::new(
+            procedure.mount(),
+            procedure.path().clone(),
+            procedure.language(),
+            procedure.declaration().clone(),
+            SemanticRole::MemoryLocation,
+            anchor,
+        ))
+    }
+
+    fn property_parts(&self, node: Node<'tree>) -> Option<(Node<'tree>, SemanticLocator)> {
+        if node.kind() != "call" || node.child_by_field_name("arguments").is_some() {
+            return None;
+        }
+        let receiver = node.child_by_field_name("receiver")?;
+        let property = node.child_by_field_name("method")?;
+        self.property_member_locator(receiver, property)
+            .map(|member| (receiver, member))
+    }
+
+    fn element_parts(&self, node: Node<'tree>) -> Option<(Node<'tree>, Node<'tree>)> {
+        if node.kind() != "element_reference" {
+            return None;
+        }
+        let object = node.child_by_field_name("object")?;
+        let name = node_text(self.source, object)?;
+        let (object_value, _) = self.binding_value(name)?;
+        if self.local_storage.get(&object_value) != Some(&RubyLocalStorage::Indexable) {
+            return None;
+        }
+        let mut indices = named_children(node).into_iter().filter(|child| {
+            child.id() != object.id() && child.kind() != "block" && child.kind() != "do_block"
+        });
+        let index = indices.next()?;
+        indices.next().is_none().then_some((object, index))
+    }
+
+    fn constant_index_value(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+    ) -> Result<Option<ValueId>, RubyLoweringError> {
+        let Some(index) = (node.kind() == "integer")
+            .then(|| node_text(self.source, node))
+            .flatten()
+            .and_then(|text| text.parse::<u64>().ok())
+        else {
+            return Ok(None);
+        };
+        if let Some(value) = self.constant_index_values.get(&index) {
+            self.expression_values.insert(node.id(), *value);
+            return Ok(Some(*value));
+        }
+        let value = self.expression_value(builder, node, SemanticValueKind::Constant)?;
+        self.constant_index_values.insert(index, value);
+        Ok(Some(value))
+    }
+
+    fn add_dynamic_index_gap(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        point: ProgramPointId,
+        location: MemoryLocationId,
+    ) -> Result<(), RubyLoweringError> {
+        self.session.add_gap_with_impacts(
+            builder,
+            point,
+            SemanticGapSubject::MemoryLocation(location),
+            SemanticCapability::IndexMemory,
+            SemanticGapImpacts::single(SemanticGapImpact::HeapRead)
+                .with(SemanticGapImpact::HeapWrite)
+                .with(SemanticGapImpact::Aliasing),
+            SemanticGapKind::Unsupported,
+            "Ruby dynamic element index identity is not proven",
+        )?;
+        Ok(())
+    }
+
     fn source_value(
         &mut self,
         builder: &mut ProcedureCfgBuilder,
@@ -1539,6 +1849,9 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             "break" | "next" | "redo" | "retry" => {
                 self.control_expression(builder, node, entry, scope, stack)
             }
+            "call" if self.property_parts(node).is_some() => {
+                self.property_access(builder, node, entry, next, scope, stack)
+            }
             "call" => self.call_expression(builder, node, entry, next, scope, stack),
             "yield" => self.yield_expression(builder, node, entry, next, scope, stack),
             "method" | "singleton_method" | "lambda" | "block" | "do_block" => {
@@ -1601,6 +1914,9 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             | "end_block" => self.statement(builder, node, entry, next, scope, stack),
             "block" | "do_block" if node.id() == self.procedure_body_node_id => {
                 self.statement(builder, node, entry, next, scope, stack)
+            }
+            "call" if self.property_parts(node).is_some() => {
+                self.property_access(builder, node, entry, next, scope, stack)
             }
             "call" => self.call_expression(builder, node, entry, next, scope, stack),
             "conditional" => self.if_expression(builder, node, entry, next, scope, stack),
@@ -2929,6 +3245,45 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         )
     }
 
+    fn property_access(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        entry: ProgramPointId,
+        next: EdgeTarget,
+        scope: ScopeFrameId,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(), RubyLoweringError> {
+        let (receiver, member) = self
+            .property_parts(node)
+            .expect("property access is selected structurally");
+        let access = self.point(builder, node, Vec::new())?;
+        let result = self.expression_value(builder, node, expression_value_kind(node))?;
+        let base = self.expression_value(builder, receiver, expression_value_kind(receiver))?;
+        let location = self.session.add_memory_location(
+            builder,
+            access,
+            MemoryLocationKind::Field { base, member },
+        )?;
+        self.append_effect(
+            builder,
+            access,
+            SemanticEffect::MemoryLoad {
+                kind: MemoryAccessKind::Field,
+                location,
+                result,
+            },
+        )?;
+        self.edge(builder, access, next)?;
+        stack.push(Work::Expression {
+            node: receiver,
+            entry,
+            next: EdgeTarget::normal(access),
+            scope,
+        });
+        Ok(())
+    }
+
     fn yield_expression(
         &mut self,
         builder: &mut ProcedureCfgBuilder,
@@ -3357,7 +3712,59 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         };
         let identity_assignment =
             (node.kind() == "assignment" || short_circuit) && left.kind() == "identifier";
-        if identity_assignment {
+        self.update_local_storage(node, left, right);
+        let property_place = (node.kind() == "assignment")
+            .then(|| self.property_parts(left))
+            .flatten();
+        let element_place = (node.kind() == "assignment")
+            .then(|| self.element_parts(left))
+            .flatten();
+        if let Some((receiver, member)) = property_place {
+            let value = self.expression_value(builder, right, expression_value_kind(right))?;
+            let base = self.expression_value(builder, receiver, expression_value_kind(receiver))?;
+            let location = self.session.add_memory_location(
+                builder,
+                terminal,
+                MemoryLocationKind::Field { base, member },
+            )?;
+            self.append_effect(
+                builder,
+                terminal,
+                SemanticEffect::MemoryStore {
+                    kind: MemoryAccessKind::Field,
+                    location,
+                    value,
+                },
+            )?;
+            self.expression_values.insert(node.id(), value);
+        } else if let Some((object, index_node)) = element_place {
+            let value = self.expression_value(builder, right, expression_value_kind(right))?;
+            let base = self.expression_value(builder, object, expression_value_kind(object))?;
+            let index = self.constant_index_value(builder, index_node)?;
+            let location = self.session.add_memory_location(
+                builder,
+                terminal,
+                MemoryLocationKind::Index {
+                    base,
+                    index,
+                    constant_index: None,
+                    identity: IndexedLocationIdentity::Element,
+                },
+            )?;
+            if index.is_none() {
+                self.add_dynamic_index_gap(builder, terminal, location)?;
+            }
+            self.append_effect(
+                builder,
+                terminal,
+                SemanticEffect::MemoryStore {
+                    kind: MemoryAccessKind::Index,
+                    location,
+                    value,
+                },
+            )?;
+            self.expression_values.insert(node.id(), value);
+        } else if identity_assignment {
             let name = node_text(self.source, left).unwrap_or_default();
             if let Some((target, flow_kind)) = self.binding_value(name) {
                 let value = self.expression_value(builder, right, expression_value_kind(right))?;
@@ -3591,6 +3998,33 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         stack: &mut Vec<Work<'tree>>,
     ) -> Result<(), RubyLoweringError> {
         let terminal = self.point(builder, node, Vec::new())?;
+        if let Some((object, index_node)) = self.element_parts(node) {
+            let result = self.expression_value(builder, node, expression_value_kind(node))?;
+            let base = self.expression_value(builder, object, expression_value_kind(object))?;
+            let index = self.constant_index_value(builder, index_node)?;
+            let location = self.session.add_memory_location(
+                builder,
+                terminal,
+                MemoryLocationKind::Index {
+                    base,
+                    index,
+                    constant_index: None,
+                    identity: IndexedLocationIdentity::Element,
+                },
+            )?;
+            if index.is_none() {
+                self.add_dynamic_index_gap(builder, terminal, location)?;
+            }
+            self.append_effect(
+                builder,
+                terminal,
+                SemanticEffect::MemoryLoad {
+                    kind: MemoryAccessKind::Index,
+                    location,
+                    result,
+                },
+            )?;
+        }
         self.add_gap(
             builder,
             terminal,
@@ -4253,6 +4687,50 @@ mod tests {
         }
         matches.extend(descendants_of_kind(node, kind));
         matches
+    }
+
+    #[test]
+    fn property_inventory_honors_pre_cancelled_requests() {
+        let source = "class Holder\n  attr_accessor :value\nend\n\ndef sample\nend\n";
+        let (tree, _) = parsed_method(source);
+        let cancellation = CancellationToken::default();
+        cancellation.cancel();
+
+        match collect_property_inventory(
+            tree.root_node(),
+            source,
+            &SemanticBudget::default(),
+            &cancellation,
+        ) {
+            Err(RubyLoweringError::Cancelled(work)) => {
+                assert_eq!(*work, SemanticWork::default());
+            }
+            _ => panic!("pre-cancelled property inventory must stop at its first checkpoint"),
+        }
+    }
+
+    #[test]
+    fn property_inventory_charges_iterative_visits_deterministically() {
+        let source = "class Holder\n  attr_accessor :value\nend\n\ndef sample\nend\n";
+        let (tree, _) = parsed_method(source);
+        let mut limits = SemanticWork::uniform(usize::MAX);
+        limits.nested_entries = 1;
+        let budget = SemanticBudget::new(limits).expect("all limits are positive");
+
+        match collect_property_inventory(
+            tree.root_node(),
+            source,
+            &budget,
+            &CancellationToken::default(),
+        ) {
+            Err(RubyLoweringError::Budget(exceeded, work)) => {
+                assert_eq!(exceeded.dimension(), SemanticBudgetDimension::NestedEntries);
+                assert_eq!(exceeded.limit(), 1);
+                assert_eq!(exceeded.attempted(), 2);
+                assert_eq!(work.nested_entries, 2);
+            }
+            _ => panic!("property inventory must charge every iterative node visit"),
+        }
     }
 
     #[test]

@@ -81,11 +81,19 @@ pub(super) fn render_pipeline_item(
         PipelineValue::ReceiverAnalysis(value) => CodeQueryResultValue::ReceiverAnalysis {
             value: Box::new(render_receiver_analysis(analyzer, &value, detail, cache)),
         },
+        PipelineValue::MemberTargetAnalysis(value) => CodeQueryResultValue::MemberTargetAnalysis {
+            value: Box::new(render_member_target_analysis(
+                analyzer, &value, detail, cache,
+            )),
+        },
         PipelineValue::ReceiverOutcome(value) => CodeQueryResultValue::ReceiverOutcome {
             value: Box::new(render_receiver_outcome(analyzer, &value, cache)),
         },
         PipelineValue::ReceiverEvidence(value) => CodeQueryResultValue::ReceiverEvidence {
             value: Box::new(render_receiver_evidence(analyzer, &value, cache)),
+        },
+        PipelineValue::FieldWriteValue(value) => CodeQueryResultValue::FieldWriteValue {
+            value: Box::new(render_field_write_value(analyzer, &value, detail, cache)),
         },
         PipelineValue::CallShape(value) => CodeQueryResultValue::CallShape {
             value: Box::new(render_call_shape(analyzer, &value, cache)),
@@ -113,6 +121,20 @@ pub(super) fn render_pipeline_item(
                 value: Box::new(render_result_contract_failure_use(analyzer, &value, cache)),
             }
         }
+        PipelineValue::NilnessOperation(value) => CodeQueryResultValue::NilnessOperation {
+            value: Box::new(render_nilness_operation(analyzer, &value, cache)),
+        },
+        PipelineValue::SwitchCoverage(value) => CodeQueryResultValue::SwitchCoverage {
+            value: Box::new(render_switch_coverage(analyzer, &value, cache)),
+        },
+        PipelineValue::ConcurrentAccessConflict(value) => {
+            CodeQueryResultValue::ConcurrentAccessConflict {
+                value: Box::new(render_concurrent_access_conflict(analyzer, &value, cache)),
+            }
+        }
+        PipelineValue::DetachedTaskTransfer(value) => CodeQueryResultValue::DetachedTaskTransfer {
+            value: Box::new(render_detached_task_transfer(analyzer, &value, cache)),
+        },
         PipelineValue::ProcedureEffect(value) => CodeQueryResultValue::ProcedureEffect {
             value: Box::new(render_procedure_effect(analyzer, &value, cache)),
         },
@@ -250,11 +272,17 @@ pub(super) fn render_provenance(
                     PipelineTraceValue::ReceiverAnalysis(value) => {
                         render_receiver_analysis_ref(analyzer, value, cache)
                     }
+                    PipelineTraceValue::MemberTargetAnalysis(value) => {
+                        render_member_target_analysis_ref(analyzer, value, cache)
+                    }
                     PipelineTraceValue::ReceiverOutcome(value) => {
                         render_receiver_outcome_ref(analyzer, value, cache)
                     }
                     PipelineTraceValue::ReceiverEvidence(value) => {
                         render_receiver_evidence_ref(analyzer, value, cache)
+                    }
+                    PipelineTraceValue::FieldWriteValue(value) => {
+                        render_field_write_value_ref(analyzer, value, cache)
                     }
                     PipelineTraceValue::CallShape(value) => {
                         let rendered = render_call_shape(analyzer, value, cache);
@@ -360,6 +388,49 @@ pub(super) fn render_provenance(
                             range: rendered.range,
                             provenance: rendered.failure_provenance,
                             consumer: rendered.consumer,
+                            coverage: rendered.coverage,
+                        }
+                    }
+                    PipelineTraceValue::NilnessOperation(value) => {
+                        let rendered = render_nilness_operation(analyzer, value, cache);
+                        CodeQueryResultRef::NilnessOperation {
+                            id: rendered.id,
+                            path: rendered.path,
+                            range: rendered.range,
+                            use_kind: rendered.use_kind,
+                            fact: rendered.fact,
+                            coverage: rendered.coverage,
+                        }
+                    }
+                    PipelineTraceValue::SwitchCoverage(value) => {
+                        let rendered = render_switch_coverage(analyzer, value, cache);
+                        CodeQueryResultRef::SwitchCoverage {
+                            id: rendered.id,
+                            path: rendered.path,
+                            range: rendered.range,
+                            verdict: rendered.verdict,
+                            proof: rendered.proof,
+                        }
+                    }
+                    PipelineTraceValue::ConcurrentAccessConflict(value) => {
+                        let rendered = render_concurrent_access_conflict(analyzer, value, cache);
+                        CodeQueryResultRef::ConcurrentAccessConflict {
+                            id: rendered.id,
+                            path: rendered.path,
+                            range: rendered.range,
+                            ordering: rendered.ordering,
+                            protection: rendered.protection,
+                            proof: rendered.proof,
+                        }
+                    }
+                    PipelineTraceValue::DetachedTaskTransfer(value) => {
+                        let rendered = render_detached_task_transfer(analyzer, value, cache);
+                        CodeQueryResultRef::DetachedTaskTransfer {
+                            id: rendered.id,
+                            path: rendered.path,
+                            range: rendered.range,
+                            role: rendered.role,
+                            timing: rendered.timing,
                             coverage: rendered.coverage,
                         }
                     }
@@ -655,6 +726,23 @@ pub(super) fn render_receiver_outcome_ref(
     }
 }
 
+pub(super) fn render_member_target_analysis_ref(
+    analyzer: &dyn IAnalyzer,
+    value: &ReceiverAnalysisValue,
+    cache: &mut PipelineRenderCache,
+) -> CodeQueryResultRef {
+    let rendered =
+        render_member_target_analysis(analyzer, value, CodeQueryResultDetail::Compact, cache);
+    CodeQueryResultRef::MemberTargetAnalysis {
+        site_id: rendered.site_id,
+        path: rendered.path,
+        receiver_range: rendered.receiver_range,
+        outcome: rendered.outcome,
+        coverage: rendered.coverage,
+        capture: rendered.capture,
+    }
+}
+
 pub(super) fn render_receiver_evidence_ref(
     analyzer: &dyn IAnalyzer,
     value: &ReceiverEvidenceValue,
@@ -671,6 +759,26 @@ pub(super) fn render_receiver_evidence_ref(
             cache,
         ),
         evidence_kind: receiver_evidence_kind(&value.value),
+    }
+}
+
+pub(super) fn render_field_write_value_ref(
+    analyzer: &dyn IAnalyzer,
+    value: &FieldWriteValue,
+    cache: &mut PipelineRenderCache,
+) -> CodeQueryResultRef {
+    let rendered = render_field_write_value(analyzer, value, CodeQueryResultDetail::Compact, cache);
+    CodeQueryResultRef::FieldWriteValue {
+        id: rendered.id,
+        assignment_ast_id: rendered.assignment_ast_id,
+        rhs_ast_id: rendered.rhs_ast_id,
+        receiver_identity_id: rendered.receiver_identity_id,
+        member_target_id: rendered.member_target_id,
+        path: rendered.path,
+        range: rendered.range,
+        proof: rendered.proof,
+        completeness: rendered.completeness,
+        coverage: rendered.coverage,
     }
 }
 
@@ -2044,17 +2152,8 @@ pub(super) fn render_receiver_analysis(
             (label, rendered, Vec::new(), reason, limit)
         }
         ReceiverQueryAnalysis::MemberTargets(outcome) => {
-            let rendered = outcome
-                .values()
-                .into_iter()
-                .flatten()
-                .map(|unit| {
-                    let declaration = declaration_value_for_unit(analyzer, unit, fallback);
-                    render_declaration(analyzer, &declaration, detail, cache)
-                })
-                .collect();
             let (label, reason, limit) = receiver_outcome_metadata(outcome);
-            (label, Vec::new(), rendered, reason, limit)
+            (label, Vec::new(), Vec::new(), reason, limit)
         }
     };
     CodeQueryReceiverAnalysis {
@@ -2077,6 +2176,219 @@ pub(super) fn render_receiver_analysis(
         member_targets,
         reason,
         limit,
+    }
+}
+
+pub(super) fn render_member_target_analysis(
+    analyzer: &dyn IAnalyzer,
+    value: &ReceiverAnalysisValue,
+    detail: CodeQueryResultDetail,
+    cache: &mut PipelineRenderCache,
+) -> CodeQueryMemberTargetAnalysis {
+    let ReceiverQueryAnalysis::MemberTargets(outcome) = &value.report.analysis else {
+        unreachable!("member-target rows carry member-target analysis");
+    };
+    let member_targets = outcome
+        .values()
+        .into_iter()
+        .flatten()
+        .map(|target| {
+            render_member_target(analyzer, target, value.report.site.range, detail, cache)
+        })
+        .collect();
+    let (outcome, reason, limit) = receiver_outcome_metadata(outcome);
+    let coverage = render_receiver_outcome(analyzer, value, cache).coverage;
+    CodeQueryMemberTargetAnalysis {
+        site_id: value.site_id.clone(),
+        site_ast_id: value.site_ast_id.clone(),
+        path: rel_path_string(&value.report.site.file),
+        language: value.report.site.language.config_label(),
+        receiver_range: render_source_range(
+            analyzer,
+            &value.report.site.file,
+            &value.report.site.range,
+            cache,
+        ),
+        member_range: value
+            .report
+            .member_range
+            .map(|range| render_source_range(analyzer, &value.report.site.file, &range, cache)),
+        receiver_text: snippet(&value.report.site.text),
+        input_kind: value.report.site.syntax_kind.clone(),
+        capture: value.capture.clone(),
+        outcome,
+        member_targets,
+        reason,
+        limit,
+        coverage,
+    }
+}
+
+pub(super) fn render_member_target(
+    analyzer: &dyn IAnalyzer,
+    target: &ReceiverMemberTarget,
+    fallback: Range,
+    detail: CodeQueryResultDetail,
+    cache: &mut PipelineRenderCache,
+) -> CodeQueryMemberTarget {
+    match target {
+        ReceiverMemberTarget::Workspace { receiver, member } => {
+            let receiver_declaration = receiver.as_ref().map(|receiver| {
+                let declaration = declaration_value_for_unit(analyzer, receiver, fallback);
+                render_declaration(analyzer, &declaration, detail, cache)
+            });
+            let declaration = declaration_value_for_unit(analyzer, member, fallback);
+            let rendered = render_declaration(analyzer, &declaration, detail, cache);
+            CodeQueryMemberTarget {
+                id: target.member_identity_id(),
+                path: Some(rendered.path.clone()),
+                language: Some(rendered.language),
+                start_line: Some(rendered.start_line),
+                end_line: Some(rendered.end_line),
+                signature: rendered.signature.clone(),
+                node_range: rendered.node_range,
+                receiver_id: target.receiver_identity_id(),
+                receiver_fq_name: receiver.as_ref().map(CodeUnit::fq_name),
+                receiver_kind: receiver_declaration.as_ref().map(|value| value.kind),
+                receiver_declaration,
+                receiver_semantic_model: None,
+                receiver_proof: None,
+                receiver_binding_path: None,
+                receiver_binding_range: None,
+                name: member.identifier().to_string(),
+                fq_name: member.fq_name(),
+                kind: rendered.kind,
+                declaration: Some(rendered),
+                semantic_model: None,
+            }
+        }
+        ReceiverMemberTarget::SemanticModel {
+            receiver,
+            member,
+            receiver_proof,
+        } => {
+            let (receiver_proof, receiver_binding_path, receiver_binding_range) =
+                match receiver_proof {
+                    ReceiverIdentityProof::ExactValueAnalysis => {
+                        ("exact_value_analysis", None, None)
+                    }
+                    ReceiverIdentityProof::ExactStaticTypeReference => {
+                        ("exact_static_type_reference", None, None)
+                    }
+                    ReceiverIdentityProof::ImmutableBinding {
+                        file,
+                        declaration_range,
+                    } => (
+                        "immutable_binding",
+                        Some(rel_path_string(file)),
+                        Some(render_source_range(
+                            analyzer,
+                            file,
+                            declaration_range,
+                            cache,
+                        )),
+                    ),
+                };
+            CodeQueryMemberTarget {
+                id: member.id.clone(),
+                path: None,
+                language: model_language_label(&member.language),
+                start_line: None,
+                end_line: None,
+                signature: None,
+                node_range: None,
+                receiver_id: Some(receiver.id.clone()),
+                receiver_fq_name: Some(receiver.qualified_name.clone()),
+                receiver_kind: Some(model_symbol_kind_label(receiver.kind)),
+                receiver_declaration: None,
+                receiver_semantic_model: Some(Box::new(receiver.provenance.clone())),
+                receiver_proof: Some(receiver_proof),
+                receiver_binding_path,
+                receiver_binding_range,
+                name: member.name.clone(),
+                fq_name: member.qualified_name.clone(),
+                kind: model_symbol_kind_label(member.kind),
+                declaration: None,
+                semantic_model: Some(Box::new(member.provenance.clone())),
+            }
+        }
+    }
+}
+
+pub(super) fn render_field_write_value(
+    analyzer: &dyn IAnalyzer,
+    value: &FieldWriteValue,
+    detail: CodeQueryResultDetail,
+    cache: &mut PipelineRenderCache,
+) -> CodeQueryFieldWriteValue {
+    let facts = &value.seed.facts;
+    let assignment = facts.node(value.assignment_node).range;
+    let receiver = facts.node(value.receiver_node).range;
+    let member = facts.node(value.member_node).range;
+    let rhs = facts.node(value.rhs_node).range;
+    CodeQueryFieldWriteValue {
+        id: value.id(),
+        write_site_id: value.assignment_ast_id(),
+        assignment_ast_id: value.assignment_ast_id(),
+        left_ast_id: value.ast_id(value.left_node),
+        receiver_ast_id: value.ast_id(value.receiver_node),
+        member_ast_id: value.ast_id(value.member_node),
+        rhs_ast_id: value.rhs_ast_id(),
+        path: rel_path_string(&value.seed.file),
+        language: value.seed.language.config_label(),
+        range: render_source_range(analyzer, &value.seed.file, &rhs, cache),
+        text: snippet(
+            facts
+                .source()
+                .get(rhs.start_byte..rhs.end_byte)
+                .unwrap_or_default(),
+        ),
+        assignment_range: render_source_range(analyzer, &value.seed.file, &assignment, cache),
+        receiver_range: render_source_range(analyzer, &value.seed.file, &receiver, cache),
+        member_range: render_source_range(analyzer, &value.seed.file, &member, cache),
+        receiver_identity_id: value
+            .target
+            .receiver_identity_id()
+            .expect("field-write values retain exact receiver identity"),
+        member_target_id: value.target.member_identity_id(),
+        member_target: render_member_target(
+            analyzer,
+            &value.target,
+            value.analysis.report.site.range,
+            detail,
+            cache,
+        ),
+        proof: "precise",
+        completeness: "complete",
+        coverage: "exhaustive",
+    }
+}
+
+fn model_symbol_kind_label(
+    kind: crate::analyzer::semantic_model::SemanticModelSymbolKind,
+) -> &'static str {
+    use crate::analyzer::semantic_model::SemanticModelSymbolKind as Kind;
+    match kind {
+        Kind::Class => "class",
+        Kind::Annotation => "annotation",
+        Kind::Delegate => "delegate",
+        Kind::Interface => "interface",
+        Kind::Trait => "trait",
+        Kind::Struct => "struct",
+        Kind::Union => "union",
+        Kind::Enum => "enum",
+        Kind::Record => "record",
+        Kind::Module => "module",
+        Kind::TypeAlias => "type_alias",
+        Kind::Constructor => "constructor",
+        Kind::Method => "method",
+        Kind::Function => "function",
+        Kind::Field => "field",
+        Kind::Property => "property",
+        Kind::Constant => "constant",
+        Kind::Static => "static",
+        Kind::Macro => "macro",
+        Kind::Event => "event",
     }
 }
 
@@ -2246,6 +2558,8 @@ pub(super) fn render_call_binding(
         selector_summary_producer: summary.map(|value| value.producer.clone()),
         selector_summary_producer_version: summary.map(|value| value.producer_version.clone()),
         signature_id: value.site.signature_id.clone(),
+        model_callable_id: value.site.model_callable_id.clone(),
+        formal_layout_id: value.site.formal_layout_id.clone(),
         model_id: value.site.model_id.clone(),
         receiver_type_id: value.site.receiver_type_id.clone(),
         pack_id: value.site.pack_id.clone(),
@@ -2304,6 +2618,7 @@ pub(super) fn render_call_effect(
         effect_id: row.effect_id.clone(),
         classification: row.classification.label(),
         timing: row.timing.map(|timing| timing.label()),
+        execution_timing: row.execution_timing.map(|timing| timing.label()),
         certainty: row.certainty.map(|certainty| certainty.label()),
         proof: row.proof.map(|proof| proof.label()),
         derivation: row.derivation.label(),
@@ -2410,6 +2725,163 @@ pub(super) fn render_result_contract_use(
     }
 }
 
+pub(super) fn render_nilness_operation(
+    analyzer: &dyn IAnalyzer,
+    value: &effects::NilnessOperationValue,
+    cache: &mut PipelineRenderCache,
+) -> CodeQueryNilnessOperation {
+    CodeQueryNilnessOperation {
+        id: value.id.clone(),
+        procedure_id: value.procedure_id.clone(),
+        operation_point_id: value.operation_point_id.clone(),
+        subject_value_id: value.subject_value_id,
+        ast_id: value.ast_id.clone(),
+        path: rel_path_string(&value.file),
+        language: crate::analyzer::common::language_for_file(&value.file).config_label(),
+        range: render_source_range(analyzer, &value.file, &value.range, cache),
+        use_kind: value.use_kind.label(),
+        fact: value.fact.label(),
+        origin: value.origin,
+        proof: value.proof,
+        coverage: value.coverage.label(),
+        reason: value.reason,
+    }
+}
+
+pub(super) fn render_switch_coverage(
+    analyzer: &dyn IAnalyzer,
+    value: &effects::SwitchCoverageValue,
+    cache: &mut PipelineRenderCache,
+) -> CodeQuerySwitchCoverage {
+    CodeQuerySwitchCoverage {
+        id: value.id.clone(),
+        procedure_id: value.procedure_id.clone(),
+        switch_fact_id: value.switch_fact_id,
+        ast_id: value.ast_id.clone(),
+        path: rel_path_string(&value.file),
+        language: crate::analyzer::common::language_for_file(&value.file).config_label(),
+        range: render_source_range(analyzer, &value.file, &value.range, cache),
+        kind: value.kind,
+        selector_value_id: value.selector_value_id,
+        selector_domain: value.selector_domain,
+        case_count: value.case_count,
+        has_true_case: value.has_true_case,
+        has_false_case: value.has_false_case,
+        default_present: value.default_present,
+        verdict: value.verdict,
+        proof: value.proof,
+        reason: value.reason,
+    }
+}
+
+pub(super) fn render_concurrent_access_conflict(
+    analyzer: &dyn IAnalyzer,
+    value: &concurrency::ConcurrentAccessConflictValue,
+    cache: &mut PipelineRenderCache,
+) -> CodeQueryConcurrentAccessConflict {
+    use brokk_bifrost_flow::concurrency::{
+        ConcurrencyOpenReason, ConcurrentAccessMode, ConcurrentOrdering, ConcurrentProtection,
+        ConcurrentTaskRelation,
+    };
+    let access = |mode| match mode {
+        ConcurrentAccessMode::Read => "read",
+        ConcurrentAccessMode::Write => "write",
+    };
+    let relation = match value.conflict.task_relation {
+        ConcurrentTaskRelation::ParentChild => "parent_child",
+        ConcurrentTaskRelation::Siblings => "siblings",
+        ConcurrentTaskRelation::Nested => "nested",
+        ConcurrentTaskRelation::Repeated => "repeated",
+    };
+    let ordering = match value.conflict.ordering {
+        ConcurrentOrdering::Unordered => "unordered",
+        ConcurrentOrdering::HappensBefore => "happens_before",
+        ConcurrentOrdering::Open => "open",
+    };
+    let protection = match value.conflict.protection {
+        ConcurrentProtection::Unprotected => "unprotected",
+        ConcurrentProtection::CompatibleLock => "compatible_lock",
+        ConcurrentProtection::AtomicOnly => "atomic_only",
+        ConcurrentProtection::Open => "open",
+    };
+    let reason = |reason: &ConcurrencyOpenReason| match reason {
+        ConcurrencyOpenReason::UnresolvedTarget => "unresolved_target".to_owned(),
+        ConcurrencyOpenReason::AmbiguousTarget => "ambiguous_target".to_owned(),
+        ConcurrencyOpenReason::UnknownLocation => "unknown_location".to_owned(),
+        ConcurrencyOpenReason::AmbiguousSynchronization => "ambiguous_synchronization".to_owned(),
+        ConcurrencyOpenReason::UnsupportedSynchronization(protocol) => {
+            format!("unsupported_synchronization:{protocol}")
+        }
+        ConcurrencyOpenReason::RecursiveExpansion => "recursive_expansion".to_owned(),
+        ConcurrencyOpenReason::BudgetExhausted => "budget_exhausted".to_owned(),
+    };
+    CodeQueryConcurrentAccessConflict {
+        id: value.id.clone(),
+        root_procedure_id: value.root_procedure_id.clone(),
+        ast_id: value.ast_id.clone(),
+        path: rel_path_string(&value.file),
+        language: crate::analyzer::common::language_for_file(&value.file).config_label(),
+        range: render_source_range(analyzer, &value.file, &value.range, cache),
+        location_id: value.conflict.location.identity.to_string(),
+        location_kind: value.conflict.location.kind.to_string(),
+        first_procedure_id: format!("{:?}", value.conflict.first.procedure.durable_key()),
+        first_point_id: value.conflict.first.point.get(),
+        first_access: access(value.conflict.first.mode),
+        first_path: rel_path_string(&value.first_file),
+        first_range: render_source_range(analyzer, &value.first_file, &value.first_range, cache),
+        first_start_byte: value.first_range.start_byte,
+        first_end_byte: value.first_range.end_byte,
+        second_procedure_id: format!("{:?}", value.conflict.second.procedure.durable_key()),
+        second_point_id: value.conflict.second.point.get(),
+        second_access: access(value.conflict.second.mode),
+        second_path: rel_path_string(&value.second_file),
+        second_range: render_source_range(analyzer, &value.second_file, &value.second_range, cache),
+        second_start_byte: value.second_range.start_byte,
+        second_end_byte: value.second_range.end_byte,
+        task_relation: relation,
+        ordering,
+        protection,
+        verdict: "conflict",
+        proof: if value.conflict.proven {
+            "proven"
+        } else {
+            "open"
+        },
+        coverage: if value.conflict.exhaustive {
+            "exhaustive"
+        } else {
+            "open"
+        },
+        reasons: value.conflict.reasons.iter().map(reason).collect(),
+    }
+}
+
+pub(super) fn render_detached_task_transfer(
+    analyzer: &dyn IAnalyzer,
+    value: &effects::DetachedTaskTransferValue,
+    cache: &mut PipelineRenderCache,
+) -> CodeQueryDetachedTaskTransfer {
+    CodeQueryDetachedTaskTransfer {
+        id: value.id.clone(),
+        procedure_id: value.procedure_id.clone(),
+        call_id: value.call_id.clone(),
+        call_point_id: value.call_point_id.clone(),
+        ast_id: value.ast_id.clone(),
+        path: rel_path_string(&value.file),
+        language: crate::analyzer::common::language_for_file(&value.file).config_label(),
+        range: render_source_range(analyzer, &value.file, &value.range, cache),
+        role: value.role,
+        ordinal: value.ordinal,
+        value_id: value.value_id.clone(),
+        object_id: value.object_id.clone(),
+        object_cardinality: value.object_cardinality,
+        timing: value.timing,
+        proof: value.proof,
+        coverage: value.coverage,
+        reason: value.reason,
+    }
+}
+
 pub(super) fn render_result_contract_failure_use(
     analyzer: &dyn IAnalyzer,
     value: &effects::ResultContractFailureUseValue,
@@ -2473,6 +2945,7 @@ pub(super) fn render_procedure_effect(
             .map(|classification| classification.label()),
         certainty: row.certainty.map(|certainty| certainty.label()),
         timing: row.timing.map(|timing| timing.label()),
+        execution_timing: row.execution_timing.map(|timing| timing.label()),
         depth: row.depth,
         derivation: row.derivation.label(),
         reason: row.reason.map(|reason| reason.label()),
@@ -2814,22 +3287,61 @@ pub(super) fn provider_supports_feature(
     }
 }
 
+/// Report the live work counters for a limit diagnostic that cannot restate
+/// them.
+///
+/// The counters depend on worker scheduling and cache state at the moment the
+/// limit tripped, so two executions of one query over an unchanged workspace
+/// disagree (#2897: 5178 facts on one run, 4927 on the next). A diagnostic
+/// message is snapshot, diffed, and documented, so it must carry only stable
+/// facts. `CodeQueryExecutionWork` on `DetailedCodeQueryResult` remains the
+/// machine-readable form of the same numbers; this note is the run-dependent
+/// view a profiling session asks for.
+fn note_budget_work(code: CodeQueryDiagnosticCode, budget: &CodeQueryExecutionBudget) {
+    crate::profiling::note_with(|| {
+        format!(
+            "query_code.{} scanned_files={} scanned_source_bytes={} fact_nodes={} pipeline_rows={} examined_references={} provenance_steps={}",
+            code.as_str(),
+            budget.scanned_files,
+            budget.scanned_source_bytes,
+            budget.fact_nodes,
+            budget.pipeline_rows,
+            budget.examined_references,
+            budget.provenance_steps
+        )
+    });
+}
+
+/// Whether this execution already named `code` for the branch being collected.
+///
+/// Budget walls are detected per file, per row, or per relation scan, so one
+/// execution can reach the same wall many times. The counters used to make
+/// each report look different; without them the repeats are the same sentence,
+/// and how many arrive depends on scheduling, so one report per code per
+/// branch is both the readable and the reproducible answer.
+fn already_reported(diagnostics: &[CodeQueryDiagnostic], code: CodeQueryDiagnosticCode) -> bool {
+    diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.branch.is_empty() && diagnostic.code == code)
+}
+
 pub(super) fn push_budget_diagnostic(
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
     budget: &CodeQueryExecutionBudget,
 ) {
+    note_budget_work(CodeQueryDiagnosticCode::ExecutionBudgetExhausted, budget);
+    if already_reported(
+        diagnostics,
+        CodeQueryDiagnosticCode::ExecutionBudgetExhausted,
+    ) {
+        return;
+    }
     diagnostics.push(CodeQueryDiagnostic {
         code: CodeQueryDiagnosticCode::ExecutionBudgetExhausted,
         impact: CodeQueryDiagnosticImpact::Incomplete,
         branch: Vec::new(),
         language: "workspace",
-        message: format!(
-            "query_code execution budget exhausted after scanning {} files, {} bytes, {} facts, and examining {} references; refine the query with where, languages, kind/name anchors, or a narrower pattern",
-            budget.scanned_files,
-            budget.scanned_source_bytes,
-            budget.fact_nodes,
-            budget.examined_references
-        ),
+        message: "query_code execution budget exhausted before the query finished; refine the query with where, languages, kind/name anchors, or a narrower pattern".to_string(),
     });
 }
 
@@ -2837,10 +3349,11 @@ pub(super) fn push_pipeline_budget_diagnostic(
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
     budget: &CodeQueryExecutionBudget,
 ) {
-    if diagnostics.iter().any(|diagnostic| {
-        diagnostic.branch.is_empty()
-            && diagnostic.code == CodeQueryDiagnosticCode::PipelineBudgetExhausted
-    }) {
+    note_budget_work(CodeQueryDiagnosticCode::PipelineBudgetExhausted, budget);
+    if already_reported(
+        diagnostics,
+        CodeQueryDiagnosticCode::PipelineBudgetExhausted,
+    ) {
         return;
     }
     diagnostics.push(CodeQueryDiagnostic {
@@ -2848,10 +3361,7 @@ pub(super) fn push_pipeline_budget_diagnostic(
         impact: CodeQueryDiagnosticImpact::Incomplete,
         branch: Vec::new(),
         language: "workspace",
-        message: format!(
-            "query_code pipeline budget exhausted after producing {} seed and edge rows; refine the match, where, or languages filters",
-            budget.pipeline_rows
-        ),
+        message: "query_code pipeline budget exhausted while producing seed and edge rows; refine the match, where, or languages filters".to_string(),
     });
 }
 
@@ -2859,15 +3369,26 @@ pub(super) fn push_import_graph_budget_diagnostic(
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
     graph: &RequestLocalDirectImportGraph,
 ) {
+    crate::profiling::note_with(|| {
+        format!(
+            "query_code.{} resolved_files={} resolved_edges={}",
+            CodeQueryDiagnosticCode::ImportGraphBudgetExhausted.as_str(),
+            graph.resolved_files(),
+            graph.resolved_edges()
+        )
+    });
+    if already_reported(
+        diagnostics,
+        CodeQueryDiagnosticCode::ImportGraphBudgetExhausted,
+    ) {
+        return;
+    }
     diagnostics.push(CodeQueryDiagnostic {
         code: CodeQueryDiagnosticCode::ImportGraphBudgetExhausted,
         impact: CodeQueryDiagnosticImpact::Incomplete,
         branch: Vec::new(),
         language: "workspace",
-        message: format!(
-            "query_code import graph budget exhausted after resolving {} files and {} direct edges; import traversal results are partial",
-            graph.resolved_files(), graph.resolved_edges()
-        ),
+        message: "query_code import graph budget exhausted while resolving files and direct edges; import traversal results are partial".to_string(),
     });
 }
 
@@ -2876,17 +3397,14 @@ pub(super) fn push_truncation_diagnostic(
     budget: &CodeQueryExecutionBudget,
     limit: usize,
 ) {
+    note_budget_work(CodeQueryDiagnosticCode::ResultLimitReached, budget);
     diagnostics.push(CodeQueryDiagnostic {
         code: CodeQueryDiagnosticCode::ResultLimitReached,
         impact: CodeQueryDiagnosticImpact::Incomplete,
         branch: Vec::new(),
         language: "workspace",
         message: format!(
-            "query_code returned the first {limit} results after scanning {} files, {} bytes, {} facts, and examining {} references; results are ordered by project-relative path; refine the query with where, languages, exact names, or a narrower pattern",
-            budget.scanned_files,
-            budget.scanned_source_bytes,
-            budget.fact_nodes,
-            budget.examined_references
+            "query_code reached the query limit of {limit} and returned the first {limit} results; results are ordered by project-relative path; refine the query with where, languages, exact names, or a narrower pattern"
         ),
     });
 }
@@ -2907,18 +3425,13 @@ pub(super) fn push_broad_query_diagnostic(
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
     budget: &CodeQueryExecutionBudget,
 ) {
+    note_budget_work(CodeQueryDiagnosticCode::BroadQuery, budget);
     diagnostics.push(CodeQueryDiagnostic {
         code: CodeQueryDiagnosticCode::BroadQuery,
         impact: CodeQueryDiagnosticImpact::Advisory,
         branch: Vec::new(),
         language: "workspace",
-        message: format!(
-            "broad unanchored query_code query scanned {} files, {} bytes, {} facts, and examined {} references; add where, languages, exact name predicates, or a more specific pattern to reduce work and output",
-            budget.scanned_files,
-            budget.scanned_source_bytes,
-            budget.fact_nodes,
-            budget.examined_references
-        ),
+        message: "broad unanchored query_code query scanned the workspace without a source anchor; add where, languages, exact name predicates, or a more specific pattern to reduce work and output".to_string(),
     });
 }
 

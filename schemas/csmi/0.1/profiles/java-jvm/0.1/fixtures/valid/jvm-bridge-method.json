@@ -1,0 +1,19 @@
+{
+  "$profileSchema": "jvm-binary-identity",
+  "profileVersion": "0.1",
+  "owner": "org/example/StringBox",
+  "binaryEntity": {
+    "kind": "method",
+    "name": "value",
+    "descriptor": "()Ljava/lang/Object;"
+  },
+  "variant": {
+    "entryPath": "org/example/StringBox.class",
+    "release": 0,
+    "classFileMajor": 61
+  },
+  "flags": {
+    "bridge": true,
+    "synthetic": true
+  }
+}

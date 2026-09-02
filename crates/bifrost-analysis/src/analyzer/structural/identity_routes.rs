@@ -25,7 +25,9 @@ use super::facts::FileFacts;
 use super::kinds::NormalizedKind;
 use super::occurrence_rows::{OccurrenceRow, OccurrenceTarget, occurrences_for_file};
 use super::occurrences::{Namespace, OccurrenceRole};
-use super::routes::{CanonicalIdentity, IdentityAxis, RouteHopKind, RouteTermination};
+use super::routes::{
+    CanonicalIdentity, CuratedExportSurface, IdentityAxis, RouteHopKind, RouteTermination,
+};
 use super::spec::StructuralSpec;
 use crate::analyzer::common::language_for_file;
 use crate::analyzer::structural_spec_for;
@@ -42,9 +44,10 @@ use std::collections::HashSet;
 /// metadata records type parameters that every rendering agrees on.
 ///
 /// `generic_arity` stays `None` when no metadata records type parameters or
-/// when renderings disagree — a recorded absence (`Some(0)`) currently has no
-/// producer, so a nongeneric declaration and an unrecorded one both project
-/// `None` and compare equal on that field.
+/// when renderings disagree. A metadata row whose producer actually read the
+/// declaration's type-parameter list contributes its length even when that
+/// length is zero, so a nongeneric declaration in a recording language is
+/// `Some(0)` and is never equal to an unrecorded one.
 pub fn canonical_identity_of(analyzer: &dyn IAnalyzer, unit: &CodeUnit) -> CanonicalIdentity {
     let namespace = if unit.is_module() {
         Namespace::Module
@@ -56,7 +59,7 @@ pub fn canonical_identity_of(analyzer: &dyn IAnalyzer, unit: &CodeUnit) -> Canon
     let mut generic_arity: Option<u32> = None;
     for metadata in analyzer.signature_metadata(unit) {
         let parameters = metadata.type_parameters();
-        if parameters.is_empty() {
+        if parameters.is_empty() && !metadata.type_parameters_recorded() {
             continue;
         }
         let count = u32::try_from(parameters.len()).expect("type parameter count fits in u32");
@@ -186,6 +189,12 @@ pub enum RouteRelationIncompleteReason {
     /// The occurrence rows the import/alias relations are derived from are
     /// themselves incomplete for the roles they need.
     OccurrenceRowsIncomplete,
+    /// The adapter could not say which indirection relation at least one
+    /// import site participates in, so the site-anchored relations are less
+    /// than the whole truth. A Python module whose `__all__` the source
+    /// computes is the case this exists for: membership decides whether an
+    /// import re-exports, and an unreadable `__all__` settles it neither way.
+    IndirectionUnclassified,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -216,6 +225,13 @@ impl RouteRelationCompleteness {
                         RouteRelationIncompleteReason::RelationUnsupported(unsupported) => {
                             *unsupported == relation
                         }
+                        // Only the site-anchored relations are classified per
+                        // import token, so an unclassified site says nothing
+                        // about the declaration-anchored ones.
+                        RouteRelationIncompleteReason::IndirectionUnclassified => matches!(
+                            relation,
+                            RouteHopKind::Import | RouteHopKind::Export | RouteHopKind::ReExport
+                        ),
                         RouteRelationIncompleteReason::NoStructuralAdapter
                         | RouteRelationIncompleteReason::FactsUnavailable
                         | RouteRelationIncompleteReason::OccurrenceRowsIncomplete => true,
@@ -297,15 +313,19 @@ pub fn route_relations_for_file(
             .find(|provider| provider.structural_language() == language)
             .and_then(|provider| provider.structural_facts(file));
         match facts {
-            Some(facts) => site_relation_rows(
-                spec,
-                file,
-                &facts,
-                language,
-                &occurrences.rows,
-                support,
-                &mut rows,
-            ),
+            Some(facts) => {
+                if let Some(reason) = site_relation_rows(
+                    spec,
+                    file,
+                    &facts,
+                    language,
+                    &occurrences.rows,
+                    support,
+                    &mut rows,
+                ) {
+                    note(&mut reasons, reason);
+                }
+            }
             None => note(
                 &mut reasons,
                 RouteRelationIncompleteReason::FactsUnavailable,
@@ -351,6 +371,9 @@ fn note(reasons: &mut Vec<RouteRelationIncompleteReason>, reason: RouteRelationI
 /// Import/export/re-export rows from resolved import-target occurrences, and
 /// alias rows from import-alias tokens paired with the target of the same
 /// import declaration.
+///
+/// Returns the reason these rows are less than the whole truth, when the
+/// adapter could not classify some site's indirection.
 fn site_relation_rows(
     spec: &dyn StructuralSpec,
     file: &ProjectFile,
@@ -359,8 +382,14 @@ fn site_relation_rows(
     occurrence_rows: &[OccurrenceRow],
     support: &super::routes::IdentityRouteSupport,
     rows: &mut Vec<RouteRelationRow>,
-) {
+) -> Option<RouteRelationIncompleteReason> {
     let tree = parse_tree_for_language(file, language, facts.source());
+    // The file's curated export surface (Python's `__all__`) decides which of
+    // its imports forward identity onward, so the adapter reads it once here
+    // rather than per token.
+    let surface = tree.as_ref().map_or(CuratedExportSurface::Absent, |tree| {
+        spec.curated_export_surface(tree.root_node(), facts.source())
+    });
 
     // The nearest enclosing Import-kind fact of each import-role token: the
     // pairing key between an alias binder and the target it respells.
@@ -384,15 +413,22 @@ fn site_relation_rows(
         }
     }
 
+    // An unclassified site still carries the plain import its occurrence role
+    // already states, but the file can no longer claim its site-anchored
+    // relations are the whole truth.
+    let mut unclassified = None;
     for &(row, _, units) in &target_rows {
-        let relation = tree
+        let classified = tree
             .as_ref()
             .and_then(|tree| {
                 tree.root_node()
                     .descendant_for_byte_range(row.range.start_byte, row.range.end_byte)
             })
-            .and_then(|token| spec.indirection_relation(token))
-            .unwrap_or(RouteHopKind::Import);
+            .and_then(|token| spec.indirection_relation(token, facts.source(), &surface));
+        if classified.is_none() {
+            unclassified = Some(RouteRelationIncompleteReason::IndirectionUnclassified);
+        }
+        let relation = classified.unwrap_or(RouteHopKind::Import);
         debug_assert!(
             support.supports_relation(relation),
             "adapter classified an indirection as {relation} without claiming that relation"
@@ -455,6 +491,8 @@ fn site_relation_rows(
             }
         }
     }
+
+    unclassified
 }
 
 /// Whether the alias token and the target token belong to the same alias
@@ -886,32 +924,74 @@ mod tests {
         result.rows.iter().filter(|row| row.kind == kind).collect()
     }
 
-    /// Declaration-side generic arity has no producer for Rust type
-    /// declarations today: `signature_metadata` records type parameters for
-    /// no struct, so a generic and a nongeneric type both project `None` and
-    /// the field never separates them. This pin fails the day a producer
-    /// arrives, which is when the generic/nongeneric decoy family can move
-    /// from the use-site surface (segment rows carry spelled arity, #1475
-    /// M2) to the declaration surface. Tracked in the #1475 follow-ups.
+    /// Rust type declarations record their own type-parameter list (#1651),
+    /// so declaration-side generic arity is a read answer: a nongeneric type
+    /// is `Some(0)`, not the `None` that means "nobody looked". This is the
+    /// declaration half of the generic/nongeneric decoy family whose use-site
+    /// half segment rows already carry (#1475 M2).
     #[test]
-    fn declaration_generic_arity_has_no_rust_producer_yet() {
+    fn rust_type_declarations_record_generic_arity() {
         let fixture = Fixture::new(
             Language::Rust,
             &[(
                 "src/lib.rs",
-                "pub struct Plain;\npub struct Generic<T> {\n    pub value: T,\n}\n",
+                "pub struct Plain;\npub struct Generic<T> {\n    pub value: T,\n}\n\
+                 pub struct Pair<K, V> {\n    pub key: K,\n    pub value: V,\n}\n\
+                 pub enum Choice<T> {\n    Only(T),\n}\npub trait Marker {}\n\
+                 pub type Alias<T> = Option<T>;\npub type Plainest = usize;\n",
             )],
         );
-        let plain = canonical_identity_of(fixture.analyzer(), &fixture.declaration("Plain"));
-        let generic = canonical_identity_of(fixture.analyzer(), &fixture.declaration("Generic"));
-        assert_eq!(plain.generic_arity, None);
-        assert_eq!(generic.generic_arity, None);
-        // The identities still separate, by name segments; arity is the
-        // field that would separate same-named siblings.
-        assert_ne!(plain, generic);
+        let arity = |fq_suffix: &str| {
+            canonical_identity_of(fixture.analyzer(), &fixture.declaration(fq_suffix)).generic_arity
+        };
+        assert_eq!(arity("Plain"), Some(0));
+        assert_eq!(arity("Generic"), Some(1));
+        assert_eq!(arity("Pair"), Some(2));
+        assert_eq!(arity("Choice"), Some(1));
+        assert_eq!(arity("Marker"), Some(0));
+        assert_eq!(arity("Alias"), Some(1));
+        assert_eq!(arity("Plainest"), Some(0));
     }
 
-    /// Two declarations whose terminal spelling coincides    /// Two declarations whose terminal spelling coincides but whose owner
+    /// Arity alone separates two identities whose every other component
+    /// coincides: same language, same namespace, same segment kinds and
+    /// spellings. This is what `generic_arity` exists to do, and it cannot be
+    /// shown by two differently named siblings.
+    #[test]
+    fn same_named_generic_and_nongeneric_types_differ_on_arity_alone() {
+        let fixture = Fixture::new(
+            Language::Rust,
+            &[
+                ("src/a.rs", "pub struct S;\n"),
+                ("src/b.rs", "pub struct S<T> {\n    pub value: T,\n}\n"),
+            ],
+        );
+        let plain = canonical_identity_of(fixture.analyzer(), &fixture.declaration("a.S"));
+        let generic = canonical_identity_of(fixture.analyzer(), &fixture.declaration("b.S"));
+        assert_eq!(plain.generic_arity, Some(0));
+        assert_eq!(generic.generic_arity, Some(1));
+        assert_ne!(plain, generic);
+
+        // Strip the owning module segment and the two are the same identity
+        // except for the arity, so arity is doing the separating on its own.
+        let terminal = |identity: &CanonicalIdentity| CanonicalIdentity {
+            segments: identity.segments[identity.segments.len() - 1..].to_vec(),
+            ..identity.clone()
+        };
+        let plain_terminal = terminal(&plain);
+        let generic_terminal = terminal(&generic);
+        assert_eq!(plain_terminal.segments, generic_terminal.segments);
+        assert_ne!(plain_terminal, generic_terminal);
+        assert_eq!(
+            CanonicalIdentity {
+                generic_arity: generic_terminal.generic_arity,
+                ..plain_terminal.clone()
+            },
+            generic_terminal
+        );
+    }
+
+    /// Two declarations whose terminal spelling coincides but whose owner
     /// segments differ are different canonical identities; equality reads the
     /// structure, never the rendering.
     #[test]
@@ -1176,6 +1256,139 @@ mod tests {
         assert!(
             !rows.completeness.covers(RouteHopKind::ReExport),
             "the unclaimed re-export relation must not read as covered"
+        );
+    }
+
+    /// The Python facade fixture of issue #1649: a package with an
+    /// implementation module, and a `facade.py` whose body the test supplies.
+    fn python_facade(facade: &str) -> Fixture {
+        Fixture::new(
+            Language::Python,
+            &[
+                ("pkg/__init__.py", ""),
+                ("pkg/impl.py", "class Widget:\n    pass\n"),
+                ("facade.py", facade),
+            ],
+        )
+    }
+
+    /// A name on the module's `__all__` re-exports whatever binding the module
+    /// gives it, so `import pkg.impl as impl` under `__all__ = ["impl"]`
+    /// forwards the module onward. The alias row for the same statement is
+    /// unaffected: a re-export and a respelling are different relations over
+    /// the same import.
+    #[test]
+    fn python_all_curated_facade_yields_reexport_and_alias_rows() {
+        let fixture = python_facade("__all__ = [\"impl\"]\nimport pkg.impl as impl\n");
+        let rows = fixture.rows(2);
+        assert!(
+            rows.completeness.covers(RouteHopKind::ReExport),
+            "a readable __all__ states every name's membership: {:?}",
+            rows.completeness
+        );
+
+        let reexports = rows_of_kind(&rows, RouteHopKind::ReExport);
+        assert_eq!(reexports.len(), 1, "rows: {:?}", rows.rows);
+        let RouteEndpoint::Declaration(target) = &reexports[0].to else {
+            panic!("re-export target must be a declaration");
+        };
+        assert_eq!(target.source(), &fixture.files[1]);
+        let RouteEndpoint::Site { name, range, .. } = &reexports[0].from else {
+            panic!("re-export site expected");
+        };
+        assert_eq!(name, "impl");
+        assert_eq!(range.start_byte, fixture.at(2, "impl as impl"));
+
+        assert_eq!(
+            rows_of_kind(&rows, RouteHopKind::Alias).len(),
+            1,
+            "rows: {:?}",
+            rows.rows
+        );
+        assert!(
+            rows_of_kind(&rows, RouteHopKind::Import).is_empty(),
+            "a listed name is a re-export, not also a plain import: {:?}",
+            rows.rows
+        );
+    }
+
+    /// The near miss, differing in exactly one statement: the same import
+    /// under no `__all__` publishes nothing. The facade convention alone is
+    /// not a re-export, which is the risk the issue's own text warns about.
+    #[test]
+    fn python_facade_without_all_states_only_an_import() {
+        let rows = python_facade("import pkg.impl as impl\n").rows(2);
+        assert!(
+            rows_of_kind(&rows, RouteHopKind::ReExport).is_empty(),
+            "rows: {:?}",
+            rows.rows
+        );
+        assert_eq!(
+            rows_of_kind(&rows, RouteHopKind::Import).len(),
+            1,
+            "rows: {:?}",
+            rows.rows
+        );
+    }
+
+    /// `from x import *` forwards the whole public surface of `x` as one star
+    /// hop on the module reference. The expansion stays the import machinery's
+    /// answer, so the producer records the hop and enumerates nothing.
+    #[test]
+    fn python_star_import_is_one_reexport_hop() {
+        let fixture = Fixture::new(
+            Language::Python,
+            &[
+                ("pkg/__init__.py", "from .impl import *\n"),
+                ("pkg/impl.py", "class Widget:\n    pass\n"),
+            ],
+        );
+        let rows = fixture.rows(0);
+        let reexports = rows_of_kind(&rows, RouteHopKind::ReExport);
+        assert_eq!(reexports.len(), 1, "rows: {:?}", rows.rows);
+        let RouteEndpoint::Site { name, range, .. } = &reexports[0].from else {
+            panic!("re-export site expected");
+        };
+        assert_eq!(name, "impl");
+        assert_eq!(range.start_byte, fixture.at(0, "impl import"));
+        let RouteEndpoint::Declaration(target) = &reexports[0].to else {
+            panic!("re-export target must be a declaration");
+        };
+        assert_eq!(target.source(), &fixture.files[1]);
+    }
+
+    /// A computed `__all__` settles no name's membership, so the facade's
+    /// site-anchored relations report incomplete instead of guessing. The
+    /// declaration-anchored relations are untouched by that gap, and the site
+    /// still carries the plain import its occurrence role already states.
+    #[test]
+    fn python_computed_all_leaves_site_relations_incomplete() {
+        let rows = python_facade("__all__ = build_exports()\nimport pkg.impl as impl\n").rows(2);
+        assert!(
+            !rows.completeness.covers(RouteHopKind::ReExport),
+            "an unreadable __all__ must not read as a complete re-export answer: {:?}",
+            rows.completeness
+        );
+        assert!(
+            !rows.completeness.covers(RouteHopKind::Import),
+            "the same site is unclassified for the import relation: {:?}",
+            rows.completeness
+        );
+        assert!(
+            rows.completeness.covers(RouteHopKind::NestedOwner),
+            "nested owners are declaration-anchored, so the gap does not reach them: {:?}",
+            rows.completeness
+        );
+        assert!(
+            rows_of_kind(&rows, RouteHopKind::ReExport).is_empty(),
+            "nothing is guessed into a re-export row: {:?}",
+            rows.rows
+        );
+        assert_eq!(
+            rows_of_kind(&rows, RouteHopKind::Import).len(),
+            1,
+            "rows: {:?}",
+            rows.rows
         );
     }
 

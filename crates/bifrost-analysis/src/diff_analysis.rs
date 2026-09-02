@@ -12,6 +12,7 @@ use crate::searchtools::{
     UsageGraphCallSite, UsageGraphEdge, UsageGraphParams, UsageGraphTruncatedSymbol, usage_graph,
 };
 use crate::{FileSetProject, FilesystemProject, ImportInfo, Project, WorkspaceAnalyzer};
+use brokk_bifrost_core::analyzer::project::BifrostIgnoreMatcher;
 use git2::{
     Delta, DiffFormat, DiffOptions, FileMode, ObjectType, Oid, Repository, TreeWalkMode,
     TreeWalkResult,
@@ -23,7 +24,7 @@ use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Endpoint label reported for the uncommitted working tree.
@@ -1547,6 +1548,7 @@ impl RevisionImage {
                     files,
                     objects: Arc::clone(objects),
                     blobs: Arc::clone(blobs),
+                    bifrost_ignore: OnceLock::new(),
                 }),
                 Some(Arc::clone(blobs)),
             ),
@@ -1564,12 +1566,24 @@ impl RevisionImage {
 pub struct RevisionExport {
     image: RevisionImage,
     commit_id: String,
+    tree_id: Oid,
 }
 
 impl RevisionExport {
     /// Root directory containing the exported files.
     pub fn root(&self) -> &Path {
         self.image.root()
+    }
+
+    /// Id of the workspace subtree this export materialized.
+    ///
+    /// The tree id determines the exported bytes exactly, including for a
+    /// workspace root that is a subdirectory of the repository, which is why
+    /// it -- and not the commit id -- is what a content-keyed record of this
+    /// evaluation is keyed by. Two commits that leave the workspace subtree
+    /// untouched export the same bytes and share this id.
+    pub fn tree_id(&self) -> Oid {
+        self.tree_id
     }
 
     /// Workspace-relative paths of every exported regular file.
@@ -1600,11 +1614,22 @@ impl RevisionExport {
     /// every later revision request -- and this build in turn parses only the
     /// blobs no earlier request already published.
     ///
+    /// `config` is the configuration the *head* of the comparison was built
+    /// with, not a configuration of this function's choosing. The analyzer
+    /// configuration selects dependency discovery, dispatch expansion, and
+    /// per-language behavior, and it is folded into every content identity the
+    /// build publishes, so a base built with a different one answers a
+    /// different question than the head it is compared against.
+    ///
     /// The returned value borrows nothing, but the files it analyzes live under
     /// this export, so the caller must keep the export alive for the whole
     /// lifetime of the returned workspace: dropping the export deletes the tree
     /// out from under it.
-    pub fn build_workspace(&self, repository_root: &Path) -> Result<RevisionWorkspace, String> {
+    pub fn build_workspace(
+        &self,
+        repository_root: &Path,
+        config: AnalyzerConfig,
+    ) -> Result<RevisionWorkspace, String> {
         let cache =
             SharedAnalyzerCache::open(repository_root).map_err(|error| error.to_string())?;
         // Claimed before the build, so a build that fails partway still leaves
@@ -1614,14 +1639,11 @@ impl RevisionExport {
         let blobs = blobs.expect(
             "an export always materializes a snapshot image, which carries the revision's blob ids",
         );
-        let workspace = WorkspaceAnalyzer::build_revision_image(
-            project,
-            AnalyzerConfig::default(),
-            None,
-            Some(&cache),
-            blobs,
-        )
-        .map_err(|error| format!("Failed to build the revision export analyzer: {error}"))?;
+        let workspace =
+            WorkspaceAnalyzer::build_revision_image(project, config, None, Some(&cache), blobs)
+                .map_err(|error| {
+                    format!("Failed to build the revision export analyzer: {error}")
+                })?;
         Ok(RevisionWorkspace {
             workspace,
             _projection: projection,
@@ -1670,6 +1692,130 @@ pub fn export_revision(workspace_root: &Path, revision: &str) -> Result<Revision
         }
         Snapshot::Worktree => unreachable!("explicit revisions never resolve to worktree"),
     };
+    let tree = workspace_subtree(&repo, workspace_root, commit_id, revision)?;
+    let tree_id = tree.id();
+    let subtree = Snapshot::Tree(tree_id);
+    // The complete-tree branch runs no import expansion, so there is nothing
+    // here for a shared cache to serve. `correspond_revisions` opens the cache
+    // itself and hands it to the analyzer it builds over this image.
+    let image = RevisionImage::materialize(&repo, subtree, None, &[], None)?;
+    Ok(RevisionExport {
+        image,
+        commit_id: commit_id.to_string(),
+        tree_id,
+    })
+}
+
+/// One committed workspace subtree, resolved without exporting a byte of it.
+///
+/// A run that already holds a complete record of evaluating this subtree needs
+/// its identity, its file listing and the bytes of the few blobs that moved --
+/// never the whole tree on disk. Exporting to answer that would cost the very
+/// work the record exists to avoid, so this stops at the tree.
+pub struct RevisionSubtree {
+    repository: Repository,
+    commit_id: String,
+    tree_id: Oid,
+    blobs: Vec<(Box<str>, Oid)>,
+}
+
+impl RevisionSubtree {
+    /// Full hex id of the commit the requested revision resolved to.
+    pub fn commit_id(&self) -> &str {
+        &self.commit_id
+    }
+
+    /// Id of the workspace subtree, the same id [`RevisionExport::tree_id`]
+    /// reports for the same revision.
+    pub fn tree_id(&self) -> Oid {
+        self.tree_id
+    }
+
+    /// Every regular file of the subtree, as its normalized
+    /// workspace-relative path and the blob that path holds.
+    pub fn blobs(&self) -> &[(Box<str>, Oid)] {
+        &self.blobs
+    }
+
+    /// The source text of one committed blob.
+    ///
+    /// `None` for a blob this repository cannot read or whose bytes are not
+    /// text, which for a caller rebuilding a file's facts is the same answer:
+    /// this blob's facts cannot be enumerated from here.
+    pub fn source(&self, blob: Oid) -> Option<String> {
+        let blob = self.repository.find_blob(blob).ok()?;
+        String::from_utf8(blob.content().to_vec()).ok()
+    }
+}
+
+/// Resolve `revision` to the workspace subtree it names, and list that
+/// subtree's regular files, without materializing any of them.
+pub fn resolve_revision_subtree(
+    workspace_root: &Path,
+    revision: &str,
+) -> Result<RevisionSubtree, String> {
+    let repository = Repository::discover(workspace_root).map_err(|err| {
+        format!(
+            "workspace root {} is not inside a git repository: {err}",
+            workspace_root.display()
+        )
+    })?;
+    let commit_id = match resolve_snapshot(&repository, revision)? {
+        Snapshot::Commit(oid) => oid,
+        Snapshot::Tree(_) => {
+            return Err(format!("revision `{revision}` is a tree, not a commit"));
+        }
+        Snapshot::Worktree => unreachable!("explicit revisions never resolve to worktree"),
+    };
+    let tree = workspace_subtree(&repository, workspace_root, commit_id, revision)?;
+    let tree_id = tree.id();
+    let mut blobs = Vec::new();
+    let mut failure = None;
+    let walk = tree.walk(TreeWalkMode::PreOrder, |parent, entry| {
+        let Some(name) = entry.name() else {
+            return TreeWalkResult::Ok;
+        };
+        let raw_path = format!("{parent}{name}");
+        let rel = match safe_tree_entry_path(&raw_path) {
+            Ok(rel) => rel,
+            Err(error) => {
+                failure = Some(error);
+                return TreeWalkResult::Abort;
+            }
+        };
+        if entry.kind() != Some(ObjectType::Blob) || !is_regular_file_mode(entry.filemode()) {
+            return TreeWalkResult::Ok;
+        }
+        blobs.push((
+            Box::from(rel.to_string_lossy().replace('\\', "/").as_str()),
+            entry.id(),
+        ));
+        TreeWalkResult::Ok
+    });
+    if let Some(error) = failure {
+        return Err(error);
+    }
+    walk.map_err(|error| format!("unable to walk immutable revision tree: {error}"))?;
+    drop(tree);
+    Ok(RevisionSubtree {
+        repository,
+        commit_id: commit_id.to_string(),
+        tree_id,
+        blobs,
+    })
+}
+
+/// The tree holding `commit_id`'s content at `workspace_root`.
+///
+/// `workspace_root` may be the repository work-tree root or a subdirectory of
+/// it; a subdirectory root peels to its own subtree, so every path this tree
+/// names is workspace-relative and joins with a path the live workspace names.
+fn workspace_subtree<'repo>(
+    repo: &'repo Repository,
+    workspace_root: &Path,
+    commit_id: Oid,
+    revision: &str,
+) -> Result<git2::Tree<'repo>, String> {
     let workdir = repo.workdir().ok_or_else(|| {
         format!(
             "repository for {} has no working tree",
@@ -1699,35 +1845,25 @@ pub fn export_revision(workspace_root: &Path, revision: &str) -> Result<Revision
         .find_commit(commit_id)
         .and_then(|commit| commit.tree())
         .map_err(|err| format!("unable to read tree for commit {commit_id}: {err}"))?;
-    let tree = if prefix.as_os_str().is_empty() {
-        commit_tree
-    } else {
-        commit_tree
-            .get_path(prefix)
-            .map_err(|err| {
-                format!(
-                    "revision `{revision}` has no entry for workspace directory `{}`: {err}",
-                    prefix.display()
-                )
-            })?
-            .to_object(&repo)
-            .and_then(|object| object.peel_to_tree())
-            .map_err(|err| {
-                format!(
-                    "workspace directory `{}` at revision `{revision}` is not a directory: {err}",
-                    prefix.display()
-                )
-            })?
-    };
-    let subtree = Snapshot::Tree(tree.id());
-    // The complete-tree branch runs no import expansion, so there is nothing
-    // here for a shared cache to serve. `correspond_revisions` opens the cache
-    // itself and hands it to the analyzer it builds over this image.
-    let image = RevisionImage::materialize(&repo, subtree, None, &[], None)?;
-    Ok(RevisionExport {
-        image,
-        commit_id: commit_id.to_string(),
-    })
+    if prefix.as_os_str().is_empty() {
+        return Ok(commit_tree);
+    }
+    commit_tree
+        .get_path(prefix)
+        .map_err(|err| {
+            format!(
+                "revision `{revision}` has no entry for workspace directory `{}`: {err}",
+                prefix.display()
+            )
+        })?
+        .to_object(repo)
+        .and_then(|object| object.peel_to_tree())
+        .map_err(|err| {
+            format!(
+                "workspace directory `{}` at revision `{revision}` is not a directory: {err}",
+                prefix.display()
+            )
+        })
 }
 
 /// Every regular file anywhere under `dir`, recursively, as paths relative to
@@ -2315,6 +2451,11 @@ struct RevisionImageProject {
     files: FileSetProject,
     objects: Arc<RevisionObjectDatabase>,
     blobs: Arc<RevisionBlobIdentities>,
+    /// The revision's own `.bifrostignore` rules, compiled on first use. The
+    /// head applies the working tree's rules to its analyzable file set, so a
+    /// revision analyzed for comparison against it must apply its own, or every
+    /// finding in an ignored file looks repaired.
+    bifrost_ignore: OnceLock<BifrostIgnoreMatcher>,
 }
 
 impl Project for RevisionImageProject {
@@ -2330,8 +2471,15 @@ impl Project for RevisionImageProject {
         self.files.all_files()
     }
 
+    /// The revision's analyzable files, less what its own `.bifrostignore`
+    /// excludes, exactly as the working tree's project answers.
     fn analyzable_files(&self, language: Language) -> std::io::Result<BTreeSet<ProjectFile>> {
-        self.files.analyzable_files(language)
+        let files = self.files.analyzable_files(language)?;
+        let ignore = self.bifrost_ignore()?;
+        Ok(files
+            .into_iter()
+            .filter(|file| !ignore.is_ignored(file))
+            .collect())
     }
 
     fn analyzable_files_from(
@@ -2339,7 +2487,18 @@ impl Project for RevisionImageProject {
         files: &BTreeSet<ProjectFile>,
         language: Language,
     ) -> std::io::Result<BTreeSet<ProjectFile>> {
-        self.files.analyzable_files_from(files, language)
+        let files = self.files.analyzable_files_from(files, language)?;
+        let ignore = self.bifrost_ignore()?;
+        Ok(files
+            .into_iter()
+            .filter(|file| !ignore.is_ignored(file))
+            .collect())
+    }
+
+    fn is_bifrostignored(&self, rel_path: &Path) -> bool {
+        let file = ProjectFile::new(self.root().to_path_buf(), rel_path.to_path_buf());
+        self.bifrost_ignore()
+            .is_ok_and(|ignore| ignore.is_ignored(&file))
     }
 
     fn file_by_rel_path(&self, rel_path: &Path) -> Option<ProjectFile> {
@@ -2378,6 +2537,36 @@ impl Project for RevisionImageProject {
 }
 
 impl RevisionImageProject {
+    /// The revision's `.bifrostignore` rules, compiled once from the bytes the
+    /// revision itself holds.
+    ///
+    /// The rules cannot come from the export directory: the file-dependency
+    /// image writes every source it names as an empty placeholder (see
+    /// `create_empty_source_files`), so a filesystem read would compile an
+    /// empty rule set and ignore nothing. Every regular file of the revision is
+    /// in the inventory, so an ignore file the revision commits is readable
+    /// through the object database like any other.
+    fn bifrost_ignore(&self) -> std::io::Result<&BifrostIgnoreMatcher> {
+        if let Some(ignore) = self.bifrost_ignore.get() {
+            return Ok(ignore);
+        }
+        let files = self.files.all_files()?;
+        let root = self.files.root();
+        let ignore = BifrostIgnoreMatcher::build_with(root, &files, |path| {
+            let rel_path = path
+                .strip_prefix(root)
+                .expect("ignore-file candidates are the project root joined with a relative path");
+            let file = ProjectFile::new(root.to_path_buf(), rel_path.to_path_buf());
+            match self.revision_bytes(&file) {
+                Some(bytes) => bytes
+                    .and_then(brokk_bifrost_core::analyzer::project::decode_source_bytes)
+                    .map(Some),
+                None => Ok(None),
+            }
+        })?;
+        Ok(self.bifrost_ignore.get_or_init(|| ignore))
+    }
+
     /// `file`'s bytes as the revision holds them, or `None` for a file this
     /// image does not name -- whose disk read then fails, as it should.
     ///
@@ -3091,7 +3280,7 @@ fn tree_dir_file_paths(repo: &Repository, tree: &git2::Tree, dir: &Path) -> Vec<
     paths
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn create_private_dirs(root: &Path, parent: &Path) -> Result<(), String> {
     create_private_dirs_cached(root, parent, &mut HashSet::new())
 }
@@ -4492,6 +4681,66 @@ mod tests {
         );
     }
 
+    /// A revision image applies the revision's own `.bifrostignore` to its
+    /// analyzable file set, exactly as the working tree's project does, and
+    /// keeps ignored paths in the file view, exactly as the working tree's
+    /// project does. Without this, a `--diff-base` run analyzes files at the
+    /// base that the head never analyzes, and reports their findings as fixed.
+    #[test]
+    fn a_revision_image_applies_the_revisions_own_bifrostignore() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = test_repo::init_repo(dir.path());
+        fs::create_dir_all(dir.path().join("generated")).unwrap();
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+        fs::write(dir.path().join(".bifrostignore"), "generated/\n").unwrap();
+        fs::write(
+            dir.path().join("generated/x.ts"),
+            "export const generated = 1;\n",
+        )
+        .unwrap();
+        fs::write(dir.path().join("src/y.ts"), "export const source = 2;\n").unwrap();
+        let commit = test_repo::commit_all(&repo, "ignored generated tree");
+
+        let image =
+            RevisionImage::materialize(&repo, Snapshot::Commit(commit), None, &[], None).unwrap();
+        // The rules must come from the revision's blobs, not from the export
+        // directory: the file-dependency image writes its sources as empty
+        // placeholders, so a filesystem read would find no rules there.
+        // Removing the exported copy leaves the object database as the only
+        // source that can still answer.
+        fs::remove_file(image.root().join(".bifrostignore")).unwrap();
+        let (project, _) = image.project();
+
+        let generated = PathBuf::from("generated/x.ts");
+        let source = PathBuf::from("src/y.ts");
+        let rel_paths = |files: BTreeSet<crate::analyzer::ProjectFile>| {
+            files
+                .into_iter()
+                .map(|file| file.rel_path().to_path_buf())
+                .collect::<BTreeSet<_>>()
+        };
+
+        assert_eq!(
+            rel_paths(project.analyzable_files(Language::TypeScript).unwrap()),
+            BTreeSet::from([source.clone()]),
+        );
+        let all_files = project.all_files().unwrap();
+        assert!(
+            rel_paths(all_files.clone()).contains(&generated),
+            "an ignored path stays in the file view"
+        );
+        assert_eq!(
+            rel_paths(
+                project
+                    .analyzable_files_from(&all_files, Language::TypeScript)
+                    .unwrap()
+            ),
+            BTreeSet::from([source.clone()]),
+        );
+        assert!(project.is_bifrostignored(&generated));
+        assert!(!project.is_bifrostignored(&source));
+    }
+
     #[test]
     fn symbol_materialization_keeps_ambient_identity_without_import_expansion() {
         let dir = tempfile::tempdir().unwrap();
@@ -4671,6 +4920,7 @@ mod tests {
     /// resolves to two different names on the two sides of the pair
     /// (`pkga.Caller` vs. the correctly module-qualified `repro/pkga.Caller`)
     /// and looks like one symbol deleted and an unrelated one introduced.
+    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
     #[test]
     fn working_tree_sentinel_matches_explicit_target_for_a_go_module() {
         let dir = tempfile::tempdir().unwrap();
@@ -4737,6 +4987,7 @@ mod tests {
     /// Same defect as the Go test above, for Rust: a crate's fqn needs its
     /// `Cargo.toml` (via `nearest_crate`'s ancestor walk) to resolve as
     /// crate-qualified rather than falling back to an unqualified name.
+    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
     #[test]
     fn working_tree_sentinel_matches_explicit_target_for_a_rust_crate() {
         let dir = tempfile::tempdir().unwrap();
@@ -4895,6 +5146,7 @@ mod tests {
 
     /// The fallback a host without a usable persisted cache takes: the same
     /// expansion runs against an ephemeral store and must select the same image.
+    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
     #[test]
     fn snapshot_import_expansion_without_a_cache_selects_the_same_image() {
         let dir = tempfile::tempdir().unwrap();
@@ -5042,6 +5294,7 @@ mod tests {
     /// candidate here would let `worktree_files` return a path outside the
     /// project -- which then panics deep inside `ProjectFile::new`'s
     /// `assert!(!rel_path.is_absolute())` once fed to the analyzer.
+    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
     #[test]
     fn worktree_import_expansion_rejects_an_absolute_import_target() {
         let dir = tempfile::tempdir().unwrap();
@@ -5882,6 +6135,7 @@ mod entry_point_tests {
         head.unwrap()
     }
 
+    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
     #[test]
     fn analyze_diff_diffs_the_analyzers_own_project_root() {
         let temp = RevisionTempDir::new("analyzer-entry").unwrap();
@@ -6049,7 +6303,9 @@ mod entry_point_tests {
         // Resolved while the export directory still exists: the identity
         // canonicalizes its root, exactly as the claim did.
         let export_identity = brokk_bifrost_core::gitblob::workspace_cache_identity(export.root());
-        let workspace = export.build_workspace(root).expect("revision workspace");
+        let workspace = export
+            .build_workspace(root, AnalyzerConfig::default())
+            .expect("revision workspace");
 
         let names = {
             let analyzer = workspace.workspace().analyzer();

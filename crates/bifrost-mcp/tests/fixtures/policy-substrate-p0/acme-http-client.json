@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "pack_id": "acme.http-effects",
   "version": "1.0.0",
   "producer": { "name": "acme-platform", "version": "1.0.0" },

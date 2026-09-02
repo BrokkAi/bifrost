@@ -61,6 +61,7 @@ fn scala_type_name_segment(raw_name: &str, is_object: bool) -> SegmentId {
     }
 }
 
+use crate::scala::graph::syntax::scala_declared_type_parameter_names;
 use crate::scala::imports::{
     scala_export_info_from_node, scala_import_infos_from_node_with_prefixes,
     scala_lexical_scope_path,
@@ -192,6 +193,43 @@ struct ScalaRecoveryOwner {
 }
 
 impl<'a> ScalaVisitor<'a> {
+    /// The [`CodeUnit`] of one Scala type-namespace declaration.
+    ///
+    /// Classes, traits, objects, and `type` aliases share one identity rule so
+    /// a same-named term declared in the same owner can never mint the same
+    /// unit: the declaration's own segment is [`scala_type_name_segment`]'s
+    /// [`SegmentKind::Type`] (or [`SegmentKind::Companion`] for an `object`),
+    /// which `declaration_id` hashes, and the unit is a
+    /// [`CodeUnitType::Class`]. Minting an alias as a `Field`/`Member` made
+    /// `object Tags { type MaxVal = Int; val MaxVal = 1 }` produce two
+    /// byte-identical units and drop one declaration (#2878).
+    fn scala_type_declaration_unit(
+        &self,
+        raw_name: &str,
+        package_name: &str,
+        parent: Option<&CodeUnit>,
+        is_object: bool,
+    ) -> CodeUnit {
+        let display_name = if is_object {
+            format!("{raw_name}$")
+        } else {
+            raw_name.to_string()
+        };
+        let short_name = parent.map_or_else(
+            || display_name.clone(),
+            |parent| format!("{}.{}", parent.short_name(), display_name),
+        );
+        let fq = scala_child_fq_base(parent, package_name)
+            .with_pushed(scala_type_name_segment(raw_name, is_object));
+        CodeUnit::new_fq(
+            self.file.clone(),
+            CodeUnitType::Class,
+            package_name.to_string(),
+            short_name,
+            fq,
+        )
+    }
+
     fn visit_compilation_unit(&mut self, node: Node<'_>, package_name: &str) {
         self.run_work_stack(vec![ScalaWork::CompilationUnit {
             children: scala_compilation_children(node),
@@ -595,23 +633,11 @@ impl<'a> ScalaVisitor<'a> {
         if raw_name.is_empty() {
             return None;
         }
-        let display_name = if kind == "object" {
-            format!("{raw_name}$")
-        } else {
-            raw_name.to_string()
-        };
-        let short_name = parent.as_ref().map_or_else(
-            || display_name.clone(),
-            |parent| format!("{}.{}", parent.short_name(), display_name),
-        );
-        let fq = scala_child_fq_base(parent.as_ref(), package_name)
-            .with_pushed(scala_type_name_segment(raw_name, kind == "object"));
-        let code_unit = CodeUnit::new_fq(
-            self.file.clone(),
-            CodeUnitType::Class,
-            package_name.to_string(),
-            short_name,
-            fq,
+        let code_unit = self.scala_type_declaration_unit(
+            raw_name,
+            package_name,
+            parent.as_ref(),
+            kind == "object",
         );
         if self.parsed.contains_declaration(&code_unit) {
             return Some(code_unit);
@@ -649,25 +675,11 @@ impl<'a> ScalaVisitor<'a> {
             return None;
         }
 
-        let display_name = if node.kind() == "object_definition" {
-            format!("{raw_name}$")
-        } else {
-            raw_name.to_string()
-        };
-        let short_name = if let Some(parent) = &parent {
-            format!("{}.{}", parent.short_name(), display_name)
-        } else {
-            display_name
-        };
-        let fq = scala_child_fq_base(parent.as_ref(), package_name).with_pushed(
-            scala_type_name_segment(raw_name, node.kind() == "object_definition"),
-        );
-        let code_unit = CodeUnit::new_fq(
-            self.file.clone(),
-            CodeUnitType::Class,
-            package_name.to_string(),
-            short_name,
-            fq,
+        let code_unit = self.scala_type_declaration_unit(
+            raw_name,
+            package_name,
+            parent.as_ref(),
+            node.kind() == "object_definition",
         );
         if self.parsed.contains_declaration(&code_unit) {
             return Some(code_unit);
@@ -675,8 +687,17 @@ impl<'a> ScalaVisitor<'a> {
 
         self.parsed
             .add_code_unit(code_unit.clone(), node, self.source, parent.clone(), None);
-        self.parsed
-            .add_signature(code_unit.clone(), scala_type_signature(node, self.source));
+        // A type declaration's own parameter list is what canonical identity
+        // reads as generic arity, so a class that writes none records a zero
+        // rather than leaving the arity unread (#1651).
+        self.parsed.add_signature_with_metadata(
+            code_unit.clone(),
+            SignatureMetadata::new(scala_type_signature(node, self.source), Vec::new())
+                .with_recorded_type_parameters(scala_declared_type_parameter_names(
+                    node,
+                    self.source,
+                )),
+        );
         let mut raw_supertypes = Vec::new();
         if let Some(enum_owner) = scala_full_enum_case_owner_supertype(node, self.source) {
             raw_supertypes.push(enum_owner);
@@ -1137,24 +1158,17 @@ impl<'a> ScalaVisitor<'a> {
             return;
         }
 
-        let short_name = parent.as_ref().map_or_else(
-            || name.to_string(),
-            |parent| format!("{}.{}", parent.short_name(), name),
-        );
-        let fq = scala_child_fq_base(parent.as_ref(), package_name)
-            .with_pushed(scala_segment(name, SegmentKind::Member));
-        let code_unit = CodeUnit::new_fq(
-            self.file.clone(),
-            CodeUnitType::Field,
-            package_name.to_string(),
-            short_name,
-            fq,
-        );
+        let code_unit =
+            self.scala_type_declaration_unit(name, package_name, parent.as_ref(), false);
         self.parsed
             .add_code_unit(code_unit.clone(), node, self.source, parent, None);
-        self.parsed.add_signature(
+        self.parsed.add_signature_with_metadata(
             code_unit.clone(),
-            scala_node_text(node, self.source).trim().to_string(),
+            SignatureMetadata::new(
+                scala_node_text(node, self.source).trim().to_string(),
+                Vec::new(),
+            )
+            .with_recorded_type_parameters(scala_declared_type_parameter_names(node, self.source)),
         );
         self.parsed.mark_type_alias(code_unit);
     }
@@ -1985,11 +1999,13 @@ fn strip_declaration_indent(text: &str, declaration_indent: usize) -> String {
 mod same_package_and_extension_tests {
     use super::*;
     use brokk_bifrost_core::analyzer::parsed_file::ParsedFile;
-    use std::path::PathBuf;
     use tree_sitter::Parser;
 
     fn parse(source: &str) -> ParsedFile {
-        let file = ProjectFile::new(PathBuf::from("/workspace"), "src/Graph.scala");
+        let file = ProjectFile::new(
+            std::env::current_dir().expect("test working directory must be available"),
+            "src/Graph.scala",
+        );
         let mut parser = Parser::new();
         parser
             .set_language(&crate::scala::language::LANGUAGE.into())
@@ -2057,6 +2073,60 @@ class Consumer {
                 .any(|unit| unit.fq_name() == "example.asInt" && unit.is_function()),
             "top-level extension methods must be declared: {:?}",
             parsed.declarations()
+        );
+    }
+}
+
+#[cfg(test)]
+mod type_parameter_metadata_tests {
+    use super::*;
+    use tree_sitter::Parser;
+
+    /// A Scala type declaration records its own type-parameter list, so a
+    /// nongeneric class is a proven zero rather than the unread list an empty
+    /// `type_parameters` used to mean (#1651). Variance annotations are part
+    /// of the parameter, not extra parameters.
+    #[test]
+    fn scala_type_declarations_record_their_type_parameters() {
+        let source = r#"package example
+
+class Foo
+class Box[T](val value: T)
+trait Pair[+K, -V]
+object Registry
+type Rows[T] = List[T]
+"#;
+        let file = ProjectFile::new(
+            std::env::current_dir().expect("test working directory must be available"),
+            "src/example/Foo.scala",
+        );
+        let mut parser = Parser::new();
+        parser
+            .set_language(&crate::scala::language::LANGUAGE.into())
+            .expect("Scala grammar");
+        let tree = parser.parse(source, None).expect("Scala tree");
+        let parsed = parse_scala_file(&file, source, &tree);
+
+        let mut recorded = parsed
+            .signature_metadata
+            .iter()
+            .flat_map(|(unit, metadata)| {
+                metadata
+                    .iter()
+                    .filter(|entry| entry.type_parameters_recorded())
+                    .map(|entry| (unit.short_name().to_string(), entry.type_parameters().len()))
+            })
+            .collect::<Vec<_>>();
+        recorded.sort();
+        assert_eq!(
+            recorded,
+            vec![
+                ("Box".to_string(), 1),
+                ("Foo".to_string(), 0),
+                ("Pair".to_string(), 2),
+                ("Registry$".to_string(), 0),
+                ("Rows".to_string(), 1),
+            ]
         );
     }
 }

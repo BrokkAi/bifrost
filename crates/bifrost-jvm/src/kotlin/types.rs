@@ -393,8 +393,8 @@ pub fn kotlin_source_type_exists(
     kotlin_source_type_by_fqn(source, token, fqn).is_some()
 }
 
-pub fn kotlin_source_type_by_fqn(
-    source: &dyn KotlinSource,
+pub fn kotlin_source_type_by_fqn<S: KotlinSource + ?Sized>(
+    source: &S,
     token: QueryToken<'_>,
     fqn: &str,
 ) -> Option<CodeUnit> {
@@ -413,8 +413,8 @@ pub fn kotlin_source_type_by_fqn(
 ///
 /// Kotlin's own index is consulted first so a same-language declaration always
 /// wins a tie, and so a realm-less caller pays nothing.
-pub fn kotlin_realm_type_by_fqn(
-    source: &dyn KotlinSource,
+pub fn kotlin_realm_type_by_fqn<S: KotlinSource + ?Sized>(
+    source: &S,
     token: QueryToken<'_>,
     fqn: &str,
     realm: Option<&JvmSourceRealm<'_>>,
@@ -428,8 +428,8 @@ pub fn kotlin_realm_type_by_fqn(
         .next()
 }
 
-pub fn kotlin_realm_type_exists(
-    source: &dyn KotlinSource,
+pub fn kotlin_realm_type_exists<S: KotlinSource + ?Sized>(
+    source: &S,
     token: QueryToken<'_>,
     fqn: &str,
     realm: Option<&JvmSourceRealm<'_>>,
@@ -439,10 +439,27 @@ pub fn kotlin_realm_type_exists(
 
 /// The scope owners visible inside `owner`: the declaration itself, each of its
 /// lexical owners, and the nested-type scopes each of those inherits.
-pub fn kotlin_scope_owners_for(
-    source: &dyn KotlinSource,
+pub fn kotlin_scope_owners_for<S: KotlinSource + ?Sized>(
+    source: &S,
     token: QueryToken<'_>,
     owner: &CodeUnit,
+) -> Vec<String> {
+    kotlin_scope_owners_for_with(source, token, owner, &mut |fqn| {
+        kotlin_source_type_by_fqn(source, token, fqn)
+    })
+}
+
+/// [`kotlin_scope_owners_for`] over a caller-owned exact type index.
+///
+/// Whole-workspace hierarchy inversion has already enumerated every Kotlin
+/// class declaration before it resolves a single supertype. Reusing those
+/// generation-consistent rows keeps inherited-scope discovery from issuing a
+/// point definition query for every class it visits.
+pub(crate) fn kotlin_scope_owners_for_with<S: KotlinSource + ?Sized>(
+    source: &S,
+    token: QueryToken<'_>,
+    owner: &CodeUnit,
+    type_by_fqn: &mut dyn FnMut(&str) -> Option<CodeUnit>,
 ) -> Vec<String> {
     let mut owners = Vec::new();
     let mut current = Some(owner.clone());
@@ -460,7 +477,7 @@ pub fn kotlin_scope_owners_for(
     for _ in 0..MAX_INHERITED_SCOPE_DEPTH {
         let mut next = Vec::new();
         for fqn in &frontier {
-            for ancestor in kotlin_lexical_direct_ancestor_fqns(source, token, fqn) {
+            for ancestor in kotlin_lexical_direct_ancestor_fqns(source, token, fqn, type_by_fqn) {
                 if !owners.contains(&ancestor) {
                     owners.push(ancestor.clone());
                     next.push(ancestor);
@@ -477,12 +494,13 @@ pub fn kotlin_scope_owners_for(
 
 /// Direct supertype fully-qualified names of `fqn`, resolved with lexical scope
 /// only so inherited-scope discovery cannot recurse into itself.
-fn kotlin_lexical_direct_ancestor_fqns(
-    source: &dyn KotlinSource,
+pub fn kotlin_lexical_direct_ancestor_fqns<S: KotlinSource + ?Sized>(
+    source: &S,
     token: QueryToken<'_>,
     fqn: &str,
+    type_by_fqn: &mut dyn FnMut(&str) -> Option<CodeUnit>,
 ) -> Vec<String> {
-    let Some(owner) = kotlin_source_type_by_fqn(source, token, fqn) else {
+    let Some(owner) = type_by_fqn(fqn) else {
         return Vec::new();
     };
     let mut lexical_owners = Vec::new();
@@ -502,7 +520,7 @@ fn kotlin_lexical_direct_ancestor_fqns(
         .iter()
         .filter_map(|spelled| {
             resolve_kotlin_type_name(spelled, &scope, |candidate| {
-                kotlin_source_type_exists(source, token, candidate)
+                type_by_fqn(candidate).is_some()
             })
             .resolved()
         })

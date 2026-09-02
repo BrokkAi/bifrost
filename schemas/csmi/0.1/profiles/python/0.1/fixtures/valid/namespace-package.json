@@ -1,0 +1,9 @@
+{
+  "kind": "distribution-imports",
+  "importRoots": [["google", "cloud", "storage"]],
+  "namespaceContributions": [["google", "cloud"], ["google"]],
+  "conditions": {
+    "python": "vers:generic/>=3.9|<4",
+    "implementation": ["cpython", "pypy"]
+  }
+}

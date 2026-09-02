@@ -1,0 +1,174 @@
+{
+  "documentType": "semantic-document",
+  "schema": "https://csmi.brokk.ai/schema/0.1/schema.json",
+  "semanticModelVersion": "0.1",
+  "serializationVersion": "0.1-json",
+  "provenanceRecords": [
+    {
+      "id": "source-analysis",
+      "producer": {
+        "identifier": "https://example.org/tools/semantic-exporter",
+        "version": "2.4.1"
+      },
+      "generationMethod": "source-analysis",
+      "inputs": [
+        {
+          "role": "target-artifact",
+          "purl": "pkg:maven/org.example/normalize@1.4.2",
+          "digest": {
+            "algorithm": "sha-256",
+            "coverage": "source-archive",
+            "value": "1111111111111111111111111111111111111111111111111111111111111111"
+          }
+        }
+      ]
+    }
+  ],
+  "defaultProvenance": "source-analysis",
+  "semanticModels": [
+    {
+      "artifactSelectors": [
+        {
+          "purl": "pkg:maven/org.example/normalize@1.4.2",
+          "digests": [
+            {
+              "algorithm": "sha-256",
+              "coverage": "source-archive",
+              "value": "1111111111111111111111111111111111111111111111111111111111111111"
+            }
+          ]
+        }
+      ],
+      "vocabularyUses": [
+        {
+          "identifier": "org.example.analysis.review-hints",
+          "version": "1.0.0",
+          "schema": "https://example.org/csmi/review-hints/1.0.0/schema.json",
+          "requirement": "optional",
+          "affects": [
+            {
+              "kind": "fact-family",
+              "family": "review-hints",
+              "scope": { "symbol": "normalize" }
+            }
+          ]
+        }
+      ],
+      "symbols": [
+        {
+          "id": "strings",
+          "scheme": "org.example.java-source",
+          "schemeVersion": "0.1",
+          "stability": "portable",
+          "descriptors": [
+            { "role": "namespace", "name": "org" },
+            { "role": "namespace", "name": "example" },
+            { "role": "type", "name": "Strings" }
+          ]
+        },
+        {
+          "id": "normalize",
+          "scheme": "org.example.java-source",
+          "schemeVersion": "0.1",
+          "stability": "portable",
+          "descriptors": [
+            { "role": "namespace", "name": "org" },
+            { "role": "namespace", "name": "example" },
+            { "role": "type", "name": "Strings" },
+            {
+              "role": "callable",
+              "name": "normalize",
+              "disambiguator": "(java.lang.String)->java.lang.String"
+            }
+          ]
+        },
+        {
+          "id": "java-string",
+          "artifactSelectors": [
+            { "purl": "pkg:maven/org.openjdk/java.base@21.0.2" }
+          ],
+          "scheme": "org.example.java-source",
+          "schemeVersion": "0.1",
+          "stability": "portable",
+          "descriptors": [
+            { "role": "namespace", "name": "java" },
+            { "role": "namespace", "name": "lang" },
+            { "role": "type", "name": "String" }
+          ]
+        }
+      ],
+      "declarations": [
+        {
+          "symbol": "strings",
+          "category": "type"
+        },
+        {
+          "symbol": "normalize",
+          "category": "callable",
+          "owner": "strings",
+          "callable": {
+            "kind": "method",
+            "receiver": {
+              "kind": "type",
+              "type": { "kind": "reference", "symbol": "strings" }
+            },
+            "parameters": [
+              {
+                "position": 0,
+                "binding": "positional-or-named",
+                "label": "value",
+                "required": true,
+                "type": { "kind": "reference", "symbol": "java-string" }
+              }
+            ],
+            "results": [
+              {
+                "position": 0,
+                "type": { "kind": "reference", "symbol": "java-string" }
+              }
+            ]
+          }
+        }
+      ],
+      "procedureSummaries": [
+        {
+          "callable": "normalize",
+          "transfers": [
+            {
+              "source": {
+                "root": {
+                  "phase": "input",
+                  "role": "parameter",
+                  "position": 0
+                }
+              },
+              "destination": {
+                "root": {
+                  "phase": "output",
+                  "role": "result",
+                  "position": 0
+                }
+              }
+            }
+          ]
+        }
+      ],
+      "extensionFacts": [
+        {
+          "vocabulary": "org.example.analysis.review-hints",
+          "version": "1.0.0",
+          "family": "review-hints",
+          "scope": { "symbol": "normalize" },
+          "payload": { "reviewCategory": "normalization-boundary" }
+        }
+      ],
+      "completenessStatements": [
+        {
+          "family": "procedure-summaries",
+          "scope": { "callable": "normalize" },
+          "status": "complete"
+        }
+      ]
+    }
+  ]
+}

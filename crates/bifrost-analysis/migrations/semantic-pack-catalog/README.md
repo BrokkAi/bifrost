@@ -22,3 +22,6 @@ Current history:
   production identities for reuse across workspaces.
 - `0005-extraction-gaps.sql`: records release-bundle reject accounting and
   declaration-scoped extraction gaps without changing compiled manifests.
+- `0006-extraction-source-entries.sql`: records typed artifact-relative source
+  entries for file-level reject accounting without adding them to declaration
+  gap lookup.

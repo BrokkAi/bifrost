@@ -368,6 +368,51 @@ impl ProcedureSummaryIdentity {
         fingerprint_procedure_identity(self)
     }
 
+    /// A checkout-independent fingerprint of this identity, for a read ledger
+    /// or any other record that must compare across two checkouts of the same
+    /// content.
+    ///
+    /// [`Self::fingerprint`] is mount-free only for external origins: the
+    /// workspace case folds `SemanticArtifactKey::fingerprint`, which carries
+    /// the `WorkspaceMountId` -- a hash of the absolute workspace root. A
+    /// `--diff-base` run analyzes the base at a temporary root, so a summary
+    /// named by that fingerprint could never match its head counterpart. This
+    /// takes the artifact's `public_fingerprint` instead and adds the
+    /// declaration locator's stable segments and the schema, semantics,
+    /// context and behavior keys, so it still separates two summaries of the
+    /// same procedure derived under different contracts.
+    pub fn public_fingerprint(&self) -> StableDigest {
+        let mut bytes = Vec::new();
+        push_digest_part(&mut bytes, b"bifrost-procedure-summary-public-identity-v1");
+        push_digest_part(&mut bytes, self.artifact.public_fingerprint().as_bytes());
+        for segment in self.declaration.segments() {
+            push_digest_part(&mut bytes, segment.kind().stable_label().as_bytes());
+            match segment.name() {
+                Some(name) => {
+                    push_digest_part(&mut bytes, b"named");
+                    push_digest_part(&mut bytes, name.as_bytes());
+                }
+                None => push_digest_part(&mut bytes, b"anonymous"),
+            }
+            push_digest_part(&mut bytes, &segment.sibling_ordinal().to_le_bytes());
+        }
+        push_digest_part(&mut bytes, &self.schema.get().to_le_bytes());
+        push_digest_part(&mut bytes, self.semantics.as_bytes());
+        push_digest_part(&mut bytes, self.context.as_bytes());
+        push_digest_part(&mut bytes, self.behavior.as_bytes());
+        match &self.origin {
+            SummaryOrigin::Inferred => push_digest_part(&mut bytes, b"inferred"),
+            SummaryOrigin::External(origin) => {
+                push_digest_part(&mut bytes, b"external");
+                push_digest_part(&mut bytes, origin.model.as_str().as_bytes());
+                push_digest_part(&mut bytes, origin.content.as_bytes());
+                push_digest_part(&mut bytes, &origin.contract_version.to_le_bytes());
+                push_digest_part(&mut bytes, &[u8::from(origin.covers_overrides)]);
+            }
+        }
+        StableDigest::sha256(bytes)
+    }
+
     /// Conservative retained size of this owned identity and its heap fields.
     pub fn retained_bytes(&self) -> usize {
         size_of::<Self>().saturating_add(identity_heap_bytes(self))

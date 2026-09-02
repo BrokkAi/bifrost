@@ -1,0 +1,1797 @@
+{
+  "schema_version": 2,
+  "pack_id": "bifrost.go.stdlib.sync-atomic",
+  "version": "1.0.0",
+  "producer": {
+    "name": "bifrost",
+    "version": "0.10.7"
+  },
+  "language": "go",
+  "ecosystem": "go",
+  "compatibility": {
+    "bifrost": ">=0.10.7, <1.0.0",
+    "toolchains": []
+  },
+  "provenance": {
+    "source": "https://go.dev/src/sync/atomic/",
+    "revision": "go1.26.0-linux-amd64"
+  },
+  "license": "BSD-3-Clause",
+  "completeness": "complete",
+  "safety": {
+    "generated_code_only": false,
+    "review_required": false
+  },
+  "shards": [
+    {
+      "id": "go.stdlib.sync-atomic.concurrency",
+      "activation": [
+        {}
+      ],
+      "payload": {
+        "kind": "procedure_summaries",
+        "summaries": [
+          {
+            "id": "sync.atomic.addint32",
+            "target": {
+              "path": "src/sync/atomic/doc.go",
+              "symbol": "sync/atomic.AddInt32(addr *int32, delta int32)",
+              "has_receiver": false,
+              "parameter_count": 2
+            },
+            "completeness": "complete",
+            "transfers": [],
+            "concurrency_effects": [
+              {
+                "kind": "atomic",
+                "location": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "operation": "read_modify_write"
+              }
+            ]
+          },
+          {
+            "id": "sync.atomic.addint64",
+            "target": {
+              "path": "src/sync/atomic/doc_64.go",
+              "symbol": "sync/atomic.AddInt64(addr *int64, delta int64)",
+              "has_receiver": false,
+              "parameter_count": 2
+            },
+            "completeness": "complete",
+            "transfers": [],
+            "concurrency_effects": [
+              {
+                "kind": "atomic",
+                "location": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "operation": "read_modify_write"
+              }
+            ]
+          },
+          {
+            "id": "sync.atomic.adduint32",
+            "target": {
+              "path": "src/sync/atomic/doc.go",
+              "symbol": "sync/atomic.AddUint32(addr *uint32, delta uint32)",
+              "has_receiver": false,
+              "parameter_count": 2
+            },
+            "completeness": "complete",
+            "transfers": [],
+            "concurrency_effects": [
+              {
+                "kind": "atomic",
+                "location": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "operation": "read_modify_write"
+              }
+            ]
+          },
+          {
+            "id": "sync.atomic.adduint64",
+            "target": {
+              "path": "src/sync/atomic/doc_64.go",
+              "symbol": "sync/atomic.AddUint64(addr *uint64, delta uint64)",
+              "has_receiver": false,
+              "parameter_count": 2
+            },
+            "completeness": "complete",
+            "transfers": [],
+            "concurrency_effects": [
+              {
+                "kind": "atomic",
+                "location": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "operation": "read_modify_write"
+              }
+            ]
+          },
+          {
+            "id": "sync.atomic.adduintptr",
+            "target": {
+              "path": "src/sync/atomic/doc.go",
+              "symbol": "sync/atomic.AddUintptr(addr *uintptr, delta uintptr)",
+              "has_receiver": false,
+              "parameter_count": 2
+            },
+            "completeness": "complete",
+            "transfers": [],
+            "concurrency_effects": [
+              {
+                "kind": "atomic",
+                "location": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "operation": "read_modify_write"
+              }
+            ]
+          },
+          {
+            "id": "sync.atomic.andint32",
+            "target": {
+              "path": "src/sync/atomic/doc.go",
+              "symbol": "sync/atomic.AndInt32(addr *int32, mask int32)",
+              "has_receiver": false,
+              "parameter_count": 2
+            },
+            "completeness": "complete",
+            "transfers": [],
+            "concurrency_effects": [
+              {
+                "kind": "atomic",
+                "location": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "operation": "read_modify_write"
+              }
+            ]
+          },
+          {
+            "id": "sync.atomic.andint64",
+            "target": {
+              "path": "src/sync/atomic/doc_64.go",
+              "symbol": "sync/atomic.AndInt64(addr *int64, mask int64)",
+              "has_receiver": false,
+              "parameter_count": 2
+            },
+            "completeness": "complete",
+            "transfers": [],
+            "concurrency_effects": [
+              {
+                "kind": "atomic",
+                "location": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "operation": "read_modify_write"
+              }
+            ]
+          },
+          {
+            "id": "sync.atomic.anduint32",
+            "target": {
+              "path": "src/sync/atomic/doc.go",
+              "symbol": "sync/atomic.AndUint32(addr *uint32, mask uint32)",
+              "has_receiver": false,
+              "parameter_count": 2
+            },
+            "completeness": "complete",
+            "transfers": [],
+            "concurrency_effects": [
+              {
+                "kind": "atomic",
+                "location": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "operation": "read_modify_write"
+              }
+            ]
+          },
+          {
+            "id": "sync.atomic.anduint64",
+            "target": {
+              "path": "src/sync/atomic/doc_64.go",
+              "symbol": "sync/atomic.AndUint64(addr *uint64, mask uint64)",
+              "has_receiver": false,
+              "parameter_count": 2
+            },
+            "completeness": "complete",
+            "transfers": [],
+            "concurrency_effects": [
+              {
+                "kind": "atomic",
+                "location": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "operation": "read_modify_write"
+              }
+            ]
+          },
+          {
+            "id": "sync.atomic.anduintptr",
+            "target": {
+              "path": "src/sync/atomic/doc.go",
+              "symbol": "sync/atomic.AndUintptr(addr *uintptr, mask uintptr)",
+              "has_receiver": false,
+              "parameter_count": 2
+            },
+            "completeness": "complete",
+            "transfers": [],
+            "concurrency_effects": [
+              {
+                "kind": "atomic",
+                "location": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "operation": "read_modify_write"
+              }
+            ]
+          },
+          {
+            "id": "sync.atomic.bool.compareandswap",
+            "target": {
+              "path": "src/sync/atomic/type.go",
+              "symbol": "sync/atomic.Bool.CompareAndSwap(old, new bool)",
+              "has_receiver": true,
+              "parameter_count": 2
+            },
+            "completeness": "complete",
+            "transfers": [],
+            "concurrency_effects": [
+              {
+                "kind": "atomic",
+                "location": {
+                  "kind": "receiver"
+                },
+                "operation": "read_modify_write"
+              }
+            ]
+          },
+          {
+            "id": "sync.atomic.bool.load",
+            "target": {
+              "path": "src/sync/atomic/type.go",
+              "symbol": "sync/atomic.Bool.Load()",
+              "has_receiver": true,
+              "parameter_count": 0
+            },
+            "completeness": "complete",
+            "transfers": [],
+            "concurrency_effects": [
+              {
+                "kind": "atomic",
+                "location": {
+                  "kind": "receiver"
+                },
+                "operation": "load"
+              }
+            ]
+          },
+          {
+            "id": "sync.atomic.bool.store",
+            "target": {
+              "path": "src/sync/atomic/type.go",
+              "symbol": "sync/atomic.Bool.Store(val bool)",
+              "has_receiver": true,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "transfers": [],
+            "concurrency_effects": [
+              {
+                "kind": "atomic",
+                "location": {
+                  "kind": "receiver"
+                },
+                "operation": "store"
+              }
+            ]
+          },
+          {
+            "id": "sync.atomic.bool.swap",
+            "target": {
+              "path": "src/sync/atomic/type.go",
+              "symbol": "sync/atomic.Bool.Swap(new bool)",
+              "has_receiver": true,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "transfers": [],
+            "concurrency_effects": [
+              {
+                "kind": "atomic",
+                "location": {
+                  "kind": "receiver"
+                },
+                "operation": "read_modify_write"
+              }
+            ]
+          },
+          {
+            "id": "sync.atomic.compareandswapint32",
+            "target": {
+              "path": "src/sync/atomic/doc.go",
+              "symbol": "sync/atomic.CompareAndSwapInt32(addr *int32, old, new int32)",
+              "has_receiver": false,
+              "parameter_count": 3
+            },
+            "completeness": "complete",
+            "transfers": [],
+            "concurrency_effects": [
+              {
+                "kind": "atomic",
+                "location": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "operation": "read_modify_write"
+              }
+            ]
+          },
+          {
+            "id": "sync.atomic.compareandswapint64",
+            "target": {
+              "path": "src/sync/atomic/doc_64.go",
+              "symbol": "sync/atomic.CompareAndSwapInt64(addr *int64, old, new int64)",
+              "has_receiver": false,
+              "parameter_count": 3
+            },
+            "completeness": "complete",
+            "transfers": [],
+            "concurrency_effects": [
+              {
+                "kind": "atomic",
+                "location": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "operation": "read_modify_write"
+              }
+            ]
+          },
+          {
+            "id": "sync.atomic.compareandswappointer",
+            "target": {
+              "path": "src/sync/atomic/doc.go",
+              "symbol": "sync/atomic.CompareAndSwapPointer(addr *unsafe.Pointer, old, new unsafe.Pointer)",
+              "has_receiver": false,
+              "parameter_count": 3
+            },
+            "completeness": "complete",
+            "transfers": [],
+            "concurrency_effects": [
+              {
+                "kind": "atomic",
+                "location": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "operation": "read_modify_write"
+              }
+            ]
+          },
+          {
+            "id": "sync.atomic.compareandswapuint32",
+            "target": {
+              "path": "src/sync/atomic/doc.go",
+              "symbol": "sync/atomic.CompareAndSwapUint32(addr *uint32, old, new uint32)",
+              "has_receiver": false,
+              "parameter_count": 3
+            },
+            "completeness": "complete",
+            "transfers": [],
+            "concurrency_effects": [
+              {
+                "kind": "atomic",
+                "location": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "operation": "read_modify_write"
+              }
+            ]
+          },
+          {
+            "id": "sync.atomic.compareandswapuint64",
+            "target": {
+              "path": "src/sync/atomic/doc_64.go",
+              "symbol": "sync/atomic.CompareAndSwapUint64(addr *uint64, old, new uint64)",
+              "has_receiver": false,
+              "parameter_count": 3
+            },
+            "completeness": "complete",
+            "transfers": [],
+            "concurrency_effects": [
+              {
+                "kind": "atomic",
+                "location": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "operation": "read_modify_write"
+              }
+            ]
+          },
+          {
+            "id": "sync.atomic.compareandswapuintptr",
+            "target": {
+              "path": "src/sync/atomic/doc.go",
+              "symbol": "sync/atomic.CompareAndSwapUintptr(addr *uintptr, old, new uintptr)",
+              "has_receiver": false,
+              "parameter_count": 3
+            },
+            "completeness": "complete",
+            "transfers": [],
+            "concurrency_effects": [
+              {
+                "kind": "atomic",
+                "location": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "operation": "read_modify_write"
+              }
+            ]
+          },
+          {
+            "id": "sync.atomic.int32.add",
+            "target": {
+              "path": "src/sync/atomic/type.go",
+              "symbol": "sync/atomic.Int32.Add(delta int32)",
+              "has_receiver": true,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "transfers": [],
+            "concurrency_effects": [
+              {
+                "kind": "atomic",
+                "location": {
+                  "kind": "receiver"
+                },
+                "operation": "read_modify_write"
+              }
+            ]
+          },
+          {
+            "id": "sync.atomic.int32.and",
+            "target": {
+              "path": "src/sync/atomic/type.go",
+              "symbol": "sync/atomic.Int32.And(mask int32)",
+              "has_receiver": true,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "transfers": [],
+            "concurrency_effects": [
+              {
+                "kind": "atomic",
+                "location": {
+                  "kind": "receiver"
+                },
+                "operation": "read_modify_write"
+              }
+            ]
+          },
+          {
+            "id": "sync.atomic.int32.compareandswap",
+            "target": {
+              "path": "src/sync/atomic/type.go",
+              "symbol": "sync/atomic.Int32.CompareAndSwap(old, new int32)",
+              "has_receiver": true,
+              "parameter_count": 2
+            },
+            "completeness": "complete",
+            "transfers": [],
+            "concurrency_effects": [
+              {
+                "kind": "atomic",
+                "location": {
+                  "kind": "receiver"
+                },
+                "operation": "read_modify_write"
+              }
+            ]
+          },
+          {
+            "id": "sync.atomic.int32.load",
+            "target": {
+              "path": "src/sync/atomic/type.go",
+              "symbol": "sync/atomic.Int32.Load()",
+              "has_receiver": true,
+              "parameter_count": 0
+            },
+            "completeness": "complete",
+            "transfers": [],
+            "concurrency_effects": [
+              {
+                "kind": "atomic",
+                "location": {
+                  "kind": "receiver"
+                },
+                "operation": "load"
+              }
+            ]
+          },
+          {
+            "id": "sync.atomic.int32.or",
+            "target": {
+              "path": "src/sync/atomic/type.go",
+              "symbol": "sync/atomic.Int32.Or(mask int32)",
+              "has_receiver": true,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "transfers": [],
+            "concurrency_effects": [
+              {
+                "kind": "atomic",
+                "location": {
+                  "kind": "receiver"
+                },
+                "operation": "read_modify_write"
+              }
+            ]
+          },
+          {
+            "id": "sync.atomic.int32.store",
+            "target": {
+              "path": "src/sync/atomic/type.go",
+              "symbol": "sync/atomic.Int32.Store(val int32)",
+              "has_receiver": true,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "transfers": [],
+            "concurrency_effects": [
+              {
+                "kind": "atomic",
+                "location": {
+                  "kind": "receiver"
+                },
+                "operation": "store"
+              }
+            ]
+          },
+          {
+            "id": "sync.atomic.int32.swap",
+            "target": {
+              "path": "src/sync/atomic/type.go",
+              "symbol": "sync/atomic.Int32.Swap(new int32)",
+              "has_receiver": true,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "transfers": [],
+            "concurrency_effects": [
+              {
+                "kind": "atomic",
+                "location": {
+                  "kind": "receiver"
+                },
+                "operation": "read_modify_write"
+              }
+            ]
+          },
+          {
+            "id": "sync.atomic.int64.add",
+            "target": {
+              "path": "src/sync/atomic/type.go",
+              "symbol": "sync/atomic.Int64.Add(delta int64)",
+              "has_receiver": true,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "transfers": [],
+            "concurrency_effects": [
+              {
+                "kind": "atomic",
+                "location": {
+                  "kind": "receiver"
+                },
+                "operation": "read_modify_write"
+              }
+            ]
+          },
+          {
+            "id": "sync.atomic.int64.and",
+            "target": {
+              "path": "src/sync/atomic/type.go",
+              "symbol": "sync/atomic.Int64.And(mask int64)",
+              "has_receiver": true,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "transfers": [],
+            "concurrency_effects": [
+              {
+                "kind": "atomic",
+                "location": {
+                  "kind": "receiver"
+                },
+                "operation": "read_modify_write"
+              }
+            ]
+          },
+          {
+            "id": "sync.atomic.int64.compareandswap",
+            "target": {
+              "path": "src/sync/atomic/type.go",
+              "symbol": "sync/atomic.Int64.CompareAndSwap(old, new int64)",
+              "has_receiver": true,
+              "parameter_count": 2
+            },
+            "completeness": "complete",
+            "transfers": [],
+            "concurrency_effects": [
+              {
+                "kind": "atomic",
+                "location": {
+                  "kind": "receiver"
+                },
+                "operation": "read_modify_write"
+              }
+            ]
+          },
+          {
+            "id": "sync.atomic.int64.load",
+            "target": {
+              "path": "src/sync/atomic/type.go",
+              "symbol": "sync/atomic.Int64.Load()",
+              "has_receiver": true,
+              "parameter_count": 0
+            },
+            "completeness": "complete",
+            "transfers": [],
+            "concurrency_effects": [
+              {
+                "kind": "atomic",
+                "location": {
+                  "kind": "receiver"
+                },
+                "operation": "load"
+              }
+            ]
+          },
+          {
+            "id": "sync.atomic.int64.or",
+            "target": {
+              "path": "src/sync/atomic/type.go",
+              "symbol": "sync/atomic.Int64.Or(mask int64)",
+              "has_receiver": true,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "transfers": [],
+            "concurrency_effects": [
+              {
+                "kind": "atomic",
+                "location": {
+                  "kind": "receiver"
+                },
+                "operation": "read_modify_write"
+              }
+            ]
+          },
+          {
+            "id": "sync.atomic.int64.store",
+            "target": {
+              "path": "src/sync/atomic/type.go",
+              "symbol": "sync/atomic.Int64.Store(val int64)",
+              "has_receiver": true,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "transfers": [],
+            "concurrency_effects": [
+              {
+                "kind": "atomic",
+                "location": {
+                  "kind": "receiver"
+                },
+                "operation": "store"
+              }
+            ]
+          },
+          {
+            "id": "sync.atomic.int64.swap",
+            "target": {
+              "path": "src/sync/atomic/type.go",
+              "symbol": "sync/atomic.Int64.Swap(new int64)",
+              "has_receiver": true,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "transfers": [],
+            "concurrency_effects": [
+              {
+                "kind": "atomic",
+                "location": {
+                  "kind": "receiver"
+                },
+                "operation": "read_modify_write"
+              }
+            ]
+          },
+          {
+            "id": "sync.atomic.loadint32",
+            "target": {
+              "path": "src/sync/atomic/doc.go",
+              "symbol": "sync/atomic.LoadInt32(addr *int32)",
+              "has_receiver": false,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "transfers": [],
+            "concurrency_effects": [
+              {
+                "kind": "atomic",
+                "location": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "operation": "load"
+              }
+            ]
+          },
+          {
+            "id": "sync.atomic.loadint64",
+            "target": {
+              "path": "src/sync/atomic/doc_64.go",
+              "symbol": "sync/atomic.LoadInt64(addr *int64)",
+              "has_receiver": false,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "transfers": [],
+            "concurrency_effects": [
+              {
+                "kind": "atomic",
+                "location": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "operation": "load"
+              }
+            ]
+          },
+          {
+            "id": "sync.atomic.loadpointer",
+            "target": {
+              "path": "src/sync/atomic/doc.go",
+              "symbol": "sync/atomic.LoadPointer(addr *unsafe.Pointer)",
+              "has_receiver": false,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "transfers": [],
+            "concurrency_effects": [
+              {
+                "kind": "atomic",
+                "location": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "operation": "load"
+              }
+            ]
+          },
+          {
+            "id": "sync.atomic.loaduint32",
+            "target": {
+              "path": "src/sync/atomic/doc.go",
+              "symbol": "sync/atomic.LoadUint32(addr *uint32)",
+              "has_receiver": false,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "transfers": [],
+            "concurrency_effects": [
+              {
+                "kind": "atomic",
+                "location": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "operation": "load"
+              }
+            ]
+          },
+          {
+            "id": "sync.atomic.loaduint64",
+            "target": {
+              "path": "src/sync/atomic/doc_64.go",
+              "symbol": "sync/atomic.LoadUint64(addr *uint64)",
+              "has_receiver": false,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "transfers": [],
+            "concurrency_effects": [
+              {
+                "kind": "atomic",
+                "location": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "operation": "load"
+              }
+            ]
+          },
+          {
+            "id": "sync.atomic.loaduintptr",
+            "target": {
+              "path": "src/sync/atomic/doc.go",
+              "symbol": "sync/atomic.LoadUintptr(addr *uintptr)",
+              "has_receiver": false,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "transfers": [],
+            "concurrency_effects": [
+              {
+                "kind": "atomic",
+                "location": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "operation": "load"
+              }
+            ]
+          },
+          {
+            "id": "sync.atomic.orint32",
+            "target": {
+              "path": "src/sync/atomic/doc.go",
+              "symbol": "sync/atomic.OrInt32(addr *int32, mask int32)",
+              "has_receiver": false,
+              "parameter_count": 2
+            },
+            "completeness": "complete",
+            "transfers": [],
+            "concurrency_effects": [
+              {
+                "kind": "atomic",
+                "location": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "operation": "read_modify_write"
+              }
+            ]
+          },
+          {
+            "id": "sync.atomic.orint64",
+            "target": {
+              "path": "src/sync/atomic/doc_64.go",
+              "symbol": "sync/atomic.OrInt64(addr *int64, mask int64)",
+              "has_receiver": false,
+              "parameter_count": 2
+            },
+            "completeness": "complete",
+            "transfers": [],
+            "concurrency_effects": [
+              {
+                "kind": "atomic",
+                "location": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "operation": "read_modify_write"
+              }
+            ]
+          },
+          {
+            "id": "sync.atomic.oruint32",
+            "target": {
+              "path": "src/sync/atomic/doc.go",
+              "symbol": "sync/atomic.OrUint32(addr *uint32, mask uint32)",
+              "has_receiver": false,
+              "parameter_count": 2
+            },
+            "completeness": "complete",
+            "transfers": [],
+            "concurrency_effects": [
+              {
+                "kind": "atomic",
+                "location": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "operation": "read_modify_write"
+              }
+            ]
+          },
+          {
+            "id": "sync.atomic.oruint64",
+            "target": {
+              "path": "src/sync/atomic/doc_64.go",
+              "symbol": "sync/atomic.OrUint64(addr *uint64, mask uint64)",
+              "has_receiver": false,
+              "parameter_count": 2
+            },
+            "completeness": "complete",
+            "transfers": [],
+            "concurrency_effects": [
+              {
+                "kind": "atomic",
+                "location": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "operation": "read_modify_write"
+              }
+            ]
+          },
+          {
+            "id": "sync.atomic.oruintptr",
+            "target": {
+              "path": "src/sync/atomic/doc.go",
+              "symbol": "sync/atomic.OrUintptr(addr *uintptr, mask uintptr)",
+              "has_receiver": false,
+              "parameter_count": 2
+            },
+            "completeness": "complete",
+            "transfers": [],
+            "concurrency_effects": [
+              {
+                "kind": "atomic",
+                "location": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "operation": "read_modify_write"
+              }
+            ]
+          },
+          {
+            "id": "sync.atomic.pointer.compareandswap",
+            "target": {
+              "path": "src/sync/atomic/type.go",
+              "symbol": "sync/atomic.Pointer.CompareAndSwap(old, new *T)",
+              "has_receiver": true,
+              "parameter_count": 2
+            },
+            "completeness": "complete",
+            "transfers": [],
+            "concurrency_effects": [
+              {
+                "kind": "atomic",
+                "location": {
+                  "kind": "receiver"
+                },
+                "operation": "read_modify_write"
+              }
+            ]
+          },
+          {
+            "id": "sync.atomic.pointer.load",
+            "target": {
+              "path": "src/sync/atomic/type.go",
+              "symbol": "sync/atomic.Pointer.Load()",
+              "has_receiver": true,
+              "parameter_count": 0
+            },
+            "completeness": "complete",
+            "transfers": [],
+            "concurrency_effects": [
+              {
+                "kind": "atomic",
+                "location": {
+                  "kind": "receiver"
+                },
+                "operation": "load"
+              }
+            ]
+          },
+          {
+            "id": "sync.atomic.pointer.store",
+            "target": {
+              "path": "src/sync/atomic/type.go",
+              "symbol": "sync/atomic.Pointer.Store(val *T)",
+              "has_receiver": true,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "transfers": [],
+            "concurrency_effects": [
+              {
+                "kind": "atomic",
+                "location": {
+                  "kind": "receiver"
+                },
+                "operation": "store"
+              }
+            ]
+          },
+          {
+            "id": "sync.atomic.pointer.swap",
+            "target": {
+              "path": "src/sync/atomic/type.go",
+              "symbol": "sync/atomic.Pointer.Swap(new *T)",
+              "has_receiver": true,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "transfers": [],
+            "concurrency_effects": [
+              {
+                "kind": "atomic",
+                "location": {
+                  "kind": "receiver"
+                },
+                "operation": "read_modify_write"
+              }
+            ]
+          },
+          {
+            "id": "sync.atomic.storeint32",
+            "target": {
+              "path": "src/sync/atomic/doc.go",
+              "symbol": "sync/atomic.StoreInt32(addr *int32, val int32)",
+              "has_receiver": false,
+              "parameter_count": 2
+            },
+            "completeness": "complete",
+            "transfers": [],
+            "concurrency_effects": [
+              {
+                "kind": "atomic",
+                "location": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "operation": "store"
+              }
+            ]
+          },
+          {
+            "id": "sync.atomic.storeint64",
+            "target": {
+              "path": "src/sync/atomic/doc_64.go",
+              "symbol": "sync/atomic.StoreInt64(addr *int64, val int64)",
+              "has_receiver": false,
+              "parameter_count": 2
+            },
+            "completeness": "complete",
+            "transfers": [],
+            "concurrency_effects": [
+              {
+                "kind": "atomic",
+                "location": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "operation": "store"
+              }
+            ]
+          },
+          {
+            "id": "sync.atomic.storepointer",
+            "target": {
+              "path": "src/sync/atomic/doc.go",
+              "symbol": "sync/atomic.StorePointer(addr *unsafe.Pointer, val unsafe.Pointer)",
+              "has_receiver": false,
+              "parameter_count": 2
+            },
+            "completeness": "complete",
+            "transfers": [],
+            "concurrency_effects": [
+              {
+                "kind": "atomic",
+                "location": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "operation": "store"
+              }
+            ]
+          },
+          {
+            "id": "sync.atomic.storeuint32",
+            "target": {
+              "path": "src/sync/atomic/doc.go",
+              "symbol": "sync/atomic.StoreUint32(addr *uint32, val uint32)",
+              "has_receiver": false,
+              "parameter_count": 2
+            },
+            "completeness": "complete",
+            "transfers": [],
+            "concurrency_effects": [
+              {
+                "kind": "atomic",
+                "location": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "operation": "store"
+              }
+            ]
+          },
+          {
+            "id": "sync.atomic.storeuint64",
+            "target": {
+              "path": "src/sync/atomic/doc_64.go",
+              "symbol": "sync/atomic.StoreUint64(addr *uint64, val uint64)",
+              "has_receiver": false,
+              "parameter_count": 2
+            },
+            "completeness": "complete",
+            "transfers": [],
+            "concurrency_effects": [
+              {
+                "kind": "atomic",
+                "location": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "operation": "store"
+              }
+            ]
+          },
+          {
+            "id": "sync.atomic.storeuintptr",
+            "target": {
+              "path": "src/sync/atomic/doc.go",
+              "symbol": "sync/atomic.StoreUintptr(addr *uintptr, val uintptr)",
+              "has_receiver": false,
+              "parameter_count": 2
+            },
+            "completeness": "complete",
+            "transfers": [],
+            "concurrency_effects": [
+              {
+                "kind": "atomic",
+                "location": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "operation": "store"
+              }
+            ]
+          },
+          {
+            "id": "sync.atomic.swapint32",
+            "target": {
+              "path": "src/sync/atomic/doc.go",
+              "symbol": "sync/atomic.SwapInt32(addr *int32, new int32)",
+              "has_receiver": false,
+              "parameter_count": 2
+            },
+            "completeness": "complete",
+            "transfers": [],
+            "concurrency_effects": [
+              {
+                "kind": "atomic",
+                "location": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "operation": "read_modify_write"
+              }
+            ]
+          },
+          {
+            "id": "sync.atomic.swapint64",
+            "target": {
+              "path": "src/sync/atomic/doc_64.go",
+              "symbol": "sync/atomic.SwapInt64(addr *int64, new int64)",
+              "has_receiver": false,
+              "parameter_count": 2
+            },
+            "completeness": "complete",
+            "transfers": [],
+            "concurrency_effects": [
+              {
+                "kind": "atomic",
+                "location": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "operation": "read_modify_write"
+              }
+            ]
+          },
+          {
+            "id": "sync.atomic.swappointer",
+            "target": {
+              "path": "src/sync/atomic/doc.go",
+              "symbol": "sync/atomic.SwapPointer(addr *unsafe.Pointer, new unsafe.Pointer)",
+              "has_receiver": false,
+              "parameter_count": 2
+            },
+            "completeness": "complete",
+            "transfers": [],
+            "concurrency_effects": [
+              {
+                "kind": "atomic",
+                "location": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "operation": "read_modify_write"
+              }
+            ]
+          },
+          {
+            "id": "sync.atomic.swapuint32",
+            "target": {
+              "path": "src/sync/atomic/doc.go",
+              "symbol": "sync/atomic.SwapUint32(addr *uint32, new uint32)",
+              "has_receiver": false,
+              "parameter_count": 2
+            },
+            "completeness": "complete",
+            "transfers": [],
+            "concurrency_effects": [
+              {
+                "kind": "atomic",
+                "location": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "operation": "read_modify_write"
+              }
+            ]
+          },
+          {
+            "id": "sync.atomic.swapuint64",
+            "target": {
+              "path": "src/sync/atomic/doc_64.go",
+              "symbol": "sync/atomic.SwapUint64(addr *uint64, new uint64)",
+              "has_receiver": false,
+              "parameter_count": 2
+            },
+            "completeness": "complete",
+            "transfers": [],
+            "concurrency_effects": [
+              {
+                "kind": "atomic",
+                "location": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "operation": "read_modify_write"
+              }
+            ]
+          },
+          {
+            "id": "sync.atomic.swapuintptr",
+            "target": {
+              "path": "src/sync/atomic/doc.go",
+              "symbol": "sync/atomic.SwapUintptr(addr *uintptr, new uintptr)",
+              "has_receiver": false,
+              "parameter_count": 2
+            },
+            "completeness": "complete",
+            "transfers": [],
+            "concurrency_effects": [
+              {
+                "kind": "atomic",
+                "location": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "operation": "read_modify_write"
+              }
+            ]
+          },
+          {
+            "id": "sync.atomic.uint32.add",
+            "target": {
+              "path": "src/sync/atomic/type.go",
+              "symbol": "sync/atomic.Uint32.Add(delta uint32)",
+              "has_receiver": true,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "transfers": [],
+            "concurrency_effects": [
+              {
+                "kind": "atomic",
+                "location": {
+                  "kind": "receiver"
+                },
+                "operation": "read_modify_write"
+              }
+            ]
+          },
+          {
+            "id": "sync.atomic.uint32.and",
+            "target": {
+              "path": "src/sync/atomic/type.go",
+              "symbol": "sync/atomic.Uint32.And(mask uint32)",
+              "has_receiver": true,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "transfers": [],
+            "concurrency_effects": [
+              {
+                "kind": "atomic",
+                "location": {
+                  "kind": "receiver"
+                },
+                "operation": "read_modify_write"
+              }
+            ]
+          },
+          {
+            "id": "sync.atomic.uint32.compareandswap",
+            "target": {
+              "path": "src/sync/atomic/type.go",
+              "symbol": "sync/atomic.Uint32.CompareAndSwap(old, new uint32)",
+              "has_receiver": true,
+              "parameter_count": 2
+            },
+            "completeness": "complete",
+            "transfers": [],
+            "concurrency_effects": [
+              {
+                "kind": "atomic",
+                "location": {
+                  "kind": "receiver"
+                },
+                "operation": "read_modify_write"
+              }
+            ]
+          },
+          {
+            "id": "sync.atomic.uint32.load",
+            "target": {
+              "path": "src/sync/atomic/type.go",
+              "symbol": "sync/atomic.Uint32.Load()",
+              "has_receiver": true,
+              "parameter_count": 0
+            },
+            "completeness": "complete",
+            "transfers": [],
+            "concurrency_effects": [
+              {
+                "kind": "atomic",
+                "location": {
+                  "kind": "receiver"
+                },
+                "operation": "load"
+              }
+            ]
+          },
+          {
+            "id": "sync.atomic.uint32.or",
+            "target": {
+              "path": "src/sync/atomic/type.go",
+              "symbol": "sync/atomic.Uint32.Or(mask uint32)",
+              "has_receiver": true,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "transfers": [],
+            "concurrency_effects": [
+              {
+                "kind": "atomic",
+                "location": {
+                  "kind": "receiver"
+                },
+                "operation": "read_modify_write"
+              }
+            ]
+          },
+          {
+            "id": "sync.atomic.uint32.store",
+            "target": {
+              "path": "src/sync/atomic/type.go",
+              "symbol": "sync/atomic.Uint32.Store(val uint32)",
+              "has_receiver": true,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "transfers": [],
+            "concurrency_effects": [
+              {
+                "kind": "atomic",
+                "location": {
+                  "kind": "receiver"
+                },
+                "operation": "store"
+              }
+            ]
+          },
+          {
+            "id": "sync.atomic.uint32.swap",
+            "target": {
+              "path": "src/sync/atomic/type.go",
+              "symbol": "sync/atomic.Uint32.Swap(new uint32)",
+              "has_receiver": true,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "transfers": [],
+            "concurrency_effects": [
+              {
+                "kind": "atomic",
+                "location": {
+                  "kind": "receiver"
+                },
+                "operation": "read_modify_write"
+              }
+            ]
+          },
+          {
+            "id": "sync.atomic.uint64.add",
+            "target": {
+              "path": "src/sync/atomic/type.go",
+              "symbol": "sync/atomic.Uint64.Add(delta uint64)",
+              "has_receiver": true,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "transfers": [],
+            "concurrency_effects": [
+              {
+                "kind": "atomic",
+                "location": {
+                  "kind": "receiver"
+                },
+                "operation": "read_modify_write"
+              }
+            ]
+          },
+          {
+            "id": "sync.atomic.uint64.and",
+            "target": {
+              "path": "src/sync/atomic/type.go",
+              "symbol": "sync/atomic.Uint64.And(mask uint64)",
+              "has_receiver": true,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "transfers": [],
+            "concurrency_effects": [
+              {
+                "kind": "atomic",
+                "location": {
+                  "kind": "receiver"
+                },
+                "operation": "read_modify_write"
+              }
+            ]
+          },
+          {
+            "id": "sync.atomic.uint64.compareandswap",
+            "target": {
+              "path": "src/sync/atomic/type.go",
+              "symbol": "sync/atomic.Uint64.CompareAndSwap(old, new uint64)",
+              "has_receiver": true,
+              "parameter_count": 2
+            },
+            "completeness": "complete",
+            "transfers": [],
+            "concurrency_effects": [
+              {
+                "kind": "atomic",
+                "location": {
+                  "kind": "receiver"
+                },
+                "operation": "read_modify_write"
+              }
+            ]
+          },
+          {
+            "id": "sync.atomic.uint64.load",
+            "target": {
+              "path": "src/sync/atomic/type.go",
+              "symbol": "sync/atomic.Uint64.Load()",
+              "has_receiver": true,
+              "parameter_count": 0
+            },
+            "completeness": "complete",
+            "transfers": [],
+            "concurrency_effects": [
+              {
+                "kind": "atomic",
+                "location": {
+                  "kind": "receiver"
+                },
+                "operation": "load"
+              }
+            ]
+          },
+          {
+            "id": "sync.atomic.uint64.or",
+            "target": {
+              "path": "src/sync/atomic/type.go",
+              "symbol": "sync/atomic.Uint64.Or(mask uint64)",
+              "has_receiver": true,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "transfers": [],
+            "concurrency_effects": [
+              {
+                "kind": "atomic",
+                "location": {
+                  "kind": "receiver"
+                },
+                "operation": "read_modify_write"
+              }
+            ]
+          },
+          {
+            "id": "sync.atomic.uint64.store",
+            "target": {
+              "path": "src/sync/atomic/type.go",
+              "symbol": "sync/atomic.Uint64.Store(val uint64)",
+              "has_receiver": true,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "transfers": [],
+            "concurrency_effects": [
+              {
+                "kind": "atomic",
+                "location": {
+                  "kind": "receiver"
+                },
+                "operation": "store"
+              }
+            ]
+          },
+          {
+            "id": "sync.atomic.uint64.swap",
+            "target": {
+              "path": "src/sync/atomic/type.go",
+              "symbol": "sync/atomic.Uint64.Swap(new uint64)",
+              "has_receiver": true,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "transfers": [],
+            "concurrency_effects": [
+              {
+                "kind": "atomic",
+                "location": {
+                  "kind": "receiver"
+                },
+                "operation": "read_modify_write"
+              }
+            ]
+          },
+          {
+            "id": "sync.atomic.uintptr.add",
+            "target": {
+              "path": "src/sync/atomic/type.go",
+              "symbol": "sync/atomic.Uintptr.Add(delta uintptr)",
+              "has_receiver": true,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "transfers": [],
+            "concurrency_effects": [
+              {
+                "kind": "atomic",
+                "location": {
+                  "kind": "receiver"
+                },
+                "operation": "read_modify_write"
+              }
+            ]
+          },
+          {
+            "id": "sync.atomic.uintptr.and",
+            "target": {
+              "path": "src/sync/atomic/type.go",
+              "symbol": "sync/atomic.Uintptr.And(mask uintptr)",
+              "has_receiver": true,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "transfers": [],
+            "concurrency_effects": [
+              {
+                "kind": "atomic",
+                "location": {
+                  "kind": "receiver"
+                },
+                "operation": "read_modify_write"
+              }
+            ]
+          },
+          {
+            "id": "sync.atomic.uintptr.compareandswap",
+            "target": {
+              "path": "src/sync/atomic/type.go",
+              "symbol": "sync/atomic.Uintptr.CompareAndSwap(old, new uintptr)",
+              "has_receiver": true,
+              "parameter_count": 2
+            },
+            "completeness": "complete",
+            "transfers": [],
+            "concurrency_effects": [
+              {
+                "kind": "atomic",
+                "location": {
+                  "kind": "receiver"
+                },
+                "operation": "read_modify_write"
+              }
+            ]
+          },
+          {
+            "id": "sync.atomic.uintptr.load",
+            "target": {
+              "path": "src/sync/atomic/type.go",
+              "symbol": "sync/atomic.Uintptr.Load()",
+              "has_receiver": true,
+              "parameter_count": 0
+            },
+            "completeness": "complete",
+            "transfers": [],
+            "concurrency_effects": [
+              {
+                "kind": "atomic",
+                "location": {
+                  "kind": "receiver"
+                },
+                "operation": "load"
+              }
+            ]
+          },
+          {
+            "id": "sync.atomic.uintptr.or",
+            "target": {
+              "path": "src/sync/atomic/type.go",
+              "symbol": "sync/atomic.Uintptr.Or(mask uintptr)",
+              "has_receiver": true,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "transfers": [],
+            "concurrency_effects": [
+              {
+                "kind": "atomic",
+                "location": {
+                  "kind": "receiver"
+                },
+                "operation": "read_modify_write"
+              }
+            ]
+          },
+          {
+            "id": "sync.atomic.uintptr.store",
+            "target": {
+              "path": "src/sync/atomic/type.go",
+              "symbol": "sync/atomic.Uintptr.Store(val uintptr)",
+              "has_receiver": true,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "transfers": [],
+            "concurrency_effects": [
+              {
+                "kind": "atomic",
+                "location": {
+                  "kind": "receiver"
+                },
+                "operation": "store"
+              }
+            ]
+          },
+          {
+            "id": "sync.atomic.uintptr.swap",
+            "target": {
+              "path": "src/sync/atomic/type.go",
+              "symbol": "sync/atomic.Uintptr.Swap(new uintptr)",
+              "has_receiver": true,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "transfers": [],
+            "concurrency_effects": [
+              {
+                "kind": "atomic",
+                "location": {
+                  "kind": "receiver"
+                },
+                "operation": "read_modify_write"
+              }
+            ]
+          },
+          {
+            "id": "sync.atomic.value.compareandswap",
+            "target": {
+              "path": "src/sync/atomic/value.go",
+              "symbol": "sync/atomic.Value.CompareAndSwap(old, new any)",
+              "has_receiver": true,
+              "parameter_count": 2
+            },
+            "completeness": "complete",
+            "transfers": [],
+            "concurrency_effects": [
+              {
+                "kind": "atomic",
+                "location": {
+                  "kind": "receiver"
+                },
+                "operation": "read_modify_write"
+              }
+            ]
+          },
+          {
+            "id": "sync.atomic.value.load",
+            "target": {
+              "path": "src/sync/atomic/value.go",
+              "symbol": "sync/atomic.Value.Load()",
+              "has_receiver": true,
+              "parameter_count": 0
+            },
+            "completeness": "complete",
+            "transfers": [],
+            "concurrency_effects": [
+              {
+                "kind": "atomic",
+                "location": {
+                  "kind": "receiver"
+                },
+                "operation": "load"
+              }
+            ]
+          },
+          {
+            "id": "sync.atomic.value.store",
+            "target": {
+              "path": "src/sync/atomic/value.go",
+              "symbol": "sync/atomic.Value.Store(val any)",
+              "has_receiver": true,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "transfers": [],
+            "concurrency_effects": [
+              {
+                "kind": "atomic",
+                "location": {
+                  "kind": "receiver"
+                },
+                "operation": "store"
+              }
+            ]
+          },
+          {
+            "id": "sync.atomic.value.swap",
+            "target": {
+              "path": "src/sync/atomic/value.go",
+              "symbol": "sync/atomic.Value.Swap(new any)",
+              "has_receiver": true,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "transfers": [],
+            "concurrency_effects": [
+              {
+                "kind": "atomic",
+                "location": {
+                  "kind": "receiver"
+                },
+                "operation": "read_modify_write"
+              }
+            ]
+          }
+        ]
+      }
+    }
+  ]
+}

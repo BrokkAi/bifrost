@@ -10,6 +10,7 @@ pub mod formatting;
 pub(crate) mod hierarchy_support;
 pub mod hover;
 pub(crate) mod import_ambiguity;
+pub mod on_type_formatting;
 pub mod references;
 pub mod rename;
 pub mod rune_ir;

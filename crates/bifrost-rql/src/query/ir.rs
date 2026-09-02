@@ -78,6 +78,7 @@ pub enum QueryValueKind {
     ProgramPoint,
     ControlEdge,
     TypestateFinding,
+    ConcurrentAccessConflict,
     TypestateWitness,
     FlowEndpoint,
     FlowWitness,
@@ -92,8 +93,11 @@ pub enum QueryValueKind {
     /// which lets policy adapters use the row as a sink subject.
     JsxAttributeValue,
     ReceiverAnalysis,
+    MemberTargetAnalysis,
     ReceiverOutcome,
     ReceiverEvidence,
+    /// Exact right-hand operand of a proven static member assignment.
+    FieldWriteValue,
     CallShape,
     CallResult,
     CallArgumentGroup,
@@ -103,6 +107,9 @@ pub enum QueryValueKind {
     CallResultContract,
     ResultContractUse,
     ResultContractFailureUse,
+    NilnessOperation,
+    SwitchCoverage,
+    DetachedTaskTransfer,
     ProcedureEffect,
     CallableSignature,
     SignatureParameter,
@@ -145,6 +152,7 @@ impl QueryValueKind {
             Self::ProgramPoint => "program_point",
             Self::ControlEdge => "control_edge",
             Self::TypestateFinding => "typestate_finding",
+            Self::ConcurrentAccessConflict => "concurrent_access_conflict",
             Self::TypestateWitness => "typestate_witness",
             Self::FlowEndpoint => "flow_endpoint",
             Self::FlowWitness => "flow_witness",
@@ -154,8 +162,10 @@ impl QueryValueKind {
             Self::ExpressionSite => "expression_site",
             Self::JsxAttributeValue => "jsx_attribute_value",
             Self::ReceiverAnalysis => "receiver_analysis",
+            Self::MemberTargetAnalysis => "member_target_analysis",
             Self::ReceiverOutcome => "receiver_outcome",
             Self::ReceiverEvidence => "receiver_evidence",
+            Self::FieldWriteValue => "field_write_value",
             Self::CallShape => "call_shape",
             Self::CallResult => "call_result",
             Self::CallArgumentGroup => "call_argument_group",
@@ -165,6 +175,9 @@ impl QueryValueKind {
             Self::CallResultContract => "call_result_contract",
             Self::ResultContractUse => "result_contract_use",
             Self::ResultContractFailureUse => "result_contract_failure_use",
+            Self::NilnessOperation => "nilness_operation",
+            Self::SwitchCoverage => "switch_coverage",
+            Self::DetachedTaskTransfer => "detached_task_transfer",
             Self::ProcedureEffect => "procedure_effect",
             Self::CallableSignature => "callable_signature",
             Self::SignatureParameter => "signature_parameter",
@@ -411,6 +424,15 @@ pub struct ReceiverTraversalFilter {
     pub capture: Option<String>,
 }
 
+/// Exact identity constraints for a field-write terminal. These compare only
+/// analyzer/model identities already proven by `member_targets`; they never
+/// inspect source spelling or recover a target from an expression range.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct FieldWriteValueTraversal {
+    pub receiver_identity_id: Option<String>,
+    pub member_target_id: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JsxElementIdentity {
     Intrinsic,
@@ -493,6 +515,7 @@ pub enum QueryStep {
     CfgEdgeSource,
     CfgEdgeTarget,
     Typestate(TypestateTraversal),
+    ConcurrentAccessConflicts,
     ValueFlow(ValueFlowTraversal),
     Taint(TaintTraversal),
     Witness(WitnessTraversal),
@@ -515,6 +538,7 @@ pub enum QueryStep {
     ReceiverTargets(ReceiverTraversalFilter),
     PointsTo(ReceiverTraversalFilter),
     MemberTargets(ReceiverTraversalFilter),
+    FieldWriteValue(FieldWriteValueTraversal),
     ReceiverOutcome,
     ReceiverEvidence,
     CallShape,
@@ -528,6 +552,9 @@ pub enum QueryStep {
     ResultContractUses,
     ResultContractOperationUses,
     ResultContractFailureUses(ResultContractFailureUseFilter),
+    NilnessOperations,
+    SwitchCoverage,
+    DetachedTaskTransfers,
     ProcedureEffects,
     CallableSignature,
     SignatureParameters,
@@ -1021,6 +1048,7 @@ impl QueryStep {
             Self::CfgEdgeSource => QueryStepOp::CfgEdgeSource,
             Self::CfgEdgeTarget => QueryStepOp::CfgEdgeTarget,
             Self::Typestate(_) => QueryStepOp::Typestate,
+            Self::ConcurrentAccessConflicts => QueryStepOp::ConcurrentAccessConflicts,
             Self::ValueFlow(_) => QueryStepOp::ValueFlow,
             Self::Taint(_) => QueryStepOp::Taint,
             Self::Witness(_) => QueryStepOp::Witness,
@@ -1043,6 +1071,7 @@ impl QueryStep {
             Self::ReceiverTargets(_) => QueryStepOp::ReceiverTargets,
             Self::PointsTo(_) => QueryStepOp::PointsTo,
             Self::MemberTargets(_) => QueryStepOp::MemberTargets,
+            Self::FieldWriteValue(_) => QueryStepOp::FieldWriteValue,
             Self::ReceiverOutcome => QueryStepOp::ReceiverOutcome,
             Self::ReceiverEvidence => QueryStepOp::ReceiverEvidence,
             Self::CallShape => QueryStepOp::CallShape,
@@ -1056,6 +1085,9 @@ impl QueryStep {
             Self::ResultContractUses => QueryStepOp::ResultContractUses,
             Self::ResultContractOperationUses => QueryStepOp::ResultContractOperationUses,
             Self::ResultContractFailureUses(_) => QueryStepOp::ResultContractFailureUses,
+            Self::NilnessOperations => QueryStepOp::NilnessOperations,
+            Self::SwitchCoverage => QueryStepOp::SwitchCoverage,
+            Self::DetachedTaskTransfers => QueryStepOp::DetachedTaskTransfers,
             Self::ProcedureEffects => QueryStepOp::ProcedureEffects,
             Self::CallableSignature => QueryStepOp::CallableSignature,
             Self::SignatureParameters => QueryStepOp::SignatureParameters,
@@ -1116,6 +1148,7 @@ impl QueryStep {
             | QueryStepOp::ValueFlow
             | QueryStepOp::Taint
             | QueryStepOp::Witness => None,
+            QueryStepOp::ConcurrentAccessConflicts => Some(Self::ConcurrentAccessConflicts),
             QueryStepOp::FileOf => Some(Self::FileOf),
             QueryStepOp::ImportsOf => Some(Self::ImportsOf),
             QueryStepOp::ImportersOf => Some(Self::ImportersOf),
@@ -1145,6 +1178,9 @@ impl QueryStep {
             QueryStepOp::MemberTargets => {
                 Some(Self::MemberTargets(ReceiverTraversalFilter::default()))
             }
+            QueryStepOp::FieldWriteValue => {
+                Some(Self::FieldWriteValue(FieldWriteValueTraversal::default()))
+            }
             QueryStepOp::ReceiverOutcome => Some(Self::ReceiverOutcome),
             QueryStepOp::ReceiverEvidence => Some(Self::ReceiverEvidence),
             QueryStepOp::CallShape => Some(Self::CallShape),
@@ -1160,6 +1196,9 @@ impl QueryStep {
             QueryStepOp::ResultContractFailureUses => Some(Self::ResultContractFailureUses(
                 ResultContractFailureUseFilter::default(),
             )),
+            QueryStepOp::NilnessOperations => Some(Self::NilnessOperations),
+            QueryStepOp::SwitchCoverage => Some(Self::SwitchCoverage),
+            QueryStepOp::DetachedTaskTransfers => Some(Self::DetachedTaskTransfers),
             QueryStepOp::ProcedureEffects => Some(Self::ProcedureEffects),
             QueryStepOp::CallableSignature => Some(Self::CallableSignature),
             QueryStepOp::SignatureParameters => Some(Self::SignatureParameters),
@@ -1234,6 +1273,9 @@ impl QueryStep {
             (Self::Typestate(_), QueryValueKind::Procedure) => {
                 Some(QueryValueKind::TypestateFinding)
             }
+            (Self::ConcurrentAccessConflicts, QueryValueKind::Procedure) => {
+                Some(QueryValueKind::ConcurrentAccessConflict)
+            }
             (Self::ValueFlow(_), QueryValueKind::Procedure) => Some(QueryValueKind::FlowEndpoint),
             (Self::Taint(_), QueryValueKind::Procedure) => Some(QueryValueKind::TaintFinding),
             (Self::Witness(_), QueryValueKind::TypestateFinding) => {
@@ -1248,6 +1290,7 @@ impl QueryStep {
                 | QueryValueKind::ProgramPoint
                 | QueryValueKind::ControlEdge
                 | QueryValueKind::TypestateFinding
+                | QueryValueKind::ConcurrentAccessConflict
                 | QueryValueKind::TypestateWitness
                 | QueryValueKind::FlowEndpoint
                 | QueryValueKind::FlowWitness
@@ -1257,8 +1300,10 @@ impl QueryStep {
                 | QueryValueKind::ExpressionSite
                 | QueryValueKind::JsxAttributeValue
                 | QueryValueKind::ReceiverAnalysis
+                | QueryValueKind::MemberTargetAnalysis
                 | QueryValueKind::ReceiverOutcome
                 | QueryValueKind::ReceiverEvidence
+                | QueryValueKind::FieldWriteValue
                 | QueryValueKind::CallShape
                 | QueryValueKind::CallResult
                 | QueryValueKind::CallArgumentGroup
@@ -1329,10 +1374,14 @@ impl QueryStep {
                 QueryValueKind::StructuralMatch
                 | QueryValueKind::ReferenceSite
                 | QueryValueKind::Occurrence,
-            ) => Some(QueryValueKind::ReceiverAnalysis),
-            (Self::ReceiverOutcome, QueryValueKind::ReceiverAnalysis) => {
-                Some(QueryValueKind::ReceiverOutcome)
+            ) => Some(QueryValueKind::MemberTargetAnalysis),
+            (Self::FieldWriteValue(_), QueryValueKind::MemberTargetAnalysis) => {
+                Some(QueryValueKind::FieldWriteValue)
             }
+            (
+                Self::ReceiverOutcome,
+                QueryValueKind::ReceiverAnalysis | QueryValueKind::MemberTargetAnalysis,
+            ) => Some(QueryValueKind::ReceiverOutcome),
             (Self::ReceiverEvidence, QueryValueKind::ReceiverAnalysis) => {
                 Some(QueryValueKind::ReceiverEvidence)
             }
@@ -1365,6 +1414,15 @@ impl QueryStep {
             }
             (Self::ResultContractFailureUses(_), QueryValueKind::CallResultContract) => {
                 Some(QueryValueKind::ResultContractFailureUse)
+            }
+            (Self::NilnessOperations, QueryValueKind::Procedure) => {
+                Some(QueryValueKind::NilnessOperation)
+            }
+            (Self::SwitchCoverage, QueryValueKind::Procedure) => {
+                Some(QueryValueKind::SwitchCoverage)
+            }
+            (Self::DetachedTaskTransfers, QueryValueKind::Procedure) => {
+                Some(QueryValueKind::DetachedTaskTransfer)
             }
             (Self::ProcedureEffects, QueryValueKind::Declaration) => {
                 Some(QueryValueKind::ProcedureEffect)
@@ -1526,6 +1584,7 @@ pub(super) fn validate_query_steps(
             QueryStep::CfgSuccessorEdges | QueryStep::CfgPredecessorEdges => "program_point",
             QueryStep::CfgEdgeSource | QueryStep::CfgEdgeTarget => "control_edge",
             QueryStep::Typestate(_) => "procedure",
+            QueryStep::ConcurrentAccessConflicts => "procedure",
             QueryStep::ValueFlow(_) => "procedure",
             QueryStep::Taint(_) => "procedure",
             QueryStep::Witness(_) => "typestate_finding or flow_endpoint",
@@ -1551,7 +1610,9 @@ pub(super) fn validate_query_steps(
                 "structural_match, reference_site, expression_site, or occurrence"
             }
             QueryStep::MemberTargets(_) => "structural_match, reference_site, or occurrence",
-            QueryStep::ReceiverOutcome | QueryStep::ReceiverEvidence => "receiver_analysis",
+            QueryStep::FieldWriteValue(_) => "member_target_analysis",
+            QueryStep::ReceiverOutcome => "receiver_analysis or member_target_analysis",
+            QueryStep::ReceiverEvidence => "receiver_analysis",
             QueryStep::CallShape => "structural_match, call_site, or occurrence",
             QueryStep::CallResults => "call_shape",
             QueryStep::CallArgumentGroups => "call_shape",
@@ -1563,6 +1624,9 @@ pub(super) fn validate_query_steps(
             QueryStep::ResultContractUses
             | QueryStep::ResultContractOperationUses
             | QueryStep::ResultContractFailureUses(_) => "call_result_contract",
+            QueryStep::NilnessOperations => "procedure",
+            QueryStep::SwitchCoverage => "procedure",
+            QueryStep::DetachedTaskTransfers => "procedure",
             QueryStep::ProcedureEffects => "declaration",
             QueryStep::CallableSignature => "declaration",
             QueryStep::SignatureParameters => "callable_signature",
@@ -2175,6 +2239,8 @@ pub struct Pattern {
     pub kwargs: Vec<(String, Pattern)>,
     pub left: Option<Box<Pattern>>,
     pub right: Option<Box<Pattern>>,
+    /// Grammar-backed assignment operator token.
+    pub operator: Option<Box<Pattern>>,
     pub module: Option<Box<Pattern>>,
     /// Each listed pattern must match some decorator/annotation.
     pub decorators: Vec<Pattern>,
@@ -2229,6 +2295,7 @@ impl Pattern {
             Role::Receiver => self.receiver.as_deref(),
             Role::Left => self.left.as_deref(),
             Role::Right => self.right.as_deref(),
+            Role::Operator => self.operator.as_deref(),
             Role::Module => self.module.as_deref(),
             Role::Object => self.object.as_deref(),
             Role::Field => self.field.as_deref(),
@@ -2257,6 +2324,7 @@ impl Pattern {
             | Role::Kwarg
             | Role::Left
             | Role::Right
+            | Role::Operator
             | Role::Module
             | Role::Object
             | Role::Field

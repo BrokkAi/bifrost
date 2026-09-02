@@ -103,8 +103,10 @@ pub(super) fn apply_plan_step(
                     | PipelineValue::ExpressionSite(_)
                     | PipelineValue::JsxAttributeValue(_)
                     | PipelineValue::ReceiverAnalysis(_)
+                    | PipelineValue::MemberTargetAnalysis(_)
                     | PipelineValue::ReceiverOutcome(_)
                     | PipelineValue::ReceiverEvidence(_)
+                    | PipelineValue::FieldWriteValue(_)
                     | PipelineValue::CallShape(_)
                     | PipelineValue::CallArgumentGroup(_)
                     | PipelineValue::CallArgument(_)
@@ -113,6 +115,10 @@ pub(super) fn apply_plan_step(
                     | PipelineValue::CallResultContract(_)
                     | PipelineValue::ResultContractUse(_)
                     | PipelineValue::ResultContractFailureUse(_)
+                    | PipelineValue::NilnessOperation(_)
+                    | PipelineValue::SwitchCoverage(_)
+                    | PipelineValue::ConcurrentAccessConflict(_)
+                    | PipelineValue::DetachedTaskTransfer(_)
                     | PipelineValue::ProcedureEffect(_)
                     | PipelineValue::CallableSignature(_)
                     | PipelineValue::SignatureParameter(_)
@@ -188,8 +194,10 @@ pub(super) fn apply_plan_step(
                                 | PipelineValue::ExpressionSite(_)
                                 | PipelineValue::JsxAttributeValue(_)
                                 | PipelineValue::ReceiverAnalysis(_)
+                                | PipelineValue::MemberTargetAnalysis(_)
                                 | PipelineValue::ReceiverOutcome(_)
                                 | PipelineValue::ReceiverEvidence(_)
+                                | PipelineValue::FieldWriteValue(_)
                                 | PipelineValue::CallShape(_)
                                 | PipelineValue::CallArgumentGroup(_)
                                 | PipelineValue::CallArgument(_)
@@ -198,6 +206,10 @@ pub(super) fn apply_plan_step(
                                 | PipelineValue::CallResultContract(_)
                                 | PipelineValue::ResultContractUse(_)
                                 | PipelineValue::ResultContractFailureUse(_)
+                                | PipelineValue::NilnessOperation(_)
+                                | PipelineValue::SwitchCoverage(_)
+                                | PipelineValue::ConcurrentAccessConflict(_)
+                                | PipelineValue::DetachedTaskTransfer(_)
                                 | PipelineValue::ProcedureEffect(_)
                                 | PipelineValue::CallableSignature(_)
                                 | PipelineValue::SignatureParameter(_)
@@ -285,8 +297,10 @@ pub(super) fn apply_plan_step(
                         | PipelineValue::ExpressionSite(_)
                         | PipelineValue::JsxAttributeValue(_)
                         | PipelineValue::ReceiverAnalysis(_)
+                        | PipelineValue::MemberTargetAnalysis(_)
                         | PipelineValue::ReceiverOutcome(_)
                         | PipelineValue::ReceiverEvidence(_)
+                        | PipelineValue::FieldWriteValue(_)
                         | PipelineValue::CallShape(_)
                         | PipelineValue::CallArgumentGroup(_)
                         | PipelineValue::CallArgument(_)
@@ -295,6 +309,10 @@ pub(super) fn apply_plan_step(
                         | PipelineValue::CallResultContract(_)
                         | PipelineValue::ResultContractUse(_)
                         | PipelineValue::ResultContractFailureUse(_)
+                        | PipelineValue::NilnessOperation(_)
+                        | PipelineValue::SwitchCoverage(_)
+                        | PipelineValue::ConcurrentAccessConflict(_)
+                        | PipelineValue::DetachedTaskTransfer(_)
                         | PipelineValue::ProcedureEffect(_)
                         | PipelineValue::CallableSignature(_)
                         | PipelineValue::SignatureParameter(_)
@@ -689,20 +707,25 @@ pub(super) fn hash_capacity_bytes_lower_bound<K, V>(capacity: usize) -> u64 {
     .unwrap_or(u64::MAX)
 }
 
-pub(super) fn cancelled_query_result() -> CodeQueryResult {
+pub(super) fn cancelled_query_result(session_subset: Option<SubsetCoverage>) -> CodeQueryResult {
     let mut diagnostics = Vec::new();
     push_cancelled_diagnostic(&mut diagnostics);
     CodeQueryResult {
         results: Vec::new(),
         truncated: true,
+        session_subset,
         diagnostics,
     }
 }
 
-pub(super) fn invalid_plan_result(error: impl ToString) -> CodeQueryResult {
+pub(super) fn invalid_plan_result(
+    session_subset: Option<SubsetCoverage>,
+    error: impl ToString,
+) -> CodeQueryResult {
     CodeQueryResult {
         results: Vec::new(),
         truncated: false,
+        session_subset,
         diagnostics: vec![CodeQueryDiagnostic {
             code: CodeQueryDiagnosticCode::InvalidPlan,
             impact: CodeQueryDiagnosticImpact::Invalid,
@@ -832,6 +855,7 @@ pub(super) fn requested_taint_result_refs(plan: &CodeQueryPlan) -> Vec<TaintResu
 }
 
 pub(super) fn query_analysis_context_error_result(
+    session_subset: Option<SubsetCoverage>,
     error: QueryAnalysisContextError,
 ) -> CodeQueryResult {
     let code = match error {
@@ -887,6 +911,7 @@ pub(super) fn query_analysis_context_error_result(
     CodeQueryResult {
         results: Vec::new(),
         truncated: true,
+        session_subset,
         diagnostics: vec![CodeQueryDiagnostic {
             code,
             impact: CodeQueryDiagnosticImpact::Incomplete,
@@ -1308,6 +1333,18 @@ pub(super) fn apply_pipeline_step(
                 .collect(),
             (
                 PipelineValue::Semantic(SemanticPipelineValue::Procedure(procedure)),
+                QueryStep::ConcurrentAccessConflicts,
+            ) => semantic
+                .as_mut()
+                .expect("concurrent access query service exists for semantic steps")
+                .concurrent_access_conflicts(procedure)
+                .into_iter()
+                .map(Box::new)
+                .map(PipelineValue::ConcurrentAccessConflict)
+                .map(pipeline_expansion)
+                .collect(),
+            (
+                PipelineValue::Semantic(SemanticPipelineValue::Procedure(procedure)),
                 QueryStep::ValueFlow(traversal),
             ) => semantic
                 .as_mut()
@@ -1460,7 +1497,10 @@ pub(super) fn apply_pipeline_step(
             (PipelineValue::ExpressionSite(site), QueryStep::FileOf) => vec![pipeline_expansion(
                 PipelineValue::File(site.call_site.0.file.clone()),
             )],
-            (PipelineValue::ReceiverAnalysis(value), QueryStep::FileOf) => {
+            (
+                PipelineValue::ReceiverAnalysis(value) | PipelineValue::MemberTargetAnalysis(value),
+                QueryStep::FileOf,
+            ) => {
                 vec![pipeline_expansion(PipelineValue::File(
                     value.report.site.file.clone(),
                 ))]
@@ -1546,6 +1586,11 @@ pub(super) fn apply_pipeline_step(
             (PipelineValue::ReceiverEvidence(value), QueryStep::FileOf) => {
                 vec![pipeline_expansion(PipelineValue::File(
                     value.receiver.report.site.file.clone(),
+                ))]
+            }
+            (PipelineValue::FieldWriteValue(value), QueryStep::FileOf) => {
+                vec![pipeline_expansion(PipelineValue::File(
+                    value.seed.file.clone(),
                 ))]
             }
             (PipelineValue::File(file), QueryStep::ImportsOf) => {
@@ -1890,7 +1935,10 @@ pub(super) fn apply_pipeline_step(
                 correlate_receiver_expansions(&mut expansions, value.row.ast_id());
                 expansions
             }
-            (PipelineValue::ReceiverAnalysis(value), QueryStep::ReceiverOutcome) => {
+            (
+                PipelineValue::ReceiverAnalysis(value) | PipelineValue::MemberTargetAnalysis(value),
+                QueryStep::ReceiverOutcome,
+            ) => {
                 vec![PipelineExpansion {
                     value: PipelineValue::ReceiverOutcome(value.clone()),
                     trace: vec![(PipelineTraceValue::ReceiverOutcome(value.clone()), None)],
@@ -1899,6 +1947,9 @@ pub(super) fn apply_pipeline_step(
             }
             (PipelineValue::ReceiverAnalysis(value), QueryStep::ReceiverEvidence) => {
                 receiver_evidence_expansions(value)
+            }
+            (PipelineValue::MemberTargetAnalysis(value), QueryStep::FieldWriteValue(filter)) => {
+                field_write::field_write_value_expansions(value, filter, &row.traces, diagnostics)
             }
             (PipelineValue::StructuralMatch(seed), QueryStep::CallShape) => {
                 let fact_range = seed.facts.node(seed.fact_match.node).range;
@@ -2493,6 +2544,56 @@ pub(super) fn apply_pipeline_step(
                     &mut row_exhausted,
                 )
             }
+            (
+                PipelineValue::Semantic(SemanticPipelineValue::Procedure(procedure)),
+                QueryStep::NilnessOperations,
+            ) => {
+                let facts = match receiver::receiver_facts_for_pipeline_row(
+                    analyzer,
+                    &row.traces,
+                    procedure.file(),
+                    receiver_facts,
+                    budget,
+                    limits,
+                    cancellation,
+                    diagnostics,
+                    cache_profile,
+                ) {
+                    receiver::PipelineReceiverFacts::Available(facts) => Some(facts),
+                    receiver::PipelineReceiverFacts::Unavailable => None,
+                    receiver::PipelineReceiverFacts::Halted => {
+                        row_exhausted = true;
+                        None
+                    }
+                };
+                effects::nilness_operation_expansions(
+                    analyzer,
+                    workspace.expect("nilness operations require a semantic workspace"),
+                    semantic
+                        .as_mut()
+                        .expect("semantic context exists for nilness operations"),
+                    &mut call_cache.effects,
+                    flow_state_cache,
+                    limits,
+                    cancellation,
+                    diagnostics,
+                    procedure,
+                    facts.as_deref(),
+                )
+            }
+            (
+                PipelineValue::Semantic(SemanticPipelineValue::Procedure(procedure)),
+                QueryStep::SwitchCoverage,
+            ) => effects::switch_coverage_expansions(procedure),
+            (
+                PipelineValue::Semantic(SemanticPipelineValue::Procedure(procedure)),
+                QueryStep::DetachedTaskTransfers,
+            ) => effects::detached_task_transfer_expansions(
+                semantic
+                    .as_mut()
+                    .expect("semantic context exists for detached task transfers"),
+                procedure,
+            ),
             (
                 PipelineValue::Semantic(SemanticPipelineValue::Procedure(procedure)),
                 QueryStep::StateEventsOf(filter),

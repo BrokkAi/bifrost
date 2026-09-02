@@ -1,7 +1,7 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "pack_id": "bifrost.cpython-golden-summaries",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "producer": {
     "name": "bifrost-golden-foundry",
     "version": "0.9.0"
@@ -48,7 +48,7 @@
             "target": {
               "path": "base64.py",
               "symbol": "base64.b64decode(s)",
-              "has_receiver": true,
+              "has_receiver": false,
               "parameter_count": 1
             },
             "completeness": "complete",
@@ -72,7 +72,7 @@
             "target": {
               "path": "base64.py",
               "symbol": "base64.b64encode(s)",
-              "has_receiver": true,
+              "has_receiver": false,
               "parameter_count": 1
             },
             "completeness": "complete",
@@ -96,7 +96,7 @@
             "target": {
               "path": "codecs.py",
               "symbol": "codecs.decode(obj,encoding)",
-              "has_receiver": true,
+              "has_receiver": false,
               "parameter_count": 2
             },
             "completeness": "partial",
@@ -120,7 +120,7 @@
             "target": {
               "path": "json/__init__.py",
               "symbol": "json.dumps(obj)",
-              "has_receiver": true,
+              "has_receiver": false,
               "parameter_count": 1
             },
             "completeness": "partial",
@@ -144,7 +144,7 @@
             "target": {
               "path": "json/__init__.py",
               "symbol": "json.loads(s)",
-              "has_receiver": true,
+              "has_receiver": false,
               "parameter_count": 1
             },
             "completeness": "partial",
@@ -168,7 +168,7 @@
             "target": {
               "path": "posixpath.py",
               "symbol": "os.path.join(a,p)",
-              "has_receiver": true,
+              "has_receiver": false,
               "parameter_count": 2
             },
             "completeness": "complete",
@@ -202,7 +202,7 @@
             "target": {
               "path": "urllib/parse.py",
               "symbol": "urllib.parse.quote(string)",
-              "has_receiver": true,
+              "has_receiver": false,
               "parameter_count": 1
             },
             "completeness": "complete",
@@ -226,7 +226,7 @@
             "target": {
               "path": "urllib/parse.py",
               "symbol": "urllib.parse.quote(string,safe)",
-              "has_receiver": true,
+              "has_receiver": false,
               "parameter_count": 2
             },
             "completeness": "complete",
@@ -250,7 +250,7 @@
             "target": {
               "path": "urllib/parse.py",
               "symbol": "urllib.parse.unquote(string)",
-              "has_receiver": true,
+              "has_receiver": false,
               "parameter_count": 1
             },
             "completeness": "complete",
@@ -274,7 +274,7 @@
             "target": {
               "path": "urllib/parse.py",
               "symbol": "urllib.parse.unquote(string,encoding)",
-              "has_receiver": true,
+              "has_receiver": false,
               "parameter_count": 2
             },
             "completeness": "complete",
@@ -298,7 +298,7 @@
             "target": {
               "path": "urllib/parse.py",
               "symbol": "urllib.parse.unquote_plus(string)",
-              "has_receiver": true,
+              "has_receiver": false,
               "parameter_count": 1
             },
             "completeness": "complete",
@@ -322,7 +322,7 @@
             "target": {
               "path": "urllib/parse.py",
               "symbol": "urllib.parse.urljoin(base,url)",
-              "has_receiver": true,
+              "has_receiver": false,
               "parameter_count": 2
             },
             "completeness": "complete",

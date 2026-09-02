@@ -1,0 +1,10 @@
+{
+  "kind": "configuration",
+  "edition": "2024",
+  "compiler": { "release": "1.85.0" },
+  "cargoResolver": "3",
+  "target": { "customName": "acme-board" },
+  "compilationRole": "target",
+  "enabledFeatures": [],
+  "cfgAtoms": []
+}

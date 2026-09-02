@@ -174,7 +174,7 @@ func run(code string) {
 
 ### C And C++
 
-C and C++ files share the `cpp` analyzer, structural adapter, and language-filter label. C++ maps `call_expression` and `new_expression` to `call`, `field_expression` to `field_access`, `function_definition` to `function`, `lambda_expression` to `lambda`, class/struct/union specifiers to `class`, `alias_declaration` to `declaration`, and `assignment_expression` / `init_declarator` to `assignment`. C files naturally expose only the subset their syntax contains.
+C and C++ files share the `cpp` analyzer, structural adapter, and language-filter label. C++ maps `call_expression` and `new_expression` to `call`, `field_expression` to `field_access`, `function_definition` to `function`, `lambda_expression` to `lambda`, class/struct/union specifiers to `class`, `namespace_definition` to `module`, `alias_declaration` to `declaration`, and `assignment_expression` / `init_declarator` to `assignment`. C files naturally expose only the subset their syntax contains.
 
 Role extraction uses the `function` field of `call_expression` or `type` field of `new_expression` as `callee`. Field calls use the field expression's `argument` as `receiver`, and qualified calls expose the qualified scope as `receiver`. Class-contained or scoped function definitions are refined to `method`, and matching scope/name constructor definitions are refined to `constructor`. `preproc_include` maps to `import`. C++ does not model `kwargs` or decorators.
 
@@ -189,9 +189,9 @@ void run(const char* code) {
 
 ### Rust
 
-Rust maps `call_expression` to `call`, `field_expression` to `field_access`, `function_item` and `function_signature_item` to `function`, `closure_expression` to `lambda`, `struct_item` / `enum_item` / `trait_item` to `class`, `type_item` to `declaration`, and `let_declaration`, `const_item`, `static_item`, assignment expressions, and compound assignment expressions to `assignment`.
+Rust maps `call_expression` to `call`, `field_expression` to `field_access`, `function_item` and `function_signature_item` to `function`, `closure_expression` to `lambda`, `struct_item` / `enum_item` / `trait_item` to `class`, `mod_item` to `module`, `type_item` to `declaration`, and `let_declaration`, `const_item`, `static_item`, assignment expressions, and compound assignment expressions to `assignment`.
 
-Role extraction uses the `function` field of a call as `callee`; generic functions are unwrapped to their terminal function name. Field-expression call targets provide `receiver`, and scoped identifiers expose the path as `receiver`. `use_declaration` maps to `import` with `module` roles for the imported path or alias. Rust does not model `kwargs` or decorators.
+Role extraction uses the `function` field of a call as `callee`; generic functions are unwrapped to their terminal function name. Field-expression call targets provide `receiver`, and scoped identifiers expose the path as `receiver`. `use_declaration` maps to `import` with `module` roles for the imported path or alias. Outer attributes are `attribute_item` siblings that precede the item they annotate, and each one contributes a `decorators` edge to the declaration below it. Rust does not model `kwargs`.
 
 Toy shape:
 
@@ -204,7 +204,7 @@ fn run(code: &str) {
 
 ### PHP
 
-PHP maps function, member, nullsafe member, scoped, and object-creation expressions to `call`. Member access, nullsafe member access, scoped property access, and class constant access map to `field_access`. Function definitions, method declarations, anonymous functions, arrow functions, class-like declarations, namespace imports, attributes, and several assignment forms map into the normalized vocabulary.
+PHP maps function, member, nullsafe member, scoped, and object-creation expressions to `call`. Member access, nullsafe member access, scoped property access, and class constant access map to `field_access`. Function definitions, method declarations, anonymous functions, arrow functions, class-like declarations, namespace definitions, namespace imports, attributes, and several assignment forms map into the normalized vocabulary. A `namespace_definition` is a `module`, named by the terminal segment of its namespace name.
 
 Role extraction uses call target fields as `callee`, object or scope fields as `receiver`, `argument` nodes as positional `args`, and named arguments as `kwargs`. Constructors are refined from `method` when the method name is `__construct`. Namespace `use` declarations provide `module` roles, including aliases. PHP attributes map to `decorators`.
 
@@ -236,7 +236,7 @@ object App {
 
 ### C#
 
-C# maps `invocation_expression` and `object_creation_expression` to `call`, member and conditional access expressions to `field_access`, method and constructor declarations to `method` and `constructor`, local functions to `function`, lambda and anonymous methods to `lambda`, class-like declarations to `class`, properties to `declaration`, variable declarators and assignment expressions to `assignment`, and `using_directive` to `import`.
+C# maps `invocation_expression` and `object_creation_expression` to `call`, member and conditional access expressions to `field_access`, method and constructor declarations to `method` and `constructor`, local functions to `function`, lambda and anonymous methods to `lambda`, class-like declarations to `class`, block and file-scoped namespace declarations to `module` (named by the terminal segment of a qualified namespace name), properties to `declaration`, variable declarators and assignment expressions to `assignment`, and `using_directive` to `import`.
 
 Role extraction uses invocation `function` targets or object-creation `type` targets as `callee`. Member and conditional access targets provide `receiver`, `object`, and `field`. Arguments can be positional `args` or named `kwargs`. Attributes map to `decorators`, and using aliases are exposed as import `module` names.
 
@@ -253,7 +253,7 @@ class App {
 
 ### Ruby
 
-Ruby maps `call` to `call`, `scope_resolution` to `field_access`, `method` and `singleton_method` to function-like declarations, `lambda`, `block`, and `do_block` to `lambda`, classes and modules to `class`, assignments to `assignment`, and bare `require`, `require_relative`, `load`, and `autoload` calls with static string arguments to `import`.
+Ruby maps `call` to `call`, `scope_resolution` to `field_access`, `method` and `singleton_method` to function-like declarations, `lambda`, `block`, and `do_block` to `lambda`, `class` to `class`, `module` to `module`, assignments to `assignment`, and bare `require`, `require_relative`, `load`, and `autoload` calls with static string arguments to `import`.
 
 Role extraction uses the call `method` field as `callee`, optional `receiver` as `receiver`, ordinary arguments as `args`, and hash-pair arguments as `kwargs`. A `method` inside a class or module is refined to `method`; top-level `def` remains `function`. Static import strings expose a `module` role, but interpolated strings do not pretend to have a precise module name. Ruby does not model decorators.
 

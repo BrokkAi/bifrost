@@ -96,6 +96,11 @@ pub(crate) struct TypeLookupDiagnostic {
 pub struct TypeLookupType {
     pub fqn: String,
     pub definitions: Vec<CodeUnit>,
+    /// Exact active semantic-model record used to produce this type, when the
+    /// type has no workspace declaration. Keep the record identity beside the
+    /// synthetic compatibility declaration so downstream member resolution
+    /// never reconstructs provenance from a rendered FQN.
+    pub semantic_model_id: Option<String>,
 }
 
 pub fn resolve_type_batch(
@@ -350,6 +355,7 @@ pub(super) fn candidates_outcome_with_target_kind(
         types: vec![TypeLookupType {
             fqn: fqn.into(),
             definitions: candidates,
+            semantic_model_id: None,
         }],
         diagnostics: if status == TypeLookupStatus::Ambiguous {
             vec![TypeLookupDiagnostic {

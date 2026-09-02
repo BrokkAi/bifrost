@@ -31,8 +31,9 @@ use crate::analyzer::common::{
     IdentifierSeek, decorated_identifier_seeks, identifier_addresses_target,
 };
 use crate::analyzer::fq_name::absent_segment_separators;
-use crate::analyzer::pool_memo::KeyedPoolSafeMemo;
+use crate::analyzer::pool_memo::{KeyedPoolSafeMemo, install_on_dedicated_build_pool};
 use crate::analyzer::project::{OverlayRevision, ProjectSourceOrigin, ProjectSourceSnapshot};
+use crate::analyzer::read_ledger::{IndexFamily, ReadKey};
 use crate::analyzer::store::liveness::{
     FileStatStamp, LivePathEntry, LivePathMap, LiveSnapshot, Liveness,
 };
@@ -177,8 +178,9 @@ const TYPE_ALIAS_STORE_ENTRY_OVERHEAD_BYTES: usize = 512;
 const TYPE_ALIAS_STORE_MAX_BYTES: usize = 32 * 1024 * 1024;
 // A large generated file can have thousands of declaration ranges. A linear
 // scan for every reference makes lexical-owner lookup quadratic in that file.
-// Keep an interval index only for these large states and bound its retained
-// `CodeUnit` copies independently from complete FileState values.
+// Keep an interval index for these states and bound its retained `CodeUnit`
+// copies independently from complete FileState values.
+#[cfg(test)]
 const ENCLOSING_CODE_UNIT_INDEX_MIN_DECLARATIONS: usize = 128;
 const ENCLOSING_CODE_UNIT_INDEX_TEXT_BYTES_MULTIPLIER: usize = 2;
 const ENCLOSING_CODE_UNIT_INDEX_ENTRY_OVERHEAD_BYTES: usize = 128;
@@ -1576,6 +1578,14 @@ impl AnalyzerRuntimeState {
             .clone()
     }
 
+    fn has_dirty_file_states(&self) -> bool {
+        !self
+            .dirty_file_states
+            .lock()
+            .expect("dirty file-state mutex poisoned")
+            .is_empty()
+    }
+
     fn dirty_path_symbol_snapshot(&self) -> HashMap<ProjectFile, (String, PathSymbolRow)> {
         self.dirty_path_symbol_rows
             .lock()
@@ -2399,6 +2409,10 @@ struct QueryReadCache {
     /// duplicate is cheap and per-key single-flighting would cost more than it
     /// saves.
     class_ranges: Arc<RwLock<HashMap<ProjectFile, Arc<ClassRangeIndex>>>>,
+    /// The definition-lookup memos every `AnalyzerDefinitionLookup` built
+    /// during this request answers from (#2883). See
+    /// [`crate::analyzer::DefinitionLookupMemo`].
+    definition_lookup: Arc<crate::analyzer::DefinitionLookupMemo>,
 }
 
 /// One request's materialization of the workspace's path-synthetic module
@@ -2442,6 +2456,27 @@ struct DefinitionSortCandidate {
     range_start: DefinitionRangeStart,
 }
 
+/// The recorder a read funnel pushes its [`ReadKey`]s into.
+///
+/// It holds the request boundaries that were open when the funnel was crossed,
+/// so one push reaches every ledger around it. Constructing one is the only
+/// work a ledger-free run would have to do, which is why
+/// [`TreeSitterAnalyzer::record_reads`] refuses to build it at all in that
+/// case.
+pub(crate) struct ReadKeySink<'a> {
+    contexts: &'a [Arc<crate::analyzer::AnalyzerQueryContext>],
+}
+
+impl ReadKeySink<'_> {
+    pub(crate) fn push(&mut self, key: crate::analyzer::read_ledger::ReadKey) {
+        for context in self.contexts {
+            if let Some(ledger) = context.read_ledger() {
+                ledger.record(key.clone());
+            }
+        }
+    }
+}
+
 impl QueryReadCache {
     fn new(file_state_budget_bytes: usize) -> Self {
         Self {
@@ -2460,32 +2495,43 @@ impl QueryReadCache {
             definition_units: Arc::new(KeyedPoolSafeMemo::new()),
             workspace_module_walk: Arc::new(RwLock::new(None)),
             class_ranges: Arc::new(RwLock::new(HashMap::default())),
+            definition_lookup: Arc::default(),
         }
     }
 
-    fn begin(&mut self, context: &Arc<crate::analyzer::AnalyzerQueryContext>) {
+    /// Register `context` as an open request boundary. Returns whether it was
+    /// newly registered, which is what keeps the analyzer's attached-ledger
+    /// count in step with this list under the re-entrant `begin_query` calls
+    /// nested scopes make.
+    fn begin(&mut self, context: &Arc<crate::analyzer::AnalyzerQueryContext>) -> bool {
         if self.contexts.is_empty() {
             self.reset_request_caches();
             self.top_level_class_units_by_package = Arc::new(OnceLock::new());
             self.workspace_file_index = Arc::new(OnceLock::new());
         }
-        if !self
+        if self
             .contexts
             .iter()
             .any(|active| Arc::ptr_eq(active, context))
         {
-            self.contexts.push(Arc::clone(context));
+            return false;
         }
+        self.contexts.push(Arc::clone(context));
+        true
     }
 
-    fn end(&mut self, context: &Arc<crate::analyzer::AnalyzerQueryContext>) {
+    /// Retire `context`. Returns whether it was registered here.
+    fn end(&mut self, context: &Arc<crate::analyzer::AnalyzerQueryContext>) -> bool {
         let was_active = !self.contexts.is_empty();
+        let before = self.contexts.len();
         self.contexts.retain(|active| !Arc::ptr_eq(active, context));
+        let removed = self.contexts.len() < before;
         if was_active && self.contexts.is_empty() {
             self.reset_request_caches();
             self.top_level_class_units_by_package = Arc::new(OnceLock::new());
             self.workspace_file_index = Arc::new(OnceLock::new());
         }
+        removed
     }
 
     /// Replace every request memo at an outer-scope transition. Callers that
@@ -2507,6 +2553,7 @@ impl QueryReadCache {
         self.definition_units = Arc::new(KeyedPoolSafeMemo::new());
         self.workspace_module_walk = Arc::new(RwLock::new(None));
         self.class_ranges = Arc::new(RwLock::new(HashMap::default()));
+        self.definition_lookup = Arc::default();
     }
 
     fn is_active(&self) -> bool {
@@ -2766,6 +2813,11 @@ pub struct TreeSitterAnalyzer<A> {
     /// entry is a pure function of content and can never go stale.
     semantic_source_digests: crate::analyzer::semantic::service::SourceContentIdentityMemo,
     store_context: AnalyzerStoreContext,
+    /// Immutable path-to-blob identities for the source generation that built
+    /// this analyzer. Queries may refresh `store_context.live_paths` as they
+    /// observe later working-tree bytes, so that mutable projection cannot
+    /// answer whether new source still matches this generation.
+    indexed_live_snapshot: Arc<LiveSnapshot>,
     /// Opaque identities of the SQLite workspace projections published for
     /// this immutable analyzer generation. Comparing these scalar rows keeps
     /// the hot relational path on liveness views while allowing a retained
@@ -2813,11 +2865,28 @@ pub struct TreeSitterAnalyzer<A> {
     /// total: what must stay bounded there is the number of *store reads* the
     /// per-reference calls turn into (#1451), not any one file's share.
     tier_access_totals: Arc<[AtomicUsize; InformationTier::COUNT]>,
+    /// How many of the open query contexts carry a read ledger.
+    ///
+    /// Every read funnel consults this before it builds a [`ReadKey`], so a
+    /// run with no ledger attached -- which is every run that is not an
+    /// incremental policy evaluation -- pays one relaxed load and allocates
+    /// nothing. It tracks `query_read_cache.contexts`, which a clone starts
+    /// empty, so it is minted fresh per clone rather than shared.
+    attached_read_ledgers: Arc<AtomicUsize>,
     transient_file_states: Arc<Mutex<FileStateCache>>,
     source_snapshot_file_states: Arc<SourceSnapshotFileStateIndex>,
     summary_file_projections: Arc<Mutex<SummaryFileProjectionCache>>,
     full_hydration_count: Arc<AtomicUsize>,
     bulk_hydration_count: Arc<AtomicUsize>,
+    /// File states [`TreeSitterAnalyzer::authoritative_file_states_for_queries`]
+    /// materializes, summed over its calls.
+    ///
+    /// Every one of them used to be a deep `FileState` clone -- source text and
+    /// all -- and the walk that produced them visited every cached state rather
+    /// than the snapshot's overlay set, so one relational batch cost the size of
+    /// the process's file-state cache (#2883). A request with no overlay open
+    /// must count zero here however many states are cached.
+    authoritative_file_state_reads: Arc<AtomicUsize>,
     sql_definitions_query_count: Arc<AtomicUsize>,
     definition_candidates_query_count: Arc<AtomicUsize>,
     definition_prefetch_batch_count: Arc<AtomicUsize>,
@@ -2861,6 +2930,7 @@ impl<A> Clone for TreeSitterAnalyzer<A> {
             semantic_cache: self.semantic_cache.clone(),
             semantic_source_digests: self.semantic_source_digests.clone(),
             store_context: self.store_context.clone(),
+            indexed_live_snapshot: Arc::clone(&self.indexed_live_snapshot),
             relational_workspace_snapshots: Arc::clone(&self.relational_workspace_snapshots),
             query_read_cache: Arc::new(RwLock::new(QueryReadCache::default())),
             live_source_snapshot: Arc::new(ArcSwapOption::empty()),
@@ -2873,10 +2943,12 @@ impl<A> Clone for TreeSitterAnalyzer<A> {
             live_oid_validation_counts: Arc::clone(&self.live_oid_validation_counts),
             tier_access_counts: Arc::clone(&self.tier_access_counts),
             tier_access_totals: Arc::clone(&self.tier_access_totals),
+            attached_read_ledgers: Arc::new(AtomicUsize::new(0)),
             transient_file_states: Arc::clone(&self.transient_file_states),
             source_snapshot_file_states: Arc::clone(&self.source_snapshot_file_states),
             summary_file_projections: Arc::clone(&self.summary_file_projections),
             full_hydration_count: Arc::clone(&self.full_hydration_count),
+            authoritative_file_state_reads: Arc::clone(&self.authoritative_file_state_reads),
             bulk_hydration_count: Arc::clone(&self.bulk_hydration_count),
             sql_definitions_query_count: Arc::clone(&self.sql_definitions_query_count),
             definition_candidates_query_count: Arc::clone(&self.definition_candidates_query_count),
@@ -2905,10 +2977,14 @@ impl<A> TreeSitterAnalyzer<A> {
         // as update/update_all keep their next-generation projections local;
         // sharing it would make a later sibling or cleared overlay resolve the
         // old transient OID instead of its own project source.
-        snapshot.store_context.live_paths = Arc::new(self.store_context.live_paths.fork());
+        snapshot.store_context.live_paths = Arc::new(
+            self.store_context
+                .live_paths
+                .fork_from_snapshot(Arc::clone(&self.indexed_live_snapshot)),
+        );
         snapshot.structural_index_cache = Arc::new(
             crate::analyzer::structural::provider::StructuralFactSnapshotCache::new(
-                self.config.structural_index_cache_budget_bytes(),
+                self.config.memo_cache_budget_bytes(),
             ),
         );
         snapshot.snapshot_caches = Arc::new(crate::analyzer::AnalyzerSnapshotCaches::new(
@@ -3072,6 +3148,7 @@ where
                 )
                 .map_err(|error| error.context("capturing relational workspace identities"))?,
         );
+        let indexed_live_snapshot = store_context.live_paths.snapshot();
         Ok(Self {
             project,
             adapter,
@@ -3085,6 +3162,7 @@ where
             semantic_source_digests:
                 crate::analyzer::semantic::service::SourceContentIdentityMemo::default(),
             store_context,
+            indexed_live_snapshot,
             relational_workspace_snapshots: Arc::new(arc_swap::ArcSwap::from(
                 relational_workspace_snapshots,
             )),
@@ -3107,6 +3185,7 @@ where
             live_oid_validation_counts: Arc::new(Mutex::new(HashMap::default())),
             tier_access_counts: Arc::new(Mutex::new(HashMap::default())),
             tier_access_totals: Arc::new(Default::default()),
+            attached_read_ledgers: Arc::new(AtomicUsize::new(0)),
             transient_file_states: Arc::new(Mutex::new(FileStateCache::new(
                 file_state_cache_budget,
             ))),
@@ -3115,6 +3194,7 @@ where
                 SUMMARY_FILE_PROJECTION_CACHE_CAPACITY,
             ))),
             full_hydration_count: Arc::new(AtomicUsize::new(0)),
+            authoritative_file_state_reads: Arc::new(AtomicUsize::new(0)),
             bulk_hydration_count: Arc::new(AtomicUsize::new(0)),
             sql_definitions_query_count: Arc::new(AtomicUsize::new(0)),
             definition_candidates_query_count: Arc::new(AtomicUsize::new(0)),
@@ -3151,7 +3231,7 @@ where
         config: &AnalyzerConfig,
     ) -> crate::analyzer::structural::provider::StructuralFactSnapshotCache {
         crate::analyzer::structural::provider::StructuralFactSnapshotCache::new(
-            config.structural_index_cache_budget_bytes(),
+            config.memo_cache_budget_bytes(),
         )
     }
 
@@ -3227,7 +3307,8 @@ where
         }
         crate::analyzer::content_identity::language_content_identity(
             self.content_identity_base,
-            self.live_snapshot().content_digest(overlays.as_deref()),
+            self.indexed_live_snapshot
+                .content_digest(overlays.as_deref()),
             overlay_paths
                 .iter()
                 .map(|(path, digest)| (path.as_str(), digest)),
@@ -3477,6 +3558,7 @@ where
             file_state_cache_budget_bytes(&config, active_persisted_payload_bytes);
         let query_file_state_cache_budget =
             query_file_state_cache_budget_bytes(file_state_cache_budget);
+        let indexed_live_snapshot = store_context.live_paths.snapshot();
         Self {
             project,
             adapter,
@@ -3490,6 +3572,7 @@ where
             semantic_source_digests:
                 crate::analyzer::semantic::service::SourceContentIdentityMemo::default(),
             store_context,
+            indexed_live_snapshot,
             relational_workspace_snapshots: Arc::new(arc_swap::ArcSwap::from(
                 relational_workspace_snapshots,
             )),
@@ -3512,6 +3595,7 @@ where
             live_oid_validation_counts: Arc::new(Mutex::new(HashMap::default())),
             tier_access_counts: Arc::new(Mutex::new(HashMap::default())),
             tier_access_totals: Arc::new(Default::default()),
+            attached_read_ledgers: Arc::new(AtomicUsize::new(0)),
             transient_file_states: Arc::new(Mutex::new(FileStateCache::new(
                 file_state_cache_budget,
             ))),
@@ -3520,6 +3604,7 @@ where
                 SUMMARY_FILE_PROJECTION_CACHE_CAPACITY,
             ))),
             full_hydration_count: Arc::new(AtomicUsize::new(0)),
+            authoritative_file_state_reads: Arc::new(AtomicUsize::new(0)),
             bulk_hydration_count: Arc::new(AtomicUsize::new(0)),
             sql_definitions_query_count: Arc::new(AtomicUsize::new(0)),
             definition_candidates_query_count: Arc::new(AtomicUsize::new(0)),
@@ -3977,10 +4062,17 @@ where
 
             let mut pending = Vec::new();
             let mut pending_files = HashMap::default();
+            // Running totals for `pending`, carried instead of refolded: the
+            // fold ran on every push, which is quadratic over a 256-blob batch
+            // on the serial persist consumer (#2267).
+            let mut pending_rows = 0usize;
+            let mut pending_bytes = 0usize;
             let mut persist_completed = 0usize;
             let mut tail_mode = false;
             let flush = |pending: &mut Vec<PreparedParsedBlob>,
                          pending_files: &mut HashMap<(Oid, String), ProjectFile>,
+                         pending_rows: &mut usize,
+                         pending_bytes: &mut usize,
                          stats: &mut PersistBatchStats,
                          persist_completed: &mut usize,
                          on_outcome: &mut PreparedOutcomeHandler<'_>| {
@@ -3988,6 +4080,8 @@ where
                     return;
                 }
                 let prepared = std::mem::take(pending);
+                *pending_rows = 0;
+                *pending_bytes = 0;
                 let persist_start = std::time::Instant::now();
                 let (outcomes, batch_stats) =
                     store_context.store.persist_prepared_blobs(prepared, limits);
@@ -4032,26 +4126,42 @@ where
                 }
             };
 
-            let add_ready =
-                |file: ProjectFile,
-                 prepared: Box<PreparedParsedBlob>,
-                 pending: &mut Vec<PreparedParsedBlob>,
-                 pending_files: &mut HashMap<(Oid, String), ProjectFile>| {
-                    let key = (prepared.oid(), prepared.lang().to_string());
-                    if pending_files.insert(key, file).is_some() {
-                        panic!("duplicate prepared blob key in reconcile batch");
-                    }
-                    pending.push(*prepared);
-                    let rows = pending.iter().fold(0usize, |total, blob| {
+            let add_ready = |file: ProjectFile,
+                             prepared: Box<PreparedParsedBlob>,
+                             pending: &mut Vec<PreparedParsedBlob>,
+                             pending_files: &mut HashMap<(Oid, String), ProjectFile>,
+                             pending_rows: &mut usize,
+                             pending_bytes: &mut usize| {
+                let key = (prepared.oid(), prepared.lang().to_string());
+                if pending_files.insert(key, file).is_some() {
+                    panic!("duplicate prepared blob key in reconcile batch");
+                }
+                let rows = prepared.logical_rows();
+                let bytes = prepared.payload_bytes();
+                pending.push(*prepared);
+                *pending_rows = pending_rows.saturating_add(rows);
+                *pending_bytes = pending_bytes.saturating_add(bytes);
+                // The totals only stay correct while every drain resets
+                // them, so debug builds pay for the fold this replaced and
+                // compare, rather than trusting the invariant silently.
+                debug_assert_eq!(
+                    *pending_rows,
+                    pending.iter().fold(0usize, |total, blob| {
                         total.saturating_add(blob.logical_rows())
-                    });
-                    let bytes = pending.iter().fold(0usize, |total, blob| {
+                    }),
+                    "pending row total drifted from the pending batch"
+                );
+                debug_assert_eq!(
+                    *pending_bytes,
+                    pending.iter().fold(0usize, |total, blob| {
                         total.saturating_add(blob.payload_bytes())
-                    });
-                    pending.len() >= limits.max_blobs
-                        || rows >= limits.max_rows
-                        || bytes >= limits.max_payload_bytes
-                };
+                    }),
+                    "pending payload byte total drifted from the pending batch"
+                );
+                pending.len() >= limits.max_blobs
+                    || *pending_rows >= limits.max_rows
+                    || *pending_bytes >= limits.max_payload_bytes
+            };
 
             let mut deferred = None;
             loop {
@@ -4074,6 +4184,8 @@ where
                         flush(
                             &mut pending,
                             &mut pending_files,
+                            &mut pending_rows,
+                            &mut pending_bytes,
                             &mut stats,
                             &mut persist_completed,
                             &mut on_outcome,
@@ -4081,10 +4193,19 @@ where
                         tail_mode = true;
                     }
                     Ok(PreparedAnalysis::Ready { file, prepared }) => {
-                        if add_ready(file, prepared, &mut pending, &mut pending_files) {
+                        if add_ready(
+                            file,
+                            prepared,
+                            &mut pending,
+                            &mut pending_files,
+                            &mut pending_rows,
+                            &mut pending_bytes,
+                        ) {
                             flush(
                                 &mut pending,
                                 &mut pending_files,
+                                &mut pending_rows,
+                                &mut pending_bytes,
                                 &mut stats,
                                 &mut persist_completed,
                                 &mut on_outcome,
@@ -4099,10 +4220,14 @@ where
                                             prepared,
                                             &mut pending,
                                             &mut pending_files,
+                                            &mut pending_rows,
+                                            &mut pending_bytes,
                                         ) {
                                             flush(
                                                 &mut pending,
                                                 &mut pending_files,
+                                                &mut pending_rows,
+                                                &mut pending_bytes,
                                                 &mut stats,
                                                 &mut persist_completed,
                                                 &mut on_outcome,
@@ -4120,6 +4245,8 @@ where
                             flush(
                                 &mut pending,
                                 &mut pending_files,
+                                &mut pending_rows,
+                                &mut pending_bytes,
                                 &mut stats,
                                 &mut persist_completed,
                                 &mut on_outcome,
@@ -4157,6 +4284,8 @@ where
                         flush(
                             &mut pending,
                             &mut pending_files,
+                            &mut pending_rows,
+                            &mut pending_bytes,
                             &mut stats,
                             &mut persist_completed,
                             &mut on_outcome,
@@ -4331,7 +4460,6 @@ where
     fn resolve_live_oids(
         project: &dyn Project,
         files: &[ProjectFile],
-        config: &AnalyzerConfig,
         store_context: &AnalyzerStoreContext,
         replace_live_paths: bool,
     ) -> Result<HashMap<ProjectFile, Oid>, String> {
@@ -4393,17 +4521,17 @@ where
             };
             Ok(Some((file.clone(), oid, entry)))
         };
-        let plan_parallel =
-            |subset: &[ProjectFile]| -> Result<Vec<Result<PlannedLiveOid, String>>, String> {
-                if subset.len() <= 1 {
-                    return Ok(subset.iter().map(&plan_one).collect());
-                }
-                let pool = rayon::ThreadPoolBuilder::new()
-                    .num_threads(config.parallelism().clamp(1, subset.len()))
-                    .build()
-                    .map_err(|err| format!("failed to build live OID thread pool: {err}"))?;
-                Ok(pool.install(|| subset.par_iter().map(&plan_one).collect()))
-            };
+        // The hashing burst runs on the process-shared dedicated build pool.
+        // A fresh `rayon::ThreadPool` per call spawned and joined one set of OS
+        // threads per reconcile, which an incremental update pays repeatedly
+        // (#2115); the shared pool is also off the global pool, so the burst
+        // does not park interactive requests behind it.
+        let plan_parallel = |subset: &[ProjectFile]| -> Vec<Result<PlannedLiveOid, String>> {
+            if subset.len() <= 1 {
+                return subset.iter().map(&plan_one).collect();
+            }
+            install_on_dedicated_build_pool(|| subset.par_iter().map(&plan_one).collect())
+        };
 
         let planned = if replace_live_paths && let Some(liveness) = liveness {
             // Startup and full-sweep reconciles project every disk file with
@@ -4427,7 +4555,7 @@ where
                     unresolved_overlays.push(file);
                 }
             }
-            planned.extend(plan_parallel(&unresolved_overlays)?);
+            planned.extend(plan_parallel(&unresolved_overlays));
 
             let mut unresolved_disk = Vec::new();
             for file in disk_files {
@@ -4450,7 +4578,7 @@ where
             }
             planned
         } else {
-            plan_parallel(files)?
+            plan_parallel(files)
         };
 
         let mut out = map_with_capacity(files.len());
@@ -5329,7 +5457,7 @@ where
         let mut workspace_package_inventory_complete = true;
         let oid_plan = {
             let _scope = profiling::scope("reconcile.resolve_live_oids");
-            Self::resolve_live_oids(project, &files, config, store_context, replace_live_paths)
+            Self::resolve_live_oids(project, &files, store_context, replace_live_paths)
         };
         match oid_plan {
             Ok(file_oids) => {
@@ -5607,11 +5735,52 @@ where
     /// The retained source text of an analyzed file. Structural search
     /// re-parses from this instead of touching disk.
     pub(crate) fn file_source(&self, file: &ProjectFile) -> Option<String> {
-        self.source_snapshot_file_state(file)
-            .or_else(|| self.fetch_file_state(file))
+        if let Some(state) = self.source_snapshot_file_state(file) {
+            return Some(state.source.clone());
+        }
+        if let Some(source) = self.analyzed_blob_source(file) {
+            return Some(source);
+        }
+        self.fetch_file_state(file)
             .or_else(|| self.fetch_file_state_from_current_source(file))
             .map(|state| state.source.clone())
             .or_else(|| self.project.read_source(file).ok())
+    }
+
+    /// The analyzed blob's source text for `file`, without hydrating its
+    /// parsed state.
+    ///
+    /// Every hydration path ends with `state.source = source_for_oid(file,
+    /// oid)`, so the text a full fetch would hand back is exactly the blob
+    /// this reads. Asking for the text through the fetch also pays a store
+    /// transaction, unit-row and FQ-segment attachment, and a file-state cache
+    /// insertion that evicts under a workspace-sized scan. A structural seed
+    /// scan asks every file in the workspace for its source and then discards
+    /// almost all of them on a literal prefilter, so that hydration was the
+    /// whole cost of a warm `query_code` on this repository (#2642).
+    ///
+    /// `None` means the blob cannot answer and the caller must fall back:
+    /// the file belongs to another adapter, a streaming read owns its state,
+    /// no live blob identity exists, or the blob is unreadable.
+    fn analyzed_blob_source(&self, file: &ProjectFile) -> Option<String> {
+        let storage_key = self.adapter.storage_language_key_for_file(file);
+        if !self.owns_storage_language_key(storage_key) {
+            return None;
+        }
+        // A streaming read owns this file's state for the length of the read
+        // and registers what it hydrates; leave that path to `fetch_file_state`.
+        if self.streaming_file_read_active(file) {
+            return None;
+        }
+        let oid = self.resolve_live_oid_for_file(file)?;
+        let key = Self::transient_cache_key(oid, file);
+        if let Some(state) = self.retry_dirty_file_state(&key, storage_key) {
+            return Some(state.source.clone());
+        }
+        if let Some(state) = self.retained_file_state(&key) {
+            return Some(state.source.clone());
+        }
+        self.source_for_oid(file, oid)
     }
 
     fn transient_cache_key(oid: Oid, file: &ProjectFile) -> FileStateCacheKey {
@@ -5920,6 +6089,7 @@ where
         let source = self.source_for_oid(file, oid)?;
         let mut state = match self
             .store_query_or_record(
+                |sink| sink.push(self.file_read_key(file, oid)),
                 self.store_context.store.hydrate_file_state_with_source(
                     oid,
                     &storage_key,
@@ -5976,6 +6146,7 @@ where
         let oid = self.resolve_live_oid_for_file(file)?;
         let source = self.source_for_oid(file, oid)?;
         self.store_query_or_record(
+            |sink| sink.push(self.file_read_key(file, oid)),
             self.store_context.store.hydrate_file_state_with_source(
                 oid,
                 storage_key,
@@ -6056,6 +6227,36 @@ where
         self.fetch_file_state_for_key_with_source(file, key, None)
     }
 
+    /// `key`'s already-materialized state, from the query snapshot, the query
+    /// read cache, or the transient cache. `None` means answering would cost a
+    /// full hydration.
+    fn retained_file_state(&self, key: &FileStateCacheKey) -> Option<Arc<FileState>> {
+        if let Some(state) = self.query_file_state_snapshot(key) {
+            return Some(state);
+        }
+        let file_states = self.active_query_cache_handle(|cache| &cache.file_states);
+        if let Some(file_states) = file_states.as_ref()
+            && let Some(state) = file_states
+                .read()
+                .expect("query file-state cache read lock poisoned")
+                .get(key)
+        {
+            return Some(state);
+        }
+        let state = self
+            .transient_file_states
+            .lock()
+            .expect("transient file-state cache mutex poisoned")
+            .get(key)?;
+        if let Some(file_states) = file_states.as_ref() {
+            let mut file_states = file_states
+                .write()
+                .expect("query file-state cache write lock poisoned");
+            file_states.retain(key.clone(), Arc::clone(&state));
+        }
+        Some(state)
+    }
+
     fn fetch_file_state_for_key_with_source(
         &self,
         file: &ProjectFile,
@@ -6082,30 +6283,7 @@ where
         if exact_source.is_none() && self.streaming_file_read_active(file) {
             return self.streaming_file_state(file);
         }
-        if let Some(state) = self.query_file_state_snapshot(key) {
-            return Some(state);
-        }
-        let file_states = self.active_query_cache_handle(|cache| &cache.file_states);
-        if let Some(file_states) = file_states.as_ref()
-            && let Some(state) = file_states
-                .read()
-                .expect("query file-state cache read lock poisoned")
-                .get(key)
-        {
-            return Some(state);
-        }
-        if let Some(state) = self
-            .transient_file_states
-            .lock()
-            .expect("transient file-state cache mutex poisoned")
-            .get(key)
-        {
-            if let Some(file_states) = file_states.as_ref() {
-                let mut file_states = file_states
-                    .write()
-                    .expect("query file-state cache write lock poisoned");
-                file_states.retain(key.clone(), Arc::clone(&state));
-            }
+        if let Some(state) = self.retained_file_state(key) {
             return Some(state);
         }
 
@@ -6116,6 +6294,7 @@ where
         };
         let mut state = match self
             .store_query_or_record(
+                |sink| sink.push(self.file_read_key(file, key.oid)),
                 self.store_context.store.hydrate_file_state_with_source(
                     key.oid,
                     storage_key,
@@ -6137,7 +6316,7 @@ where
             .lock()
             .expect("transient file-state cache mutex poisoned")
             .insert(key.clone(), Arc::clone(&state));
-        if let Some(file_states) = file_states.as_ref() {
+        if let Some(file_states) = self.active_query_cache_handle(|cache| &cache.file_states) {
             let mut file_states = file_states
                 .write()
                 .expect("query file-state cache write lock poisoned");
@@ -6236,6 +6415,7 @@ where
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
             return PreparedSyntaxLimitedOutcome::Cancelled;
         }
+        self.record_reads(|sink| sink.push(self.file_read_key(file, resolved.oid)));
 
         let key = Self::transient_cache_key(resolved.oid, file);
         let (origin, overlay_revision) = match resolved.snapshot.origin() {
@@ -6328,6 +6508,9 @@ where
         file: &ProjectFile,
     ) -> Option<Arc<PreparedSyntaxTree>> {
         let resolved = self.resolve_prepared_source(file, None).ok().flatten()?;
+        // Recorded before the per-request cell answers, so a syntax read that
+        // a memo serves still names the blob it was derived from.
+        self.record_reads(|sink| sink.push(self.file_read_key(file, resolved.oid)));
         let key = Self::transient_cache_key(resolved.oid, file);
         let (origin, overlay_revision) = match resolved.snapshot.origin() {
             ProjectSourceOrigin::Disk => (PreparedSourceOrigin::Disk, None),
@@ -6496,6 +6679,73 @@ where
         total
     }
 
+    /// Whether any open request boundary carries a read ledger.
+    ///
+    /// Read relaxed and consulted before any key is built: a run with no
+    /// ledger must pay one load and allocate nothing.
+    pub(crate) fn read_ledger_attached(&self) -> bool {
+        self.attached_read_ledgers.load(Ordering::Relaxed) > 0
+    }
+
+    /// Record the inputs `build` names on every read ledger open around this
+    /// analyzer, and nothing at all when none is.
+    ///
+    /// The active contexts are cloned out from under the coarse
+    /// `query_read_cache` read lock before they are touched, exactly as
+    /// `record_tier_access` and `record_store_error` do, so this adds no
+    /// lock-order edge.
+    pub(crate) fn record_reads(&self, build: impl FnOnce(&mut ReadKeySink<'_>)) {
+        if !self.read_ledger_attached() {
+            return;
+        }
+        let contexts = self.query_read_cache_lock().contexts.clone();
+        let mut sink = ReadKeySink {
+            contexts: &contexts,
+        };
+        build(&mut sink);
+    }
+
+    /// Record one already-built input. Callers that can avoid building the key
+    /// use [`Self::record_reads`] instead.
+    pub(crate) fn record_read_key(&self, key: crate::analyzer::read_ledger::ReadKey) {
+        self.record_reads(move |sink| sink.push(key));
+    }
+
+    /// The [`ReadKey::File`] naming `file`'s blob as this adapter reads it.
+    pub(crate) fn file_read_key(
+        &self,
+        file: &ProjectFile,
+        blob: Oid,
+    ) -> crate::analyzer::read_ledger::ReadKey {
+        crate::analyzer::read_ledger::ReadKey::file(
+            self.adapter.language(),
+            crate::path_utils::rel_path_string(file),
+            blob,
+        )
+    }
+
+    /// The [`ReadKey::File`] naming the exact source string a funnel is about
+    /// to read facts from, whose blob identity is the hash of those bytes --
+    /// the same identity [`Self::structural_snapshot_key`] persists under.
+    ///
+    /// `None` only when the bytes cannot be hashed, which is the one case
+    /// where the caller has no identity to record either.
+    pub(crate) fn source_file_read_key(
+        &self,
+        file: &ProjectFile,
+        source: &str,
+    ) -> Option<crate::analyzer::read_ledger::ReadKey> {
+        let oid = Oid::hash_object(ObjectType::Blob, source.as_bytes()).ok()?;
+        Some(self.file_read_key(file, oid))
+    }
+
+    /// The [`ReadKey::Scope`] naming this analyzer's whole analyzed file set,
+    /// for a read that no name or file can bound (a prefix, suffix, or pattern
+    /// search over the name index; a workspace enumeration).
+    pub(crate) fn scope_read_key(&self) -> crate::analyzer::read_ledger::ReadKey {
+        IAnalyzer::workspace_scope_read_key(self, &[self.adapter.language()])
+    }
+
     /// How many times `file` crossed `tier`'s funnel since the last reset.
     #[doc(hidden)]
     pub fn tier_access_count_for_test(&self, tier: InformationTier, file: &ProjectFile) -> usize {
@@ -6611,6 +6861,11 @@ where
 
         let mut states = self
             .store_query_or_record(
+                |sink| {
+                    for (file, oid, _) in &entries {
+                        sink.push(self.file_read_key(file, *oid));
+                    }
+                },
                 self.store_context.store.hydrate_file_states_by_key(
                     &entries,
                     self.store_context.generations.as_ref(),
@@ -6755,6 +7010,11 @@ where
         }
         let mut facts: HashMap<ProjectFile, ImportFileFacts> = self
             .store_query_or_record(
+                |sink| {
+                    for (file, oid, _) in &entries {
+                        sink.push(self.file_read_key(file, *oid));
+                    }
+                },
                 self.store_context.store.hydrate_import_facts_by_key(
                     &entries,
                     self.store_context.generations.as_ref(),
@@ -6841,6 +7101,17 @@ where
             }
         }
 
+        self.record_reads(|sink| {
+            for segment in explicit_import_segments
+                .iter()
+                .chain(wildcard_import_segments)
+            {
+                sink.push(ReadKey::index(IndexFamily::ImportPathSegment, segment));
+            }
+            for identifier in type_identifiers {
+                sink.push(ReadKey::index(IndexFamily::ReferenceIdentifier, identifier));
+            }
+        });
         for lang in clean_languages {
             if cancellation.is_cancelled() {
                 return HashSet::default();
@@ -6899,6 +7170,11 @@ where
         let Some(generation) = self.store_context.generations.get(lang).copied() else {
             return self.all_files().into_iter().collect();
         };
+        self.record_reads(|sink| {
+            for identifier in identifiers {
+                sink.push(ReadKey::index(IndexFamily::ReferenceIdentifier, identifier));
+            }
+        });
         let paths = match self.store_context.store.reverse_identifier_candidate_paths(
             self.selected_workspace_snapshots().as_ref(),
             lang,
@@ -6969,6 +7245,11 @@ where
         }
         let hydrated = self
             .store_query_or_record(
+                |sink| {
+                    for (file, oid, _) in &clean_entries {
+                        sink.push(self.file_read_key(file, *oid));
+                    }
+                },
                 self.store_context.store.hydrate_type_identifiers_by_key(
                     &clean_entries,
                     self.store_context.generations.as_ref(),
@@ -7384,6 +7665,10 @@ where
         });
         self.analyzed_file_listing_count
             .fetch_add(1, Ordering::Relaxed);
+        // The answer is the analyzed file set itself, which nothing narrower
+        // than the whole language scope can bound. Recorded before the request
+        // memo answers, so a second call under the same ledger still names it.
+        self.record_reads(|sink| sink.push(self.scope_read_key()));
         // Capture the two request handles together. `analyzed_live_files` is
         // also the one path that already validates every live filesystem entry;
         // publishing that same snapshot into `live_sources` before publishing
@@ -7489,6 +7774,7 @@ where
                 )
             });
             self.store_query_or_record(
+                |sink| sink.push(self.scope_read_key()),
                 self.store_context.store.parsed_blob_keys_at_generations(
                     &keys,
                     self.store_context.generations.as_ref(),
@@ -7655,6 +7941,10 @@ where
             return Ok(Vec::new());
         }
 
+        self.record_reads(|sink| {
+            sink.push(ReadKey::index(IndexFamily::PathSymbol, fq_name));
+            sink.push(ReadKey::index(IndexFamily::PathSymbol, normalized));
+        });
         let rows = self
             .store_context
             .store
@@ -7690,6 +7980,12 @@ where
             .iter()
             .map(|fq_name| (fq_name.clone(), self.adapter.normalize_full_name(fq_name)))
             .collect();
+        self.record_reads(|sink| {
+            for (fq_name, normalized) in &pairs {
+                sink.push(ReadKey::index(IndexFamily::PathSymbol, fq_name));
+                sink.push(ReadKey::index(IndexFamily::PathSymbol, normalized));
+            }
+        });
         match self
             .store_context
             .store
@@ -7791,6 +8087,7 @@ where
         keep: impl FnMut(&CodeUnit) -> bool,
     ) -> Option<Vec<CodeUnit>> {
         self.store_query_or_record(
+            |sink| sink.push(self.scope_read_key()),
             self.try_sql_nonpersisted_workspace_declarations_vec_matching(keep),
             "querying non-persisted workspace declarations",
         )
@@ -7802,6 +8099,7 @@ where
         cancellation: Option<&CancellationToken>,
     ) -> Option<LimitedQueryRows<CodeUnit>> {
         self.store_query_or_record(
+            |sink| sink.push(self.scope_read_key()),
             self.try_sql_nonpersisted_workspace_declarations_vec_matching_limited(keep, || {
                 !cancellation.is_some_and(CancellationToken::is_cancelled)
             }),
@@ -7993,7 +8291,7 @@ where
         Ok(LimitedQueryRows::complete(declarations, inspected))
     }
 
-    fn dirty_file_states_for_queries(&self) -> Vec<FileState> {
+    fn dirty_file_states_for_queries(&self) -> Vec<Arc<FileState>> {
         let snapshot = self.live_snapshot();
         let dirty = self.state.dirty_snapshot();
         let mut states = Vec::new();
@@ -8007,7 +8305,7 @@ where
             }
             let storage_key = self.adapter.storage_language_key_for_file(&file);
             if let Some(state) = self.retry_dirty_file_state(&key, storage_key) {
-                states.push(state.as_ref().clone());
+                states.push(state);
             }
         }
         states
@@ -8029,7 +8327,15 @@ where
     /// the workspace. Without it an exact lookup has no in-memory facts to
     /// override the persisted disk row, especially when the overlay introduces
     /// a declaration name absent from disk.
-    fn authoritative_file_states_for_queries(&self) -> (Vec<FileState>, HashSet<ProjectFile>) {
+    ///
+    /// Only an overlay path can override a persisted row, and the live snapshot
+    /// already knows which paths those are, so this walks that bounded set and
+    /// asks the caches about each one. Walking the caches instead and filtering
+    /// them down to overlays made every relational batch cost the number of
+    /// file states the process had cached, and it deep-cloned each surviving
+    /// `FileState` -- which is why a warm analyzer answered `scan_usages` more
+    /// slowly than a cold one (#2883).
+    fn authoritative_file_states_for_queries(&self) -> (Vec<Arc<FileState>>, HashSet<ProjectFile>) {
         let overlay_files = self
             .project
             .overlay_content()
@@ -8041,6 +8347,20 @@ where
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
+        // Relational reads call this once per lookup, and a usage scan issues
+        // thousands of lookups per request. Overlay-authoritative states can
+        // only come from overlay-backed paths or dirty (unpersisted) states;
+        // with neither present the walks below provably contribute nothing,
+        // so skip the per-lookup cache iteration that rebuilt a `ProjectFile`
+        // for every retained file-state entry just to discard it. The project
+        // overlay registry is checked alongside the frozen snapshot's overlay
+        // flags because either side can observe an overlay first.
+        if overlay_files.is_empty()
+            && !self.state.has_dirty_file_states()
+            && !self.live_snapshot().has_overlay_paths()
+        {
+            return (Vec::new(), HashSet::default());
+        }
         for file in &overlay_files {
             let _ = self.fetch_file_state(file);
         }
@@ -8055,46 +8375,50 @@ where
                 .or_else(|| state.definition_lookup_units.iter().next())
                 .map(|unit| unit.source().clone())
             {
-                states.insert(file, Arc::new(state));
+                states.insert(file, state);
             }
         }
 
-        let mut cached = self
-            .transient_file_states
-            .lock()
-            .expect("transient file-state cache mutex poisoned")
-            .entries
-            .iter()
-            .map(|(key, entry)| (key.clone(), Arc::clone(&entry.state)))
-            .collect::<Vec<_>>();
-        if let Some(query_states) = self.active_query_cache_handle(|cache| &cache.file_states) {
-            cached.extend(
-                query_states
-                    .read()
-                    .expect("query file-state cache read lock poisoned")
-                    .entries
-                    .iter()
-                    .map(|(key, state)| (key.clone(), Arc::clone(state))),
-            );
-        }
-
-        for (key, state) in cached {
-            let file = ProjectFile::new(self.project.root().to_path_buf(), key.rel_path);
-            if !snapshot.is_overlay_path(&file)
-                || !self.adapter_owns_file(&file, &snapshot)
-                || snapshot.validated_oid_for_path(&file) != Some(key.oid)
-            {
+        for file in snapshot.overlay_files() {
+            if states.contains_key(file) || !self.adapter_owns_file(file, &snapshot) {
                 continue;
             }
-            states.entry(file).or_insert(state);
+            let Some(oid) = snapshot.validated_oid_for_path(file) else {
+                continue;
+            };
+            let key = Self::transient_cache_key(oid, file);
+            let Some(state) = self.retained_overlay_file_state(&key) else {
+                continue;
+            };
+            states.insert(file.clone(), state);
         }
 
+        self.authoritative_file_state_reads
+            .fetch_add(states.len(), Ordering::Relaxed);
         let paths = states.keys().cloned().collect();
-        let states = states
-            .into_values()
-            .map(|state| state.as_ref().clone())
-            .collect();
-        (states, paths)
+        (states.into_values().collect(), paths)
+    }
+
+    /// `key`'s already-materialized state in the two caches a request overlay
+    /// can be retained in: the active query cache and the transient cache.
+    ///
+    /// Unlike [`Self::retained_file_state`] this never consults the generation
+    /// snapshot index. That index holds the states the immutable generation was
+    /// built from, which are the states the persisted rows already describe, so
+    /// one found only there overrides nothing.
+    fn retained_overlay_file_state(&self, key: &FileStateCacheKey) -> Option<Arc<FileState>> {
+        if let Some(query_states) = self.active_query_cache_handle(|cache| &cache.file_states)
+            && let Some(state) = query_states
+                .read()
+                .expect("query file-state cache read lock poisoned")
+                .get(key)
+        {
+            return Some(state);
+        }
+        self.transient_file_states
+            .lock()
+            .expect("transient file-state cache mutex poisoned")
+            .get(key)
     }
 
     fn dirty_units_matching(
@@ -8107,15 +8431,17 @@ where
             out.extend(
                 state
                     .declarations
-                    .into_iter()
-                    .filter(|unit| !unit.is_file_scope() && keep(unit)),
+                    .iter()
+                    .filter(|unit| !unit.is_file_scope() && keep(unit))
+                    .cloned(),
             );
             if include_definition_lookup_units {
                 out.extend(
                     state
                         .definition_lookup_units
-                        .into_iter()
-                        .filter(|unit| !unit.is_file_scope() && keep(unit)),
+                        .iter()
+                        .filter(|unit| !unit.is_file_scope() && keep(unit))
+                        .cloned(),
                 );
             }
         }
@@ -8240,6 +8566,17 @@ where
     #[doc(hidden)]
     pub fn bulk_hydration_count_for_test(&self) -> usize {
         self.bulk_hydration_count.load(Ordering::Relaxed)
+    }
+
+    #[doc(hidden)]
+    pub fn reset_authoritative_file_state_reads_for_test(&self) {
+        self.authoritative_file_state_reads
+            .store(0, Ordering::Relaxed);
+    }
+
+    #[doc(hidden)]
+    pub fn authoritative_file_state_reads_for_test(&self) -> usize {
+        self.authoritative_file_state_reads.load(Ordering::Relaxed)
     }
 
     #[doc(hidden)]
@@ -8483,6 +8820,7 @@ where
         };
         let persisted = self
             .store_query_or_record(
+                |sink| sink.push(self.file_read_key(file, oid)),
                 self.store_context.store.direct_children_for_unit_limited(
                     oid,
                     &storage_key,
@@ -8551,6 +8889,7 @@ where
             let mut after: Option<(String, Oid, i64)> = None;
             loop {
                 let Some(rows) = self.store_query_or_record(
+                    |sink| sink.push(self.scope_read_key()),
                     self.store_context
                         .store
                         .declaration_rows_by_package_prefix_page(
@@ -8595,6 +8934,7 @@ where
         let state = Self::analyze_source(&mut parser, self.adapter.as_ref(), file, source)?;
         let storage_key = self.adapter.storage_language_key_for_file(file);
         self.store_query_or_record(
+            |sink| sink.push(self.file_read_key(file, oid)),
             self.store_context.store.write_parsed_blob_at_generation(
                 oid,
                 storage_key,
@@ -8621,11 +8961,13 @@ where
             self.authoritative_file_states_for_queries();
         let storage_languages = self.storage_language_keys_for_queries();
         let workspace_is_current = self.store_query_or_record(
+            |sink| sink.push(self.scope_read_key()),
             self.relational_workspace_is_current(),
             "reading relational workspace identities",
         )?;
         let mut units = if workspace_is_current {
             let rows = self.store_query_or_record(
+                |sink| sink.push(self.scope_read_key()),
                 self.store_context.store.mounted_declaration_rows_for_langs(
                     self.selected_workspace_snapshots().as_ref(),
                     &storage_languages,
@@ -8634,11 +8976,13 @@ where
                 "scanning all mounted declarations",
             )?;
             self.store_query_or_record(
+                |sink| sink.push(self.scope_read_key()),
                 self.resolve_mounted_candidate_rows(rows),
                 "hydrating mounted declarations",
             )?
         } else {
             let rows = self.store_query_or_record(
+                |sink| sink.push(self.scope_read_key()),
                 self.store_context
                     .store
                     .declaration_candidate_rows_for_langs(
@@ -8650,11 +8994,12 @@ where
             self.resolve_candidate_rows(rows)
         };
         units.retain(|unit| !authoritative_paths.contains(unit.source()));
-        units.extend(authoritative_states.into_iter().flat_map(|state| {
+        units.extend(authoritative_states.iter().flat_map(|state| {
             state
                 .declarations
-                .into_iter()
+                .iter()
                 .filter(|unit| !unit.is_file_scope())
+                .cloned()
         }));
         units.extend(self.sql_nonpersisted_workspace_declarations_vec_matching(|_| true)?);
         units.retain(|unit| !unit.is_file_scope());
@@ -8674,6 +9019,7 @@ where
     fn capture_relational_workspace_snapshots(&self) -> (Arc<WorkspaceSnapshots>, bool) {
         let storage_languages = self.storage_language_keys_for_queries();
         match self.store_query_or_record(
+            |sink| sink.push(self.scope_read_key()),
             self.store_context.store.workspace_snapshots_for_langs(
                 &self.store_context.workspace_id,
                 &storage_languages,
@@ -8692,6 +9038,7 @@ where
         let (authoritative_states, authoritative_paths) =
             self.authoritative_file_states_for_queries();
         let rows = self.store_query_or_record(
+            |sink| sink.push(self.scope_read_key()),
             self.store_context
                 .store
                 .declaration_candidate_rows_with_primary_ranges_for_langs(
@@ -8744,6 +9091,7 @@ where
             return Some(Vec::new());
         }
         let rows = self.store_query_or_record(
+            |sink| sink.push(self.scope_read_key()),
             self.store_context
                 .store
                 .declaration_candidate_rows_with_primary_ranges_by_kind_for_langs(
@@ -8841,6 +9189,7 @@ where
             .filter_map(|facts| facts.storage_key.clone())
             .collect::<Vec<_>>();
         let persisted = self.store_query_or_record(
+            |sink| sink.push(self.scope_read_key()),
             self.store_context
                 .store
                 .hierarchy_facts_by_keys(&keys, self.store_context.generations.as_ref()),
@@ -8943,6 +9292,15 @@ where
         let storage_languages = self.storage_language_keys_for_queries();
         let ordered = self
             .store_query_or_record(
+                |sink| {
+                    for name in &names {
+                        sink.push(ReadKey::index(
+                            IndexFamily::DefinitionExact,
+                            name.full_name()
+                                .display(crate::analyzer::fq_name::segment_interner()),
+                        ));
+                    }
+                },
                 self.store_context
                     .store
                     .relational_exact_definition_order_rows(
@@ -9170,10 +9528,10 @@ where
             let (authoritative_states, authoritative_paths) =
                 self.authoritative_file_states_for_queries();
             candidates.retain(|candidate| !authoritative_paths.contains(candidate.unit.source()));
-            for state in authoritative_states {
-                let units = state.declarations.into_iter().chain(
+            for state in &authoritative_states {
+                let units = state.declarations.iter().chain(
                     include_definition_lookup_units
-                        .then_some(state.definition_lookup_units)
+                        .then_some(&state.definition_lookup_units)
                         .into_iter()
                         .flatten(),
                 );
@@ -9186,7 +9544,7 @@ where
                                         == normalized)
                         })
                         .map(|unit| DefinitionSortCandidate {
-                            unit,
+                            unit: unit.clone(),
                             range_start: DefinitionRangeStart::FileState,
                         }),
                 );
@@ -9350,6 +9708,12 @@ where
         for short_name in &candidate_names {
             rows.extend(
                 self.store_query_or_record(
+                    |sink| {
+                        sink.push(ReadKey::index(
+                            IndexFamily::DefinitionIdentifier,
+                            short_name,
+                        ))
+                    },
                     self.store_context
                         .store
                         .declaration_candidate_rows_by_short_name_for_langs(
@@ -9395,6 +9759,12 @@ where
         let names = |unit: &CodeUnit| identifier_addresses_target(unit, identifier);
         let mut rows = self
             .store_query_or_record(
+                |sink| {
+                    sink.push(ReadKey::index(
+                        IndexFamily::DefinitionIdentifier,
+                        identifier,
+                    ))
+                },
                 self.store_context
                     .store
                     .declaration_candidate_rows_by_identifier_for_langs(
@@ -9408,6 +9778,7 @@ where
         for seek in decorated_identifier_seeks(self.adapter.language(), identifier) {
             let decorated = match &seek {
                 IdentifierSeek::Exact(spelling) => self.store_query_or_record(
+                    |sink| sink.push(ReadKey::index(IndexFamily::DefinitionIdentifier, spelling)),
                     self.store_context
                         .store
                         .declaration_candidate_rows_by_identifier_for_langs(
@@ -9418,6 +9789,7 @@ where
                     format!("querying declarations by decorated identifier `{spelling}`"),
                 ),
                 IdentifierSeek::Prefix(prefix) => self.store_query_or_record(
+                    |sink| sink.push(self.scope_read_key()),
                     self.store_context
                         .store
                         .declaration_candidate_rows_by_identifier_prefix_for_langs(
@@ -9466,6 +9838,13 @@ where
         };
         let rows = self
             .store_query_or_record(
+                |sink| {
+                    sink.push(self.file_read_key(file, blob_oid));
+                    sink.push(ReadKey::index(
+                        IndexFamily::DefinitionIdentifier,
+                        identifier,
+                    ));
+                },
                 self.store_context
                     .store
                     .declaration_candidate_rows_by_identifier_for_blob(
@@ -9503,6 +9882,12 @@ where
         let langs = self.storage_language_keys_for_queries();
         let persisted = self
             .store_query_or_record(
+                |sink| {
+                    sink.push(ReadKey::index(
+                        IndexFamily::DefinitionIdentifier,
+                        identifier,
+                    ))
+                },
                 self.store_context
                     .store
                     .declaration_candidate_rows_by_identifier_for_langs_limited(
@@ -9546,6 +9931,13 @@ where
         let generations = HashMap::from_iter([(storage_key.clone(), generation)]);
         let persisted = self
             .store_query_or_record(
+                |sink| {
+                    sink.push(self.file_read_key(file, blob_oid));
+                    sink.push(ReadKey::index(
+                        IndexFamily::DefinitionIdentifier,
+                        identifier,
+                    ));
+                },
                 self.store_context
                     .store
                     .declaration_candidate_rows_by_identifier_for_blob_limited(
@@ -9603,6 +9995,12 @@ where
         let langs = self.storage_language_keys_for_queries();
         let persisted = self
             .store_query_or_record(
+                |sink| {
+                    sink.push(ReadKey::index(
+                        IndexFamily::DefinitionIdentifier,
+                        identifier,
+                    ))
+                },
                 self.store_context
                     .store
                     .declaration_candidate_rows_by_identifier_for_langs_limited(
@@ -9648,6 +10046,16 @@ where
             fqn.to_string()
         };
         let rows = self.store_query_or_record(
+            |sink| {
+                sink.push(ReadKey::index(
+                    if normalized {
+                        IndexFamily::DefinitionNormalizedTail
+                    } else {
+                        IndexFamily::DefinitionExact
+                    },
+                    &lookup,
+                ))
+            },
             self.store_context
                 .store
                 .declaration_candidate_rows_by_lookup_key_for_langs(
@@ -9703,6 +10111,16 @@ where
         };
         let persisted = self
             .store_query_or_record(
+                |sink| {
+                    sink.push(ReadKey::index(
+                        if normalized {
+                            IndexFamily::DefinitionNormalizedTail
+                        } else {
+                            IndexFamily::DefinitionExact
+                        },
+                        &lookup,
+                    ))
+                },
                 self.store_context
                     .store
                     .declaration_candidate_rows_by_lookup_key_for_langs_limited(
@@ -9739,6 +10157,7 @@ where
     ) -> BTreeSet<CodeUnit> {
         let exact_rows = self
             .store_query_or_record(
+                |sink| sink.push(ReadKey::index(IndexFamily::DefinitionExact, owner_fqn)),
                 self.store_context
                     .store
                     .declaration_member_rows_for_owner_for_langs(
@@ -9771,6 +10190,12 @@ where
         let normalized_owner = self.adapter.normalize_full_name(owner_fqn);
         let normalized_rows = self
             .store_query_or_record(
+                |sink| {
+                    sink.push(ReadKey::index(
+                        IndexFamily::DefinitionNormalizedTail,
+                        &normalized_owner,
+                    ))
+                },
                 self.store_context
                     .store
                     .declaration_member_rows_for_owner_for_langs(
@@ -9811,6 +10236,7 @@ where
         let langs = self.storage_language_keys_for_queries();
         let exact_persisted = self
             .store_query_or_record(
+                |sink| sink.push(ReadKey::index(IndexFamily::DefinitionExact, owner_fqn)),
                 self.store_context
                     .store
                     .declaration_member_rows_for_owner_for_langs_limited(
@@ -9844,6 +10270,12 @@ where
         let remaining = limit - exact.inspected;
         let normalized_persisted = self
             .store_query_or_record(
+                |sink| {
+                    sink.push(ReadKey::index(
+                        IndexFamily::DefinitionNormalizedTail,
+                        &normalized_owner,
+                    ))
+                },
                 self.store_context
                     .store
                     .declaration_member_rows_for_owner_for_langs_limited(
@@ -9888,6 +10320,7 @@ where
         }
         let rows = self
             .store_query_or_record(
+                |sink| sink.push(ReadKey::index(IndexFamily::PackageMembership, package)),
                 self.store_context
                     .store
                     .declaration_rows_by_package_for_langs(
@@ -9932,6 +10365,7 @@ where
             return Some(true);
         }
         self.store_query_or_record(
+            |sink| sink.push(ReadKey::index(IndexFamily::PackageMembership, package)),
             self.store_context.store.workspace_package_exists_for_langs(
                 &self.storage_language_keys_for_queries(),
                 self.store_context.generations.as_ref(),
@@ -9993,6 +10427,11 @@ where
             .ok()?;
         let spellings: Vec<&str> = terminal_identifiers.iter().map(String::as_str).collect();
         let rows = self.store_query_or_record(
+            |sink| {
+                for spelling in &spellings {
+                    sink.push(ReadKey::index(IndexFamily::DefinitionIdentifier, spelling));
+                }
+            },
             self.store_context
                 .store
                 .declaration_candidate_rows_by_identifiers_for_langs(
@@ -10057,6 +10496,7 @@ where
             && let Some(substring) = substring_prefilter
         {
             self.store_query_or_record(
+                |sink| sink.push(self.scope_read_key()),
                 self.store_context
                     .store
                     .declaration_candidate_rows_by_literal_substring_for_langs(
@@ -10075,6 +10515,7 @@ where
             self.full_declaration_scan_count
                 .fetch_add(1, Ordering::Relaxed);
             self.store_query_or_record(
+                |sink| sink.push(self.scope_read_key()),
                 self.store_context
                     .store
                     .declaration_candidate_rows_by_pattern_for_langs(
@@ -10223,6 +10664,7 @@ where
         let name_rows = {
             let _scope = profiling::scope("search_symbols.candidates.load_names");
             self.store_query_or_record(
+                |sink| sink.push(self.scope_read_key()),
                 self.store_context
                     .store
                     .search_candidate_name_rows_for_langs(
@@ -10257,6 +10699,7 @@ where
         let rows = {
             let _scope = profiling::scope("search_symbols.candidates.hydrate_rows");
             self.store_query_or_record(
+                |sink| sink.push(self.scope_read_key()),
                 self.store_context.store.search_candidate_rows_for_keys(
                     &langs,
                     self.store_context.generations.as_ref(),
@@ -10377,6 +10820,7 @@ where
         // qualifier here, and the snapshot fallbacks below refuse it too.
         let (storage_key, generation) = self.storage_key_and_generation(file)?;
         self.store_query_or_record(
+            |sink| sink.push(self.file_read_key(file, oid)),
             self.store_context
                 .store
                 .content_package(oid, &storage_key, generation),
@@ -10443,6 +10887,7 @@ where
             return LimitedQueryRows::incomplete(Vec::new(), 0);
         };
         let content_qualifier = self.store_query_or_record(
+            |sink| sink.push(self.file_read_key(file, oid)),
             self.store_context
                 .store
                 .content_package_limited(oid, &storage_key, generation, limit),
@@ -10465,6 +10910,7 @@ where
             return LimitedQueryRows::incomplete(Vec::new(), inspected);
         }
         let declaration_qualifier = self.store_query_or_record(
+            |sink| sink.push(self.file_read_key(file, oid)),
             self.store_context
                 .store
                 .first_declaration_content_qualifier_for_key_limited(
@@ -10534,6 +10980,7 @@ where
             return LimitedQueryRows::incomplete(Vec::new(), 0);
         };
         self.store_query_or_record(
+            |sink| sink.push(self.file_read_key(file, oid)),
             self.store_context
                 .store
                 .ruby_method_dispatch_modes_for_unit_limited(
@@ -10579,6 +11026,7 @@ where
         self.record_file_tier_access(InformationTier::Imports, file);
         let Some(imports) = self
             .store_query_or_record(
+                |sink| sink.push(self.file_read_key(file, oid)),
                 self.store_context.store.hydrate_import_infos_by_key(
                     &[(file.clone(), oid, storage_key.to_string())],
                     self.store_context.generations.as_ref(),
@@ -10650,6 +11098,7 @@ where
             return LimitedQueryRows::incomplete(Vec::new(), 0);
         };
         self.store_query_or_record(
+            |sink| sink.push(self.file_read_key(file, oid)),
             self.store_context.store.import_infos_for_key_limited(
                 oid,
                 &storage_key,
@@ -10768,6 +11217,10 @@ where
         };
         self.record_file_tier_access(InformationTier::Supertypes, file);
         self.store_query_or_record(
+            |sink| {
+                sink.push(self.file_read_key(file, oid));
+                sink.push(ReadKey::index(IndexFamily::Supertype, code_unit.fq_name()));
+            },
             self.store_context.store.raw_supertypes_for_unit_limited(
                 oid,
                 &storage_key,
@@ -10813,6 +11266,13 @@ where
             return LimitedQueryRows::incomplete(Vec::new(), 0);
         };
         self.store_query_or_record(
+            |sink| {
+                sink.push(self.file_read_key(file, oid));
+                sink.push(ReadKey::index(
+                    IndexFamily::SupertypeLookupPath,
+                    code_unit.fq_name(),
+                ));
+            },
             self.store_context
                 .store
                 .supertype_lookup_paths_for_unit_limited(
@@ -10961,6 +11421,7 @@ where
             .fetch_add(1, Ordering::Relaxed);
         let rows = self
             .store_query_or_record(
+                |sink| sink.push(ReadKey::index(IndexFamily::PackageMembership, package_name)),
                 self.store_context.store.mounted_declaration_rows_for_langs(
                     self.selected_workspace_snapshots().as_ref(),
                     &self.storage_language_keys_for_queries(),
@@ -10975,6 +11436,7 @@ where
             })
             .collect();
         self.store_query_or_record(
+            |sink| sink.push(ReadKey::index(IndexFamily::PackageMembership, package_name)),
             self.resolve_mounted_candidate_rows(rows),
             format!("hydrating class declarations in package `{package_name}`"),
         )
@@ -11056,6 +11518,7 @@ where
         };
         let aliases = self
             .store_query_or_record(
+                |sink| sink.push(self.file_read_key(file, oid)),
                 self.store_context.store.type_aliases_for_file(
                     oid,
                     &storage_key,
@@ -11092,14 +11555,25 @@ where
             .retain(key, aliases);
     }
 
-    fn enclosing_code_unit_from_cached_state(
+    /// The cached per-file enclosing-declaration index behind both the single
+    /// and the batched enclosing queries: live file states first, then the
+    /// index LRU, then one whole-file declaration-projection read. `None`
+    /// means the store holds no projection for this reading, so the caller
+    /// falls back to full hydration.
+    fn enclosing_code_unit_index(
         &self,
+        oid: Oid,
         key: &FileStateCacheKey,
-        state: &FileState,
-        range: &Range,
-    ) -> Option<CodeUnit> {
-        if state.declarations.len() < ENCLOSING_CODE_UNIT_INDEX_MIN_DECLARATIONS {
-            return enclosing_code_unit_from_state(state, range);
+        file: &ProjectFile,
+    ) -> Option<Arc<EnclosingCodeUnitIndex>> {
+        if let Some(state) = self.state.dirty_file_state(key) {
+            return Some(self.enclosing_code_unit_index_from_state(key, &state));
+        }
+        if let Some(state) = self.source_snapshot_file_state(file) {
+            return Some(self.enclosing_code_unit_index_from_state(key, &state));
+        }
+        if let Some(state) = self.query_file_state_snapshot(key) {
+            return Some(self.enclosing_code_unit_index_from_state(key, &state));
         }
         if let Some(index) = self
             .enclosing_code_unit_store
@@ -11107,15 +11581,37 @@ where
             .expect("enclosing code-unit store mutex poisoned")
             .get(key)
         {
-            return index.enclosing_code_unit(range);
+            return Some(index);
         }
-        let index = Arc::new(EnclosingCodeUnitIndex::from_file_state(state));
-        let result = index.enclosing_code_unit(range);
+        // Keep this projection separate from any single-range query: it reads
+        // only declaration identities and ranges, then the bounded index
+        // answers every requested range.
+        //
+        // See `storage_key_and_generation`: `CodeUnitIndex` consumers fan a
+        // file out to every provider, and this analyzer encloses nothing in a
+        // file it never analyzed.
+        let (storage_key, generation) = self.storage_key_and_generation(file)?;
+        let declarations = self
+            .store_query_or_record(
+                |sink| sink.push(self.file_read_key(file, oid)),
+                self.store_context.store.enclosing_declarations_for_file(
+                    oid,
+                    &storage_key,
+                    generation,
+                    self.adapter.as_ref(),
+                    file,
+                ),
+                format!("querying enclosing declarations for `{file}`"),
+            )
+            .flatten()?;
+        let index = Arc::new(EnclosingCodeUnitIndex::from_declaration_ranges(
+            declarations,
+        ));
         self.enclosing_code_unit_store
             .lock()
             .expect("enclosing code-unit store mutex poisoned")
-            .retain(key.clone(), index);
-        result
+            .retain(key.clone(), Arc::clone(&index));
+        Some(index)
     }
 
     fn enclosing_code_unit_index_from_state(
@@ -11155,47 +11651,7 @@ where
 
         let oid = self.resolve_live_oid_for_file(file)?;
         let key = Self::transient_cache_key(oid, file);
-        let index = if let Some(state) = self.state.dirty_file_state(&key) {
-            self.enclosing_code_unit_index_from_state(&key, &state)
-        } else if let Some(state) = self.source_snapshot_file_state(file) {
-            self.enclosing_code_unit_index_from_state(&key, &state)
-        } else if let Some(state) = self.query_file_state_snapshot(&key) {
-            self.enclosing_code_unit_index_from_state(&key, &state)
-        } else {
-            if let Some(index) = self
-                .enclosing_code_unit_store
-                .lock()
-                .expect("enclosing code-unit store mutex poisoned")
-                .get(&key)
-            {
-                index
-            } else {
-                // Keep this projection separate from the single-range query:
-                // it reads only declaration identities and ranges, then the
-                // existing bounded index answers every requested range.
-                let (storage_key, generation) = self.storage_key_and_generation(file)?;
-                let declarations = self
-                    .store_query_or_record(
-                        self.store_context.store.enclosing_declarations_for_file(
-                            oid,
-                            &storage_key,
-                            generation,
-                            self.adapter.as_ref(),
-                            file,
-                        ),
-                        format!("querying enclosing declarations for `{file}`"),
-                    )
-                    .flatten()?;
-                let index = Arc::new(EnclosingCodeUnitIndex::from_declaration_ranges(
-                    declarations,
-                ));
-                self.enclosing_code_unit_store
-                    .lock()
-                    .expect("enclosing code-unit store mutex poisoned")
-                    .retain(key, Arc::clone(&index));
-                index
-            }
-        };
+        let index = self.enclosing_code_unit_index(oid, &key, file)?;
 
         Some(
             ranges
@@ -11262,6 +11718,7 @@ where
             return LimitedQueryRows::incomplete(Vec::new(), 0);
         };
         self.store_query_or_record(
+            |sink| sink.push(self.file_read_key(file, oid)),
             self.store_context.store.signatures_for_unit_limited(
                 oid,
                 &storage_key,
@@ -11322,6 +11779,7 @@ where
             return LimitedQueryRows::incomplete(Vec::new(), 0);
         };
         self.store_query_or_record(
+            |sink| sink.push(self.file_read_key(file, oid)),
             self.store_context
                 .store
                 .signature_metadata_for_unit_limited(
@@ -11375,6 +11833,7 @@ where
             return LimitedQueryRows::incomplete(Vec::new(), 0);
         };
         self.store_query_or_record(
+            |sink| sink.push(self.file_read_key(file, oid)),
             self.store_context.store.ranges_for_unit_limited(
                 oid,
                 &storage_key,
@@ -11515,11 +11974,22 @@ where
         }
     }
 
+    /// Route one analyzer-side store read through the request boundary: name
+    /// the inputs it reads on every open read ledger, then record any failure.
+    ///
+    /// `reads` is a closure, not a key, so a run with no ledger attached never
+    /// builds one. Every store call this analyzer makes goes through here and
+    /// names its inputs; a store read that could not name them would record an
+    /// unattributed read on the request context instead, and no such read
+    /// exists today, which is what makes "the ledger saw every store read" a
+    /// checked property rather than a claim.
     fn store_query_or_record<T>(
         &self,
+        reads: impl FnOnce(&mut ReadKeySink<'_>),
         result: std::result::Result<T, StoreError>,
         operation: impl std::fmt::Display,
     ) -> Option<T> {
+        self.record_reads(reads);
         match result {
             Ok(value) => Some(value),
             Err(error) => {
@@ -11631,7 +12101,7 @@ fn unit_matches_relational_request<A: LanguageAdapter>(
 fn merge_dirty_relational_value<A: LanguageAdapter>(
     adapter: &A,
     request: &RelationalDefinitionRequest,
-    dirty_states: &[FileState],
+    dirty_states: &[Arc<FileState>],
     dirty_paths: &HashSet<ProjectFile>,
     value: &mut RelationalDefinitionValue,
 ) {
@@ -11771,6 +12241,11 @@ where
         // relational rows have been hydrated but before committing the read
         // transaction, so a complete result has one snapshot boundary.
         let (dirty_states, dirty_paths) = self.authoritative_file_states_for_queries();
+        self.record_reads(|sink| {
+            for request in &unique {
+                push_relational_request_reads(self, request, sink);
+            }
+        });
         let values = if unique.is_empty() {
             Vec::new()
         } else {
@@ -11829,6 +12304,60 @@ where
     }
 }
 
+/// Record the inputs one relational definition question reads.
+///
+/// The family is the index the store probes to answer it. A members question
+/// probes two: the owner by exact name and the member by identifier, so it
+/// records both rather than folding one spelling under the other's family.
+///
+/// Two questions read the name index by *prefix* rather than by an exact key
+/// -- an identifier prefix range, and the structural-children walk whose name
+/// subject may be empty -- and an exact-key membership test can verify
+/// neither, so those record the whole-language scope instead of an `Index` key
+/// that would look precise and verify unsoundly.
+fn push_relational_request_reads<A: LanguageAdapter>(
+    analyzer: &TreeSitterAnalyzer<A>,
+    request: &RelationalDefinitionRequest,
+    sink: &mut ReadKeySink<'_>,
+) {
+    let name = request
+        .name
+        .full_name()
+        .display(crate::analyzer::fq_name::segment_interner());
+    match &request.query {
+        RelationalDefinitionQuery::ExactName | RelationalDefinitionQuery::CallableFacts => {
+            sink.push(ReadKey::index(IndexFamily::DefinitionExact, name));
+        }
+        RelationalDefinitionQuery::NormalizedName => {
+            sink.push(ReadKey::index(IndexFamily::DefinitionNormalizedTail, name));
+        }
+        RelationalDefinitionQuery::Identifier { .. } => {
+            sink.push(ReadKey::index(IndexFamily::DefinitionIdentifier, name));
+        }
+        RelationalDefinitionQuery::StructuralMembers { identifier }
+        | RelationalDefinitionQuery::VisibleMembers { identifier } => {
+            sink.push(ReadKey::index(IndexFamily::DefinitionExact, name));
+            sink.push(ReadKey::index(
+                IndexFamily::DefinitionIdentifier,
+                identifier,
+            ));
+        }
+        RelationalDefinitionQuery::PackageTypes { simple_name } => {
+            sink.push(ReadKey::index(IndexFamily::PackageMembership, name));
+            sink.push(ReadKey::index(
+                IndexFamily::DefinitionIdentifier,
+                simple_name,
+            ));
+        }
+        RelationalDefinitionQuery::PackageTypesInPackage
+        | RelationalDefinitionQuery::PackageRelation(_) => {
+            sink.push(ReadKey::index(IndexFamily::PackageMembership, name));
+        }
+        RelationalDefinitionQuery::IdentifierPrefix { .. }
+        | RelationalDefinitionQuery::StructuralChildren => sink.push(analyzer.scope_read_key()),
+    }
+}
+
 impl<A> crate::analyzer::CodeUnitIndex for TreeSitterAnalyzer<A>
 where
     A: LanguageAdapter,
@@ -11870,40 +12399,17 @@ where
 
         let oid = self.resolve_live_oid_for_file(file)?;
         let key = Self::transient_cache_key(oid, file);
-        if let Some(state) = self.state.dirty_file_state(&key) {
-            return enclosing_code_unit_from_state(&state, range);
-        }
-        if let Some(state) = self.source_snapshot_file_state(file) {
-            return self.enclosing_code_unit_from_cached_state(&key, &state, range);
-        }
-        if let Some(state) = self.query_file_state_snapshot(&key) {
-            return self.enclosing_code_unit_from_cached_state(&key, &state, range);
-        }
-
-        // See `storage_key_and_generation`: `CodeUnitIndex` consumers fan a file
-        // out to every provider, and this analyzer encloses nothing in a file
-        // it never analyzed.
-        let (storage_key, generation) = self.storage_key_and_generation(file)?;
-        if let Some(candidates) = self
-            .store_query_or_record(
-                self.store_context.store.enclosing_declarations_for_range(
-                    oid,
-                    &storage_key,
-                    generation,
-                    self.adapter.as_ref(),
-                    file,
-                    range,
-                ),
-                format!("querying enclosing declarations for `{file}`"),
-            )
-            .flatten()
-            .filter(|candidates| !candidates.is_empty())
+        // One bounded per-file index answers every range in this file. Usage
+        // scans ask for the enclosing declaration of hundreds of occurrence
+        // sites per file; a per-range store query here turned each site into
+        // its own SQL round trip (54,890 point queries in one exposed-kotlin
+        // `scan_usages` request), while the batched
+        // `enclosing_code_units_for_ranges` path already built and cached this
+        // exact index from one declaration-projection read.
+        if let Some(index) = self.enclosing_code_unit_index(oid, &key, file)
+            && let Some(unit) = index.enclosing_code_unit(range)
         {
-            return select_enclosing_code_unit(
-                candidates
-                    .into_iter()
-                    .map(|(code_unit, candidate_range)| (candidate_range, code_unit)),
-            );
+            return Some(unit);
         }
 
         self.fetch_file_state(file)
@@ -11983,6 +12489,7 @@ where
         let source = self.source_for_oid(file, oid)?;
         let mut projection = self
             .store_query_or_record(
+                |sink| sink.push(self.file_read_key(file, oid)),
                 self.store_context.store.summary_file_projection(
                     oid,
                     storage_key,
@@ -12014,7 +12521,7 @@ where
     }
 
     fn indexed_source_matches(&self, file: &ProjectFile, source: &str) -> bool {
-        let Some(indexed_oid) = self.live_snapshot().oid_for_path(file) else {
+        let Some(indexed_oid) = self.indexed_live_snapshot.oid_for_path(file) else {
             return false;
         };
         Oid::hash_object(ObjectType::Blob, source.as_bytes()).ok() == Some(indexed_oid)
@@ -12030,6 +12537,7 @@ where
             self.retry_dirty_file_state(&key, storage_key).is_some()
                 || self
                     .store_query_or_record(
+                        |sink| sink.push(self.file_read_key(file, oid)),
                         self.store_context.store.contains_parsed_blob_at_generation(
                             oid,
                             storage_key,
@@ -12095,6 +12603,11 @@ where
             .collect::<Vec<_>>();
         let present = self
             .store_query_or_record(
+                |sink| {
+                    for (candidate, oid, _) in &persisted_candidates {
+                        sink.push(self.file_read_key(candidate, *oid));
+                    }
+                },
                 self.store_context.store.parsed_blob_keys_at_generations(
                     &keys,
                     self.store_context.generations.as_ref(),
@@ -12190,6 +12703,22 @@ where
             }
         };
         Box::new(definitions.into_iter())
+    }
+
+    /// Seek the terminal identifier, then compare whole names.
+    ///
+    /// The persisted `exact_fqn` column cannot answer this: an anchored
+    /// identity stores only its tail plus the anchor, and the rendered name
+    /// is reassembled from the declaring file at hydration time. The
+    /// identifier index is the one the store keys on a segment the name
+    /// carries verbatim, and it narrows a workspace scan to the declarations
+    /// that can possibly match.
+    fn declarations_sharing_name(&self, unit: &CodeUnit) -> Vec<CodeUnit> {
+        let fq_name = unit.fq_name();
+        self.lookup_declarations_by_identifier(unit.identifier())
+            .into_iter()
+            .filter(|candidate| candidate.fq_name() == fq_name)
+            .collect()
     }
 
     fn direct_children(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
@@ -12291,10 +12820,18 @@ where
             return BTreeSet::new();
         }
         let mut ranges = if code_unit.is_function() {
+            // A function's source merges every same-file definition that
+            // renders the same fq name (overload groups, split definitions).
+            // Those siblings all live in the file's own declaration state, so
+            // read them there: a global definitions() name lookup resolves
+            // arbitrary spellings through per-component rendered seeks, which
+            // costs a multiple of this file-scoped read and adds nothing when
+            // the request is a stored unit's own rendering.
             let _scope = profiling::scope("TreeSitterAnalyzer::get_sources::definitions");
+            let fq_name = code_unit.fq_name();
             let mut grouped = Vec::new();
-            for candidate in self.definitions(&code_unit.fq_name()) {
-                if candidate.source() == code_unit.source() {
+            for candidate in self.declarations(code_unit.source()) {
+                if candidate.is_function() && candidate.fq_name() == fq_name {
                     grouped.extend(self.ranges(&candidate));
                 }
             }
@@ -12371,9 +12908,33 @@ where
         self
     }
 
+    fn claimed_files(&self) -> Vec<ProjectFile> {
+        if !self.adapter.claims_included_files() {
+            return Vec::new();
+        }
+        self.store_context
+            .live_paths
+            .files()
+            .into_iter()
+            .filter(|file| {
+                crate::analyzer::common::language_for_file(file) != self.adapter.language()
+            })
+            .collect()
+    }
+
     fn invalidate_cached_file_identities(&self) {
         if let Some(liveness) = self.store_context.liveness.as_ref() {
             liveness.invalidate_startup_oids();
+        }
+    }
+
+    fn invalidate_cached_file_identities_for(&self, changed_files: &BTreeSet<ProjectFile>) {
+        if let Some(liveness) = self.store_context.liveness.as_ref() {
+            liveness
+                .invalidate_startup_oids_for_files(changed_files)
+                .unwrap_or_else(|error| {
+                    panic!("failed to invalidate changed file identities: {error}")
+                });
         }
     }
 
@@ -12387,7 +12948,10 @@ where
     fn begin_query(&self, context: &Arc<crate::analyzer::AnalyzerQueryContext>) {
         let mut cache = self.query_read_cache_write();
         let was_active = cache.is_active();
-        cache.begin(context);
+        let registered = cache.begin(context);
+        if registered && context.read_ledger().is_some() {
+            self.attached_read_ledgers.fetch_add(1, Ordering::Relaxed);
+        }
         if !was_active {
             self.live_source_snapshot.store(None);
             self.query_file_state_snapshot.store(None);
@@ -12397,11 +12961,23 @@ where
     fn end_query(&self, context: &Arc<crate::analyzer::AnalyzerQueryContext>) {
         let mut cache = self.query_read_cache_write();
         let was_active = cache.is_active();
-        cache.end(context);
+        let retired = cache.end(context);
+        if retired && context.read_ledger().is_some() {
+            let before = self.attached_read_ledgers.fetch_sub(1, Ordering::Relaxed);
+            debug_assert!(before > 0, "an attached read ledger was retired twice");
+        }
         if was_active && !cache.is_active() {
             self.live_source_snapshot.store(None);
             self.query_file_state_snapshot.store(None);
         }
+    }
+
+    fn record_read(&self, key: crate::analyzer::read_ledger::ReadKey) {
+        TreeSitterAnalyzer::record_read_key(self, key);
+    }
+
+    fn read_ledger_attached(&self) -> bool {
+        TreeSitterAnalyzer::read_ledger_attached(self)
     }
 
     fn active_query_cancellation(&self) -> Option<CancellationToken> {
@@ -12430,6 +13006,10 @@ where
 
     fn workspace_file_index_cell(&self) -> Option<crate::analyzer::WorkspaceFileIndexCell> {
         self.query_read_cache_lock().workspace_file_index_cell()
+    }
+
+    fn definition_lookup_memo(&self) -> Option<Arc<crate::analyzer::DefinitionLookupMemo>> {
+        self.active_query_cache_handle(|cache| &cache.definition_lookup)
     }
 
     fn record_query_failure(&self, error: StoreError) {
@@ -12474,7 +13054,11 @@ where
         }
 
         let mut store_context = self.store_context.clone();
-        store_context.live_paths = Arc::new(self.store_context.live_paths.fork());
+        store_context.live_paths = Arc::new(
+            self.store_context
+                .live_paths
+                .fork_from_snapshot(Arc::clone(&self.indexed_live_snapshot)),
+        );
         let mut relational_workspace_snapshots =
             self.selected_workspace_snapshots().as_ref().clone();
         let mut to_update = Vec::new();
@@ -12600,7 +13184,11 @@ where
 
     fn update_all(&self) -> Self {
         let mut store_context = self.store_context.clone();
-        store_context.live_paths = Arc::new(self.store_context.live_paths.fork());
+        store_context.live_paths = Arc::new(
+            self.store_context
+                .live_paths
+                .fork_from_snapshot(Arc::clone(&self.indexed_live_snapshot)),
+        );
         store_context.workspace_snapshot = WorkspaceBuildSnapshot::capture(
             self.project.as_ref(),
             store_context.liveness.as_deref(),
@@ -12701,6 +13289,12 @@ where
                 self.language_content_identity(),
             )]),
         )
+    }
+
+    fn workspace_fact_indexes(
+        &self,
+    ) -> Vec<&dyn crate::analyzer::read_verification::WorkspaceFactIndex> {
+        vec![self]
     }
 
     fn is_access_expression(
@@ -12995,6 +13589,146 @@ pub(crate) fn enclosing_code_unit_from_declaration_ranges(
             .find(|candidate| candidate.contains(range))?;
         Some((best_range, code_unit))
     }))
+}
+
+/// The producer side of the read ledger's per-file keys for this language.
+///
+/// Every key here is produced by the same code the publish path runs, never by
+/// a second interpretation of a name: `PreparedParsedBlob::index_keys` reads
+/// the rows `write_prepared_blob_rows_tx` writes, the supertype keys are the
+/// declarations the file state actually recorded supertypes for,
+/// `path_symbol_row` mints the path-symbol row the workspace projection
+/// persists, and the package names come from `workspace_snapshot_relations`
+/// over this blob's own content-package facts. A key spelled any other way
+/// would not match the probe that reads it, and verification would pass a
+/// changed input.
+impl<A: LanguageAdapter> crate::analyzer::read_verification::WorkspaceFactIndex
+    for TreeSitterAnalyzer<A>
+{
+    fn fact_index_language(&self) -> Language {
+        self.adapter.language()
+    }
+
+    fn analyzed_blobs(&self) -> Vec<(ProjectFile, Oid)> {
+        self.analyzed_live_files()
+            .into_iter()
+            .filter_map(|file| {
+                let oid = self.resolve_live_oid_for_file(&file)?;
+                Some((file, oid))
+            })
+            .collect()
+    }
+
+    fn blob_index_keys(
+        &self,
+        file: &ProjectFile,
+        blob: Oid,
+    ) -> Option<Vec<(crate::analyzer::read_ledger::IndexFamily, Box<[u8]>)>> {
+        let state = self.fetch_file_state(file)?;
+        self.index_keys_of_state(file, blob, state)
+    }
+
+    fn stored_blob_index_keys(
+        &self,
+        file: &ProjectFile,
+        blob: Oid,
+        source: &str,
+    ) -> Option<Vec<(crate::analyzer::read_ledger::IndexFamily, Box<[u8]>)>> {
+        let storage_key = self.adapter.storage_language_key_for_file(file);
+        let generation = self.store_context.generations.get(storage_key).copied()?;
+        let state = self
+            .store_context
+            .store
+            .hydrate_file_state_with_source(
+                blob,
+                storage_key,
+                generation,
+                self.adapter.as_ref(),
+                file,
+                source,
+            )
+            .ok()??;
+        self.index_keys_of_state(file, blob, Arc::new(state))
+    }
+}
+
+/// The producer half of [`WorkspaceFactIndex`], shared by the mounted and the
+/// store-fed enumerations so that one blob has one key set however it was
+/// reached.
+impl<A: LanguageAdapter> TreeSitterAnalyzer<A> {
+    fn index_keys_of_state(
+        &self,
+        file: &ProjectFile,
+        blob: Oid,
+        state: Arc<FileState>,
+    ) -> Option<Vec<(crate::analyzer::read_ledger::IndexFamily, Box<[u8]>)>> {
+        use crate::analyzer::read_ledger::IndexFamily;
+
+        let storage_key = self.adapter.storage_language_key_for_file(file);
+        let generation = self.store_context.generations.get(storage_key).copied()?;
+        let prepared = crate::analyzer::store::AnalyzerStore::prepare_parsed_blob(
+            blob,
+            storage_key,
+            generation,
+            self.adapter.as_ref(),
+            Arc::clone(&state),
+        )
+        .ok()?;
+
+        let mut keys = Vec::new();
+        prepared.index_keys(self.adapter.as_ref(), &mut |family, key| {
+            keys.push((family, Box::from(key)))
+        });
+        for unit in state.raw_supertypes.keys() {
+            keys.push((IndexFamily::Supertype, Box::from(unit.fq_name().as_bytes())));
+        }
+        for unit in state.supertype_lookup_paths.keys() {
+            keys.push((
+                IndexFamily::SupertypeLookupPath,
+                Box::from(unit.fq_name().as_bytes()),
+            ));
+        }
+        let path_symbol = Self::path_symbol_row(&self.adapter, file, blob);
+        if let Some(row) = &path_symbol {
+            keys.push((IndexFamily::PathSymbol, Box::from(row.exact_fqn.as_bytes())));
+            keys.push((
+                IndexFamily::PathSymbol,
+                Box::from(row.normalized_fqn.as_bytes()),
+            ));
+        }
+        let facts = self
+            .store_context
+            .store
+            .workspace_content_package_facts(
+                storage_key,
+                generation,
+                &[blob],
+                self.adapter.workspace_file_package_anchor(),
+            )
+            .ok()?;
+        if !facts.complete {
+            return None;
+        }
+        let entry = (
+            file.clone(),
+            WorkspaceFileRow {
+                rel_path: crate::path_utils::rel_path_string(file),
+                blob_oid: blob,
+            },
+            path_symbol,
+        );
+        let (packages, _, _, _) =
+            Self::workspace_snapshot_relations(&self.adapter, &[entry], &facts.facts).ok()?;
+        for package in packages {
+            keys.push((
+                IndexFamily::PackageMembership,
+                Box::from(package.as_bytes()),
+            ));
+        }
+        keys.sort();
+        keys.dedup();
+        Some(keys)
+    }
 }
 
 #[cfg(test)]
@@ -13725,21 +14459,14 @@ mod tests {
         }
     }
 
-    #[derive(Default)]
-    struct OidRendezvousState {
-        arrivals: usize,
-    }
-
+    /// Records the thread each overlay OID read is billed to.
     #[derive(Clone)]
-    struct RendezvousOverlayProject {
+    struct OverlayReadThreadProject {
         delegate: TestProject,
-        calls: Arc<AtomicUsize>,
-        rendezvous: Arc<(Mutex<OidRendezvousState>, Condvar)>,
-        timed_out: Arc<std::sync::atomic::AtomicBool>,
-        fail_reads: bool,
+        read_threads: Arc<Mutex<Vec<String>>>,
     }
 
-    impl Project for RendezvousOverlayProject {
+    impl Project for OverlayReadThreadProject {
         fn root(&self) -> &Path {
             self.delegate.root()
         }
@@ -13761,35 +14488,55 @@ mod tests {
         }
 
         fn read_source(&self, file: &ProjectFile) -> std::io::Result<String> {
-            let call = self.calls.fetch_add(1, Ordering::SeqCst);
-            if call < 2 {
-                let (state, wake) = &*self.rendezvous;
-                let mut state = state.lock().expect("OID rendezvous mutex poisoned");
-                state.arrivals += 1;
-                wake.notify_all();
-                if state.arrivals < 2 {
-                    let (new_state, timeout) = wake
-                        .wait_timeout_while(state, Duration::from_secs(5), |state| {
-                            state.arrivals < 2
-                        })
-                        .expect("OID rendezvous mutex poisoned");
-                    state = new_state;
-                    if timeout.timed_out() && state.arrivals < 2 {
-                        self.timed_out.store(true, Ordering::SeqCst);
-                        wake.notify_all();
-                    }
-                }
-            }
-            if self.fail_reads {
-                if file.rel_path() == Path::new("src/First.java") {
-                    std::thread::sleep(Duration::from_millis(50));
-                }
-                return Err(std::io::Error::other(format!(
-                    "{} overlay OID failure",
-                    file.rel_path().display()
-                )));
-            }
+            self.read_threads
+                .lock()
+                .expect("overlay read thread log poisoned")
+                .push(
+                    std::thread::current()
+                        .name()
+                        .unwrap_or("<unnamed>")
+                        .to_string(),
+                );
             self.delegate.read_source(file)
+        }
+
+        fn has_overlay(&self, _file: &ProjectFile) -> bool {
+            true
+        }
+    }
+
+    /// Every overlay OID read fails, naming the file that failed.
+    #[derive(Clone)]
+    struct FailingOverlayProject {
+        delegate: TestProject,
+    }
+
+    impl Project for FailingOverlayProject {
+        fn root(&self) -> &Path {
+            self.delegate.root()
+        }
+
+        fn analyzer_languages(&self) -> BTreeSet<Language> {
+            self.delegate.analyzer_languages()
+        }
+
+        fn all_files(&self) -> std::io::Result<BTreeSet<ProjectFile>> {
+            self.delegate.all_files()
+        }
+
+        fn analyzable_files(&self, language: Language) -> std::io::Result<BTreeSet<ProjectFile>> {
+            self.delegate.analyzable_files(language)
+        }
+
+        fn file_by_rel_path(&self, rel_path: &Path) -> Option<ProjectFile> {
+            self.delegate.file_by_rel_path(rel_path)
+        }
+
+        fn read_source(&self, file: &ProjectFile) -> std::io::Result<String> {
+            Err(std::io::Error::other(format!(
+                "{} overlay OID failure",
+                file.rel_path().display()
+            )))
         }
 
         fn has_overlay(&self, _file: &ProjectFile) -> bool {
@@ -13841,54 +14588,62 @@ mod tests {
         }
     }
 
+    /// The multi-file hashing burst runs on the process-shared dedicated build
+    /// pool, so it is billed neither to the calling thread nor to a global-pool
+    /// worker that an interactive request would otherwise be waiting for
+    /// (#2115). The pool's width is a process setting, so the burst's own
+    /// concurrency is not something one `AnalyzerConfig` can assert; that it
+    /// runs off the caller and off the global pool is.
     #[test]
-    fn live_oid_resolution_hashes_two_overlays_concurrently() {
+    fn live_oid_resolution_hashes_overlays_on_the_dedicated_build_pool() {
         let temp = tempfile::tempdir().expect("temp dir");
         let root = temp.path().canonicalize().expect("canonical temp dir");
         let first = temp_file(&root, "src/First.java");
-        first
-            .write("package demo; class First {}\n")
-            .expect("first Java source");
+        let first_source = "package demo; class First {}\n";
+        first.write(first_source).expect("first Java source");
         let second = temp_file(&root, "src/Second.java");
-        second
-            .write("package demo; class Second {}\n")
-            .expect("second Java source");
+        let second_source = "package demo; class Second {}\n";
+        second.write(second_source).expect("second Java source");
 
-        let timed_out = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let project: Arc<dyn Project> = Arc::new(RendezvousOverlayProject {
+        let read_threads = Arc::new(Mutex::new(Vec::new()));
+        let project = OverlayReadThreadProject {
             delegate: TestProject::new(&root, Language::Java),
-            calls: Arc::new(AtomicUsize::new(0)),
-            rendezvous: Arc::new((Mutex::new(OidRendezvousState::default()), Condvar::new())),
-            timed_out: Arc::clone(&timed_out),
-            fail_reads: false,
-        });
+            read_threads: Arc::clone(&read_threads),
+        };
+        let store_context = ephemeral_store_context(&project).unwrap();
 
-        let analyzer = TreeSitterAnalyzer::new_with_config(
-            project,
-            JavaAdapter,
-            AnalyzerConfig {
-                parallelism: Some(2),
-                ..AnalyzerConfig::default()
-            },
-        );
+        let resolved = TreeSitterAnalyzer::<JavaAdapter>::resolve_live_oids(
+            &project,
+            &[first.clone(), second.clone()],
+            &store_context,
+            true,
+        )
+        .expect("both overlay identities resolve");
 
-        assert!(
-            !timed_out.load(Ordering::SeqCst),
-            "both overlay OID reads should rendezvous before the deadlock guard releases either one"
-        );
-        for (file, expected) in [(&first, "First"), (&second, "Second")] {
-            assert!(
-                analyzer
-                    .get_declarations(file)
-                    .iter()
-                    .any(|declaration| declaration.short_name() == expected),
-                "real reconcile should retain the {expected} declaration"
-            );
+        for (file, source) in [(&first, first_source), (&second, second_source)] {
+            let expected =
+                Oid::hash_object(ObjectType::Blob, source.as_bytes()).expect("overlay OID");
+            assert_eq!(resolved.get(file), Some(&expected));
         }
+
+        let read_threads = read_threads.lock().expect("read thread log poisoned");
+        assert_eq!(
+            read_threads.len(),
+            2,
+            "both overlays hashed: {read_threads:?}"
+        );
+        assert!(
+            read_threads
+                .iter()
+                .all(|name| name.starts_with("bifrost-index-build-")),
+            "overlay hashing escaped the dedicated build pool: {read_threads:?}"
+        );
     }
 
+    /// A failed plan reports the first *input's* error, not the first error the
+    /// burst happened to produce, so the same edit always reports the same file.
     #[test]
-    fn live_oid_resolution_reports_first_input_error_after_parallel_planning() {
+    fn live_oid_resolution_reports_the_first_input_error() {
         let temp = tempfile::tempdir().expect("temp dir");
         let root = temp.path().canonicalize().expect("canonical temp dir");
         let first = temp_file(&root, "src/First.java");
@@ -13897,32 +14652,19 @@ mod tests {
         let second = temp_file(&root, "src/Second.java");
         second.write("second\n").expect("second source");
 
-        let timed_out = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let project = RendezvousOverlayProject {
+        let project = FailingOverlayProject {
             delegate: TestProject::new(&root, Language::Java),
-            calls: Arc::new(AtomicUsize::new(0)),
-            rendezvous: Arc::new((Mutex::new(OidRendezvousState::default()), Condvar::new())),
-            timed_out: Arc::clone(&timed_out),
-            fail_reads: true,
         };
         let store_context = ephemeral_store_context(&project).unwrap();
 
         let error = TreeSitterAnalyzer::<JavaAdapter>::resolve_live_oids(
             &project,
             &[first, second],
-            &AnalyzerConfig {
-                parallelism: Some(2),
-                ..AnalyzerConfig::default()
-            },
             &store_context,
             true,
         )
         .expect_err("both overlay reads fail");
 
-        assert!(
-            !timed_out.load(Ordering::SeqCst),
-            "the error-order test should exercise concurrent planning"
-        );
         assert_eq!(error, expected_first_error);
     }
 
@@ -13939,15 +14681,10 @@ mod tests {
         store_context
             .live_paths
             .refresh([LivePathEntry::overlay(file.clone(), oid)]);
-        let config = AnalyzerConfig {
-            parallelism: Some(2),
-            ..AnalyzerConfig::default()
-        };
 
         let refreshed = TreeSitterAnalyzer::<JavaAdapter>::resolve_live_oids(
             &project,
             &[],
-            &config,
             &store_context,
             false,
         )
@@ -13961,7 +14698,6 @@ mod tests {
         let replaced = TreeSitterAnalyzer::<JavaAdapter>::resolve_live_oids(
             &project,
             &[],
-            &config,
             &store_context,
             true,
         )
@@ -13971,6 +14707,76 @@ mod tests {
             store_context.live_paths.snapshot().oid_for_path(&file),
             None
         );
+    }
+
+    #[test]
+    fn indexed_source_match_is_anchored_to_the_analyzer_generation() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        let file = temp_file(&root, "src/Widget.java");
+        let indexed = "package demo; class Widget {}\n";
+        let later = "package demo; class Widget { void later() {} }\n";
+        file.write(indexed).expect("indexed Java source");
+        let project: Arc<dyn Project> = Arc::new(TestProject::new(&root, Language::Java));
+        let analyzer = TreeSitterAnalyzer::new(project, JavaAdapter);
+        assert!(analyzer.indexed_source_matches(&file, indexed));
+        let indexed_identity = analyzer.language_content_identity();
+
+        file.write(later).expect("later Java source");
+        let stale_query = analyzer.clone();
+        stale_query
+            .fetch_file_state_from_current_source(&file)
+            .expect("stale query observes and parses the later source");
+        let later_oid = Oid::hash_object(ObjectType::Blob, later.as_bytes()).expect("later OID");
+        assert_eq!(
+            analyzer.live_snapshot().oid_for_path(&file),
+            Some(later_oid),
+            "the query must exercise a refresh of the shared live projection"
+        );
+        assert!(analyzer.indexed_source_matches(&file, indexed));
+        assert!(
+            !analyzer.indexed_source_matches(&file, later),
+            "a refreshed live projection must not redefine what this generation indexed"
+        );
+        assert_eq!(
+            analyzer.language_content_identity(),
+            indexed_identity,
+            "query hydration must not move the analyzer generation's cache identity"
+        );
+    }
+
+    #[test]
+    fn incremental_update_retains_unmodified_identity_from_the_prior_generation() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        let first = temp_file(&root, "src/First.java");
+        let second = temp_file(&root, "src/Second.java");
+        let first_indexed = "package demo; class First {}\n";
+        let first_later = "package demo; class First { void later() {} }\n";
+        let second_indexed = "package demo; class Second {}\n";
+        let second_later = "package demo; class Second { void later() {} }\n";
+        first.write(first_indexed).expect("indexed first source");
+        second.write(second_indexed).expect("indexed second source");
+        let project: Arc<dyn Project> = Arc::new(TestProject::new(&root, Language::Java));
+        let analyzer = TreeSitterAnalyzer::new(project, JavaAdapter);
+
+        second.write(second_later).expect("later second source");
+        analyzer
+            .clone()
+            .fetch_file_state_from_current_source(&second)
+            .expect("stale query observes the later second source");
+        first.write(first_later).expect("later first source");
+
+        let updated = analyzer.update(&BTreeSet::from([first.clone()]));
+        assert!(updated.indexed_source_matches(&first, first_later));
+        assert!(updated.indexed_source_matches(&second, second_indexed));
+        assert!(
+            !updated.indexed_source_matches(&second, second_later),
+            "updating another file must not bless a stale query's observation as indexed"
+        );
+
+        let fully_updated = updated.update(&BTreeSet::from([second.clone()]));
+        assert!(fully_updated.indexed_source_matches(&second, second_later));
     }
 
     #[test]
@@ -14006,7 +14812,6 @@ mod tests {
         let resolved = TreeSitterAnalyzer::<JavaAdapter>::resolve_live_oids(
             &project,
             &[first.clone(), second.clone()],
-            &AnalyzerConfig::default(),
             &store_context,
             true,
         )
@@ -14053,7 +14858,6 @@ mod tests {
         let _ = TreeSitterAnalyzer::<JavaAdapter>::resolve_live_oids(
             &project,
             &[only],
-            &AnalyzerConfig::default(),
             &store_context,
             true,
         );
@@ -14451,6 +15255,64 @@ mod tests {
 
     fn temp_file(root: &Path, rel_path: &str) -> ProjectFile {
         ProjectFile::new(root.to_path_buf(), rel_path)
+    }
+
+    /// #2883: only an open buffer can override a persisted row, so the
+    /// authoritative read walks the live snapshot's overlay set instead of
+    /// every cached file state. The buffer's declaration must still win, and
+    /// the walk must materialize that one state -- with no buffer open it must
+    /// materialize none at all, however many states the analyzer has cached.
+    #[test]
+    fn authoritative_reads_cost_the_open_buffers_not_the_cached_file_states() {
+        const FILE_COUNT: usize = 8;
+
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        let files = (0..FILE_COUNT)
+            .map(|index| {
+                let file = temp_file(&root, &format!("src/file{index}.rs"));
+                file.write(format!("pub fn disk_{index}() {{}}\n"))
+                    .expect("rust source");
+                file
+            })
+            .collect::<Vec<_>>();
+        let base: Arc<dyn Project> = Arc::new(TestProject::new(root, Language::Rust));
+        let overlay = Arc::new(OverlayProject::new(base));
+        let analyzer =
+            TreeSitterAnalyzer::new(Arc::clone(&overlay) as Arc<dyn Project>, RustAdapter);
+        for file in &files {
+            analyzer.fetch_file_state(file).expect("warm file state");
+        }
+
+        analyzer.reset_authoritative_file_state_reads_for_test();
+        let on_disk = analyzer.get_all_declarations();
+        assert!(
+            !on_disk
+                .iter()
+                .any(|unit| unit.fq_name().ends_with("buffer_only")),
+            "the fixture declares this name only in the buffer: {on_disk:?}"
+        );
+        assert_eq!(
+            analyzer.authoritative_file_state_reads_for_test(),
+            0,
+            "with no buffer open a read must materialize none of the {FILE_COUNT} cached states"
+        );
+
+        assert!(overlay.set(files[0].abs_path(), "pub fn buffer_only() {}\n".to_owned()));
+        analyzer.reset_authoritative_file_state_reads_for_test();
+        let with_buffer = analyzer.get_all_declarations();
+
+        assert!(
+            with_buffer
+                .iter()
+                .any(|unit| unit.fq_name().ends_with("buffer_only") && unit.source() == &files[0]),
+            "the open buffer's declaration must override the disk row: {with_buffer:?}"
+        );
+        assert_eq!(
+            analyzer.authoritative_file_state_reads_for_test(),
+            1,
+            "one open buffer is one materialized file state"
+        );
     }
 
     #[test]
@@ -15834,6 +16696,7 @@ mod tests {
         assert_eq!(state.ranges.get(module).map(Vec::len), Some(1));
     }
 
+    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
     #[test]
     fn type_alias_projection_avoids_full_file_hydration() {
         let temp = tempfile::tempdir().expect("temp dir");
@@ -15865,6 +16728,7 @@ mod tests {
         );
     }
 
+    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
     #[test]
     fn signature_projection_avoids_full_file_hydration() {
         let temp = tempfile::tempdir().expect("temp dir");
@@ -15905,6 +16769,7 @@ mod tests {
         );
     }
 
+    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
     #[test]
     fn enclosing_declaration_projection_avoids_full_file_hydration() {
         let temp = tempfile::tempdir().expect("temp dir");
@@ -15949,6 +16814,48 @@ mod tests {
         );
     }
 
+    #[test]
+    fn file_source_avoids_full_file_hydration() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        std::fs::create_dir_all(root.join("src")).expect("source directory");
+        let files: Vec<_> = (0..=SOURCE_SNAPSHOT_FILE_STATE_INDEX_CAPACITY)
+            .map(|index| {
+                let file = temp_file(&root, &format!("src/file{index}.rs"));
+                file.write(format!("pub fn declared{index}() {{}}\n"))
+                    .expect("write Rust source");
+                file
+            })
+            .collect();
+
+        let project: Arc<dyn Project> = Arc::new(TestProject::new(root, Language::Rust));
+        let analyzer = TreeSitterAnalyzer::new(project, RustAdapter);
+        analyzer.get_all_declarations();
+        let outside = files
+            .iter()
+            .find(|file| analyzer.source_snapshot_file_state(file).is_none())
+            .cloned()
+            .expect("analyzed file outside the source snapshot index");
+        // A structural seed scan asks every analyzed file for its source, long
+        // after the build's own file states have turned over. Drop them so the
+        // read below has only the blob or a full hydration to answer from.
+        analyzer
+            .transient_file_states
+            .lock()
+            .expect("transient file-state cache mutex poisoned")
+            .clear();
+        analyzer.reset_full_hydration_count_for_test();
+
+        let expected = std::fs::read_to_string(outside.abs_path()).expect("Rust source");
+        assert_eq!(analyzer.file_source(&outside).as_deref(), Some(&*expected));
+        assert_eq!(
+            analyzer.full_hydration_count_for_test(),
+            0,
+            "a source read must not hydrate a FileState (#2642)"
+        );
+    }
+
+    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
     #[test]
     fn batched_enclosing_projection_matches_single_range_queries() {
         let temp = tempfile::tempdir().expect("temp dir");
@@ -16171,6 +17078,7 @@ mod tests {
         analyzer.end_query(&context);
     }
 
+    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
     #[test]
     fn query_read_cache_keeps_broad_traversals_out_of_the_lru_eviction_loop() {
         let temp = tempfile::tempdir().expect("temp dir");

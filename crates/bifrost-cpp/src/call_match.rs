@@ -85,6 +85,64 @@ fn cpp_type_text_shape(text: &str) -> (usize, i32) {
     (base_end, depth)
 }
 
+/// The single argument a `std::move` or `std::forward` call forwards, or `None`
+/// for every other call.
+///
+/// As far as an overload's parameter types are concerned these two are the
+/// identity: the argument's type is the call's type. Without that,
+/// `Montgomery_Int(m_params, std::move(t))` had one argument of unknown type,
+/// the argument filter kept every candidate rather than guess, and the call
+/// reported *ambiguous* between the `secure_vector<word>` and
+/// `std::span<const word>` overloads (#2552).
+///
+/// Recognized structurally, from the callee's `scope` and `name` fields: a
+/// `qualified_identifier` whose scope is `std` and whose name is `move` or
+/// `forward`, with the template arguments of `std::forward<T>(t)` unwrapped
+/// wherever the grammar attached them. A local `move(x)` or
+/// another namespace's `move` is not this, and neither is a call with any
+/// argument count but one -- that is not the standard signature, so the
+/// argument type stays unknown and the filter keeps every candidate.
+pub fn cpp_forwarding_call_argument<'tree>(call: Node<'tree>, source: &str) -> Option<Node<'tree>> {
+    if call.kind() != "call_expression" {
+        return None;
+    }
+    let mut callee = call.child_by_field_name("function")?;
+    if callee.kind() == "template_function" {
+        callee = callee.child_by_field_name("name")?;
+    }
+    if callee.kind() != "qualified_identifier" {
+        return None;
+    }
+    let scope = callee.child_by_field_name("scope")?;
+    if !matches!(scope.kind(), "namespace_identifier" | "identifier")
+        || cpp_node_text(scope, source).trim() != "std"
+    {
+        return None;
+    }
+    let mut name = callee.child_by_field_name("name")?;
+    // `std::forward<T>(t)` attaches its template arguments to the name half of
+    // the qualified name, so the `name` field is a `template_function` whose own
+    // `name` is the identifier.
+    if name.kind() == "template_function" {
+        name = name.child_by_field_name("name")?;
+    }
+    if !matches!(name.kind(), "identifier" | "field_identifier")
+        || !matches!(cpp_node_text(name, source).trim(), "move" | "forward")
+    {
+        return None;
+    }
+    let arguments = call.child_by_field_name("arguments")?;
+    let mut cursor = arguments.walk();
+    let forwarded = arguments
+        .named_children(&mut cursor)
+        .filter(|argument| argument.kind() != "comment")
+        .collect::<Vec<_>>();
+    let [argument] = forwarded.as_slice() else {
+        return None;
+    };
+    Some(*argument)
+}
+
 pub fn cpp_literal_arg_type(node: Node<'_>, source: &str) -> Option<CppArgType> {
     let scalar = |name: &str| CppArgType {
         name: name.to_string(),
@@ -150,26 +208,35 @@ pub fn cpp_filter_candidates_by_args_with_parameter_types(
     if candidates.len() <= 1 || arg_types.iter().any(Option::is_none) {
         return candidates;
     }
+    let args: Vec<&CppArgType> = arg_types.iter().flatten().collect();
+    debug_assert_eq!(args.len(), arg_types.len());
 
-    let filtered: Vec<_> = candidates
-        .iter()
-        .filter(|candidate| {
-            let template_candidate = cpp_signature_is_template_candidate(candidate);
-            parameter_types(candidate).is_some_and(|params| {
-                params.len() == arg_types.len()
-                    && params.iter().zip(arg_types.iter()).all(|(param, arg)| {
-                        cpp_param_matches_arg(
-                            param,
-                            arg,
-                            template_candidate,
-                            resolve_type,
-                            assignable,
-                        )
-                    })
-            })
-        })
-        .cloned()
-        .collect();
+    // Exact matches first; standard conversions decide only when nothing
+    // matches exactly. That order is C++'s own -- an identity conversion
+    // sequence beats every other one -- and it is what keeps
+    // `own(std::vector<uint8_t>)` winning over `own(std::span<const uint8_t>)`
+    // for a `std::vector<uint8_t>` argument now that the second is viable too.
+    let exact = cpp_candidates_matching(
+        &candidates,
+        &args,
+        parameter_types,
+        &|param, arg, template_candidate| {
+            cpp_param_matches_arg(param, arg, template_candidate, resolve_type, assignable)
+        },
+    );
+    let filtered = if exact.is_empty() {
+        cpp_candidates_matching(
+            &candidates,
+            &args,
+            parameter_types,
+            &|param, arg, template_candidate| {
+                cpp_param_matches_arg(param, arg, template_candidate, resolve_type, assignable)
+                    || cpp_standard_conversion_applies(arg, param)
+            },
+        )
+    } else {
+        exact
+    };
     if filtered.is_empty() {
         candidates
     } else if filtered.iter().any(cpp_signature_is_template_candidate) {
@@ -183,6 +250,30 @@ pub fn cpp_filter_candidates_by_args_with_parameter_types(
     }
 }
 
+/// The candidates whose parameter list has the call's arity and whose every
+/// parameter accepts the argument in that position under `matches`.
+fn cpp_candidates_matching(
+    candidates: &[CodeUnit],
+    args: &[&CppArgType],
+    parameter_types: &dyn Fn(&CodeUnit) -> Option<Vec<String>>,
+    matches: &dyn Fn(&str, &CppArgType, bool) -> bool,
+) -> Vec<CodeUnit> {
+    candidates
+        .iter()
+        .filter(|candidate| {
+            let template_candidate = cpp_signature_is_template_candidate(candidate);
+            parameter_types(candidate).is_some_and(|params| {
+                params.len() == args.len()
+                    && params
+                        .iter()
+                        .zip(args.iter())
+                        .all(|(param, arg)| matches(param, arg, template_candidate))
+            })
+        })
+        .cloned()
+        .collect()
+}
+
 fn cpp_signature_is_template_candidate(candidate: &CodeUnit) -> bool {
     candidate
         .signature()
@@ -191,14 +282,11 @@ fn cpp_signature_is_template_candidate(candidate: &CodeUnit) -> bool {
 
 fn cpp_param_matches_arg(
     param: &str,
-    arg: &Option<CppArgType>,
+    arg: &CppArgType,
     template_candidate: bool,
     resolve_type: &dyn Fn(&str) -> Option<CodeUnit>,
     assignable: &dyn Fn(&CodeUnit, &CodeUnit) -> bool,
 ) -> bool {
-    let Some(arg) = arg else {
-        return false;
-    };
     if cpp_type_text_pointer_depth(param) != arg.indirection {
         return false;
     }
@@ -218,6 +306,90 @@ fn cpp_param_matches_arg(
         (Some(param_unit), Some(arg_unit)) => assignable(arg_unit, &param_unit),
         _ => param_name == arg.name,
     }
+}
+
+/// Whether an argument of type `arg` satisfies a parameter written `param`
+/// through a standard conversion. Asked only after name equality and
+/// derived-to-base have both failed for every candidate.
+///
+/// This is a closed list, not a conversion engine. Every entry is a conversion
+/// the analyzer can state from the two spellings alone -- no user-defined
+/// conversion operator, no converting-constructor lookup, no template
+/// deduction -- and every entry is here because a corpus call site is ambiguous
+/// without it:
+///
+/// - an owning contiguous range (`std::vector<T>`, `std::array<T, N>`)
+///   satisfies `std::span<T>` and `std::span<const T>`. `return DL_Group(ber,
+///   format);` with `const std::vector<uint8_t> ber` matched no candidate at
+///   all, so the filter kept the whole overload set (#2894).
+/// - `std::string` and a `char*` or `const char*` satisfy `std::string_view`.
+///
+/// Deliberately absent:
+///
+/// - `T*` to `std::span<T>`: viable only paired with a count argument, which is
+///   arity's decision rather than a per-parameter one.
+/// - `T[N]` to `std::span<T>`: an array argument arrives here spelled as its
+///   bare element type, because [`CppArgType`] records pointer depth and an
+///   array declarator adds none. Accepting it would accept every scalar `T`.
+/// - an alias of a listed container, such as Botan's `secure_vector<T>` for
+///   `std::vector<T>`: the argument carries the written spelling, and resolving
+///   the alias here would make `Montgomery_Int(m_params, std::move(t))` satisfy
+///   both its `secure_vector<word>` and its `std::span<const word>` overload.
+/// - the argument's own top-level `const`: [`CppArgType`] does not record it,
+///   so `const std::vector<uint8_t>` and `std::vector<uint8_t>` are one type
+///   here and both satisfy `std::span<uint8_t>`. Element `const` is recorded,
+///   and is checked.
+fn cpp_standard_conversion_applies(arg: &CppArgType, param: &str) -> bool {
+    if cpp_type_text_pointer_depth(param) != 0 {
+        return false;
+    }
+    let param_name = normalize_cpp_type_name(param);
+    let span_element = cpp_template_arguments(&param_name, "std::span")
+        .and_then(|arguments| arguments.first().copied());
+    if let Some(span_element) = span_element {
+        return arg.indirection == 0
+            && cpp_contiguous_range_element(&arg.name)
+                .is_some_and(|element| cpp_span_element_accepts(span_element, element));
+    }
+    if param_name == "std::string_view" {
+        return (arg.indirection == 0 && arg.name == "std::string")
+            || (arg.indirection == 1 && arg.name == "char");
+    }
+    false
+}
+
+/// The template arguments of `text` when it names a specialization of `base`.
+///
+/// Bracket aware like the parameter-list reader beside it: the argument split is
+/// [`cpp_split_top_level_commas`], so `std::array<std::pair<int, int>, 4>` reads
+/// as two arguments rather than three, and `std::vector<int>::iterator` is not a
+/// specialization of `std::vector` at all.
+fn cpp_template_arguments<'a>(text: &'a str, base: &str) -> Option<Vec<&'a str>> {
+    let inner = text
+        .strip_prefix(base)?
+        .trim_start()
+        .strip_prefix('<')?
+        .trim_end()
+        .strip_suffix('>')?;
+    Some(cpp_split_top_level_commas(inner).collect())
+}
+
+/// The element type of an owning contiguous range: the `T` of `std::vector<T>`
+/// or of `std::array<T, N>`.
+fn cpp_contiguous_range_element(name: &str) -> Option<&str> {
+    ["std::vector", "std::array"]
+        .into_iter()
+        .find_map(|base| cpp_template_arguments(name, base))
+        .and_then(|arguments| arguments.first().copied())
+}
+
+/// Whether a `std::span` over `param_element` accepts a range over
+/// `arg_element`. A span may add `const` to its element type, never drop it.
+fn cpp_span_element_accepts(param_element: &str, arg_element: &str) -> bool {
+    cpp_type_text_pointer_depth(param_element) == cpp_type_text_pointer_depth(arg_element)
+        && normalize_cpp_type_name(param_element) == normalize_cpp_type_name(arg_element)
+        && (cpp_type_text_pointee_is_const(param_element)
+            || !cpp_type_text_pointee_is_const(arg_element))
 }
 
 fn cpp_type_text_pointee_is_const(text: &str) -> bool {
@@ -522,6 +694,169 @@ mod tests {
             &|_, _| false,
         );
         assert_eq!(candidates, filtered);
+    }
+
+    /// Every `call_expression` in `source`, in source order.
+    fn call_expressions(tree: &tree_sitter::Tree) -> Vec<Node<'_>> {
+        let mut calls = Vec::new();
+        let mut stack = vec![tree.root_node()];
+        while let Some(node) = stack.pop() {
+            if node.kind() == "call_expression" {
+                calls.push(node);
+            }
+            let mut cursor = node.walk();
+            stack.extend(node.named_children(&mut cursor));
+        }
+        calls.sort_by_key(Node::start_byte);
+        calls
+    }
+
+    fn parse(source: &str) -> tree_sitter::Tree {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_cpp::LANGUAGE.into())
+            .expect("the C++ grammar loads");
+        parser.parse(source, None).expect("the fixture parses")
+    }
+
+    /// #2552 shape 4. `std::move` and `std::forward` forward one argument, and
+    /// its type is the call's type. Nothing else is that, including the same
+    /// names outside `std` and a call with the wrong argument count.
+    #[test]
+    fn a_forwarding_call_reports_the_one_argument_it_forwards() {
+        let source = r#"void f() {
+   sink(std::move(a));
+   sink(std::forward<T>(b));
+   sink(std::move(c, 1));
+   sink(std::swap(d, e));
+   sink(move(g));
+   sink(other::move(h));
+   sink(std::vector<int>(i));
+}
+"#;
+        let tree = parse(source);
+        let forwarded = call_expressions(&tree)
+            .into_iter()
+            .filter_map(|call| cpp_forwarding_call_argument(call, source))
+            .map(|argument| cpp_node_text(argument, source).to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(forwarded, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    fn value_arg(name: &str) -> Option<CppArgType> {
+        Some(CppArgType {
+            name: name.to_string(),
+            unit: None,
+            indirection: 0,
+            pointee_const: false,
+        })
+    }
+
+    /// #2894 gap 2. `DL_Group(ber, format)` with a `std::vector<uint8_t> ber`
+    /// matched neither two-parameter constructor, so the filter kept both.
+    /// A contiguous owning range now satisfies a span over the same element,
+    /// including a span that adds `const`.
+    #[test]
+    fn a_contiguous_range_satisfies_a_span_over_its_element() {
+        for arg in ["std::vector<uint8_t>", "std::array<uint8_t, 16>"] {
+            for param in ["std::span<const uint8_t>", "std::span<uint8_t>"] {
+                let candidates = vec![
+                    function("take", &format!("void take({param} bytes)")),
+                    function("take", "void take(int count)"),
+                ];
+                let filtered = cpp_filter_candidates_by_args(
+                    candidates,
+                    &[value_arg(arg)],
+                    &|_| None,
+                    &|_, _| false,
+                );
+                assert_eq!(filtered.len(), 1, "{arg} -> {param}");
+                assert!(
+                    filtered[0].signature().unwrap().contains(param),
+                    "{arg} -> {param}: {:?}",
+                    filtered[0].signature()
+                );
+            }
+        }
+    }
+
+    /// The near misses the issue asked for: a different element type, and an
+    /// element that would lose its `const`.
+    #[test]
+    fn a_range_over_another_element_does_not_satisfy_a_span() {
+        for (arg, param) in [
+            ("std::vector<int>", "std::span<const uint8_t>"),
+            ("std::vector<const uint8_t>", "std::span<uint8_t>"),
+            ("std::vector<uint8_t>", "std::span<const uint8_t*>"),
+            ("std::deque<uint8_t>", "std::span<const uint8_t>"),
+        ] {
+            let candidates = vec![
+                function("take", &format!("void take({param} bytes)")),
+                function("take", "void take(int count)"),
+            ];
+            let filtered = cpp_filter_candidates_by_args(
+                candidates.clone(),
+                &[value_arg(arg)],
+                &|_| None,
+                &|_, _| false,
+            );
+            assert_eq!(
+                candidates, filtered,
+                "{arg} must not satisfy {param}, so every candidate stays"
+            );
+        }
+    }
+
+    #[test]
+    fn an_owned_string_and_a_character_pointer_satisfy_a_string_view() {
+        let literal = Some(CppArgType {
+            name: "char".to_string(),
+            unit: None,
+            indirection: 1,
+            pointee_const: true,
+        });
+        for arg in [value_arg("std::string"), literal] {
+            let filtered = cpp_filter_candidates_by_args(
+                vec![
+                    function("label", "void label(std::string_view text)"),
+                    function("label", "void label(int count)"),
+                ],
+                std::slice::from_ref(&arg),
+                &|_| None,
+                &|_, _| false,
+            );
+            assert_eq!(filtered.len(), 1, "{:?}", arg.as_ref().map(|arg| &arg.name));
+            assert!(
+                filtered[0]
+                    .signature()
+                    .unwrap()
+                    .contains("std::string_view"),
+                "{:?}",
+                filtered[0].signature()
+            );
+        }
+    }
+
+    /// A standard conversion never outranks an exact match: the overload set
+    /// that has both keeps resolving to the exact one, as it did before the
+    /// conversion table existed.
+    #[test]
+    fn an_exact_match_outranks_a_standard_conversion() {
+        let candidates = vec![
+            function("own", "void own(std::vector<uint8_t> bytes)"),
+            function("own", "void own(std::span<const uint8_t> bytes)"),
+        ];
+        let filtered = cpp_filter_candidates_by_args(
+            candidates,
+            &[value_arg("std::vector<uint8_t>")],
+            &|_| None,
+            &|_, _| false,
+        );
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(
+            "void own(std::vector<uint8_t> bytes)",
+            filtered[0].signature().unwrap()
+        );
     }
 
     #[test]

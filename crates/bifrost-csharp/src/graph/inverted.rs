@@ -23,17 +23,17 @@ use crate::graph::extractor::{
     member_access_receiver,
 };
 use crate::graph::resolver::{
-    UnqualifiedMethodGroupResolution, argument_count, class_unit_for_fq_name,
-    collection_target_element_type_node, extension_visibility_site_key, first_type_child,
-    invocation_member_candidates_for_owner, is_member_variable_declaration, is_type_reference_node,
-    nearest_member_candidates_for_owner, node_text, object_creation_collection_target,
-    object_initializer_for_label, object_initializer_owner_type_node, reference_type_text,
-    resolve_arity_free_type_fq_name_at, resolve_type_fq_name_at,
-    resolve_unqualified_method_group_for_owner, same_node, unqualified_member_has_local_binding,
-    unqualified_member_has_structured_shadow, usage_class_field_receiver_type, usage_direct_base,
-    usage_member_declared_type_fq_name, usage_method_return_type_fq_name_for_arity,
-    usage_relational_generic_call_has_type_argument, usage_unqualified_value_member_shadows_type,
-    usage_visible_extension_method_candidates,
+    CSharpBuiltinValueArguments, UnqualifiedMethodGroupResolution, argument_count,
+    class_unit_for_fq_name, collection_target_element_type_node, extension_visibility_site_key,
+    first_type_child, invocation_member_candidates_for_owner, is_member_variable_declaration,
+    is_type_reference_node, nearest_member_candidates_for_owner, node_text,
+    object_creation_collection_target, object_initializer_for_label,
+    object_initializer_owner_type_node, reference_type_text, resolve_arity_free_type_fq_name_at,
+    resolve_type_fq_name_at, resolve_unqualified_method_group_for_owner, same_node,
+    unqualified_member_has_local_binding, unqualified_member_has_structured_shadow,
+    usage_class_field_receiver_type, usage_direct_base, usage_member_declared_type_fq_name,
+    usage_method_return_type_fq_name_for_arity, usage_relational_generic_call_has_type_argument,
+    usage_unqualified_value_member_shadows_type, usage_visible_extension_method_candidates,
 };
 use crate::graph_support::CSharpSource;
 use crate::hierarchy;
@@ -103,7 +103,15 @@ struct CsScan<'a> {
     edges: PerFileEdges,
 }
 
-type ExtensionCacheKey = (String, String, usize, Option<usize>, usize, usize);
+type ExtensionCacheKey = (
+    String,
+    String,
+    usize,
+    Option<usize>,
+    usize,
+    usize,
+    CSharpBuiltinValueArguments,
+);
 type MemberCacheKey = (String, String, Option<usize>, Option<usize>);
 
 impl CsScan<'_> {
@@ -272,6 +280,10 @@ impl CsScan<'_> {
         let extension_callees = call_arity
             .map(|call_arity| {
                 let (scope_start, scope_end) = extension_visibility_site_key(node);
+                // The scan can refute a candidate on an argument's proven type
+                // (#2225), so two sites that agree on owner, name, arity and
+                // visibility scope can still reach different answers. The
+                // evidence that decides it belongs in the key.
                 let extension_key = (
                     owner_fqn.to_string(),
                     name.to_string(),
@@ -279,6 +291,7 @@ impl CsScan<'_> {
                     explicit_generic_arity,
                     scope_start,
                     scope_end,
+                    CSharpBuiltinValueArguments::at_site(node, self.source),
                 );
                 if !self.extension_cache.contains_key(&extension_key) {
                     let receiver_types = [owner_fqn.to_string()];

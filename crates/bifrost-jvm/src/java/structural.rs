@@ -5,10 +5,10 @@
 
 use brokk_bifrost_core::analyzer::structural::adapter_helpers::{
     attach_positional_argument_roles, attach_role_with_derived_name, attach_terminal_callee,
-    field_name_in_parent, first_named_child, is_field_of, nearest_ancestor, node_range,
+    field_name_in_parent, first_named_child, nearest_ancestor, node_range,
 };
 use brokk_bifrost_core::analyzer::structural::adapter_helpers::{
-    linear_chain_tokens, qualified_chain_root, spelled_generic_arity,
+    chain_name_child, linear_chain_tokens, qualified_chain_root, spelled_generic_arity,
 };
 use brokk_bifrost_core::analyzer::structural::callable::{
     CallKind, CallSiteContext, CallSiteFacts,
@@ -28,7 +28,7 @@ use brokk_bifrost_core::analyzer::structural::resolution::{
     HoistingClass, LexicalEnvironmentSupport,
 };
 use brokk_bifrost_core::analyzer::structural::routes::{
-    DEEP_IDENTITY_AXES, IdentityRouteSupport, RouteHopKind,
+    CuratedExportSurface, DEEP_IDENTITY_AXES, IdentityRouteSupport, RouteHopKind,
 };
 use brokk_bifrost_core::analyzer::structural::spec::{RoleSink, StructuralSpec};
 use brokk_bifrost_core::analyzer::{Language, Range};
@@ -201,14 +201,20 @@ fn java_occurrence_role(node: Node<'_>) -> Option<OccurrenceRole> {
     }
 
     // Climb out of any qualified-name chain this token terminates. A token in
-    // a `scope` position is a path segment however deep the chain runs.
+    // a `scope` position is a path segment however deep the chain runs. Which
+    // child spells the chain node's own segment comes from `JAVA_PATH_CHAIN`,
+    // the same table `qualified_path_root` and `path_segment_tokens` read:
+    // `scoped_identifier` names it in a field, `scoped_type_identifier` has no
+    // fields at all and spells it positionally as the last named child, so a
+    // field lookup there is false for the tail as well as for the scope and
+    // would classify a whole qualified type as path segments (#1644).
     let mut anchor = node;
     let mut parent = anchor.parent()?;
-    while matches!(
-        parent.kind(),
-        "scoped_identifier" | "scoped_type_identifier"
-    ) {
-        if !is_field_of(parent, anchor, "name") {
+    while let Some(&(_, name_field)) = JAVA_PATH_CHAIN
+        .iter()
+        .find(|(kind, _)| *kind == parent.kind())
+    {
+        if chain_name_child(parent, name_field).map(|name| name.id()) != Some(anchor.id()) {
             return Some(OccurrenceRole::PathSegment);
         }
         anchor = parent;
@@ -447,7 +453,12 @@ impl StructuralSpec for JavaStructuralSpec {
         spelled_generic_arity(token, JAVA_PATH_CHAIN, &["generic_type"])
     }
 
-    fn indirection_relation(&self, token: Node<'_>) -> Option<RouteHopKind> {
+    fn indirection_relation(
+        &self,
+        token: Node<'_>,
+        _source: &str,
+        _surface: &CuratedExportSurface,
+    ) -> Option<RouteHopKind> {
         nearest_ancestor(token, |kind| kind == "import_declaration").map(|_| RouteHopKind::Import)
     }
 

@@ -27,10 +27,11 @@ use brokk_bifrost_jvm::scala::graph::local::{
     seed_scala_binding_with_receiver_declaration,
 };
 use brokk_bifrost_jvm::scala::graph::namespace::{
-    ScalaDirectAncestorResolution, ScalaTypeNamespaceResolution, ScalaUnindexedTypeBinding,
-    resolve_exact_lexical_type_namespace, scala_anonymous_instance_for_template,
-    scala_nearest_unindexed_type_binding, scala_qualified_type_root,
-    scala_type_reference_is_singleton, scala_unindexed_type_binding_shadows,
+    ScalaDirectAncestorResolution, ScalaTiedSupertypes, ScalaTypeNamespaceResolution,
+    ScalaUnindexedTypeBinding, resolve_exact_lexical_type_namespace,
+    scala_anonymous_instance_for_template, scala_nearest_unindexed_type_binding,
+    scala_qualified_type_root, scala_tied_tier_declarations, scala_type_reference_is_singleton,
+    scala_unindexed_type_binding_shadows,
 };
 use brokk_bifrost_jvm::scala::graph::resolver::{
     method_signature_arity, resolved_extension_receiver_type,
@@ -82,9 +83,17 @@ fn scala_unit_matches_owner_kind(
     unit: &CodeUnit,
     kind: ScalaOwnerKind,
 ) -> bool {
+    // Every Scala type-namespace declaration is a `Class` unit, aliases
+    // included (#2878), so each owner kind states which of them it admits: a
+    // `Class` owner is a declared class, trait, or enum and never an alias,
+    // while `TypeNamespace` is the kind that does admit one.
     match kind {
-        ScalaOwnerKind::Class => unit.is_class() && !unit.short_name().ends_with('$'),
-        ScalaOwnerKind::SingletonObject => unit.is_class() && unit.short_name().ends_with('$'),
+        ScalaOwnerKind::Class => {
+            unit.is_class() && !unit.short_name().ends_with('$') && !scala.is_type_alias(unit)
+        }
+        ScalaOwnerKind::SingletonObject => {
+            unit.is_class() && unit.short_name().ends_with('$') && !scala.is_type_alias(unit)
+        }
         ScalaOwnerKind::TypeNamespace => {
             unit.is_class() && !unit.short_name().ends_with('$') || scala.is_type_alias(unit)
         }
@@ -119,23 +128,6 @@ enum ScalaNameResolution {
     MissingExplicitImport,
     Ambiguous(Vec<ScalaOwnerIdentity>),
     Unresolved,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum ForwardScalaDirectAncestorResolution {
-    Resolved(Vec<CodeUnit>),
-    Ambiguous(Vec<CodeUnit>),
-    Incomplete(Vec<CodeUnit>),
-}
-
-impl ForwardScalaDirectAncestorResolution {
-    fn into_shared(self) -> ScalaDirectAncestorResolution {
-        match self {
-            Self::Resolved(ancestors) => ScalaDirectAncestorResolution::Resolved(ancestors),
-            Self::Ambiguous(_) => ScalaDirectAncestorResolution::Ambiguous,
-            Self::Incomplete(ancestors) => ScalaDirectAncestorResolution::Incomplete(ancestors),
-        }
-    }
 }
 
 /// Answer a Scala ambiguity under the diagnostic kind that names the tier where
@@ -186,7 +178,7 @@ type ScalaNameResolver<'a> = ForwardScalaNameResolver<'a>;
 #[derive(Default)]
 pub(crate) struct ScalaLookupCache {
     direct_children_by_owner: RefCell<HashMap<CodeUnit, Vec<CodeUnit>>>,
-    direct_ancestors_by_owner: RefCell<HashMap<CodeUnit, ForwardScalaDirectAncestorResolution>>,
+    direct_ancestors_by_owner: RefCell<HashMap<CodeUnit, ScalaDirectAncestorResolution>>,
     #[cfg(test)]
     direct_children_builds: Cell<usize>,
     #[cfg(test)]
@@ -212,13 +204,13 @@ impl ScalaLookupCache {
         resolved
     }
 
-    fn direct_ancestor_details(
+    fn direct_ancestors(
         &self,
         token: QueryToken<'_>,
         scala: &ScalaAnalyzer,
         support: &dyn BoundedDefinitionLookup,
         owner: &CodeUnit,
-    ) -> ForwardScalaDirectAncestorResolution {
+    ) -> ScalaDirectAncestorResolution {
         if let Some(cached) = self.direct_ancestors_by_owner.borrow().get(owner) {
             return cached.clone();
         }
@@ -781,7 +773,8 @@ impl<'a> ForwardScalaNameResolver<'a> {
         segments: &[String],
         kind: ScalaOwnerKind,
     ) -> ScalaNameResolution {
-        let environment = self.wildcard_import_environment();
+        let imports = self.visible_import_list();
+        let environment = self.wildcard_import_environment(&imports);
         if environment.ambiguous {
             return ScalaNameResolution::Ambiguous(Vec::new());
         }
@@ -795,6 +788,94 @@ impl<'a> ForwardScalaNameResolver<'a> {
             .collect::<Vec<_>>();
         candidates.extend(self.enclosing_owner_qualified_wildcard_candidates(segments));
         self.resolve_candidate_tier(candidates, kind)
+    }
+
+    /// The owner a term-position reference (an `apply` or extractor name)
+    /// denotes when a scope nested inside the compilation unit binds it.
+    ///
+    /// SLS 2 nests scopes before it ranks precedences. An import written
+    /// inside a template body or block is a more deeply nested binding than
+    /// the compilation unit's package clause, so it shadows a same-named
+    /// package member; a compilation-unit wildcard import sits at the same
+    /// nesting as the package clause and is ranked against it by precedence
+    /// instead, which is what `resolve_owner_segments` walks (#2224).
+    ///
+    /// Term position accepts either namespace: the owner may be an object, or
+    /// a case class whose companion is synthetic and therefore unindexed. The
+    /// walk is scope-major for that reason -- one scope answers from the
+    /// singleton-object namespace and then from the class namespace before
+    /// the walk widens -- because a name bound in a nested scope shadows every
+    /// binding of the name outside it, in either namespace.
+    ///
+    /// `Unresolved` means no nested scope binds the name; the caller then
+    /// continues with the compilation-unit-and-outward walk
+    /// (`resolve_owner_segments`), which keeps its existing tier order.
+    fn resolve_nested_scope_term_owner(&self, segments: &[String]) -> ScalaNameResolution {
+        // An explicit import binds one name in both namespaces, so both
+        // lookups belong to this tier: reporting the unindexed-import
+        // boundary after only the singleton-object lookup hid the imported
+        // class. `Unresolved` here means no visible explicit import spells
+        // the name at all, which is a kind-independent verdict, so the class
+        // lookup cannot answer either.
+        match self.resolve_explicit_owner_segments(segments, ScalaOwnerKind::SingletonObject) {
+            ScalaNameResolution::MissingExplicitImport => {
+                return match self.resolve_explicit_owner_segments(segments, ScalaOwnerKind::Class) {
+                    ScalaNameResolution::Unresolved => ScalaNameResolution::MissingExplicitImport,
+                    outcome => outcome,
+                };
+            }
+            ScalaNameResolution::Unresolved => {}
+            outcome => return outcome,
+        }
+
+        // The wildcard tier `resolve_owner_segments` walks, narrowed to the
+        // imports a template body or block encloses.
+        // `enclosing_owner_qualified_wildcard_candidates` contributes only
+        // owner-qualified spellings of imports that have an enclosing
+        // template, so every candidate it yields belongs to this tier too.
+        let imports = self.visible_import_list();
+        let environment = self.wildcard_import_environment(&imports);
+        if environment.ambiguous {
+            return ScalaNameResolution::Ambiguous(Vec::new());
+        }
+        let mut candidates = environment
+            .owners
+            .into_iter()
+            .filter(|owner| {
+                let import = imports
+                    .get(owner.import_index)
+                    .expect("wildcard owner indexes the import list it was resolved from");
+                self.import_is_template_nested(import)
+            })
+            .flat_map(|owner| {
+                let singleton = owner.is_singleton();
+                scala_nested_type_candidates(owner.fqn, segments, singleton)
+            })
+            .collect::<Vec<_>>();
+        candidates.extend(self.enclosing_owner_qualified_wildcard_candidates(segments));
+        for kind in [ScalaOwnerKind::SingletonObject, ScalaOwnerKind::Class] {
+            match self.resolve_candidate_tier(candidates.clone(), kind) {
+                ScalaNameResolution::Unresolved => {}
+                outcome => return outcome,
+            }
+        }
+        ScalaNameResolution::Unresolved
+    }
+
+    /// Whether an import is written inside a template body or block rather
+    /// than at compilation-unit level. The parser records where the import
+    /// declaration starts; the class-range index answers which templates
+    /// enclose that byte.
+    fn import_is_template_nested(&self, import: &ImportInfo) -> bool {
+        import.path.as_ref().is_some_and(|path| {
+            !scala_enclosing_template_owner_fq_names(
+                self.scala,
+                self.scala,
+                &self.file,
+                path.declaration_start_byte,
+            )
+            .is_empty()
+        })
     }
 
     fn resolve_absolute_owner_segments(
@@ -960,7 +1041,7 @@ impl<'a> ForwardScalaNameResolver<'a> {
     fn resolve_wildcard_singleton(&self, name: &str) -> ScalaNameResolution {
         let segments = [name.to_string()];
         let mut owners = Vec::new();
-        let environment = self.wildcard_import_environment();
+        let environment = self.wildcard_import_environment(&self.visible_import_list());
         if environment.ambiguous {
             return ScalaNameResolution::Ambiguous(Vec::new());
         }
@@ -1033,10 +1114,20 @@ impl<'a> ForwardScalaNameResolver<'a> {
         }
     }
 
-    fn wildcard_import_environment(&self) -> ScalaWildcardImportEnvironment {
-        let imports = self.visible_imports().cloned().collect::<Vec<_>>();
+    /// The imports visible at the reference, in source order. The owners
+    /// `wildcard_import_environment` returns index into this list, so a tier
+    /// that needs the import behind an owner resolves the environment over
+    /// the same slice it built.
+    fn visible_import_list(&self) -> Vec<ImportInfo> {
+        self.visible_imports().cloned().collect::<Vec<_>>()
+    }
+
+    fn wildcard_import_environment(
+        &self,
+        imports: &[ImportInfo],
+    ) -> ScalaWildcardImportEnvironment {
         resolve_scala_wildcard_import_environment(
-            &imports,
+            imports,
             &self.package_prefixes,
             |declaration_start_byte| {
                 scala_enclosing_template_owner_fq_names(
@@ -5525,72 +5616,107 @@ fn resolve_scala_parser_proven_term_role(
             return None;
         }
         let display_name = reference.segments.join(".");
-        return Some(
-            match resolver
-                .resolve_owner_segments(&reference.segments, ScalaOwnerKind::SingletonObject)
+        let call_shape = call_site_shape_for_reference(reference.expression);
+        // Scope-major: a scope nested inside the compilation unit answers from
+        // both namespaces before the compilation-unit-and-outward walk runs
+        // (#2224).
+        let resolution = match resolver.resolve_nested_scope_term_owner(&reference.segments) {
+            ScalaNameResolution::Unresolved => resolver
+                .resolve_owner_segments(&reference.segments, ScalaOwnerKind::SingletonObject),
+            outcome => outcome,
+        };
+        // Scala applies `Owner.Name(args)` in the term namespace: the target
+        // is a `val`, `def`, or `object` member `Name` of `Owner`, and the
+        // type namespace answers only when `Owner` declares no such member,
+        // through the companion callable (explicit or synthetic) of a type
+        // named `Name`. A path that resolves to a singleton object already is
+        // that term member. A class-namespace owner and an explicit-import
+        // boundary are not, so neither may answer for a site the owner's own
+        // `val`/`def` owns: `object Tags { sealed trait MaxVal; val MaxVal }`
+        // reported the trait's missing constructor for `Tags.MaxVal(3)`
+        // (#2220). Scala forbids a `val`/`def` beside an `object` of one name
+        // in one template, so the two readings never compete. The general
+        // member path below owns the selection -- overloads, named arguments,
+        // call shape -- so declining hands the site to it.
+        if reference.role == ScalaQualifiedStableTypeRole::Apply
+            && matches!(
+                resolution,
+                ScalaNameResolution::MissingExplicitImport
+                    | ScalaNameResolution::Resolved(ScalaOwnerIdentity {
+                        kind: ScalaOwnerKind::Class,
+                        ..
+                    })
+            )
+            && scala_qualified_owner_declares_term_member(ctx, token, resolver, &reference.segments)
+        {
+            return None;
+        }
+        return Some(match resolution {
+            // A nested scope can bind the name in the class namespace
+            // alone: a case class whose companion is synthetic has no
+            // indexed object, and its primary constructor is the callable
+            // the reference denotes in either term role.
+            ScalaNameResolution::Resolved(owner) if owner.kind == ScalaOwnerKind::Class => {
+                scala_parser_proven_class_outcome(ctx, &owner, &display_name, call_shape.as_ref())
+            }
+            ScalaNameResolution::Resolved(owner) => match reference.role {
+                ScalaQualifiedStableTypeRole::Apply => scala_exact_singleton_apply_outcome(
+                    ctx,
+                    token,
+                    &owner._declaration,
+                    &display_name,
+                    call_shape.as_ref(),
+                ),
+                ScalaQualifiedStableTypeRole::Extractor => {
+                    scala_extractor_outcome(ctx, &owner, &display_name, call_shape.as_ref())
+                }
+                ScalaQualifiedStableTypeRole::Type | ScalaQualifiedStableTypeRole::Constructor => {
+                    unreachable!()
+                }
+            },
+            // gated upstream: resolver-verdict arm (workspace check is the
+            // resolver's -- see the sibling arm's note above).
+            ScalaNameResolution::MissingExplicitImport => boundary_unchecked(format!(
+                "`{root_name}` is bound by an explicit Scala import whose declaration is not indexed in this workspace"
+            )),
+            ScalaNameResolution::Ambiguous(_) => no_definition(
+                "ambiguous_scala_term_namespace",
+                format!("`{display_name}` resolves to multiple physical Scala objects"),
+            ),
+            ScalaNameResolution::Unresolved
+                if reference.role == ScalaQualifiedStableTypeRole::Extractor =>
             {
-                ScalaNameResolution::Resolved(owner) => match reference.role {
-                    ScalaQualifiedStableTypeRole::Apply => scala_exact_singleton_apply_outcome(
-                        ctx,
-                        token,
-                        &owner._declaration,
-                        &display_name,
-                        call_site_shape_for_reference(reference.expression).as_ref(),
-                    ),
-                    ScalaQualifiedStableTypeRole::Extractor => scala_extractor_outcome(
+                let resolution = scala_exact_extractor_class_owner(ctx, token, resolver, node)
+                    .map(ScalaNameResolution::Resolved)
+                    .unwrap_or_else(|| {
+                        resolver.resolve_owner_segments(&reference.segments, ScalaOwnerKind::Class)
+                    });
+                match resolution {
+                    ScalaNameResolution::Resolved(owner) => scala_parser_proven_class_outcome(
                         ctx,
                         &owner,
                         &display_name,
-                        call_site_shape_for_reference(reference.expression).as_ref(),
+                        call_shape.as_ref(),
                     ),
-                    ScalaQualifiedStableTypeRole::Type
-                    | ScalaQualifiedStableTypeRole::Constructor => unreachable!(),
-                },
-                // gated upstream: resolver-verdict arm (workspace check is the
-                // resolver's — see the sibling arm's note above).
-                ScalaNameResolution::MissingExplicitImport => boundary_unchecked(format!(
-                    "`{root_name}` is bound by an explicit Scala import whose declaration is not indexed in this workspace"
-                )),
-                ScalaNameResolution::Ambiguous(_) => no_definition(
-                    "ambiguous_scala_term_namespace",
-                    format!("`{display_name}` resolves to multiple physical Scala objects"),
-                ),
-                ScalaNameResolution::Unresolved
-                    if reference.role == ScalaQualifiedStableTypeRole::Extractor =>
-                {
-                    let resolution = scala_exact_extractor_class_owner(ctx, token, resolver, node)
-                        .map(ScalaNameResolution::Resolved)
-                        .unwrap_or_else(|| {
-                            resolver
-                                .resolve_owner_segments(&reference.segments, ScalaOwnerKind::Class)
-                        });
-                    match resolution {
-                        ScalaNameResolution::Resolved(owner) => scala_extractor_class_outcome(
-                            ctx,
-                            &owner,
-                            &display_name,
-                            call_site_shape_for_reference(reference.expression).as_ref(),
+                    // gated upstream: resolver-verdict arm (workspace check is
+                    // the resolver's).
+                    ScalaNameResolution::MissingExplicitImport => boundary_unchecked(format!(
+                        "`{root_name}` is bound by an explicit Scala import whose declaration is not indexed in this workspace"
+                    )),
+                    ScalaNameResolution::Ambiguous(_) => no_definition(
+                        "ambiguous_scala_term_namespace",
+                        format!(
+                            "`{display_name}` resolves to multiple physical Scala extractor classes"
                         ),
-                        // gated upstream: resolver-verdict arm (workspace check is
-                        // the resolver's).
-                        ScalaNameResolution::MissingExplicitImport => boundary_unchecked(format!(
-                            "`{root_name}` is bound by an explicit Scala import whose declaration is not indexed in this workspace"
-                        )),
-                        ScalaNameResolution::Ambiguous(_) => no_definition(
-                            "ambiguous_scala_term_namespace",
-                            format!(
-                                "`{display_name}` resolves to multiple physical Scala extractor classes"
-                            ),
-                        ),
-                        ScalaNameResolution::Unresolved => no_definition(
-                            "no_applicable_scala_callable",
-                            format!("`{display_name}` has no indexed Scala extractor owner"),
-                        ),
-                    }
+                    ),
+                    ScalaNameResolution::Unresolved => no_definition(
+                        "no_applicable_scala_callable",
+                        format!("`{display_name}` has no indexed Scala extractor owner"),
+                    ),
                 }
-                ScalaNameResolution::Unresolved => return None,
-            },
-        );
+            }
+            ScalaNameResolution::Unresolved => return None,
+        });
     }
 
     if !is_extractor_reference(node) {
@@ -5609,7 +5735,10 @@ fn resolve_scala_parser_proven_term_role(
             format!("`{name}` is a local Scala value"),
         ));
     }
-    let resolution = match resolver.resolve_explicit_singleton(name) {
+    // Scope-major: a scope nested inside the compilation unit answers from
+    // both namespaces before the compilation-unit-and-outward walk runs
+    // (#2224).
+    let resolution = match resolver.resolve_nested_scope_term_owner(&[name.to_string()]) {
         ScalaNameResolution::Unresolved => match resolver.resolve_wildcard_singleton(name) {
             ScalaNameResolution::Unresolved => {
                 resolver.resolve_owner(name, ScalaOwnerKind::SingletonObject)
@@ -5619,6 +5748,17 @@ fn resolve_scala_parser_proven_term_role(
         outcome => outcome,
     };
     Some(match resolution {
+        // A nested scope can bind the name in the class namespace alone: a
+        // case class whose companion is synthetic has no indexed object, and
+        // its primary constructor is the extractor the pattern denotes.
+        ScalaNameResolution::Resolved(owner) if owner.kind == ScalaOwnerKind::Class => {
+            scala_parser_proven_class_outcome(
+                ctx,
+                &owner,
+                name,
+                call_site_shape_for_reference(node).as_ref(),
+            )
+        }
         ScalaNameResolution::Resolved(owner) => scala_extractor_outcome(
             ctx,
             &owner,
@@ -5638,7 +5778,7 @@ fn resolve_scala_parser_proven_term_role(
                 .map(ScalaNameResolution::Resolved)
                 .unwrap_or_else(|| resolver.resolve_owner(name, ScalaOwnerKind::Class));
             match resolution {
-                ScalaNameResolution::Resolved(owner) => scala_extractor_class_outcome(
+                ScalaNameResolution::Resolved(owner) => scala_parser_proven_class_outcome(
                     ctx,
                     &owner,
                     name,
@@ -5677,6 +5817,46 @@ fn resolve_scala_parser_proven_term_role(
     })
 }
 
+/// Whether a declaration can be the target of a term-position reference: a
+/// `val` or a `def`, not a type alias and not a constructor-only callable.
+fn scala_declares_term_member(scala: &ScalaAnalyzer, unit: &CodeUnit) -> bool {
+    (unit.is_field() || unit.is_function())
+        && !scala.is_type_alias(unit)
+        && !scala_constructor_only_callable(scala, unit)
+}
+
+/// Whether the owner of a qualified term application declares a `val` or `def`
+/// under the reference's terminal name.
+///
+/// `Owner.Name(args)` applies a term member of `Owner`, so such a member owns
+/// the site and the type-namespace tiers must decline it (#2220). The owner is
+/// read in the singleton-object namespace because only a stable owner can
+/// qualify a term selection.
+fn scala_qualified_owner_declares_term_member(
+    ctx: ScalaLookupCtx<'_>,
+    token: QueryToken<'_>,
+    resolver: &ScalaNameResolver<'_>,
+    segments: &[String],
+) -> bool {
+    let Some((name, owner_segments)) = segments.split_last() else {
+        return false;
+    };
+    if owner_segments.is_empty() {
+        return false;
+    }
+    let ScalaNameResolution::Resolved(owner) =
+        resolver.resolve_owner_segments(owner_segments, ScalaOwnerKind::SingletonObject)
+    else {
+        return false;
+    };
+    match scala_exact_owner_member_candidate_units(ctx, token, &owner._declaration, name, false) {
+        ScalaExactMemberResolution::Found(candidates) => candidates
+            .iter()
+            .any(|unit| scala_declares_term_member(ctx.scala, unit)),
+        ScalaExactMemberResolution::Ambiguous(_) | ScalaExactMemberResolution::NoMatch => false,
+    }
+}
+
 /// The value an extractor pattern names when no object and no class of that
 /// name is visible: a value member of an enclosing template, innermost first.
 ///
@@ -5710,11 +5890,7 @@ fn scala_enclosing_member_value_units(
                 ScalaExactMemberResolution::Found(mut candidates) => {
                     // A nested class or type member of the same name is the
                     // class tier's business, and it already declined above.
-                    candidates.retain(|unit| {
-                        (unit.is_field() || unit.is_function())
-                            && !ctx.scala.is_type_alias(unit)
-                            && !scala_constructor_only_callable(ctx.scala, unit)
-                    });
+                    candidates.retain(|unit| scala_declares_term_member(ctx.scala, unit));
                     if !candidates.is_empty() {
                         return ScalaExactMemberResolution::Found(candidates);
                     }
@@ -5807,12 +5983,13 @@ fn scala_extractor_outcome(
 }
 
 /// Case-class companions may be parser-synthetic and therefore have no
-/// physical object CodeUnit. In a parser-proven extractor role, retain the
-/// exact imported class and validate its synthetic primary constructor instead
-/// of falling back into the type namespace. Parameterized enum cases project a
-/// uniquely validated constructor back to the physical case-class declaration;
-/// ordinary case classes retain the constructor as their callable identity.
-fn scala_extractor_class_outcome(
+/// physical object CodeUnit. In a parser-proven term role -- an extractor
+/// pattern or an `apply` -- retain the exact visible class and validate its
+/// synthetic primary constructor instead of falling back into the type
+/// namespace. Parameterized enum cases project a uniquely validated
+/// constructor back to the physical case-class declaration; ordinary case
+/// classes retain the constructor as their callable identity.
+fn scala_parser_proven_class_outcome(
     ctx: ScalaLookupCtx<'_>,
     class: &ScalaOwnerIdentity,
     reference: &str,
@@ -6056,12 +6233,17 @@ fn scala_exact_lexical_singleton_for_call(
         match candidates.len() {
             0 => {}
             1 => {
+                // Only a declared class or trait companion makes the bare name
+                // ambiguous. A type alias of the same name is a type-namespace
+                // declaration that introduces no term, so the application still
+                // denotes the singleton (#2878).
                 let has_class_companion = ctx
                     .support
                     .fqn_direct_children(&owner.fq_name())
                     .into_iter()
                     .any(|candidate| {
                         candidate.is_class()
+                            && !ctx.scala.is_type_alias(&candidate)
                             && candidate.identifier().trim_end_matches('$') == name
                             && !candidate.fq_name().ends_with('$')
                             && candidate.source() == owner.source()
@@ -6643,17 +6825,8 @@ impl ScalaLookupCtx<'_> {
         token: QueryToken<'_>,
         owner: &CodeUnit,
     ) -> ScalaDirectAncestorResolution {
-        self.direct_ancestor_details_for_owner(token, owner)
-            .into_shared()
-    }
-
-    fn direct_ancestor_details_for_owner(
-        &self,
-        token: QueryToken<'_>,
-        owner: &CodeUnit,
-    ) -> ForwardScalaDirectAncestorResolution {
         self.cache
-            .direct_ancestor_details(token, self.scala, self.support, owner)
+            .direct_ancestors(token, self.scala, self.support, owner)
     }
 }
 
@@ -8910,21 +9083,29 @@ fn scala_exact_owner_typed_overload_resolution(
                 Some(call_shape),
                 ScalaCallableSiteRole::Ordinary,
             ));
-            match ctx.direct_ancestor_details_for_owner(token, &current) {
-                ForwardScalaDirectAncestorResolution::Resolved(ancestors) => {
+            match ctx.direct_ancestors_for_owner(token, &current) {
+                ScalaDirectAncestorResolution::Resolved(ancestors) => {
                     next.extend(ancestors);
                 }
-                ForwardScalaDirectAncestorResolution::Incomplete(ancestors) => {
+                ScalaDirectAncestorResolution::Incomplete(ancestors) => {
                     next.extend(ancestors);
                     unindexed_supertype = true;
                 }
                 // A multiply declared supertype is not a boundary: the
                 // workspace holds those declarations, and the chain below
-                // reports the conflict where it can name it.
-                ForwardScalaDirectAncestorResolution::Ambiguous(owners) => {
+                // reports the conflict where it can name it. The tier's other
+                // supertypes are unaffected by the tie and keep their place in
+                // the walk (#2229); an unnamed tie contributes nothing, exactly
+                // as an empty contender list did before.
+                ScalaDirectAncestorResolution::Ambiguous { resolved, tied } => {
+                    next.extend(resolved);
+                    let tied = match tied {
+                        ScalaTiedSupertypes::Named(tied) => tied,
+                        ScalaTiedSupertypes::Unnamed => Vec::new(),
+                    };
                     carried_candidates.extend(scala_filter_callable_units(
                         ctx.scala,
-                        scala_ambiguous_owner_member_candidates(ctx, owners, member),
+                        scala_tied_owner_member_candidates(ctx, &tied, member),
                         Some(call_shape),
                         ScalaCallableSiteRole::Ordinary,
                     ));
@@ -9215,7 +9396,11 @@ fn scala_exact_subtype_relation(
                 stack.extend(ancestors);
                 incomplete = true;
             }
-            ScalaDirectAncestorResolution::Ambiguous => {
+            // A conformance question is about the whole hierarchy, not about
+            // one name in it, so the per-name reading of a tie (#2229) has
+            // nothing to offer here: an unknown supertype leaves the relation
+            // unproven either way.
+            ScalaDirectAncestorResolution::Ambiguous { .. } => {
                 return ScalaTypedCandidateMatch::Unknown;
             }
         }
@@ -9512,15 +9697,16 @@ fn scala_owner_declaration(ctx: ScalaLookupCtx<'_>, owner_fqn: &str) -> Option<C
     Some(owner.clone())
 }
 
-fn scala_ambiguous_owner_member_candidates(
+/// [`scala_tied_tier_declarations`] for the TERM namespace: what a tied
+/// supertype tier declares for one member name.
+fn scala_tied_owner_member_candidates(
     ctx: ScalaLookupCtx<'_>,
-    owners: Vec<CodeUnit>,
+    tied: &[CodeUnit],
     member: &str,
 ) -> Vec<CodeUnit> {
-    let mut candidates = owners
-        .into_iter()
-        .flat_map(|owner| scala_direct_member_candidate_units_for_owner(ctx, &owner, member))
-        .collect::<Vec<_>>();
+    let mut candidates = scala_tied_tier_declarations(tied, member, |owner, member| {
+        scala_direct_member_candidate_units_for_owner(ctx, owner, member)
+    });
     sort_units(&mut candidates);
     candidates.dedup();
     candidates
@@ -9543,32 +9729,35 @@ fn scala_exact_owner_member_candidate_units(
         return ScalaExactMemberResolution::Found(direct);
     }
 
-    let mut level = match ctx.direct_ancestor_details_for_owner(token, owner) {
-        ForwardScalaDirectAncestorResolution::Resolved(ancestors)
-        | ForwardScalaDirectAncestorResolution::Incomplete(ancestors) => ancestors,
-        ForwardScalaDirectAncestorResolution::Ambiguous(owners) => {
-            let candidates = scala_ambiguous_owner_member_candidates(ctx, owners, member);
-            return if candidates.is_empty() {
-                // no contenders: the tie is the SUPERTYPE name's, and none of
-                // the tied owners declares `member`, so no declaration of
-                // `member` was ever in hand (#2167).
-                ScalaExactMemberResolution::Ambiguous(Vec::new())
-            } else {
-                ScalaExactMemberResolution::Found(candidates)
-            };
-        }
+    let (mut level, mut tied) = match ctx.direct_ancestors_for_owner(token, owner) {
+        ScalaDirectAncestorResolution::Resolved(ancestors)
+        | ScalaDirectAncestorResolution::Incomplete(ancestors) => (ancestors, Vec::new()),
+        ScalaDirectAncestorResolution::Ambiguous {
+            resolved,
+            tied: ScalaTiedSupertypes::Named(tied),
+        } => (resolved, tied),
+        // no contenders: the tie is the SUPERTYPE name's and its declarations
+        // are unnamed here, so whether they declare `member` is unknowable
+        // (#2167).
+        ScalaDirectAncestorResolution::Ambiguous {
+            tied: ScalaTiedSupertypes::Unnamed,
+            ..
+        } => return ScalaExactMemberResolution::Ambiguous(Vec::new()),
     };
     if let Some(state) = member_trace.as_mut() {
         state.record_supertypes(ctx.scala, owner, &level);
     }
     let mut seen = HashSet::from_iter([owner.clone()]);
     let mut depth = 0_usize;
-    while !level.is_empty() {
+    while !level.is_empty() || !tied.is_empty() {
         depth += 1;
-        let mut matches = Vec::new();
+        // The tied declarations answer for THIS tier alongside its resolved
+        // supertypes, so a member one of them declares competes with -- and a
+        // member none of them declares does not stop -- the ordinary walk
+        // (#2229).
+        let mut matches = scala_tied_owner_member_candidates(ctx, &tied, member);
         let mut next = Vec::new();
-        let mut next_is_ambiguous = false;
-        let mut ambiguous_matches = Vec::new();
+        let mut next_tied = Vec::new();
         for ancestor in level {
             if !seen.insert(ancestor.clone()) {
                 continue;
@@ -9578,19 +9767,29 @@ fn scala_exact_owner_member_candidate_units(
                 state.record_found(ctx.scala, &found, &ancestor, depth);
             }
             matches.extend(found);
-            match ctx.direct_ancestor_details_for_owner(token, &ancestor) {
-                ForwardScalaDirectAncestorResolution::Resolved(ancestors)
-                | ForwardScalaDirectAncestorResolution::Incomplete(ancestors) => {
+            match ctx.direct_ancestors_for_owner(token, &ancestor) {
+                ScalaDirectAncestorResolution::Resolved(ancestors)
+                | ScalaDirectAncestorResolution::Incomplete(ancestors) => {
                     if let Some(state) = member_trace.as_mut() {
                         state.record_supertypes(ctx.scala, &ancestor, &ancestors);
                     }
                     next.extend(ancestors);
                 }
-                ForwardScalaDirectAncestorResolution::Ambiguous(owners) => {
-                    next_is_ambiguous = true;
-                    ambiguous_matches
-                        .extend(scala_ambiguous_owner_member_candidates(ctx, owners, member));
+                ScalaDirectAncestorResolution::Ambiguous {
+                    resolved,
+                    tied: ScalaTiedSupertypes::Named(tied),
+                } => {
+                    if let Some(state) = member_trace.as_mut() {
+                        state.record_supertypes(ctx.scala, &ancestor, &resolved);
+                    }
+                    next.extend(resolved);
+                    next_tied.extend(tied);
                 }
+                // no contenders: see the direct-ancestor arm above.
+                ScalaDirectAncestorResolution::Ambiguous {
+                    tied: ScalaTiedSupertypes::Unnamed,
+                    ..
+                } => return ScalaExactMemberResolution::Ambiguous(Vec::new()),
             }
         }
         sort_units(&mut matches);
@@ -9599,25 +9798,15 @@ fn scala_exact_owner_member_candidate_units(
             if let Some(state) = member_trace.as_ref() {
                 state.stage_selection(&matches);
             }
-            // Each ancestor path was already resolved to one exact physical
-            // declaration. Distinct resolved traits at the same inheritance
-            // depth are a legitimate Scala conflict, so definition lookup
-            // returns every declaration and lets the client present the
-            // alternatives. Name/import or duplicate-physical-owner
-            // ambiguity is rejected earlier by the bounded ancestor resolver.
+            // Distinct traits at the same inheritance depth are a legitimate
+            // Scala conflict, so definition lookup returns every declaration
+            // and lets the client present the alternatives. That is also the
+            // right answer for a tier whose tied declarations both declare the
+            // member: the site's contenders are those declarations (#2229).
             return ScalaExactMemberResolution::Found(matches);
         }
-        if next_is_ambiguous {
-            sort_units(&mut ambiguous_matches);
-            ambiguous_matches.dedup();
-            return if ambiguous_matches.is_empty() {
-                // no contenders: see the direct-ancestor arm above.
-                ScalaExactMemberResolution::Ambiguous(Vec::new())
-            } else {
-                ScalaExactMemberResolution::Found(ambiguous_matches)
-            };
-        }
         level = next;
+        tied = next_tied;
     }
 
     if include_companion && !owner.fq_name().ends_with('$') {
@@ -10760,8 +10949,8 @@ fn scala_ancestor_owners(
     let mut discovered = HashSet::from_iter([owner.fq_name()]);
     let mut ancestors = Vec::new();
     while let Some((current, depth)) = queue.pop_front() {
-        let (ForwardScalaDirectAncestorResolution::Resolved(direct)
-        | ForwardScalaDirectAncestorResolution::Incomplete(direct)) =
+        let (ScalaDirectAncestorResolution::Resolved(direct)
+        | ScalaDirectAncestorResolution::Incomplete(direct)) =
             scala_forward_direct_ancestor_resolution(scala, token, support, &current)
         else {
             break;
@@ -10787,9 +10976,9 @@ fn scala_forward_direct_ancestor_resolution(
     token: QueryToken<'_>,
     support: &dyn BoundedDefinitionLookup,
     owner: &CodeUnit,
-) -> ForwardScalaDirectAncestorResolution {
+) -> ScalaDirectAncestorResolution {
     let Some(facts) = scala.forward_owner_facts(owner) else {
-        return ForwardScalaDirectAncestorResolution::Resolved(Vec::new());
+        return ScalaDirectAncestorResolution::Resolved(Vec::new());
     };
     let resolver = scala_name_resolver_for_unit(scala, token, support, owner);
     let mut ancestors = Vec::new();
@@ -10801,18 +10990,24 @@ fn scala_forward_direct_ancestor_resolution(
     // while incompleteness must not, or one unindexed library type silences
     // every member and type lookup made from inside the class (#1849, #1851).
     let mut unindexed_supertype = false;
+    // One tied supertype does not erase the tier's other supertypes. They still
+    // declare what they declare, and a name one of them supplies must beat -- or
+    // tie with -- whatever the tied declarations supply, so the whole tier
+    // travels with the verdict and the tie is decided per name (#2229).
+    //
+    // One entry per tied path. A resolver verdict of `Ambiguous` with no owners
+    // is the wildcard-import environment saying it cannot name what collided,
+    // so an empty entry is an UNNAMED tie: no walk can decide it per name, and
+    // one of them makes the whole tier unnamed.
+    let mut ties: Vec<Vec<CodeUnit>> = Vec::new();
     for path in facts.supertype_lookup_paths {
         let identity = match resolver
             .resolve_explicit_owner_segments(path.segments(), ScalaOwnerKind::Class)
         {
             ScalaNameResolution::Resolved(identity) => identity,
             ScalaNameResolution::Ambiguous(owners) => {
-                return ForwardScalaDirectAncestorResolution::Ambiguous(
-                    owners
-                        .into_iter()
-                        .map(|identity| identity._declaration)
-                        .collect(),
-                );
+                ties.push(scala_owner_declarations(owners));
+                continue;
             }
             ScalaNameResolution::MissingExplicitImport => continue,
             ScalaNameResolution::Unresolved => {
@@ -10841,23 +11036,15 @@ fn scala_forward_direct_ancestor_resolution(
                             // indexed declaration and this source does not
                             // single one out. The workspace holds the
                             // supertype; it cannot say which one.
-                            return ForwardScalaDirectAncestorResolution::Ambiguous(
-                                ambiguous
-                                    .into_iter()
-                                    .map(|identity| identity._declaration)
-                                    .collect(),
-                            );
+                            ties.push(scala_owner_declarations(ambiguous));
+                            continue;
                         };
                         ancestors.push(ancestor.clone());
                         continue;
                     }
                     ScalaNameResolution::Ambiguous(owners) => {
-                        return ForwardScalaDirectAncestorResolution::Ambiguous(
-                            owners
-                                .into_iter()
-                                .map(|identity| identity._declaration)
-                                .collect(),
-                        );
+                        ties.push(scala_owner_declarations(owners));
+                        continue;
                     }
                     ScalaNameResolution::MissingExplicitImport => continue,
                     ScalaNameResolution::Unresolved => {
@@ -10871,10 +11058,29 @@ fn scala_forward_direct_ancestor_resolution(
     }
     sort_units(&mut ancestors);
     ancestors.dedup();
+    if !ties.is_empty() {
+        if ties.iter().any(Vec::is_empty) {
+            return ScalaDirectAncestorResolution::Ambiguous {
+                resolved: ancestors,
+                tied: ScalaTiedSupertypes::Unnamed,
+            };
+        }
+        let mut tied = ties.concat();
+        sort_units(&mut tied);
+        tied.dedup();
+        debug_assert!(
+            tied.len() > 1,
+            "a named supertype tie is a choice between declarations, got {tied:?}"
+        );
+        return ScalaDirectAncestorResolution::Ambiguous {
+            resolved: ancestors,
+            tied: ScalaTiedSupertypes::Named(tied),
+        };
+    }
     if unindexed_supertype {
-        ForwardScalaDirectAncestorResolution::Incomplete(ancestors)
+        ScalaDirectAncestorResolution::Incomplete(ancestors)
     } else {
-        ForwardScalaDirectAncestorResolution::Resolved(ancestors)
+        ScalaDirectAncestorResolution::Resolved(ancestors)
     }
 }
 
@@ -12208,19 +12414,30 @@ fn scala_exact_owner_namespace_children(
         return ScalaExactMemberResolution::Found(direct);
     }
 
-    let mut level = match ctx.direct_ancestors_for_owner(token, owner) {
+    let (mut level, mut tied) = match ctx.direct_ancestors_for_owner(token, owner) {
         ScalaDirectAncestorResolution::Resolved(ancestors)
-        | ScalaDirectAncestorResolution::Incomplete(ancestors) => ancestors,
-        // no contenders: the tie is the SUPERTYPE name's, so no declaration of
-        // `name` was ever in hand (#2167).
-        ScalaDirectAncestorResolution::Ambiguous => {
+        | ScalaDirectAncestorResolution::Incomplete(ancestors) => (ancestors, Vec::new()),
+        ScalaDirectAncestorResolution::Ambiguous {
+            resolved,
+            tied: ScalaTiedSupertypes::Named(tied),
+        } => (resolved, tied),
+        // no contenders: the tie is the SUPERTYPE name's and its declarations
+        // are unnamed here, so no declaration of `name` was ever in hand
+        // (#2167).
+        ScalaDirectAncestorResolution::Ambiguous {
+            tied: ScalaTiedSupertypes::Unnamed,
+            ..
+        } => {
             return ScalaExactMemberResolution::Ambiguous(Vec::new());
         }
     };
     let mut seen = HashSet::from_iter([owner.clone()]);
-    while !level.is_empty() {
-        let mut matches = Vec::new();
+    while !level.is_empty() || !tied.is_empty() {
+        let mut matches = scala_tied_tier_declarations(&tied, name, |owner, member| {
+            scala_exact_direct_namespace_children(ctx, owner, member, None)
+        });
         let mut next = Vec::new();
+        let mut next_tied = Vec::new();
         for ancestor in level {
             if !seen.insert(ancestor.clone()) {
                 continue;
@@ -12231,8 +12448,18 @@ fn scala_exact_owner_namespace_children(
             match ctx.direct_ancestors_for_owner(token, &ancestor) {
                 ScalaDirectAncestorResolution::Resolved(ancestors)
                 | ScalaDirectAncestorResolution::Incomplete(ancestors) => next.extend(ancestors),
+                ScalaDirectAncestorResolution::Ambiguous {
+                    resolved,
+                    tied: ScalaTiedSupertypes::Named(tied),
+                } => {
+                    next.extend(resolved);
+                    next_tied.extend(tied);
+                }
                 // no contenders: see the direct-ancestor arm above.
-                ScalaDirectAncestorResolution::Ambiguous => {
+                ScalaDirectAncestorResolution::Ambiguous {
+                    tied: ScalaTiedSupertypes::Unnamed,
+                    ..
+                } => {
                     return ScalaExactMemberResolution::Ambiguous(Vec::new());
                 }
             }
@@ -12243,6 +12470,7 @@ fn scala_exact_owner_namespace_children(
             return ScalaExactMemberResolution::Found(matches);
         }
         level = next;
+        tied = next_tied;
     }
     ScalaExactMemberResolution::NoMatch
 }
@@ -12401,9 +12629,14 @@ fn scala_enclosing_type_fqn(
     }
     let owner = scala_enclosing_class(ctx.analyzer, ctx.support, ctx.file, reference_byte)?;
     let candidate = format!("{}.{simple}", owner.fq_name());
+    // A type alias is a `Class` unit too (#2878), but naming one here would
+    // report the alias itself as the annotation's owner, and this path has no
+    // way to follow the alias to what it stands for. Declining it keeps the
+    // annotation unresolved, which is what lets a `val`'s initializer supply
+    // the receiver type.
     ctx.analyzer
         .definitions(&candidate)
-        .any(|unit| unit.is_class())
+        .any(|unit| unit.is_class() && !ctx.scala.is_type_alias(&unit))
         .then_some(candidate)
 }
 
@@ -12582,18 +12815,15 @@ fn scala_enclosing_member_shadows_bare_call(
         session: None,
     };
     match scala_exact_owner_member_candidate_units(ctx, token, &owner, name, false) {
-        ScalaExactMemberResolution::Found(candidates) => candidates.into_iter().any(|unit| {
-            !unit.is_synthetic()
-                && (unit.is_function() || scala_has_term_field_declaration(scala, &unit))
-        }),
+        // A bare call is shadowed by an enclosing member only when that member
+        // is a term: a function, or a field. Since #2878 a Scala type alias is
+        // a `Class`, so `is_field` alone answers the term-namespace question.
+        ScalaExactMemberResolution::Found(candidates) => candidates
+            .into_iter()
+            .any(|unit| !unit.is_synthetic() && (unit.is_function() || unit.is_field())),
         ScalaExactMemberResolution::Ambiguous(_) => true,
         ScalaExactMemberResolution::NoMatch => false,
     }
-}
-
-fn scala_has_term_field_declaration(scala: &ScalaAnalyzer, unit: &CodeUnit) -> bool {
-    unit.is_field()
-        && (!scala.is_type_alias(unit) || scala.signatures(unit).into_iter().nth(1).is_some())
 }
 
 fn scala_imported_member_shadows_bare_call(

@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "pack_id": "bifrost.scala.case-class",
   "version": "1.0.0",
   "producer": { "name": "bifrost", "version": "0.8.21" },

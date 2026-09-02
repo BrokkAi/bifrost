@@ -1130,7 +1130,51 @@ fn a_group_key_that_is_not_a_column_is_rejected() {
         Err(RelationalAssertionPlanError::UnknownField {
             binding: "arg".to_string(),
             field: "source_range".to_string(),
+            known_fields: DOMAIN
+                .row_fields()
+                .iter()
+                .map(|field| field.name.to_string())
+                .collect(),
         })
+    );
+}
+
+/// The unknown-field diagnostic must publish the complete alternative set and
+/// the flag that prints the whole catalog (issue #2517). A misspelled column is
+/// the most common relational authoring mistake, and the author has no other
+/// way to see the binding's columns at the point of failure.
+#[test]
+fn an_unknown_field_names_every_column_the_binding_carries() {
+    let arg = source(0, "arg");
+    let mut grouped = group(
+        1,
+        "by-site",
+        &arg,
+        vec![column("arg", "site_id")],
+        vec![fold("by-site", "calls", IrAggregateOp::Count, None)],
+    );
+    let IrRelationOp::Group { by, .. } = &mut grouped.op else {
+        panic!("the relation under test is a group");
+    };
+    by[0] = column("arg", "argument_indices");
+    let assert = assertion("calls", &grouped, "calls", AssertCardinality::AtMost(0));
+    let message = validate_plan_ir(&plan(vec![arg, grouped], vec![assert]))
+        .expect_err("`argument_indices` is not a call-argument column")
+        .to_string();
+    assert!(
+        message.starts_with("unknown field `arg.argument_indices`; `arg` has fields: "),
+        "{message}"
+    );
+    for field in DOMAIN.row_fields() {
+        assert!(
+            message.contains(field.name),
+            "{message} omits {}",
+            field.name
+        );
+    }
+    assert!(
+        message.ends_with("see `bifrost --list-row-schemas`"),
+        "{message}"
     );
 }
 

@@ -423,6 +423,16 @@ pub struct StableValueCarrier {
     pub digest: StableDigest,
     pub projection: Box<str>,
 }
+impl StableValueCarrier {
+    /// Build a carrier whose digest is bound to the exact projection text at
+    /// the construction point, so a mismatched digest cannot be persisted.
+    pub fn new(projection: &str) -> Result<Self, RelationCodecError> {
+        Ok(Self {
+            digest: value_carrier_digest(projection)?,
+            projection: projection.into(),
+        })
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -465,6 +475,89 @@ pub enum ValueDependenceMayStatus {
     Unproven,
 }
 
+/// Why a value-dependence edge's transfer creates a distinct identity.
+///
+/// Every kind gives the target its own storage/object identity while the
+/// edge itself still carries ordinary value dependence on the source. No
+/// kind implies storage aliasing: access-path and heap walks must stop at a
+/// transfer rather than read it as an alias.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ValueTransferKind {
+    /// The value is duplicated; the source is unaffected.
+    Copy,
+    /// A whole aggregate value is copied into independent element storage.
+    /// The copied element contents are not carried by this edge.
+    AggregateCopy,
+    /// The value (and, where the language defines it, ownership) moves to
+    /// the target and the source stops holding it.
+    Move { invalidation: ValueMoveInvalidation },
+    /// The target holds a converted form of the source's value.
+    Conversion {
+        preservation: ValueConversionPreservation,
+    },
+    /// The source value is wrapped into a distinct container object.
+    Boxing,
+    /// The contained value is extracted out of a container object.
+    Unboxing,
+}
+
+/// What a move leaves behind in the source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ValueMoveInvalidation {
+    /// The source no longer holds the relevant value after the transfer.
+    Invalidated,
+    /// The producer cannot state what the source holds afterward. The edge's
+    /// own proof and completeness must not claim proven, complete knowledge.
+    Unknown,
+}
+
+/// Whether a conversion preserves the relevant value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ValueConversionPreservation {
+    /// The target holds the identical value in an identical representation.
+    Identity,
+    /// The representation changes but the relevant value is preserved.
+    Preserving,
+    /// The relevant value is not preserved (narrowing, lossy,
+    /// reinterpreting).
+    Changing,
+}
+
+/// The exact operation shape the producer selected for a transfer.
+///
+/// The callable identity of a call-site operation is deliberately not
+/// duplicated here: a stable digest names the exact call occurrence, its span
+/// locates that occurrence in source, and dispatch facts for the occurrence
+/// are their own query. There is no name-based or display-string form of
+/// operation identity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ValueTransferOperation {
+    /// No distinct operation runs (a trivial or bitwise transfer).
+    None,
+    /// The selected operation is the procedure invoked at this call site.
+    CallSite {
+        /// Durable identity of the exact call occurrence. The selected
+        /// callable remains owned by the dispatch relation for this site.
+        id: StableDigest,
+        span: SourceSpan,
+    },
+    /// An operation runs but was not selected exactly. The edge's own proof
+    /// and completeness must not claim proven, complete knowledge.
+    Unknown,
+}
+
+/// The identity-separating transfer one value-dependence edge carries.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ValueTransfer {
+    pub kind: ValueTransferKind,
+    pub operation: ValueTransferOperation,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SemanticRelationDetail {
@@ -474,6 +567,11 @@ pub enum SemanticRelationDetail {
         source: ValueOccurrence,
         target: ValueOccurrence,
         may: ValueDependenceMayStatus,
+        /// Exact transfer semantics when the edge was projected from an
+        /// identity-separating by-value transfer. Ordinary dependencies
+        /// carry `None`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        transfer: Option<ValueTransfer>,
     },
 }
 
@@ -700,6 +798,7 @@ impl SemanticRelationSnapshot {
                 subtypes,
                 source,
                 target,
+                transfer,
                 ..
             } = &edge.detail
             {
@@ -716,6 +815,16 @@ impl SemanticRelationSnapshot {
                 for carrier in [&source.carrier, &target.carrier] {
                     if carrier.digest != value_carrier_digest(&carrier.projection)? {
                         return Err(RelationCodecError::new("value carrier digest mismatch"));
+                    }
+                }
+                if let Some(transfer) = transfer {
+                    if subtypes.as_ref() != [ValueDependenceSubtype::Assignment] {
+                        return Err(RelationCodecError::new(
+                            "transfer metadata requires an assignment value dependence",
+                        ));
+                    }
+                    if let ValueTransferOperation::CallSite { span, .. } = &transfer.operation {
+                        span.validate().map_err(RelationCodecError::new)?;
                     }
                 }
             } else if edge.kind == SemanticRelationKind::ValueDependence {

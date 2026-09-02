@@ -1,0 +1,291 @@
+{
+  "documentType": "semantic-document",
+  "schema": "https://csmi.brokk.ai/schema/0.1/schema.json",
+  "semanticModelVersion": "0.1",
+  "serializationVersion": "0.1-json",
+  "provenanceRecords": [
+    {
+      "id": "profile-fixture",
+      "producer": {
+        "identifier": "https://csmi.brokk.ai/conformance/javascript-typescript-node",
+        "version": "0.1.0"
+      },
+      "generationMethod": "manual-authoring"
+    }
+  ],
+  "defaultProvenance": "profile-fixture",
+  "semanticModels": [
+    {
+      "artifactSelectors": [
+        {
+          "purl": "pkg:generic/nodejs.org/node@22.11.0",
+          "digests": [
+            {
+              "algorithm": "sha-256",
+              "coverage": "official-distribution-archive",
+              "value": "1111111111111111111111111111111111111111111111111111111111111111"
+            }
+          ]
+        }
+      ],
+      "vocabularyUses": [
+        {
+          "identifier": "csmi.javascript-typescript",
+          "version": "0.1.0",
+          "schema": "https://csmi.brokk.ai/schema/profiles/javascript-typescript/0.1/schema.json",
+          "requirement": "required",
+          "affects": [
+            {
+              "kind": "attachment",
+              "attachmentPoint": "module-binding",
+              "target": { "symbol": "exec-sync-runtime" }
+            },
+            {
+              "kind": "core-slot",
+              "slot": "symbol-identity-scheme",
+              "target": { "symbol": "exec-sync-declaration" }
+            },
+            {
+              "kind": "core-slot",
+              "slot": "symbol-identity-scheme",
+              "target": { "symbol": "exec-sync-runtime" }
+            },
+            {
+              "kind": "fact-family",
+              "family": "runtime-declaration-bindings",
+              "scope": { "runtimeSymbol": "exec-sync-runtime" }
+            }
+          ]
+        }
+      ],
+      "symbols": [
+        {
+          "id": "exec-sync-declaration",
+          "artifactSelectors": [
+            { "purl": "pkg:npm/%40types/node@22.10.2" }
+          ],
+          "scheme": "csmi.typescript-declaration",
+          "schemeVersion": "0.1.0",
+          "stability": "portable",
+          "descriptors": [
+            { "role": "namespace", "name": "node:child_process" },
+            {
+              "role": "callable",
+              "name": "execSync",
+              "disambiguator": "tsig-0.1:UcyKSoEeNxSKiNWAk6kDEX8tU60W9MwepnMOMlAJZNY"
+            }
+          ]
+        },
+        {
+          "id": "exec-sync-runtime",
+          "scheme": "csmi.javascript-runtime",
+          "schemeVersion": "0.1.0",
+          "stability": "portable",
+          "descriptors": [
+            { "role": "namespace", "name": "node:child_process" },
+            { "role": "callable", "name": "execSync" }
+          ],
+          "extensions": [
+            {
+              "vocabulary": "csmi.javascript-typescript",
+              "version": "0.1.0",
+              "payload": {
+                "kind": "module-binding",
+                "canonicalModule": "node:child_process",
+                "exportName": "execSync",
+                "acceptedSpecifiers": [
+                  { "form": "commonjs-property", "value": "child_process" },
+                  { "form": "commonjs-property", "value": "node:child_process" },
+                  { "form": "esm-named", "value": "child_process" },
+                  { "form": "esm-named", "value": "node:child_process" }
+                ]
+              }
+            }
+          ]
+        }
+      ],
+      "declarations": [
+        {
+          "symbol": "exec-sync-declaration",
+          "category": "callable"
+        },
+        {
+          "symbol": "exec-sync-runtime",
+          "category": "callable",
+          "callable": {
+            "kind": "function",
+            "parameters": [
+              {
+                "position": 0,
+                "binding": "positional-only",
+                "required": true
+              },
+              {
+                "position": 1,
+                "binding": "positional-only",
+                "required": false
+              }
+            ],
+            "results": [
+              { "position": 0, "type": { "kind": "unknown" } }
+            ]
+          }
+        }
+      ],
+      "procedureSummaries": [
+        {
+          "callable": "exec-sync-runtime",
+          "transfers": [
+            {
+              "source": {
+                "root": {
+                  "phase": "input",
+                  "role": "parameter",
+                  "position": 0
+                }
+              },
+              "destination": {
+                "root": {
+                  "phase": "output",
+                  "role": "result",
+                  "position": 0
+                }
+              }
+            }
+          ]
+        }
+      ],
+      "extensionFacts": [
+        {
+          "vocabulary": "csmi.javascript-typescript",
+          "version": "0.1.0",
+          "family": "runtime-declaration-bindings",
+          "scope": { "runtimeSymbol": "exec-sync-runtime" },
+          "payload": {
+            "kind": "runtime-declaration-binding",
+            "runtimeSymbol": "exec-sync-runtime",
+            "declarationSymbols": ["exec-sync-declaration"],
+            "relation": "describes-runtime-binding"
+          }
+        }
+      ],
+      "completenessStatements": [
+        {
+          "family": "procedure-summaries",
+          "scope": { "callable": "exec-sync-runtime" },
+          "status": "partial",
+          "limitations": [
+            { "kind": "coverage-limited" }
+          ]
+        },
+        {
+          "vocabulary": "csmi.javascript-typescript",
+          "version": "0.1.0",
+          "family": "runtime-declaration-bindings",
+          "scope": { "runtimeSymbol": "exec-sync-runtime" },
+          "status": "partial",
+          "limitations": [
+            { "kind": "coverage-limited" }
+          ]
+        }
+      ]
+    },
+    {
+      "artifactSelectors": [
+        { "purl": "pkg:npm/example-dual-package@4.2.0" }
+      ],
+      "compatibilityConstraints": [
+        {
+          "vocabulary": "csmi.node-compatibility",
+          "version": "0.1.0",
+          "value": {
+            "kind": "node-runtime",
+            "versionInterval": {
+              "minimum": { "version": "20.0.0", "inclusive": true },
+              "maximum": { "version": "23.0.0", "inclusive": false }
+            }
+          }
+        },
+        {
+          "vocabulary": "csmi.node-compatibility",
+          "version": "0.1.0",
+          "value": {
+            "kind": "node-module-resolution",
+            "moduleSystem": "esm",
+            "packageExport": ".",
+            "conditions": ["import", "node"],
+            "resolvedTargetDigest": "2222222222222222222222222222222222222222222222222222222222222222"
+          }
+        },
+        {
+          "vocabulary": "csmi.node-compatibility",
+          "version": "0.1.0",
+          "value": {
+            "kind": "typescript-resolution",
+            "compilerVersionInterval": {
+              "minimum": { "version": "5.7.0", "inclusive": true },
+              "maximum": { "version": "5.9.0", "inclusive": false }
+            },
+            "moduleResolution": "nodenext",
+            "moduleKind": "nodenext",
+            "conditions": ["types"],
+            "effectiveOptionsDigest": "3333333333333333333333333333333333333333333333333333333333333333"
+          }
+        }
+      ],
+      "vocabularyUses": [
+        {
+          "identifier": "csmi.javascript-typescript",
+          "version": "0.1.0",
+          "schema": "https://csmi.brokk.ai/schema/profiles/javascript-typescript/0.1/schema.json",
+          "requirement": "required",
+          "affects": [
+            {
+              "kind": "core-slot",
+              "slot": "symbol-identity-scheme",
+              "target": { "symbol": "normalize-esm" }
+            }
+          ]
+        },
+        {
+          "identifier": "csmi.node-compatibility",
+          "version": "0.1.0",
+          "schema": "https://csmi.brokk.ai/schema/profiles/node-compatibility/0.1/schema.json",
+          "requirement": "required",
+          "affects": [
+            {
+              "kind": "core-slot",
+              "slot": "artifact-compatibility",
+              "target": { "semanticModel": "current" }
+            }
+          ]
+        }
+      ],
+      "symbols": [
+        {
+          "id": "normalize-esm",
+          "scheme": "csmi.javascript-runtime",
+          "schemeVersion": "0.1.0",
+          "stability": "portable",
+          "descriptors": [
+            { "role": "namespace", "name": "." },
+            { "role": "callable", "name": "normalize" }
+          ]
+        }
+      ],
+      "declarations": [
+        {
+          "symbol": "normalize-esm",
+          "category": "callable"
+        }
+      ],
+      "completenessStatements": [
+        {
+          "family": "declaration-aspects",
+          "scope": { "symbol": "normalize-esm", "aspect": "callable-shape" },
+          "status": "unknown"
+        }
+      ]
+    }
+  ]
+}

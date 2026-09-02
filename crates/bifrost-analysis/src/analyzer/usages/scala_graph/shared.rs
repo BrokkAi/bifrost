@@ -3,8 +3,9 @@ use super::inverted::{
 };
 use crate::analyzer::usages::common::language_for_file;
 use crate::analyzer::usages::inverted_edges::{
-    ClassRangeIndex, EdgeNodeDomain, UsageEdgeBuildOutput, UsageEdgeWeights, UsageEdges,
-    build_edge_output, build_file_declarations_from_declaration_ranges_filtered,
+    ClassRangeIndex, EdgeNodeDomain, UsageEdgeBuildOutput, UsageEdgeBuildResult, UsageEdgeWeights,
+    UsageEdges, build_edge_output, build_edge_output_with_completeness,
+    build_file_declarations_from_declaration_ranges_filtered,
     class_range_index_from_declaration_ranges,
     parse_source_and_collect_with_declarations_and_domain,
 };
@@ -60,6 +61,38 @@ where
         // Synthetic anonymous classes are not public graph nodes. Do not let
         // their ranges hide references from the enclosing callable. Their
         // named members remain eligible callers through their own ranges.
+        let declarations = build_file_declarations_from_declaration_ranges_filtered(
+            &state.declarations,
+            &state.ranges,
+            |unit| !(unit.is_class() && unit.is_synthetic()),
+        );
+        let class_ranges =
+            class_range_index_from_declaration_ranges(&state.declarations, &state.ranges);
+        parse_source_and_collect_with_declarations_and_domain(
+            graph.types.source_for_file(scala, file)?,
+            file,
+            domain,
+            ParseSpec::whole(&language),
+            declarations,
+            |input| scan_edge_file(scala, token, &graph.types, file, state, class_ranges, input),
+        )
+    })
+}
+
+fn build_scala_edges_with_completeness<Output, F>(
+    scala: &ScalaAnalyzer,
+    token: QueryToken<'_>,
+    graph: &ScalaEdgeGraph,
+    domain: EdgeNodeDomain<'_>,
+    keep_file: F,
+) -> UsageEdgeBuildResult<Output>
+where
+    Output: UsageEdgeBuildOutput<String>,
+    F: Fn(&ProjectFile) -> bool + Sync,
+{
+    let language = brokk_bifrost_jvm::scala::language::LANGUAGE.into();
+    build_edge_output_with_completeness(&graph.files, keep_file, |file| {
+        let state = graph.types.bulk_file_state(file)?;
         let declarations = build_file_declarations_from_declaration_ranges_filtered(
             &state.declarations,
             &state.ranges,
@@ -486,17 +519,17 @@ impl<'a> ScalaEdgeResolver<'a> {
         )
     }
 
-    pub(crate) fn build_inbound_edges<F>(
+    pub(crate) fn build_inbound_edges_with_completeness<F>(
         &self,
         _analyzer: &dyn IAnalyzer,
         token: QueryToken<'_>,
         callees: &HashSet<String>,
         keep_file: F,
-    ) -> UsageEdges
+    ) -> UsageEdgeBuildResult<UsageEdges>
     where
         F: Fn(&ProjectFile) -> bool + Sync,
     {
-        build_scala_edges(
+        build_scala_edges_with_completeness(
             self.scala,
             token,
             &self.graph,

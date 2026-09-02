@@ -545,6 +545,15 @@ fn policy_definition_to_json(definition: &PolicyDefinition) -> Value {
         "analysis",
         policy_analysis_to_json(&definition.analysis),
     );
+    // Omitted when the policy did not declare it, and when it declared the
+    // default. Either way the projection -- and therefore the semantic hash --
+    // of every policy authored before the record existed is unchanged.
+    insert_option(
+        &mut object,
+        "on_unknown",
+        (definition.on_unknown.verdict != UnknownVerdict::Abstain)
+            .then(|| json!({ "verdict": definition.on_unknown.verdict.label() })),
+    );
     insert_option(
         &mut object,
         "classification",
@@ -2612,6 +2621,7 @@ mod tests {
                         selector: inline_selector(),
                     },
                 },
+                on_unknown: OnUnknownSpec::default(),
                 classification: None,
                 report: PolicyReportOptions::default(),
             }),
@@ -2760,6 +2770,7 @@ mod tests {
                         finding_combinations: vec![],
                     },
                 },
+                on_unknown: OnUnknownSpec::default(),
                 classification: None,
                 report: PolicyReportOptions::default(),
             }),
@@ -2883,6 +2894,7 @@ mod tests {
                         },
                     },
                 },
+                on_unknown: OnUnknownSpec::default(),
                 classification: None,
                 report: PolicyReportOptions::default(),
             }),
@@ -3067,6 +3079,7 @@ mod tests {
                     selector: inline_selector(),
                 },
             },
+            on_unknown: OnUnknownSpec::default(),
             classification: Some(PolicyClassificationSpec {
                 fallback: TaxonomyClassificationSpec {
                     taxonomy: "Bifrost".to_string(),
@@ -3387,5 +3400,96 @@ mod tests {
             )),
             "a projected column rename is semantic content"
         );
+    }
+
+    /// The subject every origin-shape variant below shares: a call written
+    /// under a loop, with both nodes captured.
+    fn origin_shape_policy(asserts: &str) -> String {
+        format!(
+            r#"(policy
+  :id "test.origin-shape.canonical"
+  :name "Origin shape canonical"
+  :message "M"
+  :severity note
+  :analysis (analysis
+    :type assertion
+    :subject (rql (inside-decl (loop :capture "region")
+                               (call :callee (name "open") :capture "smell")))
+    :asserts [{asserts}]))"#
+        )
+    }
+
+    /// A document that predates the origin-shape record (#2647), used both as
+    /// the "unchanged" pin and as the base every variant is compared against.
+    const PRE_ORIGIN_SHAPE_ASSERT: &str = r#"(assert-value-origin :id base :at "smell" :role value_reference :established outside :relative-to "region")"#;
+
+    /// The semantic hash is the finding identity, the baseline key, and the
+    /// suppression key. Adding the origin-shape record must therefore be
+    /// invisible to documents that do not use it, and every field of it that
+    /// changes what the assert means must move the hash of documents that do.
+    #[test]
+    fn the_origin_shape_record_is_hash_sensitive_and_leaves_other_documents_alone() {
+        // Pinned before the record existed: a document that uses none of the
+        // new vocabulary must project exactly the bytes it always projected.
+        let untouched = origin_shape_policy(PRE_ORIGIN_SHAPE_ASSERT);
+        assert_eq!(
+            canonical_semantic_bytes(&untouched).len(),
+            642,
+            "the canonical projection of a document without the origin-shape record changed length"
+        );
+        assert_eq!(
+            canonical_semantic_sha256(&untouched),
+            "1fb3c8a0d8fd70f36173f26e2ae6c782645060de3541d72502a44c921f110354",
+            "the canonical projection of a document without the origin-shape record moved"
+        );
+
+        let with_record = |max_elements: u32| {
+            origin_shape_policy(&format!(
+                r#"(assert-origin-shape :id small :at "region" :anchor "smell" :role value_reference :shape collection-literal :max-elements {max_elements})"#
+            ))
+        };
+        let eight = with_record(8);
+        assert_ne!(
+            canonical_semantic_sha256(&eight),
+            canonical_semantic_sha256(&untouched),
+            "the origin-shape record is semantic content, not decoration"
+        );
+        assert_ne!(
+            canonical_semantic_sha256(&eight),
+            canonical_semantic_sha256(&with_record(9)),
+            "`:max-elements` decides which loops the assert excludes, so it must move the hash"
+        );
+
+        // The projected object is what the digest is taken over, so name the
+        // keys a future reader would have to account for.
+        let parsed = crate::parse_rqlp_source(
+            &eight,
+            crate::PolicySourceIdentity::new("test:origin-shape-canonical"),
+        )
+        .expect("the origin-shape policy parses");
+        let value = parsed
+            .document()
+            .to_inline_local_canonical_semantic_json()
+            .expect("an inline assertion policy is a closed document");
+        let assertion = value
+            .pointer("/analysis/asserts/0")
+            .and_then(Value::as_object)
+            .expect("an assertion analysis projects its asserts");
+        assert_eq!(
+            assertion.keys().map(String::as_str).collect::<Vec<_>>(),
+            vec![
+                "anchor",
+                "at",
+                "id",
+                "kind",
+                "max_elements",
+                "role",
+                "shape"
+            ],
+            "the origin-shape projection publishes exactly its decoded fields"
+        );
+        assert_eq!(assertion["kind"], json!("origin_shape"));
+        assert_eq!(assertion["max_elements"], json!(8));
+        assert_eq!(assertion["shape"], json!("collection-literal"));
     }
 }

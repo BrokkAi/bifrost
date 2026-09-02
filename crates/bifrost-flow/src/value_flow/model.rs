@@ -198,6 +198,10 @@ fn same_path(left: &AccessPath, right: &AccessPath) -> bool {
                     AccessSelector::Index(IndexSelector::Exact(right)),
                 ) => same_value(left, right),
                 (
+                    AccessSelector::Index(IndexSelector::Constant(left)),
+                    AccessSelector::Index(IndexSelector::Constant(right)),
+                ) => left == right,
+                (
                     AccessSelector::Index(IndexSelector::Any),
                     AccessSelector::Index(IndexSelector::Any),
                 ) => true,
@@ -297,6 +301,7 @@ impl ValueFlowCarrierKey {
                                 total = total.saturating_add(std::mem::size_of::<Self>());
                                 stack.push(key);
                             }
+                            ValueFlowSelectorKey::ConstantIndex(_) => {}
                             ValueFlowSelectorKey::AnyIndex => {}
                         }
                     }
@@ -330,6 +335,7 @@ pub enum ValueFlowScopedRootKind {
 pub enum ValueFlowSelectorKey {
     Field(SemanticLocator),
     ExactIndex(Box<ValueFlowCarrierKey>),
+    ConstantIndex(u128),
     AnyIndex,
 }
 
@@ -649,6 +655,9 @@ fn selector_key(selector: &AccessSelector) -> Result<ValueFlowSelectorKey, Value
         AccessSelector::Index(IndexSelector::Exact(index)) => Ok(ValueFlowSelectorKey::ExactIndex(
             Box::new(value_key(index)?),
         )),
+        AccessSelector::Index(IndexSelector::Constant(index)) => {
+            Ok(ValueFlowSelectorKey::ConstantIndex(*index))
+        }
         AccessSelector::Index(IndexSelector::Any) => Ok(ValueFlowSelectorKey::AnyIndex),
     }
 }

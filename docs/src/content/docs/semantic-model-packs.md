@@ -252,6 +252,18 @@ declaration row's exact dot-qualified `fq_name`, with the authored
 `has_receiver` flag and `parameter_count` matching that declaration's
 structured callable signature.
 
+`target.symbol` has two forms, and they differ in what supplies the procedure's
+owner. A qualified symbol names its own owner: `Acme.run` at
+`path: "src/acme.ts"` targets the member `run` of `Acme`, and the path is
+provenance rather than part of the identity. A bare symbol targets a
+module-level declaration, which has no owner in its name at all; the module that
+`target.path` names is its owner. So `run` at `path: "src/run.ts"` targets the
+top-level function `run` of the module `src/run`, the path with its extension
+removed. Author the bare form for a top-level function in a language that
+qualifies nothing by package, such as JavaScript, TypeScript, or Ruby. Do not
+author a bare symbol for a member that has an owner: a qualified symbol and a
+bare symbol name different declarations.
+
 For a declaration with a variadic final formal, set `variadic: true` and count
 that tail once in `parameter_count`; a target with three total formals then
 matches calls with two or more actual arguments. Fixed-arity targets continue
@@ -311,14 +323,14 @@ rules failed closed, so production emitted neither rule.
 
 ## Version and extension rules
 
-Every source pack must contain `schema_version: 1`. The field is mandatory and
+Every source pack must contain `schema_version: 2`. The field is mandatory and
 exact: omitted, zero, and future versions fail instead of falling back. Every
 object rejects unknown fields, and every variant is explicitly tagged. A future
 schema adds a new versioned Rust model and checked-in schema rather than
-silently widening version one.
+silently widening version two.
 
 The machine-readable contract is
-[`schemas/semantic-model-pack-v1.schema.json`](https://github.com/BrokkAi/bifrost/blob/master/schemas/semantic-model-pack-v1.schema.json).
+[`schemas/semantic-model-pack-v2.schema.json`](https://github.com/BrokkAi/bifrost/blob/master/schemas/semantic-model-pack-v2.schema.json).
 It is generated from `AuthoredSemanticModelPack`; a repository test requires
 the checked-in bytes to match the Rust-derived schema exactly.
 
@@ -515,6 +527,11 @@ though ordinary Java and C# source methods cannot overload only by return type.
 Binary formats do not guarantee parameter names. `signature.parameters[].name`
 is therefore optional: producers retain a source or binary name when it is
 available and omit it otherwise rather than inventing `arg0`-style data.
+`signature.parameters[].passing_mode` records whether a formal accepts
+`positional_only`, `positional_or_named`, or `named_only` arguments. The field
+defaults to `positional_or_named`; Python stub producers derive the other modes
+from the structured `/`, `*`, `*args`, and `**kwargs` parameter regions so
+model applicability cannot accept a call the declared API rejects.
 Generic parameter names are retained from Java Signature or CLI GenericParam
 metadata when present. Unsupported generic shapes make the result partial
 instead of being flattened to a misleading string.
@@ -769,7 +786,7 @@ reviewed.
 
 <!-- semantic-model-doc-test:tests/fixtures/semantic-model-packs/declarations-v1.yaml -->
 ```yaml
-schema_version: 1
+schema_version: 2
 pack_id: acme.widget
 version: "1.2.0"
 producer:
@@ -876,7 +893,7 @@ compilation.
 
 <!-- semantic-model-doc-test:tests/fixtures/semantic-model-packs/generator-rules-v1.yaml -->
 ```yaml
-schema_version: 1
+schema_version: 2
 pack_id: acme.builders
 version: "1.0.0"
 producer:
@@ -1028,8 +1045,11 @@ refinements, which establish a predicate after a call returns.
 
 A result contract relates one indexed normal result to a predicate over a
 different indexed result, such as a resource whose validity requires its paired
-error to be null. A member contract can then describe one operation on that
-result by exact member name and parameter count. Its own optional
+error to be null. The finite predicate vocabulary is `null`, `non_null`,
+`true`, and `false`; the Boolean values let a reviewed `(value, ok)`-style API
+state which exact outcome validates the protected result. They do not evaluate
+arbitrary expressions. A member contract can then describe one operation on
+that result by exact member name and parameter count. Its own optional
 `preconditions` field has the same three states:
 
 - omitted means the operation's input requirements were not reviewed;

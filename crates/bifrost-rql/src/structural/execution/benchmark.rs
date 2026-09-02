@@ -34,8 +34,8 @@ use crate::structural::search::{
     UnionExecutionStrategy, execute_code_query_with_union_strategy,
 };
 use brokk_bifrost_analysis::{
-    AnalyzerConfig, FileSetProject, IAnalyzer, Language, Project, ProjectFile, TestProject,
-    WorkspaceAnalyzer, analyzer::AnalyzerQueryScope,
+    AnalyzerConfig, FileSetProject, IAnalyzer, Language, Project, ProjectCoverage, ProjectFile,
+    TestProject, WorkspaceAnalyzer, analyzer::AnalyzerQueryScope,
 };
 use brokk_bifrost_core::benchmark_provenance::{
     command_output_in, git_tree_fingerprint as framed_git_tree_fingerprint,
@@ -314,6 +314,10 @@ impl PersistentFileSetProject {
 impl Project for PersistentFileSetProject {
     fn root(&self) -> &Path {
         self.sources.root()
+    }
+
+    fn coverage(&self) -> ProjectCoverage {
+        self.sources.coverage()
     }
 
     fn analyzer_languages(&self) -> BTreeSet<Language> {

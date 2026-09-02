@@ -7,7 +7,7 @@ use flate2::read::GzDecoder;
 
 use crate::CancellationToken;
 use crate::analyzer::semantic_model::{
-    ArtifactProducerLimits, BoundedProducerDiagnostics, ProducerDiagnostic,
+    ArtifactProducerLimits, BoundedProducerDiagnostics, ProducerDiagnostic, SuppressedDiagnostics,
 };
 
 const MAX_OUTER_ENTRIES: usize = 64;
@@ -33,7 +33,7 @@ pub(crate) struct RubyGemArchiveOutcome {
     pub archive_sha256: String,
     pub entries: Vec<RubyGemDeclarationEntry>,
     pub diagnostics: Vec<ProducerDiagnostic>,
-    pub suppressed_diagnostics: usize,
+    pub suppressed_diagnostics: SuppressedDiagnostics,
     pub complete: bool,
     pub cancelled: bool,
 }
@@ -445,7 +445,7 @@ fn finish(
         entries,
         diagnostics,
         suppressed_diagnostics,
-        complete: complete && suppressed_diagnostics == 0,
+        complete: complete && suppressed_diagnostics.total() == 0,
         cancelled,
     }
 }

@@ -54,67 +54,51 @@ pub fn display_symbol_for_target(target: &CodeUnit) -> String {
 ///
 /// Methods are not always lexically nested in their type (Go receivers, Rust `impl`,
 /// C++ out-of-line definitions), so consumers can't reliably reconstruct the parent from
-/// line spans. The hierarchy is encoded in `short_name` (members after `.`, nested types
-/// via `$`), so we strip the last segment and re-qualify with the package.
+/// line spans. The enclosing scope is the declaration's [`FqName`] with its terminal
+/// segment dropped, so that is what this renders: the parent is a *structured* prefix of
+/// the name, never a cut of the rendered spelling.
 ///
-/// Scala `object`s carry a trailing companion `$` on their own name segment (`Foo$`;
-/// nested: `CharsetRange$.Atom$`, per `is_scala_object_like` above and
-/// bifrost-jvm's `Companion` segment rendering). That trailing `$` is
-/// self-decoration, not a hierarchy separator, so like TypeScript's `$static` suffix
-/// above it must be stripped before the `rfind` cut -- otherwise it's read as the last
-/// separator and an object names itself as its own parent (top-level `Probe$` -> `Some`
-/// instead of `None`) or names its own display symbol instead of its enclosing scope
-/// (`CharsetRange$.Atom$` -> itself instead of `CharsetRange`).
+/// Deriving the parent by scanning the rendered `short_name` right-to-left for a `.` or
+/// `$` cannot be made correct, because those characters are also ordinary segment text:
 ///
-/// A `$` is a nesting join only *between* two names (C# `Outer$Inner`). At the
-/// start of a segment it is identifier text (`angular.mock.$LogProvider`,
-/// `$http`) -- the same misreading `split_segments_on_dollar` guards against on
-/// the query side (#1057). Cutting there named `angular.mock.`, trailing
-/// separator and all, as the parent.
+/// * `$` inside a terminal identifier is a name, not a join -- a Java method `render$` or
+///   `a$b`, a JS `angular.mock.$LogProvider` or `$http` (the same misreading
+///   `split_segments_on_dollar` guards against on the query side, #1057). The scan cut at
+///   the last `$` and named `com.example.Gadget.render`, or `angular.mock.` with the
+///   trailing separator still attached, as the parent.
+/// * A trailing `$` can be a segment's own decoration: a Scala companion object renders
+///   `Probe$` / `CharsetRange$.Atom$` ([`SegmentKind::Companion`]), and a TypeScript
+///   static member is indexed as `create$static` (one `Member` segment, per
+///   `visit_ts_method`). Read as a separator, an object named itself as its own parent.
+/// * A `.` can be inside one segment: a JS/TS object-literal key such as
+///   `"data/web-interface.csv"` is a single recorded segment (#2111).
+///
+/// Dropping a whole segment answers all of these the same way, with no per-language
+/// pre-stripping: a `$` or `.` that belongs to a segment's text travels with that
+/// segment. Rendering the remaining prefix natively also makes `parent_symbol` a genuine
+/// prefix of the unit's own [`display_symbol_for_target`] spelling by construction,
+/// because [`FqName::render_native`] joins each pair of segments from their kinds alone.
+///
+/// A declaration whose parent prefix is exactly its package prefix is top level and has
+/// no enclosing scope: a package is not a parent symbol.
+///
+/// [`FqName`]: brokk_bifrost_core::analyzer::fq_name::FqName
+/// [`FqName::render_native`]: brokk_bifrost_core::analyzer::fq_name::FqName::render_native
+/// [`SegmentKind::Companion`]: brokk_bifrost_core::analyzer::fq_name::SegmentKind::Companion
 pub(crate) fn display_parent_symbol_for_target(target: &CodeUnit) -> Option<String> {
-    let short_storage;
-    let short = if language_for_target(target) == Language::TypeScript {
-        short_storage = target
-            .short_name()
-            .strip_suffix("$static")
-            .unwrap_or(target.short_name())
-            .to_string();
-        short_storage.as_str()
-    } else if language_for_target(target) == Language::Scala {
-        short_storage = target
-            .short_name()
-            .strip_suffix('$')
-            .unwrap_or(target.short_name())
-            .to_string();
-        short_storage.as_str()
-    } else {
-        target.short_name()
-    };
-    // fqname-M4: parent-of on the raw short_name string; runs on targets whose
-    // fq is not threaded to this display helper.
-    let cut = short
-        .char_indices()
-        .rev()
-        .find(|&(index, ch)| match ch {
-            '.' => true,
-            '$' => !matches!(
-                short[..index].chars().next_back(),
-                None | Some('.') | Some('$')
-            ),
-            _ => false,
-        })
-        .map(|(index, _)| index)?;
-    let parent_short = &short[..cut];
-    if parent_short.is_empty() {
+    let fq = target.fq();
+    // `CodeUnit::from_fq` asserts a non-empty name whose package prefix leaves a
+    // non-empty declaration tail, so the parent prefix always exists and is never
+    // shorter than the package prefix.
+    let parent_len = fq.len() - 1;
+    if parent_len == target.package_segment_count() {
         return None;
     }
-    let package = target.package_name();
-    let parent_fq = if package.is_empty() {
-        parent_short.to_string()
-    } else {
-        format!("{package}.{parent_short}")
-    };
-    Some(display_symbol_name(language_for_target(target), &parent_fq))
+    let language = language_for_target(target);
+    let parent_fq = fq
+        .prefix(parent_len)
+        .display_native(language, crate::analyzer::fq_name::segment_interner());
+    Some(display_symbol_name(language, &parent_fq))
 }
 
 /// The user-facing terminal name of `target`: its recorded terminal segment,
@@ -468,6 +452,101 @@ mod tests {
             false,
         );
         assert_eq!(None, display_parent_symbol_for_target(&top_level));
+    }
+
+    /// `$` is a legal Java identifier character, so it appears at the end of
+    /// and inside a member's own name. Scanning the rendered `short_name` for
+    /// the last `$` cut inside the terminal identifier and reported
+    /// `com.example.tool.Gadget.render` -- the method's own name minus a
+    /// character -- as the declaring type of `render$`.
+    #[test]
+    fn dollar_inside_a_terminal_identifier_is_not_a_parent_separator() {
+        let root = std::env::temp_dir().join("bifrost-common-java-parent-test");
+        let interner = segment_interner();
+        let expected = Some("com.example.tool.Gadget".to_string());
+
+        for method in ["render$", "a$b", "compute"] {
+            let mut fq = FqName::new();
+            fq.push(interner.intern("com.example.tool", SegmentKind::Package));
+            fq.push(interner.intern("Gadget", SegmentKind::Type));
+            fq.push(interner.intern(method, SegmentKind::Member));
+            let unit = CodeUnit::from_fq(
+                ProjectFile::new(&root, "Gadget.java"),
+                CodeUnitType::Function,
+                fq,
+                1,
+                None,
+                false,
+            );
+            assert_eq!(
+                expected,
+                display_parent_symbol_for_target(&unit),
+                "method `{method}` must report its declaring class"
+            );
+        }
+
+        // The `$` that Java's nested-class join renders (`SegmentKind::Nested`)
+        // IS a boundary, and it is one because the segments say so -- including
+        // for a synthetic name whose own text also carries a `$`.
+        for nested_name in ["Helper", "anon$3:5"] {
+            let mut nested_fq = FqName::new();
+            nested_fq.push(interner.intern("com.example.tool", SegmentKind::Package));
+            nested_fq.push(interner.intern("Gadget", SegmentKind::Type));
+            nested_fq.push(interner.intern(nested_name, SegmentKind::Nested));
+            let nested = CodeUnit::from_fq(
+                ProjectFile::new(&root, "Gadget.java"),
+                CodeUnitType::Class,
+                nested_fq,
+                1,
+                None,
+                false,
+            );
+            assert_eq!(
+                expected,
+                display_parent_symbol_for_target(&nested),
+                "nested class `{nested_name}` must report its outer class"
+            );
+        }
+
+        // A class that is itself top level in its package has no enclosing
+        // scope: the package is not a parent symbol.
+        let mut top_level_fq = FqName::new();
+        top_level_fq.push(interner.intern("com.example.tool", SegmentKind::Package));
+        top_level_fq.push(interner.intern("Gadget", SegmentKind::Type));
+        let top_level = CodeUnit::from_fq(
+            ProjectFile::new(&root, "Gadget.java"),
+            CodeUnitType::Class,
+            top_level_fq,
+            1,
+            None,
+            false,
+        );
+        assert_eq!(None, display_parent_symbol_for_target(&top_level));
+    }
+
+    /// A TypeScript static member's `$static` marker is part of its own
+    /// `Member` segment's text (`visit_ts_method`), so dropping the terminal
+    /// segment takes the marker with it. The parent is the class.
+    #[test]
+    fn typescript_static_marker_is_not_a_parent_separator() {
+        let root = std::env::temp_dir().join("bifrost-common-ts-parent-test");
+        let interner = segment_interner();
+
+        let mut fq = FqName::new();
+        fq.push(interner.intern("Widget", SegmentKind::Type));
+        fq.push(interner.intern("create$static", SegmentKind::Member));
+        let member = CodeUnit::from_fq(
+            ProjectFile::new(&root, "widget.ts"),
+            CodeUnitType::Function,
+            fq,
+            0,
+            None,
+            false,
+        );
+        assert_eq!(
+            Some("Widget".to_string()),
+            display_parent_symbol_for_target(&member)
+        );
     }
 
     #[test]

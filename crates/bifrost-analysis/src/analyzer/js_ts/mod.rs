@@ -52,7 +52,7 @@ use crate::analyzer::{CodeUnit, Language, SummaryFileProjection};
 use crate::hash::HashSet;
 use crate::text_utils::compute_line_starts;
 use brokk_bifrost_core::analyzer::usages::model::ImportKind;
-use brokk_bifrost_js_ts::imports::npm_package_of_module_specifier;
+use brokk_bifrost_js_ts::imports::js_ts_module_identity;
 use brokk_bifrost_js_ts::model::module_code_unit;
 use brokk_bifrost_js_ts::syntax::{
     JsTsLexicalBindingIndex, compute_import_binder as compute_js_ts_import_binder,
@@ -516,9 +516,11 @@ static JS_TS_USAGE_STRATEGY: JsTsExportUsageGraphStrategy = JsTsExportUsageGraph
 ///     -- the owner is that module's identity. A default, namespace or
 ///     CommonJS module-object binding *is* the module, so the specifier is the
 ///     owner and `import p from 'path'` keys identically to
-///     `import path from 'path'`. A named import binds a member *of* the
-///     module, and that member is itself the owner: `import { Buffer } from
-///     'buffer'` makes `Buffer.from` owner `Buffer`, never `buffer`;
+///     `import path from 'path'`. The specifier is read in its canonical
+///     spelling, so `node:path` and `path` are one owner (#2609). A named
+///     import binds a member *of* the module, and that member is itself the
+///     owner: `import { Buffer } from 'buffer'` makes `Buffer.from` owner
+///     `Buffer`, never `buffer`;
 ///   * bound by an import whose specifier is relative or absolute -- refused.
 ///     That specifier addresses a workspace file, so a call through it that did
 ///     not resolve is a resolution gap to fix, not an external surface to
@@ -550,12 +552,13 @@ fn js_ts_single_segment_external_owner(
         return (!lexical.is_bound_at(owner, site.callee_start_byte)).then(|| owner.to_owned());
     };
     // A relative or absolute specifier addresses a workspace file rather than a
-    // package, which is what `npm_package_of_module_specifier` answers `None`
-    // for.
-    npm_package_of_module_specifier(&binding.module_specifier)?;
+    // package, which is what `js_ts_module_identity` answers `None` for. The
+    // same call folds Node's `node:` scheme away, so `node:fs` and `fs` mint one
+    // owner (#2609).
+    let module = js_ts_module_identity(&binding.module_specifier)?;
     match binding.kind {
         ImportKind::Default | ImportKind::Namespace | ImportKind::CommonJsRequire => {
-            Some(binding.module_specifier.clone())
+            Some(module.specifier.to_owned())
         }
         ImportKind::Named => Some(owner.to_owned()),
         // A glob binds no single name, so it cannot be what bound this owner.
@@ -892,7 +895,10 @@ ruleTester.run("rule", rule, { valid: [], invalid: [] });
 "#;
         let tree = parse_javascript(source);
         assert!(contains_tests(
-            &ProjectFile::new("/tmp/project", "tests/lib/rules/rule.js"),
+            &ProjectFile::new(
+                std::env::current_dir().expect("test working directory must be available"),
+                "tests/lib/rules/rule.js",
+            ),
             source,
             &tree
         ));
@@ -907,7 +913,10 @@ ruleTester.run("rule", rule, { valid: [], invalid: [] });
 "#;
         let tree = parse_typescript(source);
         assert!(contains_tests(
-            &ProjectFile::new("/tmp/project", "tests/lib/rules/rule.ts"),
+            &ProjectFile::new(
+                std::env::current_dir().expect("test working directory must be available"),
+                "tests/lib/rules/rule.ts",
+            ),
             source,
             &tree
         ));
@@ -1058,7 +1067,10 @@ ruleTester.run("rule", rule, {});
             ("test/parallel/test-http.ts", false),
         ];
         for (path, expected) in cases {
-            let file = ProjectFile::new("/tmp/project", path);
+            let file = ProjectFile::new(
+                std::env::current_dir().expect("test working directory must be available"),
+                path,
+            );
             let tree = parse_javascript(production);
             assert_eq!(contains_tests(&file, production, &tree), expected, "{path}");
         }
@@ -1067,7 +1079,10 @@ ruleTester.run("rule", rule, {});
     #[test]
     fn conventional_test_suffixes_remain_supported_without_source_text() {
         for path in ["src/parser.test.js", "src/parser.spec.ts"] {
-            let file = ProjectFile::new("/tmp/project", path);
+            let file = ProjectFile::new(
+                std::env::current_dir().expect("test working directory must be available"),
+                path,
+            );
             let tree = parse_javascript("");
             assert!(contains_tests(&file, "", &tree), "{path}");
         }

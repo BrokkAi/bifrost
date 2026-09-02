@@ -32,6 +32,7 @@ pub static GO_STRUCTURAL_SPEC: GoStructuralSpec = GoStructuralSpec;
 
 const GO_KIND_TABLE: &[(&str, NormalizedKind)] = &[
     ("call_expression", NormalizedKind::Call),
+    ("go_statement", NormalizedKind::ConcurrentSpawn),
     ("selector_expression", NormalizedKind::FieldAccess),
     ("function_declaration", NormalizedKind::Function),
     ("method_declaration", NormalizedKind::Method),
@@ -83,6 +84,21 @@ fn transparent_parenthesized_expression<'tree>(mut expression: Node<'tree>) -> N
         expression = inner;
     }
     expression
+}
+
+fn attach_call_roles(sink: &mut RoleSink<'_>, node: Node<'_>) {
+    if let Some(function) = node.child_by_field_name("function") {
+        attach_terminal_callee(sink, function, expression_name_node(function));
+        if function.kind() == "selector_expression"
+            && let Some(operand) = function.child_by_field_name("operand")
+        {
+            let operand = transparent_parenthesized_expression(operand);
+            attach_role_with_derived_name(sink, Role::Receiver, operand, expression_name_node);
+        }
+    }
+    if let Some(arguments) = node.child_by_field_name("arguments") {
+        attach_positional_argument_roles(sink, arguments, expression_name_node);
+    }
 }
 
 fn unquoted_go_string_span(node: Node<'_>) -> Option<Span> {
@@ -268,23 +284,12 @@ impl StructuralSpec for GoStructuralSpec {
             sink.occurrence_role(node, role);
         }
         match kind {
-            NormalizedKind::Call => {
-                if let Some(function) = node.child_by_field_name("function") {
-                    attach_terminal_callee(sink, function, expression_name_node(function));
-                    if function.kind() == "selector_expression"
-                        && let Some(operand) = function.child_by_field_name("operand")
-                    {
-                        let operand = transparent_parenthesized_expression(operand);
-                        attach_role_with_derived_name(
-                            sink,
-                            Role::Receiver,
-                            operand,
-                            expression_name_node,
-                        );
-                    }
-                }
-                if let Some(arguments) = node.child_by_field_name("arguments") {
-                    attach_positional_argument_roles(sink, arguments, expression_name_node);
+            NormalizedKind::Call => attach_call_roles(sink, node),
+            NormalizedKind::ConcurrentSpawn => {
+                if let Some(call) = first_named_child(node)
+                    && call.kind() == "call_expression"
+                {
+                    attach_call_roles(sink, call);
                 }
             }
             NormalizedKind::FieldAccess => {

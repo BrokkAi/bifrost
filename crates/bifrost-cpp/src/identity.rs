@@ -4,25 +4,26 @@
 //!
 //! Two things stay in `analyzer/cpp/identity.rs` on purpose:
 //!
-//! * [`cpp_header_body_files_are_related`] here takes the implementation file's
-//!   `#include` lines and the include-target index as arguments. The analysis
-//!   wrapper of the same name owns the `resolve_analyzer::<CppAnalyzer>`
-//!   downcast that produces them, because the searchtools identity block reaches
-//!   this predicate through `&dyn IAnalyzer` and there is no capability that
-//!   carries an `IncludeTargetIndex`.
+//! * [`cpp_header_body_files_are_related`] here reads the include closure off a
+//!   [`CppSource`]. The analysis wrapper of the same name owns the
+//!   `resolve_analyzer::<CppAnalyzer>` downcast that produces one, because the
+//!   searchtools identity block reaches this predicate through `&dyn IAnalyzer`
+//!   and no capability carries the include graph.
 //! * The moka cells that memoize [`cpp_reconcile_candidates`] per member
 //!   identifier and [`cpp_reconcile_group`] per [`CppReconcileGroupKey`] stay
 //!   on the analyzer, as does every other cache, so `IAnalyzer::update` keeps
 //!   rebuilding them wholesale.
 
-use crate::declarations::{cpp_file_using_namespaces, cpp_member_fq, node_text};
+use crate::declarations::{
+    CppRecoveredExportClassIndex, cpp_file_using_namespaces, cpp_member_fq,
+    extract_function_declarator, node_text, recovered_callable_body_at, recovered_class_body_at,
+};
 use crate::graph::CppGraphSource;
 use crate::graph::resolver::{
-    VisibilityIndex, cpp_type_name_components, declarator_name_node,
+    VisibilityIndex, cpp_include_closure_reaches, cpp_type_name_components, declarator_name_node,
     qualified_name_has_concrete_scope_separators,
 };
 use crate::graph_support::CppSource;
-use crate::imports::{IncludeTargetIndex, include_paths, resolve_include_targets_with_index};
 use crate::reconcile::{ReconciledIdentity, VisibleClass, reconcile_out_of_line_member_identity};
 use brokk_bifrost_core::analyzer::fq_name::{SegmentKind, segment_interner};
 use brokk_bifrost_core::analyzer::model::{CallableLinkage, Range, SignatureMetadata};
@@ -64,6 +65,12 @@ impl CppOccurrenceRole {
 
 pub struct CppOccurrenceClassifier {
     tree: Tree,
+    /// The parsed text. A class role reads the recovered export-macro shapes,
+    /// and those are named from source text the tree alone does not carry.
+    source: String,
+    /// Resolved once for the whole tree rather than per classified occurrence
+    /// (#1496).
+    recovered_export_classes: CppRecoveredExportClassIndex,
 }
 
 impl CppOccurrenceClassifier {
@@ -72,11 +79,25 @@ impl CppOccurrenceClassifier {
         parser
             .set_language(&tree_sitter_cpp::LANGUAGE.into())
             .ok()?;
-        parser.parse(source, None).map(|tree| Self { tree })
+        parser.parse(source, None).map(|tree| {
+            let recovered_export_classes =
+                CppRecoveredExportClassIndex::build(tree.root_node(), source);
+            Self {
+                tree,
+                source: source.to_owned(),
+                recovered_export_classes,
+            }
+        })
     }
 
     pub fn classify(&self, candidate: &CodeUnit, range: &Range) -> CppOccurrenceRole {
-        cpp_occurrence_role_for_range(self.tree.root_node(), candidate, range)
+        cpp_occurrence_role_for_range(
+            &self.recovered_export_classes,
+            self.tree.root_node(),
+            &self.source,
+            candidate,
+            range,
+        )
     }
 }
 
@@ -129,8 +150,8 @@ pub fn cpp_indexed_callable_linkage(
 /// Whether `left` and `right` are the same callable seen twice.
 ///
 /// `header_body_related` is the include-evidence predicate; the analysis wrapper
-/// supplies it because reaching an `IncludeTargetIndex` needs the analyzer
-/// downcast this crate cannot perform.
+/// supplies it because reaching the include graph needs the analyzer downcast
+/// this crate cannot perform.
 pub fn cpp_callable_definitions_share_identity_evidence(
     index: &dyn CodeUnitIndex,
     left: &CodeUnit,
@@ -468,17 +489,27 @@ fn cpp_same_node(left: Node<'_>, right: Node<'_>) -> bool {
         && left.end_byte() == right.end_byte()
 }
 
-/// Direct include evidence relates one header declaration to one implementation
-/// file without pretending that every external name in a workspace belongs to
-/// one linker unit.
+/// Include evidence relates one header declaration to one implementation file
+/// without pretending that every external name in a workspace belongs to one
+/// linker unit.
 ///
-/// `implementation_imports` are that file's raw `#include` lines; the analysis
-/// wrapper reads them off the analyzer along with `include_targets`.
+/// The question is whether the implementation file's translation unit sees the
+/// declaring header at all, and a translation unit sees every header in its
+/// `#include` closure, not only the ones it names itself. `llama-vocab.cpp`
+/// defines `llama_tokenize`, declared in `llama.h`, while including only
+/// `llama-vocab.h`, which includes `llama.h`; reading the direct include list
+/// refused that pair and left definition navigation with a bodiless
+/// declaration (#2909).
+///
+/// [`cpp_include_closure_reaches`] is that closure. It resolves each include
+/// the way visibility does, to a unique target or to nothing, so two headers
+/// sharing a basename still relate only to the translation units that
+/// unambiguously name them.
 pub fn cpp_header_body_files_are_related(
+    source: &dyn CppSource,
+    token: QueryToken<'_>,
     left: &ProjectFile,
     right: &ProjectFile,
-    implementation_imports: &[String],
-    include_targets: &IncludeTargetIndex,
 ) -> bool {
     let (header, implementation) = if cpp_source_path_is_header(left) {
         (left, right)
@@ -490,31 +521,7 @@ pub fn cpp_header_body_files_are_related(
     if cpp_source_path_is_header(implementation) {
         return false;
     }
-    implementation_imports
-        .iter()
-        .flat_map(|import| include_paths(std::slice::from_ref(import)))
-        .any(|include| {
-            let targets =
-                resolve_include_targets_with_index(implementation, &include, include_targets);
-            targets.len() == 1 && targets.first() == Some(header)
-        })
-}
-
-/// Which of `left`/`right` the include evidence would read as the header, if
-/// either. The analysis wrapper uses this to decide which file's imports to read
-/// before paying for them.
-pub fn cpp_header_body_implementation_file<'a>(
-    left: &'a ProjectFile,
-    right: &'a ProjectFile,
-) -> Option<&'a ProjectFile> {
-    let implementation = if cpp_source_path_is_header(left) {
-        right
-    } else if cpp_source_path_is_header(right) {
-        left
-    } else {
-        return None;
-    };
-    (!cpp_source_path_is_header(implementation)).then_some(implementation)
+    cpp_include_closure_reaches(source, token, implementation, header)
 }
 
 pub fn cpp_source_path_is_header(source: &ProjectFile) -> bool {
@@ -526,7 +533,9 @@ pub fn cpp_source_path_is_header(source: &ProjectFile) -> bool {
 }
 
 pub fn cpp_occurrence_role_for_range(
+    recovered_export_classes: &CppRecoveredExportClassIndex,
     root: Node<'_>,
+    source: &str,
     candidate: &CodeUnit,
     range: &Range,
 ) -> CppOccurrenceRole {
@@ -537,17 +546,53 @@ pub fn cpp_occurrence_role_for_range(
         return CppOccurrenceRole::Unknown;
     };
     if candidate.is_callable() {
-        return if subtree_contains(node, |descendant| {
+        if subtree_contains(node, |descendant| {
             descendant.kind() == "function_definition"
                 && descendant.child_by_field_name("body").is_some()
         }) {
+            return CppOccurrenceRole::Definition;
+        }
+        // A callable recovered from a mangled region owns no node of its own,
+        // so the climb above landed on the container the parser left -- an
+        // access label, an `ERROR`, a statement -- and the scan answered for
+        // whatever else that container holds. Ask the recovery about this exact
+        // range instead, the same way a recovered class is asked below. An
+        // ordinary declaration lands on a declaration node and never gets here.
+        if !matches!(
+            node.kind(),
+            "declaration" | "field_declaration" | "function_definition"
+        ) && let Some(has_body) = recovered_callable_body_at(source, range)
+        {
+            return if has_body {
+                CppOccurrenceRole::Definition
+            } else {
+                CppOccurrenceRole::DeclarationOnly
+            };
+        }
+        return CppOccurrenceRole::DeclarationOnly;
+    }
+    if node.kind() == "function_definition" && node.child_by_field_name("body").is_some() {
+        return CppOccurrenceRole::Definition;
+    }
+    // A recovered export-macro class owns no node of its own, so the fallback
+    // climb lands on the enclosing container and the specifier scan below would
+    // answer for whatever else that container holds. In a header where every
+    // class is macro decorated, no plain specifier has a body and the scan
+    // calls every class a forward declaration. Ask the recovery shapes about
+    // this exact range first; they are the same answer the resolver's
+    // declaration strength uses.
+    if let Some(has_body) = recovered_class_body_at(
+        recovered_export_classes,
+        root,
+        source,
+        candidate.identifier(),
+        range,
+    ) {
+        return if has_body {
             CppOccurrenceRole::Definition
         } else {
             CppOccurrenceRole::DeclarationOnly
         };
-    }
-    if node.kind() == "function_definition" && node.child_by_field_name("body").is_some() {
-        return CppOccurrenceRole::Definition;
     }
     if !subtree_contains(node, |descendant| {
         matches!(
@@ -567,6 +612,46 @@ pub fn cpp_occurrence_role_for_range(
     } else {
         CppOccurrenceRole::DeclarationOnly
     }
+}
+
+/// Whether the occurrence at `range` is a pure-virtual member declaration
+/// (`virtual T f() = 0;`).
+///
+/// A pure virtual is the C++ spelling of an abstract method: `= 0` says the
+/// declaration has no body, so the declaration is itself the definition site.
+/// Definition navigation answers with it the way the JVM adapters answer an
+/// interface method with its declaration, instead of reporting that the
+/// candidates hold no implementation body (#2178). A pure virtual may still
+/// carry an out-of-line body; that occurrence is a real definition and is
+/// selected on its own role.
+pub fn cpp_range_is_pure_virtual_declaration(root: Node<'_>, source: &str, range: &Range) -> bool {
+    let Some(node) = cpp_declaration_node_for_range(root, range) else {
+        return false;
+    };
+    let mut current = Some(node);
+    while let Some(node) = current {
+        match node.kind() {
+            "field_declaration" => {
+                // `int data = 0;` and `int (*hook)() = 0;` share this
+                // `default_value` shape, so the declarator has to be a real
+                // function declarator rather than a function-pointer member.
+                return node
+                    .child_by_field_name("default_value")
+                    .is_some_and(|value| {
+                        value.kind() == "number_literal" && node_text(value, source) == "0"
+                    })
+                    && node
+                        .child_by_field_name("declarator")
+                        .and_then(extract_function_declarator)
+                        .is_some();
+            }
+            // Anything at or above the member list is a different construct:
+            // the occurrence range names the declaration or one of its parts.
+            "field_declaration_list" | "function_definition" | "translation_unit" => return false,
+            _ => current = node.parent(),
+        }
+    }
+    false
 }
 
 fn cpp_declaration_node_for_range<'tree>(root: Node<'tree>, range: &Range) -> Option<Node<'tree>> {
@@ -1389,5 +1474,74 @@ mod tests {
                 "the {label} at byte {start} stays a reference"
             );
         }
+    }
+
+    /// Every class role in one file, so a header can be classified with no
+    /// ordinary body-bearing class in it.
+    fn class_roles(source: &str, name: &str) -> Vec<CppOccurrenceRole> {
+        let tree = parse_cpp(source);
+        let file = ProjectFile::new(std::env::temp_dir(), "occurrence-role.hpp");
+        let parsed = crate::adapter::parse_cpp_file(&file, source, &tree);
+        let unit = parsed
+            .declarations()
+            .iter()
+            .find(|unit| unit.is_class() && unit.fq_name() == name)
+            .unwrap_or_else(|| panic!("missing class {name}: {parsed:#?}"));
+        let ranges = parsed.declaration_ranges(unit);
+        assert!(!ranges.is_empty(), "{name} must have a declaration range");
+        ranges
+            .iter()
+            .map(|range| {
+                cpp_occurrence_role_for_range(
+                    &CppRecoveredExportClassIndex::build(tree.root_node(), source),
+                    tree.root_node(),
+                    source,
+                    unit,
+                    range,
+                )
+            })
+            .collect()
+    }
+
+    /// #2557: the role of a recovered `class MACRO(2, 0) Name` comes from the
+    /// recovery itself. The fallback climb lands on the enclosing container, so
+    /// a header whose classes are all export-macro decorated used to hold no
+    /// body-bearing `class_specifier` at all and every class in it read as a
+    /// forward declaration, which dropped it from navigation.
+    #[test]
+    fn recovered_export_macro_classes_are_definitions_without_an_ordinary_class() {
+        let source = concat!(
+            "namespace api {\n",
+            "class PROJECT_PUBLIC_API(2, 0) Name final {\n",
+            "  public:\n",
+            "    Name();\n",
+            "};\n",
+            "class PROJECT_PUBLIC_API(2, 0) Other : public Name {\n",
+            "  public:\n",
+            "    Other();\n",
+            "};\n",
+            "} // namespace api\n",
+        );
+        for name in ["api.Name", "api.Other"] {
+            assert_eq!(
+                class_roles(source, name),
+                vec![CppOccurrenceRole::Definition],
+                "{name} is a complete recovered definition"
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_class_roles_keep_their_plain_specifier_reading() {
+        assert_eq!(
+            class_roles("class Plain;\n", "Plain"),
+            vec![CppOccurrenceRole::DeclarationOnly],
+            "a forward declaration stays a declaration"
+        );
+        assert_eq!(
+            class_roles("class Plain { };\n", "Plain"),
+            vec![CppOccurrenceRole::Definition],
+            "a complete class stays a definition"
+        );
     }
 }

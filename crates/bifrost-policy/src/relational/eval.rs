@@ -22,7 +22,7 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 
-use brokk_bifrost_rql::structural::CodeQueryResultValue;
+use brokk_bifrost_rql::structural::{CodeQueryResultValue, CodeQueryRowRef};
 
 use crate::definition::{
     AssertCardinality, PolicyAssertId, RowBindingName, RowGroupName, RowLiteral,
@@ -79,6 +79,17 @@ pub struct RelationalAssertionEvaluation {
     /// the run non-reliable.
     pub exhaustive: bool,
     pub limit_exceeded: bool,
+    /// Row-engine work beyond the CodeQuery scans that produced the inputs.
+    pub work: RelationalEvaluationWork,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RelationalEvaluationWork {
+    pub input_rows: u64,
+    pub materialized_rows: u64,
+    pub join_key_probes: u64,
+    pub produced_groups: u64,
+    pub assertion_checks: u64,
 }
 
 /// The provenance selected by one endpoint row-selector plan.
@@ -262,6 +273,7 @@ pub fn evaluate_row_selector_ir(
         limits: plan.limits,
         comparisons: 0,
         limit_exceeded: false,
+        work: RelationalEvaluationWork::default(),
     };
     let mut relations: Vec<Option<EvalRelation>> = Vec::with_capacity(plan.relations.len());
     for relation in &plan.relations {
@@ -278,6 +290,10 @@ pub fn evaluate_row_selector_ir(
             &binding_order,
             &mut state,
         )?;
+        state.work.materialized_rows = state
+            .work
+            .materialized_rows
+            .saturating_add(u64::try_from(evaluated.tuples.len()).unwrap_or(u64::MAX));
         relations.push(Some(evaluated));
     }
     let get = |id: IrRelationId| {
@@ -316,6 +332,7 @@ pub fn evaluate_plan_ir(
         limits: plan.limits,
         comparisons: 0,
         limit_exceeded: false,
+        work: RelationalEvaluationWork::default(),
     };
     let mut relations: Vec<Option<EvalRelation>> = Vec::with_capacity(plan.relations.len());
     for relation in &plan.relations {
@@ -332,6 +349,10 @@ pub fn evaluate_plan_ir(
             &binding_order,
             &mut state,
         )?;
+        state.work.materialized_rows = state
+            .work
+            .materialized_rows
+            .saturating_add(u64::try_from(evaluated.tuples.len()).unwrap_or(u64::MAX));
         relations.push(Some(evaluated));
     }
 
@@ -375,6 +396,7 @@ pub fn evaluate_plan_ir(
         }
 
         for tuple in &relation.tuples {
+            state.work.assertion_checks = state.work.assertion_checks.saturating_add(1);
             let key = tuple.values[..key_width].to_vec();
             let Some(RowScalar::Integer(actual)) = tuple.values.get(value_index).cloned().flatten()
             else {
@@ -444,6 +466,7 @@ pub fn evaluate_plan_ir(
         omitted_obligations_lower_bound: obligations.omitted,
         exhaustive,
         limit_exceeded: state.limit_exceeded,
+        work: state.work,
     })
 }
 
@@ -487,6 +510,7 @@ struct EvalState {
     limits: super::ir::IrLimits,
     comparisons: usize,
     limit_exceeded: bool,
+    work: RelationalEvaluationWork,
 }
 
 impl EvalState {
@@ -776,6 +800,10 @@ fn load_rows(
 
     let mut coverage = inherited.meet(input.coverage.clone());
     let count = input.rows.len().min(max_rows);
+    state.work.input_rows = state
+        .work
+        .input_rows
+        .saturating_add(u64::try_from(count).unwrap_or(u64::MAX));
     if count < input.rows.len() {
         coverage = state.truncate(coverage);
     }
@@ -863,6 +891,7 @@ fn evaluate_join(
         // replaces the old per-pair comparison loop, while output remains
         // independently bounded by max_joined_rows below.
         state.comparisons = state.comparisons.saturating_add(1);
+        state.work.join_key_probes = state.work.join_key_probes.saturating_add(1);
         if state.comparisons > state.limits.max_join_comparisons {
             coverage = state.truncate(coverage);
             break;
@@ -986,6 +1015,10 @@ fn evaluate_group(
     let mut layout = by.to_vec();
     layout.extend(aggregates.iter().map(|aggregate| aggregate.output.clone()));
 
+    state.work.produced_groups = state
+        .work
+        .produced_groups
+        .saturating_add(u64::try_from(grouped.len()).unwrap_or(u64::MAX));
     let mut tuples = Vec::with_capacity(grouped.len());
     for (key, rows) in grouped {
         let mut values = key;
@@ -1192,6 +1225,71 @@ fn predicates_match(
         }
     }
     Ok(true)
+}
+
+/// One located CodeQuery row, materialized under the column names one
+/// relation's predicates address it by.
+///
+/// The `why-not` explainer replays a single located row through the filters a
+/// plan attaches directly to a row binding. Deciding a predicate is the
+/// evaluator's semantics -- two-valued null handling, ordered comparison only
+/// over integers, literal matching by scalar type -- so the explainer builds
+/// this and asks, instead of re-deriving what a comparison means.
+pub(crate) struct ReplayRow {
+    relation: EvalRelation,
+    tuple: EvalTuple,
+}
+
+impl ReplayRow {
+    /// Read one CodeQuery row under `columns`, each pair naming a column of the
+    /// replayed relation and the row field that column reads. A projection
+    /// between the binding and the filter is what makes the two names differ.
+    pub(crate) fn new(
+        columns: &[(IrColumn, String)],
+        row: CodeQueryRowRef<'_>,
+    ) -> EvalResult<Self> {
+        let mut values = Vec::with_capacity(columns.len());
+        for (column, field) in columns {
+            let value =
+                row.field(field)
+                    .map_err(|_| RelationalAssertionEvaluationError::RowField {
+                        binding: column.qualifier.clone(),
+                        field: field.clone(),
+                    })?;
+            values.push(value.map(RowScalar::from));
+        }
+        Ok(Self {
+            relation: EvalRelation {
+                layout: columns.iter().map(|(column, _)| column.clone()).collect(),
+                tuples: Vec::new(),
+                coverage: RelationCoverage::Exhaustive,
+                witness_reasons: Vec::new(),
+            },
+            tuple: EvalTuple {
+                values,
+                contributors: Vec::new(),
+                witness_sound: true,
+            },
+        })
+    }
+
+    /// This row's value for one column of the replayed relation.
+    pub(crate) fn value(&self, column: &IrColumn) -> EvalResult<Option<RowScalar>> {
+        read(&self.relation, &self.tuple, column)
+    }
+
+    /// The first test of `predicates` this row does not satisfy, if any.
+    pub(crate) fn first_failed_predicate<'a>(
+        &self,
+        predicates: &'a [IrPredicate],
+    ) -> EvalResult<Option<&'a IrPredicate>> {
+        for predicate in predicates {
+            if !predicates_match(&self.relation, &self.tuple, std::slice::from_ref(predicate))? {
+                return Ok(Some(predicate));
+            }
+        }
+        Ok(None)
+    }
 }
 
 fn read(

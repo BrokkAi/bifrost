@@ -3,6 +3,7 @@
 use std::fmt;
 use std::io::{self, Write};
 
+use crate::PolicyIncrementalReview;
 use crate::display_path::TaintDisplayPath;
 
 use super::super::{
@@ -197,6 +198,9 @@ pub fn write_policy_human<W: Write>(
         }
         if let Some(review) = report.baseline() {
             write_baseline_review(&mut output, review)?;
+        }
+        if let Some(review) = report.incremental() {
+            write_incremental_review(&mut output, review)?;
         }
     }
 
@@ -2499,6 +2503,47 @@ fn write_query_result_detail<W: Write>(
             )
             .map_err(map_io_error)?;
         }
+        PolicyQueryResultRef::MemberTargetAnalysis {
+            outcome,
+            coverage,
+            capture,
+            ..
+        } => {
+            write!(
+                output,
+                " outcome {}; coverage {}",
+                escape_terminal_text(outcome),
+                escape_terminal_text(coverage),
+            )
+            .map_err(map_io_error)?;
+            if let Some(capture) = capture {
+                write!(output, "; capture {}", escape_terminal_text(capture))
+                    .map_err(map_io_error)?;
+            }
+        }
+        PolicyQueryResultRef::FieldWriteValue {
+            assignment_ast_id,
+            rhs_ast_id,
+            receiver_identity_id,
+            member_target_id,
+            proof,
+            completeness,
+            coverage,
+            ..
+        } => {
+            write!(
+                output,
+                " assignment {}; rhs {}; receiver {}; member {}; proof {}; completeness {}; coverage {}",
+                escape_terminal_text(assignment_ast_id),
+                escape_terminal_text(rhs_ast_id),
+                escape_terminal_text(receiver_identity_id),
+                escape_terminal_text(member_target_id),
+                escape_terminal_text(proof),
+                escape_terminal_text(completeness),
+                escape_terminal_text(coverage),
+            )
+            .map_err(map_io_error)?;
+        }
         PolicyQueryResultRef::ReceiverAnalysis {
             analysis_kind,
             outcome,
@@ -2867,6 +2912,33 @@ fn write_capability<W: Write>(
         }
     }
     Ok(())
+}
+
+/// What this run reused instead of recomputing, in one line.
+///
+/// Verbose only, and never part of the concise summary: reuse is a
+/// measurement of the run, not a statement about the workspace, and a reader
+/// comparing two runs of the same tree must see the same summary whether or
+/// not either of them reused anything.
+fn write_incremental_review<W: Write>(
+    output: &mut BoundedWriter<W>,
+    review: &PolicyIncrementalReview,
+) -> Result<(), PolicyRenderError> {
+    let widened = review
+        .policies()
+        .iter()
+        .filter(|run| run.widen_reason.is_some())
+        .count();
+    writeln!(
+        output,
+        "incremental: base {}, {} of {} units reused, {} recomputed, {widened} polic{} evaluated in full",
+        review.base().stable_label(),
+        review.reused_units(),
+        review.reused_units() + review.recomputed_units(),
+        review.recomputed_units(),
+        if widened == 1 { "y" } else { "ies" },
+    )
+    .map_err(map_io_error)
 }
 
 fn write_summary<W: Write>(
@@ -3288,6 +3360,8 @@ const fn query_result_kind(value: &PolicyQueryResultRef) -> &'static str {
         PolicyQueryResultRef::CallSite { .. } => "call_site",
         PolicyQueryResultRef::ExpressionSite { .. } => "expression_site",
         PolicyQueryResultRef::JsxAttributeValue { .. } => "jsx_attribute_value",
+        PolicyQueryResultRef::MemberTargetAnalysis { .. } => "member_target_analysis",
+        PolicyQueryResultRef::FieldWriteValue { .. } => "field_write_value",
         PolicyQueryResultRef::ReceiverAnalysis { .. } => "receiver_analysis",
         PolicyQueryResultRef::Unsupported { .. } => "unsupported",
     }
@@ -3368,6 +3442,7 @@ const fn match_result_domain(value: MatchResultDomain) -> &'static str {
         MatchResultDomain::CallSite => "call_site",
         MatchResultDomain::ExpressionSite => "expression_site",
         MatchResultDomain::JsxAttributeValue => "jsx_attribute_value",
+        MatchResultDomain::FieldWriteValue => "field_write_value",
         MatchResultDomain::Occurrence => "occurrence",
         MatchResultDomain::LexicalScope => "lexical_scope",
         MatchResultDomain::Binding => "binding",

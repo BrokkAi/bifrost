@@ -5,7 +5,7 @@
 tests/fixtures/typestate/*.canonical*.json text eol=lf
 
 # Semantic-model source, schema, and text goldens are exact cross-platform contracts.
-schemas/semantic-model-pack-v1.schema.json text eol=lf
+schemas/semantic-model-pack-v2.schema.json text eol=lf
 tests/fixtures/semantic-model-packs/*.json text eol=lf
 tests/fixtures/semantic-model-packs/*.yaml text eol=lf
 tests/fixtures/semantic-model-packs/*.deflate binary

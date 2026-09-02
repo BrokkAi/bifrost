@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "pack_id": "bifrost.go.stdlib.errors-declarations",
   "version": "1.0.0",
   "producer": {
@@ -102,6 +102,55 @@
               "kind": "artifact",
               "path": "errors/wrap.go",
               "symbol": "errors.Is"
+            }
+          },
+          {
+            "id": "member.9fd565756088ca91d69be236b28ee436db05c9fa5b505d121a26fcf7d151992d",
+            "owner": "type.1eef3afbc23b6c534c6d054fc877197155006d5fdbdce518890a99d07a1f85d8",
+            "name": "As",
+            "member_kind": "function",
+            "visibility": "public",
+            "is_static": true,
+            "is_abstract": false,
+            "is_virtual": false,
+            "signature": {
+              "type_parameters": [],
+              "parameters": [
+                {
+                  "name": "err",
+                  "type": {
+                    "kind": "named",
+                    "name": "error",
+                    "arguments": [],
+                    "nullable": false
+                  },
+                  "optional": false,
+                  "variadic": false
+                },
+                {
+                  "name": "target",
+                  "type": {
+                    "kind": "named",
+                    "name": "any",
+                    "arguments": [],
+                    "nullable": false
+                  },
+                  "optional": false,
+                  "variadic": false
+                }
+              ],
+              "returns": {
+                "kind": "named",
+                "name": "bool",
+                "arguments": [],
+                "nullable": false
+              }
+            },
+            "aliases": [],
+            "locator": {
+              "kind": "artifact",
+              "path": "errors/wrap.go",
+              "symbol": "errors.As"
             }
           }
         ],

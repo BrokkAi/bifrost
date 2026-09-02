@@ -66,6 +66,14 @@ pub(super) fn acquire_direct_import_layer(
         }
         return None;
     };
+    if state.analyzer.read_ledger_attached() {
+        // The direct-import topology is whole-workspace: its cache key is the
+        // request shape, which is constant here, plus this identity.
+        let languages = state.analyzer.languages().into_iter().collect::<Vec<_>>();
+        state
+            .analyzer
+            .record_read(state.analyzer.workspace_scope_read_key(&languages));
+    }
     if state
         .direct_import_layer_content
         .is_some_and(|content| content != workspace_content)

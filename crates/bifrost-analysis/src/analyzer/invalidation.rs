@@ -64,6 +64,14 @@ pub enum DerivedArtifactKind {
     WorkspaceUsageGraph,
     /// One immutable structural posting index for a single language.
     StructuralIndex,
+    /// One policy evaluation unit, identified by the digest of the read set it
+    /// recorded.
+    ///
+    /// A unit is derived from its recorded inputs exactly as an IR artifact is
+    /// derived from a file revision, so a verdict about one is the same kind of
+    /// statement; naming it by its read-set digest is checkout-independent
+    /// because every read key is.
+    PolicyEvaluationUnit,
 }
 
 impl DerivedArtifactKind {
@@ -77,6 +85,7 @@ impl DerivedArtifactKind {
             Self::DerivedQueryLayer => "derived_query_layer",
             Self::WorkspaceUsageGraph => "workspace_usage_graph",
             Self::StructuralIndex => "structural_index",
+            Self::PolicyEvaluationUnit => "policy_evaluation_unit",
         }
     }
 }
@@ -186,6 +195,19 @@ pub enum InvalidationReason {
         dependency: DerivedArtifactId,
         recomputed: DerivedArtifactId,
     },
+    /// One named input this artifact read moved, and the input is not itself a
+    /// derived artifact.
+    ///
+    /// Applies when a recorded read is verified against what changed rather
+    /// than against a recomputed dependency: a name-keyed index entry a changed
+    /// blob rewrote, a whole-language scope whose content identity moved. There
+    /// is no dependency [`DerivedArtifactId`] to name, so the input is named by
+    /// the canonical digest of the read key that recorded it -- which is
+    /// exactly the identity the reader wrote down.
+    DependencyChanged {
+        artifact: DerivedArtifactId,
+        dependency: StableDigest,
+    },
     /// The artifact's dependency closure fingerprint moved.
     ///
     /// Applies when the *set* of dependencies changed -- one was added,
@@ -266,6 +288,7 @@ impl InvalidationReason {
         match self {
             Self::InputContentChanged { artifact, .. }
             | Self::DependencyArtifactChanged { artifact, .. }
+            | Self::DependencyChanged { artifact, .. }
             | Self::DependencyFingerprintChanged { artifact, .. }
             | Self::EpochChanged { artifact, .. }
             | Self::BudgetModeDiffers { artifact, .. }
@@ -280,6 +303,7 @@ impl InvalidationReason {
         match self {
             Self::InputContentChanged { .. } => "input_content_changed",
             Self::DependencyArtifactChanged { .. } => "dependency_artifact_changed",
+            Self::DependencyChanged { .. } => "dependency_changed",
             Self::DependencyFingerprintChanged { .. } => "dependency_fingerprint_changed",
             Self::EpochChanged { .. } => "epoch_changed",
             Self::BudgetModeDiffers { .. } => "budget_mode_differs",
@@ -308,6 +332,13 @@ impl fmt::Display for InvalidationReason {
             } => write!(
                 formatter,
                 "{artifact} is invalid: dependency {dependency} was recomputed to {recomputed} with a changed output"
+            ),
+            Self::DependencyChanged {
+                artifact,
+                dependency,
+            } => write!(
+                formatter,
+                "{artifact} is invalid: the input it recorded as {dependency} moved"
             ),
             Self::DependencyFingerprintChanged {
                 artifact,

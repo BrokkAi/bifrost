@@ -52,9 +52,6 @@ fn mcp_server_binary() -> &'static str {
 
 fn spawn_server(root: &Path) -> Child {
     Command::new(mcp_server_binary())
-        // This fixture proves a checked-in workspace model, not whichever JDK
-        // dependency pack the developer machine happens to expose.
-        .env_remove("JAVA_HOME")
         // The workspace-authoring location for semantic models is opt-in.
         .env("BIFROST_WORKSPACE_SEMANTIC_MODELS", "on")
         // A functional wire test must not incidentally assert the cold-start
@@ -168,6 +165,7 @@ fn run_policy_over(app: &str) -> Value {
 
 /// The violating tree: `run_policy` reports the finding status, exit status 1,
 /// and the canonical schema-5 report carrying both marked procedures.
+#[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
 #[test]
 fn mcp_run_policy_reports_the_forbidden_transitive_effect() {
     let structured = run_policy_over(FINDING_APP);

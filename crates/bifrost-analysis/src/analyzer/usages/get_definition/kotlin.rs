@@ -615,18 +615,15 @@ impl<'a> KotlinCtx<'a> {
 
     /// The type declarations at `fqn`.
     ///
-    /// A Kotlin `typealias` counts: `declarations.rs` indexes one as a `Field`
-    /// carrying the alias marker rather than as a class, and a spelled type
-    /// name can resolve to one (issue #2696). The usage scan's target model
-    /// makes the same extension, so navigation and usages cannot disagree
-    /// about whether an alias is a type.
+    /// A Kotlin `typealias` counts, and asks nothing extra: since #2892 an
+    /// alias mints a `Class` unit like every other Kotlin type declaration, so
+    /// a spelled type name that resolves to one (issue #2696) is admitted by
+    /// the same predicate the usage scan's target model uses.
     fn types_named(&self, fqn: &str) -> Vec<CodeUnit> {
         self.support
             .fqn_in_any_language(fqn)
             .into_iter()
-            .filter(|unit| {
-                !unit.is_synthetic() && (unit.is_class() || self.is_kotlin_type_alias(unit))
-            })
+            .filter(|unit| !unit.is_synthetic() && unit.is_class())
             .collect()
     }
 
@@ -969,14 +966,32 @@ impl<'a> KotlinCtx<'a> {
 
     /// Declarations at `fqn` that a bare name can denote as a value: a
     /// property, an enum entry, an object, or a class used as a qualifier.
+    ///
+    /// A `typealias` is not one of them. It is a `Class` unit like every other
+    /// Kotlin type declaration since #2892, but it introduces no term: where an
+    /// alias and a `val` share one name, the bare read is the `val`, and this
+    /// path cannot follow an alias to the classifier it stands for anyway.
     fn values_named(&self, fqn: &str) -> Vec<CodeUnit> {
         self.support
             .fqn_in_any_language(fqn)
             .into_iter()
             .filter(|unit| {
-                !unit.is_synthetic() && (unit.is_field() || unit.is_class() || unit.is_function())
+                !unit.is_synthetic()
+                    && (unit.is_field()
+                        || unit.is_function()
+                        || (unit.is_class() && !self.is_type_alias(unit)))
             })
             .collect()
+    }
+
+    /// Whether `unit` is a Kotlin `typealias`.
+    ///
+    /// The marker is what tells an alias apart from the class, interface or
+    /// object it stands beside, all of which mint the same `Class` unit.
+    fn is_type_alias(&self, unit: &CodeUnit) -> bool {
+        self.analyzer
+            .type_alias_provider()
+            .is_some_and(|provider| provider.is_type_alias(unit))
     }
 
     /// Whether `unit`'s recorded arity admits a call passing `arity` arguments.
@@ -1263,15 +1278,6 @@ impl<'a> KotlinCtx<'a> {
     /// about which objects are companions.
     fn is_companion_object(&self, unit: &CodeUnit) -> bool {
         crate::analyzer::usages::kotlin_graph::is_companion_object(self.analyzer, unit)
-    }
-
-    /// Whether `unit` is a Kotlin `typealias`.
-    ///
-    /// The alias marker is the same one the usage scan consults (issue #1239):
-    /// an alias is indexed as a `Field`, so without asking for the marker the
-    /// type tier of this ladder would never see one (issue #2696).
-    fn is_kotlin_type_alias(&self, unit: &CodeUnit) -> bool {
-        crate::analyzer::usages::kotlin_graph::is_kotlin_type_alias(self.analyzer, unit)
     }
 
     /// The declarations enclosing `byte`, innermost first, followed by the

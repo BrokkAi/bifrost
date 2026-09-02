@@ -1,0 +1,1198 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://csmi.brokk.ai/schema/0.1/schema.json",
+  "title": "Code Semantic Model Interchange v0.1",
+  "description": "Normative JSON serialization for CSMI v0.1 semantic documents and pack manifests.",
+  "oneOf": [
+    { "$ref": "#/$defs/semanticDocument" },
+    { "$ref": "#/$defs/packManifest" }
+  ],
+  "$defs": {
+    "nonEmptyString": {
+      "type": "string",
+      "minLength": 1
+    },
+    "localId": {
+      "type": "string",
+      "pattern": "^[A-Za-z][A-Za-z0-9._-]*$"
+    },
+    "vocabularyIdentifier": {
+      "type": "string",
+      "pattern": "^(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\\.)+[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$"
+    },
+    "absoluteUri": {
+      "type": "string",
+      "format": "uri",
+      "pattern": "^[A-Za-z][A-Za-z0-9+.-]*:"
+    },
+    "utcTimestamp": {
+      "type": "string",
+      "format": "date-time",
+      "pattern": "(?:Z|[+-]00:00)$"
+    },
+    "sha256Value": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "sha384Value": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{96}$"
+    },
+    "sha512Value": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{128}$"
+    },
+    "contentDigest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["algorithm", "value"],
+      "properties": {
+        "algorithm": { "const": "sha-256" },
+        "value": { "$ref": "#/$defs/sha256Value" }
+      }
+    },
+    "artifactDigest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["algorithm", "coverage", "value"],
+      "properties": {
+        "algorithm": {
+          "enum": ["sha-256", "sha-384", "sha-512"]
+        },
+        "coverage": { "$ref": "#/$defs/nonEmptyString" },
+        "canonicalization": { "$ref": "#/$defs/absoluteUri" },
+        "value": { "type": "string" }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "algorithm": { "const": "sha-256" } },
+            "required": ["algorithm"]
+          },
+          "then": { "properties": { "value": { "$ref": "#/$defs/sha256Value" } } }
+        },
+        {
+          "if": {
+            "properties": { "algorithm": { "const": "sha-384" } },
+            "required": ["algorithm"]
+          },
+          "then": { "properties": { "value": { "$ref": "#/$defs/sha384Value" } } }
+        },
+        {
+          "if": {
+            "properties": { "algorithm": { "const": "sha-512" } },
+            "required": ["algorithm"]
+          },
+          "then": { "properties": { "value": { "$ref": "#/$defs/sha512Value" } } }
+        }
+      ]
+    },
+    "artifactSelector": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["purl"],
+      "properties": {
+        "purl": {
+          "type": "string",
+          "pattern": "^pkg:"
+        },
+        "versionRange": {
+          "type": "string",
+          "pattern": "^vers:"
+        },
+        "digests": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/artifactDigest" }
+        }
+      },
+      "oneOf": [
+        {
+          "properties": {
+            "purl": {
+              "pattern": "^pkg:[^?#]+@[^?#]+(?:\\?[^#]+)?$"
+            }
+          },
+          "not": { "required": ["versionRange"] }
+        },
+        {
+          "required": ["versionRange"],
+          "properties": {
+            "purl": {
+              "pattern": "^pkg:[^@?#]+(?:\\?[^#]+)?$"
+            }
+          }
+        }
+      ]
+    },
+    "artifactSelectors": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/artifactSelector" }
+    },
+    "provenanceReferences": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/localId" }
+    },
+    "extensionAttachment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["vocabulary", "version", "payload"],
+      "properties": {
+        "vocabulary": { "$ref": "#/$defs/vocabularyIdentifier" },
+        "version": { "$ref": "#/$defs/nonEmptyString" },
+        "payload": true
+      }
+    },
+    "extensions": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/extensionAttachment" }
+    },
+    "compatibilityConstraint": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["vocabulary", "version", "value"],
+      "properties": {
+        "vocabulary": { "$ref": "#/$defs/vocabularyIdentifier" },
+        "version": { "$ref": "#/$defs/nonEmptyString" },
+        "value": true
+      }
+    },
+    "descriptor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["role"],
+      "properties": {
+        "role": {
+          "enum": [
+            "namespace",
+            "type",
+            "term",
+            "callable",
+            "type-parameter",
+            "value-parameter",
+            "meta"
+          ]
+        },
+        "name": { "$ref": "#/$defs/nonEmptyString" },
+        "disambiguator": { "$ref": "#/$defs/nonEmptyString" }
+      },
+      "anyOf": [
+        { "required": ["name"] },
+        { "required": ["disambiguator"] }
+      ]
+    },
+    "externalIdentity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["scheme", "version", "value"],
+      "properties": {
+        "scheme": { "$ref": "#/$defs/vocabularyIdentifier" },
+        "version": { "$ref": "#/$defs/nonEmptyString" },
+        "value": { "$ref": "#/$defs/nonEmptyString" }
+      }
+    },
+    "symbolDefinition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "scheme", "schemeVersion", "stability", "descriptors"],
+      "properties": {
+        "id": { "$ref": "#/$defs/localId" },
+        "artifactSelectors": { "$ref": "#/$defs/artifactSelectors" },
+        "scheme": { "$ref": "#/$defs/vocabularyIdentifier" },
+        "schemeVersion": { "$ref": "#/$defs/nonEmptyString" },
+        "stability": {
+          "enum": ["portable", "artifact-local"]
+        },
+        "descriptors": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/descriptor" }
+        },
+        "displayName": { "$ref": "#/$defs/nonEmptyString" },
+        "qualifiedDisplayName": { "$ref": "#/$defs/nonEmptyString" },
+        "nativeSignature": { "$ref": "#/$defs/nonEmptyString" },
+        "documentationName": { "$ref": "#/$defs/nonEmptyString" },
+        "abiName": { "$ref": "#/$defs/nonEmptyString" },
+        "origin": {
+          "enum": ["named", "generated", "synthetic", "local"]
+        },
+        "externalIdentities": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/externalIdentity" }
+        },
+        "provenance": { "$ref": "#/$defs/provenanceReferences" },
+        "extensions": { "$ref": "#/$defs/extensions" }
+      }
+    },
+    "unknownType": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind"],
+      "properties": {
+        "kind": { "const": "unknown" }
+      }
+    },
+    "referenceType": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "symbol"],
+      "properties": {
+        "kind": { "const": "reference" },
+        "symbol": { "$ref": "#/$defs/localId" },
+        "arguments": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/typeExpression" }
+        }
+      }
+    },
+    "parameterType": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "symbol"],
+      "properties": {
+        "kind": { "const": "parameter" },
+        "symbol": { "$ref": "#/$defs/localId" }
+      }
+    },
+    "intrinsicType": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "vocabulary", "version", "identifier"],
+      "properties": {
+        "kind": { "const": "intrinsic" },
+        "vocabulary": { "$ref": "#/$defs/vocabularyIdentifier" },
+        "version": { "$ref": "#/$defs/nonEmptyString" },
+        "identifier": { "$ref": "#/$defs/nonEmptyString" }
+      }
+    },
+    "typeExpression": {
+      "oneOf": [
+        { "$ref": "#/$defs/unknownType" },
+        { "$ref": "#/$defs/referenceType" },
+        { "$ref": "#/$defs/parameterType" },
+        { "$ref": "#/$defs/intrinsicType" }
+      ]
+    },
+    "genericParameter": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["position", "symbol", "kind"],
+      "properties": {
+        "position": { "type": "integer", "minimum": 0 },
+        "symbol": { "$ref": "#/$defs/localId" },
+        "kind": { "enum": ["type", "value", "lifetime"] },
+        "extensions": { "$ref": "#/$defs/extensions" }
+      }
+    },
+    "receiver": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind"],
+      "properties": {
+        "kind": { "enum": ["instance", "type", "extension"] },
+        "type": { "$ref": "#/$defs/typeExpression" },
+        "extensions": { "$ref": "#/$defs/extensions" }
+      }
+    },
+    "parameter": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["position", "binding", "required"],
+      "properties": {
+        "position": { "type": "integer", "minimum": 0 },
+        "binding": {
+          "enum": [
+            "positional-only",
+            "positional-or-named",
+            "named-only",
+            "variadic-positional",
+            "variadic-named"
+          ]
+        },
+        "label": { "$ref": "#/$defs/nonEmptyString" },
+        "required": { "type": "boolean" },
+        "symbol": { "$ref": "#/$defs/localId" },
+        "type": { "$ref": "#/$defs/typeExpression" },
+        "extensions": { "$ref": "#/$defs/extensions" }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "binding": { "enum": ["positional-or-named", "named-only"] }
+            },
+            "required": ["binding"]
+          },
+          "then": { "required": ["label"] }
+        }
+      ]
+    },
+    "result": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["position"],
+      "properties": {
+        "position": { "type": "integer", "minimum": 0 },
+        "label": { "$ref": "#/$defs/nonEmptyString" },
+        "type": { "$ref": "#/$defs/typeExpression" },
+        "extensions": { "$ref": "#/$defs/extensions" }
+      }
+    },
+    "callableShape": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "parameters", "results"],
+      "properties": {
+        "kind": {
+          "enum": [
+            "function",
+            "method",
+            "constructor",
+            "accessor",
+            "operator",
+            "destructor",
+            "other"
+          ]
+        },
+        "receiver": { "$ref": "#/$defs/receiver" },
+        "parameters": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/parameter" }
+        },
+        "results": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/result" }
+        },
+        "extensions": { "$ref": "#/$defs/extensions" }
+      }
+    },
+    "declaration": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["symbol", "category"],
+      "properties": {
+        "symbol": { "$ref": "#/$defs/localId" },
+        "category": {
+          "enum": [
+            "namespace",
+            "type",
+            "type-alias",
+            "value",
+            "callable",
+            "type-parameter",
+            "value-parameter",
+            "meta"
+          ]
+        },
+        "owner": { "$ref": "#/$defs/localId" },
+        "genericParameters": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/genericParameter" }
+        },
+        "callable": { "$ref": "#/$defs/callableShape" },
+        "aliasTarget": { "$ref": "#/$defs/typeExpression" },
+        "provenance": { "$ref": "#/$defs/provenanceReferences" },
+        "extensions": { "$ref": "#/$defs/extensions" }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "category": { "const": "type-alias" } },
+            "required": ["category"]
+          },
+          "then": { "required": ["aliasTarget"] },
+          "else": { "not": { "required": ["aliasTarget"] } }
+        },
+        {
+          "if": {
+            "properties": { "category": { "const": "callable" } },
+            "required": ["category"]
+          },
+          "else": { "not": { "required": ["callable"] } }
+        }
+      ]
+    },
+    "typeRelationship": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["subject", "predicate", "object"],
+      "properties": {
+        "subject": { "$ref": "#/$defs/localId" },
+        "predicate": { "enum": ["inherits", "conforms-to"] },
+        "object": { "$ref": "#/$defs/localId" },
+        "typeArguments": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/typeExpression" }
+        },
+        "provenance": { "$ref": "#/$defs/provenanceReferences" },
+        "extensions": { "$ref": "#/$defs/extensions" }
+      }
+    },
+    "memberRelationship": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["subject", "predicate", "object"],
+      "properties": {
+        "subject": { "$ref": "#/$defs/localId" },
+        "predicate": { "enum": ["overrides", "implements"] },
+        "object": { "$ref": "#/$defs/localId" },
+        "provenance": { "$ref": "#/$defs/provenanceReferences" },
+        "extensions": { "$ref": "#/$defs/extensions" }
+      }
+    },
+    "relationship": {
+      "oneOf": [
+        { "$ref": "#/$defs/typeRelationship" },
+        { "$ref": "#/$defs/memberRelationship" }
+      ]
+    },
+    "singleAspectDependency": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["symbol", "aspect"],
+      "properties": {
+        "symbol": { "$ref": "#/$defs/localId" },
+        "aspect": {
+          "enum": [
+            "category",
+            "owner",
+            "generic-parameters",
+            "callable-shape",
+            "alias-target"
+          ]
+        }
+      }
+    },
+    "relationshipDependency": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["symbol", "aspect", "predicate", "object"],
+      "properties": {
+        "symbol": { "$ref": "#/$defs/localId" },
+        "aspect": { "const": "relationships" },
+        "predicate": {
+          "enum": ["inherits", "conforms-to", "overrides", "implements"]
+        },
+        "object": { "$ref": "#/$defs/localId" },
+        "typeArguments": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/typeExpression" }
+        },
+        "completeSet": { "type": "boolean" }
+      }
+    },
+    "declarationDependency": {
+      "oneOf": [
+        { "$ref": "#/$defs/singleAspectDependency" },
+        { "$ref": "#/$defs/relationshipDependency" }
+      ]
+    },
+    "inputReceiverRoot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["phase", "role"],
+      "properties": {
+        "phase": { "const": "input" },
+        "role": { "const": "receiver" }
+      }
+    },
+    "inputParameterRoot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["phase", "role", "position"],
+      "properties": {
+        "phase": { "const": "input" },
+        "role": { "const": "parameter" },
+        "position": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "inputCaptureRoot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["phase", "role", "symbol"],
+      "properties": {
+        "phase": { "const": "input" },
+        "role": { "const": "capture" },
+        "symbol": { "$ref": "#/$defs/localId" }
+      }
+    },
+    "outputReceiverRoot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["phase", "role"],
+      "properties": {
+        "phase": { "const": "output" },
+        "role": { "const": "receiver" }
+      }
+    },
+    "outputParameterRoot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["phase", "role", "position"],
+      "properties": {
+        "phase": { "const": "output" },
+        "role": { "const": "parameter" },
+        "position": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "outputCaptureRoot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["phase", "role", "symbol"],
+      "properties": {
+        "phase": { "const": "output" },
+        "role": { "const": "capture" },
+        "symbol": { "$ref": "#/$defs/localId" }
+      }
+    },
+    "outputResultRoot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["phase", "role", "position"],
+      "properties": {
+        "phase": { "const": "output" },
+        "role": { "const": "result" },
+        "position": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "outputExceptionRoot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["phase", "role"],
+      "properties": {
+        "phase": { "const": "output" },
+        "role": { "const": "exception" }
+      }
+    },
+    "inputBoundaryRoot": {
+      "oneOf": [
+        { "$ref": "#/$defs/inputReceiverRoot" },
+        { "$ref": "#/$defs/inputParameterRoot" },
+        { "$ref": "#/$defs/inputCaptureRoot" }
+      ]
+    },
+    "outputBoundaryRoot": {
+      "oneOf": [
+        { "$ref": "#/$defs/outputReceiverRoot" },
+        { "$ref": "#/$defs/outputParameterRoot" },
+        { "$ref": "#/$defs/outputCaptureRoot" },
+        { "$ref": "#/$defs/outputResultRoot" },
+        { "$ref": "#/$defs/outputExceptionRoot" }
+      ]
+    },
+    "projectionStep": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind"],
+      "properties": {
+        "kind": { "$ref": "#/$defs/nonEmptyString" },
+        "args": { "type": "object" }
+      }
+    },
+    "projection": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["scheme", "schemeVersion", "steps"],
+      "properties": {
+        "scheme": { "$ref": "#/$defs/vocabularyIdentifier" },
+        "schemeVersion": { "$ref": "#/$defs/nonEmptyString" },
+        "steps": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/projectionStep" }
+        }
+      }
+    },
+    "inputLocation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["root"],
+      "properties": {
+        "root": { "$ref": "#/$defs/inputBoundaryRoot" },
+        "projection": { "$ref": "#/$defs/projection" }
+      }
+    },
+    "outputLocation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["root"],
+      "properties": {
+        "root": { "$ref": "#/$defs/outputBoundaryRoot" },
+        "projection": { "$ref": "#/$defs/projection" }
+      }
+    },
+    "transfer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source", "destination"],
+      "properties": {
+        "source": { "$ref": "#/$defs/inputLocation" },
+        "destination": { "$ref": "#/$defs/outputLocation" },
+        "provenance": { "$ref": "#/$defs/provenanceReferences" },
+        "extensions": { "$ref": "#/$defs/extensions" }
+      }
+    },
+    "procedureSummary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["callable", "transfers"],
+      "properties": {
+        "callable": { "$ref": "#/$defs/localId" },
+        "transfers": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/transfer" }
+        },
+        "extensions": { "$ref": "#/$defs/extensions" }
+      }
+    },
+    "diagnostic": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["message"],
+      "properties": {
+        "message": { "$ref": "#/$defs/nonEmptyString" },
+        "code": { "$ref": "#/$defs/nonEmptyString" },
+        "details": true
+      }
+    },
+    "limitation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind"],
+      "properties": {
+        "kind": { "$ref": "#/$defs/nonEmptyString" },
+        "diagnostic": { "$ref": "#/$defs/diagnostic" }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "kind": { "const": "other" } },
+            "required": ["kind"]
+          },
+          "then": { "required": ["diagnostic"] }
+        }
+      ]
+    },
+    "declarationRecordsScope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["scheme", "schemeVersion"],
+      "properties": {
+        "scheme": { "$ref": "#/$defs/vocabularyIdentifier" },
+        "schemeVersion": { "$ref": "#/$defs/nonEmptyString" }
+      }
+    },
+    "declarationAspectScope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["symbol", "aspect"],
+      "properties": {
+        "symbol": { "$ref": "#/$defs/localId" },
+        "aspect": {
+          "enum": [
+            "category",
+            "owner",
+            "generic-parameters",
+            "callable-shape",
+            "alias-target"
+          ]
+        }
+      }
+    },
+    "declarationRelationshipScope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["subject", "predicate"],
+      "properties": {
+        "subject": { "$ref": "#/$defs/localId" },
+        "predicate": {
+          "enum": ["inherits", "conforms-to", "overrides", "implements"]
+        }
+      }
+    },
+    "procedureSummaryScope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["callable"],
+      "properties": {
+        "callable": { "$ref": "#/$defs/localId" }
+      }
+    },
+    "completenessStatement": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["family", "scope", "status"],
+      "properties": {
+        "vocabulary": { "$ref": "#/$defs/vocabularyIdentifier" },
+        "version": { "$ref": "#/$defs/nonEmptyString" },
+        "family": { "$ref": "#/$defs/nonEmptyString" },
+        "scope": { "type": "object" },
+        "status": { "enum": ["unknown", "partial", "complete"] },
+        "limitations": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/limitation" }
+        },
+        "provenance": { "$ref": "#/$defs/provenanceReferences" },
+        "extensions": { "$ref": "#/$defs/extensions" }
+      },
+      "allOf": [
+        {
+          "oneOf": [
+            {
+              "properties": {
+                "family": { "const": "declaration-records" },
+                "scope": { "$ref": "#/$defs/declarationRecordsScope" }
+              },
+              "not": {
+                "anyOf": [
+                  { "required": ["vocabulary"] },
+                  { "required": ["version"] }
+                ]
+              }
+            },
+            {
+              "properties": {
+                "family": { "const": "declaration-aspects" },
+                "scope": { "$ref": "#/$defs/declarationAspectScope" }
+              },
+              "not": {
+                "anyOf": [
+                  { "required": ["vocabulary"] },
+                  { "required": ["version"] }
+                ]
+              }
+            },
+            {
+              "properties": {
+                "family": { "const": "declaration-relationships" },
+                "scope": { "$ref": "#/$defs/declarationRelationshipScope" }
+              },
+              "not": {
+                "anyOf": [
+                  { "required": ["vocabulary"] },
+                  { "required": ["version"] }
+                ]
+              }
+            },
+            {
+              "properties": {
+                "family": { "const": "procedure-summaries" },
+                "scope": { "$ref": "#/$defs/procedureSummaryScope" }
+              },
+              "not": {
+                "anyOf": [
+                  { "required": ["vocabulary"] },
+                  { "required": ["version"] }
+                ]
+              }
+            },
+            {
+              "required": ["vocabulary", "version"],
+              "properties": {
+                "family": {
+                  "not": {
+                    "enum": [
+                      "declaration-records",
+                      "declaration-aspects",
+                      "declaration-relationships",
+                      "procedure-summaries"
+                    ]
+                  }
+                },
+                "scope": { "type": "object" }
+              }
+            }
+          ]
+        },
+        {
+          "if": {
+            "properties": { "status": { "const": "partial" } },
+            "required": ["status"]
+          },
+          "then": { "required": ["limitations"] }
+        },
+        {
+          "if": {
+            "properties": { "status": { "const": "complete" } },
+            "required": ["status"]
+          },
+          "then": { "not": { "required": ["limitations"] } }
+        }
+      ]
+    },
+    "affectedFactFamily": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "family", "scope"],
+      "properties": {
+        "kind": { "const": "fact-family" },
+        "family": { "$ref": "#/$defs/nonEmptyString" },
+        "scope": { "type": "object" }
+      }
+    },
+    "affectedCoreSlot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "slot", "target"],
+      "properties": {
+        "kind": { "const": "core-slot" },
+        "slot": { "$ref": "#/$defs/nonEmptyString" },
+        "target": { "type": "object" }
+      }
+    },
+    "affectedAttachment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "attachmentPoint", "target"],
+      "properties": {
+        "kind": { "const": "attachment" },
+        "attachmentPoint": { "$ref": "#/$defs/nonEmptyString" },
+        "target": { "type": "object" }
+      }
+    },
+    "affectedUnit": {
+      "oneOf": [
+        { "$ref": "#/$defs/affectedFactFamily" },
+        { "$ref": "#/$defs/affectedCoreSlot" },
+        { "$ref": "#/$defs/affectedAttachment" }
+      ]
+    },
+    "vocabularyUse": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["identifier", "version", "schema", "requirement", "affects"],
+      "properties": {
+        "identifier": { "$ref": "#/$defs/vocabularyIdentifier" },
+        "version": { "$ref": "#/$defs/nonEmptyString" },
+        "schema": { "$ref": "#/$defs/absoluteUri" },
+        "requirement": { "enum": ["optional", "required"] },
+        "affects": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/affectedUnit" }
+        }
+      }
+    },
+    "extensionFact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["vocabulary", "version", "family", "scope", "payload"],
+      "properties": {
+        "vocabulary": { "$ref": "#/$defs/vocabularyIdentifier" },
+        "version": { "$ref": "#/$defs/nonEmptyString" },
+        "family": { "$ref": "#/$defs/nonEmptyString" },
+        "scope": { "type": "object" },
+        "payload": true,
+        "provenance": { "$ref": "#/$defs/provenanceReferences" },
+        "extensions": { "$ref": "#/$defs/extensions" }
+      }
+    },
+    "producerIdentity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["identifier", "version"],
+      "properties": {
+        "identifier": { "$ref": "#/$defs/absoluteUri" },
+        "version": { "$ref": "#/$defs/nonEmptyString" }
+      }
+    },
+    "provenanceInput": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["role"],
+      "properties": {
+        "role": { "$ref": "#/$defs/nonEmptyString" },
+        "identifier": { "$ref": "#/$defs/absoluteUri" },
+        "purl": {
+          "type": "string",
+          "pattern": "^pkg:"
+        },
+        "digest": { "$ref": "#/$defs/artifactDigest" },
+        "packDigest": { "$ref": "#/$defs/contentDigest" },
+        "semanticDocumentDigest": { "$ref": "#/$defs/contentDigest" }
+      },
+      "anyOf": [
+        { "required": ["identifier"] },
+        { "required": ["purl"] },
+        { "required": ["digest"] },
+        { "required": ["packDigest"] },
+        { "required": ["semanticDocumentDigest"] }
+      ]
+    },
+    "provenanceRecord": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "producer", "generationMethod"],
+      "properties": {
+        "id": { "$ref": "#/$defs/localId" },
+        "producer": { "$ref": "#/$defs/producerIdentity" },
+        "generationMethod": {
+          "enum": [
+            "source-analysis",
+            "binary-analysis",
+            "metadata-conversion",
+            "manual-authoring",
+            "composition",
+            "mixed",
+            "other"
+          ]
+        },
+        "inputs": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/provenanceInput" }
+        },
+        "createdAt": { "$ref": "#/$defs/utcTimestamp" },
+        "invocationId": { "$ref": "#/$defs/nonEmptyString" },
+        "diagnostic": { "$ref": "#/$defs/diagnostic" }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "generationMethod": { "const": "manual-authoring" } },
+            "required": ["generationMethod"]
+          },
+          "else": { "required": ["inputs"] }
+        },
+        {
+          "if": {
+            "properties": { "generationMethod": { "const": "other" } },
+            "required": ["generationMethod"]
+          },
+          "then": { "required": ["diagnostic"] }
+        }
+      ]
+    },
+    "semanticModel": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["artifactSelectors"],
+      "properties": {
+        "artifactSelectors": { "$ref": "#/$defs/artifactSelectors" },
+        "compatibilityConstraints": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/compatibilityConstraint" }
+        },
+        "vocabularyUses": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/vocabularyUse" }
+        },
+        "consumerResolvedDependencies": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/declarationDependency" }
+        },
+        "symbols": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/symbolDefinition" }
+        },
+        "declarations": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/declaration" }
+        },
+        "relationships": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/relationship" }
+        },
+        "procedureSummaries": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/procedureSummary" }
+        },
+        "extensionFacts": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/extensionFact" }
+        },
+        "completenessStatements": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/completenessStatement" }
+        },
+        "extensions": { "$ref": "#/$defs/extensions" }
+      },
+      "anyOf": [
+        { "required": ["declarations"] },
+        { "required": ["relationships"] },
+        { "required": ["procedureSummaries"] },
+        { "required": ["extensionFacts"] },
+        { "required": ["completenessStatements"] },
+        { "required": ["extensions"] }
+      ]
+    },
+    "semanticDocument": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "documentType",
+        "schema",
+        "semanticModelVersion",
+        "serializationVersion",
+        "provenanceRecords",
+        "semanticModels"
+      ],
+      "properties": {
+        "documentType": { "const": "semantic-document" },
+        "schema": { "const": "https://csmi.brokk.ai/schema/0.1/schema.json" },
+        "semanticModelVersion": { "const": "0.1" },
+        "serializationVersion": { "const": "0.1-json" },
+        "provenanceRecords": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/provenanceRecord" }
+        },
+        "defaultProvenance": { "$ref": "#/$defs/localId" },
+        "semanticModels": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/semanticModel" }
+        }
+      }
+    },
+    "spdxExpression": {
+      "type": "string",
+      "minLength": 1
+    },
+    "licenseReference": {
+      "type": "string",
+      "pattern": "^(?:DocumentRef-[A-Za-z0-9.-]+:)?LicenseRef-[A-Za-z0-9.-]+$"
+    },
+    "resourcePath": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^(?!.*\\u0000)(?!.*\\/$)(?!/)(?![A-Za-z]:)(?![A-Za-z][A-Za-z0-9+.-]*:)(?!.*//)(?!.*\\\\)(?!.*(?:^|/)\\.\\.?(/|$))(?!.*%(?:2[eEfF]|5[cC])).+$"
+    },
+    "mediaType": {
+      "type": "string",
+      "pattern": "^[a-z0-9!#$&^_.+-]+/[a-z0-9!#$&^_.+-]+(?:[ ]*;.*)?$"
+    },
+    "resourceDescriptor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "role", "mediaType", "size", "digest"],
+      "properties": {
+        "path": { "$ref": "#/$defs/resourcePath" },
+        "role": {
+          "enum": [
+            "semantic-document",
+            "vocabulary-schema",
+            "license-text",
+            "notice",
+            "auxiliary"
+          ]
+        },
+        "mediaType": { "$ref": "#/$defs/mediaType" },
+        "size": { "type": "integer", "minimum": 0 },
+        "digest": { "$ref": "#/$defs/contentDigest" },
+        "license": { "$ref": "#/$defs/spdxExpression" },
+        "schemaIdentifier": { "$ref": "#/$defs/absoluteUri" },
+        "licenseReference": { "$ref": "#/$defs/licenseReference" }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "role": { "const": "semantic-document" } },
+            "required": ["role"]
+          },
+          "then": {
+            "properties": {
+              "mediaType": { "const": "application/vnd.csmi.semantic-model.v0.1+json" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "role": { "const": "vocabulary-schema" } },
+            "required": ["role"]
+          },
+          "then": {
+            "required": ["schemaIdentifier"],
+            "properties": {
+              "mediaType": { "const": "application/schema+json" }
+            }
+          },
+          "else": { "not": { "required": ["schemaIdentifier"] } }
+        },
+        {
+          "if": {
+            "properties": { "role": { "const": "license-text" } },
+            "required": ["role"]
+          },
+          "else": { "not": { "required": ["licenseReference"] } }
+        }
+      ]
+    },
+    "packManifest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "documentType",
+        "schema",
+        "packFormatVersion",
+        "assembler",
+        "license",
+        "resources"
+      ],
+      "properties": {
+        "documentType": { "const": "pack-manifest" },
+        "schema": { "const": "https://csmi.brokk.ai/schema/0.1/schema.json" },
+        "packFormatVersion": { "const": "0.1" },
+        "assembler": { "$ref": "#/$defs/producerIdentity" },
+        "license": { "$ref": "#/$defs/spdxExpression" },
+        "createdAt": { "$ref": "#/$defs/utcTimestamp" },
+        "resources": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "contains": {
+            "type": "object",
+            "properties": { "role": { "const": "semantic-document" } },
+            "required": ["role"]
+          },
+          "minContains": 1,
+          "items": { "$ref": "#/$defs/resourceDescriptor" }
+        },
+        "derivedFrom": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/contentDigest" }
+        }
+      }
+    }
+  }
+}

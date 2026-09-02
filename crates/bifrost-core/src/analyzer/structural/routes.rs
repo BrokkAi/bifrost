@@ -21,6 +21,7 @@
 use super::occurrences::{Namespace, labelled_enum};
 use crate::analyzer::Language;
 use crate::analyzer::fq_name::{FqName, SegmentInterner, SegmentKind};
+use crate::hash::HashSet;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
@@ -239,6 +240,44 @@ impl IdentityRouteSupport {
         ALL_ROUTE_HOP_KINDS
             .iter()
             .map(|&relation| (relation, self.relation(relation)))
+    }
+}
+
+/// The public surface a module curates by listing names, rather than by
+/// marking each declaration: Python's module-level `__all__`.
+///
+/// A listed name is re-exported by whatever binding the module gives it,
+/// which is the rule PEP 484 stub semantics state and pyright and mypy
+/// enforce. `Unreadable` is the honest answer for a surface the source
+/// computes (`__all__ = build()`, `__all__.extend(other)`): membership is
+/// unknown, so an import the file does not otherwise classify has no relation
+/// the adapter can state, and the file's route relations report incomplete
+/// rather than guessing.
+///
+/// Adapters gather this once per file in
+/// [`super::spec::StructuralSpec::curated_export_surface`] and read it per
+/// token in [`super::spec::StructuralSpec::indirection_relation`].
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum CuratedExportSurface {
+    /// The file names no curated surface, so its exports follow the
+    /// language's ordinary declaration-level rules.
+    #[default]
+    Absent,
+    /// The file names one, and every member was read from the parse tree.
+    Listed(HashSet<String>),
+    /// The file names one whose members the adapter cannot read.
+    Unreadable,
+}
+
+impl CuratedExportSurface {
+    /// Whether `name` is on the curated surface. `None` is "the file curates a
+    /// surface this adapter cannot read", which is never a `false`.
+    pub fn lists(&self, name: &str) -> Option<bool> {
+        match self {
+            Self::Absent => Some(false),
+            Self::Listed(names) => Some(names.contains(name)),
+            Self::Unreadable => None,
+        }
     }
 }
 

@@ -134,7 +134,7 @@ impl DependencyPackAdapter for GoDependencyPackAdapter {
         };
         let request = production_request(dependency);
         let (diagnostics, suppressed_diagnostics) = diagnostics.finish();
-        let completeness = if diagnostics.is_empty() && suppressed_diagnostics == 0 {
+        let completeness = if diagnostics.is_empty() && suppressed_diagnostics.total() == 0 {
             Completeness::Complete
         } else {
             Completeness::Partial
@@ -207,6 +207,7 @@ impl GoModulePackProducer {
             return ArtifactProduction::failed(
                 ProducerDiagnostic {
                     severity: ProducerDiagnosticSeverity::Error,
+                    source_entry: None,
                     code: "artifact.kind".to_owned(),
                     location: None,
                     declaration: None,
@@ -249,7 +250,7 @@ impl GoModulePackProducer {
             };
         };
         let (diagnostics, suppressed_diagnostics) = diagnostics.finish();
-        let completeness = if diagnostics.is_empty() && suppressed_diagnostics == 0 {
+        let completeness = if diagnostics.is_empty() && suppressed_diagnostics.total() == 0 {
             Completeness::Complete
         } else {
             Completeness::Partial
@@ -947,6 +948,7 @@ fn module_type_drafts(
                         type_parameters: Vec::new(),
                         type_parameter_constraints: Vec::new(),
                         underlying_type: None,
+                        value_semantics: None,
                         embedded_types: Vec::new(),
                         hierarchy: Vec::new(),
                         aliases,
@@ -1204,6 +1206,7 @@ fn collect_type_draft(
             type_parameters,
             type_parameter_constraints,
             underlying_type,
+            value_semantics: None,
             embedded_types,
             hierarchy: Vec::<HierarchyFact>::new(),
             aliases: (type_kind == TypeKind::TypeAlias)
@@ -1602,6 +1605,7 @@ fn push_member(
             is_static,
             is_abstract,
             is_virtual: is_abstract,
+            implicit_operation: None,
             callable_family_complete: false,
             signature,
             receiver,
@@ -1734,6 +1738,7 @@ fn callable_parameters(
                 r#type: parameter_type,
                 optional: false,
                 variadic,
+                passing_mode: Default::default(),
             });
         } else {
             result.extend(names.into_iter().map(|name| Parameter {
@@ -1741,6 +1746,7 @@ fn callable_parameters(
                 r#type: parameter_type.clone(),
                 optional: false,
                 variadic,
+                passing_mode: Default::default(),
             }));
         }
     }
@@ -2090,6 +2096,7 @@ fn type_ref(
                         r#type,
                         optional: false,
                         variadic,
+                        passing_mode: Default::default(),
                     })
                     .collect();
                 let result = match results.len() {
@@ -2512,7 +2519,9 @@ fn artifact_locator(path: &str, symbol: &str) -> Locator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::analyzer::semantic_model::{CompilerOptions, ProducerDiagnostic, compile_pack};
+    use crate::analyzer::semantic_model::{
+        CompilerOptions, ProducerDiagnostic, SuppressedDiagnostics, compile_pack,
+    };
 
     fn package(files: &[&str]) -> DiscoveredGoPackage {
         DiscoveredGoPackage {
@@ -2540,7 +2549,7 @@ mod tests {
         )
         .unwrap();
         let (diagnostics, suppressed) = diagnostics.finish();
-        assert_eq!(suppressed, 0);
+        assert_eq!(suppressed, SuppressedDiagnostics::default());
         (facts.0, facts.1, diagnostics)
     }
 

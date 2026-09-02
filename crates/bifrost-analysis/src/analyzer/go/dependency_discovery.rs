@@ -4,7 +4,7 @@ use crate::analyzer::semantic_model::{
     CatalogCoordinate, DependencyArtifactRole, DependencyDiscoveryOutcome,
     DependencyDiscoveryProfile, DependencyPackDiagnostic, DependencyPackDiagnosticSeverity,
     DependencyPackLimits, DependencyProvenance, ExternalArtifactKind, ResolvedDependency,
-    ResolvedDependencyArtifact, SemanticModelActivationEvidence,
+    ResolvedDependencyArtifact, SemanticModelActivationEvidence, SuppressedDiagnostics,
 };
 use crate::analyzer::topology::DependencyScope;
 use crate::analyzer::{
@@ -428,9 +428,11 @@ fn build_curated_pack_evidence_outcome(
         })
         .collect::<Vec<_>>();
 
-    let mut suppressed_diagnostics = 0;
+    let mut suppressed_diagnostics = SuppressedDiagnostics::default();
     if dependencies.len() > limits.max_dependencies {
-        suppressed_diagnostics += dependencies.len() - limits.max_dependencies;
+        // Dropped dependencies are not diagnostics; the breach itself is
+        // reported as the error diagnostic pushed here.
+        suppressed_diagnostics.warnings = dependencies.len() - limits.max_dependencies;
         dependencies.truncate(limits.max_dependencies);
         diagnostics.push(error_diagnostic(
             "limit.dependencies",
@@ -443,7 +445,8 @@ fn build_curated_pack_evidence_outcome(
         ));
     }
     if diagnostics.len() > limits.max_diagnostics {
-        suppressed_diagnostics += diagnostics.len() - limits.max_diagnostics;
+        // Go discovery emits error-severity diagnostics only.
+        suppressed_diagnostics.errors = diagnostics.len() - limits.max_diagnostics;
         diagnostics.truncate(limits.max_diagnostics);
     }
     DependencyDiscoveryOutcome {
@@ -452,7 +455,7 @@ fn build_curated_pack_evidence_outcome(
             dependencies_resolved: dependencies.len(),
         },
         dependencies,
-        complete: diagnostics.is_empty() && suppressed_diagnostics == 0,
+        complete: diagnostics.is_empty() && suppressed_diagnostics.total() == 0,
         diagnostics,
         suppressed_diagnostics,
         cancelled: false,
@@ -857,9 +860,11 @@ fn build_outcome(
             declared_by: None,
         });
     }
-    let mut suppressed_diagnostics = 0;
+    let mut suppressed_diagnostics = SuppressedDiagnostics::default();
     if dependencies.len() > limits.max_dependencies {
-        suppressed_diagnostics += dependencies.len() - limits.max_dependencies;
+        // Dropped dependencies are not diagnostics; the breach itself is
+        // reported as the error diagnostic pushed here.
+        suppressed_diagnostics.warnings = dependencies.len() - limits.max_dependencies;
         dependencies.truncate(limits.max_dependencies);
         diagnostics.push(error_diagnostic(
             "limit.dependencies",
@@ -872,7 +877,8 @@ fn build_outcome(
         ));
     }
     if diagnostics.len() > limits.max_diagnostics {
-        suppressed_diagnostics += diagnostics.len() - limits.max_diagnostics;
+        // Go discovery emits error-severity diagnostics only.
+        suppressed_diagnostics.errors = diagnostics.len() - limits.max_diagnostics;
         diagnostics.truncate(limits.max_diagnostics);
     }
     DependencyDiscoveryOutcome {
@@ -881,7 +887,7 @@ fn build_outcome(
             dependencies_resolved: dependencies.len(),
         },
         dependencies,
-        complete: diagnostics.is_empty() && suppressed_diagnostics == 0,
+        complete: diagnostics.is_empty() && suppressed_diagnostics.total() == 0,
         diagnostics,
         suppressed_diagnostics,
         cancelled: false,
@@ -1170,7 +1176,7 @@ fn failed_outcome(
     DependencyDiscoveryOutcome {
         dependencies: Vec::new(),
         diagnostics: vec![error_diagnostic(code, None, message, limits)],
-        suppressed_diagnostics: 0,
+        suppressed_diagnostics: SuppressedDiagnostics::default(),
         complete: false,
         cancelled: false,
         profile: DependencyDiscoveryProfile::default(),
@@ -1187,7 +1193,7 @@ fn cancelled_outcome() -> DependencyDiscoveryOutcome {
             location: None,
             message: "Go dependency discovery was cancelled".to_owned(),
         }],
-        suppressed_diagnostics: 0,
+        suppressed_diagnostics: SuppressedDiagnostics::default(),
         complete: false,
         cancelled: true,
         profile: DependencyDiscoveryProfile::default(),

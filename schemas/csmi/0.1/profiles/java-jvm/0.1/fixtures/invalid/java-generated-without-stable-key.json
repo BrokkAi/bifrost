@@ -1,0 +1,13 @@
+{
+  "$profileSchema": "java-source-identity",
+  "profileVersion": "0.1",
+  "language": "scala",
+  "package": ["org", "example"],
+  "ownerPath": [],
+  "declaration": {
+    "kind": "function",
+    "name": "generated",
+    "signature": { "parameterTypes": [] }
+  },
+  "origin": "generated"
+}

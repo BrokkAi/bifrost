@@ -315,6 +315,14 @@ pub(super) fn describe_ref(value: &PolicyQueryResultRef) -> String {
             coverage,
             ..
         } => format!("jsx_attribute_value {element_identity} {coverage}"),
+        PolicyQueryResultRef::MemberTargetAnalysis {
+            outcome, coverage, ..
+        } => format!("member_target_analysis {outcome} {coverage}"),
+        PolicyQueryResultRef::FieldWriteValue {
+            member_target_id,
+            coverage,
+            ..
+        } => format!("field_write_value -> {member_target_id} {coverage}"),
         PolicyQueryResultRef::ReceiverAnalysis {
             analysis_kind,
             outcome,

@@ -677,7 +677,26 @@ fn ts_collect_receiver_owners_from_bindings(
             && let Some(name) = node.child_by_field_name("name")
             && node_text_matches(name, source, receiver)
         {
-            if let Some(type_node) = node.child_by_field_name("type") {
+            if let Some(value) = node.child_by_field_name("value") {
+                let initialized = ts_expression_property_owners(
+                    host,
+                    support,
+                    file,
+                    source,
+                    root,
+                    imports,
+                    aliases,
+                    value,
+                    depth + 1,
+                    resolution,
+                );
+                // An annotation is a structural contract, not a second
+                // nominal runtime owner. When an initializer exists, its
+                // structured value evidence is authoritative; an unresolved
+                // initializer remains Unknown instead of borrowing the
+                // annotation's owner (#2495).
+                out.record(initialized);
+            } else if let Some(type_node) = node.child_by_field_name("type") {
                 let annotated = match ts_resolve_type_node_to_property_owner_outcome(
                     host,
                     support,
@@ -696,21 +715,6 @@ fn ts_collect_receiver_owners_from_bindings(
                     | ReceiverAnalysisOutcome::ExceededBudget { .. } => Vec::new(),
                 };
                 out.record(annotated);
-            }
-            if let Some(value) = node.child_by_field_name("value") {
-                let initialized = ts_expression_property_owners(
-                    host,
-                    support,
-                    file,
-                    source,
-                    root,
-                    imports,
-                    aliases,
-                    value,
-                    depth + 1,
-                    resolution,
-                );
-                out.record(initialized);
             }
         }
 

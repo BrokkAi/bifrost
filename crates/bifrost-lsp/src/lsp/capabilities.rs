@@ -1,16 +1,16 @@
 use lsp_types::{
     ClientCapabilities, CodeActionKind, CodeActionOptions, CodeActionProviderCapability,
     CompletionClientCapabilities, CompletionOptions, DeclarationCapability, DiagnosticOptions,
-    DiagnosticServerCapabilities, DocumentFormattingOptions, FoldingRangeProviderCapability,
-    HoverProviderCapability, ImplementationProviderCapability, OneOf, ReferencesOptions,
-    RenameOptions, SemanticTokensFullOptions, SemanticTokensOptions,
+    DiagnosticServerCapabilities, DocumentFormattingOptions, DocumentOnTypeFormattingOptions,
+    FoldingRangeProviderCapability, HoverProviderCapability, ImplementationProviderCapability,
+    OneOf, ReferencesOptions, RenameOptions, SemanticTokensFullOptions, SemanticTokensOptions,
     SemanticTokensServerCapabilities, ServerCapabilities, SignatureHelpOptions,
     TextDocumentSyncCapability, TextDocumentSyncKind, TextDocumentSyncOptions,
     TextDocumentSyncSaveOptions, TokenFormat, TypeDefinitionProviderCapability,
     WorkDoneProgressOptions, WorkspaceFoldersServerCapabilities,
 };
 
-use crate::lsp::handlers::semantic_tokens;
+use crate::lsp::handlers::{on_type_formatting, semantic_tokens};
 
 pub fn server_capabilities(client_capabilities: &ClientCapabilities) -> ServerCapabilities {
     // Incremental changes are applied transactionally to the complete buffer
@@ -45,6 +45,18 @@ pub fn server_capabilities(client_capabilities: &ClientCapabilities) -> ServerCa
         document_formatting_provider: Some(OneOf::Right(DocumentFormattingOptions {
             work_done_progress_options: WorkDoneProgressOptions::default(),
         })),
+        // On-type formatting is a global capability with no language filter,
+        // so the trigger characters are the Bifrost S-expression terminators
+        // and the handler answers every other document with no edits.
+        document_on_type_formatting_provider: Some(DocumentOnTypeFormattingOptions {
+            first_trigger_character: on_type_formatting::FIRST_TRIGGER_CHARACTER.to_string(),
+            more_trigger_character: Some(
+                on_type_formatting::MORE_TRIGGER_CHARACTERS
+                    .iter()
+                    .map(|character| (*character).to_string())
+                    .collect(),
+            ),
+        }),
         folding_range_provider: Some(FoldingRangeProviderCapability::Simple(true)),
         hover_provider: Some(HoverProviderCapability::Simple(true)),
         references_provider: Some(OneOf::Right(ReferencesOptions {

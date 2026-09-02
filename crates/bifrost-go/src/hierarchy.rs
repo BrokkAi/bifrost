@@ -8,7 +8,9 @@ use crate::declarations::{
     determine_go_package_name, go_field_declaration_is_embedded, go_identifier_is_exported,
     go_node_text, is_predeclared_go_type,
 };
-use crate::imports::{default_go_import_local_name, go_import_path};
+use crate::imports::{
+    default_go_import_local_name, go_import_path, parent_path_key, path_suffixes,
+};
 use crate::packages::canonical_go_package_name;
 use brokk_bifrost_core::analyzer::capabilities::ImportAnalysisProvider;
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
@@ -123,6 +125,10 @@ pub struct GoHierarchyIndex {
     /// file did not parse or the pair cap fired, in which case no member's
     /// family can be stated as exhaustive.
     enumeration_complete: bool,
+    /// [`GoPackageIndex::packages_for`] calls the import pass made, which is
+    /// one per resolvable import when the package table is indexed.
+    #[cfg(any(test, feature = "test-support"))]
+    package_lookups: usize,
     #[cfg(any(test, feature = "test-support"))]
     relations: Vec<TypeRelation>,
 }
@@ -188,6 +194,15 @@ impl GoHierarchyIndex {
     pub fn relations(&self) -> &[TypeRelation] {
         &self.relations
     }
+
+    /// How many times the import pass probed the package table. One probe per
+    /// import is the indexed cost; the scan this replaced had no probe count
+    /// because it visited every workspace file for every import.
+    #[cfg(any(test, feature = "test-support"))]
+    #[allow(dead_code)]
+    pub fn package_lookups(&self) -> usize {
+        self.package_lookups
+    }
 }
 
 struct ParsedGoFile {
@@ -211,6 +226,9 @@ struct GoHierarchyBuilder<'a> {
     /// hold a type that satisfies an interface, so the member family it would
     /// have contributed to is not exhaustive.
     all_files_parsed: bool,
+    /// [`GoPackageIndex::packages_for`] calls the import pass made.
+    #[cfg(any(test, feature = "test-support"))]
+    package_lookups: usize,
     #[cfg(any(test, feature = "test-support"))]
     relations: Vec<TypeRelation>,
 }
@@ -230,6 +248,8 @@ impl<'a> GoHierarchyBuilder<'a> {
             aliases: HashMap::default(),
             alias_units: HashMap::default(),
             all_files_parsed: true,
+            #[cfg(any(test, feature = "test-support"))]
+            package_lookups: 0,
             #[cfg(any(test, feature = "test-support"))]
             relations: Vec::new(),
         }
@@ -409,6 +429,8 @@ impl<'a> GoHierarchyBuilder<'a> {
             unenumerated_methods,
             enumeration_complete: self.all_files_parsed && pairs_within_cap,
             #[cfg(any(test, feature = "test-support"))]
+            package_lookups: self.package_lookups,
+            #[cfg(any(test, feature = "test-support"))]
             relations,
         }
     }
@@ -451,6 +473,7 @@ impl<'a> GoHierarchyBuilder<'a> {
                 dot_imports: Vec::new(),
             });
         }
+        let package_index = GoPackageIndex::new(package_index);
         for mut parsed in parsed_files {
             let (imports, dot_imports) = import_packages(
                 self.token,
@@ -462,6 +485,10 @@ impl<'a> GoHierarchyBuilder<'a> {
             parsed.imports = imports;
             parsed.dot_imports = dot_imports;
             self.files.push(parsed);
+        }
+        #[cfg(any(test, feature = "test-support"))]
+        {
+            self.package_lookups = package_index.lookups.get();
         }
     }
 
@@ -999,11 +1026,83 @@ impl<'a> GoHierarchyBuilder<'a> {
     }
 }
 
+/// The workspace package table, keyed by every import path spelling that can
+/// bind to a file, so [`import_packages`] costs one hash probe per import
+/// instead of a scan of every workspace file (#1748: 48.6% of the samples in a
+/// warm `scan_usages_by_reference` on kubernetes were that scan).
+///
+/// The scan this replaces accepted a candidate when the candidate's canonical
+/// package equalled the import path, or when the import path was a trailing
+/// component sequence of the candidate's parent directory. The second rule is
+/// exactly "the import path is one of [`path_suffixes`] of the candidate's
+/// [`parent_path_key`]", so those suffixes are the keys and the package name
+/// is one more key. The rule is a disjunction, so a single bucket per spelling
+/// reproduces it exactly, and no separate predicate function is left that
+/// could drift away from the keys.
+struct GoPackageIndex {
+    /// `(file, canonical package)` for every parsed file, in the order the
+    /// scan visited them.
+    entries: Vec<(ProjectFile, String)>,
+    /// Import path spelling -> the `entries` positions that spelling binds.
+    by_import_path: HashMap<String, Vec<usize>>,
+    /// Counts [`Self::packages_for`] calls so a test can pin that resolution
+    /// stays one probe per import.
+    #[cfg(any(test, feature = "test-support"))]
+    lookups: std::cell::Cell<usize>,
+}
+
+impl GoPackageIndex {
+    fn new(entries: Vec<(ProjectFile, String)>) -> Self {
+        let mut by_import_path: HashMap<String, Vec<usize>> = HashMap::default();
+        for (position, (file, package)) in entries.iter().enumerate() {
+            // Positions arrive in increasing order, so the only position a
+            // bucket can already end with is this one. That happens whenever a
+            // file's package name is also a suffix of its own directory, the
+            // normal shape under a `go.mod`.
+            let mut bind = |key: &str| {
+                let bucket = by_import_path.entry(key.to_string()).or_default();
+                if bucket.last() != Some(&position) {
+                    bucket.push(position);
+                }
+            };
+            bind(package);
+            for suffix in path_suffixes(&parent_path_key(file)) {
+                bind(suffix);
+            }
+        }
+        Self {
+            entries,
+            by_import_path,
+            #[cfg(any(test, feature = "test-support"))]
+            lookups: std::cell::Cell::new(0),
+        }
+    }
+
+    /// Every canonical package an `import "import_path"` written in `file`
+    /// binds, sorted and deduplicated. A file never answers its own import.
+    fn packages_for(&self, file: &ProjectFile, import_path: &str) -> Vec<String> {
+        #[cfg(any(test, feature = "test-support"))]
+        self.lookups.set(self.lookups.get() + 1);
+        let mut packages: Vec<String> = self
+            .by_import_path
+            .get(import_path)
+            .into_iter()
+            .flatten()
+            .map(|position| &self.entries[*position])
+            .filter(|(candidate, _package)| candidate != file)
+            .map(|(_candidate, package)| package.clone())
+            .collect();
+        packages.sort();
+        packages.dedup();
+        packages
+    }
+}
+
 fn import_packages(
     token: QueryToken<'_>,
     imports: &dyn ImportAnalysisProvider,
     file: &ProjectFile,
-    package_index: &[(ProjectFile, String)],
+    package_index: &GoPackageIndex,
     declared_names: &HashMap<String, String>,
 ) -> (HashMap<String, Vec<String>>, Vec<String>) {
     let mut by_alias: HashMap<String, Vec<String>> = HashMap::default();
@@ -1016,21 +1115,11 @@ fn import_packages(
         let Some(path) = go_import_path(&import) else {
             continue;
         };
-        let mut packages: Vec<_> = package_index
-            .iter()
-            .filter(|(candidate, _package)| candidate != file)
-            .filter(|(candidate, package)| {
-                package == &path || path_suffix_matches(&candidate.parent(), &path)
-            })
-            .map(|(_candidate, package)| package.clone())
-            .collect();
+        let mut packages = package_index.packages_for(file, &path);
         if packages.is_empty() {
+            // Nothing in the workspace declares this package: keep the source
+            // spelling so callers can still report an import boundary.
             packages.push(path.clone());
-        }
-        packages.sort();
-        packages.dedup();
-        if packages.is_empty() {
-            continue;
         }
         match alias {
             Some(".") => dot_imports.extend(packages),
@@ -1352,11 +1441,6 @@ fn rebuild_direct_descendants(
     direct_descendants
 }
 
-fn path_suffix_matches(path: &std::path::Path, suffix: &str) -> bool {
-    let parent = path.to_string_lossy().replace('\\', "/");
-    parent == suffix || parent.ends_with(&format!("/{suffix}"))
-}
-
 fn channel_direction(node: Node<'_>) -> &'static str {
     let mut chan_start = None;
     let mut arrow_start = None;
@@ -1554,4 +1638,79 @@ fn record_structural_relation(
         to: to.clone(),
         kind: TypeRelationKind::StructuralSatisfaction,
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::GoPackageIndex;
+    use brokk_bifrost_core::analyzer::ProjectFile;
+
+    /// The scan [`GoPackageIndex`] replaced, kept here as an oracle that does
+    /// not share a line of code with the index: a candidate binds an import
+    /// path when its canonical package equals the path, or when the path is a
+    /// trailing component sequence of the candidate's directory.
+    fn scan(
+        entries: &[(ProjectFile, String)],
+        file: &ProjectFile,
+        import_path: &str,
+    ) -> Vec<String> {
+        let mut packages: Vec<String> = entries
+            .iter()
+            .filter(|(candidate, _package)| candidate != file)
+            .filter(|(candidate, package)| {
+                let parent = candidate.parent().to_string_lossy().replace('\\', "/");
+                package == import_path
+                    || parent == import_path
+                    || parent.ends_with(&format!("/{import_path}"))
+            })
+            .map(|(_candidate, package)| package.clone())
+            .collect();
+        packages.sort();
+        packages.dedup();
+        packages
+    }
+
+    /// Same-suffix directories (`a/pkg`, `b/pkg`, `pkg`) plus a vendored copy,
+    /// which is where a suffix index can differ from the scan if its keys are
+    /// not derived from the same rule.
+    #[test]
+    fn package_index_answers_exactly_what_the_scan_answered() {
+        let root = std::env::temp_dir().join("bifrost-go-package-index");
+        let entries: Vec<(ProjectFile, String)> = [
+            ("a/pkg/one.go", "example.com/app/a/pkg"),
+            ("b/pkg/two.go", "example.com/app/b/pkg"),
+            ("pkg/three.go", "example.com/app/pkg"),
+            ("pkg/four.go", "example.com/app/pkg"),
+            (
+                "vendor/k8s.io/utils/pkg/five.go",
+                "example.com/app/vendor/k8s.io/utils/pkg",
+            ),
+        ]
+        .into_iter()
+        .map(|(path, package)| (ProjectFile::new(root.clone(), path), package.to_string()))
+        .collect();
+        let index = GoPackageIndex::new(entries.clone());
+
+        for (file, _package) in &entries {
+            for import_path in [
+                "pkg",
+                "a/pkg",
+                "b/pkg",
+                "utils/pkg",
+                "k8s.io/utils/pkg",
+                "vendor/k8s.io/utils/pkg",
+                "example.com/app/pkg",
+                "example.com/app/a/pkg",
+                "example.com/app/vendor/k8s.io/utils/pkg",
+                "example.com/app",
+                "nowhere/at/all",
+            ] {
+                assert_eq!(
+                    index.packages_for(file, import_path),
+                    scan(&entries, file, import_path),
+                    "import {import_path:?} from {file}"
+                );
+            }
+        }
+    }
 }

@@ -1,6 +1,7 @@
 use super::*;
+use brokk_bifrost_cpp::declarations::CppRecoveredExportClassIndex;
 use brokk_bifrost_cpp::graph::resolver::{
-    EffectiveUsingTarget, OrdinaryTypeImport, PreprocessorGuard,
+    CppClassDeclarationStrength, EffectiveUsingTarget, OrdinaryTypeImport, PreprocessorGuard,
 };
 use std::mem::size_of;
 use std::sync::Arc;
@@ -214,4 +215,23 @@ pub(super) fn weight_c_reading(
         .saturating_mul(size_of::<CodeUnit>().saturating_add(64))
         .saturating_add(ranges.saturating_mul(size_of::<Range>()))
         .saturating_add(size_of::<super::projection::CppCReading>()) as u32
+}
+
+/// #1496: one entry is a single class-like unit's declaration strength, a
+/// three-state enum. The unit key carries the strings, so weigh the key the way
+/// every other unit-keyed cell here does rather than counting entries.
+pub(super) fn weight_class_declaration_strength(
+    key: &CodeUnit,
+    _value: &CppClassDeclarationStrength,
+) -> u32 {
+    weight_code_unit(key).clamp(1, u32::MAX as usize) as u32
+}
+
+/// #1496: one entry is a whole file's embedded export-macro class recovery, so
+/// weigh it by the classes it holds rather than counting it as one entry.
+pub(super) fn weight_recovered_export_class_index(
+    _key: &ProjectFile,
+    value: &Arc<CppRecoveredExportClassIndex>,
+) -> u32 {
+    value.approximate_size().clamp(1, u32::MAX as usize) as u32
 }

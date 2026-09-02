@@ -42,8 +42,11 @@ pub fn go_import_path(import: &ImportInfo) -> Option<String> {
 /// Legacy directory-suffix import match, used only as a fallback when no
 /// declaration's canonical package equals the import path (module-less or
 /// vendored layouts).
-pub fn dir_suffix_matches(candidate: &ProjectFile, path: &str) -> bool {
-    let parent = parent_path_key(candidate);
+///
+/// Takes the directory key rather than the file so a caller testing one file
+/// against many import paths computes [`parent_path_key`] once. The rule
+/// itself lives here and nowhere else.
+pub fn dir_suffix_matches(parent: &str, path: &str) -> bool {
     parent == path || path.ends_with(&format!("/{parent}")) || parent.ends_with(&format!("/{path}"))
 }
 

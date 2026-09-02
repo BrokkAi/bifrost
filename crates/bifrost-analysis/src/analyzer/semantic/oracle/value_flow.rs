@@ -1,14 +1,15 @@
 use std::sync::Arc;
 
 use super::super::ir::{
-    CaptureSource, EvidenceCompleteness, MemoryLocationKind, ProcedureHandle, ProgramPointHandle,
-    ProofStatus, SemanticEffect, SemanticValueKind, ValueFlowKind, ValueHandle,
+    CaptureSource, EvidenceCompleteness, ExecutionTiming, MemoryLocationKind, ProcedureHandle,
+    ProgramPointHandle, ProofStatus, SemanticEffect, SemanticValueKind, ValueFlowKind, ValueHandle,
+    ValueTransfer,
 };
 use super::error::{OracleContractError, require_same_procedure};
 use super::limits::OracleLimits;
 use super::model::{
-    AbstractLocation, AbstractObjectIdentity, ExecutionTiming, ExecutionTimingClaim,
-    OracleCallContext, ProcedurePortHandle, ProcedurePortKind,
+    AbstractLocation, AbstractObjectIdentity, ExecutionTimingClaim, OracleCallContext,
+    ProcedurePortHandle, ProcedurePortKind,
 };
 use super::relation::{
     CandidateCoverage, OracleRelationHandle, OracleRelationKind, OracleRelationOwner,
@@ -147,10 +148,15 @@ impl MemoryAccessChains {
                 let defined = match event.effect {
                     SemanticEffect::Assignment { target, value }
                     | SemanticEffect::ValueFlow {
-                        kind: ValueFlowKind::Local,
+                        kind: ValueFlowKind::Local | ValueFlowKind::BackingStore { .. },
                         target,
                         source: value,
                     } => (target, ValueOrigin::Copy(value)),
+                    SemanticEffect::ValueFlow {
+                        kind: ValueFlowKind::Transfer(_),
+                        target,
+                        ..
+                    } => (target, ValueOrigin::Ambiguous),
                     SemanticEffect::MemoryLoad {
                         location, result, ..
                     } => (result, ValueOrigin::Load(location)),
@@ -281,19 +287,31 @@ fn relation_matches_event(
     match effect {
         SemanticEffect::Assignment { target, value } => {
             (relation.kind == ValueFlowRelationKind::Assignment
+                && relation.transfer.is_none()
                 && value_endpoint(&relation.source, *value)
                 && value_endpoint(&relation.target, *target))
                 || is_container_collapse(relation, *target)
         }
         SemanticEffect::ValueFlow {
-            kind: ValueFlowKind::Local,
+            kind: ValueFlowKind::Local | ValueFlowKind::BackingStore { .. },
             source,
             target,
         } => {
             (relation.kind == ValueFlowRelationKind::Assignment
+                && relation.transfer.is_none()
                 && value_endpoint(&relation.source, *source)
                 && value_endpoint(&relation.target, *target))
                 || is_container_collapse(relation, *target)
+        }
+        SemanticEffect::ValueFlow {
+            kind: ValueFlowKind::Transfer(transfer),
+            source,
+            target,
+        } => {
+            relation.kind == ValueFlowRelationKind::Assignment
+                && relation.transfer == Some(*transfer)
+                && value_endpoint(&relation.source, *source)
+                && value_endpoint(&relation.target, *target)
         }
         SemanticEffect::ValueFlow {
             kind: ValueFlowKind::Parameter,
@@ -498,6 +516,14 @@ pub struct ValueFlowRelation {
     pub event_index: u32,
     pub id: OracleRelationHandle,
     pub kind: ValueFlowRelationKind,
+    /// Exact identity-separating transfer semantics when this relation was
+    /// projected from [`ValueFlowKind::Transfer`]. Ordinary dependencies carry
+    /// `None`.
+    ///
+    /// Keeping this metadata on an assignment relation lets generic clients
+    /// retain data dependence while identity-sensitive consumers distinguish
+    /// copies, moves, conversions and boxing.
+    pub transfer: Option<ValueTransfer>,
     pub source: ValueFlowEndpoint,
     pub target: ValueFlowEndpoint,
     pub proof: ProofStatus,
@@ -623,6 +649,9 @@ impl ValueFlowSnapshot {
                 .get(relation.event_index as usize)
                 .ok_or(OracleContractError::InvalidRelationIdentity)?;
             if !relation_matches_event(&procedure, relation, &event.effect, &mut chains) {
+                return Err(OracleContractError::InvalidRelationIdentity);
+            }
+            if relation.transfer.is_some() && relation.kind != ValueFlowRelationKind::Assignment {
                 return Err(OracleContractError::InvalidRelationIdentity);
             }
             if relation.id.owner() != &owner

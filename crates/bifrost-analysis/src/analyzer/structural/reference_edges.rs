@@ -31,6 +31,8 @@ use super::occurrence_rows::{
 };
 use super::occurrences::{ALL_OCCURRENCE_ROLES, OccurrenceClass, OccurrenceRole};
 use super::resolution::EnvironmentAxis;
+use crate::analyzer::canonical_hash::CanonicalHasher;
+use crate::analyzer::semantic::ids::StableDigest;
 use crate::analyzer::usages::{
     FuzzyResult, ReferenceEngine, ReferenceHit, ReferenceKind, UsageHit, UsageHitKind,
     UsageHitSurface, UsageProof, UsageQueryCompletion,
@@ -38,6 +40,7 @@ use crate::analyzer::usages::{
 use crate::analyzer::{CodeUnit, DeclarationId, IAnalyzer, ProjectFile, Range};
 use crate::cancellation::CancellationToken;
 use crate::hash::{HashMap, HashSet};
+use crate::path_utils::rel_path_string;
 use rayon::prelude::*;
 
 /// The file a scan unit reads: a bare file scans whole, a file with demanded
@@ -913,7 +916,8 @@ pub(crate) fn edge_rows_from_reference_hits(
                 UsageHitKind::Reference
                 | UsageHitKind::Import
                 | UsageHitKind::Reexport
-                | UsageHitKind::SelfReceiver => SiteClass::UseSite,
+                | UsageHitKind::SelfReceiver
+                | UsageHitKind::DeclaredReference => SiteClass::UseSite,
             };
             let owner_relation =
                 classify_owner_relation(analyzer, Some(&hit.enclosing_unit), &hit.resolved);
@@ -1058,7 +1062,7 @@ pub fn inverse_edges_for_declaration(
         ));
     }
 
-    EdgeDerivationResult {
+    let result = EdgeDerivationResult {
         edges: run.edges,
         completeness: if reasons.is_empty() {
             EdgeCompleteness::Complete
@@ -1067,7 +1071,57 @@ pub fn inverse_edges_for_declaration(
         },
         provenance: EdgeProvenance::Inverse,
         generation,
+    };
+    if analyzer.read_ledger_attached() {
+        // The candidate set is a superset the reader confirms, and it is a
+        // cross-file answer: a new reference in an unrelated file changes it
+        // while no key the reader recorded moves.
+        analyzer.record_read(crate::analyzer::read_ledger::ReadKey::lookup(
+            crate::analyzer::read_ledger::LookupKind::ReferenceCandidates,
+            crate::analyzer::read_ledger::LookupQuestion::declaration(declaration),
+            inverse_edge_answer_digest(&result),
+        ));
     }
+    result
+}
+
+/// Domain for the digest of one declaration's inverse-edge answer.
+const INVERSE_EDGE_ANSWER_DOMAIN: &[u8] = b"bifrost-read-ledger:inverse-edge-answer:v1";
+
+/// The canonical digest of an inverse-edge answer, by site path and byte range
+/// and by completeness.
+///
+/// Never by row address or `ProjectFile`: the same edges over the same content
+/// at two roots must digest identically. Completeness is folded in because a
+/// truncated answer and a complete answer that happens to hold the same rows
+/// are different facts about the workspace.
+pub(crate) fn inverse_edge_answer_digest(result: &EdgeDerivationResult) -> StableDigest {
+    let mut sites = result
+        .edges
+        .iter()
+        .map(|edge| {
+            (
+                rel_path_string(&edge.site.file),
+                edge.site.range.start_byte,
+                edge.site.range.end_byte,
+            )
+        })
+        .collect::<Vec<_>>();
+    sites.sort();
+    sites.dedup();
+    let mut hasher = CanonicalHasher::new(INVERSE_EDGE_ANSWER_DOMAIN);
+    hasher.field(
+        "completeness",
+        match result.completeness {
+            EdgeCompleteness::Complete => b"complete".as_slice(),
+            EdgeCompleteness::Incomplete { .. } => b"incomplete".as_slice(),
+        },
+    );
+    for (path, start, end) in sites {
+        hasher.field(&path, &(start as u64).to_be_bytes());
+        hasher.value(&(end as u64).to_be_bytes());
+    }
+    StableDigest::from_array(hasher.finish())
 }
 
 /// Every forward edge of one file: each reference-class occurrence that the

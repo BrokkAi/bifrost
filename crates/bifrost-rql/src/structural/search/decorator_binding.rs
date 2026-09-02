@@ -16,8 +16,7 @@ use super::results::{CodeQueryDecoratedParameter, DetailedCodeQueryDecoratedPara
 use super::*;
 use crate::analyzer::lexical_definitions::formal_parameter_slots;
 use crate::analyzer::semantic::{
-    DurablePortIdentity, DurableValueIdentity, ProcedurePortHandle, SemanticValueKind,
-    StructuralNodeIdentity, ValueHandle,
+    DurablePortIdentity, ProcedurePortHandle, SemanticValueKind, StructuralNodeIdentity,
 };
 use crate::analyzer::usages::get_definition::parse_tree_for_language;
 use brokk_bifrost_core::analyzer::structural::resolution::BoundaryStatus;
@@ -334,9 +333,7 @@ fn semantic_parameter_identity(
                 .handle
                 .value_handle(value.id)
                 .expect("semantic parameter value must resolve in its procedure");
-            let value_identity = DurableValueIdentity::of(&value_handle)
-                .expect("semantic parameter value has a durable source identity");
-            let value_id = semantic_value_id(&value_handle, &value_identity);
+            let value_id = super::semantic::semantic_value_wire_id(&value_handle);
             let port_handle = ProcedurePortHandle::parameter(procedure.handle.clone(), ordinal)
                 .expect("semantic parameter value establishes its parameter port");
             let port = DurablePortIdentity::of(&port_handle)
@@ -374,24 +371,6 @@ fn semantic_parameter_identity(
             )),
         ),
     }
-}
-
-fn semantic_value_id(value: &ValueHandle, identity: &DurableValueIdentity) -> String {
-    let mut digest = LengthDelimitedDigest::new(b"bifrost.code_query.semantic_value.v1");
-    digest.push(
-        value
-            .procedure()
-            .artifact()
-            .key()
-            .public_fingerprint()
-            .as_bytes(),
-    );
-    identity.locator.push_stable_identity(&mut digest);
-    digest.push(identity.role.as_bytes());
-    if let Some(ordinal) = identity.ordinal {
-        digest.push(&ordinal.to_le_bytes());
-    }
-    digest.finish().to_string()
 }
 
 fn semantic_port_id(procedure_id: &str, port: &DurablePortIdentity) -> String {

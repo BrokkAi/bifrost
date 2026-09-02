@@ -3,7 +3,7 @@ title: Rust
 description: Query Rust calls, assignments, imports, closures, and method receivers with query_code.
 ---
 
-> Last verified end to end: 2026-07-18 (`query_code` schema version 1).
+> Last verified end to end: 2026-09-01 (`query_code` schema version 1).
 
 For exact inbound and outbound symbol edges, proof tiers, and adapter-specific caveats, see [Reference Traversal](../reference-traversal/).
 
@@ -192,7 +192,88 @@ Rust exposes the imported path through `module`, and signed numeric expressions 
 }
 ```
 
-Rust does not expose `kwargs`, `decorators`, or a normalized null-literal syntax in this adapter. Queries for those shapes should retain the returned capability diagnostic and be refined to roles Rust can prove, such as `receiver`, `args`, `module`, `left`, and `right`.
+Rust does not expose `kwargs` or a normalized null-literal syntax in this adapter. Queries for those shapes should retain the returned capability diagnostic and be refined to roles Rust can prove, such as `receiver`, `args`, `module`, `decorators`, `left`, and `right`.
+
+## Modules And Test-Gated Code
+
+A `mod` declaration is the normalized `module` kind, and it is the containment
+parent of everything it encloses. That makes "production code only" a
+structural constraint rather than a path convention: `not-inside` a
+`(module :name "tests")` drops the calls written inside the test module and
+keeps the rest.
+
+<!-- code-query-fixture:rust/modules.rs -->
+```rust
+fn load(raw: &str) -> String {
+    raw.parse::<String>().unwrap()
+}
+
+mod tests {
+    fn covers_load() {
+        assert_eq!("1".parse::<String>().unwrap(), load("1"));
+    }
+}
+```
+
+<!-- code-query-case:module:rql -->
+```lisp
+(language rust (module :name "tests"))
+```
+
+<!-- code-query-case:module:json -->
+```json
+{"languages":["rust"],"match":{"kind":"module","name":"tests"}}
+```
+
+<!-- code-query-case:module:expected -->
+```json
+{
+  "results": [
+    {
+      "enclosing_symbol": "rust.tests",
+      "end_line": 9,
+      "kind": "module",
+      "language": "rust",
+      "path": "rust/modules.rs",
+      "result_type": "structural_match",
+      "start_line": 5,
+      "text": "mod tests {\u2026"
+    }
+  ],
+  "truncated": false
+}
+```
+
+<!-- code-query-case:outside-test-module:rql -->
+```lisp
+(not-inside
+  (module :name "tests")
+  (language rust (call :callee (name "unwrap"))))
+```
+
+<!-- code-query-case:outside-test-module:json -->
+```json
+{"languages":["rust"],"match":{"kind":"call","callee":{"name":"unwrap"}},"not_inside":{"kind":"module","name":"tests"}}
+```
+
+<!-- code-query-case:outside-test-module:expected -->
+```json
+{
+  "results": [
+    {
+      "enclosing_symbol": "rust.load",
+      "end_line": 2,
+      "kind": "call",
+      "language": "rust",
+      "path": "rust/modules.rs",
+      "result_type": "structural_match",
+      "start_line": 2,
+      "text": "raw.parse::<String>().unwrap()"
+    }
+  ],
+  "truncated": false
+}
+```
 
 ## Traverse Indexed Types And Members
 

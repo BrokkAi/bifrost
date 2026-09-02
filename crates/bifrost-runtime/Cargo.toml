@@ -2,14 +2,10 @@
 name = "brokk-bifrost-runtime"
 version.workspace = true
 edition.workspace = true
-rust-version.workspace = true
 description = "Protocol-neutral runtime and stable extension API for brokk-bifrost"
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
-readme = "README.md"
-keywords.workspace = true
-categories.workspace = true
 publish = true
 exclude = ["tests/**"]
 
@@ -17,10 +13,10 @@ exclude = ["tests/**"]
 name = "brokk_bifrost_runtime"
 
 [dependencies]
-brokk-bifrost-analysis = { path = "../bifrost-analysis", version = "=0.10.8" }
-brokk-bifrost-flow = { path = "../bifrost-flow", version = "=0.10.8" }
-brokk-bifrost-policy = { path = "../bifrost-policy", version = "=0.10.8" }
-brokk-bifrost-rql = { path = "../bifrost-rql", version = "=0.10.8" }
+brokk-bifrost-analysis = { path = "../bifrost-analysis", version = "=0.10.9" }
+brokk-bifrost-flow = { path = "../bifrost-flow", version = "=0.10.9" }
+brokk-bifrost-policy = { path = "../bifrost-policy", version = "=0.10.9" }
+brokk-bifrost-rql = { path = "../bifrost-rql", version = "=0.10.9" }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
 sha2 = "0.10.8"
@@ -34,3 +30,6 @@ tempfile = "3.23.0"
 # Persistence unit tests build linked worktrees to prove the extension surface
 # shares the primary checkout's cache.
 git2 = { version = "0.20.2", default-features = false }
+
+[lints]
+workspace = true

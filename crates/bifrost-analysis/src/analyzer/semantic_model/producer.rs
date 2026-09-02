@@ -1,5 +1,8 @@
+use super::dependency::admit_into_full_diagnostics;
+use super::validate::is_canonical_relative_path;
 use super::{
     ActivationSelector, AuthoredSemanticModelPack, Compatibility, Completeness, Provenance, Safety,
+    SuppressedDiagnostics,
 };
 use crate::CancellationToken;
 use crate::analyzer::canonical_hash::{lower_hex_string, sha256_bytes};
@@ -79,6 +82,8 @@ pub struct ProducerDiagnostic {
     pub severity: ProducerDiagnosticSeverity,
     pub code: String,
     pub location: Option<String>,
+    /// Stable artifact-relative source entry accountable for a file-level reject.
+    pub source_entry: Option<Box<str>>,
     /// Canonical fully-qualified declaration whose extraction failed.
     pub declaration: Option<String>,
     pub message: String,
@@ -90,7 +95,7 @@ pub struct ArtifactProduction {
     pub pack: Option<AuthoredSemanticModelPack>,
     pub completeness: Completeness,
     pub diagnostics: Vec<ProducerDiagnostic>,
-    pub suppressed_diagnostics: usize,
+    pub suppressed_diagnostics: SuppressedDiagnostics,
 }
 
 impl ArtifactProduction {
@@ -125,6 +130,7 @@ pub trait ExternalArtifactPackProducer {
             return ArtifactProduction::failed(
                 ProducerDiagnostic {
                     severity: ProducerDiagnosticSeverity::Error,
+                    source_entry: None,
                     code: "artifact.cancelled".to_owned(),
                     location: None,
                     declaration: None,
@@ -219,6 +225,7 @@ pub(crate) fn read_exact_artifact_while(
 ) -> Result<ExactArtifact, ProducerDiagnostic> {
     let metadata = path.metadata().map_err(|error| ProducerDiagnostic {
         severity: ProducerDiagnosticSeverity::Error,
+        source_entry: None,
         code: "artifact.metadata".to_owned(),
         location: None,
         declaration: None,
@@ -230,6 +237,7 @@ pub(crate) fn read_exact_artifact_while(
     if !metadata.is_file() {
         return Err(ProducerDiagnostic {
             severity: ProducerDiagnosticSeverity::Error,
+            source_entry: None,
             code: "artifact.not_file".to_owned(),
             location: None,
             declaration: None,
@@ -239,6 +247,7 @@ pub(crate) fn read_exact_artifact_while(
     if metadata.len() > limits.max_artifact_bytes {
         return Err(ProducerDiagnostic {
             severity: ProducerDiagnosticSeverity::Error,
+            source_entry: None,
             code: "limit.artifact_bytes".to_owned(),
             location: None,
             declaration: None,
@@ -251,6 +260,7 @@ pub(crate) fn read_exact_artifact_while(
 
     let file = File::open(path).map_err(|error| ProducerDiagnostic {
         severity: ProducerDiagnosticSeverity::Error,
+        source_entry: None,
         code: "artifact.open".to_owned(),
         location: None,
         declaration: None,
@@ -266,6 +276,7 @@ pub(crate) fn read_exact_artifact_while(
         if is_cancelled() {
             return Err(ProducerDiagnostic {
                 severity: ProducerDiagnosticSeverity::Error,
+                source_entry: None,
                 code: "artifact.cancelled".to_owned(),
                 location: None,
                 declaration: None,
@@ -276,6 +287,7 @@ pub(crate) fn read_exact_artifact_while(
             .read(&mut buffer)
             .map_err(|error| ProducerDiagnostic {
                 severity: ProducerDiagnosticSeverity::Error,
+                source_entry: None,
                 code: "artifact.read".to_owned(),
                 location: None,
                 declaration: None,
@@ -292,6 +304,7 @@ pub(crate) fn read_exact_artifact_while(
     if bytes.len() as u64 > limits.max_artifact_bytes {
         return Err(ProducerDiagnostic {
             severity: ProducerDiagnosticSeverity::Error,
+            source_entry: None,
             code: "limit.artifact_bytes".to_owned(),
             location: None,
             declaration: None,
@@ -598,6 +611,7 @@ fn source_set_diagnostic(
 ) -> ProducerDiagnostic {
     ProducerDiagnostic {
         severity: ProducerDiagnosticSeverity::Error,
+        source_entry: None,
         code: code.to_owned(),
         location: Some(path.to_string_lossy().into_owned()),
         declaration: None,
@@ -607,7 +621,7 @@ fn source_set_diagnostic(
 
 pub struct BoundedProducerDiagnostics {
     diagnostics: Vec<ProducerDiagnostic>,
-    suppressed: usize,
+    suppressed: SuppressedDiagnostics,
     max_diagnostics: usize,
     max_message_bytes: usize,
 }
@@ -616,7 +630,7 @@ impl BoundedProducerDiagnostics {
     pub fn new(limits: &ArtifactProducerLimits) -> Self {
         Self {
             diagnostics: Vec::new(),
-            suppressed: 0,
+            suppressed: SuppressedDiagnostics::default(),
             max_diagnostics: limits.max_diagnostics,
             max_message_bytes: limits.max_diagnostic_message_bytes,
         }
@@ -633,6 +647,7 @@ impl BoundedProducerDiagnostics {
             code,
             location,
             None,
+            None,
             message,
         );
     }
@@ -648,7 +663,31 @@ impl BoundedProducerDiagnostics {
             ProducerDiagnosticSeverity::Warning,
             code,
             location,
+            None,
             Some(declaration.into()),
+            message,
+        );
+    }
+
+    /// Record a warning whose accountable subject is one artifact source entry.
+    ///
+    /// The source entry is identity, not display text, so an invalid or
+    /// over-limit value is dropped and the warning remains anonymous. That
+    /// keeps downstream activation fail-closed instead of accounting for a
+    /// truncated or rewritten path.
+    pub fn warning_for_source_entry(
+        &mut self,
+        code: impl Into<String>,
+        location: Option<String>,
+        source_entry: Option<String>,
+        message: impl Into<String>,
+    ) {
+        self.push(
+            ProducerDiagnosticSeverity::Warning,
+            code,
+            location,
+            source_entry,
+            None,
             message,
         );
     }
@@ -664,6 +703,7 @@ impl BoundedProducerDiagnostics {
             code,
             location,
             None,
+            None,
             message,
         );
     }
@@ -673,17 +713,31 @@ impl BoundedProducerDiagnostics {
         severity: ProducerDiagnosticSeverity,
         code: impl Into<String>,
         location: Option<String>,
+        source_entry: Option<String>,
         declaration: Option<String>,
         message: impl Into<String>,
     ) {
-        if self.diagnostics.len() >= self.max_diagnostics {
-            self.suppressed = self.suppressed.saturating_add(1);
+        if self.diagnostics.len() >= self.max_diagnostics
+            && !admit_into_full_diagnostics(
+                &mut self.diagnostics,
+                &mut self.suppressed,
+                severity == ProducerDiagnosticSeverity::Warning,
+                |retained| retained.severity == ProducerDiagnosticSeverity::Warning,
+            )
+        {
             return;
         }
         self.diagnostics.push(ProducerDiagnostic {
             severity,
             code: code.into(),
             location: location.map(|location| bounded_message(location, self.max_message_bytes)),
+            source_entry: source_entry
+                .filter(|entry| {
+                    !entry.is_empty()
+                        && entry.len() <= self.max_message_bytes
+                        && is_canonical_relative_path(entry)
+                })
+                .map(String::into_boxed_str),
             declaration: declaration
                 .map(|declaration| bounded_message(declaration, self.max_message_bytes)),
             message: bounded_message(message.into(), self.max_message_bytes),
@@ -695,17 +749,18 @@ impl BoundedProducerDiagnostics {
             diagnostic.severity,
             diagnostic.code,
             diagnostic.location,
+            diagnostic.source_entry.map(String::from),
             diagnostic.declaration,
             diagnostic.message,
         );
     }
 
-    pub fn finish(self) -> (Vec<ProducerDiagnostic>, usize) {
+    pub fn finish(self) -> (Vec<ProducerDiagnostic>, SuppressedDiagnostics) {
         (self.diagnostics, self.suppressed)
     }
 
     pub fn is_empty(&self) -> bool {
-        self.diagnostics.is_empty() && self.suppressed == 0
+        self.diagnostics.is_empty() && self.suppressed.total() == 0
     }
 }
 
@@ -875,17 +930,35 @@ mod tests {
         };
         let mut diagnostics = BoundedProducerDiagnostics::new(&limits);
         diagnostics.warning("metadata.unsupported", Some("entry".to_owned()), "abcdef");
-        diagnostics.error("metadata.invalid", None, "second");
-        let (diagnostics, suppressed) = diagnostics.finish();
+        let (bounded, suppressed) = diagnostics.finish();
 
-        assert_eq!(diagnostics.len(), 1);
-        assert_eq!(diagnostics[0].location.as_deref(), Some("entr"));
-        assert_eq!(diagnostics[0].message, "abcd");
-        assert_eq!(suppressed, 1);
+        assert_eq!(bounded.len(), 1);
+        assert_eq!(bounded[0].location.as_deref(), Some("entr"));
+        assert_eq!(bounded[0].message, "abcd");
+        assert_eq!(suppressed, SuppressedDiagnostics::default());
+
+        // An error arriving at a full collector evicts the last retained
+        // warning and takes its slot, so the failure stays visible (#2876).
+        let mut diagnostics = BoundedProducerDiagnostics::new(&limits);
+        diagnostics.warning("metadata.unsupported", Some("entry".to_owned()), "abcdef");
+        diagnostics.error("metadata.invalid", None, "second");
+        let (bounded, suppressed) = diagnostics.finish();
+
+        assert_eq!(bounded.len(), 1);
+        assert_eq!(bounded[0].code, "metadata.invalid");
+        assert_eq!(bounded[0].message, "seco");
+        assert_eq!(
+            suppressed,
+            SuppressedDiagnostics {
+                warnings: 1,
+                errors: 0
+            }
+        );
 
         let failure = ArtifactProduction::failed(
             ProducerDiagnostic {
                 severity: ProducerDiagnosticSeverity::Error,
+                source_entry: None,
                 code: "failure".to_owned(),
                 location: Some("unbounded-location".to_owned()),
                 declaration: None,
@@ -897,6 +970,51 @@ mod tests {
             },
         );
         assert!(failure.diagnostics.is_empty());
-        assert_eq!(failure.suppressed_diagnostics, 1);
+        assert_eq!(
+            failure.suppressed_diagnostics,
+            SuppressedDiagnostics {
+                warnings: 0,
+                errors: 1
+            }
+        );
+    }
+
+    #[test]
+    fn source_entry_identity_is_kept_exact_or_left_anonymous() {
+        let limits = ArtifactProducerLimits {
+            max_diagnostic_message_bytes: 16,
+            ..ArtifactProducerLimits::default()
+        };
+        let mut diagnostics = BoundedProducerDiagnostics::new(&limits);
+        diagnostics.warning_for_source_entry(
+            "source.parse",
+            Some("display location".to_owned()),
+            Some("src/example.kt".to_owned()),
+            "unsupported syntax",
+        );
+        diagnostics.warning_for_source_entry(
+            "source.parse",
+            Some("../example.kt".to_owned()),
+            Some("../example.kt".to_owned()),
+            "unsupported syntax",
+        );
+        diagnostics.warning_for_source_entry(
+            "source.parse",
+            Some("long/example.kt".to_owned()),
+            Some("a-very-long-source-entry-path".to_owned()),
+            "path exceeds the identity budget",
+        );
+        let (diagnostics, suppressed) = diagnostics.finish();
+
+        assert_eq!(diagnostics.len(), 3);
+        assert_eq!(suppressed, SuppressedDiagnostics::default());
+        assert_eq!(
+            diagnostics[0].source_entry.as_deref(),
+            Some("src/example.kt")
+        );
+        assert_eq!(diagnostics[0].location.as_deref(), Some("display location"));
+        assert_eq!(diagnostics[0].declaration, None);
+        assert_eq!(diagnostics[1].source_entry, None);
+        assert_eq!(diagnostics[2].source_entry, None);
     }
 }

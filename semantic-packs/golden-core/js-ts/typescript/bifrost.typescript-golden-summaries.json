@@ -1,7 +1,7 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "pack_id": "bifrost.typescript-golden-summaries",
-  "version": "0.2.0",
+  "version": "0.4.0",
   "producer": {
     "name": "bifrost-golden-foundry",
     "version": "0.9.0"
@@ -110,6 +110,31 @@
             "effects": []
           },
           {
+            "id": "buffer.from-string-string",
+            "target": {
+              "path": "node/lib/buffer.js",
+              "symbol": "Buffer.from(string,string)",
+              "has_receiver": true,
+              "parameter_count": 2
+            },
+            "completeness": "complete",
+            "covers_overrides": true,
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          },
+          {
             "id": "json.parse",
             "target": {
               "path": "ecma262/json.js",
@@ -139,116 +164,6 @@
             "target": {
               "path": "ecma262/json.js",
               "symbol": "JSON.stringify",
-              "has_receiver": true,
-              "parameter_count": 1
-            },
-            "completeness": "complete",
-            "covers_overrides": true,
-            "locations": [],
-            "transfers": [
-              {
-                "input": {
-                  "kind": "parameter",
-                  "ordinal": 0
-                },
-                "exit_kind": "normal",
-                "output": {
-                  "kind": "normal_return"
-                }
-              }
-            ],
-            "effects": []
-          },
-          {
-            "id": "node-path.join",
-            "target": {
-              "path": "node/lib/path.js",
-              "symbol": "node:path.join",
-              "has_receiver": true,
-              "parameter_count": 2
-            },
-            "completeness": "complete",
-            "covers_overrides": true,
-            "locations": [],
-            "transfers": [
-              {
-                "input": {
-                  "kind": "parameter",
-                  "ordinal": 0
-                },
-                "exit_kind": "normal",
-                "output": {
-                  "kind": "normal_return"
-                }
-              },
-              {
-                "input": {
-                  "kind": "parameter",
-                  "ordinal": 1
-                },
-                "exit_kind": "normal",
-                "output": {
-                  "kind": "normal_return"
-                }
-              }
-            ],
-            "effects": []
-          },
-          {
-            "id": "node-path.normalize",
-            "target": {
-              "path": "node/lib/path.js",
-              "symbol": "node:path.normalize",
-              "has_receiver": true,
-              "parameter_count": 1
-            },
-            "completeness": "complete",
-            "covers_overrides": true,
-            "locations": [],
-            "transfers": [
-              {
-                "input": {
-                  "kind": "parameter",
-                  "ordinal": 0
-                },
-                "exit_kind": "normal",
-                "output": {
-                  "kind": "normal_return"
-                }
-              }
-            ],
-            "effects": []
-          },
-          {
-            "id": "node-querystring.escape",
-            "target": {
-              "path": "node/lib/querystring.js",
-              "symbol": "node:querystring.escape",
-              "has_receiver": true,
-              "parameter_count": 1
-            },
-            "completeness": "complete",
-            "covers_overrides": true,
-            "locations": [],
-            "transfers": [
-              {
-                "input": {
-                  "kind": "parameter",
-                  "ordinal": 0
-                },
-                "exit_kind": "normal",
-                "output": {
-                  "kind": "normal_return"
-                }
-              }
-            ],
-            "effects": []
-          },
-          {
-            "id": "node-querystring.unescape",
-            "target": {
-              "path": "node/lib/querystring.js",
-              "symbol": "node:querystring.unescape",
               "has_receiver": true,
               "parameter_count": 1
             },

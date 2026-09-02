@@ -1,0 +1,11 @@
+{
+  "kind": "typescript-resolution",
+  "compilerVersionInterval": {
+    "minimum": { "version": "5.7.0", "inclusive": true },
+    "maximum": { "version": "5.9.0", "inclusive": false }
+  },
+  "moduleResolution": "nodenext",
+  "moduleKind": "nodenext",
+  "conditions": ["types"],
+  "effectiveOptionsDigest": "4444444444444444444444444444444444444444444444444444444444444444"
+}

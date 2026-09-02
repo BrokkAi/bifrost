@@ -17,7 +17,7 @@ That produces a dependency like:
 
 ```toml
 [dependencies]
-brokk-bifrost = "0.10.8"
+brokk-bifrost = "0.10.9"
 ```
 
 For local development against a checkout, use a path dependency:
@@ -152,6 +152,8 @@ The top-level crate re-exports the public analyzer and service types most caller
 | `resolve_ruby_semantic_pack_dependencies`, `RubyDependencyPackAdapter` | Validate exact Ruby dependency selections and prepare reusable RBS/RBI/source semantic-model packs without invoking Ruby tools. |
 
 For most embedded code-intelligence workflows, prefer `SearchToolsService` over manually composing individual analyzer calls. It keeps the tool argument and rendering behavior aligned with MCP and the Python client.
+
+[Library Integration](/code-query-tutorials/library-integration/) is the executable walkthrough: it runs one canonical query through `SearchToolsService::query_code_result(...)` against a checked-in fixture, shows the typed result consumption, states when to use the lower-level `execute_request` API instead, and runs the same query through the Python client so the two stay in step.
 
 `analyzer::structural::execute` always returns ordinary rows for embedders that own execution policy. Use the top-level `execute_request` to honor the query's root `execution_mode`; its untagged `CodeQueryResponse::Results` variant preserves the existing serialized result shape. Explain performs logical lowering and physical selection without reading analyzer data during that phase, while profile nests the exact ordinary result. Cancellable embedders can call `execute_request_with_cancellation` with a top-level `CancellationToken` and receive the versioned profile, including cancellation observations and a cancellation-safe partial result. See [Explain and Profile CodeQuery](/code-query-explain-profile/) for the stable wire contract and measurement caveats.
 

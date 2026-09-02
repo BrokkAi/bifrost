@@ -61,10 +61,17 @@ dense_ids! {
     EvidenceId,
     SemanticGapId,
     GuardId,
+    SwitchFactId,
 }
 
 /// One stable SHA-256 digest. Domain-specific wrappers prevent accidental key mixing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+///
+/// Serializable because a persisted read key names its subject by digest and
+/// must round-trip: the digest is 32 content-derived bytes with no interior
+/// structure, so its wire form is those bytes and nothing else.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
 pub struct StableDigest([u8; 32]);
 
 impl StableDigest {
@@ -182,13 +189,21 @@ pub const SEMANTIC_IR_SCHEMA_DOMAIN: &[u8] = b"bifrost-language-neutral-semantic
 
 /// Current language-neutral semantic IR schema revision.
 ///
-/// Revision 14 adds producer-authored structural fact identity to source
-/// mappings for narrow downstream proofs while retaining revision 13's active
-/// cleanup and deferred-execution vocabulary. Every cached semantic artifact
+/// Revision 20 replaces the fieldless aggregate-copy value-flow marker with
+/// the identity-separating transfer vocabulary (copy, aggregate copy, move
+/// with invalidation, conversion with value preservation, boxing, unboxing,
+/// each with an exact selected-operation binding). Revision 19 added
+/// aggregate-versus-element indexed location identity, revision 18 added
+/// capture-slot binding identities, and revision 17 added synchronization
+/// capabilities and effects. Revision 16 added
+/// producer-authored constant index magnitudes, slice allocation and
+/// backing-store flow identities, aggregate-copy boundaries, and orthogonal
+/// call invocation-mode and execution-timing facts while retaining revision
+/// 14's structural source-mapping identity. Every cached semantic artifact
 /// and every wire id derived from one rotates exactly once when this constant
-/// moves; that is a mechanical consequence of extending source-mapping
-/// provenance, not a signal that anything else changed.
-pub const SEMANTIC_IR_SCHEMA_VERSION: u32 = 14;
+/// moves; that is a mechanical consequence of extending the IR, not a signal
+/// that anything else changed.
+pub const SEMANTIC_IR_SCHEMA_VERSION: u32 = 20;
 
 impl SemanticIrVersion {
     /// The contract-owned fingerprint shared by every language adapter that
@@ -1146,10 +1161,10 @@ mod tests {
         let current = SemanticIrVersion::current();
         assert_eq!(
             current.to_string(),
-            "787f18917a81c1a3b0202189e9e8970f70097530a5c0785a62ab961e5927c9fc"
+            "90eaced8a414637ec6673579e9a14450010663868885f685ba10771a0037927f"
         );
         assert_ne!(current.as_bytes(), &[0_u8; 32]);
-        assert_eq!(SEMANTIC_IR_SCHEMA_VERSION, 14);
+        assert_eq!(SEMANTIC_IR_SCHEMA_VERSION, 20);
     }
 
     fn digest(label: &str) -> StableDigest {

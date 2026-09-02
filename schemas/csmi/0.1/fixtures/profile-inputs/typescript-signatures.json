@@ -1,0 +1,45 @@
+{
+  "records": [
+    {
+      "fixture": "valid/javascript-typescript-node.json",
+      "symbol": "exec-sync-declaration",
+      "canonicalInput": {
+        "callableKind": "call",
+        "typeParameterCount": 0,
+        "receiver": null,
+        "parameters": [
+          {
+            "binding": "positional-only",
+            "required": true,
+            "rest": false,
+            "type": {
+              "kind": "intrinsic",
+              "name": "string"
+            }
+          }
+        ],
+        "result": {
+          "kind": "reference",
+          "artifactSelectors": [
+            {
+              "purl": "pkg:npm/%40types/node@22.10.2"
+            }
+          ],
+          "scheme": "csmi.typescript-declaration",
+          "schemeVersion": "0.1.0",
+          "stability": "portable",
+          "descriptors": [
+            {
+              "role": "namespace",
+              "name": "node:buffer"
+            },
+            {
+              "role": "type",
+              "name": "Buffer"
+            }
+          ]
+        }
+      }
+    }
+  ]
+}

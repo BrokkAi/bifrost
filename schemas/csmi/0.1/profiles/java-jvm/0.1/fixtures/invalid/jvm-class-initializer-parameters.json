@@ -1,0 +1,14 @@
+{
+  "$profileSchema": "jvm-binary-identity",
+  "profileVersion": "0.1",
+  "owner": "org/example/Strings",
+  "binaryEntity": {
+    "kind": "method",
+    "name": "<clinit>",
+    "descriptor": "(I)V"
+  },
+  "variant": {
+    "entryPath": "org/example/Strings.class",
+    "release": 0
+  }
+}

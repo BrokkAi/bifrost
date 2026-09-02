@@ -15,7 +15,7 @@ function selected(decision) {
 }
 
 test("impact schema version tracks the exported component contract", () => {
-  assert.equal(SCHEMA_VERSION, "2");
+  assert.equal(SCHEMA_VERSION, "3");
 });
 
 test("unmapped paths conservatively select the full matrix", () => {
@@ -30,7 +30,7 @@ test("build, packaging, dependency, and workflow changes conservatively select t
     ["crates/bifrost-analysis/Cargo.toml"],
     ["crates/bifrost-flow/Cargo.toml"],
     ["crates/bifrost-analysis/resources/treesitter/java/definitions.scm"],
-    ["schemas/semantic-model-pack-v1.schema.json"],
+    ["schemas/semantic-model-pack-v2.schema.json"],
     ["crates/bifrost-jvm/Cargo.toml"],
     ["crates/bifrost-js-ts/Cargo.toml"],
     ["crates/bifrost-python/Cargo.toml"],
@@ -133,6 +133,50 @@ test("ordinary analyzer and test changes select the Rust matrix only", () => {
   });
   assert.equal(decision.mode, "impact");
   assert.deepEqual(selected(decision), ["rust"]);
+});
+
+test("CSMI paths retain their existing components and select focused validation", () => {
+  for (const [changedPath, components] of [
+    [
+      "crates/bifrost-analysis/src/analyzer/semantic_model/csmi/validate.rs",
+      [
+        "csmi",
+        "rust",
+        "semantic_pack_jvm",
+        "semantic_pack_python",
+        "semantic_pack_rust",
+        "semantic_pack_typescript",
+      ],
+    ],
+    ["schemas/csmi/0.1/schema.json", ["csmi"]],
+    [
+      "crates/bifrost-semantic-packs/src/bin/bifrost-semantic-pack.rs",
+      [
+        "csmi",
+        "rust",
+        "semantic_pack_jvm",
+        "semantic_pack_python",
+        "semantic_pack_rust",
+        "semantic_pack_typescript",
+      ],
+    ],
+    ["crates/bifrost-semantic-packs/tests/authoring_cli.rs", ["csmi", "rust"]],
+  ]) {
+    const decision = classifyChangeSet({ eventName: "pull_request", changedPaths: [changedPath] });
+    assert.equal(decision.mode, "impact", changedPath);
+    assert.deepEqual(selected(decision), components, changedPath);
+  }
+});
+
+test("unrelated Rust, documentation, and plugin paths do not select CSMI", () => {
+  for (const changedPaths of [
+    ["crates/bifrost-analysis/src/analyzer/javascript/semantic.rs"],
+    ["docs/src/content/docs/antigravity.md"],
+    ["plugins/bifrost-agent/package.json"],
+  ]) {
+    const decision = classifyChangeSet({ eventName: "pull_request", changedPaths });
+    assert.equal(decision.selected.has("csmi"), false, changedPaths[0]);
+  }
 });
 
 test("pinned semantic-pack inputs and builders select only their matching lanes", () => {

@@ -1,0 +1,8 @@
+{
+  "$profileSchema": "java-jvm-mapping",
+  "profileVersion": "0.1",
+  "resolution": "established",
+  "sourceSymbol": "java-normalize",
+  "binarySymbols": ["jvm-normalize"],
+  "mappingKind": "direct"
+}

@@ -1,0 +1,7 @@
+{
+  "kind": "node-module-resolution",
+  "moduleSystem": "esm",
+  "packageExport": ".",
+  "conditions": [],
+  "resolvedTargetDigest": "3333333333333333333333333333333333333333333333333333333333333333"
+}

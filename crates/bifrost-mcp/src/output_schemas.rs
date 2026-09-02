@@ -12,7 +12,7 @@ use brokk_bifrost_analysis::cyclomatic_complexity_diff::CyclomaticComplexityDiff
 use brokk_bifrost_analysis::searchtools::{
     ActiveWorkspaceResult, GetDefinitionResult, SearchSymbolsResult,
 };
-use brokk_bifrost_policy::BuiltInPolicyPackManifest;
+use brokk_bifrost_policy::BuiltInPolicyCatalogManifest;
 use serde_json::Value;
 
 type OutputSchemaSource = fn() -> Value;
@@ -33,7 +33,7 @@ const OUTPUT_SCHEMAS: &[(&str, OutputSchemaSource)] = &[
     ),
     (
         "list_policies",
-        generate_output_schema::<BuiltInPolicyPackManifest>,
+        generate_output_schema::<BuiltInPolicyCatalogManifest>,
     ),
     (
         "search_symbols",

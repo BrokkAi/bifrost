@@ -11,9 +11,7 @@ pub mod hits;
 pub mod inverted;
 pub mod resolver;
 
-use brokk_bifrost_core::analyzer::capabilities::{
-    ImportAnalysisProvider, TypeAliasProvider, TypeHierarchyProvider,
-};
+use brokk_bifrost_core::analyzer::capabilities::{ImportAnalysisProvider, TypeHierarchyProvider};
 use brokk_bifrost_core::analyzer::fq_name::{FqName, SegmentKind, segment_interner};
 use brokk_bifrost_core::analyzer::{
     CodeUnit, CodeUnitIndex, DefinitionLanguageScope, RelationalDefinitionFrontier,
@@ -34,7 +32,6 @@ use brokk_bifrost_core::analyzer::{
 pub struct KotlinGraphSource<'a> {
     pub index: &'a dyn CodeUnitIndex,
     pub hierarchy: Option<&'a dyn TypeHierarchyProvider>,
-    pub type_alias: Option<&'a dyn TypeAliasProvider>,
     pub imports: Option<&'a dyn ImportAnalysisProvider>,
     /// Request-local answers for questions whose owner is already structured.
     pub relational_definitions: &'a dyn RelationalDefinitionFrontier,

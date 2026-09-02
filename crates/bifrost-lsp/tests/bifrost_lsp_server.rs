@@ -469,6 +469,7 @@ fn bifrost_lsp_server_indexes_all_startup_workspace_folders() {
 /// circuits the cache-location funnel, so no other test can show where a server
 /// decides to write. This one lets the funnel run and only relocates the
 /// machine cache root, which is what a real multi-root session resolves.
+#[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
 #[test]
 fn bifrost_lsp_server_persists_multi_root_session_to_the_machine_cache_root() {
     let temp = TempDir::new().expect("tempdir");
@@ -2713,6 +2714,7 @@ fn bifrost_lsp_server_runtime_configuration_restores_latest_editor_roots_and_app
     );
 }
 
+#[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
 #[test]
 fn bifrost_lsp_server_runtime_configuration_clears_departed_diagnostics() {
     let temp = TempDir::new().expect("tempdir");
@@ -2855,6 +2857,7 @@ fn bifrost_lsp_server_runtime_configuration_replays_overlay_opened_outside_expli
     );
 }
 
+#[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
 #[test]
 fn bifrost_lsp_server_runtime_configuration_ignores_stale_and_malformed_pull_responses() {
     let temp = TempDir::new().expect("tempdir");
@@ -4416,6 +4419,7 @@ fn bifrost_lsp_server_type_definition_resolves_rust_explicit_local_type() {
     );
 }
 
+#[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
 #[test]
 fn bifrost_lsp_server_implementation_returns_null_for_go_interface_local_value() {
     let temp = TempDir::new().expect("tempdir");
@@ -4447,6 +4451,7 @@ fn bifrost_lsp_server_implementation_returns_null_for_go_interface_local_value()
     );
 }
 
+#[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
 #[test]
 fn bifrost_lsp_server_implementation_works_from_go_interface_declaration() {
     let temp = TempDir::new().expect("tempdir");
@@ -4740,6 +4745,7 @@ fn assert_lsp_implementation_start_lines(
     );
 }
 
+#[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
 #[test]
 fn bifrost_lsp_server_go_type_or_implementation_rejects_value_contexts() {
     let temp = TempDir::new().expect("tempdir");
@@ -4782,6 +4788,7 @@ fn bifrost_lsp_server_go_type_or_implementation_rejects_value_contexts() {
     }
 }
 
+#[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
 #[test]
 fn bifrost_lsp_server_implementation_filters_java_csharp_scala_value_contexts() {
     let temp = TempDir::new().expect("tempdir");
@@ -4840,6 +4847,7 @@ fn bifrost_lsp_server_implementation_filters_java_csharp_scala_value_contexts() 
     );
 }
 
+#[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
 #[test]
 fn bifrost_lsp_server_implementation_works_from_typescript_type_reference() {
     let temp = TempDir::new().expect("tempdir");
@@ -5703,6 +5711,7 @@ fn bifrost_lsp_server_type_definition_uses_did_open_overlay() {
     );
 }
 
+#[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
 #[test]
 fn bifrost_lsp_server_references_cancel_stops_active_search() {
     let temp = TempDir::new().expect("tempdir");
@@ -6156,6 +6165,7 @@ fn bifrost_lsp_server_definition_resolves_rust_attributed_async_function_call_to
     );
 }
 
+#[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
 #[test]
 fn bifrost_lsp_server_hover_fast_fails_rust_external_import() {
     let temp = TempDir::new().expect("tempdir");
@@ -6368,6 +6378,7 @@ fn bifrost_lsp_server_definition_ignores_literals_keywords_unresolved_and_ambigu
     assert_no_invalid_context_results(BroadEndpoint::Definition, &responses);
 }
 
+#[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
 #[test]
 fn bifrost_lsp_server_hover_ignores_literals_keywords_unresolved_and_ambiguous_tokens() {
     let temp = TempDir::new().expect("tempdir");
@@ -6907,6 +6918,7 @@ fn bifrost_lsp_server_call_hierarchy_prepare_filters_rust_cursor_contexts() {
     assert_eq!(target["name"], "target", "prepared Rust call: {target}");
 }
 
+#[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
 #[test]
 fn bifrost_lsp_server_call_hierarchy_prepare_filters_remaining_language_contexts() {
     let temp = TempDir::new().expect("tempdir");
@@ -7472,6 +7484,7 @@ fn bifrost_lsp_server_diagnostics_edge_cases() {
     server.exit();
 }
 
+#[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
 #[test]
 fn bifrost_lsp_server_go_semantic_diagnostics_pull_suppresses_unrecognized_symbol_lints() {
     let temp = TempDir::new().expect("temp dir");
@@ -7838,6 +7851,7 @@ fn bifrost_lsp_server_default_activates_dependency_packs_off_the_request_path() 
     );
 }
 
+#[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
 #[test]
 fn bifrost_lsp_server_packs_document_opts_the_session_into_its_named_ecosystems() {
     let temp = TempDir::new().expect("temp dir");
@@ -8983,6 +8997,7 @@ fn bifrost_lsp_server_type_hierarchy_java_round_trips_item_data() {
     assert_eq!(subtype_names, vec!["Child"], "subtypes: {subtypes:#?}");
 }
 
+#[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
 #[test]
 fn bifrost_lsp_server_type_hierarchy_python_uses_same_handler() {
     let temp = TempDir::new().expect("tempdir");
@@ -9006,6 +9021,7 @@ fn bifrost_lsp_server_type_hierarchy_python_uses_same_handler() {
     assert_eq!(supertype_names, vec!["Base"], "supertypes: {supertypes:#?}");
 }
 
+#[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
 #[test]
 fn bifrost_lsp_server_type_hierarchy_javascript_uses_same_handler() {
     let temp = TempDir::new().expect("tempdir");
@@ -9094,6 +9110,7 @@ fn bifrost_lsp_server_type_hierarchy_typescript_uses_same_handler() {
     );
 }
 
+#[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
 #[test]
 fn bifrost_lsp_server_type_hierarchy_php_uses_same_handler() {
     let temp = TempDir::new().expect("tempdir");
@@ -9165,6 +9182,7 @@ fn bifrost_lsp_server_type_hierarchy_cpp_uses_same_handler() {
     assert_eq!(subtype_names, vec!["Child"], "subtypes: {subtypes:#?}");
 }
 
+#[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
 #[test]
 fn bifrost_lsp_server_type_hierarchy_scala_uses_same_handler() {
     let temp = TempDir::new().expect("tempdir");
@@ -9205,6 +9223,7 @@ fn bifrost_lsp_server_type_hierarchy_scala_uses_same_handler() {
     assert_eq!(subtype_names, vec!["Child"], "subtypes: {subtypes:#?}");
 }
 
+#[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
 #[test]
 fn bifrost_lsp_server_type_hierarchy_rust_uses_same_handler() {
     let temp = TempDir::new().expect("tempdir");
@@ -9248,6 +9267,7 @@ fn bifrost_lsp_server_type_hierarchy_rust_uses_same_handler() {
     );
 }
 
+#[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
 #[test]
 fn bifrost_lsp_server_go_type_hierarchy_returns_structural_interface_edges() {
     let temp = TempDir::new().expect("tempdir");
@@ -10083,6 +10103,243 @@ fn bifrost_lsp_server_formatting_reports_formatter_failure() {
     assert!(error.contains("exited with status"), "{response}");
 }
 
+fn on_type_formatting_response(
+    server: &mut LspServer,
+    file_uri: &str,
+    line: usize,
+    character: usize,
+    ch: &str,
+) -> Value {
+    server.request(
+        "textDocument/onTypeFormatting",
+        json!({
+            "textDocument": {"uri": file_uri},
+            "position": {"line": line, "character": character},
+            "ch": ch,
+            "options": {"tabSize": 4, "insertSpaces": true}
+        }),
+    )
+}
+
+#[test]
+fn bifrost_lsp_server_on_type_formatting_replaces_only_the_enclosing_policy_form() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    let policy_path = root.join("on-type.rqlp");
+    fs::write(&policy_path, "").expect("write disk placeholder");
+    let policy_uri = uri_for(&policy_path);
+    let mut server = LspServer::start(&root);
+
+    let long_callee = "evaluate_".to_string() + &"a".repeat(60);
+    let prefix = "; retained comment\n";
+    let form = format!(
+        "(policy :id \"test.on-type\" :name \"On type\" :message \"Dynamic evaluation is forbidden\" :severity warning :analysis (analysis :type match :selector (rql (call :callee (name \"{long_callee}\")))))"
+    );
+    let suffix = "\n";
+    let source = format!("{prefix}{form}{suffix}");
+    let formatted_document = format_rqlp_source(&source).expect("complete RQLP source formats");
+    let expected_form = formatted_document
+        .strip_prefix(prefix)
+        .and_then(|rest| rest.strip_suffix(suffix))
+        .expect("document formatting preserves the trivia around the form");
+    assert_ne!(
+        expected_form, form,
+        "the fixture must exercise policy formatting"
+    );
+
+    server.notify(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": policy_uri,
+                "languageId": "bifrost-rql-policy",
+                "version": 1,
+                "text": source,
+            }
+        }),
+    );
+    // The trigger position is where the editor leaves the cursor after typing
+    // the `)` that closes the form: one past its last character.
+    let response =
+        on_type_formatting_response(&mut server, &policy_uri, 1, form.chars().count(), ")");
+    let edits = response["result"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected on-type formatting edits: {response}"));
+    assert_eq!(edits.len(), 1, "{response}");
+    assert_eq!(edits[0]["newText"], expected_form, "{response}");
+    assert_eq!(
+        edits[0]["range"]["start"],
+        json!({"line": 1, "character": 0}),
+        "the edit must start at the form, not at the retained comment: {response}"
+    );
+    assert_eq!(
+        edits[0]["range"]["end"],
+        json!({"line": 1, "character": form.chars().count()}),
+        "the edit must end at the form, not at the end of the document: {response}"
+    );
+}
+
+#[test]
+fn bifrost_lsp_server_on_type_formatting_replaces_one_form_of_an_rql_document() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    let rql_path = root.join("on-type.rql");
+    fs::write(&rql_path, "").expect("write RQL file");
+    let rql_uri = uri_for(&rql_path);
+    let mut server = LspServer::start(&root);
+
+    let long_name = "a".repeat(90);
+    let long_form = format!(
+        "(call :name \"{long_name}\" :callee (name \"eval\") :args [(capture \"payload\")])"
+    );
+    let formatted_form = format!(
+        "(call\n  :name \"{long_name}\"\n  :callee (name \"eval\")\n  :args [(capture \"payload\")]\n)"
+    );
+    let trailing_form = "(function :name \"demo\")";
+    let source = format!("{long_form}\n{trailing_form}\n");
+
+    server.notify(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": rql_uri,
+                "languageId": "bifrost-rql",
+                "version": 1,
+                "text": source,
+            }
+        }),
+    );
+    let response =
+        on_type_formatting_response(&mut server, &rql_uri, 0, long_form.chars().count(), ")");
+    let edits = response["result"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected on-type formatting edits: {response}"));
+    assert_eq!(edits.len(), 1, "{response}");
+    assert_eq!(edits[0]["newText"], formatted_form, "{response}");
+    assert_eq!(
+        edits[0]["range"]["start"],
+        json!({"line": 0, "character": 0}),
+        "{response}"
+    );
+    assert_eq!(
+        edits[0]["range"]["end"],
+        json!({"line": 0, "character": long_form.chars().count()}),
+        "the trailing top-level form must stay outside the edit: {response}"
+    );
+}
+
+#[test]
+fn bifrost_lsp_server_on_type_formatting_declines_unparsable_forms() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    let policy_path = root.join("mid-edit.rqlp");
+    fs::write(&policy_path, "").expect("write disk placeholder");
+    let policy_uri = uri_for(&policy_path);
+    let mut server = LspServer::start(&root);
+
+    server.notify(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": policy_uri,
+                "languageId": "bifrost-rql-policy",
+                "version": 1,
+                "text": "(policy\n  (analysis :type match)\n",
+            }
+        }),
+    );
+    let response = on_type_formatting_response(&mut server, &policy_uri, 1, 24, ")");
+    assert_eq!(
+        response["result"],
+        json!([]),
+        "a `)` inside a form the author has not closed yet must produce no edits: {response}"
+    );
+
+    server.notify(
+        "textDocument/didChange",
+        json!({
+            "textDocument": {"uri": policy_uri, "version": 2},
+            "contentChanges": [{"text": "(policy :id \"x\"))\n"}]
+        }),
+    );
+    let response = on_type_formatting_response(&mut server, &policy_uri, 0, 17, ")");
+    assert_eq!(
+        response["result"],
+        json!([]),
+        "a document the S-expression parser rejects must produce no edits: {response}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn bifrost_lsp_server_on_type_formatting_never_runs_a_formatter_command() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    let file_path = root.join("lib.rs");
+    let stub_path = root.join("marking-format");
+    let marker_path = root.join("formatter-ran");
+    fs::write(&file_path, "fn disk() {}\n").expect("write disk file");
+    write_stub_command(
+        &stub_path,
+        &format!(
+            "#!/bin/sh\ntouch {}\ntr '[:lower:]' '[:upper:]'\n",
+            marker_path.display()
+        ),
+    );
+
+    let mut server = LspServer::start_with_params(
+        &root,
+        json!({
+            "processId": null,
+            "rootUri": uri_for(&root),
+            "capabilities": {},
+            "initializationOptions": {
+                "formatterCommands": [{
+                    "include": ["*.rs"],
+                    "language": "rust",
+                    "command": stub_path.display().to_string()
+                }]
+            }
+        }),
+    );
+    let file_uri = uri_for(&file_path);
+    server.notify(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": file_uri,
+                "languageId": "rust",
+                "version": 1,
+                "text": "fn overlay() {}\n"
+            }
+        }),
+    );
+
+    let response = on_type_formatting_response(&mut server, &file_uri, 0, 13, ")");
+    assert_eq!(
+        response["result"],
+        json!([]),
+        "a language without an in-process formatter must produce no edits: {response}"
+    );
+    assert!(
+        !marker_path.exists(),
+        "on-type formatting must not run the resolved formatter command"
+    );
+
+    // The same document and rule do format through the stub, so the missing
+    // marker above is the on-type path declining rather than an inert rule.
+    let response = formatting_response(&mut server, &file_uri);
+    let edits = response["result"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected formatting edits, got {response}"));
+    assert_eq!(edits.len(), 1, "{response}");
+    assert_eq!(edits[0]["newText"], "FN OVERLAY() {}\n", "{response}");
+    assert!(
+        marker_path.exists(),
+        "document formatting must run the resolved formatter command"
+    );
+}
+
 #[test]
 fn bifrost_lsp_server_did_open_overlay_drives_hover_identifier() {
     // Disk content vs. opened buffer differ in the identifier at (line 0, char 5).
@@ -10395,12 +10652,7 @@ fn bifrost_lsp_server_incremental_utf16_crlf_edits_refresh_hover_and_diagnostics
             ]
         }
     }));
-    let broken = server.read_publish_diagnostics_for_version_matching(
-        &file_uri,
-        2,
-        |diagnostics| !diagnostics.is_empty(),
-        "the malformed incremental Rust diagnostic",
-    );
+    let broken = server.read_publish_diagnostics_for_version(&file_uri, 2);
     assert!(
         !broken["params"]["diagnostics"]
             .as_array()
@@ -10424,12 +10676,7 @@ fn bifrost_lsp_server_incremental_utf16_crlf_edits_refresh_hover_and_diagnostics
             }]
         }
     }));
-    let cleared = server.read_publish_diagnostics_for_version_matching(
-        &file_uri,
-        3,
-        |diagnostics| diagnostics.is_empty(),
-        "cleared diagnostics after removing malformed Rust",
-    );
+    let cleared = server.read_publish_diagnostics_for_version(&file_uri, 3);
     assert!(
         cleared["params"]["diagnostics"]
             .as_array()

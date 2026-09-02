@@ -1,0 +1,10 @@
+{
+  "kind": "generation",
+  "item": "generatedParser",
+  "generatorKind": "procedural-macro",
+  "generator": "deriveParser",
+  "portability": "portable",
+  "generatorArtifactSha256": "2da6839400de8f99e62c07bcd6054733a1ff85ef01fa0b3d60aeb0430ad8d4a2",
+  "inputSha256": "8932b8f53aa1514e42b6fcb970deda4778486c674f3c5c9e58873798c249a46c",
+  "outputSha256": "8a5d7a2b1cd671c63b69d15bf8b9953d169c6c532ff567aad01b998c294bebbe"
+}

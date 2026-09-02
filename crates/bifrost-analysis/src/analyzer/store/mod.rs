@@ -1,6 +1,7 @@
 pub mod epoch;
 pub mod gc;
 pub mod liveness;
+pub mod policy_units;
 pub mod query;
 mod relational_query;
 pub(crate) mod writer;
@@ -13,7 +14,7 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, LazyLock, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, LazyLock, Mutex, OnceLock};
 use std::time::Duration;
 
 use git2::Oid;
@@ -44,6 +45,7 @@ use brokk_bifrost_core::analyzer::rust_facts::{
 use crate::CancellationToken;
 use crate::analyzer::fq_name::{FqName, SegmentKind, segment_interner};
 use crate::analyzer::model::MAX_SIGNATURE_METADATA_COLUMN_BYTES;
+use crate::analyzer::read_ledger::IndexFamily;
 use crate::analyzer::structural::DeclaredVisibility;
 use crate::analyzer::structural::facts::{
     PersistedCallSite, PersistedOccurrenceRole, PersistedSpan, PersistedStructuralFacts,
@@ -445,6 +447,13 @@ pub struct AnalyzerStore {
     readers: ReaderPool,
     active_readers: ReaderPool,
     streaming_readers: ReaderPool,
+    /// The workspace selection held by the writer connection's temp schema, for
+    /// the in-memory fallback that reads through it. Only the holder of the
+    /// writer connection's guard ever reads or writes this, and it takes both
+    /// guards together (see [`ReaderConn::Writer`]).
+    writer_selection: Mutex<Option<WorkspaceSnapshots>>,
+    #[cfg(test)]
+    workspace_selection_counters: WorkspaceSelectionCounters,
     db_path: Option<PathBuf>,
     lifetime: Arc<()>,
     _ephemeral: Option<EphemeralDb>,
@@ -475,22 +484,69 @@ pub struct AnalyzerStore {
 /// run their symbol lookups / hydration / search in parallel against WAL
 /// snapshots rather than serializing on the single writer mutex.
 ///
-/// Checkout pops an idle reader or lazily opens a fresh one; there is no upper
-/// bound on in-flight readers, so a burst never blocks. Checkin keeps at most
-/// `capacity` idle connections and drops the rest (transient burst readers), so
-/// the steady-state resident pool is bounded by `capacity`.
+/// `capacity` is both the concurrency limit and the resident pool size. A
+/// checkout takes one of `capacity` permits, then pops an idle reader or opens
+/// one; the guard's drop returns the reader and the permit together. So a burst
+/// wider than `capacity` waits for a reader instead of opening a cold one, and
+/// after warm-up every checkout gets a connection whose temp schema already
+/// holds the workspace selection (#2632).
 ///
-/// `capacity` is therefore an *idle-retention* bound, not a concurrency limit,
-/// and `MAX_IDLE_READERS` explains why it is a small constant.
+/// Waiting is the cheaper of the two costs. A cold connection runs the 540-line
+/// `revisioned_workspace_views.sql` before it can answer anything, and the
+/// analyzer's rayon pool is `available_parallelism()` wide -- 120 workers on the
+/// host #1748 measured, so a burst opened about 104 connections above capacity,
+/// dropped them on checkin and opened them again on the next burst. A waiting
+/// checkout costs the tail of another worker's query instead.
 ///
 /// When `source` is `None` the store has no separate readable file (the
 /// in-memory single-connection fallback); reads then route back through the
 /// writer connection so correctness is preserved at the cost of read
-/// parallelism.
+/// parallelism. That path takes no permit: it is already serialized by the
+/// writer mutex.
 struct ReaderPool {
     source: Option<PathBuf>,
     capacity: usize,
-    idle: Mutex<Vec<Connection>>,
+    state: Mutex<ReaderPoolState>,
+    /// Signalled by every checkin, so a checkout blocked at `capacity` wakes as
+    /// soon as a reader is back in `idle`.
+    reader_returned: Condvar,
+}
+
+/// The idle readers and the outstanding checkouts, under one lock so a waiter
+/// cannot miss a checkin between testing the count and sleeping.
+#[derive(Default)]
+struct ReaderPoolState {
+    idle: Vec<SelectedReader>,
+    checked_out: usize,
+}
+
+/// A reader connection together with the workspace selection its temp schema
+/// currently holds.
+///
+/// `temp.selected_workspace_revisions` and the revisioned views over it are
+/// temp objects, so they live exactly as long as the connection does.
+/// Remembering what is in them lets a checkout that wants the selection the
+/// connection already holds run no statement at all. Every relational batch
+/// used to probe `temp.sqlite_schema`, delete the selection table and
+/// re-insert one row per snapshot, and a reader that had just been opened
+/// re-parsed the 539-line view script on top of that (#2883).
+struct SelectedReader {
+    conn: Connection,
+    /// `None` until the revisioned views have been created on this connection;
+    /// afterwards, the selection materialized in
+    /// `temp.selected_workspace_revisions`.
+    selection: Option<WorkspaceSnapshots>,
+}
+
+/// What the workspace-selection path actually did, for the cost pins.
+#[cfg(test)]
+#[derive(Default)]
+struct WorkspaceSelectionCounters {
+    /// Runs of `revisioned_workspace_views.sql`, one per reader connection.
+    view_creations: AtomicUsize,
+    /// Rewrites of `temp.selected_workspace_revisions`, one per selection
+    /// change on a connection.
+    selection_writes: AtomicUsize,
 }
 
 thread_local! {
@@ -498,27 +554,27 @@ thread_local! {
         RefCell::new(HashMap::default());
 }
 
-/// Upper bound on the idle readers one pool retains between checkouts.
+/// Upper bound on the readers one pool holds, which since #2632 is both the
+/// concurrency ceiling for store reads and the resident pool size.
 ///
 /// A retained reader is not free: each one holds its own SQLite page cache (see
-/// `READER_PAGE_CACHE_KIB`) and its own prepared-statement cache for the
-/// process's lifetime. Sizing retention at `available_parallelism()` conflated
-/// "cores this host has" with "readers worth keeping warm", and it was measured
-/// on 2026-08-08. A single `scan_usages` on a 120-CPU host reached 115 live
-/// cache-DB connections within 10 s and then held that number flat for the
-/// remaining 166 s of the query. The same cell with retention capped at 16 shows
-/// what was actually concurrent: one transient 0.5 s sample at 41 connections
+/// `READER_PAGE_CACHE_KIB`, 8 MiB) and its own prepared-statement cache for the
+/// process's lifetime, so 32 readers cost 256 MiB of page cache. Sizing this at
+/// `available_parallelism()` conflated "cores this host has" with "readers worth
+/// keeping", and the 2026-08-08 measurement showed why: a single `scan_usages`
+/// on a 120-CPU host reached 115 live cache-DB connections within 10 s and then
+/// held that number flat for the remaining 166 s. Retention capped at 16 showed
+/// what was actually concurrent -- one transient 0.5 s sample at 41 connections
 /// during discovery, then 352 consecutive samples at 20. So the ~120 was
-/// retention accumulating every burst connection and never releasing it, not
-/// 120 readers doing work.
+/// retention accumulating every burst connection, not 120 readers doing work.
 ///
-/// A burst wider than this still runs at full width -- checkout never blocks --
-/// it just does not leave its connections resident afterwards. Re-opening the
-/// above-cap readers is not free (about 3% CPU on that cell, in `sys`), which is
-/// why the cap is 16 rather than the ladder's 8: 16 covers the concurrent tool
-/// calls an MCP or LSP host realistically keeps in flight with margin, and,
-/// unlike `available_parallelism()`, it does not grow with the core count.
-const MAX_IDLE_READERS: usize = 16;
+/// Now that a checkout above the cap waits instead of opening a cold
+/// connection, the cap has to cover that steady state with margin rather than
+/// merely the tool calls a host keeps in flight: 32 clears the 20 observed
+/// steady readers and the 41-reader peak's working set. Do not tie it to
+/// `available_parallelism()` again -- the 115-connection observation was
+/// retention, not concurrency.
+const MAX_IDLE_READERS: usize = 32;
 
 impl ReaderPool {
     fn new(source: Option<PathBuf>) -> Self {
@@ -529,27 +585,78 @@ impl ReaderPool {
         Self {
             source,
             capacity,
-            idle: Mutex::new(Vec::new()),
+            state: Mutex::new(ReaderPoolState::default()),
+            reader_returned: Condvar::new(),
         }
     }
 
-    fn checkin(&self, conn: Connection) {
-        let mut idle = self
-            .idle
+    /// Take one of the pool's `capacity` checkouts, waiting while they are all
+    /// out, and hand back the idle reader it found if there was one.
+    ///
+    /// `None` means the caller owns a permit for a connection that does not
+    /// exist yet and must open it, then either check it in or abandon the
+    /// checkout.
+    fn acquire(&self) -> Option<SelectedReader> {
+        let mut state = self
+            .state
             .lock()
             .expect("analyzer store reader pool poisoned");
-        if idle.len() < self.capacity {
-            idle.push(conn);
+        while state.checked_out == self.capacity {
+            state = self
+                .reader_returned
+                .wait(state)
+                .expect("analyzer store reader pool poisoned");
         }
-        // Otherwise this was a transient burst connection opened above capacity;
-        // let it drop and close.
+        state.checked_out += 1;
+        state.idle.pop()
+    }
+
+    /// Return a reader and the checkout it was held under.
+    fn checkin(&self, reader: SelectedReader) {
+        {
+            let mut state = self
+                .state
+                .lock()
+                .expect("analyzer store reader pool poisoned");
+            // The gate is what makes this an assertion rather than a discard:
+            // `capacity` outstanding checkouts can return at most `capacity`
+            // readers, so an over-capacity idle set means the accounting broke.
+            assert!(
+                state.idle.len() < self.capacity,
+                "reader pool holds {} idle readers at capacity {}",
+                state.idle.len(),
+                self.capacity
+            );
+            state.idle.push(reader);
+            state.checked_out = state
+                .checked_out
+                .checked_sub(1)
+                .expect("reader checkin without a matching checkout");
+        }
+        self.reader_returned.notify_one();
+    }
+
+    /// Return a checkout whose connection could not be opened.
+    fn abandon_checkout(&self) {
+        {
+            let mut state = self
+                .state
+                .lock()
+                .expect("analyzer store reader pool poisoned");
+            state.checked_out = state
+                .checked_out
+                .checked_sub(1)
+                .expect("abandoned checkout without a matching checkout");
+        }
+        self.reader_returned.notify_one();
     }
 
     #[cfg(test)]
     fn idle_len(&self) -> usize {
-        self.idle
+        self.state
             .lock()
             .expect("analyzer store reader pool poisoned")
+            .idle
             .len()
     }
 }
@@ -565,9 +672,31 @@ pub(crate) struct ReaderGuard<'a> {
 enum ReaderConn<'a> {
     Pooled {
         pool: &'a ReaderPool,
-        conn: Option<Connection>,
+        reader: Option<SelectedReader>,
     },
-    Writer(std::sync::MutexGuard<'a, Connection>),
+    /// The in-memory single-connection fallback reads through the writer, whose
+    /// temp schema is shared with every other user of that connection. Its
+    /// selection therefore lives beside the connection mutex rather than in a
+    /// pool entry, and is held for as long as the connection guard is.
+    Writer {
+        conn: std::sync::MutexGuard<'a, Connection>,
+        selection: std::sync::MutexGuard<'a, Option<WorkspaceSnapshots>>,
+    },
+}
+
+impl ReaderGuard<'_> {
+    /// This connection and the selection its temp schema holds, borrowed
+    /// together so a selection can be compared, applied, and recorded without
+    /// releasing the connection.
+    fn connection_and_selection(&mut self) -> (&Connection, &mut Option<WorkspaceSnapshots>) {
+        match &mut self.inner {
+            ReaderConn::Pooled { reader, .. } => {
+                let reader = reader.as_mut().expect("reader guard already returned");
+                (&reader.conn, &mut reader.selection)
+            }
+            ReaderConn::Writer { conn, selection } => (conn, selection),
+        }
+    }
 }
 
 impl std::ops::Deref for ReaderGuard<'_> {
@@ -575,10 +704,10 @@ impl std::ops::Deref for ReaderGuard<'_> {
 
     fn deref(&self) -> &Connection {
         match &self.inner {
-            ReaderConn::Pooled { conn, .. } => {
-                conn.as_ref().expect("reader guard already returned")
+            ReaderConn::Pooled { reader, .. } => {
+                &reader.as_ref().expect("reader guard already returned").conn
             }
-            ReaderConn::Writer(guard) => guard,
+            ReaderConn::Writer { conn, .. } => conn,
         }
     }
 }
@@ -586,20 +715,20 @@ impl std::ops::Deref for ReaderGuard<'_> {
 impl std::ops::DerefMut for ReaderGuard<'_> {
     fn deref_mut(&mut self) -> &mut Connection {
         match &mut self.inner {
-            ReaderConn::Pooled { conn, .. } => {
-                conn.as_mut().expect("reader guard already returned")
+            ReaderConn::Pooled { reader, .. } => {
+                &mut reader.as_mut().expect("reader guard already returned").conn
             }
-            ReaderConn::Writer(guard) => guard,
+            ReaderConn::Writer { conn, .. } => conn,
         }
     }
 }
 
 impl Drop for ReaderGuard<'_> {
     fn drop(&mut self) {
-        if let ReaderConn::Pooled { pool, conn } = &mut self.inner
-            && let Some(conn) = conn.take()
+        if let ReaderConn::Pooled { pool, reader } = &mut self.inner
+            && let Some(reader) = reader.take()
         {
-            pool.checkin(conn);
+            pool.checkin(reader);
         }
     }
 }
@@ -1145,38 +1274,8 @@ fn workspace_snapshots_conn(
     Ok(snapshots)
 }
 
-fn select_workspace_snapshots(conn: &Connection, snapshots: &WorkspaceSnapshots) -> Result<()> {
-    let configured = conn
-        .query_row(
-            "SELECT 1 FROM temp.sqlite_schema
-             WHERE type = 'table' AND name = 'selected_workspace_revisions'",
-            [],
-            |_| Ok(()),
-        )
-        .optional()?
-        .is_some();
-    if !configured {
-        conn.execute_batch(REVISIONED_WORKSPACE_VIEWS_SQL)?;
-    }
-    conn.execute("DELETE FROM temp.selected_workspace_revisions", [])?;
-    let mut insert = conn.prepare_cached(
-        "INSERT INTO temp.selected_workspace_revisions(
-           workspace_id, lang, generation, revision
-         ) VALUES(?1, ?2, ?3, ?4)",
-    )?;
-    for snapshot in snapshots.values() {
-        insert.execute(params![
-            snapshot.workspace_id.as_str(),
-            snapshot.lang,
-            snapshot.generation.0,
-            snapshot.revision,
-        ])?;
-    }
-    Ok(())
-}
-
 #[cfg(test)]
-fn select_current_test_workspace(conn: &Connection) -> Result<()> {
+fn current_test_workspace_snapshots(conn: &Connection) -> Result<WorkspaceSnapshots> {
     let workspace_id =
         WorkspaceId("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into());
     let snapshots = {
@@ -1209,7 +1308,7 @@ fn select_current_test_workspace(conn: &Connection) -> Result<()> {
         }
         snapshots
     };
-    select_workspace_snapshots(conn, &snapshots)
+    Ok(snapshots)
 }
 
 fn insert_workspace_file_projection_rows(
@@ -1749,7 +1848,7 @@ impl AnalyzerStore {
         )?;
         if self.db_path.is_none() {
             let conn = self.conn.lock().expect("ephemeral test store mutex");
-            select_workspace_snapshots(
+            self.select_writer_workspace_snapshots(
                 &conn,
                 &HashMap::from_iter([(lang.to_string(), snapshot.clone())]),
             )?;
@@ -2006,6 +2105,9 @@ impl AnalyzerStore {
             readers: ReaderPool::new(reader_source.clone()),
             active_readers: ReaderPool::new(reader_source.clone()),
             streaming_readers: ReaderPool::new(reader_source),
+            writer_selection: Mutex::new(None),
+            #[cfg(test)]
+            workspace_selection_counters: WorkspaceSelectionCounters::default(),
             db_path,
             lifetime: Arc::new(()),
             _ephemeral: ephemeral,
@@ -2037,6 +2139,9 @@ impl AnalyzerStore {
             readers: ReaderPool::new(Some(reader_source.clone())),
             active_readers: ReaderPool::new(Some(reader_source.clone())),
             streaming_readers: ReaderPool::new(Some(reader_source)),
+            writer_selection: Mutex::new(None),
+            #[cfg(test)]
+            workspace_selection_counters: WorkspaceSelectionCounters::default(),
             db_path: Some(db_path.to_path_buf()),
             lifetime: Arc::new(()),
             _ephemeral: None,
@@ -2203,26 +2308,130 @@ impl AnalyzerStore {
     /// taken by these paths (except in the in-memory single-connection
     /// fallback, where `source` is `None`).
     fn read_conn(&self) -> Result<ReaderGuard<'_>> {
-        let conn = if self.streaming_read_active() {
+        let conn = self.checkout_read_conn()?;
+        #[cfg(test)]
+        let conn = {
+            let mut conn = conn;
+            let snapshots = current_test_workspace_snapshots(&conn)?;
+            self.select_workspace_snapshots(&mut conn, &snapshots)?;
+            conn
+        };
+        Ok(conn)
+    }
+
+    /// Check out a reader and point its revisioned views at `snapshots`.
+    ///
+    /// This does not go through [`Self::read_conn`]: that path selects the test
+    /// workspace, and alternating two selections on one connection would
+    /// rewrite the selection rows on every checkout, which is the cost this
+    /// exists to remove.
+    fn read_conn_for_workspace(&self, snapshots: &WorkspaceSnapshots) -> Result<ReaderGuard<'_>> {
+        let mut conn = self.checkout_read_conn()?;
+        self.select_workspace_snapshots(&mut conn, snapshots)?;
+        Ok(conn)
+    }
+
+    fn checkout_read_conn(&self) -> Result<ReaderGuard<'_>> {
+        if self.streaming_read_active() {
             self.read_conn_from_pool(
                 &self.streaming_readers,
                 crate::cache_db::open_streaming_readonly_connection,
-            )?
+            )
         } else {
             self.read_conn_from_pool(
                 &self.readers,
                 crate::cache_db::open_readonly_temp_connection,
-            )?
-        };
-        #[cfg(test)]
-        select_current_test_workspace(&conn)?;
-        Ok(conn)
+            )
+        }
     }
 
-    fn read_conn_for_workspace(&self, snapshots: &WorkspaceSnapshots) -> Result<ReaderGuard<'_>> {
-        let conn = self.read_conn()?;
-        select_workspace_snapshots(&conn, snapshots)?;
-        Ok(conn)
+    /// Materialize `snapshots` in `guard`'s temp schema, unless that is already
+    /// what the connection holds.
+    ///
+    /// The revisioned views are created once per connection and the selection
+    /// rows are rewritten only when the selection actually changes, so a run of
+    /// batches against one workspace generation costs one view script and one
+    /// selection write however many batches it contains (#2883).
+    fn select_workspace_snapshots(
+        &self,
+        guard: &mut ReaderGuard<'_>,
+        snapshots: &WorkspaceSnapshots,
+    ) -> Result<()> {
+        let (conn, selection) = guard.connection_and_selection();
+        self.apply_workspace_selection(conn, selection, snapshots)
+    }
+
+    /// Point the writer connection's revisioned views at `snapshots`.
+    ///
+    /// Reads normally take a pooled reader; this is for the ephemeral store's
+    /// own writer-connection queries, which hold that connection already. The
+    /// selection it leaves behind is the one the writer-backed reader fallback
+    /// then sees.
+    #[cfg(test)]
+    fn select_writer_workspace_snapshots(
+        &self,
+        conn: &Connection,
+        snapshots: &WorkspaceSnapshots,
+    ) -> Result<()> {
+        let mut selection = self
+            .writer_selection
+            .lock()
+            .expect("analyzer store writer selection poisoned");
+        self.apply_workspace_selection(conn, &mut selection, snapshots)
+    }
+
+    fn apply_workspace_selection(
+        &self,
+        conn: &Connection,
+        selection: &mut Option<WorkspaceSnapshots>,
+        snapshots: &WorkspaceSnapshots,
+    ) -> Result<()> {
+        if selection.as_ref() == Some(snapshots) {
+            return Ok(());
+        }
+        if selection.is_none() {
+            #[cfg(test)]
+            self.workspace_selection_counters
+                .view_creations
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            conn.execute_batch(REVISIONED_WORKSPACE_VIEWS_SQL)?;
+        }
+        #[cfg(test)]
+        self.workspace_selection_counters
+            .selection_writes
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        conn.prepare_cached("DELETE FROM temp.selected_workspace_revisions")?
+            .execute([])?;
+        {
+            let mut insert = conn.prepare_cached(
+                "INSERT INTO temp.selected_workspace_revisions(
+                   workspace_id, lang, generation, revision
+                 ) VALUES(?1, ?2, ?3, ?4)",
+            )?;
+            for snapshot in snapshots.values() {
+                insert.execute(params![
+                    snapshot.workspace_id.as_str(),
+                    snapshot.lang,
+                    snapshot.generation.0,
+                    snapshot.revision,
+                ])?;
+            }
+        }
+        *selection = Some(snapshots.clone());
+        Ok(())
+    }
+
+    /// Runs of the revisioned view script, and rewrites of the selection rows.
+    #[cfg(test)]
+    pub(crate) fn workspace_selection_counts_for_test(&self) -> (usize, usize) {
+        (
+            self.workspace_selection_counters
+                .view_creations
+                .load(std::sync::atomic::Ordering::Relaxed),
+            self.workspace_selection_counters
+                .selection_writes
+                .load(std::sync::atomic::Ordering::Relaxed),
+        )
     }
 
     fn active_read_conn(&self) -> Result<ReaderGuard<'_>> {
@@ -2239,24 +2448,36 @@ impl AnalyzerStore {
     ) -> Result<ReaderGuard<'a>> {
         match pool.source.as_deref() {
             Some(path) => {
-                let pooled = pool
-                    .idle
-                    .lock()
-                    .expect("analyzer store reader pool poisoned")
-                    .pop();
-                let conn = match pooled {
-                    Some(conn) => conn,
-                    None => open(path).map_err(StoreError::new)?,
+                // The permit is held across the open, so a cold connection
+                // still counts against capacity while it is being built.
+                let reader = match pool.acquire() {
+                    Some(reader) => reader,
+                    None => match open(path) {
+                        Ok(conn) => SelectedReader {
+                            conn,
+                            selection: None,
+                        },
+                        Err(error) => {
+                            pool.abandon_checkout();
+                            return Err(StoreError::new(error));
+                        }
+                    },
                 };
                 Ok(ReaderGuard {
                     inner: ReaderConn::Pooled {
                         pool,
-                        conn: Some(conn),
+                        reader: Some(reader),
                     },
                 })
             }
             None => Ok(ReaderGuard {
-                inner: ReaderConn::Writer(self.conn.lock().expect("analyzer store mutex poisoned")),
+                inner: ReaderConn::Writer {
+                    conn: self.conn.lock().expect("analyzer store mutex poisoned"),
+                    selection: self
+                        .writer_selection
+                        .lock()
+                        .expect("analyzer store writer selection poisoned"),
+                },
             }),
         }
     }
@@ -3109,27 +3330,6 @@ impl AnalyzerStore {
         Ok(result)
     }
 
-    /// Read persisted declarations whose ranges enclose `range` in one file.
-    /// This is sufficient for owner lookup and avoids hydrating the file's
-    /// source and unrelated analyzer facts.
-    pub(crate) fn enclosing_declarations_for_range<A: LanguageAdapter>(
-        &self,
-        oid: Oid,
-        lang: &str,
-        generation: GenerationId,
-        adapter: &A,
-        file: &ProjectFile,
-        range: &Range,
-    ) -> Result<Option<Vec<(CodeUnit, Range)>>> {
-        let _scope = crate::profiling::scope("AnalyzerStore::enclosing_declarations_for_range");
-        let mut conn = self.read_conn()?;
-        let tx = conn.transaction()?;
-        require_current_generation(&tx, lang, generation)?;
-        let result = enclosing_declarations_for_range_conn(&tx, oid, lang, adapter, file, range)?;
-        tx.commit()?;
-        Ok(result)
-    }
-
     /// Read all persisted declaration ranges for one file. This compact
     /// projection is used by batched owner lookups and does not hydrate the
     /// file's source or unrelated analyzer facts.
@@ -3434,7 +3634,7 @@ impl AnalyzerStore {
         }
 
         let mut conn = self.active_read_conn()?;
-        select_workspace_snapshots(&conn, workspace_snapshots)?;
+        self.select_workspace_snapshots(&mut conn, workspace_snapshots)?;
         let tx = conn.transaction()?;
         require_current_generation(&tx, lang, generation)?;
         sync_reverse_reference_lookup_keys(
@@ -3489,7 +3689,7 @@ impl AnalyzerStore {
         }
 
         let mut conn = self.active_read_conn()?;
-        select_workspace_snapshots(&conn, workspace_snapshots)?;
+        self.select_workspace_snapshots(&mut conn, workspace_snapshots)?;
         let tx = conn.transaction()?;
         require_current_generation(&tx, lang, generation)?;
         sync_reverse_reference_lookup_keys(
@@ -7514,6 +7714,63 @@ impl PreparedParsedBlob {
         self.oid
     }
 
+    /// Every name-keyed index entry this blob's rows publish, in the exact
+    /// spelling the analyzer-side probes read them by.
+    ///
+    /// Read-set verification asks "did any changed blob touch this index
+    /// key?", and it can only answer that when the producer and the probe
+    /// agree on how a key is spelled. They agree because this reads the very
+    /// rows `write_prepared_blob_rows_tx` writes -- `code_units.exact_fqn`,
+    /// `.normalized_fqn`, `.short_name`, `.identifier`,
+    /// `reference_identifiers.identifier` and `import_path_segments.segment`
+    /// -- instead of re-deriving a name from a `CodeUnit`.
+    ///
+    /// The blob's other readings under different storage language keys publish
+    /// their own rows, so they are folded in. They carry no readings of their
+    /// own, which is why one flat pass covers them.
+    pub(crate) fn index_keys<A: LanguageAdapter>(
+        &self,
+        adapter: &A,
+        sink: &mut dyn FnMut(IndexFamily, &[u8]),
+    ) {
+        for blob in std::iter::once(self).chain(self.additional.iter()) {
+            debug_assert!(
+                blob.additional.is_empty() || std::ptr::eq(blob, self),
+                "a projection reading carries no readings of its own"
+            );
+            // The definition names are re-derived from the same stored units
+            // `prepare_parsed_blob` walks rather than read off `units`, because
+            // `exact_fqn` and `normalized_fqn` are persisted only by the two
+            // adapters that opt into content-stable lookup keys. Every other
+            // language answers an exact-name probe from its relational rows,
+            // which render the same qualified name, and computing the
+            // normalized spelling for every unit of every publication to fill a
+            // column nobody reads would be writer cost for nothing.
+            for stored in collect_stored_units(adapter, blob.state.as_ref()) {
+                let exact_fqn = stored.unit.fq_name();
+                sink(IndexFamily::DefinitionExact, exact_fqn.as_bytes());
+                sink(
+                    IndexFamily::DefinitionNormalizedTail,
+                    adapter.normalize_full_name(&exact_fqn).as_bytes(),
+                );
+                sink(
+                    IndexFamily::DefinitionIdentifier,
+                    stored.unit.short_name().as_bytes(),
+                );
+                sink(
+                    IndexFamily::DefinitionIdentifier,
+                    stored.unit.identifier().as_bytes(),
+                );
+            }
+            for identifier in &blob.type_identifiers {
+                sink(IndexFamily::ReferenceIdentifier, identifier.as_bytes());
+            }
+            for (_, _, segment) in &blob.imports.segments {
+                sink(IndexFamily::ImportPathSegment, segment.as_bytes());
+            }
+        }
+    }
+
     pub(crate) fn lang(&self) -> &str {
         &self.lang
     }
@@ -9326,84 +9583,6 @@ fn type_aliases_for_file_conn<A: LanguageAdapter>(
         ));
     }
     Ok(Some(aliases))
-}
-
-fn enclosing_declarations_for_range_conn<A: LanguageAdapter>(
-    conn: &Connection,
-    oid: Oid,
-    lang: &str,
-    adapter: &A,
-    file: &ProjectFile,
-    range: &Range,
-) -> Result<Option<Vec<(CodeUnit, Range)>>> {
-    if read_summary_projection_meta(conn, &oid.to_string(), lang)?.is_none() {
-        return Ok(None);
-    }
-    let unit_columns = raw_unit_columns_sql("units");
-    let sql = format!(
-        "SELECT {unit_columns},
-                ranges.start_byte, ranges.end_byte, ranges.start_line, ranges.end_line
-         FROM blobs AS keys
-         JOIN code_units AS units
-           ON units.blob_id = keys.id
-         JOIN blob_meta AS meta
-           ON meta.blob_id = units.blob_id
-         JOIN unit_ranges AS ranges
-           ON ranges.blob_id = units.blob_id
-          AND ranges.unit_key = units.unit_key
-         WHERE keys.blob_oid = ?1 AND keys.lang = ?2 AND units.in_declarations = 1
-           AND ranges.start_byte <= ?3 AND ranges.end_byte >= ?4
-           AND {PARSED_BLOB_COMPLETE_CONDITION}
-         ORDER BY units.unit_key, ranges.ordinal"
-    );
-    let oid = oid.to_string();
-    let start_byte = i64::try_from(range.start_byte)
-        .map_err(|_| StoreError::new("range start byte exceeds SQLite integer range"))?;
-    let end_byte = i64::try_from(range.end_byte)
-        .map_err(|_| StoreError::new("range end byte exceeds SQLite integer range"))?;
-    let mut statement = conn.prepare_cached(&sql)?;
-    let mut rows = statement.query(params![oid, lang, start_byte, end_byte])?;
-    let mut raw_declarations = Vec::new();
-    let mut previous_unit_key = None;
-    while let Some(row) = rows.next()? {
-        let raw = raw_unit_row_from_row(row, 0)?;
-        let unit_key = raw.key;
-        if previous_unit_key == Some(unit_key) {
-            continue;
-        }
-        previous_unit_key = Some(unit_key);
-        let range = Range {
-            start_byte: i64_to_usize(row.get(18)?)?,
-            end_byte: i64_to_usize(row.get(19)?)?,
-            start_line: i64_to_usize(row.get(20)?)?,
-            end_line: i64_to_usize(row.get(21)?)?,
-        };
-        raw_declarations.push((raw, range));
-    }
-    drop(rows);
-    drop(statement);
-    let mut raw_units = raw_declarations
-        .iter()
-        .map(|(raw, _)| raw.clone())
-        .collect::<Vec<_>>();
-    attach_raw_unit_fq_segments(conn, lang, std::slice::from_ref(&oid), &mut raw_units)?;
-    let mut declarations = Vec::with_capacity(raw_units.len());
-    for (raw, (_, range)) in raw_units.into_iter().zip(raw_declarations) {
-        let (fq_name, package_segment_count) =
-            hydrate_unit_fq(adapter, raw.fq.as_ref(), &raw.content_qualifier, file)?;
-        declarations.push((
-            CodeUnit::from_fq(
-                file.clone(),
-                raw.kind,
-                fq_name,
-                package_segment_count,
-                raw.signature,
-                raw.synthetic,
-            ),
-            range,
-        ));
-    }
-    Ok(Some(declarations))
 }
 
 fn enclosing_declarations_for_file_conn<A: LanguageAdapter>(
@@ -13523,7 +13702,7 @@ pub(crate) fn hydrate_unit_fq<A: LanguageAdapter>(
 /// makes positional decoding safe among them: a column added to the schema is
 /// added to this list once, and the encoder and decoder beside it are the only
 /// two places that have to agree about what index it lands on.
-const SIGNATURE_METADATA_VALUE_COLUMNS: [&str; 29] = [
+const SIGNATURE_METADATA_VALUE_COLUMNS: [&str; 30] = [
     "label",
     "parameters",
     "return_type_text",
@@ -13553,6 +13732,7 @@ const SIGNATURE_METADATA_VALUE_COLUMNS: [&str; 29] = [
     "callable_is_native",
     "class_like_is_interface",
     "class_like_is_static",
+    "type_parameters_recorded",
 ];
 
 /// The variable-length subset of the columns above.
@@ -13662,6 +13842,7 @@ struct SignatureMetadataColumns {
     callable_is_native: i64,
     class_like_is_interface: i64,
     class_like_is_static: i64,
+    type_parameters_recorded: i64,
 }
 
 impl SignatureMetadataColumns {
@@ -13725,6 +13906,7 @@ impl SignatureMetadataColumns {
             callable_is_native: bool_to_i64(value.callable_is_native()),
             class_like_is_interface: bool_to_i64(value.class_like_is_interface()),
             class_like_is_static: bool_to_i64(value.class_like_is_static()),
+            type_parameters_recorded: bool_to_i64(value.type_parameters_recorded()),
         })
     }
 
@@ -13795,6 +13977,7 @@ impl SignatureMetadataColumns {
             self.callable_is_native,
             self.class_like_is_interface,
             self.class_like_is_static,
+            self.type_parameters_recorded,
         ])?;
         Ok(())
     }
@@ -13911,10 +14094,10 @@ fn signature_metadata_from_row(
             "underlying_type_identity",
         )?)
         .with_declaration_only(flag(5)?)
-        .with_type_parameters(decode_signature_metadata_json(
-            "type_parameters",
-            &row.get::<_, String>(base + 9)?,
-        )?)
+        .with_persisted_type_parameters(
+            decode_signature_metadata_json("type_parameters", &row.get::<_, String>(base + 9)?)?,
+            flag(29)?,
+        )
         .with_bare_return_type_parameter(row.get::<_, Option<String>>(base + 10)?)
         .with_extension_receiver_type(row.get::<_, Option<String>>(base + 13)?)
         .with_extension_receiver_type_identity(signature_metadata_identity_from_row(
@@ -14144,6 +14327,7 @@ mod tests {
     use crate::analyzer::csharp::CSharpAdapter;
     use crate::analyzer::go::GoAdapter;
     use crate::analyzer::java::JavaAdapter;
+    use crate::analyzer::kotlin::KotlinAdapter;
     use crate::analyzer::model::{StructuredTypeIdentityBuilder, StructuredTypeName};
     use crate::analyzer::php::PhpAdapter;
     use crate::analyzer::python::PythonAdapter;
@@ -14248,7 +14432,10 @@ mod tests {
         .with_underlying_type_identity(Some(underlying_type_identity))
         .with_declaration_only(true)
         .with_callable_arity(CallableArity::new(2, 3, true))
-        .with_type_parameters(vec!["T".to_string(), "U".to_string()])
+        // The recorded builder, so the round trip pins the flag column beside
+        // the list. `bare` beside this row is the unrecorded reading, which is
+        // what a row written before #1651 reads back as.
+        .with_recorded_type_parameters(vec!["T".to_string(), "U".to_string()])
         .with_bare_return_type_parameter(Some("T"))
         .with_callable_linkage(CallableLinkage::External)
         .with_dispatch_extensibility(DispatchExtensibility::Closed)
@@ -14645,6 +14832,26 @@ mod tests {
             joined_plan.iter().all(|detail| !detail.contains("SCAN")),
             "the joined reader must not scan any table: {joined_plan:#?}"
         );
+    }
+
+    /// The view the relational callable-facts reader selects from projects
+    /// every persisted signature-metadata column.
+    ///
+    /// That reader decodes [`SIGNATURE_METADATA_VALUE_COLUMNS`] positionally,
+    /// so a column added to the table and to the list but not to the view
+    /// makes its SELECT fail to prepare. The failure surfaces at run time
+    /// inside a usage-graph frontier, as "a Scala file frontier failed", which
+    /// is three layers away from the schema that caused it. Preparing the same
+    /// projection here fails at push time instead.
+    #[test]
+    fn the_live_callable_facts_view_projects_every_signature_metadata_column() {
+        let store = AnalyzerStore::open_ephemeral().unwrap();
+        let conn = store.conn.lock().expect("store mutex");
+        let columns = signature_metadata_value_columns_sql("facts");
+        conn.prepare(&format!(
+            "SELECT facts.ordinal, facts.text, {columns} FROM live_callable_facts AS facts"
+        ))
+        .expect("live_callable_facts must project every signature metadata column");
     }
 
     #[test]
@@ -15383,6 +15590,118 @@ mod tests {
     }
 
     #[test]
+    fn kotlin_type_alias_identity_epoch_invalidates_prior_parsed_blobs() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let file = write_file(
+            temp.path(),
+            "Tags.kt",
+            "package example\n\ntypealias MaxVal = Int\n\nval MaxVal = 1\n",
+        );
+        let state = Arc::new(parse_state(&KotlinAdapter, &file));
+        let alias = state
+            .declarations
+            .iter()
+            .find(|unit| unit.fq_name() == "example.MaxVal" && unit.is_class())
+            .expect("the current walk mints the alias as a type declaration");
+        assert!(
+            state
+                .declarations
+                .iter()
+                .any(|unit| unit.fq_name() == "example.MaxVal" && unit.is_field()),
+            "the val keeps its own field declaration beside {alias:?}: {:?}",
+            state.declarations
+        );
+        let oid = oid_for(state.source.as_bytes());
+        let store = AnalyzerStore::open_ephemeral().unwrap();
+        let prior_epoch = epoch::kotlin_epoch_before_type_alias_type_identity();
+        let prior_generation = store
+            .ensure_language_epoch_value("kotlin", &prior_epoch)
+            .unwrap();
+        store
+            .write_parsed_blob_at_generation(
+                oid,
+                "kotlin",
+                prior_generation,
+                &KotlinAdapter,
+                state.as_ref(),
+            )
+            .unwrap();
+        assert!(store.contains_parsed_blob(oid, "kotlin").unwrap());
+
+        let current_generation = store
+            .ensure_language_epoch(
+                Language::Kotlin,
+                &crate::analyzer::kotlin::language::LANGUAGE.into(),
+            )
+            .unwrap();
+
+        assert_ne!(current_generation, prior_generation);
+        assert!(!store.contains_parsed_blob(oid, "kotlin").unwrap());
+        assert_eq!(
+            store
+                .missing_parsed_blob_keys(&[(oid, "kotlin".to_string())])
+                .unwrap(),
+            vec![(oid, "kotlin".to_string())]
+        );
+    }
+
+    #[test]
+    fn scala_type_alias_identity_epoch_invalidates_prior_parsed_blobs() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let file = write_file(
+            temp.path(),
+            "Tags.scala",
+            "package example\n\nobject Tags:\n  type MaxVal = Int\n  val MaxVal = 1\n",
+        );
+        let state = Arc::new(parse_state(&ScalaAdapter, &file));
+        let alias = state
+            .declarations
+            .iter()
+            .find(|unit| unit.fq_name() == "example.Tags$.MaxVal" && unit.is_class())
+            .expect("the current walk mints the alias as a type declaration");
+        assert!(
+            state
+                .declarations
+                .iter()
+                .any(|unit| unit.fq_name() == "example.Tags$.MaxVal" && unit.is_field()),
+            "the val keeps its own field declaration beside {alias:?}: {:?}",
+            state.declarations
+        );
+        let oid = oid_for(state.source.as_bytes());
+        let store = AnalyzerStore::open_ephemeral().unwrap();
+        let prior_epoch = epoch::scala_epoch_before_type_alias_type_identity();
+        let prior_generation = store
+            .ensure_language_epoch_value("scala", &prior_epoch)
+            .unwrap();
+        store
+            .write_parsed_blob_at_generation(
+                oid,
+                "scala",
+                prior_generation,
+                &ScalaAdapter,
+                state.as_ref(),
+            )
+            .unwrap();
+        assert!(store.contains_parsed_blob(oid, "scala").unwrap());
+
+        let current_generation = store
+            .ensure_language_epoch(
+                Language::Scala,
+                &crate::analyzer::scala::language::LANGUAGE.into(),
+            )
+            .unwrap();
+
+        assert_ne!(current_generation, prior_generation);
+        assert!(!store.contains_parsed_blob(oid, "scala").unwrap());
+        assert_eq!(
+            store
+                .missing_parsed_blob_keys(&[(oid, "scala".to_string())])
+                .unwrap(),
+            vec![(oid, "scala".to_string())]
+        );
+    }
+
+    #[test]
     fn scala_published_parser_epoch_invalidates_vendored_parser_rows() {
         let temp = tempfile::TempDir::new().unwrap();
         let file = write_file(
@@ -15918,41 +16237,160 @@ mod tests {
         });
     }
 
-    /// A burst wider than the pool runs at full width, and the pool keeps only
-    /// its configured idle capacity afterwards. Both halves matter:
-    /// the first barrier would deadlock if checkout throttled a burst, and the
-    /// idle count is what a live process pays for the rest of its lifetime.
+    /// Connections `counting_reader_open` opened, which is the only way to
+    /// observe how many a pool built: the pool takes its opener as a bare `fn`
+    /// pointer, so the count has to live beside it rather than be captured.
+    static BURST_READER_OPENS: AtomicUsize = AtomicUsize::new(0);
+
+    fn counting_reader_open(path: &Path) -> crate::cache_db::Result<Connection> {
+        BURST_READER_OPENS.fetch_add(1, Ordering::Relaxed);
+        crate::cache_db::open_readonly_temp_connection(path)
+    }
+
+    /// A burst wider than the pool is gated at `capacity`, and a second burst
+    /// opens nothing at all (#2632).
+    ///
+    /// Before the gate, checkout never blocked: the idle vector was empty, so
+    /// every one of the `4 * capacity` workers opened its own connection, ran
+    /// the 540-line revisioned-view script on it and dropped it on checkin --
+    /// the shape that cost a 120-worker rayon burst about 104 cold opens per
+    /// wave. `capacity` total opens is therefore the whole contract: it says
+    /// no checkout ever found the pool empty after warm-up, so it also says no
+    /// more than `capacity` readers were ever live at once.
+    ///
+    /// The barrier is `capacity` wide, not `burst` wide. It forces exactly as
+    /// many simultaneous checkouts as the gate permits, which is what makes
+    /// `capacity` opens deterministic rather than a race; a `burst`-wide
+    /// barrier would deadlock against the gate by construction.
     #[test]
-    fn reader_pool_runs_a_wide_burst_but_retains_a_bounded_idle_set() {
+    fn reader_pool_gates_a_wide_burst_at_capacity_and_reuses_its_readers() {
         let temp = tempfile::TempDir::new().unwrap();
         let store =
             Arc::new(AnalyzerStore::open_persistent(&temp.path().join("cache.db")).unwrap());
-        let burst = MAX_IDLE_READERS * 4;
-        let all_checked_out = Arc::new(std::sync::Barrier::new(burst));
-        let all_queried = Arc::new(std::sync::Barrier::new(burst));
+        let capacity = store.readers.capacity;
+        let burst = capacity * 4;
+        BURST_READER_OPENS.store(0, Ordering::Relaxed);
 
-        std::thread::scope(|scope| {
-            for _ in 0..burst {
-                let store = Arc::clone(&store);
-                let all_checked_out = Arc::clone(&all_checked_out);
-                let all_queried = Arc::clone(&all_queried);
-                scope.spawn(move || {
-                    let reader = store.read_conn().unwrap();
-                    all_checked_out.wait();
-                    let tables: i64 = reader
-                        .query_row("SELECT count(*) FROM sqlite_master", [], |row| row.get(0))
-                        .unwrap();
-                    assert!(tables > 0);
-                    all_queried.wait();
-                });
-            }
-        });
+        for round in 1..=2 {
+            let all_out = Arc::new(std::sync::Barrier::new(capacity));
+            std::thread::scope(|scope| {
+                for _ in 0..burst {
+                    let store = Arc::clone(&store);
+                    let all_out = Arc::clone(&all_out);
+                    scope.spawn(move || {
+                        let reader = store
+                            .read_conn_from_pool(&store.readers, counting_reader_open)
+                            .unwrap();
+                        let tables: i64 = reader
+                            .query_row("SELECT count(*) FROM sqlite_master", [], |row| row.get(0))
+                            .unwrap();
+                        assert!(tables > 0);
+                        all_out.wait();
+                    });
+                }
+            });
+
+            assert_eq!(
+                capacity,
+                BURST_READER_OPENS.load(Ordering::Relaxed),
+                "round {round}: a {burst}-wide burst must open {capacity} connections in total",
+            );
+            assert_eq!(
+                capacity,
+                store.readers.idle_len(),
+                "round {round}: every gated reader must come back to the pool",
+            );
+        }
+    }
+
+    /// The same two bursts through the workspace-selection path: #2883's view
+    /// script runs once per connection, and the gate is what bounds the number
+    /// of connections, so `4 * capacity` checkouts twice over cost exactly
+    /// `capacity` view scripts rather than `capacity` plus one per cold open.
+    #[test]
+    fn a_gated_burst_creates_one_view_script_run_per_pooled_reader() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let store =
+            Arc::new(AnalyzerStore::open_persistent(&temp.path().join("cache.db")).unwrap());
+        let capacity = store.readers.capacity;
+        let burst = capacity * 4;
+        let workspace_id =
+            WorkspaceId("dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd".into());
+        let selection = Arc::new(WorkspaceSnapshots::from_iter([(
+            "java".to_string(),
+            WorkspaceSnapshotId {
+                workspace_id,
+                lang: "java".to_string(),
+                generation: GenerationId::BOOTSTRAP,
+                revision: 1,
+            },
+        )]));
+
+        for _ in 0..2 {
+            let all_out = Arc::new(std::sync::Barrier::new(capacity));
+            std::thread::scope(|scope| {
+                for _ in 0..burst {
+                    let store = Arc::clone(&store);
+                    let all_out = Arc::clone(&all_out);
+                    let selection = Arc::clone(&selection);
+                    scope.spawn(move || {
+                        let reader = store.read_conn_for_workspace(&selection).unwrap();
+                        all_out.wait();
+                        drop(reader);
+                    });
+                }
+            });
+        }
 
         assert_eq!(
-            store.readers.idle_len(),
-            store.readers.capacity,
-            "a {burst}-wide burst must leave only {} readers resident",
-            store.readers.capacity,
+            (capacity, capacity),
+            store.workspace_selection_counts_for_test(),
+            "one view script and one selection write per pooled reader, and nothing per burst",
+        );
+    }
+
+    /// Cost pin for #2883. `temp.selected_workspace_revisions` and the views
+    /// over it belong to one connection, so a checkout that asks for the
+    /// selection that connection already holds must run nothing: no view
+    /// script, no selection rewrite. A different selection is a real change and
+    /// is written once.
+    #[test]
+    fn a_repeated_workspace_selection_costs_the_connection_nothing() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = AnalyzerStore::open_persistent(&temp.path().join("cache.db")).unwrap();
+        let workspace_id =
+            WorkspaceId("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee".into());
+        let selection = |revision| {
+            WorkspaceSnapshots::from_iter([(
+                "java".to_string(),
+                WorkspaceSnapshotId {
+                    workspace_id: workspace_id.clone(),
+                    lang: "java".to_string(),
+                    generation: GenerationId::BOOTSTRAP,
+                    revision,
+                },
+            )])
+        };
+
+        drop(store.read_conn_for_workspace(&selection(1)).unwrap());
+        assert_eq!(
+            store.workspace_selection_counts_for_test(),
+            (1, 1),
+            "the first checkout creates the views and writes the selection once"
+        );
+
+        drop(store.read_conn_for_workspace(&selection(1)).unwrap());
+        assert_eq!(
+            store.workspace_selection_counts_for_test(),
+            (1, 1),
+            "the same selection on the connection that already holds it must run no statement"
+        );
+
+        drop(store.read_conn_for_workspace(&selection(2)).unwrap());
+        assert_eq!(
+            store.workspace_selection_counts_for_test(),
+            (1, 2),
+            "a different revision is a real change: written once, with no second view script"
         );
     }
 
@@ -16687,11 +17125,12 @@ mod tests {
             (&r1, vec!["src/A.java", "src/B.java"], "pkg"),
             (&r2, vec!["src/A.java", "src/C.java"], "next"),
         ] {
-            select_workspace_snapshots(
-                &conn,
-                &HashMap::from_iter([("java".to_string(), snapshot.clone())]),
-            )
-            .unwrap();
+            store
+                .select_writer_workspace_snapshots(
+                    &conn,
+                    &HashMap::from_iter([("java".to_string(), snapshot.clone())]),
+                )
+                .unwrap();
             let paths = conn
                 .prepare("SELECT rel_path FROM workspace_files ORDER BY rel_path")
                 .unwrap()
@@ -17058,7 +17497,9 @@ mod tests {
     fn path_symbol_name_lookups_use_their_fqn_indexes() {
         let store = AnalyzerStore::open_ephemeral().unwrap();
         let conn = store.conn.lock().expect("store mutex");
-        select_workspace_snapshots(&conn, &HashMap::default()).unwrap();
+        store
+            .select_writer_workspace_snapshots(&conn, &HashMap::default())
+            .unwrap();
         for (sql, expected_index) in [
             (
                 EXACT_PATH_SYMBOL_FQN_SQL,
@@ -17502,6 +17943,7 @@ mod tests {
     ///
     /// Without the in-statement poll this returns all 1,200 rows and reports
     /// `complete`.
+    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
     #[test]
     fn a_cancelled_candidate_row_seek_stops_inside_the_statement() {
         const BLOBS: usize = 1_200;
@@ -17556,6 +17998,7 @@ mod tests {
     /// The token trips on its eighth check, which is generous against the three
     /// this seek needs (`1200 / 512` blocks plus the end-of-language check) and
     /// far under the 1,200 a per-row poll would spend.
+    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
     #[test]
     fn a_completing_candidate_row_seek_polls_once_per_row_block() {
         const BLOBS: usize = 1_200;
@@ -21301,6 +21744,7 @@ mod tests {
         assert_eq!(analyzer_db_path(&repo_root), analyzer_db_path(&linked_root));
     }
 
+    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
     #[test]
     fn round_trips_java_python_and_typescript_file_states() {
         let temp = tempfile::TempDir::new().unwrap();
@@ -23192,7 +23636,9 @@ mod tests {
     fn reverse_reference_candidates_use_name_first_indexes() {
         let store = AnalyzerStore::open_ephemeral().unwrap();
         let conn = store.conn.lock().expect("store mutex");
-        select_workspace_snapshots(&conn, &HashMap::default()).unwrap();
+        store
+            .select_writer_workspace_snapshots(&conn, &HashMap::default())
+            .unwrap();
         sync_reverse_reference_lookup_keys(
             &conn,
             &["Target".to_string()].into_iter().collect(),
@@ -23480,9 +23926,13 @@ mod tests {
                 _ => None,
             })
             .collect();
+        // The class, and the constructor its access label swallowed: the
+        // reparsed body reads `QgsPoint( double x, double y );` as a call
+        // statement under `public:`, and recovery reparses the declarator from
+        // that call (#2552).
         assert_eq!(
             recovered,
-            vec!["QgsPoint".to_string()],
+            vec!["QgsPoint".to_string(), "QgsPoint.QgsPoint".to_string()],
             "records: {:?}",
             state.materialization_records
         );

@@ -1,6 +1,5 @@
 //! The analyzer-owned half of Rust's type hierarchy: the `TypeHierarchyProvider`
-//! and `MemberFamilyProvider` capability impls and the `OnceLock` cells behind
-//! them.
+//! and `MemberFamilyProvider` capability impls and the memo cells behind them.
 //!
 //! The index itself and every predicate it is built from live in
 //! [`brokk_bifrost_rust::hierarchy`] and [`brokk_bifrost_rust::graph_support`].
@@ -20,6 +19,7 @@ use brokk_bifrost_rust::graph_support::{
     is_rust_trait_impl_member_declaration, is_rust_type_alias_declaration,
 };
 use brokk_bifrost_rust::hierarchy::{RustHierarchyIndex, RustMemberFamily, RustMemberFamilyEdge};
+use std::sync::Arc;
 
 use super::RustAnalyzer;
 
@@ -197,9 +197,19 @@ fn rust_member_family(
 }
 
 impl RustAnalyzer {
-    pub fn hierarchy_index(&self) -> &RustHierarchyIndex {
-        self.hierarchy_index
-            .get_or_init(|| RustHierarchyIndex::build(self, AnalyzerQueryScope::new(self).token()))
+    /// The workspace's Rust type hierarchy, built at most once per analyzer
+    /// snapshot and on the dedicated build pool.
+    ///
+    /// The build parses every workspace file and takes double-digit seconds on
+    /// a large one, and every caller here is on the request path
+    /// (`TypeHierarchyProvider`, `member_family`, `type_relations`). Running it
+    /// on the dedicated pool keeps its parallelism off the global request pool
+    /// and lets a global-pool worker that reaches this memo park on the one
+    /// build instead of duplicating it serially (#1772).
+    pub fn hierarchy_index(&self) -> Arc<RustHierarchyIndex> {
+        self.hierarchy_index.get_or_build_on_dedicated_pool(|| {
+            RustHierarchyIndex::build(self, AnalyzerQueryScope::new(self).token())
+        })
     }
 
     pub fn type_relations(&self) -> &[TypeRelation] {
@@ -299,13 +309,13 @@ impl Runnable for Worker {}
         )]);
 
         assert!(!analyzer.query_indexes_warm());
-        assert!(analyzer.hierarchy_index.get().is_none());
+        assert!(!analyzer.hierarchy_index.is_ready());
         assert!(!analyzer.rust_usage_facts_warm());
 
         analyzer.warm_query_indexes();
 
         assert!(analyzer.query_indexes_warm());
-        assert!(analyzer.hierarchy_index.get().is_some());
+        assert!(analyzer.hierarchy_index.is_ready());
         assert!(analyzer.rust_usage_facts_warm());
 
         let runnable = definition(&analyzer, "Runnable");
@@ -494,6 +504,7 @@ impl Shouter for Robot {
         ])
     }
 
+    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
     #[test]
     fn a_trait_method_resolves_to_its_impl_methods_in_other_files() {
         let (_fixture, analyzer) = cross_file_workspace();
@@ -535,6 +546,7 @@ impl Shouter for Robot {
         );
     }
 
+    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
     #[test]
     fn a_different_traits_same_named_method_is_not_an_implementor() {
         let (_fixture, analyzer) = cross_file_workspace();

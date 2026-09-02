@@ -7,7 +7,9 @@ use brokk_bifrost_core::analyzer::structural::adapter_helpers::{
 use brokk_bifrost_core::analyzer::structural::adapter_helpers::{
     linear_chain_tokens, qualified_chain_root, spelled_generic_arity,
 };
-use brokk_bifrost_core::analyzer::structural::callable::CallSiteContext;
+use brokk_bifrost_core::analyzer::structural::callable::{
+    CallShapeCoverage, CallSiteContext, CallSiteFacts,
+};
 use brokk_bifrost_core::analyzer::structural::edges::{
     DEEP_REFERENCE_EDGE_SUPPORT, ReferenceEdgeSupport,
 };
@@ -23,7 +25,7 @@ use brokk_bifrost_core::analyzer::structural::resolution::{
     HoistingClass, LexicalEnvironmentSupport,
 };
 use brokk_bifrost_core::analyzer::structural::routes::{
-    DEEP_IDENTITY_AXES, IdentityRouteSupport, RouteHopKind,
+    CuratedExportSurface, DEEP_IDENTITY_AXES, IdentityRouteSupport, RouteHopKind,
 };
 use brokk_bifrost_core::analyzer::structural::spec::{RoleSink, StructuralSpec};
 use brokk_bifrost_core::analyzer::{Language, Range};
@@ -64,6 +66,7 @@ pub const RUST_KIND_TABLE: &[(&str, NormalizedKind)] = &[
     ("enum_item", NormalizedKind::Class),
     ("trait_item", NormalizedKind::Class),
     ("type_item", NormalizedKind::Declaration),
+    ("mod_item", NormalizedKind::Module),
     ("const_item", NormalizedKind::Assignment),
     ("static_item", NormalizedKind::Assignment),
     ("let_declaration", NormalizedKind::Assignment),
@@ -202,6 +205,36 @@ fn is_inside_derive_attribute(node: Node<'_>, source: &str) -> bool {
         }
     }
     false
+}
+
+/// Attach `decorators` edges for the outer attributes written above `item`.
+///
+/// tree-sitter-rust does not nest an item's attributes inside the item: an
+/// outer `#[...]` is an `attribute_item` sibling that precedes the item in the
+/// parent's child list, so the run of `attribute_item` siblings immediately
+/// before `item` is exactly its attribute list. Inner `#![...]` attributes are
+/// `inner_attribute_item` nodes that configure the enclosing module rather
+/// than the item that follows them, so the walk stops at the first sibling
+/// that is not an `attribute_item`.
+fn attach_outer_attribute_decorators(sink: &mut RoleSink<'_>, item: Node<'_>) {
+    let mut first = item;
+    while let Some(previous) = first.prev_named_sibling() {
+        if previous.kind() != "attribute_item" {
+            break;
+        }
+        first = previous;
+    }
+    // Walk the run forward again so the edges land in source order.
+    let mut current = first;
+    while current.id() != item.id() {
+        if let Some(attribute) = first_named_child(current) {
+            attach_role_with_derived_name(sink, Role::Decorator, attribute, first_named_child);
+        }
+        let Some(next) = current.next_named_sibling() else {
+            break;
+        };
+        current = next;
+    }
 }
 
 fn derive_path_module(node: Node<'_>) -> Option<Node<'_>> {
@@ -400,6 +433,21 @@ impl StructuralSpec for RustStructuralSpec {
         RUST_KIND_TABLE
     }
 
+    fn call_site_facts(
+        &self,
+        node: Node<'_>,
+        _source: &str,
+        _context: &CallSiteContext,
+    ) -> Option<CallSiteFacts> {
+        // A macro's token tree is input to arbitrary expansion logic, not the
+        // argument list of an ordinary callable. Pattern alternatives and
+        // other named token-tree children therefore cannot establish an exact
+        // callable arity even though retaining their Arg roles remains useful
+        // to other structured analyses.
+        (node.kind() == "macro_invocation")
+            .then(|| CallSiteFacts::of_coverage(CallShapeCoverage::UnknownMacroDerived))
+    }
+
     fn refine_kind(
         &self,
         node: Node<'_>,
@@ -447,7 +495,7 @@ impl StructuralSpec for RustStructuralSpec {
     }
 
     fn supports_role(&self, role: Role) -> bool {
-        !matches!(role, Role::Kwarg | Role::Decorator)
+        role != Role::Kwarg
     }
 
     fn occurrence_role_support(&self) -> &OccurrenceRoleSupport {
@@ -501,7 +549,12 @@ impl StructuralSpec for RustStructuralSpec {
         )
     }
 
-    fn indirection_relation(&self, token: Node<'_>) -> Option<RouteHopKind> {
+    fn indirection_relation(
+        &self,
+        token: Node<'_>,
+        _source: &str,
+        _surface: &CuratedExportSurface,
+    ) -> Option<RouteHopKind> {
         let declaration = nearest_ancestor(token, |kind| kind == "use_declaration")?;
         let mut cursor = declaration.walk();
         let reexports = declaration
@@ -549,6 +602,7 @@ impl StructuralSpec for RustStructuralSpec {
                 if let Some(name) = node.child_by_field_name("name") {
                     sink.set_name(name);
                 }
+                attach_outer_attribute_decorators(sink, node);
             }
             NormalizedKind::Call => {
                 if node.kind() == "macro_invocation" {
@@ -591,13 +645,16 @@ impl StructuralSpec for RustStructuralSpec {
             NormalizedKind::Function
             | NormalizedKind::Method
             | NormalizedKind::Class
+            | NormalizedKind::Module
             | NormalizedKind::Declaration => {
                 if let Some(name) = node.child_by_field_name("name") {
                     sink.set_name(name);
                 }
+                attach_outer_attribute_decorators(sink, node);
             }
             NormalizedKind::Assignment => match node.kind() {
                 "const_item" | "static_item" => {
+                    attach_outer_attribute_decorators(sink, node);
                     if let Some(name) = node.child_by_field_name("name") {
                         sink.role_named(Role::Left, name, name);
                         sink.set_name(name);
@@ -648,6 +705,7 @@ impl StructuralSpec for RustStructuralSpec {
                 _ => {}
             },
             NormalizedKind::Import => {
+                attach_outer_attribute_decorators(sink, node);
                 if let Some(argument) = node.child_by_field_name("argument") {
                     attach_use_module(sink, argument);
                 }

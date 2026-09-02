@@ -52,16 +52,17 @@ use brokk_bifrost_analysis::CancellationToken;
 use brokk_bifrost_analysis::analyzer::common::language_for_file;
 use brokk_bifrost_analysis::analyzer::lexical_definitions::formal_parameter_slots;
 use brokk_bifrost_analysis::analyzer::semantic::workspace_oracle::{
-    ProcedureRangeLookupStatus, procedures_for_source_ranges,
+    ProcedureRangeLookupStatus, procedures_in_artifact,
 };
 use brokk_bifrost_analysis::analyzer::semantic::{
     AbstractObject, AccessPath, AccessPathAtPoint, AccessPathRoot, AliasQuery, AliasRelation,
-    CallBinding, CallSiteHandle, CallSiteId, CallTransferSet, CandidateCoverage, DispatchOracle,
-    DispatchResult, EvidenceCompleteness, FreshObjectPublicationKind, FreshObjectPublicationQuery,
-    HeapOracle, IcfgExitProfile, IcfgProvider, IcfgProviderBehaviorIdentity, IcfgSnapshot,
-    IcfgSnapshotLimits, ObservationPhase, OracleCallContext, OracleLimits, ProcedureHandle,
-    ProcedurePortHandle, ProcedurePortKind, ProgramPointHandle, ProofStatus, SemanticArtifact,
-    SemanticArtifactCollector, SemanticArtifactLeaseError, SemanticBudget, SemanticBudgetDimension,
+    CallBinding, CallInvocationMode, CallSiteHandle, CallSiteId, CallTransferSet,
+    CandidateCoverage, DispatchOracle, DispatchResult, EvidenceCompleteness,
+    FreshObjectPublicationKind, FreshObjectPublicationQuery, HeapOracle, IcfgExitProfile,
+    IcfgProvider, IcfgProviderBehaviorIdentity, IcfgSnapshot, IcfgSnapshotLimits, ObservationPhase,
+    OracleCallContext, OracleLimits, ProcedureHandle, ProcedurePortHandle, ProcedurePortKind,
+    ProgramPointHandle, ProofStatus, SemanticArtifact, SemanticArtifactCollector,
+    SemanticArtifactLeaseError, SemanticBudget, SemanticBudgetDimension,
     SemanticBudgetScopeSnapshot, SemanticExecutionBudget, SemanticExecutionWork, SemanticLocator,
     SemanticOutcome, SemanticProviderError, SemanticRequest, SemanticWork, ValueAtPoint,
     ValueFlowOracle, ValueHandle, WorkspaceIcfgProvider,
@@ -88,7 +89,7 @@ use brokk_bifrost_flow::typestate::{
     TypestateBindingMultiplicity, TypestateBindingPlan, TypestateBindingQuality,
     TypestateCallNonInterferenceSpec, TypestateEventBindingId, TypestateEventBindingSpec,
     TypestateFinding, TypestateFindingCertainty, TypestateFindingKind, TypestateFindingLimits,
-    TypestateFlowProblemError, TypestateInitialSeedSpec, TypestateObjectRole,
+    TypestateFlowProblemError, TypestateInitialSeedSpec, TypestateObjectKey, TypestateObjectRole,
     TypestateObservationSite, TypestateSubjectClassKey, TypestateSubjectKey,
     TypestateTerminalBindingId, TypestateTerminalBindingSpec, TypestateUncertainty,
     collect_summary_findings_with_limits, solve_typestate_with_production_summaries,
@@ -624,6 +625,10 @@ fn typestate_work_report(
             PolicyWorkUnit::Count,
             count(measured.evaluation_traversal_steps),
         ),
+        // Physical source preparation charged during evaluation. A revived
+        // leased artifact reuses its rows, but may or may not re-read its
+        // source depending on cache residency, so this metric is bounded
+        // rather than exact across an eviction (#2877).
         typestate_work_metric(
             "typestate.evaluation_semantic_source_bytes",
             PolicyWorkUnit::Bytes,
@@ -2172,6 +2177,25 @@ impl<'a> TypestatePolicyCompiler<'a> {
             }
         }
 
+        let mut detached_escape_transfers =
+            HashMap::<SemanticLocator, Vec<(TypestateObjectKey, ProgramPointHandle)>>::new();
+        for subject in &mut subjects {
+            let root_locator = subject.root.semantics().locator().clone();
+            if !detached_escape_transfers.contains_key(&root_locator) {
+                let transfers = self.exact_detached_task_transfers(&subject.root)?;
+                detached_escape_transfers.insert(root_locator.clone(), transfers);
+            }
+            let subject_object = TypestateObjectKey::for_object(&subject.object);
+            for (_, escape_start) in detached_escape_transfers[&root_locator]
+                .iter()
+                .filter(|(object, _)| *object == subject_object)
+            {
+                if !subject.escape_starts.contains(escape_start) {
+                    subject.escape_starts.push(escape_start.clone());
+                }
+            }
+        }
+
         roots.sort_by(|left, right| left.semantics().locator().cmp(right.semantics().locator()));
         roots.dedup_by(|left, right| left == right);
         subjects.sort_by(|left, right| left.key.cmp(&right.key));
@@ -2581,10 +2605,8 @@ impl<'a> TypestatePolicyCompiler<'a> {
             .selectors
             .materialize_with_artifact_continuation(&selection.file)
             .map_err(typestate_selector_error)?;
-        let range = super::selector_compiler::source_range(&selection.span);
-        let lookup = procedures_for_source_ranges(
+        let lookup = procedures_in_artifact(
             &artifact,
-            &[range],
             self.selectors
                 .remaining_semantic_traversal_steps()
                 .map_err(typestate_selector_error)?,
@@ -2690,6 +2712,20 @@ impl<'a> TypestatePolicyCompiler<'a> {
         } else {
             binding
         };
+        let invocation_mode = procedure
+            .semantics()
+            .call_site(call.id())
+            .expect("validated call handle resolves")
+            .invocation_mode;
+        if detached_call_lacks_requested_observation(invocation_mode, effective_binding, phase) {
+            self.binding_omission_procedures
+                .insert(procedure.semantics().locator().clone());
+            self.binding_omissions.push(format!(
+                "{}:{}..{} requests target completion from a detached call, whose completion is not observable in the caller",
+                selection.file, selection.span.start, selection.span.end
+            ));
+            return Ok(None);
+        }
         let (value, observation_point, role) =
             select_value(&procedure, &call, &selection.span, effective_binding, phase)?;
         let oracle = self.selectors.workspace().semantic_oracle_provider();
@@ -3138,6 +3174,73 @@ impl<'a> TypestatePolicyCompiler<'a> {
             specs,
             proven_pairs,
         })
+    }
+
+    /// Detached work takes ownership at registration, before the child task
+    /// executes. An escape is therefore established only when the structured
+    /// transfer value resolves to one Proven+Complete object and that object
+    /// is the exact typestate subject. Open or ambiguous object sets retain the
+    /// ordinary call uncertainty without manufacturing an escape event.
+    fn exact_detached_task_transfers(
+        &mut self,
+        root: &ProcedureHandle,
+    ) -> Result<Vec<(TypestateObjectKey, ProgramPointHandle)>, TypestatePolicyCompileError> {
+        let mut exact_transfers = Vec::new();
+        for transfer in brokk_bifrost_flow::detached_task::detached_task_transfers(root.semantics())
+        {
+            let value = root
+                .value_handle(transfer.value)
+                .expect("validated detached transfer retains its value");
+            let point = root
+                .point_handle(transfer.point)
+                .expect("validated detached transfer retains its registration point");
+            let observation_point = root
+                .point_handle(transfer.observation_point)
+                .expect("validated detached transfer retains its observation point");
+            let observation = ValueAtPoint::new(
+                value,
+                observation_point,
+                ObservationPhase::BeforeEffects,
+                OracleCallContext::empty(),
+            )
+            .expect("detached transfer value and registration point share one procedure");
+            let oracle = self.selectors.workspace().semantic_oracle_provider();
+            let continuation = self
+                .selectors
+                .continue_semantic(|request| oracle.pointees(&observation, request))
+                .map_err(typestate_selector_error)?;
+            require_uninterrupted_semantic_outcome(
+                continuation.outcome(),
+                "detached-task transfer heap analysis",
+            )?;
+            self.selectors
+                .require_execution_budget("detached-task transfer heap analysis")
+                .map_err(typestate_selector_error)?;
+            let exact_object = continuation
+                .outcome()
+                .is_complete()
+                .then(|| continuation.outcome().available_value())
+                .flatten()
+                .filter(|result| result.objects().coverage().is_exhaustive())
+                .and_then(|result| {
+                    let [candidate] = result.objects().candidates() else {
+                        return None;
+                    };
+                    candidate.is_proven_complete().then_some(candidate.value())
+                })
+                .map(TypestateObjectKey::for_object);
+            let exact_object = continuation
+                .finish_scalar(exact_object, "detached-task transfer heap analysis")
+                .map_err(typestate_selector_error)?;
+            if let Some(object) = exact_object
+                && !exact_transfers
+                    .iter()
+                    .any(|(existing, start)| existing == &object && start == &point)
+            {
+                exact_transfers.push((object, point));
+            }
+        }
+        Ok(exact_transfers)
     }
 
     /// Subjects this observation may act on that its own object set did not
@@ -4214,6 +4317,25 @@ fn select_value(
     Ok((value, point, role))
 }
 
+fn detached_call_lacks_requested_observation(
+    invocation_mode: CallInvocationMode,
+    binding: &SelectorBinding,
+    phase: Option<EndpointObservationPhase>,
+) -> bool {
+    invocation_mode == CallInvocationMode::Detached
+        && match phase {
+            Some(
+                EndpointObservationPhase::AfterNormalReturn
+                | EndpointObservationPhase::AfterExceptionalReturn,
+            ) => true,
+            None => matches!(
+                binding,
+                SelectorBinding::ReturnValue | SelectorBinding::ResultIndex(_)
+            ),
+            Some(EndpointObservationPhase::AtMatch | EndpointObservationPhase::BeforeCall) => false,
+        }
+}
+
 fn oracle_observation_phase(phase: Option<EndpointObservationPhase>) -> ObservationPhase {
     match phase {
         Some(EndpointObservationPhase::BeforeCall) => ObservationPhase::BeforeEffects,
@@ -4495,6 +4617,187 @@ mod tests {
             .find(|metric| metric.name() == name)
             .unwrap_or_else(|| panic!("missing metric {name}: {:#?}", work.metrics()))
             .value()
+    }
+
+    #[test]
+    fn detached_calls_reject_only_target_completion_observations() {
+        let argument = SelectorBinding::ArgumentIndex(0);
+        let result = SelectorBinding::ResultIndex(0);
+
+        assert!(detached_call_lacks_requested_observation(
+            CallInvocationMode::Detached,
+            &argument,
+            Some(EndpointObservationPhase::AfterNormalReturn),
+        ));
+        assert!(detached_call_lacks_requested_observation(
+            CallInvocationMode::Detached,
+            &argument,
+            Some(EndpointObservationPhase::AfterExceptionalReturn),
+        ));
+        assert!(detached_call_lacks_requested_observation(
+            CallInvocationMode::Detached,
+            &result,
+            None,
+        ));
+        assert!(!detached_call_lacks_requested_observation(
+            CallInvocationMode::Detached,
+            &argument,
+            Some(EndpointObservationPhase::AtMatch),
+        ));
+        assert!(!detached_call_lacks_requested_observation(
+            CallInvocationMode::Detached,
+            &argument,
+            Some(EndpointObservationPhase::BeforeCall),
+        ));
+        assert!(!detached_call_lacks_requested_observation(
+            CallInvocationMode::Detached,
+            &argument,
+            None,
+        ));
+        assert!(!detached_call_lacks_requested_observation(
+            CallInvocationMode::Ordinary,
+            &argument,
+            Some(EndpointObservationPhase::AfterNormalReturn),
+        ));
+    }
+
+    #[test]
+    fn exact_detached_arguments_and_captures_escape_at_registration() {
+        const POLICY_PATH: &str = "policies/detached-resource-lifecycle.rqlp";
+        const POLICY: &str = r#"(policy
+  :schema-version 1
+  :id "bifrost.test.detached-resource-lifecycle"
+  :name "Detached resource lifecycle"
+  :message "Resource lifecycle transferred to detached work"
+  :severity error
+  :analysis
+    (analysis
+      :type typestate
+      :mode may
+      :call-modeling (call-modeling :unmodeled paranoid)
+      :subjects
+        (subject-set
+          :include-matches [
+            (match-directory
+              :path "policies/endpoints"
+              :scope recursive
+              :categories (all [resource.acquire]))]
+          :entries [])
+      :uncertainty (uncertainty :escape inconclusive)
+      :automaton
+        (automaton
+          :states [open error]
+          :initial open
+          :accepting-states [open]
+          :error-states [error]
+          :events [
+            (event :id finish :on (normal-procedure-exit :scope analysis-root))]
+          :transitions [
+            (transition :from open :on finish :to error)]
+          :terminal-expectations [])))"#;
+        const ACQUIRE_ENDPOINT: &str = r#"(endpoint
+  :schema-version 1
+  :id "bifrost.test.detached-resource-lifecycle.acquire"
+  :name "Resource acquisition"
+  :display-name "acquired resource"
+  :role source
+  :categories [resource.acquire]
+  :selector (rql :schema-version 1 (language go (call :callee (name "OpenRes"))))
+  :binding return-value
+  :supersedes [])"#;
+
+        let project = InlineTestProject::with_language(Language::Go)
+            .file("go.mod", "module example.com/detached-resource-lifecycle\n")
+            .file(
+                "resource.go",
+                r#"package lifecycle
+
+type Res struct{}
+
+func OpenRes() *Res { return &Res{} }
+func Consume(*Res) {}
+
+func ExactArgumentEscape() {
+    resource := OpenRes()
+    go Consume(resource)
+}
+
+func ExactCaptureEscape() {
+    resource := OpenRes()
+    go func() { Consume(resource) }()
+}
+
+func OrdinaryNearMiss() {
+    resource := OpenRes()
+    Consume(resource)
+}
+
+func DeferredNearMiss() {
+    resource := OpenRes()
+    defer Consume(resource)
+}
+
+func AmbiguousNearMiss(flag bool) {
+    var resource *Res
+    if flag { resource = OpenRes() } else { resource = OpenRes() }
+    go Consume(resource)
+}
+"#,
+            )
+            .file(POLICY_PATH, POLICY)
+            .file("policies/endpoints/acquire.rqlp", ACQUIRE_ENDPOINT)
+            .build();
+        let workspace = project.workspace_analyzer(AnalyzerConfig {
+            parallelism: Some(1),
+            ..AnalyzerConfig::default()
+        });
+        let catalogs = Arc::new(TaintCatalogRegistry::new_without_workspace(
+            CatalogRegistryLimits::default(),
+        ));
+        let mut registry = PolicyRegistry::new_for_workspace(
+            project.root().to_path_buf(),
+            catalogs,
+            PolicyRegistryLimits::default(),
+        )
+        .expect("absolute inline workspace opens for policy loading");
+        let policy = registry
+            .load_policy_path(POLICY_PATH)
+            .expect("fixture typestate policy loads");
+        let spec = policy
+            .resolved_typestate()
+            .expect("fixture policy resolves typestate authoring");
+        let cancellation = CancellationToken::default();
+        let budget = PolicyBudget::default();
+        let compiled = TypestatePolicyCompiler::new(
+            &workspace,
+            budget.query_limits(),
+            budget.max_selector_results(),
+            &cancellation,
+        )
+        .compile(policy, spec)
+        .unwrap_or_else(|failure| panic!("fixture policy compiles: {}", failure.error));
+
+        let escapes = compiled
+            .bindings
+            .event_bindings()
+            .iter()
+            .filter(|binding| binding.role() == TypestateObjectRole::EscapedObject)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            escapes.len(),
+            2,
+            "only exact detached argument and immutable capture transfers escape: {:#?}",
+            compiled.bindings.event_bindings()
+        );
+        let escape_event = compiled
+            .protocol
+            .event_id(&internal_escape_event_key(std::iter::empty()))
+            .expect("compiler appends its internal escape event");
+        assert!(
+            escapes
+                .iter()
+                .all(|binding| binding.event() == escape_event)
+        );
     }
 
     #[test]

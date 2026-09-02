@@ -29,6 +29,10 @@ pub enum UsageHitKind {
     Import,
     Reexport,
     SelfReceiver,
+    /// A source occurrence connected through an explicit declared contract,
+    /// even when exact runtime evidence names a different structural owner.
+    /// Editor references retain this edge; runtime usage surfaces do not.
+    DeclaredReference,
     /// A callable definition corresponding to a separate declaration. Definition
     /// sites are editor-visible for navigation but are not runtime usages.
     Definition,
@@ -62,15 +66,17 @@ impl UsageHitKind {
         "import",
         "reexport",
         "self_receiver",
+        "declared_reference",
         "definition",
         "override_declaration",
     ];
 
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         UsageHitKind::Reference,
         UsageHitKind::Import,
         UsageHitKind::Reexport,
         UsageHitKind::SelfReceiver,
+        UsageHitKind::DeclaredReference,
         UsageHitKind::Definition,
         UsageHitKind::OverrideDeclaration,
     ];
@@ -81,6 +87,7 @@ impl UsageHitKind {
             UsageHitKind::Import => "import",
             UsageHitKind::Reexport => "reexport",
             UsageHitKind::SelfReceiver => "self_receiver",
+            UsageHitKind::DeclaredReference => "declared_reference",
             UsageHitKind::Definition => "definition",
             UsageHitKind::OverrideDeclaration => "override_declaration",
         }
@@ -105,6 +112,7 @@ impl UsageHitKind {
             UsageHitKind::Import
             | UsageHitKind::Reexport
             | UsageHitKind::SelfReceiver
+            | UsageHitKind::DeclaredReference
             | UsageHitKind::Definition => None,
         }
     }
@@ -166,6 +174,12 @@ impl UsageHit {
     /// Reclassify this hit as a self/this receiver reference.
     pub fn into_self_receiver(mut self) -> Self {
         self.kind = UsageHitKind::SelfReceiver;
+        self
+    }
+
+    /// Reclassify this hit as an editor-only declared-contract reference.
+    pub fn into_declared_reference(mut self) -> Self {
+        self.kind = UsageHitKind::DeclaredReference;
         self
     }
 
@@ -716,6 +730,16 @@ mod tests {
             "this.target()",
         )
         .into_self_receiver();
+        let declared_reference = UsageHit::new(
+            project_file("app.ts"),
+            15,
+            150,
+            160,
+            unit.clone(),
+            1.0,
+            "processor.process()",
+        )
+        .into_declared_reference();
         let override_declaration = UsageHit::new(
             project_file("Foo.java"),
             16,
@@ -742,6 +766,7 @@ mod tests {
         hits.insert(import.clone());
         hits.insert(reexport.clone());
         hits.insert(self_receiver.clone());
+        hits.insert(declared_reference.clone());
         hits.insert(override_declaration.clone());
         hits.insert(definition.clone());
         let result = FuzzyResult::success(unit, hits);
@@ -759,6 +784,7 @@ mod tests {
                 import,
                 reexport,
                 self_receiver,
+                declared_reference,
                 definition,
                 override_declaration,
             ]

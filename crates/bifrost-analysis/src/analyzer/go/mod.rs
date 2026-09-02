@@ -354,12 +354,19 @@ impl TypeAliasProvider for GoAnalyzer {
 
 impl GoAnalyzer {
     /// The workspace's Go type and member relations, built at most once per
-    /// analyzer snapshot.
-    fn hierarchy_index(&self) -> &GoHierarchyIndex {
-        self.memo_caches.hierarchy_index.get_or_init(|| {
-            let scope = AnalyzerQueryScope::new(self);
-            GoHierarchyIndex::build(scope.token(), &self.inner, self)
-        })
+    /// analyzer snapshot and on the dedicated build pool.
+    ///
+    /// Go has no background warm, so every caller here is on the request path.
+    /// Running the build on the dedicated pool keeps it off the global request
+    /// pool and lets a global-pool worker that reaches this memo park on the
+    /// one build instead of duplicating it serially (#1772).
+    fn hierarchy_index(&self) -> Arc<GoHierarchyIndex> {
+        self.memo_caches
+            .hierarchy_index
+            .get_or_build_on_dedicated_pool(|| {
+                let scope = AnalyzerQueryScope::new(self);
+                GoHierarchyIndex::build(scope.token(), &self.inner, self)
+            })
     }
 }
 
@@ -417,7 +424,7 @@ impl crate::analyzer::usages::MemberFamilyProvider for GoAnalyzer {
         member: &CodeUnit,
         cancellation: Option<&crate::cancellation::CancellationToken>,
     ) -> crate::analyzer::usages::MemberFamilyAnswer {
-        go_member_family(self, self.hierarchy_index(), member, cancellation)
+        go_member_family(self, &self.hierarchy_index(), member, cancellation)
     }
 }
 
@@ -596,6 +603,10 @@ impl CodeUnitIndex for GoAnalyzer {
         self.inner.all_declarations()
     }
 
+    fn declarations_sharing_name(&self, unit: &CodeUnit) -> Vec<CodeUnit> {
+        self.inner.declarations_sharing_name(unit)
+    }
+
     fn declarations(&self, file: &ProjectFile) -> BTreeSet<CodeUnit> {
         self.inner.declarations(file)
     }
@@ -765,6 +776,11 @@ impl IAnalyzer for GoAnalyzer {
         invalidate_nearest_go_module_cache();
     }
 
+    fn invalidate_cached_file_identities_for(&self, changed_files: &BTreeSet<ProjectFile>) {
+        self.inner
+            .invalidate_cached_file_identities_for(changed_files);
+    }
+
     fn working_tree_identity(&self) -> Option<std::sync::Arc<crate::gitblob::WorkingTreeIdentity>> {
         self.inner.working_tree_identity()
     }
@@ -783,6 +799,12 @@ impl IAnalyzer for GoAnalyzer {
 
     fn workspace_file_index_cell(&self) -> Option<crate::analyzer::WorkspaceFileIndexCell> {
         self.inner.workspace_file_index_cell()
+    }
+
+    fn definition_lookup_memo(
+        &self,
+    ) -> Option<std::sync::Arc<crate::analyzer::DefinitionLookupMemo>> {
+        self.inner.definition_lookup_memo()
     }
 
     fn import_statements(&self, file: &ProjectFile) -> Vec<String> {
@@ -902,6 +924,12 @@ impl IAnalyzer for GoAnalyzer {
         &self,
     ) -> Option<crate::analyzer::content_identity::WorkspaceContentIdentities> {
         self.inner.workspace_content_identities()
+    }
+
+    fn workspace_fact_indexes(
+        &self,
+    ) -> Vec<&dyn crate::analyzer::read_verification::WorkspaceFactIndex> {
+        self.inner.workspace_fact_indexes()
     }
 
     fn contains_tests(&self, file: &ProjectFile) -> bool {
@@ -1191,29 +1219,111 @@ fn go_module_level_field(unit: &CodeUnit) -> bool {
     unit.is_field() && unit.short_name().starts_with("_module_.")
 }
 
+/// A `GoAnalyzer` over an inline single-module fixture, shared by the test
+/// modules of this analyzer.
+#[cfg(test)]
+pub(super) fn test_analyzer(files: &[(&str, &str)]) -> GoAnalyzer {
+    use crate::analyzer::TestProject;
+
+    let root = tempfile::tempdir().unwrap().keep();
+    std::fs::write(root.join("go.mod"), "module example.com/app\n\ngo 1.22\n").unwrap();
+    for (path, source) in files {
+        let path = root.join(path);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(path, source).unwrap();
+    }
+    GoAnalyzer::from_project(TestProject::new(root, Language::Go))
+}
+
 #[cfg(test)]
 mod hierarchy_tests {
     //! Lives here rather than beside the builder in `brokk-bifrost-go`: the
     //! fixture needs a real `GoAnalyzer` to supply the `CodeUnitIndex` and
     //! `ImportAnalysisProvider` the hierarchy is built from.
     use super::*;
-    use crate::analyzer::TestProject;
     use crate::analyzer::type_relations::TypeRelationKind;
-    use std::fs;
-    use tempfile::tempdir;
 
     fn analyzer(files: &[(&str, &str)]) -> GoAnalyzer {
-        let temp = tempdir().unwrap();
-        let root = temp.keep();
-        fs::write(root.join("go.mod"), "module example.com/app\n\ngo 1.22\n").unwrap();
-        for (path, source) in files {
-            let path = root.join(path);
-            if let Some(parent) = path.parent() {
-                fs::create_dir_all(parent).unwrap();
-            }
-            fs::write(path, source).unwrap();
-        }
-        GoAnalyzer::from_project(TestProject::new(root, Language::Go))
+        super::test_analyzer(files)
+    }
+
+    /// Same-suffix package directories (`a/pkg`, `b/pkg`) must each bind only
+    /// their own import path. The package table is indexed by every spelling
+    /// that can bind (#1748), and a suffix index whose keys did not come from
+    /// the same rule as the old scan would let `b/pkg` answer `a/pkg`'s
+    /// import, giving `Worker` the wrong method set.
+    #[test]
+    fn same_suffix_package_directories_bind_only_their_own_import() {
+        let analyzer = analyzer(&[
+            (
+                "a/pkg/base.go",
+                "package pkg\ntype Base struct{}\nfunc (Base) Run() error { return nil }\n",
+            ),
+            (
+                "b/pkg/base.go",
+                "package pkg\ntype Base struct{}\nfunc (Base) Walk() error { return nil }\n",
+            ),
+            (
+                "app/worker.go",
+                "package app\n\nimport \"example.com/app/a/pkg\"\n\ntype Worker struct { pkg.Base }\ntype Runner interface { Run() error }\ntype Walker interface { Walk() error }\n",
+            ),
+        ]);
+        let scope = AnalyzerQueryScope::new(&analyzer);
+        let index = GoHierarchyIndex::build(scope.token(), &analyzer, &analyzer);
+
+        let satisfied: Vec<&str> = index
+            .relations()
+            .iter()
+            .filter(|relation| {
+                relation.kind == TypeRelationKind::StructuralSatisfaction
+                    && relation.from.identifier() == "Worker"
+            })
+            .map(|relation| relation.to.identifier())
+            .collect();
+        assert!(
+            satisfied.contains(&"Runner"),
+            "Worker embeds a/pkg.Base and must satisfy Runner: {satisfied:?}"
+        );
+        assert!(
+            !satisfied.contains(&"Walker"),
+            "Worker must not pick up b/pkg.Base's method set: {satisfied:?}"
+        );
+    }
+
+    /// Cost pin for #1748: the import pass probes the package table once per
+    /// import. The scan this replaced had no probe count at all -- it visited
+    /// every workspace file for every import of every file.
+    #[test]
+    fn hierarchy_build_probes_the_package_table_once_per_import() {
+        const PACKAGES: usize = 200;
+
+        let sources: Vec<(String, String)> = (0..PACKAGES)
+            .map(|index| {
+                (
+                    format!("pkg{index}/file.go"),
+                    format!(
+                        "package pkg{index}\n\nimport \"example.com/app/pkg{}\"\n\ntype Holder{index} struct {{ value pkg{}.Value }}\ntype Value struct{{}}\n",
+                        (index + 1) % PACKAGES,
+                        (index + 1) % PACKAGES
+                    ),
+                )
+            })
+            .collect();
+        let files: Vec<(&str, &str)> = sources
+            .iter()
+            .map(|(path, source)| (path.as_str(), source.as_str()))
+            .collect();
+        let analyzer = analyzer(&files);
+        let scope = AnalyzerQueryScope::new(&analyzer);
+        let index = GoHierarchyIndex::build(scope.token(), &analyzer, &analyzer);
+
+        assert_eq!(
+            index.package_lookups(),
+            PACKAGES,
+            "one probe per import, not one scan of {PACKAGES} files per import"
+        );
     }
 
     #[test]

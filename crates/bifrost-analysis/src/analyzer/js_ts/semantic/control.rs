@@ -330,6 +330,8 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 MemoryLocationKind::Index {
                     base,
                     index: Some(index_value),
+                    constant_index: None,
+                    identity: crate::analyzer::semantic::IndexedLocationIdentity::Element,
                 },
             )?;
             if !established_array_base {
@@ -1381,6 +1383,8 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 MemoryLocationKind::Index {
                     base,
                     index: Some(index_value),
+                    constant_index: None,
+                    identity: crate::analyzer::semantic::IndexedLocationIdentity::Element,
                 },
             )?;
             self.append_effect(

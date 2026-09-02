@@ -102,6 +102,16 @@ pub(crate) enum CallDispatchBoundaryKind {
     /// The exact resolver status is retained rather than collapsed into an
     /// empty target list.
     Unresolved(DefinitionLookupStatus),
+    /// Resolution remains unproven, but the same structured resolver outcome
+    /// retained a canonical callee identity that semantic lowering may be able
+    /// to address with an authored model. This never upgrades the status: if
+    /// the semantic call shape cannot mint the canonical target, lowering
+    /// falls back to the ordinary targetless unresolved boundary.
+    UnresolvedWithTarget {
+        status: DefinitionLookupStatus,
+        callee_text: Box<str>,
+        normalized_static_owner: Option<Box<str>>,
+    },
     /// Structured declaration/body evidence exists, but no build graph proves
     /// that the retained C/C++ body belongs to this call's link unit.
     UnprovenTargetIdentity,
@@ -240,6 +250,74 @@ pub struct CallRelationResult {
     pub cancelled: bool,
     pub diagnostics: Vec<CallRelationDiagnostic>,
     pub work: CallRelationWork,
+}
+
+/// Domain for the digest of one call-relation answer.
+const CALL_RELATION_ANSWER_DOMAIN: &[u8] = b"bifrost-read-ledger:call-relation-answer:v1";
+
+/// Record the callers or callees answer for one declaration.
+///
+/// This is the funnel behind the `callers` and `callees` steps and behind
+/// every other consumer of the call relation, so recording here covers the
+/// request-scoped memo above it too: a memo hit means the funnel was crossed
+/// earlier in the same request, which already recorded the key.
+///
+/// The two directions record two kinds -- [`LookupKind::Callers`] and
+/// [`LookupKind::Callees`] -- because verification replays the funnel a kind
+/// names, and a kind that named both this relation and the usage finder could
+/// never be replayed: the two answer the same subject with different digests.
+fn record_call_relation_read(
+    analyzer: &dyn IAnalyzer,
+    kind: crate::analyzer::read_ledger::LookupKind,
+    subject: &CodeUnit,
+    result: &CallRelationResult,
+) {
+    if !analyzer.read_ledger_attached() {
+        return;
+    }
+    analyzer.record_read(crate::analyzer::read_ledger::ReadKey::lookup(
+        kind,
+        crate::analyzer::read_ledger::LookupQuestion::declaration(subject),
+        call_relation_answer_digest(result),
+    ));
+}
+
+/// The canonical digest of one call-relation answer.
+///
+/// Public to the crate because verification replays the same funnel against
+/// the head workspace and must compute the answer digest with this function
+/// rather than a second copy of it.
+pub(crate) fn call_relation_answer_digest(
+    result: &CallRelationResult,
+) -> crate::analyzer::semantic::ids::StableDigest {
+    let mut sites = result
+        .sites
+        .iter()
+        .map(|site| {
+            (
+                crate::path_utils::rel_path_string(&site.file),
+                site.range.start_byte,
+                site.range.end_byte,
+                site.caller.fq_name(),
+                site.callee.fq_name(),
+            )
+        })
+        .collect::<Vec<_>>();
+    sites.sort();
+    sites.dedup();
+    let mut hasher =
+        crate::analyzer::canonical_hash::CanonicalHasher::new(CALL_RELATION_ANSWER_DOMAIN);
+    // A truncated or cancelled answer is a different fact about the workspace
+    // from a complete one that happens to hold the same sites.
+    hasher.field("truncated", &[u8::from(result.truncated)]);
+    hasher.field("cancelled", &[u8::from(result.cancelled)]);
+    for (path, start, end, caller, callee) in sites {
+        hasher.field(&path, &(start as u64).to_be_bytes());
+        hasher.value(&(end as u64).to_be_bytes());
+        hasher.field("caller", caller.as_bytes());
+        hasher.field("callee", callee.as_bytes());
+    }
+    crate::analyzer::semantic::ids::StableDigest::from_array(hasher.finish())
 }
 
 #[derive(Default)]
@@ -709,16 +787,17 @@ impl CallDispatchSession {
                 analyzer, &self.file, &outcome,
             ));
         }
+        let site = ExternalCalleeSite {
+            source: &self.exact_source,
+            tree,
+            callee_start_byte: callee_range.start_byte,
+        };
         apply_call_target_outcome(
             &mut lookup,
-            expand_imported_external_callee(analyzer, &self.file, outcome),
+            expand_imported_external_callee(analyzer, &self.file, outcome, Some(&site)),
             max_candidates,
             self.language,
-            Some(&ExternalCalleeSite {
-                source: &self.exact_source,
-                tree,
-                callee_start_byte: callee_range.start_byte,
-            }),
+            Some(&site),
         );
         lookup
     }
@@ -872,16 +951,17 @@ impl CallRelationService {
             if outcome.outcome.status == DefinitionLookupStatus::UnresolvableImportBoundary {
                 lookup.boundary = Some(call_target_boundary_evidence(analyzer, file, &outcome));
             }
+            let site = ExternalCalleeSite {
+                source: &exact_source,
+                tree: &tree,
+                callee_start_byte: callee_range.start_byte,
+            };
             apply_call_target_outcome(
                 &mut lookup,
-                expand_imported_external_callee(analyzer, file, outcome),
+                expand_imported_external_callee(analyzer, file, outcome, Some(&site)),
                 limits.max_candidates,
                 language,
-                Some(&ExternalCalleeSite {
-                    source: &exact_source,
-                    tree: &tree,
-                    callee_start_byte: callee_range.start_byte,
-                }),
+                Some(&site),
             );
             lookups[*index] = Some(lookup);
         }
@@ -933,6 +1013,23 @@ impl CallRelationService {
     }
 
     pub fn incoming_bounded(
+        analyzer: &dyn IAnalyzer,
+        token: QueryToken<'_>,
+        target: &CodeUnit,
+        limits: CallRelationLimits,
+        cancellation: Option<&CancellationToken>,
+    ) -> CallRelationResult {
+        let result = Self::incoming_bounded_inner(analyzer, token, target, limits, cancellation);
+        record_call_relation_read(
+            analyzer,
+            crate::analyzer::read_ledger::LookupKind::Callers,
+            target,
+            &result,
+        );
+        result
+    }
+
+    fn incoming_bounded_inner(
         analyzer: &dyn IAnalyzer,
         token: QueryToken<'_>,
         target: &CodeUnit,
@@ -1103,6 +1200,23 @@ impl CallRelationService {
     }
 
     pub fn outgoing_bounded(
+        analyzer: &dyn IAnalyzer,
+        token: QueryToken<'_>,
+        caller: &CodeUnit,
+        limits: CallRelationLimits,
+        cancellation: Option<&CancellationToken>,
+    ) -> CallRelationResult {
+        let result = Self::outgoing_bounded_inner(analyzer, token, caller, limits, cancellation);
+        record_call_relation_read(
+            analyzer,
+            crate::analyzer::read_ledger::LookupKind::Callees,
+            caller,
+            &result,
+        );
+        result
+    }
+
+    fn outgoing_bounded_inner(
         analyzer: &dyn IAnalyzer,
         token: QueryToken<'_>,
         caller: &CodeUnit,
@@ -1378,6 +1492,21 @@ fn unresolved_dispatch_lookup(
     }
 }
 
+fn unresolved_call_boundary(
+    status: DefinitionLookupStatus,
+    callee_text: Option<Box<str>>,
+    normalized_static_owner: Option<Box<str>>,
+) -> CallDispatchBoundaryKind {
+    match callee_text {
+        Some(callee_text) => CallDispatchBoundaryKind::UnresolvedWithTarget {
+            status,
+            callee_text,
+            normalized_static_owner,
+        },
+        None => CallDispatchBoundaryKind::Unresolved(status),
+    }
+}
+
 #[cfg(test)]
 /// The test-facing entry point, which has no parsed file behind it. A call
 /// site with no file evidence can never admit a single-segment external owner;
@@ -1395,6 +1524,8 @@ fn apply_dispatch_outcome(
         max_targets,
         language,
         None,
+        None,
+        false,
         false,
         false,
         false,
@@ -1410,38 +1541,95 @@ fn apply_dispatch_outcome(
 /// its resolver followed the `use` out of the workspace before giving up
 /// (#2596). Gating on only one of the two would have made the expansion dead
 /// for one of the two languages that implement it.
+///
+/// The returned bit is provenance, not a convenience flag. Kotlin's dotted
+/// source spelling can be a receiver-expression chain, so that language may
+/// publish the expanded text only when its external declaration resolver
+/// produced it.
 fn expand_imported_external_callee(
     analyzer: &dyn IAnalyzer,
     file: &ProjectFile,
     mut outcome: CallTargetLookupOutcome,
-) -> CallTargetLookupOutcome {
-    if !matches!(
-        outcome.outcome.status,
-        DefinitionLookupStatus::NoDefinition | DefinitionLookupStatus::UnresolvableImportBoundary
-    ) {
-        return outcome;
+    site: Option<&ExternalCalleeSite<'_>>,
+) -> ExpandedExternalCallee {
+    let kotlin_import_resolved_without_target = language_for_file(file) == Language::Kotlin
+        && outcome.outcome.status == DefinitionLookupStatus::Resolved
+        && outcome.outcome.definitions.is_empty();
+    if !kotlin_import_resolved_without_target
+        && !matches!(
+            outcome.outcome.status,
+            DefinitionLookupStatus::NoDefinition
+                | DefinitionLookupStatus::UnresolvableImportBoundary
+        )
+    {
+        return ExpandedExternalCallee::unproven(outcome);
     }
-    let Some(text) = outcome.outcome.resolved_reference_target() else {
-        return outcome;
+    let structured_kotlin_callee = kotlin_import_resolved_without_target
+        .then(|| site.and_then(kotlin_callee_text))
+        .flatten();
+    let Some(text) =
+        structured_kotlin_callee.or_else(|| outcome.outcome.resolved_reference_target())
+    else {
+        return ExpandedExternalCallee::unproven(outcome);
     };
     let Some(expanded) = language_support(language_for_file(file))
         .and_then(|support| support.expand_imported_external_callee(analyzer, file, text))
     else {
-        return outcome;
+        return ExpandedExternalCallee::unproven(outcome);
     };
     if let Some(reference) = outcome.outcome.reference.as_mut() {
         reference.text = expanded;
     }
-    outcome
+    // Kotlin can resolve the local import binding while still having no
+    // workspace definition for the imported member. Once the external-member
+    // resolver proves that member, preserve the import cut as an external
+    // boundary instead of reporting a targetless `Resolved` outcome.
+    if kotlin_import_resolved_without_target {
+        outcome.outcome.status = DefinitionLookupStatus::UnresolvableImportBoundary;
+    }
+    ExpandedExternalCallee {
+        outcome,
+        resolver_proven_identity: true,
+    }
+}
+
+fn kotlin_callee_text<'a>(site: &'a ExternalCalleeSite<'_>) -> Option<&'a str> {
+    let mut node = site.tree.root_node().named_descendant_for_byte_range(
+        site.callee_start_byte,
+        site.callee_start_byte.saturating_add(1),
+    )?;
+    while node.kind() != "call_expression" {
+        node = node.parent()?;
+    }
+    let callee = language_support(Language::Kotlin)?.call_callee_node(node)?;
+    site.source.get(callee.byte_range())
+}
+
+struct ExpandedExternalCallee {
+    outcome: CallTargetLookupOutcome,
+    resolver_proven_identity: bool,
+}
+
+impl ExpandedExternalCallee {
+    fn unproven(outcome: CallTargetLookupOutcome) -> Self {
+        Self {
+            outcome,
+            resolver_proven_identity: false,
+        }
+    }
 }
 
 fn apply_call_target_outcome(
     lookup: &mut CallDispatchLookup,
-    outcome: CallTargetLookupOutcome,
+    expanded: ExpandedExternalCallee,
     max_targets: usize,
     language: Language,
     site: Option<&ExternalCalleeSite<'_>>,
 ) {
+    let ExpandedExternalCallee {
+        outcome,
+        resolver_proven_identity,
+    } = expanded;
     let CallTargetLookupOutcome {
         outcome,
         call_application,
@@ -1451,6 +1639,9 @@ fn apply_call_target_outcome(
         unproven_link_unit,
         truncated,
     } = outcome;
+    let exact_external_callee = exact_external_call
+        .as_ref()
+        .map(|proof| Box::<str>::from(proof.canonical_callee()));
     if let Some(proof) = &exact_external_call {
         debug_assert_eq!(proof.call_application(), call_application);
         debug_assert_eq!(proof.dispatch_extensibility(), dispatch_extensibility);
@@ -1473,7 +1664,9 @@ fn apply_call_target_outcome(
         outcome,
         max_targets,
         language,
+        exact_external_callee,
         site,
+        resolver_proven_identity,
         structure_unavailable,
         unproven_link_unit,
         truncated,
@@ -1488,7 +1681,9 @@ fn apply_dispatch_outcome_with_flags(
     outcome: DefinitionLookupOutcome,
     max_targets: usize,
     language: Language,
+    exact_external_callee: Option<Box<str>>,
     site: Option<&ExternalCalleeSite<'_>>,
+    resolver_proven_external_identity: bool,
     structure_unavailable: bool,
     unproven_link_unit: bool,
     navigation_targets_truncated: bool,
@@ -1500,15 +1695,28 @@ fn apply_dispatch_outcome_with_flags(
         diagnostics,
         reference,
     } = outcome;
-    // The syntactic callee text (`java.net.URLDecoder.decode`) is the only
-    // identity an unmaterialized external callee leaves behind, so retain it on
-    // the external boundary instead of dropping it (#1978). Canonicalizing it
-    // once here is what makes every external route below carry an identity that
-    // is bindable, or none at all (#2598).
-    let external_callee_text: Option<Box<str>> = reference
-        .as_ref()
-        .and_then(|reference| canonical_external_callee(&reference.text, language, site))
-        .map(Box::<str>::from);
+    // A resolver-owned exact proof is already canonical and outranks syntax
+    // classification; this is how an imported single-segment Python owner such
+    // as `subprocess` crosses the boundary without making every
+    // `subprocess.run` spelling globally trusted. Otherwise the syntactic
+    // callee text (`java.net.URLDecoder.decode`) is the only identity an
+    // unmaterialized external callee leaves behind, so canonicalize it once
+    // here and retain either one bindable identity or none (#1978, #2598).
+    // Kotlin's dotted syntax additionally requires the external-member
+    // resolver provenance carried alongside the lookup (#2781).
+    let external_callee_text: Option<Box<str>> = exact_external_callee.or_else(|| {
+        reference
+            .as_ref()
+            .and_then(|reference| {
+                canonical_external_callee(
+                    &reference.text,
+                    language,
+                    site,
+                    resolver_proven_external_identity,
+                )
+            })
+            .map(Box::<str>::from)
+    });
     let normalized_static_owner = external_callee_text
         .as_deref()
         .and_then(|callee_text| java_normalized_static_owner(callee_text, language, site));
@@ -1544,8 +1752,10 @@ fn apply_dispatch_outcome_with_flags(
         });
     }
     if partial_unresolved_import {
-        lookup.boundaries.push(CallDispatchBoundaryKind::Unresolved(
+        lookup.boundaries.push(unresolved_call_boundary(
             DefinitionLookupStatus::NoDefinition,
+            external_callee_text.clone(),
+            normalized_static_owner.clone(),
         ));
     }
     if import_bindings_truncated {
@@ -1592,9 +1802,11 @@ fn apply_dispatch_outcome_with_flags(
         DefinitionLookupStatus::Resolved | DefinitionLookupStatus::Ambiguous
             if lookup.targets.is_empty() =>
         {
-            lookup
-                .boundaries
-                .push(CallDispatchBoundaryKind::Unresolved(status));
+            lookup.boundaries.push(unresolved_call_boundary(
+                status,
+                external_callee_text,
+                normalized_static_owner,
+            ));
         }
         DefinitionLookupStatus::Resolved | DefinitionLookupStatus::Ambiguous => {}
         DefinitionLookupStatus::UnresolvableImportBoundary => {
@@ -1624,15 +1836,19 @@ fn apply_dispatch_outcome_with_flags(
                 callee_text: Some(text),
                 normalized_static_owner,
             }),
-            None => lookup
-                .boundaries
-                .push(CallDispatchBoundaryKind::Unresolved(status)),
+            None => lookup.boundaries.push(unresolved_call_boundary(
+                status,
+                None,
+                normalized_static_owner,
+            )),
         },
         DefinitionLookupStatus::UnsupportedLanguage
         | DefinitionLookupStatus::InvalidLocation
-        | DefinitionLookupStatus::NotFound => lookup
-            .boundaries
-            .push(CallDispatchBoundaryKind::Unresolved(status)),
+        | DefinitionLookupStatus::NotFound => lookup.boundaries.push(unresolved_call_boundary(
+            status,
+            external_callee_text,
+            normalized_static_owner,
+        )),
     }
 }
 
@@ -1710,7 +1926,15 @@ fn canonical_external_callee(
     callee_text: &str,
     language: Language,
     site: Option<&ExternalCalleeSite<'_>>,
+    resolver_proven_external_identity: bool,
 ) -> Option<String> {
+    // Kotlin writes package paths and receiver-expression chains with the same
+    // separator. A dotted source spelling proves no package root on its own;
+    // only the language resolver's external-member expansion may publish one
+    // as a bindable boundary identity (#2781).
+    if language == Language::Kotlin && !resolver_proven_external_identity {
+        return None;
+    }
     let (owner, member) =
         crate::analyzer::semantic::split_canonical_qualified_callee(callee_text, language)?;
     if owner.contains('.') {
@@ -1914,10 +2138,11 @@ pub fn bind_call_site_arguments(
 /// object.
 ///
 /// A callee that is already a callable owns its own formals. A *class* callee
-/// is a Python constructor call, whose formals are `__init__`'s and whose
-/// `self` the allocation binds; a class in any other language names no
-/// parameter list this seam can read. Shared with the `call_binding` row
-/// producer so both answer from one rule (issue #2499).
+/// names the language's indexed constructor child when that convention is
+/// structured and unique. Python's allocation additionally binds `self`; a
+/// JavaScript or TypeScript constructor declares only its written parameters.
+/// Shared with the `call_binding` row producer so both answer from one rule
+/// (issue #2499).
 pub fn formal_owner_for_callee(
     analyzer: &dyn IAnalyzer,
     callee: &CodeUnit,
@@ -1925,17 +2150,20 @@ pub fn formal_owner_for_callee(
     if !callee.is_class() {
         return Some((callee.clone(), false));
     }
-    if language_for_file(callee.source()) != Language::Python {
-        return None;
-    }
+    let (constructor_name, allocation_binds_first_formal) = match language_for_file(callee.source())
+    {
+        Language::Python => ("__init__", true),
+        Language::JavaScript | Language::TypeScript => ("constructor", false),
+        _ => return None,
+    };
     let mut constructors = analyzer
         .direct_children(callee)
         .into_iter()
-        .filter(|unit| unit.is_callable() && unit.identifier() == "__init__")
+        .filter(|unit| unit.is_callable() && unit.identifier() == constructor_name)
         .collect::<Vec<_>>();
     constructors.sort();
     constructors.dedup();
-    (constructors.len() == 1).then(|| (constructors.remove(0), true))
+    (constructors.len() == 1).then(|| (constructors.remove(0), allocation_binds_first_formal))
 }
 
 /// Whether the callee's first declared formal is consumed by the call's
@@ -2221,7 +2449,7 @@ mod tests {
             }),
         );
         let source = serde_json::to_vec(&serde_json::json!({
-            "schema_version": 1,
+            "schema_version": 2,
             "pack_id": pack_id,
             "version": "1.0.0",
             "producer": { "name": "go-dispatch-fixture", "version": "1.0.0" },
@@ -3313,6 +3541,48 @@ func caller(os opener) { os.Open("book.xlsx") }
     }
 
     #[test]
+    fn exact_dispatch_retains_python_imported_callable_proof() {
+        let source = "import subprocess\ndef caller(command):\n    return subprocess.run(command, shell=True)\n";
+        let fixture =
+            AnalyzerFixture::new_for_language(Language::Python, &[("external.py", source)]);
+        let lookup = CallRelationService::dispatch_at_bounded(
+            fixture.analyzer.analyzer(),
+            AnalyzerQueryScope::new(fixture.analyzer.analyzer()).token(),
+            &ExactCallLocation {
+                file: ProjectFile::new(fixture.project_root(), "external.py"),
+                call_span: call_span(source, "subprocess.run(command, shell=True)"),
+            },
+            Arc::from(source),
+            generous_limits(),
+            None,
+        );
+
+        assert_eq!(
+            lookup.status,
+            Some(DefinitionLookupStatus::UnresolvableImportBoundary),
+            "{lookup:#?}"
+        );
+        assert_eq!(lookup.boundary, Some(BoundaryStatus::ExternalIndexed));
+        assert_eq!(
+            lookup.boundaries,
+            vec![CallDispatchBoundaryKind::External {
+                callee_text: Some("subprocess.run".into()),
+                normalized_static_owner: None,
+            }]
+        );
+        let proof = lookup
+            .exact_external_call
+            .as_ref()
+            .expect("Python import proof");
+        assert_eq!(proof.canonical_callee(), "subprocess.run");
+        assert_eq!(
+            proof.call_application(),
+            CallApplicationKind::PackageFunction
+        );
+        assert_eq!(proof.parameter_count(), 2);
+    }
+
+    #[test]
     fn exact_dispatch_resolves_cpp_template_operator_and_destructor_names() {
         let source = r#"
 namespace ns {
@@ -3510,7 +3780,11 @@ int caller() { return local_target(1); }
         let mut unavailable = CallDispatchLookup::default();
         apply_call_target_outcome(
             &mut unavailable,
-            outcome(DefinitionLookupStatus::Resolved, true, false),
+            ExpandedExternalCallee::unproven(outcome(
+                DefinitionLookupStatus::Resolved,
+                true,
+                false,
+            )),
             8,
             Language::Cpp,
             None,
@@ -3530,7 +3804,11 @@ int caller() { return local_target(1); }
         let mut truncated = CallDispatchLookup::default();
         apply_call_target_outcome(
             &mut truncated,
-            outcome(DefinitionLookupStatus::Ambiguous, false, true),
+            ExpandedExternalCallee::unproven(outcome(
+                DefinitionLookupStatus::Ambiguous,
+                false,
+                true,
+            )),
             8,
             Language::Cpp,
             None,
@@ -4277,6 +4555,351 @@ object Calls {
             ),
             "the resolver's proven imported-package boundary remains external: {imported:#?}"
         );
+    }
+
+    #[test]
+    fn unresolved_outcome_retains_only_a_structured_canonical_callee_target() {
+        let canonical_reference = ResolvedReferenceSite {
+            path: "Caller.java".to_owned(),
+            text: "com.example.Missing.run".to_owned(),
+            range: Range {
+                start_byte: 0,
+                end_byte: 23,
+                start_line: 1,
+                end_line: 1,
+            },
+            focus_start_byte: 20,
+            focus_end_byte: 23,
+        };
+        let mut named = CallDispatchLookup::default();
+        apply_dispatch_outcome(
+            &mut named,
+            DefinitionLookupOutcome {
+                status: DefinitionLookupStatus::NotFound,
+                reference: Some(canonical_reference),
+                definitions: Vec::new(),
+                lexical_definition: None,
+                diagnostics: Vec::new(),
+            },
+            1,
+            Language::Java,
+        );
+        assert!(matches!(
+            named.boundaries.as_slice(),
+            [CallDispatchBoundaryKind::UnresolvedWithTarget {
+                status: DefinitionLookupStatus::NotFound,
+                callee_text,
+                ..
+            }] if callee_text.as_ref() == "com.example.Missing.run"
+        ));
+
+        let mut unnamed = CallDispatchLookup::default();
+        apply_dispatch_outcome(
+            &mut unnamed,
+            DefinitionLookupOutcome {
+                status: DefinitionLookupStatus::NotFound,
+                reference: None,
+                definitions: Vec::new(),
+                lexical_definition: None,
+                diagnostics: Vec::new(),
+            },
+            1,
+            Language::Java,
+        );
+        assert_eq!(
+            unnamed.boundaries,
+            vec![CallDispatchBoundaryKind::Unresolved(
+                DefinitionLookupStatus::NotFound
+            )],
+            "an unnamed residual must remain targetless"
+        );
+    }
+
+    #[test]
+    fn kotlin_external_identity_requires_resolver_proven_package_root() {
+        assert_eq!(
+            canonical_external_callee("com.example.ext.Ext.wrap", Language::Kotlin, None, true,),
+            Some("com.example.ext.Ext.wrap".to_owned()),
+            "the Kotlin external-member resolver may publish its canonical identity"
+        );
+        for expression_spelling in [
+            "value.value.toString",
+            "this.kotlin.notRegisteredMessage",
+            "type.upperBounds.first",
+        ] {
+            assert_eq!(
+                canonical_external_callee(expression_spelling, Language::Kotlin, None, false,),
+                None,
+                "a receiver-expression spelling is not a package-rooted identity"
+            );
+        }
+    }
+
+    #[test]
+    fn kotlin_unknown_receiver_chain_stays_identityless() {
+        let source = r#"package app
+
+class Holder(val value: MissingType)
+
+fun caller(holder: Holder): String = holder.value.toString()
+"#;
+        let call = "holder.value.toString()";
+        let fixture = AnalyzerFixture::new_for_language(Language::Kotlin, &[("App.kt", source)]);
+        let scope = AnalyzerQueryScope::new(fixture.analyzer.analyzer());
+        let lookup = CallRelationService::dispatch_at_bounded(
+            fixture.analyzer.analyzer(),
+            scope.token(),
+            &ExactCallLocation {
+                file: ProjectFile::new(fixture.project_root(), "App.kt"),
+                call_span: call_span(source, call),
+            },
+            Arc::from(source),
+            generous_limits(),
+            None,
+        );
+
+        assert!(lookup.targets.is_empty(), "{lookup:#?}");
+        assert!(
+            lookup.boundaries.iter().all(|boundary| !matches!(
+                boundary,
+                CallDispatchBoundaryKind::External {
+                    callee_text: Some(_),
+                    ..
+                }
+            )),
+            "an unknown Kotlin receiver chain must not become bindable: {lookup:#?}"
+        );
+    }
+
+    /// A Kotlin workspace whose only external evidence is one activated
+    /// declaration-facts pack. Discovery is explicitly disabled so the
+    /// resolver-proven identity can come only from the pack's declaration.
+    struct KotlinExternalMemberFixture {
+        _temp: tempfile::TempDir,
+        analyzer: crate::analyzer::WorkspaceAnalyzer,
+        root: std::path::PathBuf,
+    }
+
+    impl KotlinExternalMemberFixture {
+        fn new(source: &str) -> Self {
+            use crate::analyzer::semantic_model::{
+                CatalogOptions, CompilerOptions, SemanticModelActivationControl,
+                SemanticModelActivationEvidence, SemanticModelActivationRequest,
+                SemanticModelControlAction, SemanticModelControlScope, SemanticModelPackSelector,
+                SemanticModelRuntimeLimits, SemanticModelRuntimeOutcome, SemanticPackCatalog,
+                SessionPackSource, SessionPackSourceKind, SourceFormat,
+                acquire_active_semantic_models_with_evidence, compile_source,
+            };
+            use crate::analyzer::{
+                AnalyzerConfig, JvmAnalyzerConfig, JvmDependencyDiscoveryConfig,
+                JvmDependencyDiscoveryMode, JvmStandardLibraryDiscoveryConfig, WorkspaceAnalyzer,
+            };
+
+            let temp = tempfile::tempdir().expect("temp dir");
+            let root = temp.path().canonicalize().expect("canonical temp dir");
+            ProjectFile::new(root.clone(), "App.kt")
+                .write(source)
+                .expect("write Kotlin fixture");
+
+            let type_id = "fixture.kotlin.external.ext";
+            let pack = serde_json::json!({
+                "schema_version": 2,
+                "pack_id": "fixture.kotlin-external",
+                "version": "1.0.0",
+                "producer": { "name": "kotlin-dispatch-fixture", "version": "1.0.0" },
+                "language": "kotlin",
+                "ecosystem": "maven",
+                "compatibility": { "bifrost": "*", "toolchains": [] },
+                "provenance": { "source": "fixture" },
+                "license": "NOASSERTION",
+                "completeness": "partial",
+                "safety": { "generated_code_only": false, "review_required": false },
+                "shards": [{
+                    "id": "declarations.fixture.kotlin-external",
+                    "activation": [{ "package": { "name": "com.example.ext" } }],
+                    "payload": {
+                        "kind": "declaration_facts",
+                        "types": [{
+                            "id": type_id,
+                            "name": "com.example.ext.Ext",
+                            "type_kind": "class",
+                            "visibility": "public",
+                            "hierarchy": [],
+                            "locator": {
+                                "kind": "artifact",
+                                "path": "fixture-source",
+                                "symbol": "com.example.ext.Ext"
+                            }
+                        }],
+                        "members": [{
+                            "id": "fixture.kotlin.external.ext.wrap",
+                            "owner": type_id,
+                            "name": "wrap",
+                            "member_kind": "method",
+                            "visibility": "public",
+                            "is_static": false,
+                            "signature": {
+                                "type_parameters": [],
+                                "parameters": [{
+                                    "name": "value",
+                                    "type": {
+                                        "kind": "named",
+                                        "name": "kotlin.String",
+                                        "arguments": [],
+                                        "nullable": false
+                                    },
+                                    "optional": false,
+                                    "variadic": false
+                                }],
+                                "returns": {
+                                    "kind": "named",
+                                    "name": "kotlin.String",
+                                    "arguments": [],
+                                    "nullable": false
+                                }
+                            },
+                            "locator": {
+                                "kind": "artifact",
+                                "path": "fixture-source",
+                                "symbol": "com.example.ext.Ext.wrap"
+                            }
+                        }],
+                        "relations": []
+                    }
+                }]
+            });
+            let pack = compile_source(
+                SourceFormat::Json,
+                &serde_json::to_vec(&pack).expect("serialize Kotlin declaration fixture"),
+                &CompilerOptions::default(),
+            )
+            .unwrap_or_else(|diagnostics| {
+                panic!("Kotlin declaration fixture must compile: {diagnostics:#?}")
+            });
+            let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default())
+                .expect("open ephemeral semantic-pack catalog");
+            catalog
+                .register_session_pack(
+                    &pack,
+                    &SessionPackSource {
+                        kind: SessionPackSourceKind::Embedded,
+                        source_id: "fixture.kotlin-external".to_owned(),
+                    },
+                )
+                .expect("register Kotlin declaration fixture");
+
+            let project = TestProject::new(root.clone(), Language::Kotlin);
+            let config = AnalyzerConfig {
+                jvm: JvmAnalyzerConfig {
+                    dependency_discovery: JvmDependencyDiscoveryConfig {
+                        mode: JvmDependencyDiscoveryMode::Disabled,
+                        ..JvmDependencyDiscoveryConfig::default()
+                    },
+                    standard_library_discovery: JvmStandardLibraryDiscoveryConfig {
+                        discover_java_home: false,
+                        ..JvmStandardLibraryDiscoveryConfig::default()
+                    },
+                    ..JvmAnalyzerConfig::default()
+                },
+                ..AnalyzerConfig::default()
+            };
+            let analyzer = WorkspaceAnalyzer::build_ephemeral_footgun(Arc::new(project), config)
+                .expect("build ephemeral Kotlin workspace");
+
+            let request = SemanticModelActivationRequest {
+                bifrost_version: semver::Version::parse(env!("CARGO_PKG_VERSION"))
+                    .expect("crate version parses"),
+                evidence: vec![SemanticModelActivationEvidence {
+                    language: "kotlin".to_owned(),
+                    ecosystem: "maven".to_owned(),
+                    package: Some(crate::analyzer::semantic_model::CatalogCoordinate {
+                        name: "com.example.ext".to_owned(),
+                        version: None,
+                    }),
+                    module: None,
+                    toolchain: None,
+                    target: None,
+                    configuration: None,
+                    artifact_sha256: None,
+                }],
+                controls: vec![SemanticModelActivationControl {
+                    scope: SemanticModelControlScope::Workspace,
+                    action: SemanticModelControlAction::Enable,
+                    selector: SemanticModelPackSelector {
+                        pack_id: "fixture.kotlin-external".to_owned(),
+                        version: None,
+                        manifest_digest: None,
+                    },
+                }],
+                limits: SemanticModelRuntimeLimits::default(),
+            };
+            let SemanticModelRuntimeOutcome::Ready { .. } =
+                acquire_active_semantic_models_with_evidence(
+                    analyzer.analyzer(),
+                    &catalog,
+                    None,
+                    &request,
+                    None,
+                    &CancellationToken::new(),
+                )
+            else {
+                panic!("Kotlin declaration fixture must activate");
+            };
+            assert!(analyzer.analyzer().semantic_model_overlay().is_some());
+
+            Self {
+                _temp: temp,
+                analyzer,
+                root,
+            }
+        }
+    }
+
+    fn dispatch_kotlin_external_member(callee: &str) {
+        let imported = callee == "Ext.wrap";
+        let import = imported.then_some("import com.example.ext.Ext\n\n");
+        let call = format!("{callee}(value)");
+        let source = format!(
+            "package app\n\n{}fun caller(value: String): String = {call}\n",
+            import.unwrap_or_default(),
+        );
+        let fixture = KotlinExternalMemberFixture::new(&source);
+        let scope = AnalyzerQueryScope::new(fixture.analyzer.analyzer());
+        let lookup = CallRelationService::dispatch_at_bounded(
+            fixture.analyzer.analyzer(),
+            scope.token(),
+            &ExactCallLocation {
+                file: ProjectFile::new(fixture.root.clone(), "App.kt"),
+                call_span: call_span(&source, &call),
+            },
+            Arc::from(source.as_str()),
+            generous_limits(),
+            None,
+        );
+
+        assert!(
+            lookup.targets.is_empty(),
+            "an external declaration is not a workspace target: {lookup:#?}"
+        );
+        assert_eq!(
+            lookup.boundaries,
+            vec![CallDispatchBoundaryKind::External {
+                callee_text: Some("com.example.ext.Ext.wrap".into()),
+                normalized_static_owner: None,
+            }],
+            "the resolver-proven external member must retain its package-rooted identity: {lookup:#?}"
+        );
+    }
+
+    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
+    #[test]
+    fn kotlin_imported_external_member_publishes_resolver_proven_identity() {
+        dispatch_kotlin_external_member("Ext.wrap");
+    }
+
+    #[test]
+    fn kotlin_fully_qualified_external_member_publishes_resolver_proven_identity() {
+        dispatch_kotlin_external_member("com.example.ext.Ext.wrap");
     }
 
     fn empty_typescript_analyzer() -> (tempfile::TempDir, TypescriptAnalyzer, ProjectFile) {

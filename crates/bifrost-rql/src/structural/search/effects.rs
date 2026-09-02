@@ -27,19 +27,20 @@
 use super::*;
 
 use crate::analyzer::semantic::{
-    ArgumentDomain, CallArgumentExpansion, CallSiteHandle, CallableReferenceKind, CallableTarget,
-    CallableTargetResolution, CallerReceiverBinding, CaptureMode, CaptureSource, ContentIdentity,
-    GuardPredicate, MemoryAccessKind, MemoryLocationKind, SemanticCapability, SemanticEffect,
-    SemanticGapDischarge, SemanticGapImpact, SemanticGapSubject, SemanticLocator,
-    SemanticValueKind, ValueFlowKind, ValueUseKind,
+    ArgumentDomain, CallArgumentExpansion, CallInvocationMode, CallSiteHandle,
+    CallableReferenceKind, CallableTarget, CallableTargetResolution, CallerReceiverBinding,
+    CaptureMode, CaptureSource, ContentIdentity, GuardPredicate, MemoryAccessKind,
+    MemoryLocationKind, SemanticCapability, SemanticEffect, SemanticGapDischarge,
+    SemanticGapImpact, SemanticGapSubject, SemanticLocator, SemanticValueKind, ValueFlowKind,
+    ValueUseKind,
 };
 use crate::analyzer::semantic::{LengthDelimitedDigest, UnmaterializedExternalTarget};
 use crate::analyzer::semantic_model::{
-    CompiledConditionalResultRefinement, CompiledNormalReturnRefinement,
-    CompiledOperationPrecondition, CompiledPredicateProofEffect, CompiledResultContract,
-    CompiledResultMemberContract, CompiledResultPredicate, CompiledSummaryInput, Completeness,
-    ResolvedActiveSemanticModels, SemanticModelCallableKey, SemanticModelMatchDisposition,
-    SemanticModelOverlay,
+    CompiledConditionalIndirectWrite, CompiledConditionalResultRefinement,
+    CompiledIndirectWriteTarget, CompiledNormalReturnRefinement, CompiledOperationPrecondition,
+    CompiledPredicateProofEffect, CompiledResultContract, CompiledResultMemberContract,
+    CompiledResultPredicate, CompiledSummaryInput, Completeness, ResolvedActiveSemanticModels,
+    SemanticModelCallableKey, SemanticModelMatchDisposition, SemanticModelOverlay,
 };
 use crate::analyzer::usages::CallRelationLimits;
 use crate::analyzer::usages::call_shape::{call_shape_for_call, call_shapes_in_file};
@@ -90,6 +91,9 @@ const CALL_RESULT_CONTRACT_ID_DOMAIN: &[u8] = b"bifrost.code_query.call_result_c
 const RESULT_CONTRACT_USE_ID_DOMAIN: &[u8] = b"bifrost.code_query.result_contract_use.v1";
 const RESULT_CONTRACT_FAILURE_USE_ID_DOMAIN: &[u8] =
     b"bifrost.code_query.result_contract_failure_use.v1";
+const NILNESS_OPERATION_ID_DOMAIN: &[u8] = b"bifrost.code_query.nilness_operation.v1";
+const SWITCH_COVERAGE_ID_DOMAIN: &[u8] = b"bifrost.code_query.switch_coverage.v1";
+const DETACHED_TASK_TRANSFER_ID_DOMAIN: &[u8] = b"bifrost.code_query.detached_task_transfer.v1";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(super) enum ResultContractUseKind {
@@ -109,6 +113,83 @@ impl ResultContractUseKind {
             Self::ReceiverCall => "receiver_call",
             Self::CallArgument => "call_argument",
         }
+    }
+}
+
+/// One structured operation whose pointer-like subject has a procedure-local
+/// scalar nilness fact.
+#[derive(Debug, Clone)]
+pub(super) struct NilnessOperationValue {
+    pub(super) file: ProjectFile,
+    pub(super) range: Range,
+    pub(super) ast_id: Option<String>,
+    pub(super) id: String,
+    pub(super) procedure_id: String,
+    pub(super) operation_point_id: String,
+    pub(super) subject_value_id: u64,
+    pub(super) use_kind: ResultContractUseKind,
+    pub(super) fact: brokk_bifrost_flow::scalar_state::ScalarFact,
+    pub(super) origin: &'static str,
+    pub(super) proof: &'static str,
+    pub(super) coverage: EffectCoverage,
+    pub(super) reason: Option<&'static str>,
+}
+
+impl NilnessOperationValue {
+    pub(super) fn file(&self) -> &ProjectFile {
+        &self.file
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct SwitchCoverageValue {
+    pub(super) file: ProjectFile,
+    pub(super) range: Range,
+    pub(super) ast_id: Option<String>,
+    pub(super) id: String,
+    pub(super) procedure_id: String,
+    pub(super) switch_fact_id: u32,
+    pub(super) kind: &'static str,
+    pub(super) selector_value_id: Option<u64>,
+    pub(super) selector_domain: &'static str,
+    pub(super) case_count: usize,
+    pub(super) has_true_case: bool,
+    pub(super) has_false_case: bool,
+    pub(super) default_present: bool,
+    pub(super) verdict: &'static str,
+    pub(super) proof: &'static str,
+    pub(super) reason: Option<&'static str>,
+}
+
+impl SwitchCoverageValue {
+    pub(super) fn file(&self) -> &ProjectFile {
+        &self.file
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct DetachedTaskTransferValue {
+    pub(super) file: ProjectFile,
+    pub(super) range: Range,
+    pub(super) ast_id: Option<String>,
+    pub(super) id: String,
+    pub(super) procedure_id: String,
+    pub(super) call_id: String,
+    pub(super) call_point_id: String,
+    pub(super) role: &'static str,
+    pub(super) ordinal: Option<u32>,
+    pub(super) value_id: String,
+    pub(super) object_id: Option<String>,
+    pub(super) object_cardinality: Option<&'static str>,
+    pub(super) timing: &'static str,
+    pub(super) proof: &'static str,
+    pub(super) coverage: &'static str,
+    pub(super) reason: Option<&'static str>,
+}
+
+impl DetachedTaskTransferValue {
+    pub(super) fn file(&self) -> &ProjectFile {
+        &self.file
     }
 }
 
@@ -303,6 +384,8 @@ pub(super) struct ResultContractUseValue {
     pub(super) acquisition_site_id: String,
     pub(super) acquisition_site_ast_id: String,
     pub(super) operation_point_id: String,
+    operation_point: crate::analyzer::semantic::ProgramPointId,
+    subject_value: crate::analyzer::semantic::ValueId,
     pub(super) operation_site_id: Option<String>,
     pub(super) operation_site_ast_id: Option<String>,
     pub(super) result_ordinal: u32,
@@ -429,6 +512,7 @@ enum ModelAnswer {
         result_contracts: Vec<BoundResultContract>,
         normal_return_refinements: Vec<CompiledNormalReturnRefinement>,
         conditional_result_refinements: Vec<CompiledConditionalResultRefinement>,
+        conditional_indirect_writes: Vec<CompiledConditionalIndirectWrite>,
         preconditions: Option<Vec<CompiledOperationPrecondition>>,
     },
     Conflict,
@@ -454,6 +538,7 @@ pub(super) struct EffectTraversalCache {
     modeled_call_targets: Option<ModeledCallTargetWindow>,
     conditional_wrapper_answers: HashMap<CodeUnit, ConditionalProcedureSummaryAnswer>,
     conditional_wrapper_visiting: HashSet<CodeUnit>,
+    result_contract_incomplete_diagnostics: HashSet<(ProjectFile, &'static str)>,
     /// Whether any derived row so far was not exhaustive, so the query's own
     /// completion can record the incompleteness once.
     pub(super) incomplete: bool,
@@ -1485,7 +1570,8 @@ impl EffectTraversalCache {
                             continue;
                         }
                         let Some((owner, member)) =
-                            crate::analyzer::semantic::split_qualified_member(
+                            crate::analyzer::semantic::authored_procedure_target_identity(
+                                &summary.target.path,
                                 &summary.target.symbol,
                             )
                         else {
@@ -1494,7 +1580,7 @@ impl EffectTraversalCache {
                         let language = shard.manifest.language.clone();
                         let name = ModeledProcedureName {
                             language: language.clone(),
-                            owner: owner.to_owned(),
+                            owner: owner.into_owned(),
                             member: member.to_owned(),
                             has_receiver: summary.target.has_receiver,
                         };
@@ -1828,6 +1914,7 @@ fn lookup_declared_effects(
                 .collect();
             let normal_return_refinements = selected.normal_return_refinements().to_vec();
             let conditional_result_refinements = selected.conditional_result_refinements().to_vec();
+            let conditional_indirect_writes = selected.conditional_indirect_writes().to_vec();
             let preconditions = selected
                 .preconditions()
                 .map(|preconditions| preconditions.to_vec());
@@ -1838,6 +1925,7 @@ fn lookup_declared_effects(
                 result_contracts,
                 normal_return_refinements,
                 conditional_result_refinements,
+                conditional_indirect_writes,
                 preconditions,
             }
         }
@@ -1884,29 +1972,29 @@ pub(super) fn call_effect_expansions(
     let DispatchedArms {
         status,
         arms,
-        callees,
-        // The direct rows of one call site name their callee by the arm's own
-        // target identity; an external leaf exists only for the transitive
-        // walk below, which is the only consumer that needs a graph node.
-        external_callees: _,
+        call_contexts: _,
     } = dispatch_arms(analyzer, semantic, cache, &outcome.file, outcome.range);
+    let report_arms = arms
+        .iter()
+        .map(|arm| arm.effect.clone())
+        .collect::<Vec<_>>();
     let report = Arc::new(call_effect_report(
         &outcome.file,
         &outcome.site_id,
         &outcome.site_ast_id,
         outcome.range,
         status,
-        &arms,
+        &report_arms,
     ));
     let rendered_callees = Arc::new(
-        callees
-            .into_iter()
-            .filter_map(|(target_id, unit)| {
+        arms.into_iter()
+            .filter_map(|arm| {
+                let unit = arm.callee?;
                 let range = analyzer
                     .ranges_of(&unit)
                     .into_iter()
                     .min_by_key(primary_range_key)?;
-                Some((target_id, DeclarationValue::new(unit, range)))
+                Some((arm.effect.target_id, DeclarationValue::new(unit, range)))
             })
             .collect::<BTreeMap<_, _>>(),
     );
@@ -2490,6 +2578,8 @@ pub(super) fn result_contract_operation_use_expansions(
                     acquisition_site_id: value.site_id.clone(),
                     acquisition_site_ast_id: value.site_ast_id.clone(),
                     operation_point_id: observed.point_id.to_string(),
+                    operation_point: observed.guard_point,
+                    subject_value: observed.subject_value,
                     operation_site_id: observed.operation_site_id,
                     operation_site_ast_id: observed.operation_site_ast_id,
                     result_ordinal: contract.result_ordinal,
@@ -2508,6 +2598,626 @@ pub(super) fn result_contract_operation_use_expansions(
                     pack_id: value.pack_id.clone(),
                     model_id: value.model_id.clone(),
                     summary_id: value.summary_id.clone(),
+                },
+            )))
+        })
+        .collect()
+}
+
+#[derive(Debug, Clone, Copy)]
+struct NilnessOperationCandidate {
+    point: crate::analyzer::semantic::ProgramPointId,
+    subject: crate::analyzer::semantic::ValueId,
+    use_kind: ResultContractUseKind,
+    range: Range,
+    fact: Option<brokk_bifrost_flow::scalar_state::ScalarFact>,
+    origin: &'static str,
+}
+
+fn complete_modeled_call_facts(
+    analyzer: &dyn IAnalyzer,
+    cache: &mut EffectTraversalCache,
+    shape: &crate::analyzer::usages::call_shape::CallShapeReport,
+) -> Option<(
+    Vec<CompiledConditionalIndirectWrite>,
+    Option<Vec<CompiledOperationPrecondition>>,
+)> {
+    let answer = cache
+        .modeled_call_targets
+        .as_ref()
+        .filter(|window| window.file == shape.outcome.file)?
+        .lookups
+        .get(&shape.outcome.site_id)?
+        .clone();
+    if answer.coverage != ModeledCallTargetCoverage::Exhaustive
+        || !answer.adjudicable_workspace_names.is_empty()
+        || answer.arms.is_empty()
+    {
+        return None;
+    }
+    let mut common_writes = None::<Vec<CompiledConditionalIndirectWrite>>;
+    let mut common_preconditions = None::<Vec<CompiledOperationPrecondition>>;
+    let mut preconditions_reviewed = true;
+    for arm in &answer.arms {
+        let ModelAnswer::Modeled {
+            complete: true,
+            conditional_indirect_writes,
+            preconditions,
+            ..
+        } = cache.answer_for(analyzer, &arm.key)
+        else {
+            return None;
+        };
+        match &mut common_writes {
+            None => common_writes = Some(conditional_indirect_writes),
+            Some(common) => common.retain(|write| conditional_indirect_writes.contains(write)),
+        }
+        match (
+            preconditions_reviewed,
+            preconditions,
+            &mut common_preconditions,
+        ) {
+            (true, Some(preconditions), None) => common_preconditions = Some(preconditions),
+            (true, Some(preconditions), Some(common)) => {
+                common.retain(|precondition| preconditions.contains(precondition));
+            }
+            (_, None, _) => preconditions_reviewed = false,
+            (false, Some(_), _) => {}
+        }
+    }
+    Some((
+        common_writes.unwrap_or_default(),
+        preconditions_reviewed.then(|| common_preconditions.unwrap_or_default()),
+    ))
+}
+
+fn receiver_requires_non_null(preconditions: Option<&[CompiledOperationPrecondition]>) -> bool {
+    let Some(preconditions) = preconditions else {
+        return false;
+    };
+    let receiver = preconditions
+        .iter()
+        .filter(|precondition| matches!(precondition.input, CompiledSummaryInput::Receiver {}))
+        .collect::<Vec<_>>();
+    matches!(
+        receiver.as_slice(),
+        [precondition] if precondition.predicate == CompiledResultPredicate::NonNull
+    )
+}
+
+fn modeled_call_proves_normal_continuation_absent(
+    analyzer: &dyn IAnalyzer,
+    cache: &mut EffectTraversalCache,
+    shape: &crate::analyzer::usages::call_shape::CallShapeReport,
+) -> bool {
+    let Some(lookup) = cache
+        .modeled_call_targets
+        .as_ref()
+        .filter(|window| window.file == shape.outcome.file)
+        .and_then(|window| window.lookups.get(&shape.outcome.site_id))
+        .cloned()
+    else {
+        return false;
+    };
+    if lookup.coverage != ModeledCallTargetCoverage::Exhaustive
+        || !lookup.adjudicable_workspace_names.is_empty()
+        || lookup.arms.is_empty()
+    {
+        return false;
+    }
+    let Some(models) = cache.models(analyzer) else {
+        return false;
+    };
+    lookup.arms.iter().all(|arm| {
+        models.proves_normal_continuation_absent(
+            crate::analyzer::semantic_model::ProcedureSummaryMemberKey::new(
+                &arm.key.language,
+                &arm.key.owner,
+                &arm.key.member,
+                arm.key.has_receiver,
+                arm.key.parameter_count,
+            ),
+        )
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn nilness_operation_expansions(
+    analyzer: &dyn IAnalyzer,
+    workspace: &WorkspaceAnalyzer,
+    semantic: &mut SemanticQueryContext<'_>,
+    cache: &mut EffectTraversalCache,
+    flow_state_cache: &mut FlowStateTraversalCache,
+    limits: CodeQueryExecutionLimits,
+    cancellation: Option<&CancellationToken>,
+    diagnostics: &mut Vec<CodeQueryDiagnostic>,
+    procedure: &SemanticProcedureValue,
+    facts: Option<&FileFacts>,
+) -> Vec<PipelineExpansion> {
+    use brokk_bifrost_flow::scalar_state::{
+        ScalarCallEffects, ScalarEdgeWrite, ScalarFact, ScalarStateDerivation,
+        unique_binding_origin,
+    };
+
+    let semantics = procedure.handle.semantics();
+    if semantics.locator().language()
+        != crate::analyzer::LanguageDialect::Standard(crate::analyzer::Language::Go)
+    {
+        return Vec::new();
+    }
+    let file = procedure.file();
+    let shapes = cache.result_member_call_shapes(semantic, file, facts);
+    if let Some(shapes) = shapes.as_deref() {
+        prepare_result_operation_call_lookups(analyzer, cache, limits, cancellation, file, shapes);
+    }
+    let shape_for_call = |call: &crate::analyzer::semantic::SemanticCallSite| {
+        exact_semantic_call_range(semantics, call)
+            .and_then(|range| shapes.as_deref()?.get(&range)?.as_ref())
+    };
+    let mut modeled_address_calls = Vec::new();
+    let mut edge_writes = Vec::new();
+    let mut infeasible_edges = Vec::new();
+    let mut candidates = Vec::new();
+    for call in semantics.call_sites() {
+        let Some(shape) = shape_for_call(call) else {
+            continue;
+        };
+        if modeled_call_proves_normal_continuation_absent(analyzer, cache, shape)
+            && let Some(normal) = call.normal_continuation.target()
+        {
+            let normal_edges = semantics
+                .successor_edges(call.point)
+                .filter_map(|(edge, control)| (control.target_point == normal).then_some(edge))
+                .collect::<Vec<_>>();
+            debug_assert!(
+                !normal_edges.is_empty(),
+                "a retained normal call continuation has at least one CFG edge"
+            );
+            infeasible_edges.extend(normal_edges);
+        }
+        let Some((conditional_writes, preconditions)) =
+            complete_modeled_call_facts(analyzer, cache, shape)
+        else {
+            continue;
+        };
+        modeled_address_calls.push(call.id);
+        for write in conditional_writes {
+            if write.target != CompiledIndirectWriteTarget::Pointee {
+                continue;
+            }
+            let Some(argument) = call.arguments.get(write.parameter_ordinal as usize) else {
+                continue;
+            };
+            let Some(target) = unique_binding_origin(&procedure.handle, argument.value) else {
+                continue;
+            };
+            let Some(result) = call.normal_result(write.result_ordinal as usize) else {
+                continue;
+            };
+            let Some((true_edge, false_edge)) =
+                direct_opaque_guard_edges(&procedure.handle, result)
+            else {
+                continue;
+            };
+            edge_writes.push(ScalarEdgeWrite {
+                edge: if write.outcome {
+                    true_edge.id()
+                } else {
+                    false_edge.id()
+                },
+                target,
+                fact: ScalarFact::Unknown,
+            });
+        }
+        let Some(receiver) = call.receiver else {
+            continue;
+        };
+        if !receiver_requires_non_null(preconditions.as_deref())
+            || shape.outcome.coverage != CallShapeCoverage::Exact
+            || shape.outcome.call_kind != CallKind::Method
+        {
+            continue;
+        }
+        let Some(range) = shape.outcome.receiver_range else {
+            continue;
+        };
+        candidates.push(NilnessOperationCandidate {
+            point: call.point,
+            subject: receiver,
+            use_kind: ResultContractUseKind::ReceiverCall,
+            range,
+            fact: None,
+            origin: "scalar_refinement",
+        });
+    }
+    modeled_address_calls.sort_unstable();
+    modeled_address_calls.dedup();
+    edge_writes.sort_unstable_by_key(|write| (write.edge, write.target));
+    edge_writes.dedup();
+    infeasible_edges.sort_unstable();
+    infeasible_edges.dedup();
+    let scalar = ScalarStateDerivation::derive_with_call_effects(
+        &procedure.handle,
+        ScalarCallEffects {
+            modeled_address_calls: &modeled_address_calls,
+            edge_writes: &edge_writes,
+            infeasible_edges: &infeasible_edges,
+        },
+    );
+    let procedure_id = procedure.wire_id();
+    for point in semantics.points() {
+        for event in &point.events {
+            let (subject, use_kind) = match event.effect {
+                SemanticEffect::ValueUse {
+                    kind: ValueUseKind::Dereference,
+                    value,
+                } => (value, ResultContractUseKind::Dereference),
+                SemanticEffect::MemoryLoad {
+                    kind: MemoryAccessKind::Field,
+                    location,
+                    result,
+                } => {
+                    if semantics
+                        .call_sites()
+                        .iter()
+                        .any(|call| call.callee == result)
+                    {
+                        continue;
+                    }
+                    let Some(crate::analyzer::semantic::MemoryLocation {
+                        kind: MemoryLocationKind::Field { base, .. },
+                        ..
+                    }) = semantics.memory_location(location)
+                    else {
+                        continue;
+                    };
+                    (*base, ResultContractUseKind::Field)
+                }
+                SemanticEffect::MemoryStore {
+                    kind: MemoryAccessKind::Field,
+                    location,
+                    ..
+                } => {
+                    let Some(crate::analyzer::semantic::MemoryLocation {
+                        kind: MemoryLocationKind::Field { base, .. },
+                        ..
+                    }) = semantics.memory_location(location)
+                    else {
+                        continue;
+                    };
+                    (*base, ResultContractUseKind::Field)
+                }
+                _ => continue,
+            };
+            let Some(mapping) = semantics.source_mapping(event.source) else {
+                continue;
+            };
+            let span = mapping.locator.anchor().span();
+            let range = Range {
+                start_byte: span.start_byte() as usize,
+                end_byte: span.end_byte() as usize,
+                start_line: span.start().line() as usize + 1,
+                end_line: span.end().line() as usize + 1,
+            };
+            candidates.push(NilnessOperationCandidate {
+                point: point.id,
+                subject,
+                use_kind,
+                range,
+                fact: None,
+                origin: "scalar_refinement",
+            });
+        }
+    }
+
+    // Compose reviewed result/error contracts into the same scalar relation.
+    // This reuses the contract validator instead of teaching nilness a second
+    // interpretation of result provenance or success guards.
+    let contract_shapes = semantics
+        .call_sites()
+        .iter()
+        .filter_map(shape_for_call)
+        .filter(|shape| shape.outcome.coverage == CallShapeCoverage::Exact)
+        .map(|shape| CallShapeValue {
+            report: Arc::new(shape.clone()),
+        })
+        .collect::<Vec<_>>();
+    for shape in contract_shapes {
+        if result_contract_call_expansions(analyzer, cache, diagnostics, &shape).is_empty() {
+            continue;
+        }
+        for contract in call_result_contract_expansions(
+            analyzer,
+            workspace,
+            semantic,
+            cache,
+            flow_state_cache,
+            cancellation,
+            diagnostics,
+            &shape,
+        ) {
+            let PipelineValue::CallResultContract(contract) = contract.value else {
+                unreachable!("result-contract expansion returned another row kind");
+            };
+            for operation in result_contract_operation_use_expansions(
+                analyzer,
+                workspace,
+                semantic,
+                cache,
+                flow_state_cache,
+                limits,
+                cancellation,
+                diagnostics,
+                &contract,
+            ) {
+                let PipelineValue::ResultContractUse(operation) = operation.value else {
+                    unreachable!("result-contract-use expansion returned another row kind");
+                };
+                if operation.applicability != OperationApplicability::Required
+                    || operation.required_predicate != Some(CompiledResultPredicate::NonNull)
+                    || operation.guard != ResultUseGuardVerdict::Unguarded
+                    || operation.coverage != EffectCoverage::Exhaustive
+                    || procedure
+                        .handle
+                        .point_handle(operation.operation_point)
+                        .is_none()
+                {
+                    continue;
+                }
+                candidates.push(NilnessOperationCandidate {
+                    point: operation.operation_point,
+                    subject: operation.subject_value,
+                    use_kind: operation.use_kind,
+                    range: operation.range,
+                    fact: Some(ScalarFact::MaybeNil),
+                    origin: "result_contract",
+                });
+            }
+        }
+    }
+
+    let mut candidates = candidates
+        .into_iter()
+        .map(|candidate| {
+            let fact = candidate
+                .fact
+                .unwrap_or_else(|| scalar.fact_at(candidate.point, candidate.subject));
+            (candidate, fact)
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_unstable_by_key(|(candidate, fact)| {
+        let exact = !matches!(fact, ScalarFact::Unknown | ScalarFact::Unreachable);
+        let priority = match (exact, candidate.origin) {
+            (true, "scalar_refinement") => 3,
+            (true, _) => 2,
+            (false, "scalar_refinement") => 1,
+            (false, _) => 0,
+        };
+        (
+            candidate.point,
+            candidate.subject,
+            candidate.use_kind.label(),
+            std::cmp::Reverse(priority),
+        )
+    });
+    candidates.dedup_by(|(left, _), (right, _)| {
+        left.point == right.point
+            && left.subject == right.subject
+            && left.use_kind == right.use_kind
+    });
+
+    let mut rows = Vec::with_capacity(candidates.len());
+    for (candidate, fact) in candidates {
+        let point_handle = procedure
+            .handle
+            .point_handle(candidate.point)
+            .expect("validated nilness operation point resolves");
+        let operation_point_id = super::semantic::program_point_wire_id(&point_handle);
+        let mut digest = LengthDelimitedDigest::new(NILNESS_OPERATION_ID_DOMAIN);
+        digest.push(procedure_id.as_bytes());
+        digest.push(operation_point_id.as_bytes());
+        digest.push(&candidate.subject.get().to_le_bytes());
+        digest.push(candidate.use_kind.label().as_bytes());
+        let exact = !matches!(fact, ScalarFact::Unknown | ScalarFact::Unreachable);
+        rows.push(pipeline_expansion(PipelineValue::NilnessOperation(
+            Box::new(NilnessOperationValue {
+                file: procedure.file().clone(),
+                range: candidate.range,
+                ast_id: None,
+                id: digest.finish().to_string(),
+                procedure_id: procedure_id.clone(),
+                operation_point_id,
+                subject_value_id: candidate.subject.get().into(),
+                use_kind: candidate.use_kind,
+                fact,
+                origin: candidate.origin,
+                proof: if exact { "exact" } else { "unknown" },
+                coverage: if exact {
+                    EffectCoverage::Exhaustive
+                } else {
+                    EffectCoverage::Open
+                },
+                reason: (!exact).then_some("scalar_fact_unknown"),
+            }),
+        )));
+    }
+    rows
+}
+
+/// One typed coverage row for every structured switch fact emitted by the
+/// language adapter. Closed boolean domains are the only non-default case set
+/// that can prove exhaustiveness; open and type-switch domains stay explicit
+/// unknowns instead of being guessed from source spelling.
+pub(super) fn switch_coverage_expansions(
+    procedure: &SemanticProcedureValue,
+) -> Vec<PipelineExpansion> {
+    use crate::analyzer::semantic::{SwitchFactKind, SwitchSelectorDomain};
+
+    let semantics = procedure.handle.semantics();
+    let procedure_id = procedure.wire_id();
+    semantics
+        .switch_facts()
+        .iter()
+        .map(|fact| {
+            let mut has_true_case = false;
+            let mut has_false_case = false;
+            let boolean_cases_exact = fact.cases.iter().all(|case| {
+                match semantics.value(case.value).map(|value| &value.kind) {
+                    Some(SemanticValueKind::Boolean(true)) => {
+                        has_true_case = true;
+                        true
+                    }
+                    Some(SemanticValueKind::Boolean(false)) => {
+                        has_false_case = true;
+                        true
+                    }
+                    _ => false,
+                }
+            });
+            let (verdict, proof, reason) = match fact.kind {
+                SwitchFactKind::Type => ("unknown", "unknown", Some("type_switch")),
+                _ if fact.default_present => ("exhaustive", "exact", None),
+                SwitchFactKind::Expression
+                    if fact.selector_domain == SwitchSelectorDomain::Boolean
+                        && boolean_cases_exact =>
+                {
+                    if has_true_case && has_false_case {
+                        ("exhaustive", "exact", None)
+                    } else {
+                        ("non_exhaustive", "exact", Some("boolean_case_missing"))
+                    }
+                }
+                SwitchFactKind::Expression
+                    if fact.selector_domain == SwitchSelectorDomain::Boolean =>
+                {
+                    ("unknown", "unknown", Some("case_domain_open"))
+                }
+                SwitchFactKind::Expression => ("unknown", "unknown", Some("selector_domain_open")),
+                SwitchFactKind::Expressionless => {
+                    ("unknown", "unknown", Some("expressionless_without_default"))
+                }
+            };
+            let mapping = semantics
+                .source_mapping(fact.source)
+                .expect("validated switch fact source mapping resolves");
+            let span = mapping.locator.anchor().span();
+            let range = Range {
+                start_byte: span.start_byte() as usize,
+                end_byte: span.end_byte() as usize,
+                start_line: span.start().line() as usize + 1,
+                end_line: span.end().line() as usize + 1,
+            };
+            let mut digest = LengthDelimitedDigest::new(SWITCH_COVERAGE_ID_DOMAIN);
+            digest.push(procedure_id.as_bytes());
+            digest.push(&fact.id.get().to_le_bytes());
+            pipeline_expansion(PipelineValue::SwitchCoverage(Box::new(
+                SwitchCoverageValue {
+                    file: procedure.file().clone(),
+                    range,
+                    ast_id: mapping.ast_identity.map(|identity| {
+                        super::super::occurrence_rows::ast_id(
+                            identity.content(),
+                            identity.node_id(),
+                        )
+                    }),
+                    id: digest.finish().to_string(),
+                    procedure_id: procedure_id.clone(),
+                    switch_fact_id: fact.id.get(),
+                    kind: fact.kind.label(),
+                    selector_value_id: fact.selector.map(|id| u64::from(id.get())),
+                    selector_domain: fact.selector_domain.label(),
+                    case_count: fact.cases.len(),
+                    has_true_case,
+                    has_false_case,
+                    default_present: fact.default_present,
+                    verdict,
+                    proof,
+                    reason,
+                },
+            )))
+        })
+        .collect()
+}
+
+pub(super) fn detached_task_transfer_expansions(
+    semantic: &mut super::semantic::SemanticQueryContext<'_>,
+    procedure: &SemanticProcedureValue,
+) -> Vec<PipelineExpansion> {
+    let semantics = procedure.handle.semantics();
+    let procedure_id = procedure.wire_id();
+    brokk_bifrost_flow::detached_task::detached_task_transfers(semantics)
+        .into_iter()
+        .map(|transfer| {
+            let call = procedure
+                .handle
+                .call_site_handle(transfer.call_site)
+                .expect("validated detached transfer call resolves");
+            let point = procedure
+                .handle
+                .point_handle(transfer.point)
+                .expect("validated detached transfer point resolves");
+            let observation_point = procedure
+                .handle
+                .point_handle(transfer.observation_point)
+                .expect("validated detached transfer observation point resolves");
+            let value = procedure
+                .handle
+                .value_handle(transfer.value)
+                .expect("validated detached transfer value resolves");
+            let mapping = semantics
+                .value(transfer.value)
+                .and_then(|value| semantics.source_mapping(value.source))
+                .expect("validated detached transfer value has a source mapping");
+            let span = mapping.locator.anchor().span();
+            let range = Range {
+                start_byte: span.start_byte() as usize,
+                end_byte: span.end_byte() as usize,
+                start_line: span.start().line() as usize + 1,
+                end_line: span.end().line() as usize + 1,
+            };
+            let value_id = super::semantic::semantic_value_wire_id(&value);
+            let call_id = super::semantic::call_site_wire_id(&call);
+            let call_point_id = super::semantic::program_point_wire_id(&point);
+            let object = semantic.exact_object_identity(value, observation_point);
+            let (object_id, object_cardinality, proof, coverage, reason) = match object {
+                Ok(object) => (
+                    Some(object.id),
+                    Some(object.cardinality),
+                    "exact",
+                    "exhaustive",
+                    None,
+                ),
+                Err(reason) => (None, None, "unknown", "open", Some(reason)),
+            };
+            let mut digest = LengthDelimitedDigest::new(DETACHED_TASK_TRANSFER_ID_DOMAIN);
+            digest.push(procedure_id.as_bytes());
+            digest.push(call_id.as_bytes());
+            digest.push(transfer.role.label().as_bytes());
+            digest.push(&transfer.ordinal.unwrap_or(u32::MAX).to_le_bytes());
+            digest.push(value_id.as_bytes());
+            pipeline_expansion(PipelineValue::DetachedTaskTransfer(Box::new(
+                DetachedTaskTransferValue {
+                    file: procedure.file().clone(),
+                    range,
+                    ast_id: mapping.ast_identity.map(|identity| {
+                        super::super::occurrence_rows::ast_id(
+                            identity.content(),
+                            identity.node_id(),
+                        )
+                    }),
+                    id: digest.finish().to_string(),
+                    procedure_id: procedure_id.clone(),
+                    call_id,
+                    call_point_id,
+                    role: transfer.role.label(),
+                    ordinal: transfer.ordinal,
+                    value_id,
+                    object_id,
+                    object_cardinality,
+                    timing: "different_task",
+                    proof,
+                    coverage,
+                    reason,
                 },
             )))
         })
@@ -4152,10 +4862,7 @@ fn result_success_guard_subject(
     let control_identity_open = edges.len() != identity_retained_edge_count;
     let withheld_positive_edge = !uncertain_edges.is_empty()
         || ((binding_identity_open || control_identity_open) && retained_edge_count != 0);
-    let failure_predicate = match predicate {
-        CompiledResultPredicate::Null => CompiledResultPredicate::NonNull,
-        CompiledResultPredicate::NonNull => CompiledResultPredicate::Null,
-    };
+    let failure_predicate = opposite_result_predicate(predicate);
     let failure_edges =
         normalized_success_guard_edges(procedure, &closed_read_values, failure_predicate);
     ResultSuccessGuardSubject {
@@ -4698,6 +5405,8 @@ struct ObservedResultUse {
     ast_id: Option<String>,
     /// Point at which the operation's reviewed precondition must hold.
     guard_point: crate::analyzer::semantic::ProgramPointId,
+    /// Exact semantic value on which this operation imposes its precondition.
+    subject_value: crate::analyzer::semantic::ValueId,
     /// Conservative witness from which this operation must occur before any
     /// later guard frontier. An exact zero-argument receiver read qualifies
     /// because no intervening user expression can establish the predicate.
@@ -4842,6 +5551,7 @@ fn intrinsic_result_uses_for_reads(
                 range: intrinsic.range,
                 ast_id: None,
                 guard_point: intrinsic.point,
+                subject_value: value,
                 ordering_point: Some(intrinsic.point),
                 target_call: None,
                 own_subject_read_event,
@@ -4940,6 +5650,9 @@ fn result_member_use_for_call(
             (None, None) => fallback_site.ast_id.clone(),
         },
         guard_point: call.point,
+        subject_value: call
+            .receiver
+            .expect("receiver result uses retain an exact semantic receiver"),
         ordering_point: Some(call.point),
         target_call: Some(call.id),
         own_subject_read_event: None,
@@ -5006,6 +5719,7 @@ fn result_call_argument_use_for_call(
         range: structural_argument.map_or(indexed.range, |argument| argument.range),
         ast_id: None,
         guard_point: call.point,
+        subject_value: call.arguments[indexed.argument_ordinal as usize].value,
         ordering_point: exact_read.map(|read| read.point),
         target_call: Some(call.id),
         own_subject_read_event: exact_read.map(|read| read.event),
@@ -5107,6 +5821,30 @@ fn captured_callable_invocation_enumeration_is_open(
     })
 }
 
+fn capture_observes_result_binding(
+    semantics: &crate::analyzer::semantic::ProcedureSemantics,
+    captured: CaptureSource,
+    mode: &CaptureMode,
+    binding_subjects: &HashSet<crate::analyzer::semantic::ValueId>,
+    storage_locations: &HashSet<crate::analyzer::semantic::MemoryLocationId>,
+) -> bool {
+    match captured {
+        CaptureSource::Value(value) => {
+            matches!(mode, CaptureMode::Value | CaptureMode::Move)
+                && binding_subjects.contains(&value)
+        }
+        CaptureSource::Location(location) => {
+            matches!(mode, CaptureMode::SharedCell | CaptureMode::MutableCell)
+                && (storage_locations.contains(&location)
+                    || semantics.memory_location(location).is_some_and(|location| {
+                        binding_subjects
+                            .iter()
+                            .any(|subject| location.kind.uses_value(*subject))
+                    }))
+        }
+    }
+}
+
 fn normalized_success_guard_edges(
     procedure: &crate::analyzer::semantic::ProcedureHandle,
     condition_read_values: &HashSet<crate::analyzer::semantic::ValueId>,
@@ -5122,14 +5860,32 @@ fn normalized_success_guard_edges(
                 .is_some_and(|value| condition_read_values.contains(&value))
         })
         .filter_map(|guard| {
-            let GuardPredicate::NullComparison { null_on_true } = guard.predicate else {
-                return None;
-            };
-            let wants_null = predicate == CompiledResultPredicate::Null;
-            let take_true = if wants_null {
-                null_on_true
-            } else {
-                !null_on_true
+            let take_true = match (predicate, guard.predicate) {
+                (
+                    CompiledResultPredicate::Null,
+                    GuardPredicate::NullComparison { null_on_true },
+                ) => null_on_true,
+                (
+                    CompiledResultPredicate::NonNull,
+                    GuardPredicate::NullComparison { null_on_true },
+                ) => !null_on_true,
+                // An opaque predicate whose subject is the condition value is
+                // still an exact direct Boolean decision: the typed control
+                // edges retain which successor observes true and false. More
+                // complex expressions name their own temporary value and do
+                // not join the reviewed result identity above.
+                (CompiledResultPredicate::True, GuardPredicate::Opaque { .. }) => true,
+                (CompiledResultPredicate::False, GuardPredicate::Opaque { .. }) => false,
+                (
+                    CompiledResultPredicate::Null
+                    | CompiledResultPredicate::NonNull
+                    | CompiledResultPredicate::True
+                    | CompiledResultPredicate::False,
+                    GuardPredicate::ConstantBoolean { .. }
+                    | GuardPredicate::ConstantEquality { .. }
+                    | GuardPredicate::NullComparison { .. }
+                    | GuardPredicate::Opaque { .. },
+                ) => return None,
             };
             let edge = if take_true {
                 guard.true_edge
@@ -5142,6 +5898,15 @@ fn normalized_success_guard_edges(
     edges.sort_unstable_by_key(|edge| edge.id());
     edges.dedup_by_key(|edge| edge.id());
     edges
+}
+
+const fn opposite_result_predicate(predicate: CompiledResultPredicate) -> CompiledResultPredicate {
+    match predicate {
+        CompiledResultPredicate::Null => CompiledResultPredicate::NonNull,
+        CompiledResultPredicate::NonNull => CompiledResultPredicate::Null,
+        CompiledResultPredicate::True => CompiledResultPredicate::False,
+        CompiledResultPredicate::False => CompiledResultPredicate::True,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -5164,6 +5929,9 @@ enum ConditionalResultConsumption {
         false_edge: crate::analyzer::semantic::ControlEdgeHandle,
     },
     ProvenDiscard,
+    DetachedOnly {
+        consumers: Box<[crate::analyzer::semantic::CallSiteId]>,
+    },
     Open,
 }
 
@@ -5171,11 +5939,11 @@ enum ConditionalResultConsumption {
 struct ConditionalPredicateCall {
     call: crate::analyzer::semantic::CallSiteId,
     read_point: crate::analyzer::semantic::ProgramPointId,
-    // A proven-discarded conditional result cannot establish either outcome.
-    // Retain the observed condition consumer as explicitly irrelevant so a
-    // language's partial global guard-fact capability does not turn this exact
-    // negative into the generic "no candidate enumeration" answer.
-    result_discarded: bool,
+    // Whether the modeled condition result cannot control each reviewed use.
+    // A discarded result closes every use. A result consumed only by detached
+    // work closes only those uses reached through the parent's exact linear
+    // continuation before any control or synchronization boundary.
+    caller_control_irrelevant_for_uses: Box<[bool]>,
     positive_edges: Box<[crate::analyzer::semantic::ControlEdgeHandle]>,
     closed_negative_for_uses: Box<[bool]>,
     success_arm_confines_for_uses: Box<[bool]>,
@@ -5458,6 +6226,7 @@ fn exact_conditional_wrapper_shape(
             | SemanticEffect::Allocation { .. }
             | SemanticEffect::MemoryLoad { .. }
             | SemanticEffect::MemoryStore { .. }
+            | SemanticEffect::Synchronization { .. }
             | SemanticEffect::CallableCreation { .. }
             | SemanticEffect::CaptureBind { .. }
             | SemanticEffect::Throw { .. }
@@ -5761,14 +6530,18 @@ fn conditional_result_consumption(
                 && gap_span.end_byte() >= result_span.end_byte()
         })
     };
-    let call_consumes = semantics.call_sites().iter().any(|candidate| {
-        candidate.callee == result
-            || candidate.receiver == Some(result)
-            || candidate
-                .arguments
-                .iter()
-                .any(|argument| argument.value == result)
-    });
+    let call_consumers = semantics
+        .call_sites()
+        .iter()
+        .filter(|candidate| {
+            candidate.callee == result
+                || candidate.receiver == Some(result)
+                || candidate
+                    .arguments
+                    .iter()
+                    .any(|argument| argument.value == result)
+        })
+        .collect::<Vec<_>>();
     let guard_consumes = semantics
         .guard_facts()
         .iter()
@@ -5798,6 +6571,7 @@ fn conditional_result_consumption(
             SemanticEffect::MemoryLoad { location, .. } => semantics
                 .memory_location(*location)
                 .is_some_and(|location| location.kind.uses_value(result)),
+            SemanticEffect::Synchronization { subject, .. } => *subject == result,
             SemanticEffect::CallableCreation { callable, .. }
             | SemanticEffect::CallableReference { callable, .. } => {
                 callable.bound_receiver == Some(result)
@@ -5855,11 +6629,64 @@ fn conditional_result_consumption(
             | SemanticGapSubject::AsyncContinuation { .. } => false,
         }
     });
-    if call_consumes || guard_consumes || capture_consumes || effect_consumes || gap_consumes {
+    if call_consumers
+        .iter()
+        .any(|consumer| consumer.invocation_mode == CallInvocationMode::Ordinary)
+        || guard_consumes
+        || capture_consumes
+        || effect_consumes
+        || gap_consumes
+    {
         ConditionalResultConsumption::Open
+    } else if !call_consumers.is_empty() {
+        ConditionalResultConsumption::DetachedOnly {
+            consumers: call_consumers
+                .into_iter()
+                .map(|consumer| consumer.id)
+                .collect(),
+        }
     } else {
         ConditionalResultConsumption::ProvenDiscard
     }
+}
+
+fn detached_consumers_are_irrelevant_for_uses(
+    procedure: &crate::analyzer::semantic::ProcedureHandle,
+    derivation: &crate::structural::flow_state::FlowStateDerivation,
+    result_establishments: &[crate::analyzer::semantic::ProgramPointId],
+    consumers: &[crate::analyzer::semantic::CallSiteId],
+    use_points: &[Option<crate::analyzer::semantic::ProgramPointId>],
+) -> Box<[bool]> {
+    let mut consumers = consumers.to_vec();
+    consumers.sort_unstable();
+    consumers.dedup();
+    let Some(handles) = consumers
+        .iter()
+        .copied()
+        .map(|consumer| procedure.call_site_handle(consumer))
+        .collect::<Option<Vec<_>>>()
+    else {
+        return vec![false; use_points.len()].into_boxed_slice();
+    };
+    let present = use_points
+        .iter()
+        .enumerate()
+        .filter_map(|(index, point)| point.map(|point| (index, point)))
+        .collect::<Vec<_>>();
+    let points = present.iter().map(|(_, point)| *point).collect::<Vec<_>>();
+    let Some(reached) = derivation.detached_consumers_cannot_gate_result_uses(
+        procedure,
+        result_establishments,
+        &handles,
+        &points,
+    ) else {
+        return vec![false; use_points.len()].into_boxed_slice();
+    };
+    let mut answers = vec![false; use_points.len()];
+    for ((index, _), reached) in present.into_iter().zip(reached) {
+        answers[index] = reached;
+    }
+    answers.into_boxed_slice()
 }
 
 fn conditional_guard_arm(
@@ -5920,6 +6747,7 @@ fn conditional_predicate_calls(
     derivation: &crate::structural::flow_state::FlowStateDerivation,
     result_establishments: &[crate::analyzer::semantic::ProgramPointId],
     use_points: &[crate::analyzer::semantic::ProgramPointId],
+    use_ordering_points: &[Option<crate::analyzer::semantic::ProgramPointId>],
     condition_candidate_success_edges: &[crate::analyzer::semantic::ControlEdgeHandle],
     condition_failure_edges: &[crate::analyzer::semantic::ControlEdgeHandle],
     normal_return_calls: &[CallSiteHandle],
@@ -5954,6 +6782,28 @@ fn conditional_predicate_calls(
                 CallArgumentExpansion::Direct(ArgumentDomain::Positional)
             ) && modelable_condition_values.contains(&argument.value)
         });
+        // Detached completion cannot itself gate the parent, but the child may
+        // communicate back through shared state. Close only uses reached by the
+        // parent's exact linear continuation before any control or
+        // synchronization boundary; every other use remains an open candidate.
+        if call.invocation_mode != CallInvocationMode::Ordinary {
+            candidates.push(ConditionalPredicateCall {
+                call: call.id,
+                read_point: call.point,
+                caller_control_irrelevant_for_uses: detached_consumers_are_irrelevant_for_uses(
+                    procedure,
+                    derivation,
+                    result_establishments,
+                    &[call.id],
+                    use_ordering_points,
+                ),
+                positive_edges: Box::new([]),
+                closed_negative_for_uses: vec![false; use_points.len()].into_boxed_slice(),
+                success_arm_confines_for_uses: vec![false; use_points.len()].into_boxed_slice(),
+                failure_arm_confines_for_uses: vec![false; use_points.len()].into_boxed_slice(),
+            });
+            continue;
+        }
         // An unmodeled consumer reached only through the contract's exact
         // failure arm cannot make that already-failing arm a success proof.
         // A consumer confined to the success arm is already redundant and
@@ -5993,7 +6843,8 @@ fn conditional_predicate_calls(
             candidates.push(ConditionalPredicateCall {
                 call: call.id,
                 read_point: call.point,
-                result_discarded: false,
+                caller_control_irrelevant_for_uses: vec![false; use_points.len()]
+                    .into_boxed_slice(),
                 positive_edges: Box::new([]),
                 closed_negative_for_uses: vec![false; use_points.len()].into_boxed_slice(),
                 success_arm_confines_for_uses,
@@ -6032,15 +6883,43 @@ fn conditional_predicate_calls(
                         )
                     })
                     .collect::<HashMap<_, _>>();
-                if !modeled_results.is_empty()
+                let results_have_no_direct_caller_control = !modeled_results.is_empty()
                     && result_consumptions.values().all(|consumption| {
-                        matches!(consumption, ConditionalResultConsumption::ProvenDiscard)
-                    })
-                {
+                        matches!(
+                            consumption,
+                            ConditionalResultConsumption::ProvenDiscard
+                                | ConditionalResultConsumption::DetachedOnly { .. }
+                        )
+                    });
+                if results_have_no_direct_caller_control {
+                    let detached_consumers = result_consumptions
+                        .values()
+                        .filter_map(|consumption| match consumption {
+                            ConditionalResultConsumption::DetachedOnly { consumers } => {
+                                Some(consumers.as_ref())
+                            }
+                            ConditionalResultConsumption::DirectGuard { .. }
+                            | ConditionalResultConsumption::ProvenDiscard
+                            | ConditionalResultConsumption::Open => None,
+                        })
+                        .flatten()
+                        .copied()
+                        .collect::<Vec<_>>();
+                    let caller_control_irrelevant_for_uses = if detached_consumers.is_empty() {
+                        vec![true; use_points.len()].into_boxed_slice()
+                    } else {
+                        detached_consumers_are_irrelevant_for_uses(
+                            procedure,
+                            derivation,
+                            result_establishments,
+                            &detached_consumers,
+                            use_ordering_points,
+                        )
+                    };
                     candidates.push(ConditionalPredicateCall {
                         call: call.id,
                         read_point: call.point,
-                        result_discarded: true,
+                        caller_control_irrelevant_for_uses,
                         positive_edges: Box::new([]),
                         closed_negative_for_uses: vec![false; use_points.len()].into_boxed_slice(),
                         success_arm_confines_for_uses,
@@ -6105,7 +6984,7 @@ fn conditional_predicate_calls(
         candidates.push(ConditionalPredicateCall {
             call: call.id,
             read_point: call.point,
-            result_discarded: false,
+            caller_control_irrelevant_for_uses: vec![false; use_points.len()].into_boxed_slice(),
             positive_edges,
             closed_negative_for_uses,
             success_arm_confines_for_uses,
@@ -6132,6 +7011,10 @@ fn conditional_predicate_use_answer(
         candidate.success_arm_confines_for_uses.len(),
         candidate.closed_negative_for_uses.len()
     );
+    debug_assert_eq!(
+        candidate.success_arm_confines_for_uses.len(),
+        candidate.caller_control_irrelevant_for_uses.len()
+    );
     debug_assert!(use_index < candidate.success_arm_confines_for_uses.len());
     if let (Some(target_call), Some(candidate_call)) = (
         target_call.and_then(|call| procedure.semantics().call_site(call)),
@@ -6140,7 +7023,7 @@ fn conditional_predicate_use_answer(
     {
         return ConditionalPredicateUseAnswer::Irrelevant;
     }
-    if candidate.result_discarded {
+    if candidate.caller_control_irrelevant_for_uses[use_index] {
         return ConditionalPredicateUseAnswer::Irrelevant;
     }
     let mut positive = false;
@@ -6451,6 +7334,21 @@ fn validate_result_contract_uses(
         .iter()
         .map(|read| read.value)
         .collect::<HashSet<_>>();
+    let mut capture_source_values = result_establishment_values.clone();
+    capture_source_values.insert(result.value);
+    capture_source_values.extend(result_read_values.iter().copied());
+    capture_source_values.extend(converted_result_read_values.iter().copied());
+    let result_storage_locations = semantics
+        .points()
+        .iter()
+        .flat_map(|point| &point.events)
+        .filter_map(|event| match event.effect {
+            SemanticEffect::MemoryStore {
+                location, value, ..
+            } if capture_source_values.contains(&value) => Some(location),
+            _ => None,
+        })
+        .collect::<HashSet<_>>();
     let read_identity = read_identity_closure(result_reads.iter().map(|read| {
         (
             read.event,
@@ -6463,8 +7361,13 @@ fn validate_result_contract_uses(
         )
     }));
     let captured_result_may_be_used = semantics.captures().iter().any(|capture| {
-        matches!(capture.captured, CaptureSource::Value(captured) if capture_binding_subjects.contains(&captured))
-            && matches!(capture.mode, CaptureMode::Value | CaptureMode::Move)
+        capture_observes_result_binding(
+            semantics,
+            capture.captured,
+            &capture.mode,
+            &capture_binding_subjects,
+            &result_storage_locations,
+        )
     });
     let direct_call_argument_may_be_used = result_read_values.iter().any(|value| {
         result_use_index
@@ -6873,12 +7776,13 @@ fn validate_result_contract_uses(
     let mut capture_use_enumeration_open = false;
     let mut capture_file_state = None;
     for capture in semantics.captures() {
-        let CaptureSource::Value(captured) = capture.captured else {
-            continue;
-        };
-        if !capture_binding_subjects.contains(&captured)
-            || !matches!(capture.mode, CaptureMode::Value | CaptureMode::Move)
-        {
+        if !capture_observes_result_binding(
+            semantics,
+            capture.captured,
+            &capture.mode,
+            &capture_binding_subjects,
+            &result_storage_locations,
+        ) {
             continue;
         }
         let Some(child_handle) = procedure.artifact().procedure_handle(capture.target) else {
@@ -6886,7 +7790,7 @@ fn validate_result_contract_uses(
             continue;
         };
         let child = child_handle.semantics();
-        let capture_inputs = child
+        let mut capture_inputs = child
             .points()
             .iter()
             .flat_map(|point| &point.events)
@@ -6899,6 +7803,15 @@ fn validate_result_contract_uses(
                 _ => None,
             })
             .collect::<HashSet<_>>();
+        if let Some(binding) = child
+            .memory_location(capture.destination)
+            .and_then(|location| match location.kind {
+                MemoryLocationKind::Capture { binding, .. } => binding,
+                _ => None,
+            })
+        {
+            capture_inputs.insert(binding);
+        }
         if capture_inputs.is_empty() {
             capture_use_enumeration_open = true;
             continue;
@@ -7345,6 +8258,7 @@ fn validate_result_contract_uses(
             derivation,
             &result_establishment_points,
             &use_guard_points,
+            &use_ordering_points,
             &condition_candidate_success_edges,
             &condition_failure_edges,
             &normal_return_calls,
@@ -7575,6 +8489,12 @@ fn normal_return_refinement_calls(
     let semantics = procedure.semantics();
     let mut candidates = Vec::new();
     for call in semantics.call_sites() {
+        // A detached invocation only establishes that its task was scheduled.
+        // Its callee has not returned on the parent continuation, so a modeled
+        // normal-return refinement cannot guard a later parent operation.
+        if call.invocation_mode != CallInvocationMode::Ordinary {
+            continue;
+        }
         if call.normal_continuation.target().is_none() {
             continue;
         }
@@ -7729,6 +8649,8 @@ pub(super) const fn result_predicate_label(predicate: CompiledResultPredicate) -
     match predicate {
         CompiledResultPredicate::Null => "null",
         CompiledResultPredicate::NonNull => "non_null",
+        CompiledResultPredicate::True => "true",
+        CompiledResultPredicate::False => "false",
     }
 }
 
@@ -7789,6 +8711,12 @@ fn record_result_contract_incomplete(
     }
     cache.incomplete = true;
     cache.truncated |= coverage == EffectCoverage::Truncated;
+    if !cache
+        .result_contract_incomplete_diagnostics
+        .insert((file.clone(), message))
+    {
+        return;
+    }
     diagnostics.push(CodeQueryDiagnostic {
         code: CodeQueryDiagnosticCode::ResultContractDerivationIncomplete,
         impact: CodeQueryDiagnosticImpact::Incomplete,
@@ -7848,15 +8776,18 @@ fn record_coverage(
 /// One call site's dispatch answer, reduced to what both row families need.
 struct DispatchedArms {
     status: CallEffectSiteStatus,
-    arms: Vec<CallEffectArm>,
-    /// The workspace callables the answer named, keyed by the arm's target
-    /// identity so the order is the arms' own.
-    callees: Vec<(String, CodeUnit)>,
-    /// The external members the answer named that an activated summary declares
-    /// effects for, keyed the same way. The workspace holds no declaration for
-    /// these, so the effect graph admits them as leaves rather than walking
-    /// into them.
-    external_callees: Vec<(String, ExternalEffectCallee)>,
+    arms: Vec<DispatchedArm>,
+    call_contexts: Vec<super::dispatch::DispatchCallContext>,
+}
+
+/// One arm plus its exact semantic caller and optional graph target. Keeping
+/// this association intact prevents a nested callable's source-contained call
+/// from becoming an edge of its lexical parent.
+struct DispatchedArm {
+    effect: CallEffectArm,
+    call_context: usize,
+    callee: Option<CodeUnit>,
+    external_callee: Option<ExternalEffectCallee>,
 }
 
 /// One external member an activated summary declares effects for: a leaf of the
@@ -7937,12 +8868,9 @@ fn dispatch_arms(
 ) -> DispatchedArms {
     let answer = cache.dispatch_at_source(semantic, file, range);
     let mut arms = Vec::with_capacity(answer.arms.len());
-    let mut callees = Vec::new();
-    let mut external_callees = Vec::new();
     for arm in &answer.arms {
-        if let Some(unit) = &arm.target_unit {
-            callees.push((arm.target_id.clone(), unit.clone()));
-        }
+        let callee = arm.target_unit.clone();
+        let mut external_callee = None;
         let proof = if arm.proof == "proven" {
             EffectProof::Proven
         } else {
@@ -7984,26 +8912,31 @@ fn dispatch_arms(
                 Some(key) => {
                     let (lookup, leaf) =
                         external_arm_lookup(cache.answer_for(analyzer, &key), &key);
-                    if let Some(leaf) = leaf {
-                        external_callees.push((arm.target_id.clone(), leaf));
-                    }
+                    external_callee = leaf;
                     (Some(key), lookup, None)
                 }
                 None => (None, ArmLookup::Unmodeled { analyzable: false }, None),
             },
         };
-        arms.push(CallEffectArm {
-            target_id: arm.target_id.clone(),
-            callee_declaration_id: declaration_id,
-            key,
-            proof,
-            complete,
-            lookup,
+        arms.push(DispatchedArm {
+            effect: CallEffectArm {
+                target_id: arm.target_id.clone(),
+                callee_declaration_id: declaration_id,
+                key,
+                proof,
+                complete,
+                execution_timing: arm.execution_timing,
+                lookup,
+            },
+            call_context: arm.call_context,
+            callee,
+            external_callee,
         });
     }
-    arms.sort_by(|left, right| left.target_id.cmp(&right.target_id));
-    callees.sort_by(|left, right| left.0.cmp(&right.0));
-    external_callees.sort_by(|left, right| left.0.cmp(&right.0));
+    arms.sort_by(|left, right| {
+        (&left.effect.target_id, left.call_context)
+            .cmp(&(&right.effect.target_id, right.call_context))
+    });
     // The site's coverage is read after the arms are classified: whether an
     // unresolved residual is discharged depends on what the activated packs
     // answered for the arms beside it.
@@ -8024,8 +8957,7 @@ fn dispatch_arms(
     DispatchedArms {
         status,
         arms,
-        callees,
-        external_callees,
+        call_contexts: answer.call_contexts.clone(),
     }
 }
 
@@ -8070,7 +9002,7 @@ fn coverage_for(coverage: crate::analyzer::semantic::CandidateCoverage) -> Effec
 /// address them.
 fn site_coverage(
     answer: &super::dispatch::DispatchSiteAnswer,
-    arms: &[CallEffectArm],
+    arms: &[DispatchedArm],
 ) -> EffectCoverage {
     use crate::analyzer::semantic::CandidateCoverage;
     if answer.coverage != CandidateCoverage::Open || arms.is_empty() {
@@ -8078,7 +9010,9 @@ fn site_coverage(
     }
     let residual_discharged = match answer.unnamed_boundaries.as_slice() {
         [] => true,
-        ["unresolved"] => arms.iter().all(|arm| arm.lookup.is_closed_by_summary()),
+        ["unresolved"] => arms
+            .iter()
+            .all(|arm| arm.effect.lookup.is_closed_by_summary()),
         _ => false,
     };
     if residual_discharged {
@@ -8355,8 +9289,7 @@ fn discover_effect_graph(
             let DispatchedArms {
                 status,
                 arms,
-                callees,
-                external_callees,
+                call_contexts,
             } = dispatch_arms(
                 analyzer,
                 semantic,
@@ -8364,6 +9297,35 @@ fn discover_effect_graph(
                 &shape.outcome.file,
                 shape.outcome.range,
             );
+            let matching_contexts = call_contexts
+                .iter()
+                .enumerate()
+                .filter_map(|(index, context)| {
+                    (context.caller_is_exact && context.caller.as_ref() == Some(&unit))
+                        .then_some(index)
+                })
+                .collect::<HashSet<_>>();
+            let unknown_caller = call_contexts.iter().any(|context| context.caller.is_none());
+            if matching_contexts.is_empty() {
+                if call_contexts.is_empty() || unknown_caller {
+                    graph.procedures[node]
+                        .local_gaps
+                        .push(EffectReason::DispatchUnresolved);
+                }
+                // Every exact context belongs to another semantic procedure:
+                // this is a source-contained call in a nested declaration,
+                // not an edge of the procedure currently being summarized.
+                continue;
+            }
+            if unknown_caller {
+                graph.procedures[node]
+                    .local_gaps
+                    .push(EffectReason::DispatchUnresolved);
+            }
+            let arms = arms
+                .into_iter()
+                .filter(|arm| matching_contexts.contains(&arm.call_context))
+                .collect::<Vec<_>>();
             let site_coverage = match status {
                 CallEffectSiteStatus::Answered { coverage } => coverage,
                 CallEffectSiteStatus::Interrupted { reason } => {
@@ -8376,9 +9338,9 @@ fn discover_effect_graph(
                     .local_gaps
                     .push(EffectReason::DispatchUnresolved);
             }
-            let exact_site = site_coverage.is_exhaustive() && arms.len() == 1;
+            let exact_site = site_coverage.is_exhaustive() && arms.len() == 1 && !unknown_caller;
             for arm in &arms {
-                match &arm.lookup {
+                match &arm.effect.lookup {
                     ArmLookup::Unkeyable => {
                         graph.procedures[node]
                             .local_gaps
@@ -8399,60 +9361,55 @@ fn discover_effect_graph(
                     | ArmLookup::Unmodeled { analyzable: true } => {}
                 }
             }
-            for (_, callee_unit) in callees {
-                let Some(callee) = push_node(&mut graph, &mut index_by_unit, cache, &callee_unit)
-                else {
-                    graph.procedures[node]
-                        .local_gaps
-                        .push(EffectReason::ProcedureBudgetExhausted);
-                    continue;
-                };
+            for arm in arms {
                 let certainty = if exact_site {
                     EffectCertainty::Definite
                 } else {
                     EffectCertainty::Possible
                 };
-                graph.edges.push(EffectGraphEdge {
-                    caller: node,
-                    callee,
-                    site_id: shape.outcome.site_id.clone(),
-                    certainty,
-                });
-                // A callee already queued is already going to be walked at a
-                // depth no greater than this one, so re-queueing it would only
-                // repeat work; the fixpoint below, not this walk, is what
-                // resolves a cycle.
-                if queue.iter().all(|(queued, _)| queued != &callee_unit) {
-                    queue.push((callee_unit.clone(), depth.saturating_add(1)));
+                if let Some(callee_unit) = arm.callee {
+                    let Some(callee) =
+                        push_node(&mut graph, &mut index_by_unit, cache, &callee_unit)
+                    else {
+                        graph.procedures[node]
+                            .local_gaps
+                            .push(EffectReason::ProcedureBudgetExhausted);
+                        continue;
+                    };
+                    graph.edges.push(EffectGraphEdge {
+                        caller: node,
+                        callee,
+                        site_id: shape.outcome.site_id.clone(),
+                        certainty,
+                        execution_timing: arm.effect.execution_timing,
+                    });
+                    // A callee already queued is already going to be walked at
+                    // a depth no greater than this one. The fixpoint below,
+                    // rather than this walk, resolves cycles.
+                    if queue.iter().all(|(queued, _)| queued != &callee_unit) {
+                        queue.push((callee_unit, depth.saturating_add(1)));
+                    }
                 }
-            }
-            // An external member an activated summary declares effects for
-            // joins the graph as a leaf and is never queued: the workspace
-            // holds no body to read, and its own callees are outside the
-            // analyzable tree. The leaf's own basis says whether that costs
-            // coverage. The edge carries the same certainty a workspace edge
-            // from this site would, so a possible dispatch still yields a
-            // possible effect.
-            for (_, external) in external_callees {
-                let Some(callee) =
-                    push_external_node(&mut graph, &mut index_by_external, &external)
-                else {
-                    graph.procedures[node]
-                        .local_gaps
-                        .push(EffectReason::ProcedureBudgetExhausted);
-                    continue;
-                };
-                let certainty = if exact_site {
-                    EffectCertainty::Definite
-                } else {
-                    EffectCertainty::Possible
-                };
-                graph.edges.push(EffectGraphEdge {
-                    caller: node,
-                    callee,
-                    site_id: shape.outcome.site_id.clone(),
-                    certainty,
-                });
+                // An external modeled member is a graph leaf: there is no
+                // workspace body to queue, but the exact call timing still
+                // composes with its declared effects.
+                if let Some(external) = arm.external_callee {
+                    let Some(callee) =
+                        push_external_node(&mut graph, &mut index_by_external, &external)
+                    else {
+                        graph.procedures[node]
+                            .local_gaps
+                            .push(EffectReason::ProcedureBudgetExhausted);
+                        continue;
+                    };
+                    graph.edges.push(EffectGraphEdge {
+                        caller: node,
+                        callee,
+                        site_id: shape.outcome.site_id.clone(),
+                        certainty,
+                        execution_timing: arm.effect.execution_timing,
+                    });
+                }
             }
         }
         graph.procedures[node].local_gaps.sort_unstable();
@@ -8460,7 +9417,18 @@ fn discover_effect_graph(
     }
 
     graph.edges.sort_by(|left, right| {
-        (left.caller, left.callee, &left.site_id).cmp(&(right.caller, right.callee, &right.site_id))
+        (
+            left.caller,
+            left.callee,
+            &left.site_id,
+            left.execution_timing,
+        )
+            .cmp(&(
+                right.caller,
+                right.callee,
+                &right.site_id,
+                right.execution_timing,
+            ))
     });
     graph.edges.dedup();
     graph
@@ -8477,6 +9445,77 @@ mod modeled_call_target_window_tests {
     use super::*;
     use crate::analyzer::AnalyzerConfig;
     use crate::analyzer::semantic::{SemanticBudget, SemanticRequest};
+
+    #[test]
+    fn direct_boolean_result_predicates_select_the_typed_guard_arms() {
+        let project = InlineTestProject::with_language(Language::Go)
+            .file(
+                "main.go",
+                r#"package main
+func observe() {}
+func inspect(ok bool) {
+    if ok { observe() } else { observe() }
+}
+"#,
+            )
+            .build();
+        let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+        let file = project.file("main.go");
+        let cancellation = CancellationToken::default();
+        let mut budget = SemanticBudget::default();
+        let outcome = workspace
+            .materialize_program_semantics(
+                &file,
+                &mut SemanticRequest::new(&mut budget, &cancellation),
+            )
+            .expect("Go artifact materialization");
+        let artifact = outcome
+            .available_value()
+            .expect("Go artifact remains available");
+        let procedure = artifact
+            .procedures()
+            .iter()
+            .find(|procedure| {
+                procedure
+                    .locator()
+                    .declaration()
+                    .segments()
+                    .last()
+                    .and_then(|segment| segment.name())
+                    == Some("inspect")
+            })
+            .and_then(|procedure| artifact.procedure_handle(procedure.id()))
+            .expect("inspect procedure");
+        let [guard] = procedure.semantics().guard_facts() else {
+            panic!("one direct Boolean guard: {:#?}", procedure.semantics());
+        };
+        assert!(matches!(guard.predicate, GuardPredicate::Opaque { .. }));
+        let subject = guard
+            .subject
+            .expect("a direct guard names its Boolean value");
+        let subjects = [subject].into_iter().collect::<HashSet<_>>();
+        let true_edges =
+            normalized_success_guard_edges(&procedure, &subjects, CompiledResultPredicate::True);
+        let false_edges =
+            normalized_success_guard_edges(&procedure, &subjects, CompiledResultPredicate::False);
+
+        assert_eq!(
+            true_edges.iter().map(|edge| edge.id()).collect::<Vec<_>>(),
+            [guard.true_edge.expect("the true arm is retained")]
+        );
+        assert_eq!(
+            false_edges.iter().map(|edge| edge.id()).collect::<Vec<_>>(),
+            [guard.false_edge.expect("the false arm is retained")]
+        );
+        assert_eq!(
+            opposite_result_predicate(CompiledResultPredicate::True),
+            CompiledResultPredicate::False
+        );
+        assert_eq!(
+            opposite_result_predicate(CompiledResultPredicate::False),
+            CompiledResultPredicate::True
+        );
+    }
 
     #[test]
     fn failure_use_identity_includes_the_consumer_call_site() {

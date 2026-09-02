@@ -3182,6 +3182,11 @@ fn csharp_non_constructor_member_candidates(
 /// a target type that resolves to several is ambiguous, and the message names
 /// every candidate with its file, the way `csharp_indexed_candidate_honesty_message`
 /// names what it found while declining to pick.
+///
+/// Which target the owner comes from is decided by
+/// `csharp_object_initializer_owners`, the ladder the inverse usage scan runs
+/// too, so the two directions answer the same construct the same way (#2173).
+/// Only the four index probes below are forward-specific.
 #[allow(clippy::too_many_arguments)]
 fn csharp_object_initializer_label_outcome(
     analyzer: &dyn IAnalyzer,
@@ -3195,92 +3200,126 @@ fn csharp_object_initializer_label_outcome(
 ) -> Option<DefinitionLookupOutcome> {
     let initializer = csharp_object_initializer_for_label(label)?;
     let member = csharp_node_text(label, source);
-    let Some(type_node) = csharp_object_initializer_owner_type_node(initializer) else {
-        if let Some(collection_target) = csharp_object_creation_collection_target(initializer) {
-            let owners = csharp_collection_element_owner_types(
-                analyzer,
-                token,
-                csharp,
-                definitions,
-                file,
-                source,
-                collection_target,
-            );
-            let target_text = csharp_node_text(collection_target, source);
-            return Some(
-                csharp_initializer_member_outcome(
-                    analyzer,
-                    token,
-                    definitions,
-                    owners,
-                    member,
-                    target_text,
-                )
-                .unwrap_or_else(|| {
-                    no_definition(
-                        "unknown_object_initializer_owner",
-                        format!(
-                            "C# object initializer element type could not be inferred from collection target `{target_text}`"
-                        ),
-                    )
-                }),
-            );
-        }
-        // A target-typed `new()` whose target type the tree does not write.
-        // The one such target the index can still prove is an assignment's
-        // left side: it types exactly like a receiver, because the type of
-        // `x` in `x = new() { ... }` is the type of `x` in `x.Member`.
-        let Some(target) = csharp_object_creation_assignment_target(initializer) else {
-            return Some(no_definition(
-                "unknown_object_initializer_owner",
-                "C# object initializer target type could not be inferred",
-            ));
-        };
-        let owners = csharp_receiver_types(
-            analyzer,
-            token,
-            csharp,
-            definitions,
-            file,
-            source,
-            root,
-            target,
-        )
-        .units;
-        let target_text = csharp_node_text(target, source);
-        return Some(
-            csharp_initializer_member_outcome(analyzer, token, definitions, owners, member, target_text)
-                .unwrap_or_else(|| {
-                    no_definition(
-                        "unknown_object_initializer_owner",
-                        format!(
-                            "C# object initializer target type could not be inferred from assignment target `{target_text}`"
-                        ),
-                    )
-                }),
-        );
-    };
-    let type_name = csharp_reference_type_text(type_node, source);
-    let owners = csharp_constructed_type_candidates(
+    let mut lookups = CSharpForwardInitializerOwnerLookups {
         analyzer,
         token,
         csharp,
         definitions,
         file,
-        &type_name,
-        type_node.start_byte(),
-    );
+        source,
+        root,
+    };
+    let Some(resolved) = csharp_object_initializer_owners(initializer, source, &mut lookups) else {
+        return Some(no_definition(
+            "unknown_object_initializer_owner",
+            "C# object initializer target type could not be inferred",
+        ));
+    };
     Some(
-        csharp_initializer_member_outcome(analyzer, token, definitions, owners, member, &type_name)
-            .unwrap_or_else(|| {
-                no_definition(
-                    "unresolved_object_initializer_owner",
-                    format!(
-                        "C# object initializer target type `{type_name}` did not resolve to an indexed C# type"
-                    ),
-                )
-            }),
+        csharp_initializer_member_outcome(
+            analyzer,
+            token,
+            definitions,
+            resolved.owners,
+            member,
+            resolved.target.text(),
+        )
+        .unwrap_or_else(|| match &resolved.target {
+            CSharpInitializerOwnerTarget::WrittenType(type_name) => no_definition(
+                "unresolved_object_initializer_owner",
+                format!(
+                    "C# object initializer target type `{type_name}` did not resolve to an indexed C# type"
+                ),
+            ),
+            CSharpInitializerOwnerTarget::CollectionTarget(target) => no_definition(
+                "unknown_object_initializer_owner",
+                format!(
+                    "C# object initializer element type could not be inferred from collection target `{target}`"
+                ),
+            ),
+            CSharpInitializerOwnerTarget::AssignmentTarget(target) => no_definition(
+                "unknown_object_initializer_owner",
+                format!(
+                    "C# object initializer target type could not be inferred from assignment target `{target}`"
+                ),
+            ),
+            CSharpInitializerOwnerTarget::InitializerMember(member) => no_definition(
+                "unknown_object_initializer_owner",
+                format!(
+                    "C# object initializer target type could not be inferred from initializer member `{member}`"
+                ),
+            ),
+        }),
     )
+}
+
+/// The forward side of the shared object-initializer owner ladder: the same
+/// four probes the inverse scan supplies, reached through the definition
+/// provider's budgeted session instead of the usage index.
+struct CSharpForwardInitializerOwnerLookups<'a, 'tree> {
+    analyzer: &'a dyn IAnalyzer,
+    token: QueryToken<'a>,
+    csharp: &'a CSharpAnalyzer,
+    definitions: &'a CSharpDefinitionProvider<'a>,
+    file: &'a ProjectFile,
+    source: &'a str,
+    root: Node<'tree>,
+}
+
+impl CSharpInitializerOwnerLookups for CSharpForwardInitializerOwnerLookups<'_, '_> {
+    fn written_type_owners(&mut self, reference: &str, type_node: Node<'_>) -> Vec<CodeUnit> {
+        csharp_constructed_type_candidates(
+            self.analyzer,
+            self.token,
+            self.csharp,
+            self.definitions,
+            self.file,
+            reference,
+            type_node.start_byte(),
+        )
+    }
+
+    fn collection_target_owners(&mut self, target: Node<'_>) -> Vec<CodeUnit> {
+        csharp_collection_element_owner_types(
+            self.analyzer,
+            self.token,
+            self.csharp,
+            self.definitions,
+            self.file,
+            self.source,
+            target,
+        )
+    }
+
+    fn expression_owners(&mut self, target: Node<'_>) -> Vec<CodeUnit> {
+        // The type of `x` in `x = new() { ... }` is the type of `x` in
+        // `x.Member`, so an assignment target types exactly like a receiver.
+        csharp_receiver_types(
+            self.analyzer,
+            self.token,
+            self.csharp,
+            self.definitions,
+            self.file,
+            self.source,
+            self.root,
+            target,
+        )
+        .units
+    }
+
+    fn member_type_owners(&mut self, owner: &CodeUnit, member: &str) -> Vec<CodeUnit> {
+        let mut types = CSharpReceiverTypes::default();
+        csharp_collect_member_types(
+            self.csharp,
+            self.token,
+            self.definitions,
+            self.file,
+            owner,
+            member,
+            &mut types,
+        );
+        types.normalized().units
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

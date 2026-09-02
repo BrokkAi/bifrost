@@ -5,6 +5,7 @@
 //! dependency, evaluator, finding, or renderer state.
 
 use std::fmt;
+use std::hash::{Hash, Hasher};
 use std::ops::Range;
 use std::str::FromStr;
 
@@ -75,6 +76,11 @@ pub struct PolicyDefinition {
     pub schema_version: PolicySchemaVersion,
     pub metadata: PolicyMetadata,
     pub analysis: PolicyAnalysis,
+    /// What the policy wants when unknown or incomplete evidence blocked its
+    /// verdict (#2506). Authored inside the analysis record because it is a
+    /// property of the analysis the policy declares, and stored here because
+    /// it applies to every analysis kind.
+    pub on_unknown: OnUnknownSpec,
     pub classification: Option<PolicyClassificationSpec>,
     pub report: PolicyReportOptions,
 }
@@ -248,6 +254,9 @@ pub struct RowSelectorPlan {
 pub struct RowBinding {
     pub name: RowBindingName,
     pub source: RowBindingSource,
+    /// Exact authored record range. Programmatically constructed plans use
+    /// `None`; decoded RQLP always supplies it for load diagnostics.
+    pub source_range: Option<Range<usize>>,
 }
 
 #[derive(Debug, Clone)]
@@ -326,6 +335,8 @@ pub struct RowFilter {
     /// Typed identity/provenance produced when `call_locator` is resolved.
     /// Source ranges and authored spellings are deliberately not retained.
     pub resolved_locators: Vec<ResolvedPolicyLocator>,
+    /// Exact authored filter or typed-shorthand record range.
+    pub source_range: Option<Range<usize>>,
 }
 
 /// One qualified callable/type spelling and its authored source range.
@@ -377,6 +388,8 @@ pub struct RowProjection {
     pub name: RowBindingName,
     pub from: RowBindingName,
     pub columns: Vec<RowProjectionColumn>,
+    /// Exact authored projection record range.
+    pub source_range: Option<Range<usize>>,
 }
 
 /// One projected column: the field it reads, and the field name it publishes
@@ -385,6 +398,8 @@ pub struct RowProjection {
 pub struct RowProjectionColumn {
     pub source: RowFieldRef,
     pub name: String,
+    /// Exact authored column expression range.
+    pub source_range: Option<Range<usize>>,
 }
 
 #[derive(Debug, Clone)]
@@ -393,6 +408,8 @@ pub struct RowJoin {
     pub right: RowBindingName,
     pub kind: RowJoinKind,
     pub on: Vec<RowJoinCondition>,
+    /// Exact authored join record range.
+    pub source_range: Option<Range<usize>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -418,6 +435,8 @@ impl RowJoinKind {
 pub struct RowJoinCondition {
     pub left_field: String,
     pub right_field: String,
+    /// Exact authored equality-pair range.
+    pub source_range: Option<Range<usize>>,
 }
 
 #[derive(Debug, Clone)]
@@ -425,6 +444,8 @@ pub struct RowGroup {
     pub name: RowGroupName,
     pub by: Vec<RowFieldRef>,
     pub aggregates: Vec<RowAggregate>,
+    /// Exact authored group record range.
+    pub source_range: Option<Range<usize>>,
 }
 
 #[derive(Debug, Clone)]
@@ -436,6 +457,8 @@ pub struct RowAggregate {
     /// else. Every other operation folds one column, so it carries `None`.
     pub sequences: Option<RowOrderedSequencePair>,
     pub predicate: Vec<RowPredicate>,
+    /// Exact authored aggregate record range.
+    pub source_range: Option<Range<usize>>,
 }
 
 /// The two ordered sequences an `ordered-equal` aggregate compares.
@@ -493,10 +516,27 @@ impl RowAggregateOp {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone)]
 pub struct RowFieldRef {
     pub binding: RowBindingName,
     pub field: String,
+    /// Exact authored `BINDING.FIELD` range.
+    pub source_range: Option<Range<usize>>,
+}
+
+impl PartialEq for RowFieldRef {
+    fn eq(&self, other: &Self) -> bool {
+        self.binding == other.binding && self.field == other.field
+    }
+}
+
+impl Eq for RowFieldRef {}
+
+impl Hash for RowFieldRef {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.binding.hash(state);
+        self.field.hash(state);
+    }
 }
 
 /// One row test: a left field, an operator, and whatever right-hand side the
@@ -506,6 +546,8 @@ pub struct RowPredicate {
     pub field: RowFieldRef,
     pub op: RowPredicateOp,
     pub operand: RowPredicateOperand,
+    /// Exact authored predicate expression range.
+    pub source_range: Option<Range<usize>>,
 }
 
 /// The right-hand side of a row test.
@@ -587,12 +629,28 @@ pub enum RowLiteral {
     ConstrainedEnum(String),
 }
 
+/// The authored spelling of one literal, so a diagnostic that names a
+/// predicate reads back as the policy source wrote it: strings quoted, and
+/// constrained-enum labels bare.
+impl fmt::Display for RowLiteral {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::String(value) => write!(formatter, "\"{value}\""),
+            Self::Integer(value) => write!(formatter, "{value}"),
+            Self::Boolean(value) => write!(formatter, "{value}"),
+            Self::ConstrainedEnum(value) => formatter.write_str(value),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct RowAssertion {
     pub id: PolicyAssertId,
     pub group: RowGroupName,
     pub aggregate: RowAggregateName,
     pub cardinality: AssertCardinality,
+    /// Exact authored assertion or typed-shorthand record range.
+    pub source_range: Option<Range<usize>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1898,6 +1956,50 @@ pub struct CallModelingSpec {
     pub unmodeled: UnmodeledCallBehavior,
 }
 
+/// The policy's declared handling of a verdict blocked by unknown or
+/// incomplete evidence (#2506).
+///
+/// This is orthogonal to [`CallModelingSpec`]: `call-modeling` decides which
+/// facts cross an unmodeled call boundary, while this decides what the run
+/// does once some verdict could not be reached at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct OnUnknownSpec {
+    pub verdict: UnknownVerdict,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum UnknownVerdict {
+    /// Retain the findings, publish the inconclusive completion with its typed
+    /// reasons, and let the batch exit unreliable. The fail-safe default.
+    #[default]
+    Abstain,
+    /// Retain the same findings and the same inconclusive completion, mark the
+    /// run so a reader knows its findings are unreliable, and let the batch
+    /// exit on the findings alone.
+    WarnUnreliable,
+    /// Treat the blocked verdict as a gate failure at the policy's own
+    /// severity, and say in a diagnostic which unknown caused it.
+    FailClosed,
+}
+
+impl UnknownVerdict {
+    /// The one spelling this verdict has: authored source, canonical policy
+    /// projection, and report JSON all use it.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Abstain => "abstain",
+            Self::WarnUnreliable => "warn-unreliable",
+            Self::FailClosed => "fail-closed",
+        }
+    }
+}
+
+impl fmt::Display for UnknownVerdict {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.label())
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum InconclusivePolicy {
     #[default]
@@ -3056,7 +3158,27 @@ define_policy_identifier!(RowAggregateName, 128, false);
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use super::*;
+
+    #[test]
+    fn row_field_identity_excludes_diagnostic_source_ranges() {
+        let binding = RowBindingName::new("subject").unwrap();
+        let first = RowFieldRef {
+            binding: binding.clone(),
+            field: "name".to_string(),
+            source_range: Some(10..22),
+        };
+        let second = RowFieldRef {
+            binding,
+            field: "name".to_string(),
+            source_range: Some(80..92),
+        };
+
+        assert_eq!(first, second);
+        assert_eq!(HashSet::from([first, second]).len(), 1);
+    }
 
     #[test]
     fn policy_identifiers_enforce_the_two_public_grammars() {

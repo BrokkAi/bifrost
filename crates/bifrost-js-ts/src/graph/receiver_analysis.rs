@@ -5,7 +5,7 @@
 //! factory calls that return constructed values, and class factory methods whose body
 //! returns a constructed value.
 
-use crate::imports::{npm_package_of_module_specifier, require_call_module_specifier};
+use crate::imports::{js_ts_module_identity, require_call_module_specifier};
 use crate::imports::{
     resolve_js_ts_direct_import_candidates, resolve_js_ts_module_binding_candidates,
     resolve_js_ts_module_specifier,
@@ -29,14 +29,14 @@ use brokk_bifrost_core::analyzer::usages::model::ImportKind;
 use brokk_bifrost_core::analyzer::usages::receiver_analysis::{
     ReceiverAnalysisBudget, ReceiverAnalysisBudgetTracker, ReceiverAnalysisCacheKey,
     ReceiverAnalysisOutcome, ReceiverAnalysisQuery, ReceiverAnalysisReport, ReceiverContext,
-    ReceiverFactProvider, ReceiverFacts, ReceiverMemberTargetReport, ReceiverSummaryQuery,
-    ReceiverValue,
+    ReceiverFactProvider, ReceiverFacts, ReceiverIdentityProof, ReceiverMemberTargetReport,
+    ReceiverSummaryQuery, ReceiverValue,
 };
 use brokk_bifrost_core::analyzer::usages::reference_site::{
     node_range, smallest_named_node_covering,
 };
 use brokk_bifrost_core::analyzer::{
-    BoundedDefinitionLookup, CodeUnit, CodeUnitIndex, Language, ProjectFile,
+    BoundedDefinitionLookup, CodeUnit, CodeUnitIndex, Language, ProjectFile, Range,
 };
 use brokk_bifrost_core::cancellation::CancellationToken;
 use brokk_bifrost_core::hash::{HashMap, HashSet};
@@ -292,15 +292,31 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
         budget: ReceiverAnalysisBudget,
     ) -> Option<ReceiverMemberTargetReport> {
         let member_expression = member_expression_at_site(site)?;
-        let (_, member_name) = static_member_property(member_expression, self.source)?;
+        let (member, member_name) = static_member_property(member_expression, self.source)?;
         if member_name.is_empty() || expected_member.is_some_and(|expected| expected != member_name)
         {
             return None;
         }
         let receiver = member_expression.child_by_field_name("object")?;
+        let receiver_analysis = self.resolve_receiver_node_report(receiver, budget);
+        let receiver_identity = if matches!(
+            &receiver_analysis.outcome,
+            ReceiverAnalysisOutcome::Precise(values) if values.len() == 1
+        ) && !receiver_analysis.candidates_truncated
+        {
+            ReceiverAnalysisReport::without_work(
+                ReceiverAnalysisOutcome::Precise(vec![ReceiverIdentityProof::ExactValueAnalysis]),
+                budget,
+            )
+        } else {
+            self.immutable_identifier_binding_proof(receiver, budget)
+        };
         Some(ReceiverMemberTargetReport {
             receiver_range: node_range(receiver),
+            member_range: node_range(member),
             member_name: member_name.clone(),
+            receiver_analysis,
+            receiver_identity,
             analysis: self.resolve_member_targets_report(
                 receiver,
                 &member_name,
@@ -308,6 +324,93 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
                 budget,
             ),
         })
+    }
+
+    fn immutable_identifier_binding_proof(
+        &self,
+        receiver: Node<'tree>,
+        budget: ReceiverAnalysisBudget,
+    ) -> ReceiverAnalysisReport<ReceiverIdentityProof> {
+        let Some(name) = simple_identifier_text(receiver, self.source) else {
+            return ReceiverAnalysisReport::without_work(ReceiverAnalysisOutcome::Unknown, budget);
+        };
+        let mut tracker = ReceiverAnalysisBudgetTracker::new(budget);
+        for scope in lexical_scopes_for_node(receiver) {
+            match self.immutable_identifier_binding_in_scope(
+                scope,
+                name,
+                receiver.start_byte(),
+                &mut tracker,
+            ) {
+                IdentifierBindingProofSearch::NoBinding => {}
+                IdentifierBindingProofSearch::Immutable(declaration_range) => {
+                    return tracker.report(ReceiverAnalysisOutcome::Precise(vec![
+                        ReceiverIdentityProof::ImmutableBinding {
+                            file: self.file.clone(),
+                            declaration_range,
+                        },
+                    ]));
+                }
+                IdentifierBindingProofSearch::NotImmutable => {
+                    return tracker.report(ReceiverAnalysisOutcome::Unknown);
+                }
+                IdentifierBindingProofSearch::ExceededBudget => {
+                    return tracker.report(ReceiverAnalysisOutcome::ExceededBudget {
+                        limit: "max_scope_nodes",
+                    });
+                }
+            }
+        }
+        tracker.report(ReceiverAnalysisOutcome::Unknown)
+    }
+
+    fn immutable_identifier_binding_in_scope(
+        &self,
+        scope: Node<'tree>,
+        receiver: &str,
+        before_byte: usize,
+        tracker: &mut ReceiverAnalysisBudgetTracker,
+    ) -> IdentifierBindingProofSearch {
+        let mut proof = IdentifierBindingProofSearch::NoBinding;
+        let mut stack = vec![scope];
+        while let Some(node) = stack.pop() {
+            if tracker.record_scope_node().is_err() {
+                return IdentifierBindingProofSearch::ExceededBudget;
+            }
+            if node.id() != scope.id() && is_scope_boundary(node.kind()) {
+                continue;
+            }
+
+            if binding_node_shadows_receiver(node, self.source, receiver) {
+                return IdentifierBindingProofSearch::NotImmutable;
+            }
+            if node.kind() == "variable_declarator"
+                && let Some(name) = node.child_by_field_name("name")
+                && node_text_matches(name, self.source, receiver)
+            {
+                if node.start_byte() >= before_byte || !variable_declarator_is_const(node) {
+                    return IdentifierBindingProofSearch::NotImmutable;
+                }
+                if !matches!(proof, IdentifierBindingProofSearch::NoBinding) {
+                    return IdentifierBindingProofSearch::NotImmutable;
+                }
+                proof = IdentifierBindingProofSearch::Immutable(node_range(node));
+            } else if node.start_byte() < before_byte
+                && node.kind() == "assignment_expression"
+                && let Some(left) = node.child_by_field_name("left")
+                && matches!(left.kind(), "identifier" | "type_identifier")
+                && node_text_matches(left, self.source, receiver)
+            {
+                return IdentifierBindingProofSearch::NotImmutable;
+            }
+
+            for index in (0..node.named_child_count()).rev() {
+                if let Some(child) = node.named_child(index) {
+                    stack.push(child);
+                }
+            }
+        }
+        proof
     }
 
     /// The declarations that own `member` on ONE ELEMENT of `iterable`.
@@ -906,10 +1009,10 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
             return Some(ReceiverAnalysisOutcome::Ambiguous(Vec::new()));
         }
         let binding = self.imports.binding(receiver)?;
-        npm_package_of_module_specifier(&binding.module_specifier)?;
+        let imported = js_ts_module_identity(&binding.module_specifier)?;
         let identity = match binding.kind {
             ImportKind::Default | ImportKind::Namespace | ImportKind::CommonJsRequire => {
-                binding.module_specifier.clone()
+                imported.specifier.to_owned()
             }
             ImportKind::Named => receiver.to_owned(),
             ImportKind::Glob => return None,
@@ -1072,6 +1175,7 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
         budget: ReceiverAnalysisBudget,
         tracker: &mut ReceiverAnalysisBudgetTracker,
     ) -> ReceiverAnalysisOutcome<ReceiverValue> {
+        let mut initializer = None;
         if let (Some(name), Some(value)) = (
             declarator
                 .child_by_field_name("name")
@@ -1080,20 +1184,22 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
         ) && require_call_module_specifier(value, self.source).is_some()
             && let Some(outcome) = self.imported_module_receiver_outcome(name, budget)
         {
-            return outcome;
+            initializer = Some(outcome);
+        }
+        let initializer = initializer.or_else(|| {
+            declarator
+                .child_by_field_name("value")
+                .map(|value| self.resolve_expression(value, depth + 1, budget, tracker))
+        });
+        if let Some(initialized) = initializer {
+            return initialized;
         }
         if self.language == Language::TypeScript
             && let Some(type_node) = declarator.child_by_field_name("type")
         {
-            let owners = self.type_annotation_receiver_outcome(type_node, budget);
-            if !matches!(owners, ReceiverAnalysisOutcome::Unknown) {
-                return owners;
-            }
+            return self.type_annotation_receiver_outcome(type_node, budget);
         }
-        declarator
-            .child_by_field_name("value")
-            .map(|value| self.resolve_expression(value, depth + 1, budget, tracker))
-            .unwrap_or(ReceiverAnalysisOutcome::Unknown)
+        ReceiverAnalysisOutcome::Unknown
     }
 
     fn type_annotation_receiver_outcome(
@@ -2327,6 +2433,27 @@ fn lexical_scopes_for_node<'tree>(node: Node<'tree>) -> Vec<Node<'tree>> {
         current = parent;
     }
     scopes
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IdentifierBindingProofSearch {
+    NoBinding,
+    Immutable(Range),
+    NotImmutable,
+    ExceededBudget,
+}
+
+fn variable_declarator_is_const(declarator: Node<'_>) -> bool {
+    let Some(declaration) = declarator.parent() else {
+        return false;
+    };
+    if declaration.kind() != "lexical_declaration" {
+        return false;
+    }
+    let mut cursor = declaration.walk();
+    declaration
+        .children(&mut cursor)
+        .any(|child| child.kind() == "const")
 }
 
 fn enclosing_function_scope<'tree>(mut node: Node<'tree>) -> Option<Node<'tree>> {

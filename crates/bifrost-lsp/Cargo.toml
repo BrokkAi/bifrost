@@ -2,14 +2,10 @@
 name = "brokk-bifrost-lsp"
 version.workspace = true
 edition.workspace = true
-rust-version.workspace = true
 description = "Internal LSP host implementation for brokk-bifrost"
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
-readme = "README.md"
-keywords.workspace = true
-categories.workspace = true
 publish = true
 exclude = ["src/bin/bifrost-lsp-test-server.rs", "tests/**"]
 
@@ -17,11 +13,11 @@ exclude = ["src/bin/bifrost-lsp-test-server.rs", "tests/**"]
 name = "brokk_bifrost_lsp"
 
 [dependencies]
-brokk-bifrost-analysis = { path = "../bifrost-analysis", version = "=0.10.8" }
-brokk-bifrost-flow = { path = "../bifrost-flow", version = "=0.10.8" }
-brokk-bifrost-policy = { path = "../bifrost-policy", version = "=0.10.8" }
-brokk-bifrost-rql = { path = "../bifrost-rql", version = "=0.10.8" }
-brokk-bifrost-runtime = { path = "../bifrost-runtime", version = "=0.10.8" }
+brokk-bifrost-analysis = { path = "../bifrost-analysis", version = "=0.10.9" }
+brokk-bifrost-flow = { path = "../bifrost-flow", version = "=0.10.9" }
+brokk-bifrost-policy = { path = "../bifrost-policy", version = "=0.10.9" }
+brokk-bifrost-rql = { path = "../bifrost-rql", version = "=0.10.9" }
+brokk-bifrost-runtime = { path = "../bifrost-runtime", version = "=0.10.9" }
 # The same channel implementation `lsp-server` exposes through
 # `Connection::{sender,receiver}`. The main loop selects over the client
 # receiver and the dependency-pack activation receiver together (#1628).
@@ -38,7 +34,12 @@ tree-sitter-python = "0.25.0"
 toml = "0.8.23"
 
 [dev-dependencies]
+# Property tests for the byte-offset <-> UTF-16 LSP position conversions.
+proptest = "1.11"
 tempfile = "3.23.0"
 
 [target.'cfg(unix)'.dev-dependencies]
 libc = "0.2"
+
+[lints]
+workspace = true

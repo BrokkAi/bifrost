@@ -49,6 +49,12 @@ pub(crate) enum UnionExecutionStrategy {
 pub struct CodeQueryResult {
     pub results: Vec<CodeQueryResultItem>,
     pub truncated: bool,
+    /// Present only when this session covers an explicitly named subset of the
+    /// workspace, in which case the query ran over that many files. This is not
+    /// a diagnostic: a query over the named files is exact for those files. It
+    /// states the frame of reference the row set was drawn from (#2770).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_subset: Option<SubsetCoverage>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub diagnostics: Vec<CodeQueryDiagnostic>,
 }
@@ -164,7 +170,7 @@ impl CodeQueryResponse {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum CodeQueryCompletion {
     Complete,
@@ -174,6 +180,32 @@ pub enum CodeQueryCompletion {
     Invalid { codes: Vec<CodeQueryDiagnosticCode> },
 }
 
+impl CodeQueryCompletion {
+    /// Every completion tag, in declaration order.
+    ///
+    /// A client that derives completion from the same diagnostics mirrors this
+    /// vocabulary; the #2898 inventory publishes it so a missing client member
+    /// fails a test instead of a user's call.
+    pub const KIND_LABELS: &'static [&'static str] = &[
+        "complete",
+        "proven_subset",
+        "incomplete",
+        "cancelled",
+        "invalid",
+    ];
+
+    /// The `type` tag this completion serializes under.
+    pub const fn kind_label(&self) -> &'static str {
+        match self {
+            Self::Complete => "complete",
+            Self::ProvenSubset { .. } => "proven_subset",
+            Self::Incomplete { .. } => "incomplete",
+            Self::Cancelled => "cancelled",
+            Self::Invalid { .. } => "invalid",
+        }
+    }
+}
+
 impl CodeQueryResult {
     /// Derive whether this result can support a complete negative conclusion.
     ///
@@ -181,29 +213,7 @@ impl CodeQueryResult {
     /// the existing bounded-output flag. Diagnostic prose remains presentation
     /// and can change without changing this decision.
     pub fn completion(&self) -> CodeQueryCompletion {
-        let invalid = self.diagnostic_codes_with_impact(CodeQueryDiagnosticImpact::Invalid);
-        if !invalid.is_empty() {
-            return CodeQueryCompletion::Invalid { codes: invalid };
-        }
-        if self
-            .diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.code == CodeQueryDiagnosticCode::Cancelled)
-        {
-            return CodeQueryCompletion::Cancelled;
-        }
-        let incomplete = self.diagnostic_codes_with_impact(CodeQueryDiagnosticImpact::Incomplete);
-        if self.truncated || !incomplete.is_empty() {
-            return CodeQueryCompletion::Incomplete { codes: incomplete };
-        }
-        let declared_non_exhaustive =
-            self.diagnostic_codes_with_impact(CodeQueryDiagnosticImpact::DeclaredNonExhaustive);
-        if !declared_non_exhaustive.is_empty() {
-            return CodeQueryCompletion::ProvenSubset {
-                codes: declared_non_exhaustive,
-            };
-        }
-        CodeQueryCompletion::Complete
+        code_query_completion(self.truncated, &self.diagnostics)
     }
 
     /// Cap per-row flow completion by the run's own completion (#1952).
@@ -227,22 +237,53 @@ impl CodeQueryResult {
             }
         }
     }
+}
 
-    fn diagnostic_codes_with_impact(
-        &self,
-        impact: CodeQueryDiagnosticImpact,
-    ) -> Vec<CodeQueryDiagnosticCode> {
+/// Derive a result's completion from its bounded-output flag and the typed
+/// impact of its diagnostics.
+///
+/// Free-standing because a merge of per-seed executions derives the same
+/// completion from the same two inputs before it has a `CodeQueryResult` to
+/// ask (issue: impact-sliced `--diff-base`, Milestone 2), and two derivations
+/// of one contract would be two contracts.
+pub fn code_query_completion(
+    truncated: bool,
+    diagnostics: &[CodeQueryDiagnostic],
+) -> CodeQueryCompletion {
+    let codes_with_impact = |impact: CodeQueryDiagnosticImpact| {
         let mut codes = Vec::new();
-        for diagnostic in &self.diagnostics {
+        for diagnostic in diagnostics {
             if diagnostic.impact == impact && !codes.contains(&diagnostic.code) {
                 codes.push(diagnostic.code);
             }
         }
         codes
+    };
+    let invalid = codes_with_impact(CodeQueryDiagnosticImpact::Invalid);
+    if !invalid.is_empty() {
+        return CodeQueryCompletion::Invalid { codes: invalid };
     }
+    if diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.code == CodeQueryDiagnosticCode::Cancelled)
+    {
+        return CodeQueryCompletion::Cancelled;
+    }
+    let incomplete = codes_with_impact(CodeQueryDiagnosticImpact::Incomplete);
+    if truncated || !incomplete.is_empty() {
+        return CodeQueryCompletion::Incomplete { codes: incomplete };
+    }
+    let declared_non_exhaustive =
+        codes_with_impact(CodeQueryDiagnosticImpact::DeclaredNonExhaustive);
+    if !declared_non_exhaustive.is_empty() {
+        return CodeQueryCompletion::ProvenSubset {
+            codes: declared_non_exhaustive,
+        };
+    }
+    CodeQueryCompletion::Complete
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct CodeQueryResultItem {
     #[serde(flatten)]
     pub value: CodeQueryResultValue,
@@ -285,7 +326,7 @@ impl CodeQueryResultItem {
     }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(tag = "result_type", rename_all = "snake_case")]
 pub enum CodeQueryResultValue {
     StructuralMatch {
@@ -311,6 +352,10 @@ pub enum CodeQueryResultValue {
     TypestateFinding {
         #[serde(flatten)]
         value: Box<CodeQueryTypestateFinding>,
+    },
+    ConcurrentAccessConflict {
+        #[serde(flatten)]
+        value: Box<CodeQueryConcurrentAccessConflict>,
     },
     TypestateWitness {
         #[serde(flatten)]
@@ -352,6 +397,10 @@ pub enum CodeQueryResultValue {
         #[serde(flatten)]
         value: Box<CodeQueryReceiverAnalysis>,
     },
+    MemberTargetAnalysis {
+        #[serde(flatten)]
+        value: Box<CodeQueryMemberTargetAnalysis>,
+    },
     ReceiverOutcome {
         #[serde(flatten)]
         value: Box<CodeQueryReceiverOutcome>,
@@ -359,6 +408,10 @@ pub enum CodeQueryResultValue {
     ReceiverEvidence {
         #[serde(flatten)]
         value: Box<CodeQueryReceiverEvidence>,
+    },
+    FieldWriteValue {
+        #[serde(flatten)]
+        value: Box<CodeQueryFieldWriteValue>,
     },
     CallShape {
         #[serde(flatten)]
@@ -395,6 +448,18 @@ pub enum CodeQueryResultValue {
     ResultContractFailureUse {
         #[serde(flatten)]
         value: Box<CodeQueryResultContractFailureUse>,
+    },
+    NilnessOperation {
+        #[serde(flatten)]
+        value: Box<CodeQueryNilnessOperation>,
+    },
+    SwitchCoverage {
+        #[serde(flatten)]
+        value: Box<CodeQuerySwitchCoverage>,
+    },
+    DetachedTaskTransfer {
+        #[serde(flatten)]
+        value: Box<CodeQueryDetachedTaskTransfer>,
     },
     ProcedureEffect {
         #[serde(flatten)]

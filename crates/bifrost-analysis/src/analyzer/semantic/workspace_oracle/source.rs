@@ -373,9 +373,88 @@ impl<'a> WorkspaceSemanticOracle<'a> {
         range: Range,
         request: &mut SemanticRequest<'_>,
     ) -> Result<SemanticOutcome<SourceDispatchResult>, SemanticProviderError> {
-        self.prepare_source_dispatch_session_in_artifact(materialized)
-            .resolve_at_source(range, request)
+        // Only retained when a ledger will read it: the artifact is needed to
+        // name the question, and an Arc bump on every dispatch is a cost this
+        // milestone must not add to runs that record nothing.
+        let artifact = self
+            .workspace
+            .analyzer()
+            .read_ledger_attached()
+            .then(|| materialized.available_value().map(Arc::clone))
+            .flatten();
+        let question = artifact
+            .as_ref()
+            .map(|artifact| dispatch_question(artifact, range));
+        let outcome = self
+            .prepare_source_dispatch_session_in_artifact(materialized)
+            .resolve_at_source(range, request)?;
+        // Dispatch is the channel a result contract or a task slice composes
+        // callee bodies through, so the answer -- which targets, and whether
+        // the set was exhaustive -- is itself an input the reader depended on.
+        if let Some(question) = question {
+            self.workspace
+                .analyzer()
+                .record_read(crate::analyzer::read_ledger::ReadKey::lookup(
+                    crate::analyzer::read_ledger::LookupKind::Dispatch,
+                    question,
+                    dispatch_answer_digest(outcome.available_value()),
+                ));
+        }
+        Ok(outcome)
     }
+}
+
+/// Domain for the digest of one dispatch answer.
+const DISPATCH_ANSWER_DOMAIN: &[u8] = b"bifrost-read-ledger:dispatch-answer:v1";
+
+/// The replayable question "dispatch at this range of this artifact".
+///
+/// The file is named by its workspace-relative path and the artifact by its
+/// public fingerprint, never by the mount-bearing `SemanticArtifactKey`, so
+/// the same question over the same content at two roots is the same question.
+fn dispatch_question(
+    artifact: &SemanticArtifact,
+    range: Range,
+) -> crate::analyzer::read_ledger::LookupQuestion {
+    crate::analyzer::read_ledger::LookupQuestion::call_site(
+        artifact.key().path().as_str(),
+        artifact.key().public_fingerprint(),
+        range,
+    )
+}
+
+/// The canonical digest of a dispatch answer: its targets by public artifact
+/// fingerprint and procedure id, plus its coverage.
+///
+/// A target is never named by its `SemanticArtifactKey` or its
+/// `SemanticLocator`: both fold the workspace mount, so the same answer at two
+/// roots would digest differently and no base unit could ever verify.
+pub(crate) fn dispatch_answer_digest(
+    result: Option<&SourceDispatchResult>,
+) -> crate::analyzer::semantic::ids::StableDigest {
+    let mut hasher = crate::analyzer::canonical_hash::CanonicalHasher::new(DISPATCH_ANSWER_DOMAIN);
+    let Some(result) = result else {
+        hasher.value(b"unavailable");
+        return crate::analyzer::semantic::ids::StableDigest::from_array(hasher.finish());
+    };
+    hasher.field("coverage", result.coverage().label().as_bytes());
+    let mut targets = result
+        .target_candidates()
+        .map(|candidate| {
+            let target = candidate.target();
+            (
+                *target.artifact().key().public_fingerprint().as_bytes(),
+                target.id().index(),
+            )
+        })
+        .collect::<Vec<_>>();
+    targets.sort();
+    targets.dedup();
+    for (artifact, procedure) in targets {
+        hasher.value(&artifact);
+        hasher.value(&(procedure as u64).to_be_bytes());
+    }
+    crate::analyzer::semantic::ids::StableDigest::from_array(hasher.finish())
 }
 
 /// One call site addressed by a source range together with its exact dispatch

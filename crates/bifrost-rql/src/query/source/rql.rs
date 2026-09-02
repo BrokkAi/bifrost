@@ -678,6 +678,7 @@ fn validate_wrapper(
         | RqlForm::TopologyEdgesOf
         | RqlForm::GuardsOf
         | RqlForm::SegmentTarget
+        | RqlForm::FieldWriteValue
         | RqlForm::ReceiverOutcome
         | RqlForm::ReceiverEvidence
         | RqlForm::CallShape
@@ -690,6 +691,10 @@ fn validate_wrapper(
         | RqlForm::CallResultContracts
         | RqlForm::ResultContractUses
         | RqlForm::ResultContractOperationUses
+        | RqlForm::NilnessOperations
+        | RqlForm::SwitchCoverage
+        | RqlForm::ConcurrentAccessConflicts
+        | RqlForm::DetachedTaskTransfers
         | RqlForm::ProcedureEffects
         | RqlForm::CallableSignature
         | RqlForm::SignatureParameters

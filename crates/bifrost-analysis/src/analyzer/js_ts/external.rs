@@ -18,9 +18,9 @@ use crate::analyzer::semantic_model::{
     ExternalArtifactKind, ExternalArtifactPackProducer, HierarchyFact, HierarchyKind, Locator,
     MemberFact, MemberIdentity, MemberKind, NameSelector, Parameter, Producer, ProducerDiagnostic,
     ProducerDiagnosticSeverity, Provenance, ResolvedDependency, ResolvedDependencyArtifact, Safety,
-    SemanticModelActivationEvidence, Signature, TypeFact, TypeIdentity, TypeKind, TypeRef,
-    Visibility, carried_source_paths, member_declaration_id, read_exact_artifact_while,
-    type_declaration_id,
+    SemanticModelActivationEvidence, Signature, SuppressedDiagnostics, TypeFact, TypeIdentity,
+    TypeKind, TypeRef, Visibility, carried_source_paths, member_declaration_id,
+    read_exact_artifact_while, type_declaration_id,
 };
 use crate::analyzer::topology::DependencyScope;
 use crate::analyzer::{JsTsDependencyDiscoveryConfig, Project};
@@ -197,11 +197,16 @@ pub fn resolve_js_ts_semantic_pack_dependencies(
 
     dependencies.sort_by(|left, right| left.id.cmp(&right.id));
     dependencies.dedup_by(|left, right| left.id == right.id);
-    let mut suppressed_diagnostics = diagnostics.len().saturating_sub(limits.max_diagnostics);
+    // Every diagnostic below is mapped to error severity, so the truncated
+    // tail is a count of dropped errors. Dropped dependencies are not
+    // diagnostics and join the non-error bucket.
+    let mut suppressed_diagnostics = SuppressedDiagnostics {
+        warnings: 0,
+        errors: diagnostics.len().saturating_sub(limits.max_diagnostics),
+    };
     diagnostics.truncate(limits.max_diagnostics);
     if dependencies.len() > limits.max_dependencies {
-        suppressed_diagnostics =
-            suppressed_diagnostics.saturating_add(dependencies.len() - limits.max_dependencies);
+        suppressed_diagnostics.warnings = dependencies.len() - limits.max_dependencies;
         dependencies.truncate(limits.max_dependencies);
     }
     let diagnostics: Vec<_> = diagnostics
@@ -220,7 +225,7 @@ pub fn resolve_js_ts_semantic_pack_dependencies(
             dependencies_resolved: dependencies.len(),
         },
         dependencies,
-        complete: diagnostics.is_empty() && suppressed_diagnostics == 0,
+        complete: diagnostics.is_empty() && suppressed_diagnostics.total() == 0,
         diagnostics,
         suppressed_diagnostics,
         cancelled: false,
@@ -366,7 +371,7 @@ impl TypeScriptDeclarationPackProducer {
             );
         }
         let mut diagnostics = Vec::new();
-        let mut suppressed_diagnostics = 0usize;
+        let mut suppressed_diagnostics = SuppressedDiagnostics::default();
         let partial = |diagnostics, suppressed_diagnostics| ArtifactProduction {
             artifact_sha256: Some(artifact.sha256().to_owned()),
             pack: None,
@@ -381,6 +386,7 @@ impl TypeScriptDeclarationPackProducer {
         else {
             diagnostics.push(ProducerDiagnostic {
                 severity: ProducerDiagnosticSeverity::Error,
+                source_entry: None,
                 code: "npm.package.manifest_missing".to_owned(),
                 location: Some(manifest_path.to_owned()),
                 declaration: None,
@@ -391,6 +397,7 @@ impl TypeScriptDeclarationPackProducer {
         if let Err(message) = validate_npm_manifest(manifest_entry.bytes()) {
             diagnostics.push(ProducerDiagnostic {
                 severity: ProducerDiagnosticSeverity::Error,
+                source_entry: None,
                 code: "npm.package.identity".to_owned(),
                 location: Some(manifest_path.to_owned()),
                 declaration: None,
@@ -405,6 +412,7 @@ impl TypeScriptDeclarationPackProducer {
             if cancelled(cancellation) {
                 diagnostics.push(ProducerDiagnostic {
                     severity: ProducerDiagnosticSeverity::Error,
+                    source_entry: None,
                     code: "artifact.cancelled".to_owned(),
                     location: None,
                     declaration: None,
@@ -419,6 +427,7 @@ impl TypeScriptDeclarationPackProducer {
             else {
                 diagnostics.push(ProducerDiagnostic {
                     severity: ProducerDiagnosticSeverity::Warning,
+                    source_entry: None,
                     code: "npm.declarations.missing".to_owned(),
                     location: Some(declaration_path.clone()),
                     declaration: None,
@@ -430,6 +439,7 @@ impl TypeScriptDeclarationPackProducer {
             let Ok(source) = std::str::from_utf8(entry.bytes()) else {
                 diagnostics.push(ProducerDiagnostic {
                     severity: ProducerDiagnosticSeverity::Warning,
+                    source_entry: None,
                     code: "typescript.declaration.encoding".to_owned(),
                     location: Some(declaration_path.clone()),
                     declaration: None,
@@ -450,6 +460,7 @@ impl TypeScriptDeclarationPackProducer {
             if outcome.cancelled {
                 diagnostics.push(ProducerDiagnostic {
                     severity: ProducerDiagnosticSeverity::Error,
+                    source_entry: None,
                     code: "artifact.cancelled".to_owned(),
                     location: Some(declaration_path.clone()),
                     declaration: None,
@@ -459,7 +470,7 @@ impl TypeScriptDeclarationPackProducer {
             }
             let (entry_diagnostics, entry_suppressed) = outcome.diagnostics.finish();
             diagnostics.extend(entry_diagnostics);
-            suppressed_diagnostics = suppressed_diagnostics.saturating_add(entry_suppressed);
+            suppressed_diagnostics += entry_suppressed;
             types.extend(outcome.types);
             members.extend(outcome.members);
         }
@@ -473,6 +484,7 @@ impl TypeScriptDeclarationPackProducer {
         if !has_declarations {
             diagnostics.push(ProducerDiagnostic {
                 severity: ProducerDiagnosticSeverity::Error,
+                source_entry: None,
                 code: "npm.declarations.no_external_declarations".to_owned(),
                 location: None,
                 declaration: None,
@@ -484,7 +496,7 @@ impl TypeScriptDeclarationPackProducer {
         for selector in &mut activation {
             selector.artifact_sha256 = Some(artifact.sha256().to_owned());
         }
-        let completeness = if diagnostics.is_empty() && suppressed_diagnostics == 0 {
+        let completeness = if diagnostics.is_empty() && suppressed_diagnostics.total() == 0 {
             Completeness::Complete
         } else {
             Completeness::Partial
@@ -551,7 +563,7 @@ impl TypeScriptDeclarationPackProducer {
             );
         }
         let mut diagnostics = BoundedProducerDiagnostics::new(limits);
-        let mut suppressed_diagnostics = 0usize;
+        let mut suppressed_diagnostics = SuppressedDiagnostics::default();
         let Some(manifest) = artifact
             .source_entries()
             .iter()
@@ -771,7 +783,7 @@ impl TypeScriptDeclarationPackProducer {
             } = collector;
             remaining_records = collector_remaining_records;
             let (collector_diagnostics, collector_suppressed) = collector_diagnostics.finish();
-            suppressed_diagnostics = suppressed_diagnostics.saturating_add(collector_suppressed);
+            suppressed_diagnostics += collector_suppressed;
             for diagnostic in collector_diagnostics {
                 match diagnostic.severity {
                     ProducerDiagnosticSeverity::Warning => diagnostics.warning(
@@ -845,8 +857,8 @@ impl TypeScriptDeclarationPackProducer {
             );
         }
         let (diagnostics, own_suppressed_diagnostics) = diagnostics.finish();
-        suppressed_diagnostics = suppressed_diagnostics.saturating_add(own_suppressed_diagnostics);
-        let completeness = if diagnostics.is_empty() && suppressed_diagnostics == 0 {
+        suppressed_diagnostics += own_suppressed_diagnostics;
+        let completeness = if diagnostics.is_empty() && suppressed_diagnostics.total() == 0 {
             Completeness::Complete
         } else {
             Completeness::Partial
@@ -1802,6 +1814,7 @@ impl<'source, 'cancel> DeclarationCollector<'source, 'cancel> {
             type_parameters,
             type_parameter_constraints: Vec::new(),
             underlying_type: None,
+            value_semantics: None,
             embedded_types: Vec::new(),
             hierarchy,
             aliases: Vec::new(),
@@ -1853,6 +1866,7 @@ impl<'source, 'cancel> DeclarationCollector<'source, 'cancel> {
             is_static: draft.is_static,
             is_abstract: false,
             is_virtual: draft.member_kind == MemberKind::Method && !draft.is_static,
+            implicit_operation: None,
             callable_family_complete: false,
             signature: draft.signature,
             receiver: None,
@@ -2064,6 +2078,7 @@ fn callable_signature(node: Node<'_>, source: &str, max_depth: usize) -> Option<
             r#type: parameter_type,
             optional: parameter.kind() == "optional_parameter",
             variadic,
+            passing_mode: Default::default(),
         });
     }
     Some(Signature {
@@ -2243,7 +2258,7 @@ fn finish_typescript_production(
         selector.artifact_sha256 = Some(artifact_sha256.to_owned());
     }
     let (diagnostics, suppressed_diagnostics) = diagnostics.finish();
-    let completeness = if diagnostics.is_empty() && suppressed_diagnostics == 0 {
+    let completeness = if diagnostics.is_empty() && suppressed_diagnostics.total() == 0 {
         Completeness::Complete
     } else {
         Completeness::Partial
@@ -2393,6 +2408,7 @@ fn failed_production(
     ArtifactProduction::failed(
         ProducerDiagnostic {
             severity: ProducerDiagnosticSeverity::Error,
+            source_entry: None,
             code: code.to_owned(),
             location: None,
             declaration: None,
@@ -2418,12 +2434,13 @@ fn dependency_failure(code: &str, message: &str) -> DependencyPackProduction {
         pack: None,
         diagnostics: vec![ProducerDiagnostic {
             severity: ProducerDiagnosticSeverity::Error,
+            source_entry: None,
             code: code.to_owned(),
             location: None,
             declaration: None,
             message: message.to_owned(),
         }],
-        suppressed_diagnostics: 0,
+        suppressed_diagnostics: SuppressedDiagnostics::default(),
     }
 }
 
@@ -2985,7 +3002,7 @@ fn cancelled_outcome() -> DependencyDiscoveryOutcome {
             message: "npm dependency discovery was cancelled".to_owned(),
         }],
         complete: false,
-        suppressed_diagnostics: 0,
+        suppressed_diagnostics: SuppressedDiagnostics::default(),
         cancelled: true,
         profile: DependencyDiscoveryProfile::default(),
     }

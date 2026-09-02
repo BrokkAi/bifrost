@@ -613,7 +613,33 @@ impl SegmentInterner {
         SegmentId(id as u32)
     }
 
+    /// Intern `(text, kind)`, returning the id that names it.
+    ///
+    /// `text` must not be empty. An empty segment is not a name a language can
+    /// spell; it is always a producer that split a joined string and kept the
+    /// run between two separators. Unchecked, such a segment passes both here
+    /// and through `FqName::push` and fails only two layers downstream, in
+    /// `CodeUnit` construction, where the message blames `short_name` -- or
+    /// where it merely trips a `debug_assert` that is silent in a release build,
+    /// leaving a `CodeUnit` with an empty identifier span. Rejecting it here
+    /// fails at the construction point, on the frontend that produced the
+    /// component, per the #1189 model.
+    ///
+    /// A producer that carries a name as a joined string must split it with
+    /// [`joined_segments`] and store [`normalize_joined`]'s repair; both already
+    /// guarantee non-empty components.
+    ///
+    /// # Panics
+    ///
+    /// If `text` is empty. This is a plain `assert!` rather than a
+    /// `debug_assert!`: interning is far off the per-node parsing hot path, and
+    /// the corrupted state must not propagate in a release build either.
     pub fn intern(&self, text: &str, kind: SegmentKind) -> SegmentId {
+        assert!(
+            !text.is_empty(),
+            "a segment text must not be empty (kind={kind:?}); \
+             split joined names with joined_segments and store normalize_joined's repair"
+        );
         #[cfg(any(test, feature = "test-support"))]
         counters::record_intern();
         let hash = Self::text_hash(text);
@@ -1370,5 +1396,332 @@ mod tests {
                 );
             }
         }
+    }
+}
+
+/// Generative coverage of the round-trip invariants the `#1189` construction
+/// assert rests on.
+///
+/// This crate's most-repeated panic is one shape: a qualified name carried
+/// twice -- once as a separator-joined string stored in a `CodeUnit`'s
+/// `package_name`/`short_name`, once as structured [`FqName`] segments -- with
+/// the two spellings disagreeing about empty components, `$` sigils, raw
+/// identifiers, or non-ASCII text. `CodeUnit::with_signature_and_fq` asserts the
+/// two agree, so every disagreement aborted a whole workspace build.
+///
+/// The example-based tests above pin the individual corpus shapes that were
+/// reduced from those failures. These properties pin the *rules* those examples
+/// are instances of, over generated combinations of the same adversarial atoms:
+/// the string-side repair ([`normalize_joined`]) is a fixed point of the
+/// structure-side split ([`joined_segments`]); a name whose textual projections
+/// are taken from its own rendering always locates its own package boundary; and
+/// re-deriving structure from a rendering converges after one step.
+#[cfg(test)]
+mod fq_name_properties {
+    use super::*;
+    use crate::analyzer::model::{CodeUnit, CodeUnitType, ProjectFile};
+    use proptest::prelude::*;
+
+    /// Segment texts reduced from the corpora that tripped the construction
+    /// assert, plus the ordinary spellings they have to keep working beside.
+    /// Non-ASCII atoms are written as escapes so this file stays plain ASCII.
+    const SEGMENT_ATOMS: &[&str] = &[
+        // Ordinary identifiers, the case everything else must not regress.
+        "Foo",
+        "bar",
+        "_private",
+        // Literal `$` identifiers: test262's `$262Object`/`$L` shims and
+        // minifier output such as `_$$`. A `$` in a segment's own text collides
+        // with the `$` that `separator` renders before a `Nested` segment and
+        // suffixes onto a `Companion` one.
+        "$262Object",
+        "$L",
+        "_$$",
+        "$",
+        // Rust raw identifiers: the `#` is part of the name, not a delimiter.
+        "r#type",
+        // Non-ASCII. A projection taken by stepping raw byte offsets through one
+        // of these lands inside a UTF-8 code point and panics; only segment
+        // boundaries are guaranteed char boundaries.
+        "\u{03ba}\u{03b1}\u{03c0}\u{03c0}\u{03b1}", // Greek
+        "\u{7c7b}\u{578b}",                         // CJK
+        "\u{1f600}",                                // emoji
+        // One segment whose own text carries some language's separator. These
+        // must never be re-split: `github.com` is a single Go path component.
+        "a.b",
+        "ns::inner",
+        "My\\Ns",
+        "github.com",
+        // Doubled, leading, and trailing separators: `package com..foo;`,
+        // `namespace winrt::{{ namespaceCpp }}` truncated at the placeholder,
+        // `::std::chrono`, PHP's `namespace \ArrayObject`, and
+        // `namespace MyStandard\.hidden;`.
+        "com..foo",
+        "winrt::",
+        "::std::chrono",
+        "\\ArrayObject",
+        "MyStandard\\.hidden",
+        ".lead",
+        "trail.",
+        "..",
+        "::",
+        // Template markers and go.mod trailers that reach an extractor verbatim.
+        "{{ ns }}",
+        "github.com/x/y //comment",
+    ];
+
+    /// Every separator a frontend passes to the [`normalize_joined`] /
+    /// [`joined_segments`] pair: `.` (java, php's mapped spelling, scala, and
+    /// the canonical join), `::` (cpp), `\` (php's source spelling), `/` (go
+    /// import paths).
+    const JOIN_SEPARATORS: &[&str] = &[".", "::", "\\", "/"];
+
+    fn segment_text() -> impl Strategy<Value = String> {
+        prop_oneof![
+            4 => prop::sample::select(SEGMENT_ATOMS).prop_map(|atom| atom.to_owned()),
+            1 => "[A-Za-z_][A-Za-z0-9_]{0,8}",
+        ]
+    }
+
+    fn segment_kind() -> impl Strategy<Value = SegmentKind> {
+        prop::sample::select(SegmentKind::ALL.to_vec())
+    }
+
+    fn language() -> impl Strategy<Value = Language> {
+        prop::sample::select(Language::ALL.to_vec())
+    }
+
+    /// A structured name's raw material. Bounded at five segments: every
+    /// rendering rule fires between two adjacent segments, so longer names add
+    /// generation cost without adding rule combinations.
+    ///
+    /// Segment texts are non-empty. That is the one constraint the type's own
+    /// contract states -- [`joined_segments`] defines a segment as a *non-empty*
+    /// run between separators, which is precisely the guarantee the pair exists
+    /// to provide -- and `interning_an_empty_segment_text_panics_naming_the_kind`
+    /// below pins the rejection a frontend that violates it now gets.
+    fn segment_list() -> impl Strategy<Value = Vec<(String, SegmentKind)>> {
+        prop::collection::vec((segment_text(), segment_kind()), 1..6)
+    }
+
+    /// Arbitrary separator-joined text, including the malformed spellings real
+    /// corpora contain: bare separator runs, separator-bearing atoms, and
+    /// unconstrained strings.
+    fn joined_string() -> impl Strategy<Value = String> {
+        prop::collection::vec(
+            prop_oneof![
+                6 => segment_text(),
+                2 => prop::sample::select(JOIN_SEPARATORS).prop_map(|sep| sep.to_owned()),
+                1 => any::<String>(),
+            ],
+            0..5,
+        )
+        .prop_map(|pieces| pieces.concat())
+    }
+
+    fn separator() -> impl Strategy<Value = &'static str> {
+        prop::sample::select(JOIN_SEPARATORS)
+    }
+
+    fn intern_all(segments: &[(String, SegmentKind)]) -> FqName {
+        let interner = segment_interner();
+        let mut fq = FqName::new();
+        for (text, kind) in segments {
+            fq.push(interner.intern(text, *kind));
+        }
+        fq
+    }
+
+    /// A `ProjectFile` whose `declaration_language` is exactly `language`, which
+    /// is what selects the native rendering rules inside the construction path.
+    ///
+    /// `Language::None` needs an extension that is a source extension but that
+    /// no language's own extension list claims, or an unclaimed extension would
+    /// make `declaration_language` report the include-claiming language instead.
+    /// No file is ever created; a `ProjectFile` is an identity.
+    fn source_file(language: Language) -> ProjectFile {
+        let extension = match language {
+            Language::None => "vue",
+            language => language.extensions()[0],
+        };
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let file = ProjectFile::new(root, format!("unit.{extension}"));
+        assert_eq!(
+            file.declaration_language(),
+            language,
+            "extension {extension:?} must reproduce {language:?}"
+        );
+        file
+    }
+
+    proptest! {
+        /// The string half of the repair is a fixed point of the structure half.
+        ///
+        /// [`normalize_joined`] is what a frontend stores; [`joined_segments`]
+        /// is what it interns. Re-normalizing a normalized name must change
+        /// nothing, re-splitting it must reproduce it exactly, and the repair
+        /// must not change *which* components the `FqName` receives -- that last
+        /// clause is what makes the two spellings agree by construction instead
+        /// of by each call site remembering to guard.
+        #[test]
+        fn normalize_joined_is_a_fixed_point_of_joined_segments(
+            raw in joined_string(),
+            separator in separator(),
+        ) {
+            let once = normalize_joined(&raw, separator);
+            let twice = normalize_joined(&once, separator);
+            prop_assert_eq!(&*twice, &*once, "repair must be idempotent");
+
+            let components: Vec<&str> = joined_segments(&once, separator).collect();
+            prop_assert!(
+                components.iter().all(|component| !component.is_empty()),
+                "a normalized name must not re-split into an empty component: {:?}",
+                components
+            );
+            prop_assert_eq!(
+                components.join(separator),
+                once.to_string(),
+                "re-joining the split must reproduce the normalized name"
+            );
+            prop_assert_eq!(
+                joined_segments(&raw, separator).collect::<Vec<_>>(),
+                components,
+                "repairing the string must not change the fq's components"
+            );
+        }
+    }
+
+    proptest! {
+        /// The core property: a name whose textual projections are read off its
+        /// own rendering always locates its own package boundary.
+        ///
+        /// `package_name` and `short_name` are taken here exactly as
+        /// `CodeUnit::package_name`/`short_name` report them -- a prefix and a
+        /// suffix of one native rendering, split at a segment boundary -- and
+        /// then handed back to `CodeUnit::with_signature_and_fq` together with
+        /// the `FqName` they came from. The boundary search must find that
+        /// split, for every segment kind, every language, and every adversarial
+        /// spelling. Each fixed frontend defect was a violation of this: a
+        /// joined string derived independently of the segments, disagreeing on
+        /// one empty component or sigil.
+        #[test]
+        fn rendered_projections_locate_the_construction_boundary(
+            segments in segment_list(),
+            language in language(),
+            boundary in any::<prop::sample::Index>(),
+        ) {
+            check_construction_boundary(&segments, language, boundary)?;
+        }
+    }
+
+    /// The one atom [`segment_list`] leaves out -- a segment whose text is
+    /// empty -- is rejected where it is made.
+    ///
+    /// An empty segment is not a name any language spells. It is always a
+    /// producer that split a joined string and kept the run between two
+    /// separators, which is the exact state [`joined_segments`] and
+    /// [`normalize_joined`] exist to keep out of an `FqName`. It used to survive
+    /// both `SegmentInterner::intern` and `FqName::push` and fail two layers
+    /// downstream, in `CodeUnit` construction, two panics away from the mistake:
+    ///
+    /// - `[("", Path)]` renders to `""`, so the derived `short_name` was empty
+    ///   and `with_signature_and_fq`'s first assert fired with a message naming
+    ///   `short_name` rather than the empty segment.
+    /// - `[("a", Package), ("", Member)]` renders to `"a."`, whose derived
+    ///   projections (`package_name` `""`, `short_name` `"a."`) do locate a
+    ///   boundary; construction then only tripped `RenderedCodeUnitName::new`'s
+    ///   `debug_assert` on `identifier_start < text.len()`, which is silent
+    ///   corruption in a release build rather than a failure.
+    ///
+    /// [`SegmentInterner::intern`] now rejects it, so the panic lands on the
+    /// frontend that produced the component and names the segment kind. The
+    /// check runs over every kind because the rejection is kind-independent:
+    /// no kind has an empty spelling.
+    #[test]
+    fn interning_an_empty_segment_text_panics_naming_the_kind() {
+        let interner = segment_interner();
+        for kind in SegmentKind::ALL {
+            let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                interner.intern("", kind)
+            }))
+            .expect_err("interning an empty segment text must panic");
+            let message = payload
+                .downcast_ref::<String>()
+                .expect("the assert panics with a formatted String payload");
+            assert!(
+                message.contains("a segment text must not be empty")
+                    && message.contains(&format!("kind={kind:?}")),
+                "the panic must report the empty text and name its kind, got {message:?}"
+            );
+        }
+    }
+
+    /// Read `package_name`/`short_name` off a name's own rendering exactly as
+    /// `CodeUnit`'s accessors report them, then hand all three back to the
+    /// constructor and check it reproduces them.
+    fn check_construction_boundary(
+        segments: &[(String, SegmentKind)],
+        language: Language,
+        boundary: prop::sample::Index,
+    ) -> Result<(), TestCaseError> {
+        let fq = intern_all(segments);
+        let rendered = fq.render_native(language, segment_interner());
+        // A package prefix must leave a non-empty declaration tail, so the
+        // boundary ranges over 0..len rather than 0..=len.
+        let boundary = boundary.index(fq.len());
+        let package_name = rendered.text()[..rendered.prefix_end(boundary)].to_owned();
+        let short_name = rendered.text()[rendered.suffix_start(boundary)..].to_owned();
+
+        let unit = CodeUnit::with_signature_and_fq(
+            source_file(language),
+            CodeUnitType::Function,
+            package_name.clone(),
+            short_name.clone(),
+            None,
+            false,
+            fq,
+        );
+
+        prop_assert_eq!(unit.package_name(), package_name.as_str());
+        prop_assert_eq!(unit.short_name(), short_name.as_str());
+        Ok(())
+    }
+
+    proptest! {
+        /// Re-deriving structure from a rendering converges after one step.
+        ///
+        /// A consumer that only has the canonical string splits it back apart on
+        /// the canonical `.` join and interns each component as an input segment
+        /// of unknown denotation -- the inference `FqName` exists to replace, and
+        /// the one an MCP symbol path still performs at the input edge. The
+        /// first pass can lose structure (a `Path` head's `/`, a segment's own
+        /// literal dots), but the result must be stable under repetition, and it
+        /// must be exactly what [`normalize_joined`] would have stored. Without
+        /// that, a name would drift each time it crossed the string boundary.
+        #[test]
+        fn rebuilding_a_rendering_reaches_a_fixed_point(
+            segments in segment_list(),
+            language in language(),
+        ) {
+            let interner = segment_interner();
+            let rendered = intern_all(&segments).display_native(language, interner);
+            let once = rebuild_and_render(&rendered, language, interner);
+            let twice = rebuild_and_render(&once, language, interner);
+
+            prop_assert_eq!(&twice, &once, "the rebuild loop must converge");
+            prop_assert_eq!(
+                once.as_str(),
+                &*normalize_joined(&rendered, "."),
+                "the rebuilt rendering must be the repair the string side stores"
+            );
+        }
+    }
+
+    fn rebuild_and_render(text: &str, language: Language, interner: &SegmentInterner) -> String {
+        let mut fq = FqName::new();
+        for component in joined_segments(text, ".") {
+            fq.push(interner.intern(component, SegmentKind::Unknown));
+        }
+        fq.display_native(language, interner)
     }
 }

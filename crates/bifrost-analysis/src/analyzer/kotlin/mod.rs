@@ -124,7 +124,7 @@ pub struct KotlinAnalyzer {
     /// artifacts. Built lazily because opening jars is expensive and many
     /// workspaces never ask a question that needs it.
     jvm_config: JvmAnalyzerConfig,
-    external_index: Arc<OnceLock<JvmExternalDeclarationIndex>>,
+    external_index: Arc<OnceLock<Arc<JvmExternalDeclarationIndex>>>,
     memo_budget: u64,
     imported_code_units: Cache<ProjectFile, Arc<HashSet<CodeUnit>>>,
     /// Import and hierarchy answers computed with the whole JVM source realm
@@ -168,6 +168,9 @@ pub struct KotlinAnalyzer {
 
 crate::analyzer::impl_forward_query_provider!(KotlinAnalyzer);
 
+#[cfg(test)]
+mod hierarchy_tests;
+
 impl KotlinAnalyzer {
     #[cfg(test)]
     pub(crate) fn relational_batch_reader_checkouts_for_test(&self) -> usize {
@@ -175,6 +178,16 @@ impl KotlinAnalyzer {
             .analyzer_store()
             .relational_batch_counts_for_test()
             .0
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reset_authoritative_file_state_reads_for_test(&self) {
+        self.inner.reset_authoritative_file_state_reads_for_test();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn authoritative_file_state_reads_for_test(&self) -> usize {
+        self.inner.authoritative_file_state_reads_for_test()
     }
 
     pub fn new(project: Arc<dyn Project>) -> Self {
@@ -289,11 +302,22 @@ impl KotlinAnalyzer {
         )
     }
 
+    pub(crate) fn clone_for_index_warm(&self, project: Arc<dyn Project>) -> Self {
+        let mut clone = self.clone();
+        clone.inner = clone.inner.clone_with_project(project);
+        clone
+    }
+
     /// Kotlin's view of the shared JVM dependency realm.
     pub(crate) fn external_declaration_index(&self) -> &JvmExternalDeclarationIndex {
-        self.external_index.get_or_init(|| {
-            JvmExternalDeclarationIndex::build_for_project(&self.jvm_config, self.inner.project())
-        })
+        self.external_index
+            .get_or_init(|| {
+                JvmExternalDeclarationIndex::build_for_project(
+                    &self.jvm_config,
+                    self.inner.project(),
+                )
+            })
+            .as_ref()
     }
 
     /// The external declaration surface Kotlin resolution reads: the shared
@@ -499,6 +523,34 @@ impl KotlinSource for KotlinAnalyzer {
         self.inner.raw_supertypes_of(code_unit)
     }
 
+    fn resolved_ancestors_from_hydrated_facts(
+        &self,
+        token: QueryToken<'_>,
+        owner: &CodeUnit,
+        raw_supertypes: &[String],
+        imports: &[brokk_bifrost_core::analyzer::model::ImportInfo],
+        realm: Option<&brokk_bifrost_jvm::realm::JvmSourceRealm<'_>>,
+        type_by_fqn: &mut dyn FnMut(&str) -> Option<CodeUnit>,
+    ) -> Vec<CodeUnit> {
+        let cache = match realm {
+            Some(_) => &self.realm_direct_ancestors,
+            None => &self.direct_ancestors,
+        };
+        if let Some(cached) = cache.get(owner) {
+            return (*cached).clone();
+        }
+        let ancestors = brokk_bifrost_jvm::kotlin::hierarchy::kotlin_resolve_ancestors_from_facts(
+            self,
+            token,
+            owner,
+            raw_supertypes,
+            imports,
+            type_by_fqn,
+        );
+        cache.insert(owner.clone(), Arc::new(ancestors.clone()));
+        ancestors
+    }
+
     /// Built once per analyzer generation: a star import has to widen to a
     /// whole package, and repeating that scan per file would be quadratic in
     /// workspace size.
@@ -518,7 +570,7 @@ impl KotlinSource for KotlinAnalyzer {
     }
 
     fn retained_external_index(&self) -> JvmRetainedExternalIndex {
-        retained_external_index_state(self.external_index.get())
+        retained_external_index_state(self.external_index.get().map(Arc::as_ref))
     }
 
     fn retained_external_qualified_name_exists(&self, fqn: &str, access_package: &str) -> bool {
@@ -605,6 +657,10 @@ impl CodeUnitIndex for KotlinAnalyzer {
 
     fn all_declarations(&self) -> Box<dyn Iterator<Item = CodeUnit> + '_> {
         self.inner.all_declarations()
+    }
+
+    fn declarations_sharing_name(&self, unit: &CodeUnit) -> Vec<CodeUnit> {
+        self.inner.declarations_sharing_name(unit)
     }
 
     fn declarations(&self, file: &ProjectFile) -> BTreeSet<CodeUnit> {
@@ -717,9 +773,7 @@ impl CodeUnitIndex for KotlinAnalyzer {
 impl IAnalyzer for KotlinAnalyzer {
     crate::analyzer::i_analyzer::forward_relational_definition_batch!();
 
-    fn invalidate_cached_file_identities(&self) {
-        self.inner.invalidate_cached_file_identities();
-    }
+    crate::analyzer::i_analyzer::forward_file_identity_invalidation!();
 
     fn working_tree_identity(&self) -> Option<std::sync::Arc<crate::gitblob::WorkingTreeIdentity>> {
         self.inner.working_tree_identity()
@@ -746,6 +800,12 @@ impl IAnalyzer for KotlinAnalyzer {
         self.inner.workspace_file_index_cell()
     }
 
+    fn definition_lookup_memo(
+        &self,
+    ) -> Option<std::sync::Arc<crate::analyzer::DefinitionLookupMemo>> {
+        self.inner.definition_lookup_memo()
+    }
+
     fn structural_fact_providers(
         &self,
     ) -> Vec<&dyn crate::analyzer::structural::StructuralFactProvider> {
@@ -760,6 +820,12 @@ impl IAnalyzer for KotlinAnalyzer {
         &self,
     ) -> Option<crate::analyzer::content_identity::WorkspaceContentIdentities> {
         self.inner.workspace_content_identities()
+    }
+
+    fn workspace_fact_indexes(
+        &self,
+    ) -> Vec<&dyn crate::analyzer::read_verification::WorkspaceFactIndex> {
+        self.inner.workspace_fact_indexes()
     }
 
     fn import_statements(&self, file: &ProjectFile) -> Vec<String> {
@@ -1035,6 +1101,24 @@ impl DeadCodeBulkProof for KotlinDeadCodeBulk {
 impl LanguageSupport for KotlinSupport {
     fn language(&self) -> Language {
         Language::Kotlin
+    }
+
+    fn expand_imported_external_callee(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        file: &ProjectFile,
+        callee_text: &str,
+    ) -> Option<String> {
+        let scope = AnalyzerQueryScope::new(analyzer);
+        let kotlin = resolve_analyzer::<KotlinAnalyzer>(analyzer)?;
+        kotlin
+            .resolve_member_name_with_external(
+                scope.token(),
+                analyzer.semantic_model_overlay(),
+                file,
+                callee_text,
+            )
+            .map(|member| member.fqn().to_owned())
     }
 
     /// Kotlin's grammar names neither the callee of a call nor the member of a

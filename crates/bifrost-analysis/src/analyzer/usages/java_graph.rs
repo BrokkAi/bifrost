@@ -23,7 +23,7 @@ use crate::hash::HashSet;
 use brokk_bifrost_jvm::java::graph::JavaGraphSource;
 use brokk_bifrost_jvm::java::graph::extractor::{
     self, JavaFileEvidenceBuildOutcome, JavaFileEvidenceOmission, JavaFileUsageEvidence,
-    ReturnTypeCaches, ScanState,
+    OwnedReturnTypeCaches, ScanState,
 };
 use brokk_bifrost_jvm::java::graph::inverted::{
     JavaEdgeScanCaches, scan_file as scan_inverted_file,
@@ -75,6 +75,7 @@ pub(in crate::analyzer::usages) fn with_java_graph_source<R>(
 /// Build one Java file's exact, uncapped evidence inside the shared relational
 /// frontier. The returned value owns every row and can therefore be handed to
 /// a snapshot cache without retaining request-local mutable state.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn build_java_file_usage_evidence(
     relational_session: &crate::analyzer::relational_frontier::RelationalFrontierSession<'_>,
     analyzer: &dyn IAnalyzer,
@@ -82,6 +83,7 @@ pub(crate) fn build_java_file_usage_evidence(
     token: QueryToken<'_>,
     file: &ProjectFile,
     spec: &TargetSpec,
+    return_caches: &OwnedReturnTypeCaches,
     cancellation: &crate::CancellationToken,
 ) -> JavaFileEvidenceBuildOutcome {
     let outcome = relational_session.resolve_owned("java_semantic_scan", |frontier| {
@@ -93,21 +95,13 @@ pub(crate) fn build_java_file_usage_evidence(
             relational_definitions: frontier.as_ref(),
             import_statements: &import_statements,
         };
-        let method_return_cache = Mutex::new(crate::hash::HashMap::default());
-        let method_anonymous_return_cache = Mutex::new(crate::hash::HashMap::default());
-        let file_return_cache = Mutex::new(crate::hash::HashMap::default());
-        let return_caches = ReturnTypeCaches {
-            method_return: &method_return_cache,
-            method_anonymous_return: &method_anonymous_return_cache,
-            file_return: &file_return_cache,
-        };
         extractor::scan_file_evidence(
             java,
             token,
             &graph,
             file,
             spec,
-            &return_caches,
+            &return_caches.caches(),
             cancellation,
         )
     });
@@ -136,6 +130,7 @@ pub(crate) fn merge_java_file_evidence(evidence: JavaFileUsageEvidence, state: &
 /// retained bytes without making the language crate depend on analysis. This
 /// conversion is the only boundary between those representations; omitted
 /// and cancelled producer outcomes remain non-publishable cache outcomes.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn build_java_file_cache_evidence(
     relational_session: &crate::analyzer::relational_frontier::RelationalFrontierSession<'_>,
     analyzer: &dyn IAnalyzer,
@@ -143,6 +138,7 @@ pub(crate) fn build_java_file_cache_evidence(
     token: QueryToken<'_>,
     file: &ProjectFile,
     spec: &TargetSpec,
+    return_caches: &OwnedReturnTypeCaches,
     cancellation: &crate::CancellationToken,
 ) -> crate::analyzer::usages::java_usage_evidence_cache::JavaUsageEvidenceBuildOutcome {
     match build_java_file_usage_evidence(
@@ -152,6 +148,7 @@ pub(crate) fn build_java_file_cache_evidence(
         token,
         file,
         spec,
+        return_caches,
         cancellation,
     ) {
         JavaFileEvidenceBuildOutcome::Complete(evidence) => {
@@ -298,6 +295,7 @@ pub(crate) fn scan_jvm_files_for_foreign_type(
         .cloned()
         .collect();
     java_files.sort();
+    let return_caches = OwnedReturnTypeCaches::default();
     for file in &java_files {
         match build_java_file_usage_evidence(
             &relational_session,
@@ -306,6 +304,7 @@ pub(crate) fn scan_jvm_files_for_foreign_type(
             token,
             file,
             &spec,
+            &return_caches,
             &cancellation,
         ) {
             JavaFileEvidenceBuildOutcome::Complete(evidence) => {

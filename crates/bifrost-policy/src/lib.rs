@@ -40,6 +40,7 @@ mod source;
 mod suppression;
 mod taint_policy;
 mod typestate_policy;
+mod units;
 mod witness_projection;
 
 #[cfg(test)]
@@ -78,6 +79,7 @@ pub use scope::*;
 pub use source::rqlp_source_completion_at;
 pub use source::*;
 pub use suppression::*;
+pub use units::*;
 // The retained plan/report pair and its phase metrics are produced by the taint
 // engine, not by policy. They are re-exported here because they are part of this
 // crate's public authoring and reporting surface.

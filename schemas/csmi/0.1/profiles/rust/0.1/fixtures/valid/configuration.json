@@ -1,0 +1,29 @@
+{
+  "kind": "configuration",
+  "edition": "2021",
+  "compiler": {
+    "release": "1.85.0"
+  },
+  "cargoResolver": "2",
+  "target": {
+    "triple": "x86_64-unknown-linux-gnu"
+  },
+  "compilationRole": "target",
+  "enabledFeatures": [
+    "std"
+  ],
+  "cfgAtoms": [
+    {
+      "key": "feature",
+      "value": "std"
+    },
+    {
+      "key": "target_arch",
+      "value": "x86_64"
+    },
+    {
+      "key": "target_os",
+      "value": "linux"
+    }
+  ]
+}

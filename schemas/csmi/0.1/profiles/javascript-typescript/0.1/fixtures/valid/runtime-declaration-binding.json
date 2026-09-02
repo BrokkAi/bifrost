@@ -1,0 +1,6 @@
+{
+  "kind": "runtime-declaration-binding",
+  "runtimeSymbol": "exec-sync-runtime",
+  "declarationSymbols": ["exec-sync-declaration"],
+  "relation": "describes-runtime-binding"
+}

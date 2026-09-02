@@ -64,6 +64,7 @@ pub(crate) fn resolve_cpp_type_bounded(
         types: vec![TypeLookupType {
             fqn: resolution.fqn,
             definitions: resolution.candidates,
+            semantic_model_id: None,
         }],
         diagnostics: if status == TypeLookupStatus::Ambiguous {
             vec![TypeLookupDiagnostic {

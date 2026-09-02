@@ -44,7 +44,7 @@ pub const RUBY_KIND_TABLE: &[(&str, NormalizedKind)] = &[
     ("do_block", NormalizedKind::Lambda),
     ("lambda", NormalizedKind::Lambda),
     ("class", NormalizedKind::Class),
-    ("module", NormalizedKind::Class),
+    ("module", NormalizedKind::Module),
     ("assignment", NormalizedKind::Assignment),
     ("operator_assignment", NormalizedKind::Assignment),
     ("scope_resolution", NormalizedKind::FieldAccess),
@@ -483,6 +483,7 @@ impl StructuralSpec for RubyStructuralSpec {
             NormalizedKind::Function
             | NormalizedKind::Method
             | NormalizedKind::Class
+            | NormalizedKind::Module
             | NormalizedKind::Declaration => {
                 if let Some(name) = node.child_by_field_name("name") {
                     sink.set_name(expression_name_node(name).unwrap_or(name));

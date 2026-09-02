@@ -7,7 +7,7 @@
 
 use brokk_bifrost_analysis::analyzer::semantic_model::{
     SemanticModelCompleteness, SemanticModelOverlayDisposition, SemanticModelProvenance,
-    SemanticModelSymbol, SemanticModelSymbolKind,
+    SemanticModelSymbol, SemanticModelSymbolKind, semantic_model_callable_family_id,
 };
 use brokk_bifrost_analysis::analyzer::{CodeUnitType, IAnalyzer};
 
@@ -349,12 +349,12 @@ fn resolve_row_filter(
         }
         let target_field = match &identity {
             ResolvedLocatorIdentity::Workspace(_) => "target_id",
-            ResolvedLocatorIdentity::ActiveSemanticModel { .. } => "model_id",
+            ResolvedLocatorIdentity::ActiveSemanticModel { .. } => "model_callable_id",
         };
         replace_locator_predicate(
             filter,
             &target.value,
-            "model_id",
+            "model_callable_id",
             target_field,
             identity.identity(),
         );
@@ -464,6 +464,19 @@ fn resolve_qualified_locator(
     }
 
     if let Some((disposition, records)) = model_records {
+        if matches!(role, LocatorRole::Callable)
+            && records.len() > 1
+            && source_identities.is_empty()
+            && let Some(identity) = semantic_model_callable_family_id(&records)
+        {
+            let mut provenance = records[0].provenance.clone();
+            provenance.record_id = identity.clone();
+            provenance.completeness = SemanticModelCompleteness::Complete;
+            return Ok(ResolvedLocatorIdentity::ActiveSemanticModel {
+                identity,
+                provenance: Box::new(provenance),
+            });
+        }
         if records.iter().any(|record| record.provenance.ambiguous)
             || (disposition == SemanticModelOverlayDisposition::Conflict && records.len() > 1)
         {
@@ -509,6 +522,29 @@ fn resolve_qualified_locator(
                         source_identities[0], record.id
                     ),
                 ));
+            }
+            if matches!(role, LocatorRole::Callable) {
+                let Some(identity) = overlay
+                    .as_ref()
+                    .and_then(|overlay| overlay.callable_family_id_for_symbol(record))
+                else {
+                    return Err(locator_error(
+                        locator,
+                        role,
+                        LocatorFailure::Partial,
+                        format!(
+                            "active semantic-model callable family containing `{}`",
+                            record.id
+                        ),
+                    ));
+                };
+                let mut provenance = record.provenance.clone();
+                provenance.record_id = identity.clone();
+                provenance.completeness = SemanticModelCompleteness::Complete;
+                return Ok(ResolvedLocatorIdentity::ActiveSemanticModel {
+                    identity,
+                    provenance: Box::new(provenance),
+                });
             }
             return Ok(ResolvedLocatorIdentity::ActiveSemanticModel {
                 identity: record.id.clone(),

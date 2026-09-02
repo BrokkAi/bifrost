@@ -164,6 +164,41 @@ const FORBID_READS_RELATIONAL: &str = r#"(policy
       (aggregate :name reads :op count))
     (assert :group by-read :value reads :cardinality (exactly 0))))"#;
 
+/// The same invariant, but the binding admits the declaration name as well as
+/// the value reference and an authored `filter` narrows it back to the reads.
+/// The declaration name's row therefore exists in the binding's query, and a
+/// predicate rather than the query is what removes it.
+const FILTERED_READS_RELATIONAL: &str = r#"(policy
+  :id "test.explain.relational.filter"
+  :name "No value reads"
+  :message "value reads are forbidden in this fixture"
+  :severity warning
+  :analysis (analysis
+    :type assertion
+    (bind :name read :query (rql (occurrences :role [declaration_name value_reference])))
+    (filter :over read :where ((read.role eq value_reference)))
+    (group :name by-read :by (read.ast_id)
+      (aggregate :name reads :op count))
+    (assert :group by-read :value reads :cardinality (exactly 0))))"#;
+
+/// Two bindings that both retain a value reference, with a filter over the
+/// second one only. A filter narrows the relation it names and no other, so the
+/// first binding's row must reach the unreplayed join untouched.
+const SCOPED_FILTER_RELATIONAL: &str = r#"(policy
+  :id "test.explain.relational.scoped-filter"
+  :name "Scoped filter"
+  :message "a filter narrows only the relation it names"
+  :severity warning
+  :analysis (analysis
+    :type assertion
+    (bind :name read :query (rql (occurrences :role [value_reference])))
+    (bind :name other :query (rql (occurrences :role [declaration_name value_reference])))
+    (filter :over other :where ((other.role eq declaration_name)))
+    (join :left read :right other :kind inner :on ((ast_id ast_id)))
+    (group :name by-read :by (read.ast_id)
+      (aggregate :name reads :op count))
+    (assert :group by-read :value reads :cardinality (exactly 0))))"#;
+
 /// The same invariant over two bindings, the second of which is a row
 /// expansion this slice does not replay.
 const TWO_BINDING_RELATIONAL: &str = r#"(policy
@@ -214,6 +249,7 @@ impl Fixture {
             cancellation: None,
             cvss_overlays: &[],
             organizational_risk: &[],
+            incremental: None,
         }
     }
 
@@ -1378,6 +1414,7 @@ fn why_joins_the_runs_unmet_obligations_for_the_same_assertion() {
     );
 }
 
+#[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
 #[test]
 fn relational_why_explanations_serialize_byte_identically_across_runs() {
     let fixture = relational_fixture();
@@ -1421,15 +1458,19 @@ fn relational_why_not(
     candidate: &ExplanationCandidate,
     limits: &ExplanationLimits,
 ) -> PolicyExplanation {
+    relational_why_not_with_budget(fixture, source, candidate, limits, &PolicyBudget::default())
+}
+
+fn relational_why_not_with_budget(
+    fixture: &Fixture,
+    source: &str,
+    candidate: &ExplanationCandidate,
+    limits: &ExplanationLimits,
+    budget: &PolicyBudget,
+) -> PolicyExplanation {
     with_policy(source, |policy| {
-        explain_candidate(
-            policy,
-            &fixture.context(),
-            candidate,
-            &PolicyBudget::default(),
-            limits,
-        )
-        .expect("explanation")
+        explain_candidate(policy, &fixture.context(), candidate, budget, limits)
+            .expect("explanation")
     })
 }
 
@@ -1505,6 +1546,181 @@ fn why_not_stops_short_of_claiming_a_finding_when_every_binding_retains_the_row(
     assert_eq!(
         gap.reasons(),
         [PolicyIncompleteReason::CapabilityIncomplete]
+    );
+}
+
+/// Every node a binding carries for the plan's replayed `filter` records.
+fn filter_nodes(
+    binding: &super::model::ExplanationNode,
+) -> Vec<(String, String, ExplanationOutcome)> {
+    binding
+        .children()
+        .iter()
+        .filter(|child| child.kind() == ExplanationNodeKind::FilterPredicate)
+        .map(|child| {
+            (
+                child.expected().expect("predicate").to_string(),
+                child.actual().expect("row value").to_string(),
+                child.outcome(),
+            )
+        })
+        .collect()
+}
+
+fn join_replay_gap(explanation: &PolicyExplanation) -> Option<&super::model::ExplanationNode> {
+    explanation
+        .root()
+        .children()
+        .iter()
+        .find(|node| node.label() == "join_replay_unavailable")
+}
+
+#[test]
+fn why_not_names_the_filter_predicate_that_removed_the_candidates_row() {
+    let fixture = relational_fixture();
+    // The declaration name is an occurrence the binding's query returns, so the
+    // query is not what removed it: the authored filter is.
+    let explanation = relational_why_not(
+        &fixture,
+        FILTERED_READS_RELATIONAL,
+        &relational_candidate("render("),
+        &ExplanationLimits::default(),
+    );
+
+    assert_eq!(
+        binding_labels(&explanation),
+        vec![(String::from("read"), ExplanationOutcome::Failed)]
+    );
+    assert_eq!(explanation.outcome(), ExplanationOutcome::Failed);
+    assert!(
+        join_replay_gap(&explanation).is_none(),
+        "a filter decided the candidate, so no join replay is owed: {:?}",
+        explanation.root().children()
+    );
+
+    let binding = &explanation.root().children()[0];
+    assert!(
+        binding
+            .actual()
+            .expect("binding prose")
+            .contains("filter (read.role eq value_reference) removed it"),
+        "{:?}",
+        binding.actual()
+    );
+    assert_eq!(
+        child_labels(binding, ExplanationNodeKind::SelectorStage),
+        vec![(String::from("occurrences"), ExplanationOutcome::Satisfied)],
+        "the query itself retained the row"
+    );
+    assert_eq!(
+        filter_nodes(binding),
+        vec![(
+            String::from("(read.role eq value_reference)"),
+            String::from("`read.role` is declaration_name"),
+            ExplanationOutcome::Failed
+        )]
+    );
+}
+
+#[test]
+fn why_not_still_defers_to_the_unreplayed_join_when_a_filter_keeps_the_row() {
+    let fixture = relational_fixture();
+    let explanation = relational_why_not(
+        &fixture,
+        FILTERED_READS_RELATIONAL,
+        &relational_candidate("render;"),
+        &ExplanationLimits::default(),
+    );
+
+    assert_eq!(
+        binding_labels(&explanation),
+        vec![(String::from("read"), ExplanationOutcome::Satisfied)]
+    );
+    assert_eq!(explanation.outcome(), ExplanationOutcome::Unknown);
+    assert!(
+        filter_nodes(&explanation.root().children()[0]).is_empty(),
+        "a filter the row passes is not a reason for anything"
+    );
+    let gap = join_replay_gap(&explanation).expect("the unreplayed join is still stated");
+    assert_eq!(gap.outcome(), ExplanationOutcome::Unknown);
+    assert_eq!(
+        gap.reasons(),
+        [PolicyIncompleteReason::CapabilityIncomplete]
+    );
+}
+
+#[test]
+fn why_not_replays_only_the_filters_attached_to_the_bindings_own_relation() {
+    let fixture = relational_fixture();
+    let explanation = relational_why_not(
+        &fixture,
+        SCOPED_FILTER_RELATIONAL,
+        &relational_candidate("render;"),
+        &ExplanationLimits::default(),
+    );
+
+    assert_eq!(
+        binding_labels(&explanation),
+        vec![
+            (String::from("read"), ExplanationOutcome::Satisfied),
+            (String::from("other"), ExplanationOutcome::Failed),
+        ]
+    );
+    assert!(
+        filter_nodes(&explanation.root().children()[0]).is_empty(),
+        "binding `read` has no filter of its own, and `other`'s does not apply to it"
+    );
+    assert_eq!(
+        filter_nodes(&explanation.root().children()[1]),
+        vec![(
+            String::from("(other.role eq declaration_name)"),
+            String::from("`other.role` is value_reference"),
+            ExplanationOutcome::Failed
+        )]
+    );
+}
+
+#[test]
+fn why_not_reports_a_filter_drop_over_a_non_exhaustive_binding_as_unknown() {
+    // A one-row pipeline budget truncates the binding's query, so a row it did
+    // not return may still cover the candidate and pass the filter.
+    let budget = PolicyBudget::builder()
+        .with_query_limits(CodeQueryExecutionLimits {
+            max_pipeline_rows: 1,
+            ..CodeQueryExecutionLimits::default()
+        })
+        .expect("query limits")
+        .build()
+        .expect("budget");
+    let fixture = Fixture::with_source(RELATIONAL_TWO_READS);
+    let explanation = relational_why_not_with_budget(
+        &fixture,
+        FILTERED_READS_RELATIONAL,
+        &candidate_in(RELATIONAL_TWO_READS, "render("),
+        &ExplanationLimits::default(),
+        &budget,
+    );
+
+    assert_eq!(
+        binding_labels(&explanation),
+        vec![(String::from("read"), ExplanationOutcome::Unknown)]
+    );
+    assert_eq!(explanation.outcome(), ExplanationOutcome::Unknown);
+    let binding = &explanation.root().children()[0];
+    assert!(
+        binding
+            .actual()
+            .expect("binding prose")
+            .contains("not exhaustive"),
+        "{:?}",
+        binding.actual()
+    );
+    let filters = filter_nodes(binding);
+    assert_eq!(filters.len(), 1, "{filters:?}");
+    assert_eq!(filters[0].2, ExplanationOutcome::Unknown);
+    assert!(
+        !binding.reasons().is_empty(),
+        "an undecided filter drop names why it is undecided"
     );
 }
 
@@ -2531,6 +2747,7 @@ fn why_explains_a_taint_finding_in_the_security_vocabulary() {
     );
 }
 
+#[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
 #[test]
 fn flow_why_explanations_serialize_byte_identically_across_runs() {
     let fixture = Fixture::new();
@@ -2707,6 +2924,7 @@ fn near_miss_ranks_by_declared_predicate_distance_and_names_the_failing_conjunct
     );
 }
 
+#[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
 #[test]
 fn near_miss_rankings_serialize_byte_identically_across_runs() {
     let limits = ExplanationLimits::default();

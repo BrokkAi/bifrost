@@ -37,11 +37,30 @@ pub struct FormalParameterSlot {
     pub declaration_range: Range,
     pub receiver: bool,
     pub variadic: Option<FormalVariadicKind>,
+    pub passing_mode: FormalParameterPassingMode,
     /// The span of the default expression this parameter declares, when its
     /// grammar names one. `None` means the parameter declares no default *or*
     /// the language has none at all; see [`parameter_default_range`] for which
     /// grammars record it (issue #2499).
     pub default_range: Option<Range>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum FormalParameterPassingMode {
+    PositionalOnly,
+    #[default]
+    PositionalOrNamed,
+    NamedOnly,
+}
+
+impl FormalParameterPassingMode {
+    pub(crate) const fn accepts_positional(self) -> bool {
+        matches!(self, Self::PositionalOnly | Self::PositionalOrNamed)
+    }
+
+    pub(crate) const fn accepts_named(self) -> bool {
+        matches!(self, Self::PositionalOrNamed | Self::NamedOnly)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -178,6 +197,7 @@ fn formal_parameter_slots_for_owner_with_nodes_bounded<'tree>(
         let receiver = binding.kind == DeclarationKind::ReceiverParameter;
         let declaration_range = node_range(binding.declaration);
         let variadic = is_variadic_parameter(language, binding.declaration);
+        let passing_mode = formal_parameter_passing_mode(language, binding.declaration);
         let default_range = parameter_default_range(language, binding.declaration);
         let can_share_slot = language != Language::Go;
         if can_share_slot
@@ -190,6 +210,7 @@ fn formal_parameter_slots_for_owner_with_nodes_bounded<'tree>(
                 slot.names.push(name.to_owned());
             }
             slot.variadic = slot.variadic.or(variadic);
+            debug_assert_eq!(slot.passing_mode, passing_mode);
             continue;
         }
         slots.push((
@@ -198,6 +219,7 @@ fn formal_parameter_slots_for_owner_with_nodes_bounded<'tree>(
                 declaration_range,
                 receiver,
                 variadic,
+                passing_mode,
                 default_range,
             },
             binding.declaration,
@@ -212,6 +234,41 @@ fn formal_parameter_slots_for_owner_with_nodes_bounded<'tree>(
         },
         nodes,
     ))
+}
+
+fn formal_parameter_passing_mode(
+    language: Language,
+    parameter: Node<'_>,
+) -> FormalParameterPassingMode {
+    use FormalParameterPassingMode::{NamedOnly, PositionalOnly, PositionalOrNamed};
+
+    if language != Language::Python {
+        return PositionalOrNamed;
+    }
+    match is_variadic_parameter(language, parameter) {
+        Some(FormalVariadicKind::Positional) => return PositionalOnly,
+        Some(FormalVariadicKind::Keyword) => return NamedOnly,
+        Some(FormalVariadicKind::Both) => return PositionalOrNamed,
+        None => {}
+    }
+    let Some(parameters) = parameter.parent() else {
+        return PositionalOrNamed;
+    };
+    let mut cursor = parameters.walk();
+    let siblings = parameters.named_children(&mut cursor).collect::<Vec<_>>();
+    if siblings.iter().any(|sibling| {
+        sibling.kind() == "positional_separator" && parameter.end_byte() <= sibling.start_byte()
+    }) {
+        return PositionalOnly;
+    }
+    if siblings.iter().any(|sibling| {
+        (sibling.kind() == "keyword_separator"
+            || is_variadic_parameter(language, *sibling) == Some(FormalVariadicKind::Positional))
+            && sibling.end_byte() <= parameter.start_byte()
+    }) {
+        return NamedOnly;
+    }
+    PositionalOrNamed
 }
 
 /// The decorators that bind `owner` are the `decorator` children of the
@@ -1513,6 +1570,35 @@ mod tests {
             .flat_map(|slot| slot.names.iter().map(String::as_str))
             .collect();
         assert_eq!(names, vec!["seed", "label"]);
+    }
+
+    #[test]
+    fn python_formal_slots_preserve_positional_and_named_regions() {
+        let source = "def invoke(first, /, second, *values, third, **rest):\n    return second\n";
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_python::LANGUAGE.into())
+            .expect("Python grammar");
+        let tree = parser.parse(source, None).expect("Python tree");
+        let owner = first_named_kind(tree.root_node(), "function_definition");
+
+        let layout = formal_parameter_slots_for_owner(Language::Python, owner, source)
+            .expect("Python function must expose formal parameter slots");
+
+        assert_eq!(
+            layout
+                .slots
+                .iter()
+                .map(|slot| slot.passing_mode)
+                .collect::<Vec<_>>(),
+            [
+                FormalParameterPassingMode::PositionalOnly,
+                FormalParameterPassingMode::PositionalOrNamed,
+                FormalParameterPassingMode::PositionalOnly,
+                FormalParameterPassingMode::NamedOnly,
+                FormalParameterPassingMode::NamedOnly,
+            ]
+        );
     }
 
     #[test]

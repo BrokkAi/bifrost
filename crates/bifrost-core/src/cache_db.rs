@@ -3,7 +3,7 @@
 use std::collections::HashSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex, Once, Weak};
 use std::time::{Duration, Instant};
 
 use once_cell::sync::Lazy;
@@ -31,7 +31,7 @@ const BASELINE_MIGRATION_VERSION: i64 = 18;
 // Version 25 belonged to a rejected local relational-key experiment. Skipping
 // it prevents an old experimental v25 store from being mistaken for this
 // schema; the version sequence is intentionally monotonic, not contiguous.
-const CURRENT_MIGRATION_VERSION: i64 = 34;
+const CURRENT_MIGRATION_VERSION: i64 = 36;
 pub const OPTIONAL_FACT_KIND_CPP_TEMPLATE_METADATA: i64 = 1;
 pub const OPTIONAL_FACT_KIND_RUBY_METHOD_DISPATCH_MODE: i64 = 2;
 pub const OPTIONAL_FACT_KIND_SCALA_TRAIT: i64 = 3;
@@ -66,6 +66,10 @@ const REVISIONED_WORKSPACE_PROJECTIONS_SQL: &str =
 const INTERN_BLOB_IDS_SQL: &str = include_str!("../migrations/cache/0033-intern-blob-ids.sql");
 const RELATIONAL_STRUCTURAL_FACTS_SQL: &str =
     include_str!("../migrations/cache/0034-relational-structural-facts.sql");
+const SIGNATURE_TYPE_PARAMETERS_RECORDED_SQL: &str =
+    include_str!("../migrations/cache/0035-signature-type-parameters-recorded.sql");
+const POLICY_EVALUATION_UNITS_SQL: &str =
+    include_str!("../migrations/cache/0036-policy-evaluation-units.sql");
 
 // Migration 0023 spells the signature-metadata byte cap as the literal 8388608,
 // because a checked-in SQL file cannot interpolate a Rust constant. The two must
@@ -86,7 +90,7 @@ struct CacheMigration {
     sql: &'static str,
 }
 
-const CACHE_MIGRATIONS: [CacheMigration; 16] = [
+const CACHE_MIGRATIONS: [CacheMigration; 18] = [
     CacheMigration {
         version: 18,
         sql: CURRENT_BASELINE_SQL,
@@ -150,6 +154,14 @@ const CACHE_MIGRATIONS: [CacheMigration; 16] = [
     CacheMigration {
         version: 34,
         sql: RELATIONAL_STRUCTURAL_FACTS_SQL,
+    },
+    CacheMigration {
+        version: 35,
+        sql: SIGNATURE_TYPE_PARAMETERS_RECORDED_SQL,
+    },
+    CacheMigration {
+        version: 36,
+        sql: POLICY_EVALUATION_UNITS_SQL,
     },
 ];
 
@@ -367,6 +379,7 @@ fn last_store_use_unix_seconds(store: &Path) -> Result<i64> {
 /// so a permission denial is reported with the ways out instead of SQLite's
 /// bare `unable to open database file` (issue #1544).
 pub fn open_unified_connection(db_path: &Path) -> Result<Connection> {
+    disable_sqlite_memory_statistics();
     validate_writable_cache_filesystem(db_path)?;
     open_unified_connection_unclassified(db_path).map_err(|error| {
         match cache_write_denial(db_path) {
@@ -374,6 +387,50 @@ pub fn open_unified_connection(db_path: &Path) -> Result<Connection> {
             None => error,
         }
     })
+}
+
+/// Turn SQLite's process-global memory statistics off, once, before this
+/// process opens its first connection.
+///
+/// `libsqlite3-sys` bundles SQLite with memory statistics enabled, so every
+/// `sqlite3Malloc` and `sqlite3_free` takes one process-global mutex that all
+/// connections share. That mutex is what a wide analyzer query runs into: a warm
+/// `scan_usages` over the exposed-kotlin corpus on a 120-core host spent 37% of
+/// its samples in `pthread_mutex_lock`/`unlock` beneath `sqlite3_step`,
+/// `sqlite3_column_*` and `sqlite3Malloc`/`free`, with no Bifrost symbol above
+/// 1% (#2883). The counters that mutex protects are readable only through
+/// `sqlite3_memory_used`, `sqlite3_memory_highwater`, `sqlite3_status` and the
+/// soft/hard heap limits. Bifrost calls none of those and sets no heap limit, so
+/// here the statistics are pure overhead. A future SQLite memory budget has to
+/// turn them back on in this same place, ahead of the first connection.
+///
+/// `sqlite3_config` is legal only while the library is uninitialized, and the
+/// first connection open initializes it. There is no single `main` to hold this
+/// -- Bifrost runs as a CLI, an MCP server, an LSP server, a benchmark harness
+/// and a Python extension -- but every one of those reaches SQLite through a
+/// cache-DB opener here or through the semantic-pack catalog, so those entry
+/// points call this first and the `Once` keeps it to a single call.
+pub fn disable_sqlite_memory_statistics() {
+    static DISABLED: Once = Once::new();
+    DISABLED.call_once(|| {
+        // SAFETY: `sqlite3_config` is variadic, so it has no safe binding.
+        // `SQLITE_CONFIG_MEMSTATUS` takes exactly one `c_int`. The call must not
+        // race another SQLite call; `Once` serializes it, and every caller runs
+        // it ahead of its own `Connection::open`.
+        let code =
+            unsafe { rusqlite::ffi::sqlite3_config(rusqlite::ffi::SQLITE_CONFIG_MEMSTATUS, 0) };
+        if code != rusqlite::ffi::SQLITE_OK {
+            // `SQLITE_MISUSE` is the only code this call returns, and it means
+            // some other code in this process opened a raw SQLite connection
+            // first, so the library is already initialized. Test binaries do
+            // that; a Bifrost process does not. Leaving the statistics on costs
+            // throughput, never correctness, so report it and open the store.
+            eprintln!(
+                "Bifrost kept SQLite memory statistics on: \
+                 sqlite3_config(SQLITE_CONFIG_MEMSTATUS, 0) returned {code}"
+            );
+        }
+    });
 }
 
 /// The path the process cannot write, when a cache open failed on filesystem
@@ -593,6 +650,7 @@ fn disused_version_stores_on_startup(db_path: &Path) -> Option<Vec<PathBuf>> {
 /// process can access the `-wal`/`-shm` sidecars, which it can: the same process
 /// created the DB and holds the writer open for the store's lifetime.
 pub fn open_readonly_connection(db_path: &Path) -> Result<Connection> {
+    disable_sqlite_memory_statistics();
     ensure_safe_cache_path(db_path)?;
     let db_path = canonicalize_cache_db_parent(db_path)?;
     let conn = Connection::open_with_flags(
@@ -605,17 +663,38 @@ pub fn open_readonly_connection(db_path: &Path) -> Result<Connection> {
     Ok(conn)
 }
 
+/// SQLite's multi-thread mode, for a connection with exactly one owner at a
+/// time.
+///
+/// The bundled SQLite is built `SQLITE_THREADSAFE=1` (serialized), so by default
+/// every API call on a connection -- `sqlite3_step`, each `sqlite3_column_*`,
+/// the finalize -- enters and leaves that connection's own mutex. That mutex
+/// exists to let two threads share one connection, which Bifrost never does:
+/// the analyzer store's reader pool moves a connection out of its idle vector to
+/// hand it out and pushes it back on drop, so a checked-out reader has exactly
+/// one owner for as long as it is out. Rust states the same invariant in the
+/// type system, because `rusqlite::Connection` is `Send` and not `Sync`, which
+/// is precisely SQLite's multi-thread contract. The pool has no way for two
+/// guards to name one connection, so there is no concurrent-checkout state left
+/// to assert against; ownership is the check.
+///
+/// This is a read-connection flag only. The writer stays serialized: it is
+/// reached through a `Mutex` and a writer-actor thread, and proving the same
+/// single-owner property for every path into it is a separate question (#2883).
+const READER_THREADING: OpenFlags = OpenFlags::SQLITE_OPEN_NO_MUTEX;
+
 /// Open an initialized cache with a read-only main database and a writable
 /// temporary schema.
 ///
 /// The SQLite read-only flag prevents persistent writes, while a writable TEMP
 /// schema permits connection-local membership and FTS tables.
 pub fn open_readonly_temp_connection(db_path: &Path) -> Result<Connection> {
+    disable_sqlite_memory_statistics();
     ensure_safe_cache_path(db_path)?;
     let db_path = canonicalize_cache_db_parent(db_path)?;
     let conn = Connection::open_with_flags(
         &db_path,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW | READER_THREADING,
     )
     .map_err(|err| format!("cache DB active-session SQLite error: {err}"))?;
     install_busy_timeout(&conn)?;
@@ -632,11 +711,12 @@ pub fn open_readonly_temp_connection(db_path: &Path) -> Result<Connection> {
 /// after advancing to the next file group. Keeping these connections separate
 /// prevents their page cache from displacing interactive analyzer queries.
 pub fn open_streaming_readonly_connection(db_path: &Path) -> Result<Connection> {
+    disable_sqlite_memory_statistics();
     ensure_safe_cache_path(db_path)?;
     let db_path = canonicalize_cache_db_parent(db_path)?;
     let conn = Connection::open_with_flags(
         &db_path,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW | READER_THREADING,
     )
     .map_err(|err| format!("cache DB streaming read-only SQLite error: {err}"))?;
     install_busy_timeout(&conn)?;
@@ -2326,6 +2406,143 @@ mod tests {
             CURRENT_MIGRATION_VERSION
         );
         assert!(current_schema_is_valid(&conn).unwrap());
+    }
+
+    #[test]
+    fn policy_units_follow_their_seed_blob_and_enforce_partition_shape() {
+        let conn = open_in_memory_cache();
+        conn.execute_batch(
+            "INSERT INTO analysis_epochs(lang, epoch, generation)
+               VALUES('java', 'test', 7);
+             INSERT INTO blobs(blob_oid, lang, generation)
+               VALUES('1111111111111111111111111111111111111111', 'java', 7);
+             INSERT INTO policy_units(
+               policy_semantic_hash, family, partition_kind, seed_rel_path,
+               seed_blob_oid, seed_blob_id, lang, configuration_fingerprint,
+               active_model_set_hash, engine_epoch, completion, budget_mode,
+               product_kind, product, read_set_digest, published_at
+             ) VALUES(
+               'aa11bb22cc33dd44ee55ff66007788990011223344556677889900aabbccddee',
+               'match', 'seed', 'src/Main.java',
+               '1111111111111111111111111111111111111111',
+               (SELECT id FROM blobs
+                  WHERE blob_oid = '1111111111111111111111111111111111111111'
+                    AND lang = 'java'),
+               'java',
+               'bb11bb22cc33dd44ee55ff66007788990011223344556677889900aabbccddee',
+               'cc11bb22cc33dd44ee55ff66007788990011223344556677889900aabbccddee',
+               'dd11bb22cc33dd44ee55ff66007788990011223344556677889900aabbccddee',
+               'complete', 'exhaustive', 'rows', '{\"rows\":[]}',
+               zeroblob(32), 100
+             );",
+        )
+        .unwrap();
+
+        // A whole-policy unit covers the workspace, so naming a seed file
+        // would make its key mean two different things.
+        let seeded_whole = conn
+            .execute(
+                "INSERT INTO policy_units(
+                   policy_semantic_hash, family, partition_kind, seed_rel_path,
+                   seed_blob_oid, configuration_fingerprint, active_model_set_hash,
+                   engine_epoch, completion, budget_mode, product_kind, product,
+                   read_set_digest, published_at
+                 ) VALUES(
+                   'aa11bb22cc33dd44ee55ff66007788990011223344556677889900aabbccddee',
+                   'match', 'whole', 'src/Main.java', '',
+                   'bb11bb22cc33dd44ee55ff66007788990011223344556677889900aabbccddee',
+                   'cc11bb22cc33dd44ee55ff66007788990011223344556677889900aabbccddee',
+                   'dd11bb22cc33dd44ee55ff66007788990011223344556677889900aabbccddee',
+                   'complete', 'exhaustive', 'rows', '{}', zeroblob(32), 100
+                 )",
+                [],
+            )
+            .unwrap_err();
+        assert!(seeded_whole.to_string().contains("CHECK constraint failed"));
+
+        // Only exhaustive, complete units are publishable at all.
+        let bounded = conn
+            .execute("UPDATE policy_units SET budget_mode = 'bounded'", [])
+            .unwrap_err();
+        assert!(bounded.to_string().contains("CHECK constraint failed"));
+
+        // A product must be JSON, because that is the only thing a reader can
+        // do with the one column SQL does not inspect.
+        let opaque_product = conn
+            .execute("UPDATE policy_units SET product = 'not json'", [])
+            .unwrap_err();
+        assert!(
+            opaque_product
+                .to_string()
+                .contains("CHECK constraint failed")
+        );
+
+        conn.execute_batch(
+            "INSERT INTO policy_read_keys(key_digest, kind, languages, rel_path, blob_oid)
+               VALUES(zeroblob(32), 'file', 'java', 'src/Main.java',
+                      '1111111111111111111111111111111111111111');
+             INSERT INTO policy_unit_reads(unit_id, read_id)
+               VALUES((SELECT unit_id FROM policy_units),
+                      (SELECT read_id FROM policy_read_keys));
+             INSERT INTO policy_evaluations(
+               base_tree_oid, policy_set_digest, options_digest,
+               configuration_fingerprint, active_model_set_hash, engine_epoch,
+               resolved_commit, analyzed_source_bytes, analyzed_file_count,
+               unit_count, published_at
+             ) VALUES(
+               '2222222222222222222222222222222222222222',
+               'aa11bb22cc33dd44ee55ff66007788990011223344556677889900aabbccddee',
+               'bb11bb22cc33dd44ee55ff66007788990011223344556677889900aabbccddee',
+               'cc11bb22cc33dd44ee55ff66007788990011223344556677889900aabbccddee',
+               'dd11bb22cc33dd44ee55ff66007788990011223344556677889900aabbccddee',
+               'ee11bb22cc33dd44ee55ff66007788990011223344556677889900aabbccddee',
+               '3333333333333333333333333333333333333333', 42, 1, 1, 100
+             );
+             INSERT INTO policy_evaluation_units(evaluation_id, policy_id, ordinal, unit_id)
+               VALUES((SELECT evaluation_id FROM policy_evaluations), 'test.policy', 0,
+                      (SELECT unit_id FROM policy_units));",
+        )
+        .unwrap();
+
+        conn.execute(
+            "DELETE FROM blobs
+             WHERE blob_oid = '1111111111111111111111111111111111111111'
+               AND lang = 'java'",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM policy_units", [], |row| row
+                .get::<_, usize>(0))
+                .unwrap(),
+            0,
+            "a unit must follow the seed blob whose content it answered about"
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM policy_unit_reads", [], |row| row
+                .get::<_, usize>(0))
+                .unwrap(),
+            0,
+            "a unit's read membership must go with the unit"
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM policy_evaluation_units", [], |row| {
+                row.get::<_, usize>(0)
+            })
+            .unwrap(),
+            0,
+            "an evaluation's membership must go with the unit it named"
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM policy_evaluations", [], |row| row
+                .get::<_, usize>(
+                0
+            ))
+            .unwrap(),
+            1,
+            "the evaluation row survives its units, and its recorded unit count is what \
+             tells a reader the membership is no longer whole"
+        );
     }
 
     #[test]
@@ -4341,6 +4558,7 @@ mod tests {
     /// Fail-before: without [`RECOGNIZED_FOREIGN_STORES`] this test fails with
     /// that error, the upgrade is abandoned, and the assertions below see an
     /// empty store beside an ignored 248 MB one.
+    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
     #[test]
     fn foreign_import_bindings_lineage_v18_store_is_bridged_and_carried_forward() {
         let temp = tempfile::tempdir().unwrap();
@@ -4639,20 +4857,44 @@ mod tests {
             .collect()
     }
 
+    /// The non-key columns each carried fact family holds in `conn`.
+    ///
+    /// A store upgraded across an additive migration has columns the store it
+    /// was built from did not, so a comparison of the two has to be told which
+    /// columns to read rather than reading each side's own schema.
+    fn fact_table_columns(conn: &Connection) -> Vec<(String, Vec<String>)> {
+        CARRIED_ANALYZER_FACT_TABLES
+            .into_iter()
+            .map(|table| (table.to_string(), non_key_columns(conn, table)))
+            .collect()
+    }
+
     /// Every fact row of every family, projected as
     /// `(blob_oid, lang, <the table's other columns>)`.
+    fn analyzer_fact_snapshot(
+        conn: &Connection,
+    ) -> Vec<(String, Vec<String>, Vec<Vec<rusqlite::types::Value>>)> {
+        analyzer_fact_snapshot_of(conn, &fact_table_columns(conn))
+    }
+
+    /// The same projection restricted to `columns`.
     ///
     /// The projection is deliberately shape-independent: before migration 33 a
     /// row carries its own `blob_oid` and `lang`; after it, both come from the
     /// `blobs` row its `blob_id` names. Equality of two snapshots is therefore
-    /// the claim that the migration moved the key and nothing else.
-    fn analyzer_fact_snapshot(
+    /// the claim that the migration moved the key and left the columns it was
+    /// asked about alone. A column a later migration adds with a default is
+    /// outside that claim by construction, which is what the schema-object
+    /// assertion beside each use is for.
+    fn analyzer_fact_snapshot_of(
         conn: &Connection,
+        columns: &[(String, Vec<String>)],
     ) -> Vec<(String, Vec<String>, Vec<Vec<rusqlite::types::Value>>)> {
-        CARRIED_ANALYZER_FACT_TABLES
-            .into_iter()
-            .map(|table| {
-                let columns = non_key_columns(conn, table);
+        columns
+            .iter()
+            .map(|(table, columns)| {
+                let table = table.as_str();
+                let columns = columns.clone();
                 let projected = columns
                     .iter()
                     .map(|column| format!("t.{column}"))
@@ -4844,13 +5086,14 @@ mod tests {
         let cache_dir = temp.path();
         let older = store_path(cache_dir, 32);
         create_store_at(&older, &migrations_through(32), 32);
-        let (expected_facts, expected_blobs, expected_semantic) = {
+        let (expected_columns, expected_facts, expected_blobs, expected_semantic) = {
             let older_conn = Connection::open(&older).unwrap();
             older_conn
                 .pragma_update(None, "foreign_keys", "ON")
                 .unwrap();
             seed_v32_analyzer_facts(&older_conn);
             (
+                fact_table_columns(&older_conn),
                 analyzer_fact_snapshot(&older_conn),
                 blob_registry_rows(&older_conn),
                 semantic_rows(&older_conn),
@@ -4870,7 +5113,7 @@ mod tests {
             CURRENT_MIGRATION_VERSION
         );
         assert_eq!(
-            analyzer_fact_snapshot(&conn),
+            analyzer_fact_snapshot_of(&conn, &expected_columns),
             expected_facts,
             "every retained fact family must read back identically after interning"
         );

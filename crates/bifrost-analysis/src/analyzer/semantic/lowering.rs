@@ -14,17 +14,19 @@ use super::cfg::{
 };
 use super::{
     AllocationId, AllocationKind, AllocationSite, ArgumentDomain, AsyncResumeKind,
-    CallContinuationKind, CallSiteId, CallableTargetResolution, CancellationToken, CaptureBinding,
-    CaptureId, CaptureMode, CaptureSource, ControlContinuation, ControlEdge, ControlEdgeKind,
-    Evidence, EvidenceCompleteness, EvidenceId, FormalMultiplicity, GuardArm, GuardFactParts,
-    GuardId, GuardPredicate, MemoryAccessKind, MemoryLocation, MemoryLocationId,
-    MemoryLocationKind, ProcedureId, ProcedureSemanticsParts, ProgramPointId, ProofStatus,
-    SemanticBudget, SemanticBudgetExceeded, SemanticCallArgument, SemanticCallSite,
-    SemanticCapability, SemanticEffect, SemanticEvent, SemanticGap, SemanticGapDischarge,
-    SemanticGapId, SemanticGapImpacts, SemanticGapKind, SemanticGapSubject, SemanticLocator,
-    SemanticOutcome, SemanticProviderError, SemanticRole, SemanticValue, SemanticValueKind,
-    SemanticWork, SourceAnchor, SourceMapping, SourceMappingId, SourceMappingKind, SourcePosition,
-    SourceSpan, StructuralNodeIdentity, ValueFlowKind, ValueId,
+    CallContinuationKind, CallInvocationMode, CallSiteId, CallableTargetResolution,
+    CancellationToken, CaptureBinding, CaptureId, CaptureMode, CaptureSource, ControlContinuation,
+    ControlEdge, ControlEdgeKind, Evidence, EvidenceCompleteness, EvidenceId, ExecutionTiming,
+    FormalMultiplicity, GuardArm, GuardFactParts, GuardId, GuardPredicate, MemoryAccessKind,
+    MemoryLocation, MemoryLocationId, MemoryLocationKind, ProcedureId, ProcedureSemanticsParts,
+    ProgramPointId, ProofStatus, SemanticBudget, SemanticBudgetExceeded, SemanticCallArgument,
+    SemanticCallSite, SemanticCapability, SemanticEffect, SemanticEvent, SemanticGap,
+    SemanticGapDischarge, SemanticGapId, SemanticGapImpacts, SemanticGapKind, SemanticGapSubject,
+    SemanticLocator, SemanticOutcome, SemanticProviderError, SemanticRole, SemanticValue,
+    SemanticValueKind, SemanticWork, SourceAnchor, SourceMapping, SourceMappingId,
+    SourceMappingKind, SourcePosition, SourceSpan, StructuralNodeIdentity, SwitchCaseFactParts,
+    SwitchEdgeParts, SwitchFactId, SwitchFactKind, SwitchFactParts, SwitchSelectorDomain,
+    ValueFlowKind, ValueId,
 };
 
 /// Common operational failures produced while lowering one procedure.
@@ -659,6 +661,30 @@ pub(crate) struct CallSiteScaffold {
     pub(crate) exceptional_continuation: ProgramPointId,
 }
 
+/// Adapter-supplied values for a call whose work starts in another task while
+/// the registering procedure continues normally. The spawned work has no
+/// exceptional continuation in its registering procedure.
+pub(crate) struct SpawnedCallSiteScaffold {
+    pub(crate) point: ProgramPointId,
+    pub(crate) callee: ValueId,
+    pub(crate) receiver: Option<ValueId>,
+    pub(crate) arguments: Box<[SemanticCallArgument]>,
+    pub(crate) declared_targets: CallableTargetResolution,
+    pub(crate) normal_continuation: ProgramPointId,
+}
+
+/// Adapter-supplied structure for one normalized switch fact. Source and
+/// evidence metadata remain owned by the lowering session at `point`.
+pub(crate) struct SwitchFactScaffold {
+    pub(crate) point: ProgramPointId,
+    pub(crate) kind: SwitchFactKind,
+    pub(crate) selector: Option<ValueId>,
+    pub(crate) selector_domain: SwitchSelectorDomain,
+    pub(crate) cases: Vec<SwitchCaseFactParts>,
+    pub(crate) default_edge: Option<SwitchEdgeParts>,
+    pub(crate) default_present: bool,
+}
+
 pub(crate) struct ProcedureLoweringStart<'a> {
     pub(crate) builder: ProcedureCfgBuilder,
     pub(crate) session: ProcedureLoweringSession<'a>,
@@ -681,6 +707,7 @@ pub(crate) struct ProcedureLoweringSession<'a> {
     next_call_site: usize,
     next_gap: usize,
     next_guard: usize,
+    next_switch_fact: usize,
     source_occurrences: HashMap<(usize, usize), u32>,
     cancellation: &'a CancellationToken,
 }
@@ -784,6 +811,7 @@ impl<'a> ProcedureLoweringSession<'a> {
             next_call_site: 0,
             next_gap: 0,
             next_guard: 0,
+            next_switch_fact: 0,
             source_occurrences: HashMap::default(),
             cancellation,
         };
@@ -1097,7 +1125,10 @@ impl<'a> ProcedureLoweringSession<'a> {
         let location = self.add_memory_location(
             builder,
             point,
-            MemoryLocationKind::Capture { lexical_parent },
+            MemoryLocationKind::Capture {
+                lexical_parent,
+                binding: Some(value),
+            },
         )?;
         if location != RECEIVER_CAPTURE_DESTINATION {
             return Err(ProcedureLoweringError::Invalid(format!(
@@ -1366,10 +1397,53 @@ impl<'a> ProcedureLoweringSession<'a> {
         Ok(id)
     }
 
+    pub(crate) fn add_switch_fact(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        fact: SwitchFactScaffold,
+    ) -> Result<SwitchFactId, ProcedureLoweringError> {
+        let metadata = self.metadata(fact.point)?;
+        let id = SwitchFactId::try_from_index(self.next_switch_fact)
+            .map_err(|_| ProcedureLoweringError::Invalid("too many switch facts".into()))?;
+        builder.add_switch_fact(SwitchFactParts {
+            id,
+            kind: fact.kind,
+            point: fact.point,
+            selector: fact.selector,
+            selector_domain: fact.selector_domain,
+            cases: fact.cases,
+            default_edge: fact.default_edge,
+            default_present: fact.default_present,
+            source: metadata.source,
+            evidence: metadata.evidence,
+        })?;
+        self.next_switch_fact += 1;
+        Ok(id)
+    }
+
     pub(crate) fn add_call_site(
         &mut self,
         builder: &mut ProcedureCfgBuilder,
         call: CallSiteScaffold,
+    ) -> Result<CallSiteId, ProcedureLoweringError> {
+        self.add_call_site_with_timing(builder, call, ExecutionTiming::SameEvaluation)
+    }
+
+    /// Publish a supported call that executes later in the same procedure
+    /// invocation, such as a Go defer reached on its cleanup route.
+    pub(crate) fn add_deferred_call_site(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        call: CallSiteScaffold,
+    ) -> Result<CallSiteId, ProcedureLoweringError> {
+        self.add_call_site_with_timing(builder, call, ExecutionTiming::SameInvocation)
+    }
+
+    fn add_call_site_with_timing(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        call: CallSiteScaffold,
+        execution_timing: ExecutionTiming,
     ) -> Result<CallSiteId, ProcedureLoweringError> {
         let metadata = self.metadata(call.point)?;
         let id = CallSiteId::try_from_index(self.next_call_site)
@@ -1377,6 +1451,8 @@ impl<'a> ProcedureLoweringSession<'a> {
         builder.add_call_site(SemanticCallSite {
             id,
             point: call.point,
+            invocation_mode: CallInvocationMode::Ordinary,
+            execution_timing,
             callee: call.callee,
             receiver: call.receiver,
             arguments: call.arguments,
@@ -1410,6 +1486,52 @@ impl<'a> ProcedureLoweringSession<'a> {
             SemanticEffect::CallContinuation {
                 call_site: id,
                 kind: CallContinuationKind::Exceptional,
+            },
+        )?;
+        Ok(id)
+    }
+
+    /// Publish a call started by an exact spawned-work construct. The
+    /// registering activation has a normal continuation but never receives a
+    /// return or panic edge from the spawned body.
+    pub(crate) fn add_spawned_call_site(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        call: SpawnedCallSiteScaffold,
+    ) -> Result<CallSiteId, ProcedureLoweringError> {
+        let metadata = self.metadata(call.point)?;
+        let id = CallSiteId::try_from_index(self.next_call_site)
+            .map_err(|_| ProcedureLoweringError::Invalid("too many call sites".into()))?;
+        builder.add_call_site(SemanticCallSite {
+            id,
+            point: call.point,
+            invocation_mode: CallInvocationMode::Detached,
+            execution_timing: ExecutionTiming::DifferentTask,
+            callee: call.callee,
+            receiver: call.receiver,
+            arguments: call.arguments,
+            normal_results: Box::new([]),
+            result: None,
+            thrown: None,
+            declared_targets: call.declared_targets,
+            target_evidence: metadata.evidence,
+            normal_continuation: ControlContinuation::Target(call.normal_continuation),
+            exceptional_continuation: ControlContinuation::Absent,
+            source: metadata.source,
+            evidence: metadata.evidence,
+        })?;
+        self.next_call_site += 1;
+        self.append_effect(
+            builder,
+            call.point,
+            SemanticEffect::Invoke { call_site: id },
+        )?;
+        self.append_effect(
+            builder,
+            call.normal_continuation,
+            SemanticEffect::CallContinuation {
+                call_site: id,
+                kind: CallContinuationKind::Normal,
             },
         )?;
         Ok(id)

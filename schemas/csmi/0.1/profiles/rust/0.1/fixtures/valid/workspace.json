@@ -1,0 +1,9 @@
+{
+  "kind": "workspace",
+  "members": [
+    "pkg:cargo/acme-cli@1.4.0",
+    "pkg:cargo/acme-codec@1.4.0"
+  ],
+  "selectedMembers": ["pkg:cargo/acme-codec@1.4.0"],
+  "cargoResolver": "2"
+}

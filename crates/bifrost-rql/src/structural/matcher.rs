@@ -346,19 +346,26 @@ fn eval_pattern_inner_with_name(
         }
     }
 
-    // Positional args: the listed patterns must match distinct arguments in
-    // order, but not necessarily contiguously (greedy subsequence).
-    if !pattern.args.is_empty() {
-        let targets: Vec<&RoleTarget> = roles
-            .iter()
-            .filter(|target| target.role == Role::Arg)
-            .collect();
+    // List roles: the listed patterns must match distinct edges of that role
+    // in source order, but not necessarily contiguously (greedy subsequence).
+    // Arguments, collection elements, JSX attributes, and JSX children are all
+    // spelled in order and a decorator list reads the same way, so one rule
+    // serves every list role. Reading the roles from the registry rather than
+    // naming them is what makes a new list role enforced on arrival: `args`
+    // and `decorators` were once hand-written arms and `elements`,
+    // `attributes`, and `children` were silently unverified (#2647).
+    for &role in Role::list_target_roles() {
+        let sub_patterns = pattern.list_role_patterns(role);
+        if sub_patterns.is_empty() {
+            continue;
+        }
+        let targets: Vec<&RoleTarget> = roles.iter().filter(|target| target.role == role).collect();
         let mut cursor = 0usize;
-        for arg_pattern in &pattern.args {
+        for sub_pattern in sub_patterns {
             let mut advanced = None;
             for (offset, target) in targets[cursor..].iter().enumerate() {
                 if eval_target(
-                    arg_pattern,
+                    sub_pattern,
                     facts,
                     target,
                     captures,
@@ -395,27 +402,6 @@ fn eval_pattern_inner_with_name(
                         oracle,
                         incomplete,
                     )
-            });
-        if !matched {
-            return false;
-        }
-    }
-
-    // Each decorator pattern must match some decorator edge.
-    for decorator_pattern in &pattern.decorators {
-        let matched = roles
-            .iter()
-            .filter(|target| target.role == Role::Decorator)
-            .any(|target| {
-                eval_target(
-                    decorator_pattern,
-                    facts,
-                    target,
-                    captures,
-                    examined_facts,
-                    oracle,
-                    incomplete,
-                )
             });
         if !matched {
             return false;

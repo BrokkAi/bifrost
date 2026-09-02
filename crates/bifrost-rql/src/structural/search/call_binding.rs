@@ -28,14 +28,15 @@
 use super::*;
 
 use crate::analyzer::lexical_definitions::{
-    FormalParameterLayout, FormalParameterSlot, FormalVariadicKind, receiver_is_declared_parameter,
+    FormalParameterLayout, FormalParameterPassingMode, FormalParameterSlot, FormalVariadicKind,
+    receiver_is_declared_parameter,
 };
 use crate::analyzer::semantic::LengthDelimitedDigest;
 use crate::analyzer::semantic_model::{
-    Completeness, ProcedureSummaryMemberKey, SemanticModelCallableDisposition,
-    SemanticModelCallableIncompleteReason, SemanticModelCallableKey, SemanticModelCompleteness,
-    SemanticModelMatchDisposition, SemanticModelOriginKind, SemanticModelProof,
-    SemanticModelProvenance,
+    Completeness, ParameterPassingMode, ProcedureSummaryMemberKey, SemanticModelCallApplication,
+    SemanticModelCallableDisposition, SemanticModelCallableIncompleteReason,
+    SemanticModelCallableKey, SemanticModelCompleteness, SemanticModelMatchDisposition,
+    SemanticModelOriginKind, SemanticModelProof, SemanticModelProvenance,
 };
 use crate::analyzer::usages::call_binding::{
     CallBindingCoverage, CallBindingMapping, CallBindingReport, CallBindingRow, CallBindingTarget,
@@ -49,7 +50,7 @@ use crate::analyzer::usages::callable_signature::{
 };
 use crate::analyzer::usages::effects::ModeledProcedureKey;
 use crate::analyzer::usages::get_definition::DefinitionLookupStatus;
-use brokk_bifrost_core::analyzer::structural::callable::ReceiverContract;
+use brokk_bifrost_core::analyzer::structural::callable::{CallShapeCoverage, ReceiverContract};
 
 use super::dispatch::DispatchSiteAnswer;
 
@@ -66,6 +67,12 @@ pub(super) struct CallBindingSiteValue {
     /// Absent when entries with different parameter lists accept it, or none
     /// does, because naming one would be a selection nothing made.
     pub(super) signature_id: Option<String>,
+    /// Exact callable-family identity. Complete overload families retain one
+    /// identity here without selecting an overload record.
+    pub(super) model_callable_id: Option<String>,
+    /// Exact formal-layout identity for this call application. This remains
+    /// available when compatible overloads share the layout.
+    pub(super) formal_layout_id: Option<String>,
     /// The semantic dispatch answer for this exact call range. Its target
     /// identity is the #2438 dispatch identity; source declarations remain a
     /// presentation-only materialized view.
@@ -221,10 +228,20 @@ enum ModelCallBinding {
         receiver: CallReceiverBinding,
         key: ModeledProcedureKey,
         model_id: String,
+        model_callable_id: String,
         pack_id: String,
         receiver_type_id: Option<String>,
         signature_id: String,
         semantic_model_provenance: Arc<SemanticModelProvenance>,
+    },
+    CompatibleLayout {
+        layout: FormalParameterLayout,
+        receiver: CallReceiverBinding,
+        key: ModeledProcedureKey,
+        model_callable_id: String,
+        formal_layout_id: String,
+        pack_id: String,
+        receiver_type_id: Option<String>,
     },
     Conflict,
     Incomplete {
@@ -235,6 +252,71 @@ enum ModelCallBinding {
     },
     Empty,
     Unavailable,
+}
+
+fn model_formal_layout(
+    signature: &crate::analyzer::semantic_model::Signature,
+    shape: &CallShapeValue,
+) -> FormalParameterLayout {
+    let slots = signature
+        .parameters
+        .iter()
+        .map(|parameter| {
+            let name = parameter
+                .name
+                .clone()
+                .expect("an applicable model layout has every formal name");
+            let passing_mode = match parameter.passing_mode {
+                ParameterPassingMode::PositionalOnly => FormalParameterPassingMode::PositionalOnly,
+                ParameterPassingMode::PositionalOrNamed => {
+                    FormalParameterPassingMode::PositionalOrNamed
+                }
+                ParameterPassingMode::NamedOnly => FormalParameterPassingMode::NamedOnly,
+            };
+            let variadic = parameter.variadic.then_some(match parameter.passing_mode {
+                ParameterPassingMode::NamedOnly => FormalVariadicKind::Keyword,
+                ParameterPassingMode::PositionalOnly | ParameterPassingMode::PositionalOrNamed => {
+                    FormalVariadicKind::Positional
+                }
+            });
+            FormalParameterSlot {
+                names: vec![name],
+                // Model records have no source parameter range. The call
+                // range is the only source-backed location available; it is
+                // used only to keep default rows addressable.
+                declaration_range: shape.report.outcome.range,
+                receiver: false,
+                variadic,
+                passing_mode,
+                default_range: parameter.optional.then_some(shape.report.outcome.range),
+            }
+        })
+        .collect();
+    FormalParameterLayout {
+        slots,
+        python_binding: None,
+    }
+}
+
+fn model_receiver_binding(
+    target: &crate::analyzer::semantic::UnmaterializedExternalTarget,
+    shape: &CallShapeValue,
+) -> CallReceiverBinding {
+    if target.has_receiver() {
+        shape
+            .report
+            .outcome
+            .receiver_range
+            .map(|range| CallReceiverBinding::Actual {
+                range,
+                declared_first_ordinary: false,
+            })
+            .unwrap_or(CallReceiverBinding::Unestablished {
+                range: shape.report.outcome.range,
+            })
+    } else {
+        CallReceiverBinding::Absent
+    }
 }
 
 fn model_call_binding(
@@ -262,7 +344,9 @@ fn model_call_binding(
         modeled_key.has_receiver,
         modeled_key.parameter_count,
     );
-    let matched = overlay.callable_for_target(key);
+    let application = structured_model_application(shape);
+    let model_callable_id = overlay.callable_family_id_for_target(key);
+    let matched = overlay.callable_for_application(key, &application);
     let provenance = matched
         .records
         .first()
@@ -281,66 +365,66 @@ fn model_call_binding(
                     semantic_model_provenance: provenance,
                 };
             };
-            let mut slots = Vec::with_capacity(signature.parameters.len());
-            for (ordinal, parameter) in signature.parameters.iter().enumerate() {
-                let Some(name) = parameter.name.clone() else {
-                    return ModelCallBinding::Incomplete {
-                        model_id: model_id.clone(),
-                        pack_id: provenance.as_ref().map(|value| value.pack_id.clone()),
-                        reason: SemanticModelCallableIncompleteReason::MissingFormalName {
-                            ordinal,
-                        },
-                        semantic_model_provenance: provenance,
-                    };
-                };
-                slots.push(FormalParameterSlot {
-                    names: vec![name],
-                    // Model records have no source parameter range. The call
-                    // range is the only source-backed location available; it
-                    // is used only to keep default rows addressable.
-                    declaration_range: shape.report.outcome.range,
-                    receiver: false,
-                    variadic: parameter.variadic.then_some(FormalVariadicKind::Positional),
-                    default_range: parameter.optional.then_some(shape.report.outcome.range),
-                });
-            }
-            let receiver = if target.has_receiver() {
-                shape
-                    .report
-                    .outcome
-                    .receiver_range
-                    .map(|range| CallReceiverBinding::Actual {
-                        range,
-                        declared_first_ordinary: false,
-                    })
-                    .unwrap_or(CallReceiverBinding::Unestablished {
-                        range: shape.report.outcome.range,
-                    })
-            } else {
-                CallReceiverBinding::Absent
-            };
+            let layout = model_formal_layout(signature, shape);
+            let receiver = model_receiver_binding(target, shape);
             let Some(model_provenance) = provenance else {
                 return ModelCallBinding::Unavailable;
             };
             let model_id = symbol.id.clone();
             let pack_id = model_provenance.pack_id.clone();
             let signature_id = model_signature_id(&model_id, signature);
+            let Some(model_callable_id) = model_callable_id else {
+                return ModelCallBinding::Conflict;
+            };
             let receiver_type_id = target
                 .has_receiver()
                 .then(|| symbol.owner_id.clone())
                 .flatten();
             ModelCallBinding::Unique {
-                layout: FormalParameterLayout {
-                    slots,
-                    python_binding: None,
-                },
+                layout,
                 receiver,
                 key: modeled_key,
                 model_id,
+                model_callable_id,
                 pack_id,
                 receiver_type_id,
                 signature_id,
                 semantic_model_provenance: model_provenance,
+            }
+        }
+        SemanticModelCallableDisposition::CompatibleLayout => {
+            let Some(symbol) = matched.records.first().copied() else {
+                return ModelCallBinding::Unavailable;
+            };
+            let Some(signature) = symbol.structured_signature() else {
+                return ModelCallBinding::Unavailable;
+            };
+            let layout = model_formal_layout(signature, shape);
+            let Some(model_callable_id) = model_callable_id else {
+                return ModelCallBinding::Conflict;
+            };
+            let formal_layout_id = model_signature_id(&model_callable_id, signature);
+            let Some(pack_id) = matched
+                .records
+                .iter()
+                .map(|candidate| candidate.provenance.pack_id.as_str())
+                .reduce(|left, right| if left == right { left } else { "" })
+                .filter(|pack_id| !pack_id.is_empty())
+                .map(str::to_owned)
+            else {
+                return ModelCallBinding::Conflict;
+            };
+            ModelCallBinding::CompatibleLayout {
+                layout,
+                receiver: model_receiver_binding(target, shape),
+                key: modeled_key,
+                model_callable_id,
+                formal_layout_id,
+                pack_id,
+                receiver_type_id: target
+                    .has_receiver()
+                    .then(|| symbol.owner_id.clone())
+                    .flatten(),
             }
         }
         SemanticModelCallableDisposition::Conflict => ModelCallBinding::Conflict,
@@ -358,6 +442,7 @@ enum SourceTargetModelProvenance {
     Absent,
     Exact {
         model_id: String,
+        model_callable_id: String,
         receiver_type_id: Option<String>,
         provenance: Arc<SemanticModelProvenance>,
         key: ModeledProcedureKey,
@@ -380,6 +465,13 @@ fn model_provenance_for_source_target(
     else {
         return SourceTargetModelProvenance::Absent;
     };
+    let model_callable_id = overlay.callable_family_id_for_target(SemanticModelCallableKey::new(
+        &key.language,
+        &key.owner,
+        &key.member,
+        key.has_receiver,
+        key.parameter_count,
+    ));
     let matched = overlay.callable_for_target(SemanticModelCallableKey::new(
         &key.language,
         &key.owner,
@@ -395,6 +487,12 @@ fn model_provenance_for_source_target(
         return match matched.disposition {
             SemanticModelCallableDisposition::Empty => SourceTargetModelProvenance::Absent,
             SemanticModelCallableDisposition::Unique => unreachable!("unique match has a record"),
+            SemanticModelCallableDisposition::CompatibleLayout => {
+                SourceTargetModelProvenance::Incomplete {
+                    model_id: None,
+                    provenance: None,
+                }
+            }
             SemanticModelCallableDisposition::Conflict => SourceTargetModelProvenance::Incomplete {
                 model_id: None,
                 provenance: None,
@@ -410,6 +508,8 @@ fn model_provenance_for_source_target(
     debug_assert!(!symbol.provenance.ambiguous);
     SourceTargetModelProvenance::Exact {
         model_id: symbol.id.clone(),
+        model_callable_id: model_callable_id
+            .expect("an exact source model target must retain its callable family identity"),
         receiver_type_id: key.has_receiver.then(|| symbol.owner_id.clone()).flatten(),
         provenance: Arc::new(symbol.provenance.clone()),
         key,
@@ -530,11 +630,17 @@ mod authored_override_residual_tests {
             semantic_unsupported: None,
             exceeded_limit: None,
             arms: Vec::new(),
+            call_contexts: vec![super::super::dispatch::DispatchCallContext {
+                caller: None,
+                caller_is_exact: false,
+            }],
             unnamed_boundaries: vec!["unresolved"],
         };
         for outcome in ["unknown", "unproven"] {
             let mut answer = answer(outcome);
             answer.arms.push(super::super::dispatch::DispatchArm {
+                call_context: 0,
+                execution_timing: crate::analyzer::semantic::ExecutionTiming::Unknown,
                 target_id: "target".to_owned(),
                 target_path: "target".to_owned(),
                 target_unit: None,
@@ -633,47 +739,65 @@ pub(super) fn call_binding_expansions(
         ResolvedCallTarget::Unit(unit) => {
             let source_target = unit.clone();
             let declaration = indexed.get(analyzer, &unit);
-            let selection = declaration.as_ref().map(|declaration| {
+            // A class-shaped callee and its constructor formal owner are
+            // intentionally different identities. Binding rows retain the
+            // class as their resolved target, while signature selection joins
+            // the constructor declaration that owns the formals.
+            let owner = formal_owner_for_callee(analyzer, &unit);
+            let signature_unit = owner.as_ref().map(|(owner, _)| owner).unwrap_or(&unit);
+            let signature_declaration = indexed.get(analyzer, signature_unit);
+            let selection = signature_declaration.as_ref().map(|declaration| {
                 selected_signature(analyzer, declaration, shape.report.arguments.len())
             });
             let signature_id = selection
                 .as_ref()
                 .and_then(|selection| selection.signature_id.clone());
+            let signature_ambiguous = selection
+                .as_ref()
+                .map(|selection| selection.ambiguous)
+                .unwrap_or_else(|| {
+                    signature_set_is_ambiguous(
+                        analyzer,
+                        signature_unit,
+                        shape.report.arguments.len(),
+                    )
+                });
             let contract = selection.and_then(|selection| selection.receiver_contract);
-            // A class callee is a constructor call in the one language that
-            // spells it that way, and its formals are the constructor's.
-            let owner = formal_owner_for_callee(analyzer, &unit);
             // A layout nobody recorded is stated, never defaulted to "no
             // parameters": an empty parameter list and an unread one are
             // different answers about the same callable.
             let layout = owner
                 .as_ref()
                 .and_then(|(owner, _)| bindings.formal_layout(analyzer, owner));
-            let target = match (owner, layout) {
-                (Some((owner, constructor)), Some(layout)) => {
-                    match receiver_binding(
-                        analyzer,
-                        shape,
-                        &owner,
-                        &layout,
-                        contract,
-                        constructor,
-                        bindings,
-                    ) {
-                        // The receiver's own resolution failed in a language
-                        // that binds it into the declared parameter list, so
-                        // which slot the first actual reaches is exactly what
-                        // is unknown. Refusing keeps a wrong formal index out
-                        // of the relation.
-                        None => CallBindingTarget::ReceiverBindingUnsupported { unit },
-                        Some(receiver) => CallBindingTarget::Resolved {
-                            unit,
-                            layout,
-                            receiver,
-                        },
+            let target = if signature_ambiguous {
+                CallBindingTarget::Ambiguous
+            } else {
+                match (owner, layout) {
+                    (Some((owner, constructor)), Some(layout)) => {
+                        match receiver_binding(
+                            analyzer,
+                            shape,
+                            &owner,
+                            &layout,
+                            contract,
+                            constructor,
+                            bindings,
+                        ) {
+                            // The receiver's own resolution failed in a language
+                            // that binds it into the declared parameter list, so
+                            // which slot the first actual reaches is exactly what
+                            // is unknown. Refusing keeps a wrong formal index out
+                            // of the relation.
+                            None => CallBindingTarget::ReceiverBindingUnsupported { unit },
+                            Some(receiver) => CallBindingTarget::Resolved {
+                                unit,
+                                layout,
+                                receiver,
+                            },
+                        }
                     }
+                    _ => CallBindingTarget::FormalsUnrecorded { unit },
                 }
-                _ => CallBindingTarget::FormalsUnrecorded { unit },
             };
             (target, declaration, signature_id, Some(source_target))
         }
@@ -690,6 +814,8 @@ pub(super) fn call_binding_expansions(
             CallBindingDispatch::from_answer(answer, source_target.as_ref(), None)
         });
     let mut model_id = None;
+    let mut model_callable_id = None;
+    let mut formal_layout_id = None;
     let mut pack_id = None;
     let mut receiver_type_id = None;
     let mut semantic_target_id = source_target
@@ -699,6 +825,7 @@ pub(super) fn call_binding_expansions(
     let mut semantic_model_provenance = None;
     let mut modeled_key = None;
     let mut model_static_selector_proven = false;
+    let mut model_layout_compatible = false;
     // A unique model record can describe the source resolver's declaration
     // even when runtime dispatch remains open. Keep those two facts separate:
     // model provenance never upgrades the dispatch proof below.
@@ -707,11 +834,13 @@ pub(super) fn call_binding_expansions(
             SourceTargetModelProvenance::Absent => {}
             SourceTargetModelProvenance::Exact {
                 model_id: resolved_model_id,
+                model_callable_id: resolved_model_callable_id,
                 receiver_type_id: resolved_receiver_type_id,
                 provenance,
                 key,
             } => {
                 model_id = Some(resolved_model_id);
+                model_callable_id = Some(resolved_model_callable_id);
                 pack_id = Some(provenance.pack_id.clone());
                 receiver_type_id = resolved_receiver_type_id;
                 semantic_model_provenance = Some(provenance);
@@ -748,6 +877,7 @@ pub(super) fn call_binding_expansions(
                 receiver,
                 key,
                 model_id: resolved_model_id,
+                model_callable_id: resolved_model_callable_id,
                 pack_id: resolved_pack_id,
                 receiver_type_id: resolved_receiver_type_id,
                 signature_id: resolved_signature_id,
@@ -759,11 +889,35 @@ pub(super) fn call_binding_expansions(
                 target = CallBindingTarget::ResolvedExternal { layout, receiver };
                 signature_id = Some(resolved_signature_id);
                 model_id = Some(resolved_model_id);
+                model_callable_id = Some(resolved_model_callable_id);
+                formal_layout_id = signature_id.clone();
                 pack_id = Some(resolved_pack_id);
                 receiver_type_id = resolved_receiver_type_id;
                 semantic_target_id = Some(arm.target_id.clone());
                 target_origin = Some("semantic_model");
                 semantic_model_provenance = Some(resolved_provenance);
+                modeled_key = Some(key);
+            }
+            ModelCallBinding::CompatibleLayout {
+                layout,
+                receiver,
+                key,
+                model_callable_id: resolved_model_callable_id,
+                formal_layout_id: resolved_formal_layout_id,
+                pack_id: resolved_pack_id,
+                receiver_type_id: resolved_receiver_type_id,
+            } => {
+                model_static_selector_proven = dispatch_answer
+                    .as_ref()
+                    .is_some_and(resolver_proven_static_model_selector);
+                model_layout_compatible = true;
+                model_callable_id = Some(resolved_model_callable_id);
+                formal_layout_id = Some(resolved_formal_layout_id);
+                target = CallBindingTarget::ResolvedExternal { layout, receiver };
+                pack_id = Some(resolved_pack_id);
+                receiver_type_id = resolved_receiver_type_id;
+                semantic_target_id = Some(arm.target_id.clone());
+                target_origin = Some("semantic_model");
                 modeled_key = Some(key);
             }
             ModelCallBinding::Conflict => {
@@ -796,6 +950,12 @@ pub(super) fn call_binding_expansions(
         }
     }
 
+    if model_callable_id.is_none() {
+        model_callable_id = model_id.clone();
+    }
+    if formal_layout_id.is_none() {
+        formal_layout_id = signature_id.clone();
+    }
     let report = Arc::new(call_binding_report(&file, &shape.report, target));
     // The owner identity is meaningful only when this call's shared binder
     // emitted an exact receiver/implicit row. In particular, do not attach a
@@ -818,7 +978,7 @@ pub(super) fn call_binding_expansions(
         receiver_type_id = None;
     }
     let binding_is_exact = matches!(report.coverage, CallBindingCoverage::Exhaustive)
-        && signature_id.is_some()
+        && (signature_id.is_some() || model_layout_compatible)
         && report
             .rows
             .iter()
@@ -871,6 +1031,8 @@ pub(super) fn call_binding_expansions(
         report,
         target: declaration,
         signature_id,
+        model_callable_id,
+        formal_layout_id,
         dispatch,
         selector,
         semantic_target_id,
@@ -888,6 +1050,28 @@ pub(super) fn call_binding_expansions(
             })))
         })
         .collect()
+}
+
+/// The exact call partition already published by the shared shape relation.
+/// Missing or non-exact coverage is typed unknown; no source reparse happens
+/// here, and no argument is inferred from a callee display string.
+fn structured_model_application(shape: &CallShapeValue) -> SemanticModelCallApplication {
+    if shape.report.outcome.coverage != CallShapeCoverage::Exact {
+        return SemanticModelCallApplication::Unknown;
+    }
+
+    let mut positional_count = 0usize;
+    let mut named_labels = Vec::new();
+    let mut has_spread = false;
+    for argument in &shape.report.arguments {
+        has_spread |= argument.spread;
+        if let Some(name) = argument.name.as_ref() {
+            named_labels.push(name.clone());
+        } else if !argument.spread {
+            positional_count += 1;
+        }
+    }
+    SemanticModelCallApplication::structured(positional_count, named_labels, has_spread)
 }
 
 /// What the production definition resolver names for one call site's callee
@@ -946,6 +1130,10 @@ struct SelectedSignature {
     /// The `callable_signature` row this binding selects, when the entries name
     /// exactly one.
     signature_id: Option<String>,
+    /// More than one structurally different signature accepts the written
+    /// arity. Without a language-owned applicability/type verdict, no formal
+    /// layout may be selected from that set.
+    ambiguous: bool,
     /// The receiver contract the selected entry declares, or the one every
     /// entry agrees on when selection did not narrow to one.
     receiver_contract: Option<ReceiverContract>,
@@ -966,9 +1154,11 @@ struct SelectedSignature {
 /// so the entry carrying the body is named. Anything else names nothing, and
 /// the row says so rather than naming entry zero (issue #2499).
 ///
-/// An entry whose arity the adapter never recorded makes the whole set
-/// undecidable: a parameter list nobody read cannot be shown not to accept
-/// this call.
+/// An entry whose arity the adapter never recorded normally makes the whole
+/// set undecidable. There is one conservative exception: two declaration-only
+/// overload headers that each publish exactly as many parameter rows as the
+/// call writes are both possible targets. That proves ambiguity without
+/// pretending to perform the language's missing type-applicability step.
 ///
 /// The id is minted by the same projection the `callable_signature` step
 /// publishes, so it joins that domain exactly.
@@ -980,9 +1170,27 @@ fn selected_signature(
     let declaration_id = callable_signature::declaration_site_id(declaration);
     let entries = analyzer.signature_metadata(&declaration.unit);
     let reports = callable_signature_reports(&declaration_id, &declaration.unit, &entries);
-    let selected = match reports.as_slice() {
-        [] => None,
-        [only] => Some(only),
+    signature_choice(&reports, actual_count)
+}
+
+/// Whether a source target whose declaration-site projection is unavailable
+/// still publishes an overload set that the written arity cannot distinguish.
+/// The temporary row-id anchor is never rendered; selection reads only the
+/// adapter-owned arity and parameter metadata.
+fn signature_set_is_ambiguous(
+    analyzer: &dyn IAnalyzer,
+    unit: &CodeUnit,
+    actual_count: usize,
+) -> bool {
+    let entries = analyzer.signature_metadata(unit);
+    let reports = callable_signature_reports("unprojected-source-target", unit, &entries);
+    signature_choice(&reports, actual_count).ambiguous
+}
+
+fn signature_choice(reports: &[CallableSignatureReport], actual_count: usize) -> SelectedSignature {
+    let (selected, mut ambiguous) = match reports {
+        [] => (None, false),
+        [only] => (Some(only), false),
         several
             if several
                 .iter()
@@ -998,28 +1206,44 @@ fn selected_signature(
                 })
                 .collect::<Vec<_>>();
             match accepting.as_slice() {
-                [only] => Some(*only),
+                [only] => (Some(*only), false),
                 [first, rest @ ..]
                     if rest
                         .iter()
                         .all(|report| declares_the_same_parameters(first, report)) =>
                 {
-                    accepting
-                        .iter()
-                        .copied()
-                        .find(|report| !report.signature.declaration_only)
-                        .or(Some(*first))
+                    (
+                        accepting
+                            .iter()
+                            .copied()
+                            .find(|report| !report.signature.declaration_only)
+                            .or(Some(*first)),
+                        false,
+                    )
                 }
-                _ => None,
+                [_, _, ..] => (None, true),
+                [] => (None, false),
             }
         }
-        _ => None,
+        _ => (None, false),
     };
+    if selected.is_none() && !ambiguous {
+        ambiguous = reports
+            .iter()
+            .filter(|report| {
+                report.signature.declaration_only
+                    && report.signature.parameter_count == actual_count
+            })
+            .take(2)
+            .count()
+            == 2;
+    }
     SelectedSignature {
         signature_id: selected.map(|report| report.signature.id.clone()),
+        ambiguous,
         receiver_contract: selected
             .map(|report| report.signature.receiver_contract)
-            .unwrap_or_else(|| agreed_receiver_contract(&reports)),
+            .unwrap_or_else(|| agreed_receiver_contract(reports)),
     }
 }
 

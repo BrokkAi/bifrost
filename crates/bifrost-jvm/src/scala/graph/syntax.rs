@@ -533,55 +533,68 @@ fn scala_alias_underlying_type_path(type_node: Node<'_>, source: &str) -> Vec<St
     }
 }
 
+/// The type parameters `node` writes, in declaration order.
+///
+/// The grammar spells an invariant parameter directly in the multi-valued
+/// `name` field of `type_parameters` and a variant one as its own child, so
+/// both arms are named children of the list and one filtered walk covers them.
+/// A bound (`upper_bound`, `context_bound`, ...) and an `annotation` are named
+/// children of the same list and are not parameters, which is why the filter
+/// is a positive kind list rather than a count of children.
+///
+/// A nested `type_parameters` (the `[_]` of a higher-kinded `F[_]`) belongs to
+/// the parameter that already counted, so it is deliberately not one of the
+/// kinds.
+pub fn scala_declared_type_parameter_names(node: Node<'_>, source: &str) -> Vec<String> {
+    let Some(parameters) = node.child_by_field_name("type_parameters").or_else(|| {
+        let mut cursor = node.walk();
+        node.named_children(&mut cursor)
+            .find(|child| child.kind() == "type_parameters")
+    }) else {
+        return Vec::new();
+    };
+    let mut cursor = parameters.walk();
+    parameters
+        .named_children(&mut cursor)
+        .filter(|parameter| {
+            matches!(
+                parameter.kind(),
+                "contravariant_type_parameter"
+                    | "covariant_type_parameter"
+                    | "identifier"
+                    | "operator_identifier"
+                    | "type_lambda"
+                    | "wildcard"
+            )
+        })
+        .filter_map(|parameter| {
+            let name = parameter
+                .child_by_field_name("name")
+                .or_else(|| {
+                    let mut cursor = parameter.walk();
+                    parameter.named_children(&mut cursor).find(|child| {
+                        matches!(child.kind(), "type_identifier" | "operator_identifier")
+                    })
+                })
+                .or_else(|| {
+                    let mut cursor = parameter.walk();
+                    parameter
+                        .named_children(&mut cursor)
+                        .find(|child| child.kind() == "identifier")
+                })
+                .unwrap_or(parameter);
+            matches!(
+                name.kind(),
+                "identifier" | "operator_identifier" | "type_identifier"
+            )
+            .then(|| node_text(name, source).trim().to_string())
+            .filter(|name| !name.is_empty())
+        })
+        .collect()
+}
+
 fn record_generic_owner_facts(node: Node<'_>, source: &str, facts: &mut ScalaSourceFacts) {
-    let type_parameters = node
-        .child_by_field_name("type_parameters")
-        .or_else(|| {
-            let mut cursor = node.walk();
-            node.named_children(&mut cursor)
-                .find(|child| child.kind() == "type_parameters")
-        })
-        .map(|parameters| {
-            let mut cursor = parameters.walk();
-            parameters
-                .named_children(&mut cursor)
-                .filter(|parameter| {
-                    matches!(
-                        parameter.kind(),
-                        "contravariant_type_parameter"
-                            | "covariant_type_parameter"
-                            | "identifier"
-                            | "operator_identifier"
-                            | "type_lambda"
-                            | "wildcard"
-                    )
-                })
-                .filter_map(|parameter| {
-                    let name = parameter
-                        .child_by_field_name("name")
-                        .or_else(|| {
-                            let mut cursor = parameter.walk();
-                            parameter.named_children(&mut cursor).find(|child| {
-                                matches!(child.kind(), "type_identifier" | "operator_identifier")
-                            })
-                        })
-                        .or_else(|| {
-                            let mut cursor = parameter.walk();
-                            parameter
-                                .named_children(&mut cursor)
-                                .find(|child| child.kind() == "identifier")
-                        })
-                        .unwrap_or(parameter);
-                    matches!(
-                        name.kind(),
-                        "identifier" | "operator_identifier" | "type_identifier"
-                    )
-                    .then(|| node_text(name, source).trim().to_string())
-                    .filter(|name| !name.is_empty())
-                })
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
+    let type_parameters = scala_declared_type_parameter_names(node, source);
     let supertypes = crate::scala::supertypes::scala_supertype_lookup_nodes(node)
         .into_iter()
         .filter_map(|(parent, _)| scala_type_expression_path(parent, source))

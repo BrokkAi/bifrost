@@ -34,8 +34,8 @@ use brokk_bifrost_core::hash::{HashMap, HashSet};
 use crate::cache::{
     build_weighted_cache, weight_alias_routes, weight_binding_edges, weight_forward_import_edges,
     weight_include_routes, weight_macro_scope_edges, weight_macro_visible_ranges,
-    weight_module_bindings, weight_module_domains, weight_module_probe, weight_origin_routes,
-    weight_project_file_list,
+    weight_module_bindings, weight_module_declarations, weight_module_domains, weight_module_probe,
+    weight_origin_routes, weight_project_file_list,
 };
 use crate::cargo_routes::{RustCargoRouteIndex, RustCargoTargetRelation};
 use crate::graph_support::{
@@ -78,6 +78,13 @@ pub type RustModuleBindingKey = (ProjectFile, ModuleKey);
 /// argument the Milestone 2b Decision Log records for `declaration_facts`.
 pub struct RustWalkCaches {
     module_files: Cache<String, Arc<Vec<ProjectFile>>>,
+    /// Module declarations of one short name, grouped by the module package
+    /// each names. Not a separate concern from `module_files`: it is the store
+    /// half of that answer, keyed on what the store query is actually keyed on.
+    module_declarations: Cache<String, Arc<HashMap<String, Vec<ProjectFile>>>>,
+    /// Store lookups the grouped index has run, for the memo's pin. One per
+    /// distinct module short name per generation, not one per module package.
+    module_declaration_lookups: AtomicU64,
     /// The four-candidate filesystem probe, per candidate module path. Not a
     /// fourth concern: it is the leaf of `module_resolution`, split out only
     /// because its key is a path rather than a package name.
@@ -105,6 +112,8 @@ impl RustWalkCaches {
         let share = memo_budget / 16;
         Self {
             module_files: build_weighted_cache(share, weight_project_file_list),
+            module_declarations: build_weighted_cache(share, weight_module_declarations),
+            module_declaration_lookups: AtomicU64::new(0),
             owner_roots: build_weighted_cache(share, weight_project_file_list),
             module_domains: build_weighted_cache(share, weight_module_domains),
             alias_routes: build_weighted_cache(share, weight_alias_routes),
@@ -124,6 +133,15 @@ impl RustWalkCaches {
     /// memo's regression pin.
     pub fn module_probe_computations(&self) -> u64 {
         self.module_probe_computations.load(AtomicOrdering::Relaxed)
+    }
+
+    /// How many workspace declaration lookups the module-declaration index has
+    /// run. The #2622 regression pin: this grew with the number of module
+    /// PACKAGES asked about, while the store query it issues is keyed on the
+    /// module's short NAME alone.
+    pub fn module_declaration_lookups(&self) -> u64 {
+        self.module_declaration_lookups
+            .load(AtomicOrdering::Relaxed)
     }
 }
 
@@ -476,14 +494,11 @@ impl<'a> RustUsageWalks<'a> {
         let mut files: Vec<ProjectFile> = self.files.files_in_package(package).cloned().collect();
         if let Some(short_name) = package.rsplit('.').next().filter(|name| !name.is_empty()) {
             files.extend(
-                self.analyzer
-                    .lookup_candidates_by_identifier(short_name)
+                self.module_declarations_named(short_name)
+                    .get(package)
                     .into_iter()
-                    .filter(|declaration| {
-                        declaration.is_module() && declaration.fq_name() == package
-                    })
-                    .map(|declaration| declaration.source().clone())
-                    .filter(|file| self.files.contains(file)),
+                    .flatten()
+                    .cloned(),
             );
         }
         files.sort();
@@ -493,6 +508,45 @@ impl<'a> RustUsageWalks<'a> {
             .module_files
             .insert(package.to_string(), Arc::clone(&files));
         files
+    }
+
+    /// Every analyzed file that declares a module named `short_name`, grouped
+    /// by the module package the declaration names.
+    ///
+    /// `files_in_module_package` memoizes its answer per module PACKAGE, but
+    /// the store lookup behind it is keyed on the module's short NAME: it reads
+    /// every declaration in the workspace spelled `short_name` and keeps the
+    /// ones whose fq name is the package asked for. Issue #2622 measured that
+    /// mismatch: one whole-workspace usage scan asked about 29,014 distinct
+    /// module packages -- most of them speculative ancestor candidates the
+    /// alias walk synthesizes and no file declares -- and each ask paid its own
+    /// candidate query and `CodeUnit` hydration, about half the scan's CPU.
+    /// Grouping the query's own key makes it one lookup per short name.
+    fn module_declarations_named(
+        &self,
+        short_name: &str,
+    ) -> Arc<HashMap<String, Vec<ProjectFile>>> {
+        if let Some(cached) = self.caches.module_declarations.get(short_name) {
+            return cached;
+        }
+        self.caches
+            .module_declaration_lookups
+            .fetch_add(1, AtomicOrdering::Relaxed);
+        let mut by_package: HashMap<String, Vec<ProjectFile>> = HashMap::default();
+        for declaration in self.analyzer.lookup_candidates_by_identifier(short_name) {
+            if !declaration.is_module() || !self.files.contains(declaration.source()) {
+                continue;
+            }
+            by_package
+                .entry(declaration.fq_name())
+                .or_default()
+                .push(declaration.source().clone());
+        }
+        let by_package = Arc::new(by_package);
+        self.caches
+            .module_declarations
+            .insert(short_name.to_string(), Arc::clone(&by_package));
+        by_package
     }
 
     pub fn files_for_module(&self, module: &ModuleKey) -> Arc<Vec<ProjectFile>> {

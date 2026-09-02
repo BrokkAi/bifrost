@@ -220,19 +220,14 @@ pub fn callable_definitions_share_identity_evidence(
         left,
         right,
         |left_source, right_source| {
-            let Some(implementation) =
-                crate::identity::cpp_header_body_implementation_file(left_source, right_source)
-            else {
-                return false;
-            };
             let Some(cpp) = analyzer.cpp else {
                 return false;
             };
             crate::identity::cpp_header_body_files_are_related(
+                cpp,
+                analyzer.token,
                 left_source,
                 right_source,
-                &analyzer.import_statements(implementation),
-                cpp.include_target_index(),
             )
         },
     )
@@ -255,19 +250,14 @@ pub fn callable_definitions_share_identity_evidence_with_visibility(
         left,
         right,
         |left_source, right_source| {
-            let Some(implementation) =
-                crate::identity::cpp_header_body_implementation_file(left_source, right_source)
-            else {
-                return false;
-            };
             let Some(cpp) = analyzer.cpp else {
                 return false;
             };
             crate::identity::cpp_header_body_files_are_related(
+                cpp,
+                analyzer.token,
                 left_source,
                 right_source,
-                &analyzer.import_statements(implementation),
-                cpp.include_target_index(),
             )
         },
     )

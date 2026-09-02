@@ -1,0 +1,69 @@
+(policy
+  :schema-version 1
+  :id "bifrost.security.java.servlet-parameter-to-jdbc"
+  :name "Servlet parameter reaches JDBC SQL"
+  :message "A servlet request parameter reached the SQL text of Statement.execute(String)"
+  :severity error
+  :description "Reports attacker-controlled ServletRequest.getParameter(String) values that reach the SQL argument of the exact JDBC Statement.execute(String) overload. The rule does not treat PreparedStatement value binding or unrelated same-named APIs as SQL structure sinks."
+  :help-uri "https://bifrost.brokk.ai/static-analysis-policies/#built-in-security-pack"
+  :tags ["security" "java" "sql-injection" "cwe-89"]
+  :analysis
+    (analysis
+      :type taint
+      :mode may
+      :call-modeling (call-modeling :unmodeled require-model)
+      :sources
+        (endpoint-set
+          :entries [
+            (source
+              :id servlet-request-parameter
+              :display-name "ServletRequest.getParameter(String)"
+              :categories [input.user-controlled io.external]
+              :selector
+                (row-selector
+                  :output calls
+                  (bind
+                    :name calls
+                    :query
+                      (rql
+                        :schema-version 1
+                        (language java
+                          (call-bindings
+                            (call-shape
+                              (call :callee (name "getParameter") (arity 1)))))))
+                  (call
+                    :over calls
+                    :resolves-to member.servletrequest.getparameter
+                    :proof exact)
+                  (call-argument :over calls :formal-name "name"))
+              :bind return-value
+              :labels [attacker-controlled])])
+      :sinks
+        (endpoint-set
+          :entries [
+            (sink
+              :id jdbc-statement-execute-sql
+              :display-name "Statement.execute(String) SQL"
+              :categories [sql.structure]
+              :selector
+                (row-selector
+                  :output calls
+                  (bind
+                    :name calls
+                    :query
+                      (rql
+                        :schema-version 1
+                        (language java
+                          (call-bindings
+                            (call-shape
+                              (call :callee (name "execute") (arity 1)))))))
+                  (call
+                    :over calls
+                    :resolves-to member.statement.execute
+                    :proof exact)
+                  (call-argument :over calls :formal-name "sql"))
+              :dangerous-operand (argument :name "sql")
+              :accepts [attacker-controlled])]))
+  :classification
+    (classification
+      :fallback (classification-id :taxonomy "CWE" :id "89")))

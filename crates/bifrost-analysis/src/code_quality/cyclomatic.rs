@@ -97,6 +97,7 @@ mod tests {
     use super::*;
     use crate::test_support::AnalyzerFixture;
 
+    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
     #[test]
     fn simple_function_under_threshold_returns_empty_report() {
         let fix = AnalyzerFixture::new(&[("src/lib.rs", "fn trivial() -> i32 { 0 }\n")]);
@@ -207,6 +208,7 @@ mod tests {
         assert!(result.report.contains("S.m: 3"));
     }
 
+    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
     #[test]
     fn missing_files_are_silently_skipped() {
         let fix = AnalyzerFixture::new(&[("src/lib.rs", "fn x() {}\n")]);
@@ -267,6 +269,7 @@ mod tests {
         );
     }
 
+    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
     #[test]
     fn non_function_code_units_are_ignored() {
         let fix = AnalyzerFixture::new(&[("src/lib.rs", "struct S;\n")]);

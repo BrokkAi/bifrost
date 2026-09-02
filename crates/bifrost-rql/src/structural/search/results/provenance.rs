@@ -6,7 +6,7 @@ pub struct CodeQuerySourceSite {
     pub range: CodeQueryRange,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct CodeQueryProvenance {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub branch: Vec<usize>,
@@ -14,7 +14,7 @@ pub struct CodeQueryProvenance {
     pub steps: Vec<CodeQueryProvenanceStep>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct CodeQueryProvenanceStep {
     pub op: &'static str,
     pub result: CodeQueryResultRef,
@@ -22,7 +22,7 @@ pub struct CodeQueryProvenanceStep {
     pub via: Option<CodeQueryResultRef>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(tag = "result_type", rename_all = "snake_case")]
 pub enum CodeQueryResultRef {
     StructuralMatch {
@@ -145,6 +145,15 @@ pub enum CodeQueryResultRef {
         #[serde(skip_serializing_if = "Option::is_none")]
         capture: Option<String>,
     },
+    MemberTargetAnalysis {
+        site_id: String,
+        path: String,
+        receiver_range: CodeQueryRange,
+        outcome: &'static str,
+        coverage: &'static str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        capture: Option<String>,
+    },
     ReceiverOutcome {
         id: String,
         site_id: String,
@@ -159,6 +168,18 @@ pub enum CodeQueryResultRef {
         path: String,
         range: CodeQueryRange,
         evidence_kind: &'static str,
+    },
+    FieldWriteValue {
+        id: String,
+        assignment_ast_id: String,
+        rhs_ast_id: String,
+        receiver_identity_id: String,
+        member_target_id: String,
+        path: String,
+        range: CodeQueryRange,
+        proof: &'static str,
+        completeness: &'static str,
+        coverage: &'static str,
     },
     DispatchOutcome {
         id: String,
@@ -299,6 +320,37 @@ pub enum CodeQueryResultRef {
         range: CodeQueryRange,
         provenance: &'static str,
         consumer: &'static str,
+        coverage: &'static str,
+    },
+    NilnessOperation {
+        id: String,
+        path: String,
+        range: CodeQueryRange,
+        use_kind: &'static str,
+        fact: &'static str,
+        coverage: &'static str,
+    },
+    SwitchCoverage {
+        id: String,
+        path: String,
+        range: CodeQueryRange,
+        verdict: &'static str,
+        proof: &'static str,
+    },
+    ConcurrentAccessConflict {
+        id: String,
+        path: String,
+        range: CodeQueryRange,
+        ordering: &'static str,
+        protection: &'static str,
+        proof: &'static str,
+    },
+    DetachedTaskTransfer {
+        id: String,
+        path: String,
+        range: CodeQueryRange,
+        role: &'static str,
+        timing: &'static str,
         coverage: &'static str,
     },
     ProcedureEffect {
@@ -514,6 +566,152 @@ pub enum CodeQueryResultRef {
     },
 }
 
+impl CodeQueryResultRef {
+    /// The public wire label of this reference's family: the same
+    /// `snake_case` tag its serialization carries.
+    ///
+    /// Stated once here, beside the enum it describes, so no consumer
+    /// restates all 63 variant names and drifts from the wire form.
+    pub const fn kind_label(&self) -> &'static str {
+        match self {
+            Self::StructuralMatch { .. } => "structural_match",
+            Self::Declaration { .. } => "declaration",
+            Self::Procedure { .. } => "procedure",
+            Self::FlowEndpoint { .. } => "flow_endpoint",
+            Self::FlowWitness { .. } => "flow_witness",
+            Self::TaintFinding { .. } => "taint_finding",
+            Self::ProgramPoint { .. } => "program_point",
+            Self::ControlEdge { .. } => "control_edge",
+            Self::TypestateFinding { .. } => "typestate_finding",
+            Self::TypestateWitness { .. } => "typestate_witness",
+            Self::File { .. } => "file",
+            Self::ReferenceSite { .. } => "reference_site",
+            Self::CallSite { .. } => "call_site",
+            Self::ExpressionSite { .. } => "expression_site",
+            Self::JsxAttributeValue { .. } => "jsx_attribute_value",
+            Self::ReceiverAnalysis { .. } => "receiver_analysis",
+            Self::MemberTargetAnalysis { .. } => "member_target_analysis",
+            Self::ReceiverOutcome { .. } => "receiver_outcome",
+            Self::ReceiverEvidence { .. } => "receiver_evidence",
+            Self::FieldWriteValue { .. } => "field_write_value",
+            Self::DispatchOutcome { .. } => "dispatch_outcome",
+            Self::DispatchTarget { .. } => "dispatch_target",
+            Self::MemberFamily { .. } => "member_family",
+            Self::MemberFamilyEdge { .. } => "member_family_edge",
+            Self::CallShape { .. } => "call_shape",
+            Self::CallResult { .. } => "call_result",
+            Self::CallArgumentGroup { .. } => "call_argument_group",
+            Self::CallArgument { .. } => "call_argument",
+            Self::CallBinding { .. } => "call_binding",
+            Self::CallEffect { .. } => "call_effect",
+            Self::CallResultContract { .. } => "call_result_contract",
+            Self::ResultContractUse { .. } => "result_contract_use",
+            Self::ResultContractFailureUse { .. } => "result_contract_failure_use",
+            Self::NilnessOperation { .. } => "nilness_operation",
+            Self::SwitchCoverage { .. } => "switch_coverage",
+            Self::ConcurrentAccessConflict { .. } => "concurrent_access_conflict",
+            Self::DetachedTaskTransfer { .. } => "detached_task_transfer",
+            Self::ProcedureEffect { .. } => "procedure_effect",
+            Self::CallableSignature { .. } => "callable_signature",
+            Self::SignatureParameter { .. } => "signature_parameter",
+            Self::DecoratedParameter { .. } => "decorated_parameter",
+            Self::CallableApplicability { .. } => "callable_applicability",
+            Self::OverloadSelection { .. } => "overload_selection",
+            Self::MemberSelection { .. } => "member_selection",
+            Self::Occurrence { .. } => "occurrence",
+            Self::LexicalScope { .. } => "lexical_scope",
+            Self::Binding { .. } => "binding",
+            Self::ResolutionCandidate { .. } => "resolution_candidate",
+            Self::CandidateHop { .. } => "candidate_hop",
+            Self::ReferenceEdge { .. } => "reference_edge",
+            Self::StateEvent { .. } => "state_event",
+            Self::FlowRelation { .. } => "flow_relation",
+            Self::ControlRelation { .. } => "control_relation",
+            Self::Guard { .. } => "guard",
+            Self::RewritePath { .. } => "rewrite_path",
+            Self::SourceSet { .. } => "source_set",
+            Self::BuildTarget { .. } => "build_target",
+            Self::TopologyEdge { .. } => "topology_edge",
+            Self::QualifiedPath { .. } => "qualified_path",
+            Self::PathSegment { .. } => "path_segment",
+            Self::GenerationSite { .. } => "generation_site",
+            Self::Export { .. } => "export",
+            Self::DeclarationState { .. } => "declaration_state",
+        }
+    }
+
+    /// The workspace-relative path this reference is about. Every family
+    /// carries exactly one, which is why a consumer can compare it against
+    /// the evidence file without knowing the family.
+    pub fn path(&self) -> &str {
+        match self {
+            Self::StructuralMatch { path, .. }
+            | Self::Declaration { path, .. }
+            | Self::Procedure { path, .. }
+            | Self::FlowEndpoint { path, .. }
+            | Self::FlowWitness { path, .. }
+            | Self::TaintFinding { path, .. }
+            | Self::ProgramPoint { path, .. }
+            | Self::ControlEdge { path, .. }
+            | Self::TypestateFinding { path, .. }
+            | Self::TypestateWitness { path, .. }
+            | Self::File { path }
+            | Self::ReferenceSite { path, .. }
+            | Self::CallSite { path, .. }
+            | Self::ExpressionSite { path, .. }
+            | Self::JsxAttributeValue { path, .. }
+            | Self::ReceiverAnalysis { path, .. }
+            | Self::MemberTargetAnalysis { path, .. }
+            | Self::ReceiverOutcome { path, .. }
+            | Self::ReceiverEvidence { path, .. }
+            | Self::FieldWriteValue { path, .. }
+            | Self::DispatchOutcome { path, .. }
+            | Self::DispatchTarget { path, .. }
+            | Self::MemberFamily { path, .. }
+            | Self::MemberFamilyEdge { path, .. }
+            | Self::CallShape { path, .. }
+            | Self::CallResult { path, .. }
+            | Self::CallArgumentGroup { path, .. }
+            | Self::CallArgument { path, .. }
+            | Self::CallBinding { path, .. }
+            | Self::CallEffect { path, .. }
+            | Self::CallResultContract { path, .. }
+            | Self::ResultContractUse { path, .. }
+            | Self::ResultContractFailureUse { path, .. }
+            | Self::NilnessOperation { path, .. }
+            | Self::SwitchCoverage { path, .. }
+            | Self::ConcurrentAccessConflict { path, .. }
+            | Self::DetachedTaskTransfer { path, .. }
+            | Self::ProcedureEffect { path, .. }
+            | Self::CallableSignature { path, .. }
+            | Self::SignatureParameter { path, .. }
+            | Self::DecoratedParameter { path, .. }
+            | Self::CallableApplicability { path, .. }
+            | Self::OverloadSelection { path, .. }
+            | Self::MemberSelection { path, .. }
+            | Self::Occurrence { path, .. }
+            | Self::LexicalScope { path, .. }
+            | Self::Binding { path, .. }
+            | Self::ResolutionCandidate { path, .. }
+            | Self::CandidateHop { path, .. }
+            | Self::ReferenceEdge { path, .. }
+            | Self::StateEvent { path, .. }
+            | Self::FlowRelation { path, .. }
+            | Self::ControlRelation { path, .. }
+            | Self::Guard { path, .. }
+            | Self::RewritePath { path, .. }
+            | Self::SourceSet { path, .. }
+            | Self::BuildTarget { path, .. }
+            | Self::TopologyEdge { path, .. }
+            | Self::QualifiedPath { path, .. }
+            | Self::PathSegment { path, .. }
+            | Self::GenerationSite { path, .. }
+            | Self::Export { path, .. }
+            | Self::DeclarationState { path, .. } => path,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct CodeQueryCapture {
     pub name: String,
@@ -530,7 +728,7 @@ pub struct CodeQueryCapture {
     pub ast_id: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct CodeQueryRange {
     pub start_line: usize,
     pub start_column: usize,

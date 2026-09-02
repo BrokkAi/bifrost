@@ -1,0 +1,8 @@
+{
+  "$profileSchema": "java-jvm-mapping",
+  "profileVersion": "0.1",
+  "resolution": "unsupported",
+  "sourceSymbol": "scala-inline-method",
+  "unsupportedVocabulary": "org.scala-lang.tasty-identity",
+  "unsupportedVersion": "3.7"
+}

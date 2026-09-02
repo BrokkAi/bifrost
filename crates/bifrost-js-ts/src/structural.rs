@@ -24,7 +24,7 @@ use brokk_bifrost_core::analyzer::structural::resolution::{
     LexicalEnvironmentSupport,
 };
 use brokk_bifrost_core::analyzer::structural::routes::{
-    DEEP_IDENTITY_AXES, IdentityRouteSupport, RouteHopKind,
+    CuratedExportSurface, DEEP_IDENTITY_AXES, IdentityRouteSupport, RouteHopKind,
 };
 use brokk_bifrost_core::analyzer::structural::spec::{RoleSink, StructuralSpec};
 use brokk_bifrost_core::analyzer::{Language, Range};
@@ -682,7 +682,12 @@ impl StructuralSpec for JsTsStructuralSpec {
         spelled_generic_arity(token, JS_TS_PATH_CHAIN, &["generic_type"])
     }
 
-    fn indirection_relation(&self, token: Node<'_>) -> Option<RouteHopKind> {
+    fn indirection_relation(
+        &self,
+        token: Node<'_>,
+        _source: &str,
+        _surface: &CuratedExportSurface,
+    ) -> Option<RouteHopKind> {
         if let Some(export) = nearest_ancestor(token, |kind| kind == "export_statement") {
             return Some(if export.child_by_field_name("source").is_some() {
                 RouteHopKind::ReExport
@@ -777,6 +782,9 @@ impl StructuralSpec for JsTsStructuralSpec {
                     }
                 }
                 "assignment_expression" => {
+                    if let Some(operator) = js_ts_assignment_operator(node) {
+                        sink.role(Role::Operator, operator);
+                    }
                     if let Some(left) = node.child_by_field_name("left") {
                         attach_role_with_derived_name(sink, Role::Left, left, expression_name_node);
                     }
@@ -862,6 +870,30 @@ impl StructuralSpec for JsTsStructuralSpec {
             _ => {}
         }
     }
+}
+
+fn js_ts_assignment_operator(assignment: Node<'_>) -> Option<Node<'_>> {
+    let mut cursor = assignment.walk();
+    assignment.children(&mut cursor).find(|child| {
+        matches!(
+            child.kind(),
+            "=" | "+="
+                | "-="
+                | "*="
+                | "/="
+                | "%="
+                | "^="
+                | "&="
+                | "|="
+                | ">>="
+                | ">>>="
+                | "<<="
+                | "**="
+                | "&&="
+                | "||="
+                | "??="
+        )
+    })
 }
 
 /// One `elements` role edge per element of an `array` or `object` literal.

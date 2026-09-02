@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 17f06a25d1b1cb93b31c9d4f935e17eebf413cda4b3343c44983f0f6bd94f41e # shrinks to generated = GeneratedProject { functions_per_file: [1, 2, 1, 2, 2, 1, 2, 2, 1, 1], call_targets: [None, None, None, None, None, None, None, Some(8), None, Some(1), Some(4), Some(9), Some(4), Some(0), None] }

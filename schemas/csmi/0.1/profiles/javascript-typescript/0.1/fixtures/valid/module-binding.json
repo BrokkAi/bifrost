@@ -1,0 +1,9 @@
+{
+  "kind": "module-binding",
+  "canonicalModule": "node:child_process",
+  "exportName": "execSync",
+  "acceptedSpecifiers": [
+    { "form": "commonjs-property", "value": "child_process" },
+    { "form": "esm-named", "value": "node:child_process" }
+  ]
+}

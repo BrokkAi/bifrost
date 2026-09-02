@@ -47,8 +47,13 @@ impl IndexWarmer {
     /// Queue a background warm of the snapshot's lazy query indexes. Free
     /// when the snapshot is already warm (incremental updates whose sources
     /// were unchanged share the previous generation's indexes).
+    ///
+    /// A host may call this after every request, not only after the first: the
+    /// structural posting indexes become outstanding when a structural query
+    /// first asks for them, so what is left to warm is not fixed at session
+    /// start (#2879).
     pub fn schedule(self: &Arc<Self>, snapshot: Arc<WorkspaceAnalyzer>) {
-        if snapshot.query_indexes_warm() {
+        if snapshot.query_indexes_warm() && snapshot.structural_indexes_warm() {
             return;
         }
         let mut state = self.state.lock().expect("index warmer lock poisoned");
@@ -67,7 +72,25 @@ impl IndexWarmer {
             while let Some(current) = next.take() {
                 let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     let _scope = profiling::scope("mcp_cold.query_index_construction");
-                    current.warm_query_indexes();
+                    // The two halves run together because neither may wait on
+                    // the other, and because the structural half must claim
+                    // its builds promptly: a request that arrives before it
+                    // does would lead the build itself, inside the request
+                    // (#2879).
+                    //
+                    // `rayon::join` and not an OS thread: this task already
+                    // owns a worker of the dedicated build pool, and both
+                    // halves reach that same pool for their own parallelism.
+                    // A second thread that asked the pool to install work
+                    // would wait for a worker this task is holding, which
+                    // deadlocks whenever the pool has one worker
+                    // (`BIFROST_PARALLELISM=1`). Joined branches instead run
+                    // on the workers there are, concurrently when the pool has
+                    // several and one after the other when it has one.
+                    rayon::join(
+                        || current.warm_structural_indexes(),
+                        || current.warm_query_indexes(),
+                    );
                 }));
                 // Release the snapshot before publishing idle. On Windows,
                 // the snapshot can own SQLite handles that prevent its

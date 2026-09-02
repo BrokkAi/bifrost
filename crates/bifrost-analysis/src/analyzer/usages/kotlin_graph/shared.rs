@@ -10,8 +10,8 @@
 //! ladder through `super::resolver::KotlinResolutionCtx`.
 
 use super::{
-    KotlinGraphSource, kotlin_target_spec_replayable, scan_kotlin_file_replayable,
-    with_kotlin_graph_source,
+    KotlinGraphSource, kotlin_target_spec_replayable, prepare_kotlin_scan_files,
+    scan_kotlin_files_replayable, with_kotlin_graph_source,
 };
 use crate::analyzer::tree_sitter_analyzer::FileState;
 use crate::analyzer::usages::common::language_for_file;
@@ -32,7 +32,6 @@ use crate::analyzer::{
 };
 use crate::hash::{HashMap, HashSet};
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
-use brokk_bifrost_jvm::kotlin::graph::extractor::ScanState;
 use brokk_bifrost_jvm::kotlin::graph::inverted::scan_file as scan_inverted_file;
 use std::collections::BTreeSet;
 
@@ -118,46 +117,50 @@ impl<'a> UsageQueryResolver<'a> for KotlinQueryResolver {
         ordered.sort();
         drop(_select_scope);
 
+        let _prepare_scope = crate::profiling::scope("kotlin_graph::prepare_files");
+        let prepared_files = prepare_kotlin_scan_files(analyzer, &ordered);
+        drop(_prepare_scope);
+
+        let file_results: Vec<Option<_>> = match scan_kotlin_files_replayable(
+            &relational_session,
+            analyzer,
+            token,
+            &prepared_files,
+            &spec,
+            max_usages,
+        ) {
+            crate::analyzer::relational_frontier::RelationalItemFrontierOutcome::Complete(
+                results,
+            ) => results.into_iter().map(Some).collect(),
+            crate::analyzer::relational_frontier::RelationalItemFrontierOutcome::Cancelled(
+                results,
+            ) => results,
+            crate::analyzer::relational_frontier::RelationalItemFrontierOutcome::Failed(_) => {
+                return GraphUsageOutcome::fallback_safe(
+                    target.fq_name(),
+                    GraphFailureReason::UnsupportedTargetShape(
+                        "the Kotlin relational file frontier failed",
+                    ),
+                    "KotlinUsageGraphStrategy",
+                );
+            }
+        };
         let mut hits: BTreeSet<UsageHit> = BTreeSet::new();
         let mut unproven_hits: BTreeSet<UsageHit> = BTreeSet::new();
         let mut raw_match_count = 0usize;
         let mut limit_exceeded = false;
-        let mut state = ScanState {
-            max_usages,
-            hits: &mut hits,
-            unproven_hits: &mut unproven_hits,
-            raw_match_count: &mut raw_match_count,
-            limit_exceeded: &mut limit_exceeded,
-        };
-        for file in ordered {
-            if scan_scope.is_cancelled() {
-                break;
-            }
-            let _file_scope = crate::profiling::scope("kotlin_graph::scan_file");
-            match scan_kotlin_file_replayable(
-                &relational_session,
-                analyzer,
-                token,
-                &file,
-                &spec,
-                &mut state,
-            ) {
-                crate::analyzer::RelationalFrontierOutcome::Complete(()) => {}
-                crate::analyzer::RelationalFrontierOutcome::Cancelled => break,
-                crate::analyzer::RelationalFrontierOutcome::Failed(_) => {
-                    return GraphUsageOutcome::fallback_safe(
-                        target.fq_name(),
-                        GraphFailureReason::UnsupportedTargetShape(
-                            "the Kotlin relational file frontier failed",
-                        ),
-                        "KotlinUsageGraphStrategy",
-                    );
-                }
-            }
-            if *state.limit_exceeded {
-                break;
-            }
+        // Prepared order is the sorted file order, so this merge truncates the
+        // same way on every run.
+        for (file_hits, file_unproven_hits, file_raw_match_count, file_limit_exceeded) in
+            file_results.into_iter().flatten()
+        {
+            hits.extend(file_hits);
+            unproven_hits.extend(file_unproven_hits);
+            raw_match_count += file_raw_match_count;
+            limit_exceeded |= file_limit_exceeded;
         }
+        limit_exceeded |=
+            crate::analyzer::usages::common::external_usage_hit_count(&hits) > max_usages;
 
         // A Kotlin class is equally nameable from Java and Scala source, and the
         // three languages share one candidate space, so find-references on a
@@ -170,10 +173,10 @@ impl<'a> UsageQueryResolver<'a> for KotlinQueryResolver {
                 scan_scope.candidate_files(),
                 target,
                 max_usages,
-                state.hits,
-                state.unproven_hits,
-                state.raw_match_count,
-                state.limit_exceeded,
+                &mut hits,
+                &mut unproven_hits,
+                &mut raw_match_count,
+                &mut limit_exceeded,
             );
         }
 
@@ -252,31 +255,35 @@ pub(crate) fn scan_kotlin_files_for_jvm_type(
         .cloned()
         .collect();
     ordered.sort();
-    let mut state = ScanState {
+    let prepared_files = prepare_kotlin_scan_files(analyzer, &ordered);
+    let file_results: Vec<Option<_>> = match scan_kotlin_files_replayable(
+        &relational_session,
+        analyzer,
+        token,
+        &prepared_files,
+        &spec,
         max_usages,
-        hits,
-        unproven_hits,
-        raw_match_count,
-        limit_exceeded,
+    ) {
+        crate::analyzer::relational_frontier::RelationalItemFrontierOutcome::Complete(results) => {
+            results.into_iter().map(Some).collect()
+        }
+        crate::analyzer::relational_frontier::RelationalItemFrontierOutcome::Cancelled(results) => {
+            results
+        }
+        crate::analyzer::relational_frontier::RelationalItemFrontierOutcome::Failed(_) => return,
     };
-    for file in ordered {
-        if !matches!(
-            scan_kotlin_file_replayable(
-                &relational_session,
-                analyzer,
-                token,
-                &file,
-                &spec,
-                &mut state,
-            ),
-            crate::analyzer::RelationalFrontierOutcome::Complete(())
-        ) {
-            return;
-        }
-        if *state.limit_exceeded {
-            break;
-        }
+    for (file_hits, file_unproven_hits, file_raw_match_count, file_limit_exceeded) in
+        file_results.into_iter().flatten()
+    {
+        hits.extend(file_hits);
+        unproven_hits.extend(file_unproven_hits);
+        *raw_match_count += file_raw_match_count;
+        *limit_exceeded |= file_limit_exceeded;
     }
+    // The caller's hit set spans every JVM language scanned so far, so the
+    // cumulative limit is refreshed over it, exactly as the sequential scan's
+    // per-hit refresh did.
+    *limit_exceeded |= crate::analyzer::usages::common::external_usage_hit_count(hits) > max_usages;
 }
 
 /// Builds the whole Kotlin `caller -> callee` edge set in one inverted pass.
@@ -496,7 +503,6 @@ fn build_kotlin_inbound_edges_with_completeness(
             let graph = KotlinGraphSource {
                 index: analyzer,
                 hierarchy: analyzer.type_hierarchy_provider(),
-                type_alias: analyzer.type_alias_provider(),
                 imports: analyzer.import_analysis_provider(),
                 relational_definitions: frontier.as_ref(),
             };

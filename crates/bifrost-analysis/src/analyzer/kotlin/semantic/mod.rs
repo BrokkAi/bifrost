@@ -50,10 +50,9 @@ use crate::analyzer::tree_sitter_analyzer::{
 use crate::analyzer::{KotlinAnalyzer, Language, ProjectFile, Range};
 use crate::hash::{HashMap, HashSet};
 
-/// Bumped for #1242: keyword/spread argument domains, and primary-constructor
-/// parameter defaults as their own initializer procedures, both change the
-/// artifact a file lowers to.
-const ADAPTER_VERSION: &[u8] = b"kotlin-value-semantics-v2";
+/// Bumped for #2833: direct immutable lexical captures now publish closure
+/// environments and capture bindings in the neutral IR.
+const ADAPTER_VERSION: &[u8] = b"kotlin-value-semantics-v3";
 
 impl_program_semantics_provider!(KotlinAnalyzer, KotlinSemanticLowerer);
 
@@ -142,11 +141,18 @@ impl ProgramSemanticsLowerer for KotlinSemanticLowerer {
                         receiver_capture_destination: spec
                             .captures_receiver
                             .then_some(RECEIVER_CAPTURE_DESTINATION),
+                        captures: spec
+                            .captures
+                            .iter()
+                            .map(|capture| LexicalCaptureSource {
+                                name: capture.name.into(),
+                                declaration_start: capture.declaration_start,
+                            })
+                            .collect(),
                     },
                 )
             })
             .collect::<HashMap<_, _>>();
-
         let Ok(constructible_types) = collect_constructible_types(prepared, cancellation) else {
             return Ok(SemanticOutcome::Cancelled {
                 partial: None,
@@ -256,8 +262,8 @@ mod values;
 
 use control::lower_procedure;
 use inventory::{
-    NestedProcedureTarget, ProcedureBody, ProcedureEnumeration, ProcedureSpec,
-    collect_constructible_types, enumerate_procedures,
+    LexicalCaptureSource, NestedProcedureTarget, ProcedureBody, ProcedureEnumeration,
+    ProcedureSpec, collect_constructible_types, enumerate_procedures,
 };
 
 type KotlinLoweringError = ProcedureLoweringError;
@@ -334,6 +340,7 @@ struct LoweringContext<'tree, 'targets> {
     constructible_types: &'targets HashSet<Box<str>>,
     receiver: Option<ValueId>,
     captured_receiver: Option<ValueId>,
+    captured_bindings: HashMap<Box<str>, ValueId>,
     /// The label a `return@label` may name to leave *this* procedure, set for a
     /// lambda that is a labelled or trailing argument.
     boundary_label: Option<&'tree str>,
@@ -350,4 +357,16 @@ struct LocalBinding {
     scope_start: usize,
     scope_end: usize,
     value: ValueId,
+}
+
+fn lexical_capture_destination(
+    captures_receiver: bool,
+    capture_index: usize,
+) -> Result<MemoryLocationId, KotlinLoweringError> {
+    let index = capture_index
+        .checked_add(usize::from(captures_receiver))
+        .ok_or_else(|| KotlinLoweringError::Invalid("too many Kotlin captures".into()))?;
+    let index = u32::try_from(index)
+        .map_err(|_| KotlinLoweringError::Invalid("too many Kotlin captures".into()))?;
+    Ok(MemoryLocationId::new(index))
 }

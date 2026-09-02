@@ -7,13 +7,13 @@ use crate::analyzer::{
     RelationalBatchOutcome, RelationalDefinitionQuery, RelationalDefinitionRequest,
     RelationalDefinitionValue, sort_units,
 };
-use crate::hash::HashMap;
+use crate::hash::{HashMap, HashSet};
 use brokk_bifrost_core::analyzer::{
     PackageRelationKind, PackageRelationValue, RelationalName,
     fq_name::{FqName, SegmentKind, segment_interner},
     symbol_path::parse_symbol_path_fq,
 };
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 type MemberLookupKey = (Language, String, String, String);
 type StructuredMemberLookupKey = (Language, FqName, String);
@@ -81,13 +81,24 @@ macro_rules! impl_forward_query_provider {
 
 pub(crate) use impl_forward_query_provider;
 
-/// A forward-query view over an analyzer.  Keeping this separate from the
-/// legacy index makes accidental whole-workspace fallback impossible at call
-/// sites that accept only `BoundedDefinitionLookup`.
-pub struct AnalyzerDefinitionLookup<'a> {
-    analyzer: &'a dyn IAnalyzer,
-    language: Mutex<Language>,
-    workspace_languages: OnceLock<Vec<Language>>,
+/// The memoized definition answers one request's lookups share.
+///
+/// A usage scan builds an [`AnalyzerDefinitionLookup`] per candidate file --
+/// `with_usage_definitions` and the `could_import_file` and
+/// `declarations_named` paths each construct one -- so memos owned by the
+/// lookup meant every candidate repeated the same name, identifier and package
+/// store batches (#2883). The analyzer hands out one of these per open request
+/// scope, so every lookup built during that request answers from one set. With
+/// no scope open a lookup owns its own, which is exactly the old behaviour.
+///
+/// Every key names the [`Language`] its answer was resolved in, and every
+/// answer comes from that language's analyzer alone, so a lookup built over a
+/// language analyzer and one built over the multi-analyzer that owns it can
+/// share a memo. It is deliberately language-agnostic: #2783 added a Java-only
+/// usage-evidence cache, and this path has to be fast for every language rather
+/// than grow a second special case.
+#[derive(Debug, Default)]
+pub struct DefinitionLookupMemo {
     fqn_cache: Mutex<HashMap<(Language, String), Vec<CodeUnit>>>,
     normalized_fqn_cache: Mutex<HashMap<(Language, String), Vec<CodeUnit>>>,
     identifier_cache: Mutex<HashMap<(Language, String), Vec<CodeUnit>>>,
@@ -99,21 +110,26 @@ pub struct AnalyzerDefinitionLookup<'a> {
     prefix_cache: Mutex<HashMap<(Language, String), bool>>,
 }
 
+/// A forward-query view over an analyzer.  Keeping this separate from the
+/// legacy index makes accidental whole-workspace fallback impossible at call
+/// sites that accept only `BoundedDefinitionLookup`.
+pub struct AnalyzerDefinitionLookup<'a> {
+    analyzer: &'a dyn IAnalyzer,
+    language: Mutex<Language>,
+    /// Resolved per lookup rather than in the shared memo: the languages a
+    /// multi-analyzer reports are not the languages one of its delegates
+    /// reports, and both kinds of analyzer can hand out the same memo.
+    workspace_languages: OnceLock<Vec<Language>>,
+    memo: Arc<DefinitionLookupMemo>,
+}
+
 impl<'a> AnalyzerDefinitionLookup<'a> {
     pub fn new(analyzer: &'a dyn IAnalyzer, language: Language) -> Self {
         Self {
             analyzer,
             language: Mutex::new(language),
             workspace_languages: OnceLock::new(),
-            fqn_cache: Mutex::new(HashMap::default()),
-            normalized_fqn_cache: Mutex::new(HashMap::default()),
-            identifier_cache: Mutex::new(HashMap::default()),
-            file_identifier_cache: Mutex::new(HashMap::default()),
-            children_cache: Mutex::new(HashMap::default()),
-            members_cache: Mutex::new(HashMap::default()),
-            structured_members_cache: Mutex::new(HashMap::default()),
-            package_cache: Mutex::new(HashMap::default()),
-            prefix_cache: Mutex::new(HashMap::default()),
+            memo: analyzer.definition_lookup_memo().unwrap_or_default(),
         }
     }
 
@@ -241,12 +257,45 @@ impl<'a> AnalyzerDefinitionLookup<'a> {
         self.identifier_candidates_for_spellings(language, &[identifier.to_string()], file)
     }
 
-    fn identifier_candidates_for_spellings(
+    /// Every declaration this language indexes under `identifier`, anywhere in
+    /// the workspace, memoized per `(language, identifier)`.
+    ///
+    /// Both workspace-wide callers -- `identifier` and the file-set filter in
+    /// `file_identifier_in_files` -- share the one cache entry, so a bare name
+    /// asked about through either shape costs one store read per language.
+    fn workspace_identifier_candidates(
         &self,
+        language: Language,
+        identifier: &str,
+    ) -> Vec<CodeUnit> {
+        let key = (language, identifier.to_string());
+        if let Some(cached) = self
+            .memo
+            .identifier_cache
+            .lock()
+            .expect("definition identifier cache poisoned")
+            .get(&key)
+        {
+            return cached.clone();
+        }
+        let mut matches = self.identifier_candidates_for_language(language, identifier, None);
+        sort_units(&mut matches);
+        matches.dedup();
+        self.memo
+            .identifier_cache
+            .lock()
+            .expect("definition identifier cache poisoned")
+            .insert(key, matches.clone());
+        matches
+    }
+
+    /// The relational questions one set of identifier spellings asks: the bare
+    /// identifier plus each of the language's decorated seeks.
+    fn identifier_queries(
         language: Language,
         identifiers: &[String],
         file: Option<&ProjectFile>,
-    ) -> Vec<CodeUnit> {
+    ) -> Vec<(RelationalName, RelationalDefinitionQuery)> {
         let mut queries = Vec::new();
         for identifier in identifiers {
             if let Some(name) = Self::identifier_name(identifier) {
@@ -282,8 +331,17 @@ impl<'a> AnalyzerDefinitionLookup<'a> {
                 }
             }
         }
-        let mut units = self
-            .query_values(language, queries)
+        queries
+    }
+
+    /// Collapse the answers to [`Self::identifier_queries`] into the canonical
+    /// candidate set: only units one of the spellings actually addresses,
+    /// sorted and deduplicated.
+    fn identifier_units_from_values(
+        identifiers: &[String],
+        values: Vec<RelationalDefinitionValue>,
+    ) -> Vec<CodeUnit> {
+        let mut units = values
             .into_iter()
             .flat_map(|value| match value {
                 RelationalDefinitionValue::Definitions(units) => units,
@@ -298,6 +356,17 @@ impl<'a> AnalyzerDefinitionLookup<'a> {
         sort_units(&mut units);
         units.dedup();
         units
+    }
+
+    fn identifier_candidates_for_spellings(
+        &self,
+        language: Language,
+        identifiers: &[String],
+        file: Option<&ProjectFile>,
+    ) -> Vec<CodeUnit> {
+        let queries = Self::identifier_queries(language, identifiers, file);
+        let values = self.query_values(language, queries);
+        Self::identifier_units_from_values(identifiers, values)
     }
 
     fn exact_for_language(&self, rendered: &str, language: Language) -> Vec<CodeUnit> {
@@ -358,6 +427,7 @@ impl<'a> AnalyzerDefinitionLookup<'a> {
     fn fqn_for_language(&self, fqn: &str, language: Language) -> Vec<CodeUnit> {
         let key = (language, fqn.to_string());
         if let Some(cached) = self
+            .memo
             .fqn_cache
             .lock()
             .expect("definition fqn cache poisoned")
@@ -366,11 +436,113 @@ impl<'a> AnalyzerDefinitionLookup<'a> {
             return cached.clone();
         }
         let matches = self.exact_for_language(fqn, language);
-        self.fqn_cache
+        self.memo
+            .fqn_cache
             .lock()
             .expect("definition fqn cache poisoned")
             .insert(key, matches.clone());
         matches
+    }
+
+    /// Resolve many rendered names into the shared fqn memo with two batched
+    /// relational reads per language instead of one point batch per name.
+    ///
+    /// The rounds are the same two questions [`Self::exact_for_language`]
+    /// asks per name -- an exact persisted-identity seek, then the identifier
+    /// compatibility view for the names the exact round missed -- with
+    /// identical per-name filtering, so a memoized answer cannot differ from
+    /// what the point path would compute. A cancelled or failed batch
+    /// memoizes nothing: every name stays unmemoized and the point path
+    /// retries it with unchanged results.
+    pub(crate) fn prefetch_fqns(&self, fqns: &[String]) {
+        for language in self.query_languages() {
+            let missing: Vec<String> = {
+                let cache = self
+                    .memo
+                    .fqn_cache
+                    .lock()
+                    .expect("definition fqn cache poisoned");
+                let mut seen = HashSet::default();
+                fqns.iter()
+                    .filter(|fqn| seen.insert(fqn.as_str()))
+                    .filter(|fqn| !cache.contains_key(&(language, (*fqn).clone())))
+                    .cloned()
+                    .collect()
+            };
+            if missing.is_empty() {
+                continue;
+            }
+
+            let mut exact_owners = Vec::new();
+            let mut exact_questions = Vec::new();
+            for (index, fqn) in missing.iter().enumerate() {
+                if let Some(name) = Self::rendered_name(language, fqn) {
+                    exact_owners.push(index);
+                    exact_questions.push((name, RelationalDefinitionQuery::ExactName));
+                }
+            }
+            // A name the language cannot even render as a path resolves to
+            // nothing without a fallback, exactly as the point path answers.
+            let mut parseable = vec![false; missing.len()];
+            let mut units_by_name: Vec<Vec<CodeUnit>> = vec![Vec::new(); missing.len()];
+            if !exact_questions.is_empty() {
+                let expected = exact_questions.len();
+                let values = self.query_values(language, exact_questions);
+                if values.len() != expected {
+                    return;
+                }
+                for (owner, value) in exact_owners.into_iter().zip(values) {
+                    parseable[owner] = true;
+                    match value {
+                        RelationalDefinitionValue::Definitions(units) => {
+                            units_by_name[owner] = units;
+                        }
+                        _ => panic!("an exact-name query returned the wrong result shape"),
+                    }
+                }
+            }
+
+            let mut fallback: Vec<(usize, std::ops::Range<usize>, Vec<String>)> = Vec::new();
+            let mut fallback_questions = Vec::new();
+            for (index, fqn) in missing.iter().enumerate() {
+                units_by_name[index].retain(|unit| unit.fq_name() == *fqn);
+                if !parseable[index] || !units_by_name[index].is_empty() {
+                    continue;
+                }
+                let identifiers = self.rendered_identifier_candidates(language, fqn);
+                let start = fallback_questions.len();
+                fallback_questions.extend(Self::identifier_queries(language, &identifiers, None));
+                fallback.push((index, start..fallback_questions.len(), identifiers));
+            }
+            if !fallback_questions.is_empty() {
+                let expected = fallback_questions.len();
+                let values = self.query_values(language, fallback_questions);
+                if values.len() != expected {
+                    return;
+                }
+                let mut values = values.into_iter().map(Some).collect::<Vec<_>>();
+                for (index, range, identifiers) in fallback {
+                    let name_values = values[range]
+                        .iter_mut()
+                        .map(|value| value.take().expect("each fallback value is consumed once"))
+                        .collect::<Vec<_>>();
+                    units_by_name[index] =
+                        Self::identifier_units_from_values(&identifiers, name_values);
+                    units_by_name[index].retain(|unit| unit.fq_name() == missing[index]);
+                }
+            }
+
+            let mut cache = self
+                .memo
+                .fqn_cache
+                .lock()
+                .expect("definition fqn cache poisoned");
+            for (fqn, mut units) in missing.into_iter().zip(units_by_name) {
+                sort_units(&mut units);
+                units.dedup();
+                cache.insert((language, fqn), units);
+            }
+        }
     }
 }
 
@@ -412,6 +584,7 @@ impl BoundedDefinitionLookup for AnalyzerDefinitionLookup<'_> {
         for language in self.query_languages() {
             let key = (language, normalized.to_string());
             if let Some(cached) = self
+                .memo
                 .normalized_fqn_cache
                 .lock()
                 .expect("normalized definition cache poisoned")
@@ -423,7 +596,8 @@ impl BoundedDefinitionLookup for AnalyzerDefinitionLookup<'_> {
             let mut matches = self.normalized_for_language(normalized, language);
             sort_units(&mut matches);
             matches.dedup();
-            self.normalized_fqn_cache
+            self.memo
+                .normalized_fqn_cache
                 .lock()
                 .expect("normalized definition cache poisoned")
                 .insert(key, matches.clone());
@@ -459,24 +633,7 @@ impl BoundedDefinitionLookup for AnalyzerDefinitionLookup<'_> {
     fn identifier(&self, ident: &str) -> Vec<CodeUnit> {
         let mut units = Vec::new();
         for language in self.query_languages() {
-            let key = (language, ident.to_string());
-            if let Some(cached) = self
-                .identifier_cache
-                .lock()
-                .expect("definition identifier cache poisoned")
-                .get(&key)
-            {
-                units.extend(cached.clone());
-                continue;
-            }
-            let mut matches = self.identifier_candidates_for_language(language, ident, None);
-            sort_units(&mut matches);
-            matches.dedup();
-            self.identifier_cache
-                .lock()
-                .expect("definition identifier cache poisoned")
-                .insert(key, matches.clone());
-            units.extend(matches);
+            units.extend(self.workspace_identifier_candidates(language, ident));
         }
         sort_units(&mut units);
         units.dedup();
@@ -492,6 +649,7 @@ impl BoundedDefinitionLookup for AnalyzerDefinitionLookup<'_> {
     fn file_identifier(&self, file: &ProjectFile, ident: &str) -> Vec<CodeUnit> {
         let key = (file.clone(), ident.to_string());
         if let Some(cached) = self
+            .memo
             .file_identifier_cache
             .lock()
             .expect("file identifier cache poisoned")
@@ -501,11 +659,49 @@ impl BoundedDefinitionLookup for AnalyzerDefinitionLookup<'_> {
         }
         let matches =
             self.identifier_candidates_for_language(language_for_file(file), ident, Some(file));
-        self.file_identifier_cache
+        self.memo
+            .file_identifier_cache
             .lock()
             .expect("file identifier cache poisoned")
             .insert(key, matches.clone());
         matches
+    }
+
+    /// The trait default asks `file_identifier` once per file, so a caller
+    /// that hands over a whole visibility closure pays one store read per
+    /// visible file. Ruby's Zeitwerk closure is effectively the workspace, so
+    /// one bare identifier cost tens of seconds on a large repository (#2743).
+    ///
+    /// The persisted identifier view answers the same question workspace-wide
+    /// from the same `(lang, identifier)` index: `Identifier { file: Some(_) }`
+    /// is `Identifier { file: None }` plus a `names.rel_path` equality, and
+    /// the decorated seeks and the `identifier_addresses_target` filter depend
+    /// only on the language and the spelling. So the union of the per-file
+    /// answers is exactly the workspace answer restricted to those paths, and
+    /// grouping by `language_for_file` reproduces the language scope each
+    /// per-file query would have used.
+    ///
+    /// One file keeps the per-file path: the `rel_path`-scoped read is the
+    /// cheaper one there, and it is what the JS/TS import resolver caches.
+    fn file_identifier_in_files(&self, files: &[ProjectFile], ident: &str) -> Vec<CodeUnit> {
+        if let [file] = files {
+            return self.file_identifier(file, ident);
+        }
+        let wanted = files.iter().collect::<HashSet<&ProjectFile>>();
+        let mut languages = files.iter().map(language_for_file).collect::<Vec<_>>();
+        languages.sort();
+        languages.dedup();
+        let mut units = Vec::new();
+        for language in languages {
+            units.extend(
+                self.workspace_identifier_candidates(language, ident)
+                    .into_iter()
+                    .filter(|unit| wanted.contains(unit.source())),
+            );
+        }
+        sort_units(&mut units);
+        units.dedup();
+        units
     }
 
     fn fqn_direct_children(&self, fqn: &str) -> Vec<CodeUnit> {
@@ -513,6 +709,7 @@ impl BoundedDefinitionLookup for AnalyzerDefinitionLookup<'_> {
         for language in self.query_languages() {
             let key = (language, fqn.to_string());
             if let Some(cached) = self
+                .memo
                 .children_cache
                 .lock()
                 .expect("definition children cache poisoned")
@@ -547,7 +744,8 @@ impl BoundedDefinitionLookup for AnalyzerDefinitionLookup<'_> {
                 .collect::<Vec<_>>();
             sort_units(&mut children);
             children.dedup();
-            self.children_cache
+            self.memo
+                .children_cache
                 .lock()
                 .expect("definition children cache poisoned")
                 .insert(key, children.clone());
@@ -577,6 +775,7 @@ impl BoundedDefinitionLookup for AnalyzerDefinitionLookup<'_> {
                 name.to_string(),
             );
             if let Some(cached) = self
+                .memo
                 .members_cache
                 .lock()
                 .expect("definition members cache poisoned")
@@ -617,7 +816,8 @@ impl BoundedDefinitionLookup for AnalyzerDefinitionLookup<'_> {
                 .collect::<Vec<_>>();
             sort_units(&mut members);
             members.dedup();
-            self.members_cache
+            self.memo
+                .members_cache
                 .lock()
                 .expect("definition members cache poisoned")
                 .insert(key, members.clone());
@@ -632,6 +832,7 @@ impl BoundedDefinitionLookup for AnalyzerDefinitionLookup<'_> {
         let language = language_for_file(owner.source());
         let key = (language, owner.fq().clone(), name.to_string());
         if let Some(cached) = self
+            .memo
             .structured_members_cache
             .lock()
             .expect("structured definition members cache poisoned")
@@ -658,7 +859,8 @@ impl BoundedDefinitionLookup for AnalyzerDefinitionLookup<'_> {
             .collect::<Vec<_>>();
         sort_units(&mut members);
         members.dedup();
-        self.structured_members_cache
+        self.memo
+            .structured_members_cache
             .lock()
             .expect("structured definition members cache poisoned")
             .insert(key, members.clone());
@@ -674,6 +876,7 @@ impl BoundedDefinitionLookup for AnalyzerDefinitionLookup<'_> {
     fn package_exists_in_language(&self, package: &str, language: Language) -> bool {
         let key = (language, package.to_string());
         if let Some(cached) = self
+            .memo
             .package_cache
             .lock()
             .expect("package cache poisoned")
@@ -705,7 +908,8 @@ impl BoundedDefinitionLookup for AnalyzerDefinitionLookup<'_> {
                 false
             }
         };
-        self.package_cache
+        self.memo
+            .package_cache
             .lock()
             .expect("package cache poisoned")
             .insert(key, exists);
@@ -716,6 +920,7 @@ impl BoundedDefinitionLookup for AnalyzerDefinitionLookup<'_> {
         for language in self.query_languages() {
             let key = (language, prefix.to_string());
             if let Some(cached) = self
+                .memo
                 .prefix_cache
                 .lock()
                 .expect("fqn prefix cache poisoned")
@@ -749,7 +954,8 @@ impl BoundedDefinitionLookup for AnalyzerDefinitionLookup<'_> {
             let exists = package_exists
                 || has_descendants
                 || !self.fqn_for_language(prefix, language).is_empty();
-            self.prefix_cache
+            self.memo
+                .prefix_cache
                 .lock()
                 .expect("fqn prefix cache poisoned")
                 .insert(key, exists);
@@ -758,5 +964,265 @@ impl BoundedDefinitionLookup for AnalyzerDefinitionLookup<'_> {
             }
         }
         false
+    }
+}
+
+#[cfg(test)]
+mod definition_lookup_tests {
+    use super::*;
+    use crate::analyzer::{RubyAnalyzer, TestProject};
+    use std::path::PathBuf;
+
+    /// Four Ruby files declaring one bare top-level method: two inside the
+    /// file set a test passes, one outside it, and one file that declares an
+    /// unrelated name only.
+    struct BareIdentifierProject {
+        _temp: tempfile::TempDir,
+        root: PathBuf,
+        analyzer: RubyAnalyzer,
+    }
+
+    impl BareIdentifierProject {
+        fn new() -> Self {
+            let temp = tempfile::tempdir().expect("create temp dir");
+            let root = temp.path().canonicalize().expect("canonicalize temp dir");
+            for (rel, contents) in [
+                ("lib/alpha.rb", "def shared_helper\n  1\nend\n"),
+                ("lib/beta.rb", "def shared_helper\n  2\nend\n"),
+                ("lib/gamma.rb", "def other_helper\n  3\nend\n"),
+                ("lib/delta.rb", "def shared_helper\n  4\nend\n"),
+            ] {
+                ProjectFile::new(root.clone(), rel)
+                    .write(contents)
+                    .unwrap_or_else(|err| panic!("write {rel}: {err}"));
+            }
+            let analyzer =
+                RubyAnalyzer::from_project(TestProject::new(root.clone(), Language::Ruby));
+            Self {
+                _temp: temp,
+                root,
+                analyzer,
+            }
+        }
+
+        fn file(&self, rel: &str) -> ProjectFile {
+            ProjectFile::new(self.root.clone(), rel)
+        }
+
+        fn lookup(&self) -> AnalyzerDefinitionLookup<'_> {
+            AnalyzerDefinitionLookup::new(&self.analyzer, Language::None)
+        }
+
+        /// What the `BoundedDefinitionLookup::file_identifier_in_files` trait
+        /// default computes: one file-scoped store read per file, published in
+        /// the canonical order.
+        fn per_file_union(&self, files: &[ProjectFile], ident: &str) -> Vec<CodeUnit> {
+            let lookup = self.lookup();
+            let mut units = files
+                .iter()
+                .flat_map(|file| lookup.file_identifier(file, ident))
+                .collect::<Vec<_>>();
+            sort_units(&mut units);
+            units.dedup();
+            units
+        }
+
+        fn sources(units: &[CodeUnit]) -> Vec<String> {
+            units
+                .iter()
+                .map(|unit| crate::path_utils::rel_path_string(unit.source()))
+                .collect()
+        }
+    }
+
+    #[test]
+    fn file_set_identifier_lookup_matches_the_per_file_union() {
+        let project = BareIdentifierProject::new();
+        let all_three = [
+            project.file("lib/alpha.rb"),
+            project.file("lib/beta.rb"),
+            project.file("lib/gamma.rb"),
+        ];
+
+        let overridden = project
+            .lookup()
+            .file_identifier_in_files(&all_three, "shared_helper");
+        assert_eq!(
+            overridden,
+            project.per_file_union(&all_three, "shared_helper"),
+            "the workspace-wide filter must publish exactly the trait default's set and order"
+        );
+        assert_eq!(
+            BareIdentifierProject::sources(&overridden),
+            vec!["lib/alpha.rb".to_string(), "lib/beta.rb".to_string()],
+            "lib/delta.rb declares the same identifier but is outside the file set"
+        );
+
+        let subset = [project.file("lib/alpha.rb"), project.file("lib/gamma.rb")];
+        let overridden_subset = project
+            .lookup()
+            .file_identifier_in_files(&subset, "shared_helper");
+        assert_eq!(
+            overridden_subset,
+            project.per_file_union(&subset, "shared_helper"),
+            "a subset must agree with the trait default over that same subset"
+        );
+        assert_eq!(
+            BareIdentifierProject::sources(&overridden_subset),
+            vec!["lib/alpha.rb".to_string()],
+            "dropping lib/beta.rb from the set must drop its declaration"
+        );
+    }
+
+    /// Cost pin for #2883: every lookup built under one request scope answers
+    /// from one memo, so the second lookup to ask for a name it already holds
+    /// costs no store read. Candidate discovery builds one lookup per candidate
+    /// file, which is why this is what the scan actually pays.
+    #[test]
+    fn lookups_under_one_query_scope_share_one_definition_memo() {
+        let project = BareIdentifierProject::new();
+        let checkouts = || {
+            project
+                .analyzer
+                .relational_batch_reader_checkouts_for_test()
+        };
+        let _scope = crate::analyzer::AnalyzerQueryScope::new(&project.analyzer);
+
+        let before = checkouts();
+        let first = project.lookup().identifier("shared_helper");
+        let first_cost = checkouts() - before;
+        let second = project.lookup().identifier("shared_helper");
+        let second_cost = checkouts() - before - first_cost;
+
+        assert!(
+            first_cost > 0,
+            "the first lookup must actually ask the store"
+        );
+        assert_eq!(
+            second_cost, 0,
+            "a second lookup under the same scope must answer from the shared memo"
+        );
+        assert_eq!(
+            first, second,
+            "the shared memo must publish the answer the store read produced"
+        );
+    }
+
+    /// The counterpart: with no request scope open there is no shared memo, so
+    /// each lookup owns its own and pays its own store read. Ownership of the
+    /// memo is what changes, not what a lookup answers.
+    #[test]
+    fn lookups_outside_a_query_scope_keep_their_own_definition_memo() {
+        let project = BareIdentifierProject::new();
+        let checkouts = || {
+            project
+                .analyzer
+                .relational_batch_reader_checkouts_for_test()
+        };
+
+        let before = checkouts();
+        let first = project.lookup().identifier("shared_helper");
+        let first_cost = checkouts() - before;
+        let second = project.lookup().identifier("shared_helper");
+        let second_cost = checkouts() - before - first_cost;
+
+        assert_eq!(
+            (first_cost, second_cost),
+            (1, 1),
+            "without a scope each lookup asks the store for itself"
+        );
+        assert_eq!(first, second);
+    }
+
+    /// Parity and cost pin for the batched name prefetch: after
+    /// `prefetch_fqns`, a point `fqn` ask costs no store read and answers
+    /// exactly what the unprefetched point path computed -- including the
+    /// name that resolves to nothing.
+    #[test]
+    fn prefetched_fqns_answer_from_the_shared_memo_without_store_reads() {
+        let project = BareIdentifierProject::new();
+        let names = vec!["shared_helper".to_string(), "no_such_name".to_string()];
+        let unprefetched: Vec<_> = {
+            let _scope = crate::analyzer::AnalyzerQueryScope::new(&project.analyzer);
+            names
+                .iter()
+                .map(|name| project.lookup().fqn(name))
+                .collect()
+        };
+
+        let _scope = crate::analyzer::AnalyzerQueryScope::new(&project.analyzer);
+        let checkouts = || {
+            project
+                .analyzer
+                .relational_batch_reader_checkouts_for_test()
+        };
+        project.lookup().prefetch_fqns(&names);
+        let before = checkouts();
+        let prefetched: Vec<_> = names
+            .iter()
+            .map(|name| project.lookup().fqn(name))
+            .collect();
+        assert_eq!(
+            checkouts() - before,
+            0,
+            "a prefetched name must answer from the shared memo"
+        );
+        assert_eq!(
+            prefetched, unprefetched,
+            "a memoized answer must equal the point path's"
+        );
+    }
+
+    /// Cost pin for #2743: what one bare identifier costs in store reads must
+    /// not grow with the size of the file set.
+    ///
+    /// The counter is the relational batch reader checkout, one per store
+    /// round trip. `EXPLAIN QUERY PLAN` is this repository's preferred pin for
+    /// the shape of one query; it cannot express how many queries a caller
+    /// issues, which is the whole defect here.
+    #[test]
+    fn file_set_identifier_lookup_cost_is_independent_of_the_file_count() {
+        let project = BareIdentifierProject::new();
+        let all_four = [
+            project.file("lib/alpha.rb"),
+            project.file("lib/beta.rb"),
+            project.file("lib/gamma.rb"),
+            project.file("lib/delta.rb"),
+        ];
+
+        let measure = |files: &[ProjectFile]| {
+            let before = project
+                .analyzer
+                .relational_batch_reader_checkouts_for_test();
+            project
+                .lookup()
+                .file_identifier_in_files(files, "shared_helper");
+            project
+                .analyzer
+                .relational_batch_reader_checkouts_for_test()
+                - before
+        };
+
+        let two_files = measure(&all_four[..2]);
+        let four_files = measure(&all_four);
+        assert_eq!(
+            (two_files, four_files),
+            (1, 1),
+            "the override asks the store once for this single-language file set, whatever its size"
+        );
+
+        let before = project
+            .analyzer
+            .relational_batch_reader_checkouts_for_test();
+        project.per_file_union(&all_four, "shared_helper");
+        let trait_default = project
+            .analyzer
+            .relational_batch_reader_checkouts_for_test()
+            - before;
+        assert_eq!(
+            trait_default,
+            four_files * all_four.len(),
+            "the trait default pays one store read per file, which is what the override removes"
+        );
     }
 }

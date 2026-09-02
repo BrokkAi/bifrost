@@ -5,8 +5,16 @@
 //! why the footgun name appears four times below. A scoped session sees a
 //! partial file set, and a partial view must not become the workspace's
 //! persisted picture of itself: the files it never listed would read as absent
-//! to the next consumer of that cache. Surfacing the incompleteness to callers,
-//! rather than paying for it with a throwaway store, is tracked in #2770.
+//! to the next consumer of that cache.
+//!
+//! Callers see the partial view for what it is because the `FileSetProject`
+//! every branch below builds answers `Project::coverage()` with its own file
+//! count. Each cross-file tool answer publishes that count as an optional
+//! `session_subset` field (`scope.session_subset` on `scan_usages`, top level
+//! on `usage_graph`, `most_relevant_files`, `search_symbols`, `query_code`, and
+//! `get_active_workspace`), so "nothing found" from one of these sessions reads
+//! as "nothing in these N files" rather than "nothing in the workspace". A
+//! whole-workspace session omits the field entirely.
 
 use crate::analyzer::{
     AnalyzerConfig, FileSetProject, OverlayProject, Project, SourceIngestionKind,

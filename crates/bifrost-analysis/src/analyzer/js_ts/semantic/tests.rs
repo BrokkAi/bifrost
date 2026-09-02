@@ -113,7 +113,7 @@ fn local_const_callback_publishes_target_and_capture_ports() {
     assert!(callback.memory_locations.iter().any(|location| {
         matches!(
             location.kind,
-            MemoryLocationKind::Capture { lexical_parent } if lexical_parent == parent.id
+            MemoryLocationKind::Capture { lexical_parent, .. } if lexical_parent == parent.id
         )
     }));
     let captured_source = parent

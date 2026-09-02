@@ -39,14 +39,42 @@ const OVERLAY_REJECTION_LOG_MAX_ENTRIES: usize = 256;
 
 pub const BIFROST_IGNORE_FILE_NAME: &str = ".bifrostignore";
 
+/// One workspace tree's `.bifrostignore` rules, compiled per directory.
+///
+/// `.bifrostignore` uses gitignore syntax and excludes the paths it matches
+/// from code intelligence -- the analyzable file set and
+/// [`Project::is_bifrostignored`] -- while leaving them in the file-tool view
+/// that [`Project::all_files`] serves. Every project that answers those
+/// questions answers them through this matcher, so one interpretation of the
+/// rules serves the working tree and any other tree a request analyzes.
+///
+/// The rules arrive through the caller rather than from the filesystem, because
+/// a project does not necessarily keep its bytes there: an exported revision
+/// image can hold empty placeholder files and serve every byte from the
+/// repository's object database, so reading `.bifrostignore` from that root
+/// would compile an empty rule set and ignore nothing.
 #[derive(Debug)]
-struct BifrostIgnoreMatcher {
+pub struct BifrostIgnoreMatcher {
     root: PathBuf,
     by_directory: HashMap<PathBuf, Gitignore>,
 }
 
+/// Git ignores a byte-order mark at the start of an ignore file, and so does
+/// the `ignore` crate's own file reader. Rules fed line by line must too.
+const UTF8_BOM: &str = "\u{feff}";
+
 impl BifrostIgnoreMatcher {
-    fn build(root: &Path, files: &BTreeSet<ProjectFile>) -> io::Result<Self> {
+    /// Compile the ignore file of every directory that contains one of `files`,
+    /// plus `root` itself.
+    ///
+    /// `read_ignore_file` receives the absolute path of each candidate
+    /// `.bifrostignore` and answers `None` for a directory that has none. It is
+    /// the only source of rule bytes: nothing here reads the filesystem.
+    pub fn build_with(
+        root: &Path,
+        files: &BTreeSet<ProjectFile>,
+        mut read_ignore_file: impl FnMut(&Path) -> io::Result<Option<String>>,
+    ) -> io::Result<Self> {
         let mut directories = HashSet::from([root.to_path_buf()]);
         for file in files {
             let abs_path = file.abs_path();
@@ -66,18 +94,28 @@ impl BifrostIgnoreMatcher {
         let mut by_directory = HashMap::new();
         for directory in directories {
             let ignore_file = directory.join(BIFROST_IGNORE_FILE_NAME);
-            if !ignore_file.is_file() {
+            let Some(rules) = read_ignore_file(&ignore_file)? else {
                 continue;
-            }
+            };
             let mut builder = GitignoreBuilder::new(&directory);
-            if let Some(error) = builder.add(&ignore_file) {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "failed to parse Bifrost ignore file {}: {error}",
-                        ignore_file.display()
-                    ),
-                ));
+            for (index, line) in rules.lines().enumerate() {
+                let line = if index == 0 {
+                    line.trim_start_matches(UTF8_BOM)
+                } else {
+                    line
+                };
+                builder
+                    .add_line(Some(ignore_file.clone()), line)
+                    .map_err(|error| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!(
+                                "failed to parse Bifrost ignore file {} line {}: {error}",
+                                ignore_file.display(),
+                                index + 1
+                            ),
+                        )
+                    })?;
             }
             let matcher = builder.build().map_err(|error| {
                 io::Error::new(
@@ -97,7 +135,21 @@ impl BifrostIgnoreMatcher {
         })
     }
 
-    fn is_ignored(&self, file: &ProjectFile) -> bool {
+    /// Compile the ignore files the filesystem holds beneath `root`. A
+    /// candidate path that is not a regular file contributes no rules, exactly
+    /// as a directory with no ignore file does.
+    fn build(root: &Path, files: &BTreeSet<ProjectFile>) -> io::Result<Self> {
+        Self::build_with(root, files, |path| {
+            if !path.is_file() {
+                return Ok(None);
+            }
+            std::fs::read_to_string(path).map(Some)
+        })
+    }
+
+    /// Whether the rules exclude `file` from code intelligence, honoring
+    /// directory rules and later whitelist rules the way Git does.
+    pub fn is_ignored(&self, file: &ProjectFile) -> bool {
         let mut active = Vec::new();
         if let Some(matcher) = self.by_directory.get(&self.root) {
             active.push(matcher);
@@ -198,8 +250,46 @@ impl ProjectSourceSnapshot {
     }
 }
 
+/// How many of a workspace's files a project exposes, for a project that
+/// exposes only some of them. Serialized as the `session_subset` marker on a
+/// cross-file tool answer so a caller can read "no usages in these N files"
+/// rather than "no usages in the workspace" (#2770).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, schemars::JsonSchema)]
+pub struct SubsetCoverage {
+    /// The number of files the session covers.
+    pub files: usize,
+}
+
+/// Whether a project exposes the whole workspace or an explicitly named subset
+/// of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProjectCoverage {
+    Whole,
+    Subset(SubsetCoverage),
+}
+
+impl ProjectCoverage {
+    /// The subset descriptor, or `None` for a whole-workspace project.
+    pub const fn subset(self) -> Option<SubsetCoverage> {
+        match self {
+            Self::Whole => None,
+            Self::Subset(coverage) => Some(coverage),
+        }
+    }
+}
+
 pub trait Project: Send + Sync {
     fn root(&self) -> &Path;
+
+    /// How much of the workspace under [`Project::root`] this project exposes.
+    ///
+    /// A project built over an explicitly named set of files answers
+    /// [`ProjectCoverage::Subset`]; everything that walks the workspace keeps
+    /// the whole-workspace default. Cross-file tool answers publish the subset
+    /// descriptor so a caller can tell a scoped answer from a workspace one.
+    fn coverage(&self) -> ProjectCoverage {
+        ProjectCoverage::Whole
+    }
     fn workspace_root_for_file(&self, file: &ProjectFile) -> PathBuf {
         let _ = file;
         self.root().to_path_buf()
@@ -869,6 +959,12 @@ impl Project for FileSetProject {
         &self.root
     }
 
+    fn coverage(&self) -> ProjectCoverage {
+        ProjectCoverage::Subset(SubsetCoverage {
+            files: self.files.len(),
+        })
+    }
+
     fn analyzer_languages(&self) -> BTreeSet<Language> {
         self.languages.clone()
     }
@@ -1305,10 +1401,25 @@ impl WorkspaceOverlayContent {
 
 /// A [`Project`] wrapper that layers an in-memory content overlay on top of a
 /// delegate project. Reads consult the overlay first and fall back to the
-/// delegate; every other [`Project`] method (file enumeration, language
-/// detection) is delegated unchanged. Used by the LSP server to feed
-/// `textDocument/did{Open,Change}` buffer content into the analyzer without
-/// writing to disk.
+/// delegate. Used by the LSP server to feed `textDocument/did{Open,Change}`
+/// buffer content into the analyzer without writing to disk.
+///
+/// A buffer outlives the file beneath it: a branch switch, a rebase or a rename
+/// deletes the file while the editor still holds (and still edits) its
+/// contents, and `didClose` is the only point at which the editor gives it up.
+/// This project therefore lists such a path -- the bytes exist, and the buffer
+/// is the only place they are -- and resolves every path it serves from a
+/// buffer, so the editor can go on editing that document and can finally close
+/// it. Delegating both made a buffer that outlived its file serve content
+/// nobody could enumerate: an analyzer built over this project skipped it while
+/// an incrementally updated one kept it, `didChange` could no longer resolve it,
+/// and `didClose` could not clear it, so the buffer leaked for the life of the
+/// session.
+///
+/// Membership stops there. A buffer supplies bytes; it does not overrule the
+/// delegate's membership rules. A path the delegate excludes while its file is
+/// on disk -- ignored, out of scope -- stays excluded when an editor opens it,
+/// exactly as it was before the buffer existed.
 pub struct OverlayProject {
     /// The overlay content identity published for the map's current revision.
     /// Recomputing it hashes every open buffer, so it is derived once per
@@ -1463,6 +1574,64 @@ impl OverlayProject {
         }
     }
 
+    /// The buffers this project serves, as project files.
+    ///
+    /// An overlay is keyed by absolute path and installed by a caller that
+    /// resolved it through this project, so in practice every key is under the
+    /// root; a key that is not belongs to no workspace-relative path and is
+    /// dropped rather than guessed at.
+    fn overlay_project_files(&self) -> Vec<ProjectFile> {
+        let root = self.delegate.root();
+        self.overlays
+            .read()
+            .expect("overlay lock poisoned")
+            .keys()
+            .filter_map(|abs_path| {
+                let rel_path = abs_path.strip_prefix(root).ok()?;
+                Some(ProjectFile::new(root.to_path_buf(), rel_path))
+            })
+            .collect()
+    }
+
+    /// The buffers among `candidates` this project must name itself, because
+    /// `listed` does not name them and the delegate has no file there.
+    ///
+    /// This is the type's membership rule in one place: the existence probe is
+    /// what keeps a buffer from carrying an ignored or out-of-scope path into
+    /// the workspace, and it runs only for a path the delegate's own answer
+    /// left out -- in a session whose files are all saved, none of them.
+    fn buffers_missing_from<'a>(
+        candidates: impl IntoIterator<Item = ProjectFile> + 'a,
+        listed: &'a BTreeSet<ProjectFile>,
+    ) -> impl Iterator<Item = ProjectFile> + 'a {
+        candidates
+            .into_iter()
+            .filter(|file| !listed.contains(file) && !file.exists())
+    }
+
+    /// Add the buffers among `candidates` that belong in a `language` listing
+    /// to `analyzable`.
+    ///
+    /// The membership rules stay the delegate's: the language is the path's own,
+    /// and a `.bifrostignore` match excludes a buffer exactly as it excludes the
+    /// file it shadows.
+    fn add_analyzable_overlays(
+        &self,
+        language: Language,
+        candidates: impl IntoIterator<Item = ProjectFile>,
+        analyzable: &mut BTreeSet<ProjectFile>,
+    ) {
+        let additions: Vec<ProjectFile> = Self::buffers_missing_from(
+            candidates
+                .into_iter()
+                .filter(|file| file.language() == language),
+            analyzable,
+        )
+        .filter(|file| !self.delegate.is_bifrostignored(file.rel_path()))
+        .collect();
+        analyzable.extend(additions);
+    }
+
     /// Emit a single stderr line reporting that `abs_path` was rejected, but
     /// only when we haven't logged for the same path within
     /// [`OVERLAY_REJECTION_LOG_THROTTLE`]. The throttle map is bounded by
@@ -1490,6 +1659,12 @@ impl Project for OverlayProject {
         self.delegate.workspace_file_listing_count()
     }
 
+    /// An overlay supplies bytes, not membership: the session still covers
+    /// exactly the workspace slice its delegate covers.
+    fn coverage(&self) -> ProjectCoverage {
+        self.delegate.coverage()
+    }
+
     fn root(&self) -> &Path {
         self.delegate.root()
     }
@@ -1503,15 +1678,54 @@ impl Project for OverlayProject {
     }
 
     fn all_files(&self) -> io::Result<BTreeSet<ProjectFile>> {
-        self.delegate.all_files()
+        let mut files = self.delegate.all_files()?;
+        let additions: Vec<ProjectFile> =
+            Self::buffers_missing_from(self.overlay_project_files(), &files).collect();
+        files.extend(additions);
+        Ok(files)
+    }
+
+    fn all_files_shared(&self) -> io::Result<Arc<BTreeSet<ProjectFile>>> {
+        let files = self.delegate.all_files_shared()?;
+        let additions: Vec<ProjectFile> =
+            Self::buffers_missing_from(self.overlay_project_files(), &files).collect();
+        // Nothing to add is the ordinary case -- every open buffer has its file
+        // on disk -- and the delegate's listing is the one every other reader of
+        // this generation shares. Copying it per call to add nothing would make
+        // a whole-workspace clone the price of holding a buffer open.
+        if additions.is_empty() {
+            return Ok(files);
+        }
+        let mut extended = (*files).clone();
+        extended.extend(additions);
+        Ok(Arc::new(extended))
     }
 
     fn has_directory(&self, rel_path: &Path) -> bool {
-        self.delegate.has_directory(rel_path)
+        if self.delegate.has_directory(rel_path) {
+            return true;
+        }
+        // `false` is the authoritative half of this answer -- no workspace file
+        // lives beneath `rel_path` -- so a buffer under a directory the
+        // delegate no longer has must still make it `true`. `true` needs no
+        // existence probe: it only means a listing is worth computing, and that
+        // listing applies the membership rule.
+        let prefix = self.delegate.root().join(rel_path);
+        self.overlays
+            .read()
+            .expect("overlay lock poisoned")
+            .keys()
+            .any(|abs_path| {
+                abs_path
+                    .strip_prefix(&prefix)
+                    .is_ok_and(|remainder| remainder.components().next().is_some())
+            })
     }
 
     fn analyzable_files(&self, language: Language) -> io::Result<BTreeSet<ProjectFile>> {
-        self.delegate.analyzable_files(language)
+        let mut files = self.delegate.analyzable_files(language)?;
+        self.add_analyzable_overlays(language, self.overlay_project_files(), &mut files);
+        Ok(files)
     }
 
     fn analyzable_files_from(
@@ -1519,15 +1733,38 @@ impl Project for OverlayProject {
         files: &BTreeSet<ProjectFile>,
         language: Language,
     ) -> io::Result<BTreeSet<ProjectFile>> {
-        self.delegate.analyzable_files_from(files, language)
+        let mut analyzable = self.delegate.analyzable_files_from(files, language)?;
+        // A caller-owned listing is filtered, not extended: a buffer belongs in
+        // the answer only when the caller's set already names it (which a
+        // listing from this project does). The delegate is asked first and the
+        // buffers are re-added afterwards because a delegate that does not
+        // implement this hook answers from its own disk listing, where a path
+        // whose file is gone cannot appear.
+        self.add_analyzable_overlays(
+            language,
+            self.overlay_project_files()
+                .into_iter()
+                .filter(|file| files.contains(file)),
+            &mut analyzable,
+        );
+        Ok(analyzable)
     }
 
     fn file_by_rel_path(&self, rel_path: &Path) -> Option<ProjectFile> {
-        self.delegate.file_by_rel_path(rel_path)
+        if let Some(file) = self.delegate.file_by_rel_path(rel_path) {
+            return Some(file);
+        }
+        let file = ProjectFile::new(self.delegate.root().to_path_buf(), rel_path.to_path_buf());
+        self.has_overlay(&file).then_some(file)
     }
 
     fn file_by_abs_path(&self, abs_path: &Path) -> Option<ProjectFile> {
-        self.delegate.file_by_abs_path(abs_path)
+        if let Some(file) = self.delegate.file_by_abs_path(abs_path) {
+            return Some(file);
+        }
+        let normalized = abs_path.to_path_buf().normalize();
+        let rel_path = normalized.strip_prefix(self.delegate.root()).ok()?;
+        self.file_by_rel_path(rel_path)
     }
 
     fn file_by_abs_path_allow_missing(&self, abs_path: &Path) -> Option<ProjectFile> {
@@ -1667,6 +1904,63 @@ mod tests {
         }
         std::fs::write(&abs, contents).unwrap();
         ProjectFile::new(root.to_path_buf(), PathBuf::from(rel))
+    }
+
+    #[test]
+    fn file_set_project_reports_its_file_count_as_subset_coverage() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let project =
+            FileSetProject::new(&root, ["a.rs", "b.rs", "nested/c.rs"].map(PathBuf::from));
+
+        assert_eq!(
+            ProjectCoverage::Subset(SubsetCoverage { files: 3 }),
+            project.coverage()
+        );
+        assert_eq!(
+            Some(SubsetCoverage { files: 3 }),
+            project.coverage().subset()
+        );
+    }
+
+    #[test]
+    fn overlay_project_reports_its_delegate_coverage() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let files = FileSetProject::new(&root, ["a.rs", "b.rs", "nested/c.rs"].map(PathBuf::from));
+        let overlay = OverlayProject::new(Arc::new(files));
+
+        assert_eq!(
+            ProjectCoverage::Subset(SubsetCoverage { files: 3 }),
+            overlay.coverage()
+        );
+
+        // A buffer supplies bytes, not membership, so opening one does not
+        // change what slice of the workspace the session covers.
+        assert!(overlay.set(root.join("a.rs"), "fn a() {}".to_string()));
+        assert_eq!(
+            ProjectCoverage::Subset(SubsetCoverage { files: 3 }),
+            overlay.coverage()
+        );
+    }
+
+    #[test]
+    fn filesystem_project_reports_whole_workspace_coverage() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        write_file(&root, "a.rs", "fn a() {}\n");
+        let project = FilesystemProject::new(&root).unwrap();
+
+        assert_eq!(ProjectCoverage::Whole, project.coverage());
+        assert_eq!(None, project.coverage().subset());
+    }
+
+    #[test]
+    fn subset_coverage_serializes_as_a_file_count() {
+        assert_eq!(
+            serde_json::json!({ "files": 12 }),
+            serde_json::to_value(SubsetCoverage { files: 12 }).unwrap()
+        );
     }
 
     #[test]
@@ -2103,6 +2397,103 @@ mod tests {
 
         // Clearing a missing overlay returns false.
         assert!(!overlay.clear(&file.abs_path()));
+    }
+
+    #[test]
+    fn a_buffer_outliving_its_file_stays_listed_until_it_is_cleared() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let open = write_file(&root, "src/open.rs", "fn saved() {}\n");
+        let other = write_file(&root, "src/other.rs", "fn other() {}\n");
+        let delegate: Arc<dyn Project> = Arc::new(FilesystemProject::new(&root).unwrap());
+        let overlay = OverlayProject::new(delegate);
+        assert!(overlay.set(open.abs_path(), "fn unsaved() {}\n".to_string()));
+
+        // The editor's file is deleted underneath the open buffer.
+        std::fs::remove_file(open.abs_path()).unwrap();
+
+        assert_eq!(
+            BTreeSet::from([open.clone(), other.clone()]),
+            overlay.all_files().unwrap(),
+            "a path served from a buffer must be a path the project lists"
+        );
+        assert_eq!(
+            BTreeSet::from([open.clone(), other.clone()]),
+            *overlay.all_files_shared().unwrap(),
+        );
+        assert_eq!(
+            BTreeSet::from([open.clone(), other.clone()]),
+            overlay.analyzable_files(Language::Rust).unwrap(),
+        );
+        assert_eq!(
+            BTreeSet::from([open.clone()]),
+            overlay
+                .analyzable_files_from(&BTreeSet::from([open.clone()]), Language::Rust)
+                .unwrap(),
+        );
+        assert_eq!(
+            Some(open.clone()),
+            overlay.file_by_abs_path(&open.abs_path()),
+            "the buffer must stay resolvable, or the editor can neither edit nor close it"
+        );
+        assert_eq!(
+            Some(open.clone()),
+            overlay.file_by_rel_path(open.rel_path())
+        );
+        assert!(overlay.has_directory(Path::new("src")));
+        assert_eq!("fn unsaved() {}\n", overlay.read_source(&open).unwrap());
+
+        // `didClose` is the release point: after it nothing serves the path.
+        assert!(overlay.clear(&open.abs_path()));
+        assert_eq!(
+            BTreeSet::from([other.clone()]),
+            overlay.all_files().unwrap(),
+            "a closed buffer over a deleted file must leave nothing behind"
+        );
+        assert_eq!(
+            BTreeSet::from([other]),
+            overlay.analyzable_files(Language::Rust).unwrap(),
+        );
+        assert_eq!(None, overlay.file_by_abs_path(&open.abs_path()));
+        assert!(overlay.read_source(&open).is_err());
+    }
+
+    #[test]
+    fn a_buffer_does_not_carry_an_ignored_path_into_the_workspace() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        write_file(&root, BIFROST_IGNORE_FILE_NAME, "generated/\n");
+        let generated = write_file(&root, "generated/machine.rs", "fn generated() {}\n");
+        let handwritten = write_file(&root, "src/handwritten.rs", "fn handwritten() {}\n");
+        let delegate: Arc<dyn Project> = Arc::new(FilesystemProject::new(&root).unwrap());
+        let overlay = OverlayProject::new(delegate);
+        assert!(overlay.set(generated.abs_path(), "fn edited() {}\n".to_string()));
+
+        let analyzable = |overlay: &OverlayProject| {
+            overlay
+                .analyzable_files(Language::Rust)
+                .unwrap()
+                .into_iter()
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            vec![handwritten.clone()],
+            analyzable(&overlay),
+            "opening an ignored file must not add it to the analyzed workspace"
+        );
+        assert_eq!("fn edited() {}\n", overlay.read_source(&generated).unwrap());
+
+        // Still ignored once the file is gone and the buffer is all that is
+        // left: what the delegate excludes by rule, a buffer cannot smuggle in.
+        std::fs::remove_file(generated.abs_path()).unwrap();
+        assert_eq!(vec![handwritten], analyzable(&overlay));
+        assert_eq!(
+            Some(generated.clone()),
+            overlay.file_by_abs_path(&generated.abs_path()),
+            "an ignored path still resolves while a buffer serves it, so the editor \
+             can close the document"
+        );
+        assert_eq!("fn edited() {}\n", overlay.read_source(&generated).unwrap());
     }
 
     #[test]

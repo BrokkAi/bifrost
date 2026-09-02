@@ -67,8 +67,10 @@ normalized_kinds! {
     Class => "class": "Match a class-like declaration.",
     Import => "import": "Match an import declaration.",
     Parameter => "parameter": "Match a formal parameter declaration.",
+    Module => "module": "Match a module or namespace declaration.",
     // expression-ish kinds (kept flat; see ExecPlan decision log)
     Call => "call": "Match call expressions for functions, methods, or constructors.",
+    ConcurrentSpawn => "concurrent_spawn": "Match a structured operation that starts a callable in a distinct concurrent task.",
     Assignment => "assignment": "Match an assignment expression or statement.",
     FieldAccess => "field_access": "Match member or field access.",
     Identifier => "identifier": "Match an identifier reference.",
@@ -105,15 +107,16 @@ impl NormalizedKind {
     pub fn parent(self) -> Option<NormalizedKind> {
         use NormalizedKind::*;
         match self {
-            Callable | Class | Import | Parameter => Some(Declaration),
+            Callable | Class | Import | Parameter | Module => Some(Declaration),
             Function | Method | Constructor | Lambda => Some(Callable),
             StringLiteral | NumericLiteral | BooleanLiteral | NullLiteral | CollectionLiteral => {
                 Some(Literal)
             }
             ForLoop | WhileLoop => Some(Loop),
-            Declaration | Call | Assignment | FieldAccess | Identifier | Literal | Return
-            | Throw | Catch | If | Loop | Decorator | Block | JsxElement | JsxAttribute
-            | JsxSpreadAttribute | ObjectProperty | ComputedProperty | SpreadElement => None,
+            Declaration | Call | ConcurrentSpawn | Assignment | FieldAccess | Identifier
+            | Literal | Return | Throw | Catch | If | Loop | Decorator | Block | JsxElement
+            | JsxAttribute | JsxSpreadAttribute | ObjectProperty | ComputedProperty
+            | SpreadElement => None,
         }
     }
 
@@ -210,8 +213,9 @@ roles! {
     Kwarg => "kwargs": PatternMap, "Constrain named arguments by argument name.",
     Left => "left": Pattern, "Constrain the left-hand side of an assignment.",
     Right => "right": Pattern, "Constrain the right-hand side of an assignment.",
+    Operator => "operator": Pattern, "Constrain the grammar-backed assignment operator token.",
     Module => "module": Pattern, "Constrain the module referenced by an import.",
-    Decorator => "decorators": PatternList, "Constrain decorators or annotations.",
+    Decorator => "decorators": PatternList, "Constrain decorators or annotations in order.",
     Object => "object": Pattern, "Constrain the object of a field access.",
     Field => "field": Pattern, "Constrain the field portion of a field access.",
     Iterable => "iterable": Pattern, "Constrain the expression a for-each loop iterates.",
@@ -228,6 +232,7 @@ pub const SINGLE_TARGET_ROLES: &[Role] = &[
     Role::Receiver,
     Role::Left,
     Role::Right,
+    Role::Operator,
     Role::Module,
     Role::Object,
     Role::Field,
@@ -267,8 +272,10 @@ impl Role {
     pub fn valid_for(self, kind: NormalizedKind) -> bool {
         use NormalizedKind::*;
         match self {
-            Role::Callee | Role::Receiver | Role::Arg | Role::Kwarg => kind == Call,
-            Role::Left | Role::Right => kind == Assignment,
+            Role::Callee | Role::Receiver | Role::Arg | Role::Kwarg => {
+                matches!(kind, Call | ConcurrentSpawn)
+            }
+            Role::Left | Role::Right | Role::Operator => kind == Assignment,
             Role::Module => matches!(kind, Import | Declaration),
             Role::Decorator => matches!(
                 kind,
@@ -371,6 +378,9 @@ mod tests {
         assert!(Class.satisfies(Declaration));
         assert!(Import.satisfies(Declaration));
         assert!(Parameter.satisfies(Declaration));
+        assert!(Module.satisfies(Declaration));
+        assert!(!Module.satisfies(Class));
+        assert!(!Class.satisfies(Module));
 
         assert!(ForLoop.satisfies(Loop));
         assert!(WhileLoop.satisfies(Loop));

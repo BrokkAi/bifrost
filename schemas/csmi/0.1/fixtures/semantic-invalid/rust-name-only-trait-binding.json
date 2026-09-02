@@ -1,0 +1,92 @@
+{
+  "documentType": "semantic-document",
+  "schema": "https://csmi.brokk.ai/schema/0.1/schema.json",
+  "semanticModelVersion": "0.1",
+  "serializationVersion": "0.1-json",
+  "defaultProvenance": "fixtureAuthor",
+  "provenanceRecords": [
+    {
+      "id": "fixtureAuthor",
+      "producer": {
+        "identifier": "https://csmi.brokk.ai/producers/conformance-fixtures",
+        "version": "0.1.0"
+      },
+      "generationMethod": "manual-authoring"
+    }
+  ],
+  "semanticModels": [
+    {
+      "artifactSelectors": [{ "purl": "pkg:cargo/acme-codec@1.4.0" }],
+      "vocabularyUses": [
+        {
+          "identifier": "csmi.rust",
+          "version": "0.1.0",
+          "schema": "https://csmi.brokk.ai/schema/profiles/rust/0.1/schema.json",
+          "requirement": "required",
+          "affects": [
+            {
+              "kind": "fact-family",
+              "family": "implementations",
+              "scope": { "symbol": "implDisplay" }
+            }
+          ]
+        }
+      ],
+      "symbols": [
+        {
+          "id": "implDisplay",
+          "scheme": "csmi.rust.source-item",
+          "schemeVersion": "0.1.0",
+          "stability": "portable",
+          "descriptors": [
+            { "role": "namespace", "name": "crate", "disambiguator": "lib:acme_codec" },
+            { "role": "meta", "name": "impl", "disambiguator": "Display for Record" }
+          ]
+        }
+      ],
+      "declarations": [{ "symbol": "implDisplay", "category": "meta" }],
+      "extensionFacts": [
+        {
+          "vocabulary": "csmi.rust",
+          "version": "0.1.0",
+          "family": "implementations",
+          "scope": { "symbol": "implDisplay" },
+          "payload": {
+            "kind": "implementation",
+            "implementation": "implDisplay",
+            "implementationKind": "trait",
+            "implementingType": "Record",
+            "trait": "Display",
+            "identityKey": {
+              "kind": "implementation-key",
+              "trait": {
+                "artifactSelectors": [{ "purl": "pkg:cargo/acme-codec@1.4.0" }],
+                "scheme": "csmi.rust.source-item",
+                "schemeVersion": "0.1.0",
+                "stability": "portable",
+                "descriptors": [
+                  { "role": "namespace", "name": "crate", "disambiguator": "lib:acme_codec" },
+                  { "role": "type", "name": "Display", "disambiguator": "trait" }
+                ]
+              },
+              "implementingType": {
+                "kind": "declared",
+                "symbol": {
+                  "artifactSelectors": [{ "purl": "pkg:cargo/acme-codec@1.4.0" }],
+                  "scheme": "csmi.rust.source-item",
+                  "schemeVersion": "0.1.0",
+                  "stability": "portable",
+                  "descriptors": [
+                    { "role": "namespace", "name": "crate", "disambiguator": "lib:acme_codec" },
+                    { "role": "type", "name": "Record", "disambiguator": "struct" }
+                  ]
+                }
+              },
+              "binders": []
+            }
+          }
+        }
+      ]
+    }
+  ]
+}

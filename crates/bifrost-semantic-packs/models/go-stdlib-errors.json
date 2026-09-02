@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "pack_id": "bifrost.go.stdlib.errors",
   "version": "1.0.0",
   "producer": {
@@ -47,6 +47,26 @@
                 "parameter_ordinal": 0,
                 "predicate": "null",
                 "proof_effect": "does_not_establish"
+              }
+            ]
+          },
+          {
+            "id": "errors.as",
+            "target": {
+              "path": "src/errors/wrap.go",
+              "symbol": "errors.As(err error, target any)",
+              "has_receiver": false,
+              "parameter_count": 2
+            },
+            "completeness": "complete",
+            "normal_result_count": 1,
+            "transfers": [],
+            "conditional_indirect_writes": [
+              {
+                "result_ordinal": 0,
+                "outcome": true,
+                "parameter_ordinal": 1,
+                "target": "pointee"
               }
             ]
           }

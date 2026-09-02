@@ -27,11 +27,13 @@
 use std::sync::Arc;
 
 use brokk_bifrost_core::analyzer::capabilities::ImportAnalysisProvider;
+use brokk_bifrost_core::analyzer::model::ImportInfo;
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_core::analyzer::{BoundedDefinitionLookup, CodeUnit, CodeUnitIndex, ProjectFile};
 use brokk_bifrost_core::hash::{HashMap, HashSet};
 
 use crate::proof::JvmRetainedExternalIndex;
+use crate::realm::JvmSourceRealm;
 
 /// The analyzer-resident products Kotlin's language logic resolves through, on
 /// top of the two core capability traits it reads declarations and imports
@@ -62,6 +64,33 @@ pub trait KotlinSource: CodeUnitIndex + ImportAnalysisProvider {
 
     /// The supertype names written on `code_unit`, unresolved.
     fn raw_supertypes_of(&self, code_unit: &CodeUnit) -> Vec<String>;
+
+    /// Resolve one declaration's ancestors from facts the caller already
+    /// holds, memoized when the source keeps an ancestor cache.
+    ///
+    /// The descendant-index build hydrates declaration facts in batches and
+    /// then resolves every candidate through `type_by_fqn`. Without this hook
+    /// each candidate's resolution bypasses the analyzer's ancestor memo, so
+    /// the two scope variants one scan request builds re-derive the whole
+    /// workspace's ancestry, and later hierarchy questions start cold (#2868).
+    fn resolved_ancestors_from_hydrated_facts(
+        &self,
+        token: QueryToken<'_>,
+        owner: &CodeUnit,
+        raw_supertypes: &[String],
+        imports: &[ImportInfo],
+        _realm: Option<&JvmSourceRealm<'_>>,
+        type_by_fqn: &mut dyn FnMut(&str) -> Option<CodeUnit>,
+    ) -> Vec<CodeUnit> {
+        crate::kotlin::hierarchy::kotlin_resolve_ancestors_from_facts(
+            self,
+            token,
+            owner,
+            raw_supertypes,
+            imports,
+            type_by_fqn,
+        )
+    }
 
     /// The top-level declarations each Kotlin package exports, built once per
     /// analyzer generation. The uncached build is

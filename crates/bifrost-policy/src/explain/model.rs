@@ -78,7 +78,8 @@ impl ExplanationQuestion {
 /// # Additive vocabulary
 ///
 /// `relation_binding` was added after `bifrost_policy_explanation/v1` shipped,
-/// and `derivation` was added with the flow/taint adapter (issue 2497). Each
+/// `derivation` was added with the flow/taint adapter (issue 2497), and
+/// `filter_predicate` with the relational filter replay (issue 2509). Each
 /// addition is strictly additive -- no existing node changed kind, shape, or
 /// identity, and no previously emitted document contains the new tag -- so the
 /// format string stays `v1` (see the ExecPlan Decision Log for issue 2439
@@ -95,6 +96,12 @@ pub enum ExplanationNodeKind {
     /// One authored relational row binding: a named relation and what its
     /// executed query said. Its children are that binding's selector stages.
     RelationBinding,
+    /// One authored `filter` record of a relational plan, replayed against the
+    /// candidate's own row: the predicate the row failed and the value it
+    /// carried. A filter is a plan operator over a named relation, not a stage
+    /// of the query that produced the relation, which is why it is not a
+    /// `selector_stage`.
+    FilterPredicate,
     /// One retained derivation the solver proved: a whole witness path, or one
     /// step of that path in path order. A derivation is not a selector stage --
     /// nothing about it was re-executed, and its order is the path's, not the
@@ -115,6 +122,7 @@ impl ExplanationNodeKind {
             Self::SourceFact => "source_fact",
             Self::SelectorStage => "selector_stage",
             Self::RelationBinding => "relation_binding",
+            Self::FilterPredicate => "filter_predicate",
             Self::Derivation => "derivation",
             Self::Assertion => "assertion",
             Self::CoverageObligation => "coverage_obligation",

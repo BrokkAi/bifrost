@@ -1,9 +1,10 @@
 use super::*;
 use brokk_bifrost_analysis::analyzer::semantic::cfg_algorithms::ProcedureControlDependenceStop;
 use brokk_bifrost_analysis::analyzer::semantic::{
-    CandidateCoverage, EvidenceCompleteness, OracleCallContext, ProcedureSemantics, ProofStatus,
-    SemanticBudget, SemanticLocator, SemanticOutcome, SemanticRequest, ValueFlowEndpoint,
-    ValueFlowOracle, ValueFlowRelationKind, WorkspaceSemanticOracle,
+    CandidateCoverage, EvidenceCompleteness, MoveInvalidation, OracleCallContext,
+    ProcedureSemantics, ProofStatus, SemanticBudget, SemanticLocator, SemanticOutcome,
+    SemanticRequest, SourceMappingId, TransferKind, TransferOperation, ValueFlowEndpoint,
+    ValueFlowOracle, ValueFlowRelationKind, ValuePreservation, WorkspaceSemanticOracle,
     cfg_algorithms::derive_procedure_control_dependence,
 };
 use brokk_bifrost_analysis::analyzer::{
@@ -113,18 +114,6 @@ impl fmt::Display for ExtensionError {
 }
 impl std::error::Error for ExtensionError {}
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CapabilitySupport {
-    Complete,
-    Partial,
-    Unsupported,
-}
-impl CapabilitySupport {
-    const fn unsupported() -> Self {
-        Self::Unsupported
-    }
-}
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LanguageCapabilityReport {
     pub language: Box<str>,
@@ -305,34 +294,17 @@ impl ExtensionWorkspace {
         let capabilities = ExtensionCapabilityReport {
             generation: identities.generation.clone(),
             languages,
-            operations: vec![
-                OperationCapability {
-                    id: capability("structural.query"),
-                    stability: ApiStability::Stable,
-                    support: CapabilitySupport::Complete,
-                },
-                OperationCapability {
-                    id: capability("experimental.semantic.control_flow"),
-                    stability: ApiStability::Experimental { since_minor: 0 },
-                    support: CapabilitySupport::Complete,
-                },
-                OperationCapability {
-                    id: capability("experimental.semantic.value_dependence"),
-                    stability: ApiStability::Experimental { since_minor: 0 },
-                    support: CapabilitySupport::Partial,
-                },
-                // Typestate machinery exists in the engine but has no route on
-                // this surface yet. Advertising the operation as `Unsupported`
-                // (rather than omitting it) lets extensions distinguish
-                // "unsupported here" from "does not exist". Design:
-                // .agents/docs/extension-typestate-design-2026-08.md.
-                OperationCapability {
-                    id: capability("experimental.semantic.typestate"),
-                    stability: ApiStability::Experimental { since_minor: 0 },
-                    support: CapabilitySupport::Unsupported,
-                },
-            ]
-            .into_boxed_slice(),
+            // Projected from the one published-surface table so the report and
+            // `negotiate_extension_api` cannot disagree (#2328).
+            operations: PUBLISHED_OPERATIONS
+                .iter()
+                .map(|operation| OperationCapability {
+                    id: capability(operation.id),
+                    stability: operation.stability,
+                    support: operation.support,
+                })
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
         };
         Ok(Self {
             generation: identities.generation,
@@ -645,17 +617,7 @@ impl ExtensionWorkspace {
                 }
             })
             .collect::<Vec<_>>();
-        let source_span = |mapping_id| {
-            let mapping = procedure
-                .source_mapping(mapping_id)
-                .expect("validated semantic source mapping");
-            let span = mapping.locator.anchor().span();
-            SourceSpan {
-                path: seed.path.clone(),
-                start_utf8_byte: span.start_byte() as u64,
-                end_utf8_byte: span.end_byte() as u64,
-            }
-        };
+        let source_span = |mapping_id| semantic_source_span(procedure, &seed.path, mapping_id);
         let edge_evidence = |edge: &brokk_bifrost_analysis::analyzer::semantic::ControlEdge| {
             let evidence = procedure
                 .evidence_row(edge.evidence)
@@ -922,6 +884,17 @@ impl ExtensionWorkspace {
                             } else {
                                 ValueDependenceMayStatus::Unproven
                             },
+                            transfer: relation
+                                .transfer
+                                .map(|transfer| {
+                                    value_transfer_detail(
+                                        transfer,
+                                        procedure,
+                                        &seed.path,
+                                        &point_node.stable_id,
+                                    )
+                                })
+                                .transpose()?,
                         },
                         proof: proof.clone(),
                         completeness: completeness.clone(),
@@ -1077,14 +1050,11 @@ fn value_occurrence(
             .stable_key()
             .map_err(|error| ExtensionError::Execution(error.to_string().into()))?
     );
-    let digest = value_carrier_digest(&projection)
+    let carrier = StableValueCarrier::new(&projection)
         .map_err(|error| ExtensionError::Execution(error.to_string().into()))?;
     Ok(ValueOccurrence {
         node: node.local_id,
-        carrier: StableValueCarrier {
-            digest,
-            projection: projection.into(),
-        },
+        carrier,
         role: if definition {
             ValueOccurrenceRole::Definition
         } else {
@@ -1097,6 +1067,71 @@ fn value_occurrence(
         },
         event_ordinal,
     })
+}
+
+fn semantic_source_span(
+    procedure: &ProcedureSemantics,
+    path: &NormalizedRelativePath,
+    mapping_id: SourceMappingId,
+) -> SourceSpan {
+    let mapping = procedure
+        .source_mapping(mapping_id)
+        .expect("validated semantic source mapping");
+    let span = mapping.locator.anchor().span();
+    SourceSpan {
+        path: path.clone(),
+        start_utf8_byte: span.start_byte() as u64,
+        end_utf8_byte: span.end_byte() as u64,
+    }
+}
+
+fn value_transfer_detail(
+    transfer: brokk_bifrost_analysis::analyzer::semantic::ValueTransfer,
+    procedure: &ProcedureSemantics,
+    path: &NormalizedRelativePath,
+    point_identity: &StableDigest,
+) -> Result<ValueTransfer, ExtensionError> {
+    let kind = match transfer.kind {
+        TransferKind::Copy => ValueTransferKind::Copy,
+        TransferKind::AggregateCopy => ValueTransferKind::AggregateCopy,
+        TransferKind::Move { invalidation } => ValueTransferKind::Move {
+            invalidation: match invalidation {
+                MoveInvalidation::Invalidated => ValueMoveInvalidation::Invalidated,
+                MoveInvalidation::Unknown => ValueMoveInvalidation::Unknown,
+            },
+        },
+        TransferKind::Conversion { preservation } => ValueTransferKind::Conversion {
+            preservation: match preservation {
+                ValuePreservation::Identity => ValueConversionPreservation::Identity,
+                ValuePreservation::Preserving => ValueConversionPreservation::Preserving,
+                ValuePreservation::Changing => ValueConversionPreservation::Changing,
+            },
+        },
+        TransferKind::Boxing => ValueTransferKind::Boxing,
+        TransferKind::Unboxing => ValueTransferKind::Unboxing,
+    };
+    let operation = match transfer.operation {
+        TransferOperation::None => ValueTransferOperation::None,
+        TransferOperation::CallSite(call_site) => {
+            let call_site = procedure
+                .call_site(call_site)
+                .expect("validated transfer operation call site");
+            let span = semantic_source_span(procedure, path, call_site.source);
+            let mut hasher = Sha256::new();
+            update_framed(&mut hasher, b"value-transfer-call-site-v1");
+            update_framed(&mut hasher, point_identity.as_str().as_bytes());
+            update_framed(&mut hasher, span.path.as_str().as_bytes());
+            update_framed(&mut hasher, &span.start_utf8_byte.to_be_bytes());
+            update_framed(&mut hasher, &span.end_utf8_byte.to_be_bytes());
+            ValueTransferOperation::CallSite {
+                id: StableDigest::parse(format!("{:x}", hasher.finalize()))
+                    .expect("SHA-256 is canonical"),
+                span,
+            }
+        }
+        TransferOperation::Unknown => ValueTransferOperation::Unknown,
+    };
+    Ok(ValueTransfer { kind, operation })
 }
 
 const fn value_subtype(kind: ValueFlowRelationKind) -> ValueDependenceSubtype {

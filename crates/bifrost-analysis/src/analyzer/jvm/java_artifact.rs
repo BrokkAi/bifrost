@@ -87,6 +87,7 @@ impl JavaJarPackProducer {
             return ArtifactProduction::failed(
                 ProducerDiagnostic {
                     severity: ProducerDiagnosticSeverity::Error,
+                    source_entry: None,
                     code: "artifact.kind".to_owned(),
                     location: None,
                     declaration: None,
@@ -117,6 +118,7 @@ impl JavaJarPackProducer {
                 return ArtifactProduction::failed(
                     ProducerDiagnostic {
                         severity: ProducerDiagnosticSeverity::Error,
+                        source_entry: None,
                         code: "artifact.path_encoding".to_owned(),
                         location: None,
                         declaration: None,
@@ -130,6 +132,7 @@ impl JavaJarPackProducer {
             return ArtifactProduction::failed(
                 ProducerDiagnostic {
                     severity: ProducerDiagnosticSeverity::Error,
+                    source_entry: None,
                     code: "limit.archive_directory".to_owned(),
                     location: None,
                     declaration: None,
@@ -145,6 +148,7 @@ impl JavaJarPackProducer {
                 return ArtifactProduction::failed(
                     ProducerDiagnostic {
                         severity: ProducerDiagnosticSeverity::Error,
+                        source_entry: None,
                         code: "java.archive.invalid".to_owned(),
                         location: None,
                         declaration: None,
@@ -173,6 +177,7 @@ impl JavaJarPackProducer {
                 return ArtifactProduction::failed(
                     ProducerDiagnostic {
                         severity: ProducerDiagnosticSeverity::Error,
+                        source_entry: None,
                         code: "artifact.cancelled".to_owned(),
                         location: None,
                         declaration: None,
@@ -318,6 +323,7 @@ impl JavaJarPackProducer {
                     return ArtifactProduction::failed(
                         ProducerDiagnostic {
                             severity: ProducerDiagnosticSeverity::Error,
+                            source_entry: None,
                             code: "artifact.cancelled".to_owned(),
                             location: None,
                             declaration: None,
@@ -493,7 +499,7 @@ fn finish_production(
         selector.artifact_sha256 = Some(artifact_sha256.to_owned());
     }
     let (diagnostics, suppressed_diagnostics) = diagnostics.finish();
-    let completeness = if diagnostics.is_empty() && suppressed_diagnostics == 0 {
+    let completeness = if diagnostics.is_empty() && suppressed_diagnostics.total() == 0 {
         Completeness::Complete
     } else {
         Completeness::Partial
@@ -576,6 +582,7 @@ pub(super) fn java_api_facts(
             type_parameters: declaration.type_parameters,
             type_parameter_constraints: Vec::new(),
             underlying_type: None,
+            value_semantics: None,
             embedded_types: Vec::new(),
             hierarchy: declaration.hierarchy,
             aliases: Vec::new(),
@@ -630,6 +637,7 @@ pub(super) fn java_api_facts(
                 is_static: member.is_static,
                 is_abstract: member.is_abstract,
                 is_virtual: member.is_virtual,
+                implicit_operation: None,
                 callable_family_complete: false,
                 signature: member.signature,
                 receiver: None,
@@ -795,6 +803,27 @@ fn source_members(
     );
     let mut result = Vec::new();
     let mut has_constructor = false;
+    // A record's components are the parameters of its canonical constructor
+    // and the names of its implicit accessors (JLS 8.10.3). Read them before
+    // the body: an explicit compact constructor carries no parameter list of
+    // its own, so the components are the parameters it declares. `None` means
+    // a component type could not be represented; the diagnostic is already
+    // recorded, and no member may claim those parameters.
+    let record_components = (owner_kind == TypeKind::Record)
+        .then(|| {
+            source_parameters(
+                owner,
+                source,
+                resolution,
+                owner_parameters,
+                &[],
+                max_depth,
+                diagnostics,
+                source_path,
+                owner_name,
+            )
+        })
+        .flatten();
     for index in 0..body.named_child_count() {
         let Some(node) = body.named_child(index) else {
             continue;
@@ -804,10 +833,8 @@ fn source_members(
             | "constructor_declaration"
             | "compact_constructor_declaration"
             | "annotation_type_element_declaration" => {
-                let constructor = matches!(
-                    node.kind(),
-                    "constructor_declaration" | "compact_constructor_declaration"
-                );
+                let compact = node.kind() == "compact_constructor_declaration";
+                let constructor = compact || node.kind() == "constructor_declaration";
                 has_constructor |= constructor;
                 let Some(name_node) = node.child_by_field_name("name") else {
                     continue;
@@ -824,18 +851,26 @@ fn source_members(
                     continue;
                 }
                 let type_parameters = source_type_parameters(node, source);
-                let Some(parameters) = source_parameters(
-                    node,
-                    source,
-                    resolution,
-                    owner_parameters,
-                    &type_parameters,
-                    max_depth,
-                    diagnostics,
-                    source_path,
-                    &format!("{owner_name}.{declared_name}"),
-                ) else {
-                    continue;
+                let parameters = if compact {
+                    match record_components.clone() {
+                        Some(components) => components,
+                        None => continue,
+                    }
+                } else {
+                    let Some(parameters) = source_parameters(
+                        node,
+                        source,
+                        resolution,
+                        owner_parameters,
+                        &type_parameters,
+                        max_depth,
+                        diagnostics,
+                        source_path,
+                        &format!("{owner_name}.{declared_name}"),
+                    ) else {
+                        continue;
+                    };
+                    parameters
                 };
                 let returns = if constructor {
                     None
@@ -968,54 +1003,54 @@ fn source_members(
         }
     }
     if owner_kind == TypeKind::Record {
-        let components = source_parameters(
-            owner,
-            source,
-            resolution,
-            owner_parameters,
-            &[],
-            max_depth,
-            diagnostics,
-            source_path,
-            owner_name,
-        )
-        .unwrap_or_default();
-        if !has_constructor {
-            push_generated_member(
-                &mut result,
-                remaining_records,
-                record_limit_hit,
-                generated_java_member(
-                    "<init>",
-                    MemberKind::Constructor,
-                    owner_visibility,
-                    false,
-                    components.clone(),
-                    None,
-                    owner_name,
-                    source_path,
-                ),
-            );
-        }
-        for component in components {
-            let Some(name) = component.name.clone() else {
-                continue;
-            };
-            push_generated_member(
-                &mut result,
-                remaining_records,
-                record_limit_hit,
-                generated_java_member(
-                    &name,
-                    MemberKind::Method,
-                    Visibility::Public,
-                    false,
-                    Vec::new(),
-                    Some(component.r#type),
-                    owner_name,
-                    source_path,
-                ),
-            );
+        // JLS 8.10.3: each implicit record member is declared only when the
+        // body does not declare a member with that name and parameter types.
+        // An explicit accessor, canonical constructor, `equals`, `hashCode`,
+        // or `toString` therefore replaces its implicit counterpart. Emitting
+        // both gave two members the same stable id, and the compiler then
+        // rejected the whole pack; JDK 25's `java.security.PEMRecord` declares
+        // `toString` and made every automatic JDK production fail that way.
+        if let Some(components) = record_components {
+            if !declares_member(&result, MemberKind::Constructor, "<init>", &components) {
+                push_generated_member(
+                    &mut result,
+                    remaining_records,
+                    record_limit_hit,
+                    generated_java_member(
+                        "<init>",
+                        MemberKind::Constructor,
+                        owner_visibility,
+                        false,
+                        components.clone(),
+                        None,
+                        owner_name,
+                        source_path,
+                    ),
+                );
+            }
+            for component in components {
+                let Some(name) = component.name.clone() else {
+                    continue;
+                };
+                if declares_member(&result, MemberKind::Method, &name, &[]) {
+                    continue;
+                }
+                push_generated_member(
+                    &mut result,
+                    remaining_records,
+                    record_limit_hit,
+                    generated_java_member(
+                        &name,
+                        MemberKind::Method,
+                        Visibility::Public,
+                        false,
+                        Vec::new(),
+                        Some(component.r#type),
+                        owner_name,
+                        source_path,
+                    ),
+                );
+            }
         }
         for (name, parameters, returns) in [
             (
@@ -1025,6 +1060,7 @@ fn source_members(
                     r#type: named_type("java.lang.Object".to_owned()),
                     optional: false,
                     variadic: false,
+                    passing_mode: Default::default(),
                 }],
                 named_type("boolean".to_owned()),
             ),
@@ -1035,6 +1071,9 @@ fn source_members(
                 named_type("java.lang.String".to_owned()),
             ),
         ] {
+            if declares_member(&result, MemberKind::Method, name, &parameters) {
+                continue;
+            }
             push_generated_member(
                 &mut result,
                 remaining_records,
@@ -1083,6 +1122,7 @@ fn source_members(
                     r#type: named_type("java.lang.String".to_owned()),
                     optional: false,
                     variadic: false,
+                    passing_mode: Default::default(),
                 }],
                 Some(named_type(owner_name.to_owned())),
                 owner_name,
@@ -1144,6 +1184,31 @@ fn generated_java_member(
             symbol: Some(format!("{owner_name}.{name}")),
         },
     }
+}
+
+/// Whether the body already declares a member of this kind, name, and
+/// parameter types. Parameter names do not distinguish declarations.
+fn declares_member(
+    members: &[JavaApiMember],
+    member_kind: MemberKind,
+    name: &str,
+    parameters: &[Parameter],
+) -> bool {
+    members.iter().any(|member| {
+        member.member_kind == member_kind
+            && member.name == name
+            && member.signature.as_ref().is_some_and(|signature| {
+                signature.parameters.len() == parameters.len()
+                    && signature
+                        .parameters
+                        .iter()
+                        .zip(parameters)
+                        .all(|(declared, expected)| {
+                            declared.r#type == expected.r#type
+                                && declared.variadic == expected.variadic
+                        })
+            })
+    })
 }
 
 fn push_generated_member(
@@ -1234,6 +1299,7 @@ fn source_parameters(
             r#type,
             optional: false,
             variadic: parameter.kind() == "spread_parameter",
+            passing_mode: Default::default(),
         });
     }
     Some(result)
@@ -2187,6 +2253,7 @@ fn class_method_member(
             r#type,
             optional: false,
             variadic: flags.contains(MethodFlags::ACC_VARARGS) && index + 1 == parameter_count,
+            passing_mode: Default::default(),
         })
         .collect();
     let constructor = binary_name == "<init>";
@@ -2646,11 +2713,20 @@ mod tests {
     }
 
     impl JavaFixture {
+        fn new_if_supported() -> Option<Self> {
+            if let Err(reason) = probe_java_fixture_toolchain() {
+                eprintln!(
+                    "skipping Java artifact producer test: JDK 16+ with `javac` and `jar` is required ({reason})"
+                );
+                return None;
+            }
+            Some(Self::new())
+        }
+
+        /// Build the real fixture assertively. The separate capability probe
+        /// is the only path that may skip: a fixture regression on a supported
+        /// toolchain must remain a test failure.
         fn new() -> Self {
-            assert!(
-                tool_available("javac") && tool_available("jar"),
-                "Java producer parity tests require javac and jar"
-            );
             let temp = tempfile::tempdir().unwrap();
             let source_root = temp.path().join("src");
             let package_root = source_root.join("fixture/api");
@@ -2688,6 +2764,15 @@ mod tests {
                 classes,
             }
         }
+    }
+
+    macro_rules! java_fixture {
+        () => {
+            match JavaFixture::new_if_supported() {
+                Some(fixture) => fixture,
+                None => return,
+            }
+        };
     }
 
     fn request(path: PathBuf, artifact_kind: ExternalArtifactKind) -> ArtifactProductionRequest {
@@ -2740,7 +2825,7 @@ mod tests {
     /// activated pack rather than through a jar.
     #[test]
     fn the_bounded_class_surface_carries_each_member_declared_return_type() {
-        let fixture = JavaFixture::new();
+        let fixture = java_fixture!();
         let limits = ArtifactProducerLimits::default();
         let mut diagnostics = BoundedProducerDiagnostics::new(&limits);
         let mut remaining_records = limits.max_records;
@@ -2781,7 +2866,7 @@ mod tests {
     /// over-claiming.
     #[test]
     fn the_bounded_class_surface_carries_static_and_final_access_flags() {
-        let fixture = JavaFixture::new();
+        let fixture = java_fixture!();
         let limits = ArtifactProducerLimits::default();
         let mut diagnostics = BoundedProducerDiagnostics::new(&limits);
         let mut remaining_records = limits.max_records;
@@ -2845,7 +2930,7 @@ mod tests {
 
     #[test]
     fn source_and_class_jars_share_declaration_ids_and_keep_distinct_origins() {
-        let fixture = JavaFixture::new();
+        let fixture = java_fixture!();
         let source = JavaJarPackProducer.produce_exact_artifact(
             &request(
                 fixture.source_jar.clone(),
@@ -2953,6 +3038,106 @@ mod tests {
         assert!(cursor.parse_type(0).is_none());
     }
 
+    /// JLS 8.10.3: an explicit accessor, canonical constructor, `equals`,
+    /// `hashCode`, or `toString` replaces the implicit record member. JDK 25's
+    /// `java.security.PEMRecord` declares `toString`; emitting the implicit one
+    /// beside it gave two members one stable id and the compiler rejected the
+    /// whole JDK pack, so automatic JDK production failed on every session.
+    #[test]
+    fn record_implicit_members_yield_to_explicit_declarations() {
+        const EXPLICIT_SOURCE: &str = "package fixture.api;\n\
+            public record Explicit(String name, int count) {\n\
+              public Explicit { }\n\
+              public Explicit(String name) { this(name, 0); }\n\
+              public String name() { return name; }\n\
+              @Override public boolean equals(Object other) { return true; }\n\
+              @Override public int hashCode() { return 0; }\n\
+              @Override public String toString() { return \"\"; }\n\
+            }\n";
+        const IMPLICIT_SOURCE: &str = "package fixture.api;\n\
+            public record Implicit(String name, int count) {\n\
+              public Implicit(String name) { this(name, 0); }\n\
+              public boolean equals(Implicit other) { return true; }\n\
+            }\n";
+        let temp = tempfile::tempdir().unwrap();
+        let source_jar = temp.path().join("records-sources.jar");
+        let file = fs::File::create(&source_jar).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        for (name, source) in [
+            ("fixture/api/Explicit.java", EXPLICIT_SOURCE),
+            ("fixture/api/Implicit.java", IMPLICIT_SOURCE),
+        ] {
+            zip.start_file(name, SimpleFileOptions::default()).unwrap();
+            zip.write_all(source.as_bytes()).unwrap();
+        }
+        zip.finish().unwrap();
+
+        let production = JavaJarPackProducer.produce_exact_artifact(
+            &request(source_jar, ExternalArtifactKind::JavaSourceJar),
+            &ArtifactProducerLimits::default(),
+        );
+        assert!(
+            production.diagnostics.is_empty(),
+            "{:#?}",
+            production.diagnostics
+        );
+        let pack = production.pack.expect("record sources produce a pack");
+        let AuthoredPayload::DeclarationFacts { types, members, .. } = &pack.shards[0].payload
+        else {
+            panic!("expected declaration facts");
+        };
+        let signatures = |type_name: &str| {
+            let owner = types.iter().find(|fact| fact.name == type_name).unwrap();
+            let mut signatures = members
+                .iter()
+                .filter(|fact| fact.owner == owner.id)
+                .map(|fact| {
+                    let parameters = fact
+                        .signature
+                        .as_ref()
+                        .unwrap()
+                        .parameters
+                        .iter()
+                        .map(|parameter| match &parameter.r#type {
+                            TypeRef::Named { name, .. } => name.clone(),
+                            other => panic!("unexpected parameter type {other:?}"),
+                        })
+                        .collect::<Vec<_>>();
+                    format!("{}({})", fact.name, parameters.join(","))
+                })
+                .collect::<Vec<_>>();
+            signatures.sort();
+            signatures
+        };
+        assert_eq!(
+            signatures("fixture.api.Explicit"),
+            [
+                "<init>(java.lang.String)",
+                "<init>(java.lang.String,int)",
+                "count()",
+                "equals(java.lang.Object)",
+                "hashCode()",
+                "name()",
+                "toString()",
+            ]
+        );
+        assert_eq!(
+            signatures("fixture.api.Implicit"),
+            [
+                "<init>(java.lang.String)",
+                "<init>(java.lang.String,int)",
+                "count()",
+                "equals(fixture.api.Implicit)",
+                "equals(java.lang.Object)",
+                "hashCode()",
+                "name()",
+                "toString()",
+            ]
+        );
+        compile_pack(&pack, &CompilerOptions::default())
+            .unwrap_or_else(|diagnostics| panic!("{diagnostics:#?}"));
+    }
+
     #[test]
     fn source_jar_limits_and_diagnostics_are_bounded() {
         let temp = tempfile::tempdir().unwrap();
@@ -2994,7 +3179,7 @@ mod tests {
             },
         );
         assert_eq!(invalid.diagnostics.len(), 1);
-        assert!(invalid.suppressed_diagnostics >= 2);
+        assert!(invalid.suppressed_diagnostics.total() >= 2);
         assert!(invalid.pack.is_none());
     }
 
@@ -3041,11 +3226,35 @@ mod tests {
         zip.finish().unwrap();
     }
 
-    fn tool_available(tool: &str) -> bool {
-        Command::new(tool)
-            .arg("--version")
+    fn probe_java_fixture_toolchain() -> Result<(), String> {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("FixtureProbe.java");
+        let classes = temp.path().join("classes");
+        fs::create_dir(&classes).unwrap();
+        fs::write(&source, "record FixtureProbe(int value) {}\n").unwrap();
+
+        probe_command(Command::new("javac").arg("-d").arg(&classes).arg(&source))?;
+        probe_command(
+            Command::new("jar")
+                .current_dir(&classes)
+                .arg("cf")
+                .arg(temp.path().join("fixture-probe.jar"))
+                .arg("."),
+        )
+    }
+
+    fn probe_command(command: &mut Command) -> Result<(), String> {
+        let output = command
             .output()
-            .is_ok_and(|output| output.status.success())
+            .map_err(|error| format!("failed to run {command:?}: {error}"))?;
+        if output.status.success() {
+            return Ok(());
+        }
+        Err(format!(
+            "{command:?} exited with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))
     }
 
     fn run(command: &mut Command) {

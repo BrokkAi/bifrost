@@ -2689,7 +2689,12 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 let location = self.session.add_memory_location(
                     builder,
                     access,
-                    MemoryLocationKind::Index { base, index },
+                    MemoryLocationKind::Index {
+                        base,
+                        index,
+                        constant_index: None,
+                        identity: crate::analyzer::semantic::IndexedLocationIdentity::Element,
+                    },
                 )?;
                 if index.is_none() {
                     self.add_dynamic_index_gap(builder, access, location)?;
@@ -2966,7 +2971,12 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 let location = self.session.add_memory_location(
                     builder,
                     boundary,
-                    MemoryLocationKind::Index { base, index },
+                    MemoryLocationKind::Index {
+                        base,
+                        index,
+                        constant_index: None,
+                        identity: crate::analyzer::semantic::IndexedLocationIdentity::Element,
+                    },
                 )?;
                 if !self.proven_list_index(node, value_node, subscript) {
                     self.add_gap(

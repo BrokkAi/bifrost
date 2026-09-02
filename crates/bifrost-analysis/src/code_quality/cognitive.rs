@@ -129,6 +129,7 @@ mod tests {
         assert!(!result.truncated);
     }
 
+    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
     #[test]
     fn cognitive_complexity_equal_to_threshold_is_not_flagged() {
         // 1 base `if` = 1; threshold 1 must NOT flag (uses `>`, not `>=`).

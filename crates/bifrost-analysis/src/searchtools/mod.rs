@@ -28,7 +28,7 @@ use crate::analyzer::usages::{
 use crate::analyzer::{
     AnalyzerDefinitionLookup, CodeUnit, CodeUnitType, DeclarationKind, GO_MODULE_SCOPE_SEGMENT,
     GoModuleRoot, IAnalyzer, Language, ProjectFile, Range, SearchSymbolPatternBatch,
-    SummaryFileProjection, go_module_roots,
+    SubsetCoverage, SummaryFileProjection, go_module_roots,
 };
 use crate::hash::{HashMap, HashSet};
 use crate::model_context;
@@ -440,6 +440,12 @@ pub struct RefreshResult {
 #[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
 pub struct ActiveWorkspaceResult {
     pub workspace_path: String,
+    /// Present only when this session was built over an explicitly named
+    /// subset of the workspace, in which case every cross-file answer it gives
+    /// is relative to that many files rather than to the whole workspace
+    /// (#2770).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_subset: Option<SubsetCoverage>,
     /// Whether a usage query would wait for background usage-analysis work.
     /// Under the per-file fact design this is false only while an
     /// above-threshold catch-up batch is being persisted; a tool that needs
@@ -448,6 +454,18 @@ pub struct ActiveWorkspaceResult {
     /// the tool contract and did not change when the implementation moved off
     /// the v1 usage index (ExecPlan Milestone 3).
     pub usage_index_ready: bool,
+}
+
+/// The subset of the workspace this session covers, or `None` when it covers
+/// the whole workspace.
+///
+/// Every cross-file tool answer publishes this as its `session_subset` field so
+/// a caller can read "nothing in these N files" apart from "nothing in the
+/// workspace". Blob-local answers -- sources, summaries, complexity of files
+/// the request itself named -- do not, because their frame of reference is the
+/// request, not the session.
+pub fn session_subset(analyzer: &dyn IAnalyzer) -> Option<SubsetCoverage> {
+    analyzer.project().coverage().subset()
 }
 
 pub fn refresh_result(analyzer: &dyn IAnalyzer) -> RefreshResult {
@@ -866,6 +884,29 @@ fn looks_like_explicit_source_file_target(target: &str) -> bool {
 
 fn is_glob_pattern(pattern: &str) -> bool {
     pattern.contains(['*', '?', '['])
+}
+
+/// Map one batched request's items, fanning out on rayon only when there is
+/// more than one of them.
+///
+/// A batched symbol tool is nearly always called with a single symbol. Rayon's
+/// fan-out from a thread that is not already a pool worker injects the job into
+/// the global pool and parks the caller on a latch until a worker takes it, so
+/// a one-item batch pays a pool round trip for work it could have done on the
+/// spot (#2115). Two or three symbols each cost tens to hundreds of
+/// milliseconds, so the fan-out still pays from the second item onwards.
+///
+/// `Vec`'s parallel iterator is indexed and `map` keeps it indexed, so both arms
+/// return the results in input order.
+fn map_request_batch<T, R>(items: Vec<T>, map: impl Fn(T) -> R + Sync + Send) -> Vec<R>
+where
+    T: Send,
+    R: Send,
+{
+    if items.len() <= 1 {
+        return items.into_iter().map(map).collect();
+    }
+    items.into_par_iter().map(map).collect()
 }
 
 fn line_count(content: &str) -> usize {

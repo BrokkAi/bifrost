@@ -770,6 +770,228 @@ fn rejects_non_dense_and_out_of_bounds_local_ids() {
 }
 
 #[test]
+fn aggregate_copy_requires_one_adjacent_matching_assignment() {
+    let key = key();
+    let source = SourceMappingId::new(0);
+    let evidence = EvidenceId::new(0);
+    let assignment = SemanticEvent::new(
+        SemanticEffect::Assignment {
+            target: ValueId::new(1),
+            value: ValueId::new(0),
+        },
+        source,
+        evidence,
+    );
+    let aggregate_copy = SemanticEvent::new(
+        SemanticEffect::ValueFlow {
+            kind: ValueFlowKind::Transfer(ValueTransfer {
+                kind: TransferKind::AggregateCopy,
+                operation: TransferOperation::None,
+            }),
+            source: ValueId::new(0),
+            target: ValueId::new(1),
+        },
+        source,
+        evidence,
+    );
+    let separator = SemanticEvent::new(
+        SemanticEffect::ValueUse {
+            kind: ValueUseKind::Dereference,
+            value: ValueId::new(0),
+        },
+        source,
+        evidence,
+    );
+    for invalid in [
+        vec![aggregate_copy.clone()],
+        vec![assignment.clone(), separator, aggregate_copy.clone()],
+        vec![assignment.clone(), aggregate_copy.clone(), aggregate_copy],
+    ] {
+        let mut parts = minimal_procedure(&key, ProcedureId::new(0), "main", 1);
+        parts.values.extend([
+            SemanticValue {
+                id: ValueId::new(0),
+                kind: SemanticValueKind::Temporary,
+                source,
+                evidence,
+            },
+            SemanticValue {
+                id: ValueId::new(1),
+                kind: SemanticValueKind::Local,
+                source,
+                evidence,
+            },
+        ]);
+        let mut events = parts.points[0].events.to_vec();
+        events.extend(invalid);
+        parts.points[0].events = events.into_boxed_slice();
+        let error = SemanticArtifact::try_new(
+            key.clone(),
+            capabilities(&[
+                SemanticCapability::Assignments,
+                SemanticCapability::Values,
+                SemanticCapability::LocalFlow,
+            ]),
+            vec![parts],
+        )
+        .expect_err("malformed aggregate-copy pairing must fail");
+        assert_eq!(error.kind(), SemanticIrErrorKind::ValueFlowContract);
+    }
+}
+
+/// One procedure whose entry point carries `assignment; transfer` over two
+/// values, with the flow event on its own evidence row so tests can vary the
+/// claimed certainty independently of the fixture's proven-complete row 0.
+fn transfer_pair_procedure(
+    key: &SemanticArtifactKey,
+    transfer: ValueTransfer,
+    flow_proof: ProofStatus,
+    flow_completeness: EvidenceCompleteness,
+) -> ProcedureSemanticsParts {
+    let source = SourceMappingId::new(0);
+    let evidence = EvidenceId::new(0);
+    let flow_evidence = EvidenceId::new(1);
+    let mut parts = minimal_procedure(key, ProcedureId::new(0), "main", 1);
+    parts.evidence_rows.push(Evidence {
+        id: flow_evidence,
+        proof: flow_proof,
+        completeness: flow_completeness,
+        sources: vec![source].into_boxed_slice(),
+    });
+    parts.values.extend([
+        SemanticValue {
+            id: ValueId::new(0),
+            kind: SemanticValueKind::Temporary,
+            source,
+            evidence,
+        },
+        SemanticValue {
+            id: ValueId::new(1),
+            kind: SemanticValueKind::Local,
+            source,
+            evidence,
+        },
+    ]);
+    let mut events = parts.points[0].events.to_vec();
+    events.push(SemanticEvent::new(
+        SemanticEffect::Assignment {
+            target: ValueId::new(1),
+            value: ValueId::new(0),
+        },
+        source,
+        evidence,
+    ));
+    events.push(SemanticEvent::new(
+        SemanticEffect::ValueFlow {
+            kind: ValueFlowKind::Transfer(transfer),
+            source: ValueId::new(0),
+            target: ValueId::new(1),
+        },
+        source,
+        flow_evidence,
+    ));
+    parts.points[0].events = events.into_boxed_slice();
+    parts
+}
+
+fn transfer_capabilities() -> SemanticCapabilities {
+    capabilities(&[
+        SemanticCapability::Assignments,
+        SemanticCapability::Values,
+        SemanticCapability::LocalFlow,
+    ])
+}
+
+#[test]
+fn every_transfer_kind_accepts_an_adjacent_matching_assignment() {
+    let key = key();
+    for kind in [
+        TransferKind::Copy,
+        TransferKind::AggregateCopy,
+        TransferKind::Move {
+            invalidation: MoveInvalidation::Invalidated,
+        },
+        TransferKind::Conversion {
+            preservation: ValuePreservation::Identity,
+        },
+        TransferKind::Conversion {
+            preservation: ValuePreservation::Preserving,
+        },
+        TransferKind::Conversion {
+            preservation: ValuePreservation::Changing,
+        },
+        TransferKind::Boxing,
+        TransferKind::Unboxing,
+    ] {
+        let parts = transfer_pair_procedure(
+            &key,
+            ValueTransfer {
+                kind,
+                operation: TransferOperation::None,
+            },
+            ProofStatus::Proven,
+            EvidenceCompleteness::Complete,
+        );
+        SemanticArtifact::try_new(key.clone(), transfer_capabilities(), vec![parts])
+            .unwrap_or_else(|error| panic!("{} transfer must validate: {error}", kind.label()));
+    }
+}
+
+#[test]
+fn uncertain_transfer_facts_reject_proven_complete_evidence() {
+    let key = key();
+    for transfer in [
+        ValueTransfer {
+            kind: TransferKind::Move {
+                invalidation: MoveInvalidation::Unknown,
+            },
+            operation: TransferOperation::None,
+        },
+        ValueTransfer {
+            kind: TransferKind::Copy,
+            operation: TransferOperation::Unknown,
+        },
+    ] {
+        let contradictory = transfer_pair_procedure(
+            &key,
+            transfer,
+            ProofStatus::Proven,
+            EvidenceCompleteness::Complete,
+        );
+        let error =
+            SemanticArtifact::try_new(key.clone(), transfer_capabilities(), vec![contradictory])
+                .expect_err("unknown transfer fact on proven, complete evidence must fail");
+        assert_eq!(error.kind(), SemanticIrErrorKind::ValueFlowContract);
+
+        let honest = transfer_pair_procedure(
+            &key,
+            transfer,
+            ProofStatus::Proven,
+            EvidenceCompleteness::Partial("operation not selected".into()),
+        );
+        SemanticArtifact::try_new(key.clone(), transfer_capabilities(), vec![honest])
+            .expect("unknown transfer fact with partial evidence must validate");
+    }
+}
+
+#[test]
+fn transfer_operation_call_site_must_be_in_bounds() {
+    let key = key();
+    let parts = transfer_pair_procedure(
+        &key,
+        ValueTransfer {
+            kind: TransferKind::Copy,
+            operation: TransferOperation::CallSite(CallSiteId::new(0)),
+        },
+        ProofStatus::Proven,
+        EvidenceCompleteness::Complete,
+    );
+    let error = SemanticArtifact::try_new(key, transfer_capabilities(), vec![parts])
+        .expect_err("transfer operation naming a missing call site must fail");
+    assert_eq!(error.kind(), SemanticIrErrorKind::OutOfBounds);
+}
+
+#[test]
 fn value_use_requires_a_procedure_local_value() {
     let key = key();
     let mut parts = minimal_procedure(&key, ProcedureId::new(0), "main", 1);
@@ -932,6 +1154,7 @@ fn capture_slot_requires_a_subject_specific_binding_gap() {
         id: MemoryLocationId::new(0),
         kind: MemoryLocationKind::Capture {
             lexical_parent: ProcedureId::new(0),
+            binding: None,
         },
         source: SourceMappingId::new(0),
         evidence: EvidenceId::new(0),
@@ -1065,6 +1288,7 @@ fn receiver_capture_requires_a_receiver_value() {
         id: MemoryLocationId::new(0),
         kind: MemoryLocationKind::Capture {
             lexical_parent: ProcedureId::new(0),
+            binding: None,
         },
         source: SourceMappingId::new(0),
         evidence: EvidenceId::new(0),
@@ -1142,6 +1366,7 @@ fn known_capture_mode_rejects_a_contradictory_unknown_gap() {
         id: MemoryLocationId::new(0),
         kind: MemoryLocationKind::Capture {
             lexical_parent: ProcedureId::new(0),
+            binding: None,
         },
         source,
         evidence,
@@ -1457,6 +1682,8 @@ fn canonical_index_identity_requires_a_constant_indexed_location() {
         kind: MemoryLocationKind::Index {
             base: ValueId::new(0),
             index: Some(ValueId::new(1)),
+            constant_index: None,
+            identity: IndexedLocationIdentity::Element,
         },
         source,
         evidence,
@@ -1535,6 +1762,8 @@ fn canonical_index_identity_requires_its_exact_access_at_the_gap_point() {
                 kind: MemoryLocationKind::Index {
                     base: ValueId::new(0),
                     index: Some(ValueId::new(1)),
+                    constant_index: Some(0),
+                    identity: IndexedLocationIdentity::Element,
                 },
                 source,
                 evidence,
@@ -1544,6 +1773,8 @@ fn canonical_index_identity_requires_its_exact_access_at_the_gap_point() {
                 kind: MemoryLocationKind::Index {
                     base: ValueId::new(0),
                     index: Some(ValueId::new(1)),
+                    constant_index: Some(0),
+                    identity: IndexedLocationIdentity::Element,
                 },
                 source,
                 evidence,
@@ -2430,6 +2661,8 @@ fn call_site_callee_must_be_a_callable_value() {
     parts.call_sites.push(SemanticCallSite {
         id: CallSiteId::new(0),
         point: ProgramPointId::new(0),
+        invocation_mode: CallInvocationMode::Ordinary,
+        execution_timing: ExecutionTiming::SameEvaluation,
         callee: ValueId::new(0),
         receiver: None,
         arguments: Box::new([]),
@@ -2461,7 +2694,7 @@ fn call_site_callee_must_be_a_callable_value() {
 }
 
 #[test]
-fn valid_call_has_matched_normal_and_exceptional_continuations() {
+fn valid_ordinary_different_task_call_has_matched_continuations() {
     let key = key();
     let mut parts = minimal_procedure(&key, ProcedureId::new(0), "main", 1);
     let source = SourceMappingId::new(0);
@@ -2476,6 +2709,8 @@ fn valid_call_has_matched_normal_and_exceptional_continuations() {
     parts.call_sites.push(SemanticCallSite {
         id: CallSiteId::new(0),
         point: ProgramPointId::new(0),
+        invocation_mode: CallInvocationMode::Ordinary,
+        execution_timing: ExecutionTiming::DifferentTask,
         callee: ValueId::new(0),
         receiver: None,
         arguments: Box::new([]),
@@ -2542,6 +2777,91 @@ fn valid_call_has_matched_normal_and_exceptional_continuations() {
         SemanticCapability::NormalCallContinuation,
         SemanticCapability::ExceptionalCallContinuation,
     ]);
+    let mut valid_detached = parts.clone();
+    valid_detached.call_sites[0].invocation_mode = CallInvocationMode::Detached;
+    valid_detached.call_sites[0].exceptional_continuation = ControlContinuation::Absent;
+    valid_detached.points[2].events = valid_detached.points[2]
+        .events
+        .iter()
+        .filter(|event| {
+            !matches!(
+                event.effect,
+                SemanticEffect::CallContinuation {
+                    kind: CallContinuationKind::Exceptional,
+                    ..
+                }
+            )
+        })
+        .cloned()
+        .collect::<Vec<_>>()
+        .into_boxed_slice();
+    valid_detached
+        .control_edges
+        .retain(|edge| edge.kind != ControlEdgeKind::Exceptional);
+    SemanticArtifact::try_new(
+        key.clone(),
+        semantic_capabilities.clone(),
+        vec![valid_detached.clone()],
+    )
+    .expect("a detached call with one parent-normal continuation is valid");
+
+    let mut missing_normal = valid_detached.clone();
+    missing_normal.call_sites[0].normal_continuation = ControlContinuation::Absent;
+
+    let mut singular_result = valid_detached.clone();
+    singular_result.values.push(SemanticValue {
+        id: ValueId::new(1),
+        kind: SemanticValueKind::Temporary,
+        source,
+        evidence,
+    });
+    singular_result.call_sites[0].result = Some(ValueId::new(1));
+
+    let mut indexed_results = valid_detached.clone();
+    indexed_results.values.extend([
+        SemanticValue {
+            id: ValueId::new(1),
+            kind: SemanticValueKind::Temporary,
+            source,
+            evidence,
+        },
+        SemanticValue {
+            id: ValueId::new(2),
+            kind: SemanticValueKind::Temporary,
+            source,
+            evidence,
+        },
+    ]);
+    indexed_results.call_sites[0].normal_results = Box::new([ValueId::new(1), ValueId::new(2)]);
+
+    let mut thrown = valid_detached.clone();
+    thrown.values.push(SemanticValue {
+        id: ValueId::new(1),
+        kind: SemanticValueKind::Exception,
+        source,
+        evidence,
+    });
+    thrown.call_sites[0].thrown = Some(ValueId::new(1));
+
+    let mut exceptional = valid_detached;
+    exceptional.call_sites[0].exceptional_continuation =
+        ControlContinuation::Target(ProgramPointId::new(2));
+
+    for (name, invalid) in [
+        ("missing normal continuation", missing_normal),
+        ("singular result", singular_result),
+        ("indexed results", indexed_results),
+        ("thrown value", thrown),
+        ("exceptional continuation", exceptional),
+    ] {
+        match SemanticArtifact::try_new(key.clone(), semantic_capabilities.clone(), vec![invalid]) {
+            Err(error) => {
+                assert_eq!(error.kind(), SemanticIrErrorKind::CallContract, "{name}")
+            }
+            Ok(_) => panic!("detached call with {name} unexpectedly validated"),
+        }
+    }
+
     let mut extra_edge = parts.clone();
     extra_edge.control_edges.push(ControlEdge {
         source_point: ProgramPointId::new(0),
@@ -2775,6 +3095,8 @@ fn unsupported_call_arm_requires_a_gap_and_no_fabricated_edge() {
     parts.call_sites.push(SemanticCallSite {
         id: CallSiteId::new(0),
         point: ProgramPointId::new(0),
+        invocation_mode: CallInvocationMode::Ordinary,
+        execution_timing: ExecutionTiming::SameEvaluation,
         callee: ValueId::new(0),
         receiver: None,
         arguments: Box::new([]),

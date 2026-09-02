@@ -27,24 +27,6 @@ slow-timeout = { period = "60s", terminate-after = 10 }
 [profile.default.junit]
 path = "junit.xml"
 
-# These suite_bench_policy modules launch the shipped Bifrost process and
-# compete for analyzer, filesystem, and child-process resources. Serialize the
-# process-launching group while unrelated tests remain globally scheduled.
-[test-groups]
-suite-bench-policy-bifrost = { max-threads = 1 }
-
-[[profile.default.overrides]]
-filter = 'test(/^bifrost_policy_cli::/) | test(/^issue_2690_sanitizer_lowering::/) | test(/^policy_assertion_conformance::/) | test(/^policy_assertion_evaluation::/) | test(/^policy_control_relations::/) | test(/^policy_docs::/) | test(/^policy_project_topology_jvm::/) | test(/^policy_resolution_assertions::/) | test(/^policy_substrate_p0_cli::/)'
-test-group = "suite-bench-policy-bifrost"
-
-# The determinism test launches repeated child runs and needs the whole machine
-# to avoid scheduler starvation. Keep it in the same process-launching group,
-# but give it an explicit reservation separate from the group filter above.
-[[profile.default.overrides]]
-filter = 'test(/^issue_2659_determinism::/)'
-test-group = "suite-bench-policy-bifrost"
-threads-required = "num-cpus"
-
 # Start the real-process repository corpus checks before the short unit tests
 # so their analyzer/server setup overlaps the rest of the run instead of
 # becoming a serial tail. They still reserve only the default single slot.
@@ -66,17 +48,6 @@ threads-required = "num-cpus"
 # starve the worker thread long enough to mimic the deadlock it detects.
 [[profile.default.overrides]]
 filter = 'test(jsts_usage_graph_receiver_analysis_does_not_deadlock_on_pool)'
-threads-required = "num-cpus"
-
-# The process-isolated Go typestate eviction tests compare exact semantic-work
-# ledgers across resident and deliberately invalidated caches. In the full gate,
-# the solve-only case took 6.7s and observed an extra caller materialization;
-# the same binary then passed 30/30 fresh-process runs in 0.85-1.26s when it was
-# not competing with the cross-binary scheduler. Reserve the nextest worker
-# budget so the cache-invalidation oracle measures the intended single-worker
-# execution instead of whole-suite starvation.
-[[profile.default.overrides]]
-filter = 'binary(=issue_2774_go_typestate_eviction)'
 threads-required = "num-cpus"
 
 # The two cold-start latency guards are the only spawned servers intentionally

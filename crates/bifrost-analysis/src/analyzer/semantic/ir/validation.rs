@@ -4,7 +4,7 @@ use super::super::capabilities::{CapabilitySupport, SemanticCapabilities, Semant
 use super::super::ids::{
     AllocationId, BlockId, CallSiteId, CaptureId, DeclarationSegmentKind, EvidenceId,
     MemoryLocationId, ProcedureId, ProgramPointId, SemanticArtifactKey, SemanticGapId,
-    SemanticLocator, SemanticRole, SourceMappingId, ValueId,
+    SemanticLocator, SemanticRole, SourceMappingId, SwitchFactId, ValueId,
 };
 use super::super::provider::SemanticWork;
 use super::model::*;
@@ -182,7 +182,10 @@ pub(super) fn measure_artifact_work(
         // rather than as a budget dimension of its own.
         work.nested_entries = work
             .nested_entries
-            .saturating_add(procedure.guard_facts.len());
+            .saturating_add(procedure.guard_facts.len())
+            .saturating_add(procedure.switch_facts.iter().fold(0usize, |total, fact| {
+                total.saturating_add(fact.cases.len().saturating_add(1))
+            }));
         // The frozen CFG retains two point-indexed offset arrays plus one
         // incoming procedure-local edge ID per canonical rich edge.
         let adjacency_entries = procedure
@@ -211,6 +214,9 @@ pub(super) fn measure_artifact_work(
                 | SemanticValueKind::Return
                 | SemanticValueKind::Temporary
                 | SemanticValueKind::Address
+                | SemanticValueKind::Null
+                | SemanticValueKind::Boolean(_)
+                | SemanticValueKind::UnsignedInteger(_)
                 | SemanticValueKind::Constant
                 | SemanticValueKind::Exception
                 | SemanticValueKind::Callable
@@ -289,6 +295,7 @@ pub(super) fn measure_artifact_work(
                     | SemanticEffect::Throw { .. }
                     | SemanticEffect::AsyncSuspend { .. }
                     | SemanticEffect::AsyncResume { .. }
+                    | SemanticEffect::Synchronization { .. }
                     | SemanticEffect::Gap { .. } => {}
                 }
             }
@@ -810,6 +817,7 @@ fn validate_procedure(
     validate_blocks(procedure)?;
     let control_edges = validate_control_edges(capabilities, procedure)?;
     validate_guard_facts(capabilities, procedure, &control_edges)?;
+    validate_switch_facts(capabilities, procedure, &control_edges)?;
     validate_events(
         capabilities,
         procedures,
@@ -851,6 +859,89 @@ fn validate_dense_rows(procedure: &ProcedureSemanticsParts) -> Result<(), Semant
     dense!(procedure.blocks, "blocks");
     dense!(procedure.points, "points");
     dense!(procedure.guard_facts, "guard_facts");
+    dense!(procedure.switch_facts, "switch_facts");
+    Ok(())
+}
+
+fn validate_switch_facts(
+    capabilities: &SemanticCapabilities,
+    procedure: &ProcedureSemanticsParts,
+    control_edges: &ControlEdgeIndex,
+) -> Result<(), SemanticIrError> {
+    if procedure.switch_facts.is_empty() {
+        return Ok(());
+    }
+    let id = procedure.id;
+    require_capability(
+        id,
+        capabilities,
+        SemanticCapability::SwitchFacts,
+        "switch-fact rows",
+    )?;
+    for fact in &procedure.switch_facts {
+        ensure_point(id, fact.point, procedure.points.len(), "switch point")?;
+        validate_metadata(id, fact.source, fact.evidence, procedure, "switch fact")?;
+        if let Some(selector) = fact.selector {
+            ensure_value(id, selector, procedure.values.len(), "switch selector")?;
+        }
+        if fact.kind == SwitchFactKind::Expression && fact.selector.is_none() {
+            return Err(SemanticIrError::procedure(
+                id,
+                SemanticIrErrorKind::SwitchContract,
+                format!("expression switch {} has no selector", fact.id),
+            ));
+        }
+        if fact.default_present != fact.default_edge.is_some()
+            && fact.kind == SwitchFactKind::Expression
+        {
+            return Err(SemanticIrError::procedure(
+                id,
+                SemanticIrErrorKind::SwitchContract,
+                format!("switch {} default presence and edge disagree", fact.id),
+            ));
+        }
+        for case in &fact.cases {
+            ensure_value(id, case.value, procedure.values.len(), "switch case value")?;
+            validate_switch_edge(id, fact.id, case.edge, procedure, control_edges)?;
+        }
+        if let Some(edge) = fact.default_edge {
+            validate_switch_edge(id, fact.id, edge, procedure, control_edges)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_switch_edge(
+    procedure_id: ProcedureId,
+    switch_id: SwitchFactId,
+    edge: SwitchEdgeParts,
+    procedure: &ProcedureSemanticsParts,
+    control_edges: &ControlEdgeIndex,
+) -> Result<(), SemanticIrError> {
+    ensure_point(
+        procedure_id,
+        edge.source_point,
+        procedure.points.len(),
+        "switch edge source",
+    )?;
+    ensure_point(
+        procedure_id,
+        edge.arm.target_point,
+        procedure.points.len(),
+        "switch edge target",
+    )?;
+    if !control_edges.contains(edge.source_point, edge.arm.target_point, edge.arm.kind) {
+        return Err(SemanticIrError::procedure(
+            procedure_id,
+            SemanticIrErrorKind::SwitchContract,
+            format!(
+                "switch {switch_id} names absent edge {} -> {} ({})",
+                edge.source_point,
+                edge.arm.target_point,
+                edge.arm.kind.label()
+            ),
+        ));
+    }
     Ok(())
 }
 
@@ -925,10 +1016,7 @@ fn validate_guard_facts(
         }
         if let GuardPredicate::ConstantEquality { constant, .. } = guard.predicate {
             ensure_value(id, constant, procedure.values.len(), "guard constant")?;
-            if !matches!(
-                procedure.values[constant.index()].kind,
-                SemanticValueKind::Constant
-            ) {
+            if !procedure.values[constant.index()].kind.is_constant() {
                 return Err(SemanticIrError::procedure(
                     id,
                     SemanticIrErrorKind::GuardContract,
@@ -960,16 +1048,44 @@ fn validate_memory_location(
         MemoryLocationKind::Static { member } => {
             validate_memory_member_locator(id, member, "static member")?;
         }
-        MemoryLocationKind::Index { base, index } => {
+        MemoryLocationKind::Index {
+            base,
+            index,
+            constant_index,
+            ..
+        } => {
             ensure_value(id, *base, procedure.values.len(), "indexed base")?;
             if let Some(index) = index {
                 ensure_value(id, *index, procedure.values.len(), "index value")?;
+            }
+            if constant_index.is_some()
+                && index.is_none_or(|index| {
+                    !procedure
+                        .values
+                        .get(index.index())
+                        .is_some_and(|value| value.kind.is_constant())
+                })
+            {
+                return Err(SemanticIrError::procedure(
+                    id,
+                    SemanticIrErrorKind::MemoryContract,
+                    format!(
+                        "indexed location {} has a constant magnitude without a constant index value",
+                        location.id
+                    ),
+                ));
             }
         }
         MemoryLocationKind::LexicalCell { binding } => {
             ensure_value(id, *binding, procedure.values.len(), "lexical-cell binding")?;
         }
-        MemoryLocationKind::Capture { lexical_parent } => {
+        MemoryLocationKind::Capture {
+            lexical_parent,
+            binding,
+        } => {
+            if let Some(binding) = binding {
+                ensure_value(id, *binding, procedure.values.len(), "capture-slot binding")?;
+            }
             ensure_index(
                 id,
                 "capture-slot lexical parent",
@@ -1421,7 +1537,7 @@ fn validate_capture_row(
         ));
     }
     match &target.memory_locations[capture.destination.index()].kind {
-        MemoryLocationKind::Capture { lexical_parent } if *lexical_parent == id => {}
+        MemoryLocationKind::Capture { lexical_parent, .. } if *lexical_parent == id => {}
         _ => {
             return Err(SemanticIrError::procedure(
                 id,
@@ -1503,6 +1619,21 @@ fn validate_call_site(
     }
     if let Some(thrown) = call_site.thrown {
         ensure_value(id, thrown, procedure.values.len(), "thrown call value")?;
+    }
+    if call_site.invocation_mode == CallInvocationMode::Detached
+        && (call_site.normal_continuation.target().is_none()
+            || call_site.exceptional_continuation != ControlContinuation::Absent
+            || call_site.normal_result_values().next().is_some()
+            || call_site.thrown.is_some())
+    {
+        return Err(SemanticIrError::procedure(
+            id,
+            SemanticIrErrorKind::CallContract,
+            format!(
+                "detached call site {} must continue normally without caller-local results, thrown values, or exceptional continuation",
+                call_site.id
+            ),
+        ));
     }
     ensure_evidence(
         id,
@@ -1852,7 +1983,7 @@ fn validate_events(
 
     for point in &procedure.points {
         let mut control_splits = 0_usize;
-        for event in &point.events {
+        for (event_index, event) in point.events.iter().enumerate() {
             validate_metadata(id, event.source, event.evidence, procedure, "event")?;
             if is_control_splitting_effect(&event.effect) {
                 control_splits += 1;
@@ -1882,7 +2013,39 @@ fn validate_events(
                 } => {
                     ensure_value(id, *source, procedure.values.len(), "value-flow source")?;
                     ensure_value(id, *target, procedure.values.len(), "value-flow target")?;
+                    if let ValueFlowKind::BackingStore {
+                        offset: BackingStoreOffset::Value(offset),
+                    } = kind
+                    {
+                        ensure_value(id, *offset, procedure.values.len(), "backing-store offset")?;
+                    }
                     validate_value_flow_kind(procedure, *kind, *source, *target)?;
+                    if let ValueFlowKind::Transfer(transfer) = kind {
+                        let has_matching_assignment = event_index
+                            .checked_sub(1)
+                            .and_then(|assignment_index| point.events.get(assignment_index))
+                            .is_some_and(|previous| {
+                                matches!(
+                                    previous.effect,
+                                    SemanticEffect::Assignment {
+                                        target: assignment_target,
+                                        value: assignment_value,
+                                    } if assignment_value == *source && assignment_target == *target
+                                )
+                            });
+                        if !has_matching_assignment {
+                            return Err(SemanticIrError::procedure(
+                                id,
+                                SemanticIrErrorKind::ValueFlowContract,
+                                format!(
+                                    "{} transfer {source} -> {target} at point {} must immediately follow its matching assignment",
+                                    transfer.kind.label(),
+                                    point.id
+                                ),
+                            ));
+                        }
+                        validate_transfer(procedure, *transfer, event.evidence, point.id)?;
+                    }
                 }
                 SemanticEffect::ValueUse { value, .. } => {
                     ensure_value(id, *value, procedure.values.len(), "used value")?;
@@ -1934,6 +2097,14 @@ fn validate_events(
                     )?;
                     ensure_value(id, *value, procedure.values.len(), "stored value")?;
                     validate_memory_access_kind(procedure, *location, *kind)?;
+                }
+                SemanticEffect::Synchronization { subject, .. } => {
+                    ensure_value(
+                        id,
+                        *subject,
+                        procedure.values.len(),
+                        "synchronization subject",
+                    )?;
                 }
                 SemanticEffect::CallableCreation { result, callable } => {
                     validate_callable_value(
@@ -2414,7 +2585,9 @@ fn validate_value_flow_kind(
     let source_kind = &procedure.values[source.index()].kind;
     let target_kind = &procedure.values[target.index()].kind;
     let valid = match kind {
-        ValueFlowKind::Local => true,
+        ValueFlowKind::Local | ValueFlowKind::Transfer(_) | ValueFlowKind::BackingStore { .. } => {
+            true
+        }
         ValueFlowKind::Parameter => {
             matches!(source_kind, SemanticValueKind::Parameter { .. })
                 || matches!(target_kind, SemanticValueKind::Parameter { .. })
@@ -2440,6 +2613,45 @@ fn validate_value_flow_kind(
                 target
             ),
         ));
+    }
+    Ok(())
+}
+
+/// A transfer that admits uncertainty (an unknown move invalidation or an
+/// unselected operation) must not ride on proven, complete evidence: the
+/// contradiction would launder typed uncertainty into a certain fact.
+fn validate_transfer(
+    procedure: &ProcedureSemanticsParts,
+    transfer: ValueTransfer,
+    evidence: EvidenceId,
+    point: ProgramPointId,
+) -> Result<(), SemanticIrError> {
+    if let TransferOperation::CallSite(call_site) = transfer.operation {
+        ensure_call_site(
+            procedure.id,
+            call_site,
+            procedure.call_sites.len(),
+            "transfer operation",
+        )?;
+    }
+    let admits_uncertainty = matches!(
+        transfer.kind,
+        TransferKind::Move {
+            invalidation: MoveInvalidation::Unknown,
+        }
+    ) || transfer.operation == TransferOperation::Unknown;
+    if admits_uncertainty {
+        let row = &procedure.evidence_rows[evidence.index()];
+        if row.proof == ProofStatus::Proven && row.completeness == EvidenceCompleteness::Complete {
+            return Err(SemanticIrError::procedure(
+                procedure.id,
+                SemanticIrErrorKind::ValueFlowContract,
+                format!(
+                    "{} transfer at point {point} claims unknown invalidation or operation on proven, complete evidence",
+                    transfer.kind.label()
+                ),
+            ));
+        }
     }
     Ok(())
 }
@@ -2986,7 +3198,11 @@ fn effect_capabilities(effect: &SemanticEffect) -> &'static [SemanticCapability]
             &[SemanticCapability::Assignments, SemanticCapability::Values]
         }
         SemanticEffect::ValueFlow { kind, .. } => match kind {
-            ValueFlowKind::Local => &[SemanticCapability::Values, SemanticCapability::LocalFlow],
+            ValueFlowKind::Local
+            | ValueFlowKind::Transfer(_)
+            | ValueFlowKind::BackingStore { .. } => {
+                &[SemanticCapability::Values, SemanticCapability::LocalFlow]
+            }
             ValueFlowKind::Parameter => &[
                 SemanticCapability::Values,
                 SemanticCapability::ParameterFlow,
@@ -3023,6 +3239,10 @@ fn effect_capabilities(effect: &SemanticEffect) -> &'static [SemanticCapability]
                 _ => unreachable!("memory access maps only to memory capabilities"),
             }
         }
+        SemanticEffect::Synchronization { .. } => &[
+            SemanticCapability::Values,
+            SemanticCapability::Synchronization,
+        ],
         SemanticEffect::CallableCreation { .. } | SemanticEffect::CallableReference { .. } => &[
             SemanticCapability::Values,
             SemanticCapability::CallableReferences,

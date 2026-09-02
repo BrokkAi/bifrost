@@ -27,9 +27,10 @@ use super::local::{
 };
 use super::namespace::{
     ScalaDirectAncestorResolution, ScalaQualifiedTypeRootBinding, ScalaQualifiedTypeRootResolution,
-    ScalaTypeNamespaceResolution, ScalaUnindexedTypeBinding, resolve_exact_lexical_type_namespace,
-    scala_anonymous_instance_for_template, scala_nearest_unindexed_type_binding,
-    scala_qualified_type_root, scala_type_reference_is_singleton,
+    ScalaTiedSupertypes, ScalaTypeNamespaceResolution, ScalaUnindexedTypeBinding,
+    resolve_exact_lexical_type_namespace, scala_anonymous_instance_for_template,
+    scala_nearest_unindexed_type_binding, scala_qualified_type_root,
+    scala_type_reference_is_singleton,
 };
 use super::resolver::{
     preferred_scala_type, scala_builtin_type_name, scala_extension_receiver_matches_resolved,
@@ -737,34 +738,27 @@ impl ProjectTypes {
         self.type_aliases.contains(unit)
     }
 
-    /// Whether this field-shaped declaration identity also has a term-level
-    /// declaration. Scala permits a type alias and a `val` with the same name
-    /// in one owner; the analyzer intentionally coalesces those declarations
-    /// into one CodeUnit while retaining both parser-recorded signatures.
-    pub fn has_term_field_declaration(&self, unit: &CodeUnit) -> bool {
+    /// Whether this declaration is the term-namespace half of a name. Scala
+    /// permits a type alias and a `val` with the same name in one owner, and
+    /// since #2878 those are two declarations: the alias is a `Class` carrying
+    /// a `Type` segment, the `val` a `Field` carrying a `Member` segment.
+    pub fn is_term_field_declaration(&self, unit: &CodeUnit) -> bool {
         unit.is_field()
-            && (!self.type_aliases.contains(unit)
-                || self
-                    .bulk_file_state(unit.source())
-                    .and_then(|state| state.signatures.get(unit))
-                    .is_some_and(|signatures| signatures.len() > 1))
-    }
-
-    fn is_exclusive_type_alias(&self, unit: &CodeUnit) -> bool {
-        self.type_aliases.contains(unit) && !self.has_term_field_declaration(unit)
     }
 
     fn term_field_declaration_is_globally_unique(&self, unit: &CodeUnit) -> bool {
         self.index
             .by_fqn(&unit.fq_name())
             .iter()
-            .filter(|candidate| self.has_term_field_declaration(candidate))
+            .filter(|candidate| self.is_term_field_declaration(candidate))
             .count()
             == 1
     }
 
+    /// Classes, traits, objects, and type aliases all mint a `Class` unit
+    /// (`scala_type_declaration_unit`), which is exactly the type namespace.
     fn is_type_namespace_declaration(&self, unit: &CodeUnit) -> bool {
-        unit.is_class() || self.type_aliases.contains(unit)
+        unit.is_class()
     }
 
     /// Where `unit` ranks in the type namespace. A declared `object` reaches the
@@ -1278,7 +1272,7 @@ impl ProjectTypes {
                 | ScalaDirectAncestorResolution::Incomplete(_) => {
                     self.direct_ancestors_for_declaration(scala, &current)
                 }
-                ScalaDirectAncestorResolution::Ambiguous => return false,
+                ScalaDirectAncestorResolution::Ambiguous { .. } => return false,
             };
             pending.extend(ancestors);
         }
@@ -1296,7 +1290,15 @@ impl ProjectTypes {
             .as_ref()
             .is_some_and(|owners| owners.contains(owner))
         {
-            return ScalaDirectAncestorResolution::Ambiguous;
+            // This tie was proved from the precomputed ambiguous-owner set,
+            // which records THAT an owner's supertype name tied, not which
+            // declarations tied. Nothing here can be asked whether it declares
+            // a given name, so the tie stays disqualifying for every name
+            // (#2229).
+            return ScalaDirectAncestorResolution::Ambiguous {
+                resolved: Vec::new(),
+                tied: ScalaTiedSupertypes::Unnamed,
+            };
         }
         if let Some(ancestors_by_unit) = &self.direct_ancestors_by_unit {
             return ScalaDirectAncestorResolution::Resolved(
@@ -1315,7 +1317,13 @@ impl ProjectTypes {
                 self.resolve_type_in_hierarchy_context(scala, &resolver, path.segments())
             else {
                 if self.type_lookup_path_is_ambiguous(&resolver, path.segments()) {
-                    return ScalaDirectAncestorResolution::Ambiguous;
+                    // The predicate proves the tie from the name tables and
+                    // never holds the tied declarations, so it cannot answer
+                    // the per-name question #2229 asks.
+                    return ScalaDirectAncestorResolution::Ambiguous {
+                        resolved: Vec::new(),
+                        tied: ScalaTiedSupertypes::Unnamed,
+                    };
                 }
                 continue;
             };
@@ -1385,7 +1393,7 @@ impl ProjectTypes {
                 matches.extend(
                     self.members_for_exact_owner_name(&owner, member)
                         .into_iter()
-                        .filter(|unit| self.has_term_field_declaration(unit)),
+                        .filter(|unit| self.is_term_field_declaration(unit)),
                 );
                 next.extend(
                     self.direct_field_ancestors_for_owner(scala, &owner)
@@ -1430,7 +1438,7 @@ impl ProjectTypes {
                 matches.extend(
                     self.members_for_exact_owner_unit(scala, &owner, member)
                         .into_iter()
-                        .filter(|unit| self.has_term_field_declaration(unit)),
+                        .filter(|unit| self.is_term_field_declaration(unit)),
                 );
                 let ancestors = match self.exact_direct_ancestor_resolution(scala, token, &owner) {
                     ScalaDirectAncestorResolution::Resolved(ancestors)
@@ -1448,7 +1456,7 @@ impl ProjectTypes {
                         // resolver has authoritatively ruled out ambiguity.
                         self.direct_ancestors_for_declaration(scala, &owner)
                     }
-                    ScalaDirectAncestorResolution::Ambiguous => {
+                    ScalaDirectAncestorResolution::Ambiguous { .. } => {
                         return FieldResolution::Unresolved;
                     }
                 };
@@ -1538,7 +1546,7 @@ impl ProjectTypes {
                         match self.exact_direct_ancestor_resolution(scala, token, &owner) {
                             ScalaDirectAncestorResolution::Resolved(ancestors)
                             | ScalaDirectAncestorResolution::Incomplete(ancestors) => ancestors,
-                            ScalaDirectAncestorResolution::Ambiguous => {
+                            ScalaDirectAncestorResolution::Ambiguous { .. } => {
                                 next_is_ambiguous = true;
                                 Vec::new()
                             }
@@ -2154,7 +2162,7 @@ impl ProjectTypes {
     }
 
     fn member_blocks_callable_lookup(&self, scala: &dyn ScalaSource, member: &CodeUnit) -> bool {
-        self.has_term_field_declaration(member)
+        self.is_term_field_declaration(member)
             || member.is_class() && self.type_is_stable_owner(scala, member)
     }
 
@@ -2177,7 +2185,7 @@ impl ProjectTypes {
         if member.is_class() && self.type_is_stable_owner(scala, member) {
             return true;
         }
-        call.is_unapplied() && self.has_term_field_declaration(member)
+        call.is_unapplied() && self.is_term_field_declaration(member)
     }
 
     pub fn callable_parameter_function_shape(
@@ -2563,7 +2571,7 @@ impl ProjectTypes {
             {
                 ScalaDirectAncestorResolution::Resolved(ancestors)
                 | ScalaDirectAncestorResolution::Incomplete(ancestors) => ancestors,
-                ScalaDirectAncestorResolution::Ambiguous => return None,
+                ScalaDirectAncestorResolution::Ambiguous { .. } => return None,
             };
             for ancestor in direct_ancestors {
                 let mut matching_expressions = owner_facts.supertypes.iter().filter(|expression| {
@@ -4373,7 +4381,7 @@ impl ProjectTypes {
         let declarations = self.index.by_normalized_fqn(normalized_fqn);
         let candidates = declarations
             .iter()
-            .filter(|unit| unit.is_function() || self.has_term_field_declaration(unit))
+            .filter(|unit| unit.is_function() || self.is_term_field_declaration(unit))
             .collect::<Vec<_>>();
         if let [candidate] = candidates.as_slice() {
             return vec![(*candidate).clone()];
@@ -4397,7 +4405,7 @@ impl ProjectTypes {
         };
         let stable_members = candidates
             .into_iter()
-            .filter(|unit| self.has_term_field_declaration(unit))
+            .filter(|unit| self.is_term_field_declaration(unit))
             .filter(|unit| unit.source() == source_file)
             .filter(|unit| {
                 self.exact_structural_parent(scala, unit)
@@ -4426,7 +4434,7 @@ impl ProjectTypes {
             .index
             .by_fqn(&field_fqn)
             .into_iter()
-            .filter(|unit| self.has_term_field_declaration(unit))
+            .filter(|unit| self.is_term_field_declaration(unit))
             .collect::<Vec<_>>();
         (fields.len() == 1).then(|| fields[0].clone())
     }
@@ -4738,7 +4746,7 @@ impl ProjectTypes {
             match self.exact_direct_ancestor_resolution(scala, token, &owner) {
                 ScalaDirectAncestorResolution::Resolved(ancestors)
                 | ScalaDirectAncestorResolution::Incomplete(ancestors) => pending.extend(ancestors),
-                ScalaDirectAncestorResolution::Ambiguous => return false,
+                ScalaDirectAncestorResolution::Ambiguous { .. } => return false,
             }
         }
         true
@@ -5211,7 +5219,16 @@ impl ProjectTypes {
                 self.index
                     .by_fqn(fqn)
                     .into_iter()
-                    .filter(|unit| unit.is_class() && !unit.short_name().ends_with('$'))
+                    // A type alias introduces no term, so an application or an
+                    // extractor pattern spelling that name reaches the
+                    // companion object, never the alias. Excluding it here is
+                    // what keeps `Result.Success(1)` off `opaque type
+                    // Success[A]` now that the alias is a `Class` (#2878).
+                    .filter(|unit| {
+                        unit.is_class()
+                            && !self.type_aliases.contains(unit)
+                            && !unit.short_name().ends_with('$')
+                    })
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
@@ -9050,7 +9067,7 @@ fn record_exact_import_path_reference(
         }
         let role = if target.is_function() {
             ScalaReferenceRole::Callable
-        } else if ctx.types.has_term_field_declaration(&target) {
+        } else if ctx.types.is_term_field_declaration(&target) {
             ScalaReferenceRole::Field
         } else if target.is_class() && target.short_name().ends_with('$') {
             ScalaReferenceRole::StableObject
@@ -9195,7 +9212,7 @@ fn exact_import_targets_for_candidate(
     ) {
         if member.is_function() {
             exact.callable_targets.insert(member.clone());
-        } else if ctx.types.has_term_field_declaration(&member) {
+        } else if ctx.types.is_term_field_declaration(&member) {
             exact.field_targets.insert(member.clone());
         }
     }
@@ -9734,11 +9751,11 @@ fn record_reference(
                     let imported_type_alias_only = !resolved_member_units.is_empty()
                         && resolved_member_units
                             .iter()
-                            .all(|unit| ctx.types.is_exclusive_type_alias(unit));
+                            .all(|unit| ctx.types.is_type_alias(ctx.scala, unit));
                     let imported_units = resolved_member_units
                         .into_iter()
                         .filter(|unit| {
-                            unit.is_function() || ctx.types.has_term_field_declaration(unit)
+                            unit.is_function() || ctx.types.is_term_field_declaration(unit)
                         })
                         .collect::<Vec<_>>();
                     if !imported_units.is_empty()
@@ -9754,7 +9771,7 @@ fn record_reference(
                     if !imported_units.is_empty() {
                         let imported_fields = imported_units
                             .iter()
-                            .filter(|unit| ctx.types.has_term_field_declaration(unit))
+                            .filter(|unit| ctx.types.is_term_field_declaration(unit))
                             .cloned()
                             .collect::<Vec<_>>();
                         if !imported_fields.is_empty() {
@@ -11049,7 +11066,7 @@ fn record_unqualified_applied_field(
         LexicalFieldReferenceResolution::NoMatch => {}
     }
     if let Some(target) = ctx.resolver.resolve_member_unit(name)
-        && ctx.types.has_term_field_declaration(&target)
+        && ctx.types.is_term_field_declaration(&target)
         && !ctx.types.is_type_alias(ctx.scala, &target)
     {
         ctx.record_exact(target, ScalaReferenceRole::Field, function);
@@ -11646,7 +11663,9 @@ fn record_qualified_stable_reference(
         role,
         Some(ctx.source_file),
     );
+    let mut recorded = false;
     if let Some(target) = resolution.type_target {
+        recorded = true;
         ctx.record_exact(target.clone(), ScalaReferenceRole::Type, node);
         let exact_companions = ctx.types.exact_companion_objects(ctx.scala, &target);
         let has_exact_companion_callable = resolution.callable_targets.iter().any(|callable| {
@@ -11679,6 +11698,7 @@ fn record_qualified_stable_reference(
         }
     }
     for callable in resolution.callable_targets {
+        recorded = true;
         if role == TypeApplicationRole::ExplicitConstructor {
             ctx.record_exact_callable(callable, node);
         } else {
@@ -11693,7 +11713,17 @@ fn record_qualified_stable_reference(
             );
         }
     }
-    true
+    // `Owner.Name(args)` and `case Owner.Name(..)` apply a term member of
+    // `Owner`; the type namespace answers only through the companion callable
+    // (explicit or synthetic) of a type named `Name`. Resolving the type and
+    // then finding nothing applicable therefore proves the site is not a
+    // type-namespace one, so it must continue into the exact receiver,
+    // lexical-field, and extension resolution below exactly like the
+    // both-namespaces-missed case above: `object Tags { sealed trait MaxVal;
+    // val MaxVal }` lost every `Tags.MaxVal(3)` hit to the trait (#2220).
+    // `new Owner.Name(...)` is a type-namespace operation whatever it
+    // resolves to, so a miss there stays consumed.
+    recorded || role == TypeApplicationRole::ExplicitConstructor
 }
 
 fn record_intermediate_stable_object_reference(

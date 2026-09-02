@@ -65,6 +65,26 @@ macro_rules! forward_relational_definition_batch {
 
 pub(crate) use forward_relational_definition_batch;
 
+/// Forward the two Git-identity invalidation operations from a public language
+/// wrapper to its generic `TreeSitterAnalyzer`.
+macro_rules! forward_file_identity_invalidation {
+    () => {
+        fn invalidate_cached_file_identities(&self) {
+            self.inner.invalidate_cached_file_identities();
+        }
+
+        fn invalidate_cached_file_identities_for(
+            &self,
+            changed_files: &std::collections::BTreeSet<crate::analyzer::ProjectFile>,
+        ) {
+            self.inner
+                .invalidate_cached_file_identities_for(changed_files);
+        }
+    };
+}
+
+pub(crate) use forward_file_identity_invalidation;
+
 #[derive(Debug, Clone)]
 enum CompiledSymbolPatterns {
     Set(RegexSet),
@@ -536,6 +556,11 @@ pub struct AnalyzerQueryContext {
     /// made under an inner scope is recorded on every enclosing scope too:
     /// each of them did pay for it.
     tier_accesses: [AtomicUsize; InformationTier::COUNT],
+    /// The read ledger this request records its inputs into, when its opener
+    /// asked for one (`AnalyzerQueryScope::with_read_ledger`). `None` is the
+    /// ordinary case and costs nothing: every funnel checks the analyzer's
+    /// attached-ledger count before it builds a key.
+    read_ledger: Option<Arc<crate::analyzer::read_ledger::ReadLedger>>,
 }
 
 impl Default for AnalyzerQueryContext {
@@ -546,6 +571,7 @@ impl Default for AnalyzerQueryContext {
             semantic_model_overlay_override: None,
             active_semantic_model_snapshot_override: None,
             tier_accesses: Default::default(),
+            read_ledger: None,
         }
     }
 }
@@ -842,6 +868,7 @@ impl AnalyzerQueryContext {
             semantic_model_overlay_override: None,
             active_semantic_model_snapshot_override: None,
             tier_accesses: Default::default(),
+            read_ledger: None,
         }
     }
 
@@ -857,6 +884,7 @@ impl AnalyzerQueryContext {
             )),
             active_semantic_model_snapshot_override: None,
             tier_accesses: Default::default(),
+            read_ledger: None,
         }
     }
 
@@ -869,6 +897,7 @@ impl AnalyzerQueryContext {
             semantic_model_overlay_override: None,
             active_semantic_model_snapshot_override: Some((std::thread::current().id(), snapshot)),
             tier_accesses: Default::default(),
+            read_ledger: None,
         }
     }
 
@@ -889,6 +918,38 @@ impl AnalyzerQueryContext {
     ) -> Option<Option<Arc<crate::analyzer::semantic_model::ActiveSemanticModelSnapshot>>> {
         let (owner, snapshot) = self.active_semantic_model_snapshot_override.as_ref()?;
         (owner == &std::thread::current().id()).then(|| snapshot.clone())
+    }
+
+    fn with_read_ledger(ledger: Arc<crate::analyzer::read_ledger::ReadLedger>) -> Self {
+        Self {
+            first_store_error: Mutex::new(None),
+            cancellation: None,
+            semantic_model_overlay_override: None,
+            active_semantic_model_snapshot_override: None,
+            tier_accesses: Default::default(),
+            read_ledger: Some(ledger),
+        }
+    }
+
+    /// The read ledger this request records into, if its opener attached one.
+    pub fn read_ledger(&self) -> Option<&Arc<crate::analyzer::read_ledger::ReadLedger>> {
+        self.read_ledger.as_ref()
+    }
+
+    /// Records one named input under this request. A request with no ledger
+    /// drops the key; the funnels avoid building one at all by consulting the
+    /// analyzer's attached-ledger count first.
+    pub fn record_read(&self, key: crate::analyzer::read_ledger::ReadKey) {
+        if let Some(ledger) = &self.read_ledger {
+            ledger.record(key);
+        }
+    }
+
+    /// Records one funnel crossing this request could not name.
+    pub fn record_unattributed_read(&self) {
+        if let Some(ledger) = &self.read_ledger {
+            ledger.record_unattributed();
+        }
     }
 
     /// Records one crossing of `tier`'s storage funnel under this request.
@@ -937,12 +998,44 @@ pub trait IAnalyzer: CodeUnitIndex + Send + Sync + Any {
         &NoOpAnalyzerTestHooks
     }
 
+    /// Files this analyzer adopted through a structured language relation even
+    /// though the extension registry does not route them to the language.
+    ///
+    /// This is the narrow, cheap ownership surface hosts such as the workspace
+    /// watcher need. It does not validate parse products and must not infer
+    /// ownership from a filename extension at the host boundary.
+    #[doc(hidden)]
+    fn claimed_files(&self) -> Vec<ProjectFile> {
+        Vec::new()
+    }
+
     /// Starts a top-level query boundary. Persisted analyzers use this to
     /// memoize filesystem liveness checks for the duration of one request.
     fn begin_query(&self, _context: &Arc<AnalyzerQueryContext>) {}
 
     /// Ends a top-level query boundary and releases request-scoped memoized state.
     fn end_query(&self, _context: &Arc<AnalyzerQueryContext>) {}
+
+    /// Records one input this analyzer read, on every read ledger open around
+    /// it (issue: impact-sliced `--diff-base`, Milestone 1).
+    ///
+    /// This is the seam the funnels that hold only a `&dyn IAnalyzer` -- the
+    /// usage-ranking graph acquisition, the direct-import layer, the reference
+    /// candidate derivation, the descendant index, the dispatch oracle -- use
+    /// to reach the request boundary, exactly as `begin_query` and `end_query`
+    /// do. Implementations broadcast to every open context, because a funnel
+    /// crossed on an analyzer-internal worker thread was still paid for by
+    /// every request that is open around it.
+    fn record_read(&self, _key: crate::analyzer::read_ledger::ReadKey) {}
+
+    /// Whether any open request boundary carries a read ledger.
+    ///
+    /// A funnel consults this before it builds a key: with no ledger attached
+    /// -- every run that is not an incremental policy evaluation -- recording
+    /// must cost one relaxed atomic load and no allocation.
+    fn read_ledger_attached(&self) -> bool {
+        false
+    }
 
     /// The cancellation token carried by the innermost active query boundary.
     ///
@@ -999,6 +1092,19 @@ pub trait IAnalyzer: CodeUnitIndex + Send + Sync + Any {
         None
     }
 
+    /// The definition-lookup memos for the request this analyzer has open, or
+    /// `None` when no query scope is open.
+    ///
+    /// Candidate discovery builds one `AnalyzerDefinitionLookup` per candidate
+    /// file, so memos owned by the lookup made every candidate repeat the same
+    /// store batches for the same names (#2883). Sharing them across the
+    /// request is the same argument the rest of the query read cache rests on.
+    /// See [`crate::analyzer::DefinitionLookupMemo`].
+    #[doc(hidden)]
+    fn definition_lookup_memo(&self) -> Option<Arc<crate::analyzer::DefinitionLookupMemo>> {
+        None
+    }
+
     /// Record a failure that a collection-returning read could not return, on
     /// every request boundary this analyzer currently has open.
     ///
@@ -1028,6 +1134,61 @@ pub trait IAnalyzer: CodeUnitIndex + Send + Sync + Any {
         true
     }
 
+    /// Build the structural posting index of every provider a structural query
+    /// has already asked to reuse.
+    ///
+    /// Unlike `warm_query_indexes`, what this warms is not fixed when the
+    /// snapshot is installed: the posting index is built only for a provider
+    /// whose Auto admission a query has already exercised, so the work appears
+    /// after the first structural query rather than at session start (#2879).
+    /// A host that warms after every request therefore picks it up on the
+    /// request after the one that asked, and a request arriving mid-build
+    /// takes its scan path instead of parking on the build.
+    ///
+    /// Written once over `structural_fact_providers`, which every wrapping
+    /// analyzer already forwards, so no language analyzer implements it.
+    ///
+    /// The providers are warmed together rather than one after another. Each
+    /// build claims its own single-flight before it acquires a fact, and a
+    /// request that finds a claim takes its scan path; warming serially would
+    /// leave every later provider unclaimed for the whole of the first
+    /// provider's build, which is exactly the request-path build this exists
+    /// to prevent. They run on the dedicated build pool for the same reason
+    /// the hierarchy builds do (#1772): a background warm must not consume a
+    /// worker of the pool interactive requests fan out on.
+    fn warm_structural_indexes(&self) {
+        let providers = self.structural_fact_providers();
+        crate::analyzer::install_on_dedicated_build_pool(|| {
+            use rayon::prelude::*;
+            providers.into_par_iter().for_each(|provider| {
+                let (Some(cache), Some(content_identity)) = (
+                    provider.snapshot_structural_index_cache(),
+                    provider.structural_content_identity(),
+                ) else {
+                    return;
+                };
+                let cache = cache.inner();
+                if cache.auto_build_outstanding(content_identity) {
+                    cache.acquire(provider, &crate::CancellationToken::default());
+                }
+            });
+        });
+    }
+
+    /// Whether every posting index `warm_structural_indexes` would build is
+    /// already built or already rejected for this analyzer generation.
+    fn structural_indexes_warm(&self) -> bool {
+        self.structural_fact_providers().iter().all(|provider| {
+            let (Some(cache), Some(content_identity)) = (
+                provider.snapshot_structural_index_cache(),
+                provider.structural_content_identity(),
+            ) else {
+                return true;
+            };
+            !cache.inner().auto_build_outstanding(content_identity)
+        })
+    }
+
     /// Stable identity of any external declaration surface consulted while
     /// resolving dispatch for this analyzer generation.
     ///
@@ -1044,6 +1205,10 @@ pub trait IAnalyzer: CodeUnitIndex + Send + Sync + Any {
     /// Drop any cached bulk working-tree identities before an explicit
     /// from-disk rebuild. Implementations without such a cache do nothing.
     fn invalidate_cached_file_identities(&self) {}
+
+    /// Stop trusting cached Git identities for paths explicitly reported as
+    /// changed before an incremental from-disk rebuild.
+    fn invalidate_cached_file_identities_for(&self, _changed_files: &BTreeSet<ProjectFile>) {}
 
     /// The repository-wide Git identity scan this analyzer already took for its
     /// workspace, when it has one.
@@ -1267,11 +1432,23 @@ pub trait IAnalyzer: CodeUnitIndex + Send + Sync + Any {
     fn semantic_model_overlay(
         &self,
     ) -> Option<Arc<crate::analyzer::semantic_model::SemanticModelOverlay>> {
-        if let Some(semantic_model_overlay) = self.active_query_semantic_model_overlay() {
-            return semantic_model_overlay;
+        let overlay =
+            if let Some(semantic_model_overlay) = self.active_query_semantic_model_overlay() {
+                semantic_model_overlay
+            } else {
+                self.snapshot_caches()
+                    .and_then(AnalyzerSnapshotCaches::semantic_model_overlay)
+            };
+        if self.read_ledger_attached()
+            && let Some(overlay) = overlay.as_ref()
+        {
+            self.record_read(crate::analyzer::read_ledger::ReadKey::Models(
+                crate::analyzer::semantic::ids::StableDigest::sha256(
+                    overlay.active_model_set_hash(),
+                ),
+            ));
         }
-        self.snapshot_caches()
-            .and_then(AnalyzerSnapshotCaches::semantic_model_overlay)
+        overlay
     }
 
     /// The activated models and declaration overlay from one atomic runtime
@@ -1279,11 +1456,22 @@ pub trait IAnalyzer: CodeUnitIndex + Send + Sync + Any {
     fn active_semantic_model_snapshot(
         &self,
     ) -> Option<Arc<crate::analyzer::semantic_model::ActiveSemanticModelSnapshot>> {
-        if let Some(snapshot) = self.active_query_semantic_model_snapshot() {
-            return snapshot;
+        let snapshot = if let Some(snapshot) = self.active_query_semantic_model_snapshot() {
+            snapshot
+        } else {
+            self.snapshot_caches()
+                .and_then(AnalyzerSnapshotCaches::active_semantic_model_snapshot)
+        };
+        if self.read_ledger_attached()
+            && let Some(snapshot) = snapshot.as_ref()
+        {
+            self.record_read(crate::analyzer::read_ledger::ReadKey::Models(
+                crate::analyzer::semantic::ids::StableDigest::sha256(
+                    snapshot.active_models().active_model_set_hash(),
+                ),
+            ));
         }
-        self.snapshot_caches()
-            .and_then(AnalyzerSnapshotCaches::active_semantic_model_snapshot)
+        snapshot
     }
 
     /// The activated semantic-model set published for this analyzer snapshot,
@@ -1340,6 +1528,45 @@ pub trait IAnalyzer: CodeUnitIndex + Send + Sync + Any {
         &self,
     ) -> Option<crate::analyzer::content_identity::WorkspaceContentIdentities> {
         None
+    }
+
+    /// The [`crate::analyzer::read_ledger::ReadKey::Scope`] naming exactly
+    /// `languages`, folded the way verification recomputes it.
+    ///
+    /// Stated once here because producer and verifier must agree by
+    /// construction: verification folds the head's per-language identities
+    /// over the key's language set, so a producer that recorded a raw language
+    /// digest, or a delegate's own fold, would record a key nothing could ever
+    /// match. An analyzer that states no identities has nothing to name the
+    /// read by, so the key carries the unattested identity, which compares
+    /// equal to no analyzed content and therefore always invalidates.
+    #[doc(hidden)]
+    fn workspace_scope_read_key(
+        &self,
+        languages: &[crate::analyzer::Language],
+    ) -> crate::analyzer::read_ledger::ReadKey {
+        let identity = self
+            .workspace_content_identities()
+            .and_then(|identities| identities.scope(|language| languages.contains(&language)))
+            .unwrap_or_else(
+                crate::analyzer::content_identity::WorkspaceContentIdentity::unattested,
+            );
+        crate::analyzer::read_ledger::ReadKey::scope(languages.iter().copied(), identity)
+    }
+
+    /// One read-ledger fact index per language this analyzer serves.
+    ///
+    /// The producer side of `ReadKey::File` and `ReadKey::Index`: which paths
+    /// resolve to which blobs, and which index keys one blob's facts publish.
+    /// A composite returns one entry per delegate; an analyzer that publishes
+    /// none returns nothing, and a caller with fewer entries than
+    /// [`crate::analyzer::CodeUnitIndex::languages`] must widen rather than
+    /// conclude that the missing language changed nothing.
+    #[doc(hidden)]
+    fn workspace_fact_indexes(
+        &self,
+    ) -> Vec<&dyn crate::analyzer::read_verification::WorkspaceFactIndex> {
+        Vec::new()
     }
 
     /// The whole-workspace content identity, for a cache whose value spans
@@ -1418,7 +1645,10 @@ pub trait IAnalyzer: CodeUnitIndex + Send + Sync + Any {
     where
         Self: Sized,
     {
-        UsageFinder::new().find_usages(self, overloads, DEFAULT_MAX_FILES, DEFAULT_MAX_USAGES)
+        let result =
+            UsageFinder::new().find_usages(self, overloads, DEFAULT_MAX_FILES, DEFAULT_MAX_USAGES);
+        record_usage_lookup(self as &dyn IAnalyzer, overloads, &result);
+        result
     }
 
     /// Like [`Self::find_usages`] but returns the candidate file set alongside the result.
@@ -1431,7 +1661,9 @@ pub trait IAnalyzer: CodeUnitIndex + Send + Sync + Any {
     where
         Self: Sized,
     {
-        UsageFinder::new().query(self, overloads, max_files, max_usages)
+        let query = UsageFinder::new().query(self, overloads, max_files, max_usages);
+        record_usage_lookup(self as &dyn IAnalyzer, overloads, &query.result);
+        query
     }
 
     fn metrics(&self) -> CodeBaseMetrics {
@@ -1843,6 +2075,23 @@ impl<'a> AnalyzerQueryScope<'a> {
         Self { analyzer, context }
     }
 
+    /// Open a request boundary that records every input it reads into
+    /// `ledger`.
+    ///
+    /// Only the outermost scope of a unit's execution carries one. Nested
+    /// scopes -- the RQL executor opens at least two of its own per execution
+    /// -- carry none, and the analyzer's broadcast records their reads on this
+    /// ledger anyway. The ledger is set-valued, so the double recording that
+    /// broadcast causes is harmless.
+    pub fn with_read_ledger(
+        analyzer: &'a dyn IAnalyzer,
+        ledger: Arc<crate::analyzer::read_ledger::ReadLedger>,
+    ) -> Self {
+        let context = Arc::new(AnalyzerQueryContext::with_read_ledger(ledger));
+        analyzer.begin_query(&context);
+        Self { analyzer, context }
+    }
+
     pub fn store_error(&self) -> Option<StoreError> {
         self.context.store_error()
     }
@@ -1888,6 +2137,88 @@ impl Drop for AnalyzerStreamingFileScope<'_> {
     fn drop(&mut self) {
         self.analyzer.end_streaming_file_read(self.file);
     }
+}
+
+/// Domain for the digest of one declaration's usage answer.
+const USAGE_ANSWER_DOMAIN: &[u8] = b"bifrost-read-ledger:usage-answer:v1";
+
+/// Record one usage lookup per overload the caller asked about, each carrying
+/// the digest of that overload's own answer.
+///
+/// This is a cross-file channel: the answer changes when a file the reader
+/// never mentions gains a call site, and no `File` or `Index` key the reader
+/// recorded would move. Recording the answer digest is what lets Milestone 2
+/// re-run the lookup against the head and see the difference.
+pub(crate) fn record_usage_lookup(
+    analyzer: &dyn IAnalyzer,
+    overloads: &[CodeUnit],
+    result: &FuzzyResult,
+) {
+    if !analyzer.read_ledger_attached() {
+        return;
+    }
+    for overload in overloads {
+        analyzer.record_read(crate::analyzer::read_ledger::ReadKey::lookup(
+            crate::analyzer::read_ledger::LookupKind::Usages,
+            crate::analyzer::read_ledger::LookupQuestion::declaration(overload),
+            usage_answer_digest(result, overload),
+        ));
+    }
+}
+
+/// The canonical digest of what a usage query answered about one overload.
+///
+/// Sites are folded by workspace-relative path and byte range, never by
+/// `ProjectFile` (which knows its root) and never by row address, so the same
+/// answer over the same content at two roots digests identically. A refusal
+/// digests as the refusal, not as an empty answer: "we did not look" and "there
+/// is nothing" must not compare equal.
+pub(crate) fn usage_answer_digest(
+    result: &FuzzyResult,
+    overload: &CodeUnit,
+) -> crate::analyzer::semantic::ids::StableDigest {
+    let mut hasher = crate::analyzer::canonical_hash::CanonicalHasher::new(USAGE_ANSWER_DOMAIN);
+    match result {
+        FuzzyResult::Success {
+            hits_by_overload, ..
+        }
+        | FuzzyResult::Ambiguous {
+            hits_by_overload, ..
+        } => {
+            hasher.value(b"hits");
+            let mut sites = hits_by_overload
+                .get(overload)
+                .into_iter()
+                .flatten()
+                .map(|hit| {
+                    (
+                        crate::path_utils::rel_path_string(&hit.file),
+                        hit.start_offset,
+                        hit.end_offset,
+                    )
+                })
+                .collect::<Vec<_>>();
+            sites.sort();
+            sites.dedup();
+            for (path, start, end) in sites {
+                hasher.field(&path, &(start as u64).to_be_bytes());
+                hasher.value(&(end as u64).to_be_bytes());
+            }
+        }
+        FuzzyResult::Failure { reason_kind, .. } => hasher.field("failure", reason_kind.as_bytes()),
+        FuzzyResult::TooManyCallsites {
+            total_callsites,
+            limit,
+            ..
+        } => {
+            hasher.field(
+                "too_many_callsites",
+                &(*total_callsites as u64).to_be_bytes(),
+            );
+            hasher.field("limit", &(*limit as u64).to_be_bytes());
+        }
+    }
+    crate::analyzer::semantic::ids::StableDigest::from_array(hasher.finish())
 }
 
 fn summary_root_units<A: IAnalyzer + ?Sized>(analyzer: &A, file: &ProjectFile) -> Vec<CodeUnit> {

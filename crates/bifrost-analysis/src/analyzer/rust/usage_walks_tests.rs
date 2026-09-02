@@ -140,6 +140,7 @@ mod tests {
     /// target declaration, such as a glob. Ordinary code can use the same
     /// common module word without creating an import edge, so those files must
     /// not be offered for expensive forward-edge verification.
+    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
     #[test]
     fn module_import_candidates_exclude_ordinary_terminal_name_mentions() {
         let mut files = vec![
@@ -339,6 +340,84 @@ mod tests {
         assert_eq!(*fresh, *first, "the answer itself is unchanged");
     }
 
+    /// The workspace declaration lookup behind `files_in_module_package` is
+    /// keyed on the module's short name, so it runs once per short name even
+    /// when many module packages end in it.
+    ///
+    /// Issue #2622: one warm whole-workspace usage scan asked about 29,014
+    /// distinct module packages -- most of them speculative ancestor
+    /// candidates that no file declares -- and each ask paid its own candidate
+    /// query plus `CodeUnit` hydration, about half the scan's CPU. Every file's
+    /// `mod tests` shares one short name, so the counter here is 1 with the
+    /// grouped index and one per package without it.
+    #[test]
+    fn module_declaration_lookups_run_once_per_short_name_per_generation() {
+        const MODULES: usize = 12;
+        let mut lib = String::new();
+        for index in 0..MODULES {
+            lib.push_str(&format!("pub mod m{index};\n"));
+        }
+        let mut sources: Vec<(String, String)> = vec![("src/lib.rs".to_string(), lib)];
+        for index in 0..MODULES {
+            sources.push((
+                format!("src/m{index}.rs"),
+                format!(
+                    "pub struct Item{index};\n\
+                     #[cfg(test)]\nmod tests {{\n    use super::*;\n    #[test]\n    fn works() {{ let _ = Item{index}; }}\n}}\n"
+                ),
+            ));
+        }
+        let borrowed: Vec<(&str, &str)> = sources
+            .iter()
+            .map(|(rel, body)| (rel.as_str(), body.as_str()))
+            .collect();
+        let (_temp, analyzer) = project(&borrowed);
+        let analyzer_scope = AnalyzerQueryScope::new(&analyzer);
+        let walks = RustUsageWalks::new(&analyzer, analyzer_scope.token());
+
+        let before = walks.caches.module_declaration_lookups();
+        for index in 0..MODULES {
+            let package = format!("m{index}.tests");
+            assert_eq!(
+                *walks.files_in_module_package(&package),
+                vec![file(&analyzer, &format!("m{index}.rs"))],
+                "{package} is declared by exactly the file that writes it"
+            );
+        }
+        assert_eq!(
+            walks.caches.module_declaration_lookups(),
+            before + 1,
+            "every `mod tests` package shares one short name, so one store lookup answers them all"
+        );
+
+        // The empty answer is grouped too: a short name no module declares
+        // must not re-ask per speculative package.
+        let missing = walks.caches.module_declaration_lookups();
+        for index in 0..MODULES {
+            assert!(
+                walks
+                    .files_in_module_package(&format!("m{index}.absent"))
+                    .is_empty()
+            );
+        }
+        assert_eq!(
+            walks.caches.module_declaration_lookups(),
+            missing + 1,
+            "an undeclared short name costs one lookup, not one per package"
+        );
+
+        // The generation is the invalidation, as for every other walk cache.
+        let updated = analyzer.update_all();
+        let updated_scope = AnalyzerQueryScope::new(&updated);
+        let next = RustUsageWalks::new(&updated, updated_scope.token());
+        assert_eq!(
+            *next.files_in_module_package("m0.tests"),
+            vec![file(&updated, "m0.rs")],
+            "the answer itself is unchanged"
+        );
+        assert_eq!(next.caches.module_declaration_lookups(), 1);
+    }
+
     /// The segment form resolves to the same candidate path as the specifier
     /// form, so the two share one memo entry.
     #[test]
@@ -368,6 +447,7 @@ mod tests {
     /// owns the termination the worklist's `visited` set used to provide. Two
     /// modules that publish each other's name are a cycle; the walk must still
     /// return the declaration each name really reaches.
+    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
     #[test]
     fn an_export_chain_cycle_terminates_and_keeps_the_declared_origin() {
         let (_temp, analyzer) = project(&[
@@ -409,6 +489,7 @@ mod tests {
     /// cycle handling is removed is
     /// `usages_rust_graph_test::rust_graph_tracks_bare_macro_invocations_through_structured_visibility`,
     /// demonstrated failing before the fixed-point iteration landed.
+    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
     #[test]
     fn a_module_republishing_a_name_declared_beside_it_keeps_the_import_domain() {
         let (_temp, analyzer) = project(&[
@@ -690,6 +771,7 @@ mod tests {
     ///
     /// The edit also must not cost whole-workspace work, which is the other
     /// half of Milestone 3 and the `2ba5dda4` counter idiom.
+    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
     #[test]
     fn a_single_file_edit_is_reflected_by_the_next_usage_query() {
         let (temp, analyzer) = project(&[
@@ -764,6 +846,7 @@ mod tests {
     /// The point of the redesign: a usage question is indexed lookups plus
     /// bounded walks, never a pass over every declaration in the workspace.
     /// The counter is the `2ba5dda4` structural-pin idiom.
+    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
     #[test]
     fn a_usage_query_performs_no_whole_workspace_declaration_scan() {
         let (_temp, analyzer) = project(&[

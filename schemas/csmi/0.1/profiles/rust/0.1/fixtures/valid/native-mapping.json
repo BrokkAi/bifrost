@@ -1,0 +1,10 @@
+{
+  "kind": "native-mapping",
+  "source": "recordParse",
+  "nativeSystem": "rust-v0-symbol",
+  "nativeVersion": "1.85.0",
+  "artifactSha256": "f5c4dfcfeb14303ce8b38ea993bdd3c8a1bb20c1014731831e584a6bd081c29f",
+  "status": "exact",
+  "cardinality": "one-to-one",
+  "nativeIdentities": ["_ZN10acme_codec6Record5parse17h5fbe3d31aabc7f2eE"]
+}

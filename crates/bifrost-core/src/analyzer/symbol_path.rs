@@ -90,7 +90,16 @@ fn is_symbol_path_delimiter_at(value: &str) -> bool {
 fn flush_segment(language: Language, current: &mut String, segments: &mut Vec<String>) {
     let trimmed = current.trim();
     if !trimmed.is_empty() {
-        segments.push(normalized_client_symbol_segment(language, trimmed));
+        // Emptiness is decided after normalization, not before it: a Rust
+        // segment typed as nothing but the raw-identifier escape (`r#`)
+        // normalizes to nothing, and a segment is by definition a non-empty
+        // run. Emitting it would put an empty component in the string path and,
+        // via `parse_symbol_path_fq`, an empty segment text into the interner,
+        // which rejects it.
+        let normalized = normalized_client_symbol_segment(language, trimmed);
+        if !normalized.is_empty() {
+            segments.push(normalized);
+        }
     }
     current.clear();
 }
@@ -184,4 +193,33 @@ fn go_receiver_type_segment(segment: &str) -> Option<&str> {
         return None;
     }
     Some(receiver_type.strip_prefix('*').unwrap_or(receiver_type))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::analyzer::fq_name::segment_interner;
+
+    /// A segment that is nothing but the Rust raw-identifier escape normalizes
+    /// away, and a segment is a non-empty run by definition. Both spellings of
+    /// the split must agree on dropping it: the string one so the joined name
+    /// has no empty component, the structured one because
+    /// `SegmentInterner::intern` rejects an empty segment text. This is
+    /// reachable from the MCP input edge, where the selector is whatever a
+    /// client typed.
+    #[test]
+    fn a_segment_that_normalizes_away_is_dropped_by_both_spellings() {
+        assert_eq!(
+            parse_symbol_path(Language::Rust, "r#"),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            parse_symbol_path(Language::Rust, "krate::r#::r#type"),
+            vec!["krate".to_string(), "type".to_string()]
+        );
+
+        let fq = parse_symbol_path_fq(Language::Rust, "krate::r#::r#type", segment_interner());
+        assert_eq!(fq.display(segment_interner()), "krate.type");
+        assert!(parse_symbol_path_fq(Language::Rust, "r#", segment_interner()).is_empty());
+    }
 }

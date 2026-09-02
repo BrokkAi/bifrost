@@ -1,0 +1,3222 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AuthoredSemanticModelPack",
+  "type": "object",
+  "properties": {
+    "carried_sources": {
+      "description": "The producer's explicit claim that it read and parsed each of these\nrelative source paths from a sources artifact while generating the pack\n(#2613). A consumer uses the inventory to distinguish a `Locator::Source`\npath the pack carries -- a legitimate authored navigation target -- from\nan upstream path the pack merely names, which must render as a durable\n`bifrost-model://` location instead.\n\nEntries are canonical relative slash-separated paths in strictly\nascending order. Serialized only when non-empty, so adding the field\nleaves the manifest bytes and digests of every pack that does not carry\nsources unchanged -- the same discipline `declared_effects` uses.",
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "compatibility": {
+      "$ref": "#/$defs/Compatibility"
+    },
+    "completeness": {
+      "$ref": "#/$defs/Completeness"
+    },
+    "ecosystem": {
+      "type": "string"
+    },
+    "language": {
+      "type": "string"
+    },
+    "license": {
+      "type": "string"
+    },
+    "pack_id": {
+      "type": "string"
+    },
+    "producer": {
+      "$ref": "#/$defs/Producer"
+    },
+    "provenance": {
+      "$ref": "#/$defs/Provenance"
+    },
+    "safety": {
+      "$ref": "#/$defs/Safety"
+    },
+    "schema_version": {
+      "type": "integer",
+      "format": "uint32",
+      "maximum": 2,
+      "minimum": 2
+    },
+    "shards": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/AuthoredShard"
+      }
+    },
+    "version": {
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "pack_id",
+    "version",
+    "producer",
+    "language",
+    "ecosystem",
+    "compatibility",
+    "provenance",
+    "license",
+    "completeness",
+    "safety",
+    "shards"
+  ],
+  "$defs": {
+    "ActivationSelector": {
+      "type": "object",
+      "properties": {
+        "artifact_sha256": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "configurations": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
+        "module": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/NameSelector"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "package": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/NameSelector"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "targets": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
+        "toolchain": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/NameSelector"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "AsciiTransform": {
+      "type": "string",
+      "enum": [
+        "lowercase",
+        "uppercase",
+        "snake_case",
+        "kebab_case",
+        "pascal_case",
+        "camel_case"
+      ]
+    },
+    "AuthoredAtomicOperation": {
+      "type": "string",
+      "enum": [
+        "load",
+        "store",
+        "read_modify_write"
+      ]
+    },
+    "AuthoredConcurrencyEffect": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "unsupported"
+            },
+            "protocol": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "protocol"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "callable": {
+              "$ref": "#/$defs/AuthoredSummaryInput"
+            },
+            "group": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/AuthoredSummaryInput"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "kind": {
+              "type": "string",
+              "const": "task_spawn"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "callable"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "group": {
+              "$ref": "#/$defs/AuthoredSummaryInput"
+            },
+            "kind": {
+              "type": "string",
+              "const": "task_join"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "group"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "lock_acquire"
+            },
+            "lock": {
+              "$ref": "#/$defs/AuthoredSummaryInput"
+            },
+            "mode": {
+              "$ref": "#/$defs/AuthoredLockMode"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "lock",
+            "mode"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "lock_release"
+            },
+            "lock": {
+              "$ref": "#/$defs/AuthoredSummaryInput"
+            },
+            "mode": {
+              "$ref": "#/$defs/AuthoredLockMode"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "lock",
+            "mode"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "delta": {
+              "$ref": "#/$defs/AuthoredSummaryInput"
+            },
+            "group": {
+              "$ref": "#/$defs/AuthoredSummaryInput"
+            },
+            "kind": {
+              "type": "string",
+              "const": "wait_group_add"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "group",
+            "delta"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "group": {
+              "$ref": "#/$defs/AuthoredSummaryInput"
+            },
+            "kind": {
+              "type": "string",
+              "const": "wait_group_done"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "group"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "group": {
+              "$ref": "#/$defs/AuthoredSummaryInput"
+            },
+            "kind": {
+              "type": "string",
+              "const": "wait_group_wait"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "group"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "atomic"
+            },
+            "location": {
+              "$ref": "#/$defs/AuthoredSummaryInput"
+            },
+            "operation": {
+              "$ref": "#/$defs/AuthoredAtomicOperation"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "location",
+            "operation"
+          ]
+        }
+      ]
+    },
+    "AuthoredConditionalIndirectWrite": {
+      "type": "object",
+      "properties": {
+        "outcome": {
+          "type": "boolean"
+        },
+        "parameter_ordinal": {
+          "type": "integer",
+          "format": "uint32",
+          "maximum": 65535,
+          "minimum": 0
+        },
+        "result_ordinal": {
+          "type": "integer",
+          "format": "uint32",
+          "maximum": 65535,
+          "minimum": 0
+        },
+        "target": {
+          "$ref": "#/$defs/AuthoredIndirectWriteTarget"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "result_ordinal",
+        "outcome",
+        "parameter_ordinal",
+        "target"
+      ]
+    },
+    "AuthoredConditionalResultRefinement": {
+      "type": "object",
+      "properties": {
+        "outcome": {
+          "type": "boolean"
+        },
+        "parameter_ordinal": {
+          "type": "integer",
+          "format": "uint32",
+          "maximum": 65535,
+          "minimum": 0
+        },
+        "predicate": {
+          "$ref": "#/$defs/AuthoredResultPredicate"
+        },
+        "proof_effect": {
+          "$ref": "#/$defs/AuthoredPredicateProofEffect"
+        },
+        "result_ordinal": {
+          "type": "integer",
+          "format": "uint32",
+          "maximum": 65535,
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "result_ordinal",
+        "outcome",
+        "parameter_ordinal",
+        "predicate",
+        "proof_effect"
+      ]
+    },
+    "AuthoredDeclaredEffect": {
+      "description": "One namespaced effect a reviewed pack attributes to a procedure (#2437).\n\n`id` is a namespaced identifier (`vendor.effect`); the namespace separator is\nrequired so two vendors can ship packs without colliding on bare words like\n`write`.",
+      "type": "object",
+      "properties": {
+        "certainty": {
+          "$ref": "#/$defs/DeclaredEffectCertainty"
+        },
+        "id": {
+          "type": "string"
+        },
+        "timing": {
+          "$ref": "#/$defs/DeclaredEffectTiming"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "timing",
+        "certainty"
+      ]
+    },
+    "AuthoredIndirectWriteTarget": {
+      "type": "string",
+      "enum": [
+        "pointee"
+      ]
+    },
+    "AuthoredLockMode": {
+      "type": "string",
+      "enum": [
+        "shared",
+        "exclusive"
+      ]
+    },
+    "AuthoredNormalReturnRefinement": {
+      "type": "object",
+      "properties": {
+        "parameter_ordinal": {
+          "type": "integer",
+          "format": "uint32",
+          "maximum": 65535,
+          "minimum": 0
+        },
+        "predicate": {
+          "$ref": "#/$defs/AuthoredResultPredicate"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "parameter_ordinal",
+        "predicate"
+      ]
+    },
+    "AuthoredOperationPrecondition": {
+      "type": "object",
+      "properties": {
+        "input": {
+          "$ref": "#/$defs/AuthoredSummaryInput"
+        },
+        "predicate": {
+          "$ref": "#/$defs/AuthoredResultPredicate"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "input",
+        "predicate"
+      ]
+    },
+    "AuthoredPayload": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "declaration_facts"
+            },
+            "members": {
+              "type": "array",
+              "default": [],
+              "items": {
+                "$ref": "#/$defs/MemberFact"
+              }
+            },
+            "relations": {
+              "type": "array",
+              "default": [],
+              "items": {
+                "$ref": "#/$defs/RelationFact"
+              }
+            },
+            "types": {
+              "type": "array",
+              "default": [],
+              "items": {
+                "$ref": "#/$defs/TypeFact"
+              }
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "generator_rules"
+            },
+            "rules": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/GeneratorRule"
+              }
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "rules"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "procedure_summaries"
+            },
+            "summaries": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/AuthoredProcedureSummary"
+              }
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "summaries"
+          ]
+        }
+      ]
+    },
+    "AuthoredPredicateProofEffect": {
+      "type": "string",
+      "enum": [
+        "establishes",
+        "does_not_establish"
+      ]
+    },
+    "AuthoredProcedureSummary": {
+      "type": "object",
+      "properties": {
+        "completeness": {
+          "$ref": "#/$defs/Completeness"
+        },
+        "concurrency_effects": {
+          "description": "Reviewed concurrency semantics for this exact callable. These effects\nname receiver or parameter ports and are projected at an applicable\ncall site; they do not add value-flow edges to `effects`.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/AuthoredConcurrencyEffect"
+          }
+        },
+        "conditional_indirect_writes": {
+          "description": "Outcome-sensitive writes through one pointer-like parameter. The\ntarget is deliberately one-step: deeper access paths require explicit\nlocation machinery rather than an encoded path string.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/AuthoredConditionalIndirectWrite"
+          }
+        },
+        "conditional_result_refinements": {
+          "description": "Reviewed effects that one boolean normal-result outcome has on a\npredicate over a parameter. A negative proof effect says only that the\noutcome does not prove the named predicate; it does not establish the\nopposite runtime value.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/AuthoredConditionalResultRefinement"
+          }
+        },
+        "covers_overrides": {
+          "description": "The author's explicit claim that every implementation of this member\noutside the workspace conforms to this summary (#2371).\n\nThis is a statement about the member's *implementations*, not about this\nsummary's own coverage of its target, so it is deliberately not inherited\nfrom `completeness: complete`. Only a summary carrying it can discharge a\ncall's residual dynamic-dispatch arm, and only after the workspace\nimplementors of the same declaring member have been enumerated.\n\nSerialized only when claimed, so adding the field leaves the content\ndigest of every summary that does not claim it unchanged.",
+          "type": "boolean"
+        },
+        "declared_effects": {
+          "description": "Namespaced effect identifiers the reviewed pack attributes to this exact\nprocedure identity (#2437), for example `acme.network_io`.\n\nThese are declarations *about* the procedure, not dataflow ports: unlike\n`effects`, they carry no input, output, or callee and are never lowered\ninto the summary's transfer graph. They exist so a policy can ask \"does\nthis call perform this effect?\" without new analyzer code.\n\nSerialized only when non-empty, so adding the field leaves the content\ndigest of every summary that does not declare an effect unchanged --\nthe same discipline `covers_overrides` uses above.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/AuthoredDeclaredEffect"
+          }
+        },
+        "effects": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/AuthoredSummaryEffect"
+          }
+        },
+        "id": {
+          "type": "string"
+        },
+        "locations": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/AuthoredSummaryLocation"
+          }
+        },
+        "normal_continuation_absent": {
+          "description": "The author's explicit claim that this procedure has no normal\ncontinuation. Omission or `false` makes no claim; only `true` may remove\nnormal control after exact runtime agreement.\n\nSerialized only when claimed, so adding the field leaves the content\ndigest of every existing summary unchanged.",
+          "type": "boolean"
+        },
+        "normal_result_count": {
+          "description": "Number of normal result ports the target returns. It is required when\n`result_contracts` or `conditional_result_refinements` is non-empty so\nthe compiler can reject invalid ordinals without materializing a source\ndeclaration.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "normal_return_refinements": {
+          "description": "Reviewed predicates established for parameters whenever this procedure\nreturns normally. These are path postconditions, not unconditional\nclaims about the argument at call entry.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/AuthoredNormalReturnRefinement"
+          }
+        },
+        "preconditions": {
+          "description": "Reviewed predicates required of this exact procedure invocation's\ninputs. Omission means operation preconditions were not reviewed; a\npresent empty list means the procedure was reviewed and requires none.\n\nSerialized only when reviewed so adding this field leaves every\nexisting authored summary's canonical bytes and content digest\nunchanged.",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "$ref": "#/$defs/AuthoredOperationPrecondition"
+          }
+        },
+        "result_contracts": {
+          "description": "Reviewed conditions under which one normal result is valid to consume.\nA contract may name a separate condition result, as in a Go\n`(resource, error)` API, or state a validity predicate directly on the\nprotected result. The relation is explicit because return shape alone\ndoes not establish either contract.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/AuthoredResultContract"
+          }
+        },
+        "target": {
+          "$ref": "#/$defs/AuthoredProcedureTarget"
+        },
+        "transfers": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/AuthoredSummaryTransfer"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "target",
+        "completeness",
+        "transfers"
+      ]
+    },
+    "AuthoredProcedureTarget": {
+      "description": "The exact declaration one reviewed summary speaks for.\n\n`symbol` has two authored forms, and they differ in what supplies the\nprocedure's owner. A qualified symbol names its own owner, so `Acme.run` at\n`path: \"src/acme.ts\"` keys on owner `Acme` and member `run`; the path is\nprovenance and the artifact locator, and does not enter the identity. A\nbare symbol is a module-level declaration, which has no owner in its name at\nall: the module the `path` names is its owner, so `run` at\n`path: \"src/run.ts\"` keys on owner `src/run` and member `run`, the path with\nits extension removed. The bare form is the only one available for a\ntop-level function in a language that qualifies nothing by package, such as\nJavaScript, TypeScript, or Ruby.",
+      "type": "object",
+      "properties": {
+        "has_receiver": {
+          "type": "boolean",
+          "default": false
+        },
+        "parameter_count": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "path": {
+          "type": "string"
+        },
+        "symbol": {
+          "type": "string"
+        },
+        "variadic": {
+          "description": "Whether the final formal parameter accepts zero or more actual\narguments. `parameter_count` includes that final variadic formal, so a\nvariadic target accepts at least `parameter_count - 1` actual arguments.\nSemantic claims may currently reference only the fixed prefix: the\nvalidator rejects a port or refinement that names the variadic tail.",
+          "type": "boolean",
+          "default": false
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "symbol",
+        "parameter_count"
+      ]
+    },
+    "AuthoredResultContract": {
+      "type": "object",
+      "properties": {
+        "condition_result_ordinal": {
+          "description": "A separate result whose reviewed predicate establishes that the\nprotected result is valid. Omit this together with `predicate` when\nvalidity is expressed directly by `result_success_predicate`.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "maximum": 65535,
+          "minimum": 0
+        },
+        "member_contracts": {
+          "description": "Reviewed member behavior carried by this exact result port. This lets a\npack describe a resource returned by a multi-result API without\nattributing the same protocol to the other result ports.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/AuthoredResultMemberContract"
+          }
+        },
+        "predicate": {
+          "description": "The predicate required of `condition_result_ordinal`. This field and\nthe condition ordinal must be present or absent together.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AuthoredResultPredicate"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "result_ordinal": {
+          "type": "integer",
+          "format": "uint32",
+          "maximum": 65535,
+          "minimum": 0
+        },
+        "result_success_predicate": {
+          "description": "The reviewed predicate that makes the protected result valid. For a\npaired contract, this is an optional correlation that independently\nproves the separate condition predicate. For a direct contract, this\nis the validity predicate and is required.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AuthoredResultPredicate"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "result_ordinal"
+      ]
+    },
+    "AuthoredResultMemberContract": {
+      "type": "object",
+      "properties": {
+        "completeness": {
+          "$ref": "#/$defs/Completeness"
+        },
+        "declared_effects": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/AuthoredDeclaredEffect"
+          }
+        },
+        "member": {
+          "type": "string"
+        },
+        "parameter_count": {
+          "type": "integer",
+          "format": "uint32",
+          "maximum": 65535,
+          "minimum": 0
+        },
+        "preconditions": {
+          "description": "Reviewed predicates required of this exact member operation's inputs.\nOmission means operation preconditions were not reviewed; a present\nempty list means the operation was reviewed and requires none.",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "$ref": "#/$defs/AuthoredOperationPrecondition"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "member",
+        "parameter_count",
+        "completeness"
+      ]
+    },
+    "AuthoredResultPredicate": {
+      "type": "string",
+      "enum": [
+        "null",
+        "non_null",
+        "true",
+        "false"
+      ]
+    },
+    "AuthoredShard": {
+      "type": "object",
+      "properties": {
+        "activation": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ActivationSelector"
+          }
+        },
+        "id": {
+          "type": "string"
+        },
+        "payload": {
+          "$ref": "#/$defs/AuthoredPayload"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "activation",
+        "payload"
+      ]
+    },
+    "AuthoredSummaryEffect": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "event": {
+              "type": "string"
+            },
+            "kind": {
+              "type": "string",
+              "const": "allocation"
+            },
+            "output": {
+              "$ref": "#/$defs/AuthoredSummaryOutput"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "event",
+            "output"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "callee": {
+              "type": "string"
+            },
+            "event": {
+              "type": "string"
+            },
+            "kind": {
+              "type": "string",
+              "const": "call"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "event",
+            "callee"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "event": {
+              "type": "string"
+            },
+            "input": {
+              "$ref": "#/$defs/AuthoredSummaryInput"
+            },
+            "kind": {
+              "type": "string",
+              "const": "escape"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "event",
+            "input"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "event": {
+              "type": "string"
+            },
+            "input": {
+              "$ref": "#/$defs/AuthoredSummaryInput"
+            },
+            "kind": {
+              "type": "string",
+              "const": "unknown_call"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "event",
+            "input"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "event": {
+              "type": "string"
+            },
+            "kind": {
+              "type": "string",
+              "const": "unknown_call_boundary"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "event"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "candidates": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "event": {
+              "type": "string"
+            },
+            "input": {
+              "$ref": "#/$defs/AuthoredSummaryInput"
+            },
+            "kind": {
+              "type": "string",
+              "const": "ambiguous_call"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "event",
+            "input",
+            "candidates"
+          ]
+        },
+        {
+          "description": "Remove the named labels as a tainted value crosses this input-to-output\ntransfer. This is the shipped-pack mirror of the policy-local\n`(sanitize :removes [LABEL...])` effect (#1923). The `input` and `output`\nports identify a declared transfer; the effect neutralizes the named\nlabels on that modeled flow and leaves every other label flowing.",
+          "type": "object",
+          "properties": {
+            "input": {
+              "$ref": "#/$defs/AuthoredSummaryInput"
+            },
+            "kind": {
+              "type": "string",
+              "const": "sanitize"
+            },
+            "output": {
+              "$ref": "#/$defs/AuthoredSummaryOutput"
+            },
+            "removes": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "input",
+            "output",
+            "removes"
+          ]
+        }
+      ]
+    },
+    "AuthoredSummaryExitKind": {
+      "type": "string",
+      "enum": [
+        "normal",
+        "exceptional"
+      ]
+    },
+    "AuthoredSummaryInput": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "receiver"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "parameter"
+            },
+            "ordinal": {
+              "type": "integer",
+              "format": "uint32",
+              "maximum": 65535,
+              "minimum": 0
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "ordinal"
+          ]
+        }
+      ]
+    },
+    "AuthoredSummaryLocation": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "location_kind": {
+          "$ref": "#/$defs/AuthoredSummaryLocationKind"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "location_kind"
+      ]
+    },
+    "AuthoredSummaryLocationKind": {
+      "type": "string",
+      "enum": [
+        "capture",
+        "heap"
+      ]
+    },
+    "AuthoredSummaryOutput": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "normal_return"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "indexed_normal_return"
+            },
+            "ordinal": {
+              "type": "integer",
+              "format": "uint32",
+              "maximum": 65535,
+              "minimum": 0
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "ordinal"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "receiver"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "capture"
+            },
+            "location": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "location"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "heap"
+            },
+            "location": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "location"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "exceptional_return"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind"
+          ]
+        }
+      ]
+    },
+    "AuthoredSummaryTransfer": {
+      "type": "object",
+      "properties": {
+        "exit_kind": {
+          "$ref": "#/$defs/AuthoredSummaryExitKind"
+        },
+        "input": {
+          "$ref": "#/$defs/AuthoredSummaryInput"
+        },
+        "output": {
+          "$ref": "#/$defs/AuthoredSummaryOutput"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "input",
+        "exit_kind",
+        "output"
+      ]
+    },
+    "CaptureBinding": {
+      "type": "object",
+      "properties": {
+        "projection": {
+          "$ref": "#/$defs/CaptureProjection"
+        },
+        "source": {
+          "$ref": "#/$defs/CaptureSource"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "source",
+        "projection"
+      ]
+    },
+    "CaptureCardinality": {
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "one",
+            "optional",
+            "many"
+          ]
+        },
+        {
+          "description": "Keep ordered values together for one emission instead of emitting one\nrule match for each value.",
+          "type": "string",
+          "const": "group"
+        }
+      ]
+    },
+    "CaptureDeclaration": {
+      "type": "object",
+      "properties": {
+        "binding": {
+          "$ref": "#/$defs/CaptureBinding"
+        },
+        "cardinality": {
+          "$ref": "#/$defs/CaptureCardinality"
+        },
+        "name": {
+          "type": "string"
+        },
+        "value_kind": {
+          "$ref": "#/$defs/CaptureValueKind"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "binding",
+        "value_kind",
+        "cardinality"
+      ]
+    },
+    "CaptureProjection": {
+      "type": "string",
+      "enum": [
+        "name",
+        "stable_id",
+        "type",
+        "text",
+        "path"
+      ]
+    },
+    "CaptureSource": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "matched_node"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "enclosing_declaration"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "owning_type"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "description": "Direct authored fields that supply generated members. A field-level\nannotation produces that field; a type-level annotation produces its\ndirect fields.",
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "owned_fields"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "owned_mutable_fields"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "description": "Direct non-static final fields without an authored initializer. The\nmatcher preserves declaration order for generated constructor inputs.",
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "owned_uninitialized_final_fields"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "resolved_owner"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "index": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0
+            },
+            "kind": {
+              "type": "string",
+              "const": "argument"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "index"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "from": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0
+            },
+            "kind": {
+              "type": "string",
+              "const": "arguments"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "from"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "annotation_argument"
+            },
+            "name": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "name"
+          ]
+        }
+      ]
+    },
+    "CaptureValueKind": {
+      "type": "string",
+      "enum": [
+        "identifier",
+        "stable_id",
+        "type",
+        "string",
+        "path"
+      ]
+    },
+    "ChannelDirection": {
+      "type": "string",
+      "enum": [
+        "bidirectional",
+        "receive",
+        "send"
+      ]
+    },
+    "Compatibility": {
+      "type": "object",
+      "properties": {
+        "bifrost": {
+          "type": "string"
+        },
+        "toolchains": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/VersionConstraint"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "bifrost"
+      ]
+    },
+    "Completeness": {
+      "type": "string",
+      "enum": [
+        "partial",
+        "complete"
+      ]
+    },
+    "DeclarationGuard": {
+      "description": "The condition under which one activation declares a record.\n\nA reference surface can spell a declaration inside a conditional block.\nTypeshed guards `builtins.float.from_number` with\n`if sys.version_info >= (3, 14):` and `os.startfile` with\n`if sys.platform == \"win32\":`. Publishing the union of every branch with no\nguard makes a published name mean only \"some supported toolchain declares\nthis somewhere\", which is a false positive for a presence claim (#1899).\n\nEvery recorded constraint is a *necessary* condition for the record to\nexist. A producer that cannot interpret part of a condition records\n[`Self::uninterpreted`] and drops that part rather than the declaration, so\nthe guard never claims more than the producer read. Activation may drop a\nrecord only when [`Self::excludes`] proves the pinned activation cannot\ndeclare it.",
+      "type": "object",
+      "properties": {
+        "excluded_targets": {
+          "description": "Activation targets that do not declare this record.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "max_toolchain_version_exclusive": {
+          "description": "Lowest toolchain version that no longer declares this record.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/GuardVersion"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "min_toolchain_version": {
+          "description": "Lowest toolchain version that declares this record, inclusive.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/GuardVersion"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "required_targets": {
+          "description": "Activation targets that declare this record. Empty places no\nrequirement on the target.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "uninterpreted": {
+          "description": "The producer read a condition it could not express here. The recorded\nconstraints stay necessary, but they are not the whole condition, so a\nrecord this flag marks is never dropped for want of a constraint.",
+          "type": "boolean",
+          "default": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "DeclaredEffectCertainty": {
+      "description": "How firmly the reviewed pack claims the effect occurs.",
+      "oneOf": [
+        {
+          "description": "Every execution of the procedure performs the effect.",
+          "type": "string",
+          "const": "definite"
+        },
+        {
+          "description": "Some execution of the procedure may perform the effect.",
+          "type": "string",
+          "const": "possible"
+        }
+      ]
+    },
+    "DeclaredEffectTiming": {
+      "description": "When the declared effect happens relative to the call that triggers it.",
+      "oneOf": [
+        {
+          "description": "The effect happens before the call returns.",
+          "type": "string",
+          "const": "immediate"
+        },
+        {
+          "description": "The call schedules the effect; it happens after the call returns.",
+          "type": "string",
+          "const": "deferred"
+        },
+        {
+          "description": "The pack asserts the effect without claiming when it happens.",
+          "type": "string",
+          "const": "unknown"
+        }
+      ]
+    },
+    "EmbeddedTypeFact": {
+      "type": "object",
+      "properties": {
+        "pointer": {
+          "type": "boolean",
+          "default": false
+        },
+        "target": {
+          "$ref": "#/$defs/TypeRef"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "target"
+      ]
+    },
+    "EmittedDeclaration": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "extension_surfaces": {
+              "type": "array",
+              "default": [],
+              "items": {
+                "$ref": "#/$defs/TemplateExpression"
+              }
+            },
+            "hierarchy": {
+              "type": "array",
+              "default": [],
+              "items": {
+                "$ref": "#/$defs/TemplateHierarchyFact"
+              }
+            },
+            "is_abstract": {
+              "type": "boolean",
+              "default": false
+            },
+            "is_sealed": {
+              "type": "boolean",
+              "default": false
+            },
+            "kind": {
+              "type": "string",
+              "const": "type"
+            },
+            "type_kind": {
+              "$ref": "#/$defs/TypeKind"
+            },
+            "type_parameters": {
+              "type": "array",
+              "default": [],
+              "items": {
+                "$ref": "#/$defs/TemplateExpression"
+              }
+            },
+            "visibility": {
+              "$ref": "#/$defs/Visibility"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "type_kind",
+            "visibility"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "is_abstract": {
+              "type": "boolean",
+              "default": false
+            },
+            "is_static": {
+              "type": "boolean",
+              "default": false
+            },
+            "is_virtual": {
+              "type": "boolean",
+              "default": false
+            },
+            "kind": {
+              "type": "string",
+              "const": "member"
+            },
+            "member_kind": {
+              "$ref": "#/$defs/MemberKind"
+            },
+            "owner": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/TemplateExpression"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "signature": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/TemplateSignature"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "visibility": {
+              "$ref": "#/$defs/Visibility"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "member_kind",
+            "visibility"
+          ]
+        }
+      ]
+    },
+    "GeneratorRule": {
+      "type": "object",
+      "properties": {
+        "captures": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/CaptureDeclaration"
+          }
+        },
+        "emissions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/RuleEmission"
+          }
+        },
+        "id": {
+          "type": "string"
+        },
+        "trigger": {
+          "$ref": "#/$defs/RuleTrigger"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "trigger",
+        "emissions"
+      ]
+    },
+    "GuardVersion": {
+      "description": "One toolchain-version bound a guard names, padded to three components.\n\nA source condition can name fewer components than a toolchain version\ncarries, as `sys.version_info >= (3, 14)` does. Padding with zeros keeps\none comparable shape, and comparing only the three release components keeps\na pre-release toolchain on the same side of a bound as its release.",
+      "type": "object",
+      "properties": {
+        "major": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "minor": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "patch": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "major",
+        "minor",
+        "patch"
+      ]
+    },
+    "HierarchyFact": {
+      "type": "object",
+      "properties": {
+        "declaration_ordinal": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "hierarchy_kind": {
+          "$ref": "#/$defs/HierarchyKind"
+        },
+        "target": {
+          "$ref": "#/$defs/TypeRef"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "hierarchy_kind",
+        "target"
+      ]
+    },
+    "HierarchyKind": {
+      "type": "string",
+      "enum": [
+        "extends",
+        "implements",
+        "uses_trait",
+        "mixin_include",
+        "mixin_prepend",
+        "mixin_extend"
+      ]
+    },
+    "ImplicitOperation": {
+      "description": "A declaration-level role for an implicit value operation. Conversion\noperators retain their structured target type; consumers must still bind\nthe member by its exact declaration id and signature.",
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "copy_constructor"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "move_constructor"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "conversion_operator"
+            },
+            "target": {
+              "$ref": "#/$defs/TypeRef"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "target"
+          ]
+        }
+      ]
+    },
+    "Locator": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "source"
+            },
+            "path": {
+              "type": "string"
+            },
+            "symbol": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "path"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "artifact"
+            },
+            "path": {
+              "type": "string"
+            },
+            "symbol": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "path",
+            "symbol"
+          ]
+        }
+      ]
+    },
+    "MemberFact": {
+      "type": "object",
+      "properties": {
+        "aliases": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
+        "callable_family_complete": {
+          "description": "The authored declarations contain every callable with this member's\nexact owner, name, receiver form, and fixed arity.\n\nThis is narrower than pack or owner-surface completeness. It permits\nan exact external-call binding for this one structural family while a\ncurated declaration pack remains globally partial. Same-family\nduplicates still conflict, and variadic families cannot yet make this\nclaim.",
+          "type": "boolean",
+          "default": false
+        },
+        "extension_receiver": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TypeRef"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "extension_receiver_constraints": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/TypeRef"
+          }
+        },
+        "guard": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DeclarationGuard"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "id": {
+          "type": "string"
+        },
+        "implicit_operation": {
+          "description": "Reviewed role of this exact member in implicit value operations.\nThe member's own stable `id` is the operation identity.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ImplicitOperation"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "is_abstract": {
+          "type": "boolean",
+          "default": false
+        },
+        "is_static": {
+          "type": "boolean",
+          "default": false
+        },
+        "is_virtual": {
+          "type": "boolean",
+          "default": false
+        },
+        "locator": {
+          "$ref": "#/$defs/Locator"
+        },
+        "member_kind": {
+          "$ref": "#/$defs/MemberKind"
+        },
+        "name": {
+          "type": "string"
+        },
+        "owner": {
+          "type": "string"
+        },
+        "receiver": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ReceiverFact"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "signature": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Signature"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "visibility": {
+          "$ref": "#/$defs/Visibility"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "owner",
+        "name",
+        "member_kind",
+        "visibility",
+        "locator"
+      ]
+    },
+    "MemberKind": {
+      "type": "string",
+      "enum": [
+        "constructor",
+        "method",
+        "function",
+        "field",
+        "property",
+        "constant",
+        "static",
+        "macro",
+        "event"
+      ]
+    },
+    "NameSelector": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "version": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "name"
+      ]
+    },
+    "Parameter": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "optional": {
+          "type": "boolean",
+          "default": false
+        },
+        "passing_mode": {
+          "$ref": "#/$defs/ParameterPassingMode"
+        },
+        "type": {
+          "$ref": "#/$defs/TypeRef"
+        },
+        "variadic": {
+          "type": "boolean",
+          "default": false
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "type"
+      ]
+    },
+    "ParameterPassingMode": {
+      "description": "Which source-level argument forms may bind one formal parameter.\n\nMost languages permit both positional and named application. Python stubs\nadditionally use `/` and `*` to declare positional-only and named-only\nregions; preserving that distinction prevents an exact model binding from\naccepting a call the declared API itself rejects.",
+      "type": "string",
+      "enum": [
+        "positional_only",
+        "positional_or_named",
+        "named_only"
+      ]
+    },
+    "Producer": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "version": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "version"
+      ]
+    },
+    "Provenance": {
+      "type": "object",
+      "properties": {
+        "revision": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "source": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "source"
+      ]
+    },
+    "ReceiverFact": {
+      "type": "object",
+      "properties": {
+        "pointer": {
+          "type": "boolean",
+          "default": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "RelationFact": {
+      "type": "object",
+      "properties": {
+        "from": {
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "relation_kind": {
+          "$ref": "#/$defs/RelationKind"
+        },
+        "to": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "relation_kind",
+        "from",
+        "to"
+      ]
+    },
+    "RelationKind": {
+      "type": "string",
+      "enum": [
+        "navigates_to",
+        "references"
+      ]
+    },
+    "RuleEmission": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "anchor": {
+              "description": "A capture-backed authored location for the emitted declaration.\nThe runtime uses a stable model URI when this expression has no\nexact authored anchor.",
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/TemplateExpression"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "declaration": {
+              "$ref": "#/$defs/EmittedDeclaration"
+            },
+            "id": {
+              "$ref": "#/$defs/TemplateExpression"
+            },
+            "kind": {
+              "type": "string",
+              "const": "declaration"
+            },
+            "name": {
+              "$ref": "#/$defs/TemplateExpression"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "id",
+            "name",
+            "declaration"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "from": {
+              "$ref": "#/$defs/TemplateExpression"
+            },
+            "id": {
+              "$ref": "#/$defs/TemplateExpression"
+            },
+            "kind": {
+              "type": "string",
+              "const": "alias"
+            },
+            "to": {
+              "$ref": "#/$defs/TemplateExpression"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "id",
+            "from",
+            "to"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "from": {
+              "$ref": "#/$defs/TemplateExpression"
+            },
+            "id": {
+              "$ref": "#/$defs/TemplateExpression"
+            },
+            "kind": {
+              "type": "string",
+              "const": "relation"
+            },
+            "relation_kind": {
+              "$ref": "#/$defs/RelationKind"
+            },
+            "to": {
+              "$ref": "#/$defs/TemplateExpression"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "id",
+            "relation_kind",
+            "from",
+            "to"
+          ]
+        }
+      ]
+    },
+    "RuleTrigger": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "construct": {
+              "type": "string"
+            },
+            "kind": {
+              "type": "string",
+              "const": "language_construct"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "construct"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "annotation"
+            },
+            "name": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "name"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "annotation": {
+              "type": "string"
+            },
+            "excluded_annotations": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "kind": {
+              "type": "string",
+              "const": "annotated_field"
+            },
+            "owner_annotation_path": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "value": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "annotation",
+            "owner_annotation_path"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "macro_invocation"
+            },
+            "name": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "name"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "generator_invocation"
+            },
+            "name": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "name"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "resolved_owner"
+            },
+            "owner": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "owner"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "resolved_call"
+            },
+            "name": {
+              "type": "string"
+            },
+            "owner": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "owner",
+            "name"
+          ]
+        }
+      ]
+    },
+    "Safety": {
+      "type": "object",
+      "properties": {
+        "generated_code_only": {
+          "type": "boolean",
+          "default": false
+        },
+        "review_required": {
+          "type": "boolean",
+          "default": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "Signature": {
+      "type": "object",
+      "properties": {
+        "parameters": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/Parameter"
+          }
+        },
+        "returns": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TypeRef"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "type_parameters": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "StructuredTypeExpression": {
+      "type": "object",
+      "properties": {
+        "display": {
+          "type": "string"
+        },
+        "referenced_types": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/TypeRef"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "display"
+      ]
+    },
+    "TemplateCondition": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "left": {
+              "$ref": "#/$defs/TemplateExpression"
+            },
+            "op": {
+              "type": "string",
+              "const": "equals"
+            },
+            "right": {
+              "$ref": "#/$defs/TemplateExpression"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "op",
+            "left",
+            "right"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "op": {
+              "type": "string",
+              "const": "starts_with"
+            },
+            "prefix": {
+              "$ref": "#/$defs/TemplateExpression"
+            },
+            "value": {
+              "$ref": "#/$defs/TemplateExpression"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "op",
+            "value",
+            "prefix"
+          ]
+        }
+      ]
+    },
+    "TemplateExpression": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "op": {
+              "type": "string",
+              "const": "literal"
+            },
+            "value": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "op",
+            "value"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "name": {
+              "type": "string"
+            },
+            "op": {
+              "type": "string",
+              "const": "capture"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "op",
+            "name"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "op": {
+              "type": "string",
+              "const": "concat"
+            },
+            "values": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/TemplateExpression"
+              }
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "op",
+            "values"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "op": {
+              "type": "string",
+              "const": "transform"
+            },
+            "transform": {
+              "$ref": "#/$defs/AsciiTransform"
+            },
+            "value": {
+              "$ref": "#/$defs/TemplateExpression"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "op",
+            "transform",
+            "value"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "condition": {
+              "$ref": "#/$defs/TemplateCondition"
+            },
+            "else": {
+              "$ref": "#/$defs/TemplateExpression"
+            },
+            "op": {
+              "type": "string",
+              "const": "conditional"
+            },
+            "then": {
+              "$ref": "#/$defs/TemplateExpression"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "op",
+            "condition",
+            "then",
+            "else"
+          ]
+        }
+      ]
+    },
+    "TemplateHierarchyFact": {
+      "type": "object",
+      "properties": {
+        "hierarchy_kind": {
+          "$ref": "#/$defs/HierarchyKind"
+        },
+        "target": {
+          "$ref": "#/$defs/TemplateTypeRef"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "hierarchy_kind",
+        "target"
+      ]
+    },
+    "TemplateParameter": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "$ref": "#/$defs/TemplateExpression"
+        },
+        "optional": {
+          "type": "boolean",
+          "default": false
+        },
+        "type": {
+          "$ref": "#/$defs/TemplateTypeRef"
+        },
+        "variadic": {
+          "type": "boolean",
+          "default": false
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "type"
+      ]
+    },
+    "TemplateSignature": {
+      "type": "object",
+      "properties": {
+        "parameters": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/TemplateParameter"
+          }
+        },
+        "repeated_parameters": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/TemplateParameter"
+          }
+        },
+        "returns": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TemplateTypeRef"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "type_parameters": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/TemplateExpression"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "TemplateTypeRef": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "arguments": {
+              "type": "array",
+              "default": [],
+              "items": {
+                "$ref": "#/$defs/TemplateTypeRef"
+              }
+            },
+            "kind": {
+              "type": "string",
+              "const": "named"
+            },
+            "name": {
+              "$ref": "#/$defs/TemplateExpression"
+            },
+            "nullable": {
+              "type": "boolean",
+              "default": false
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "name"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "capture"
+            },
+            "name": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "name"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "element": {
+              "$ref": "#/$defs/TemplateTypeRef"
+            },
+            "kind": {
+              "type": "string",
+              "const": "array"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "element"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "element": {
+              "$ref": "#/$defs/TemplateTypeRef"
+            },
+            "kind": {
+              "type": "string",
+              "const": "by_ref"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "element"
+          ]
+        }
+      ]
+    },
+    "TypeCopySemantics": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "trivial"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "via_member"
+            },
+            "member": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "member"
+          ]
+        }
+      ]
+    },
+    "TypeFact": {
+      "type": "object",
+      "properties": {
+        "aliases": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
+        "embedded_types": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/EmbeddedTypeFact"
+          }
+        },
+        "extension_surfaces": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
+        "guard": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DeclarationGuard"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "has_explicit_type_terms": {
+          "type": "boolean",
+          "default": false
+        },
+        "hierarchy": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/HierarchyFact"
+          }
+        },
+        "id": {
+          "type": "string"
+        },
+        "is_abstract": {
+          "type": "boolean",
+          "default": false
+        },
+        "is_sealed": {
+          "type": "boolean",
+          "default": false
+        },
+        "locator": {
+          "$ref": "#/$defs/Locator"
+        },
+        "name": {
+          "type": "string"
+        },
+        "type_kind": {
+          "$ref": "#/$defs/TypeKind"
+        },
+        "type_parameter_constraints": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/TypeParameterConstraint"
+          }
+        },
+        "type_parameters": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
+        "underlying_type": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/StructuredTypeExpression"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "value_semantics": {
+          "description": "Type-wide value-transfer semantics. This is deliberately optional:\nabsence means that the producer did not review implicit value\noperations, rather than that the type has no such operations.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TypeValueSemantics"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "visibility": {
+          "$ref": "#/$defs/Visibility"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "name",
+        "type_kind",
+        "visibility",
+        "locator"
+      ]
+    },
+    "TypeKind": {
+      "type": "string",
+      "enum": [
+        "class",
+        "annotation",
+        "delegate",
+        "interface",
+        "trait",
+        "struct",
+        "union",
+        "enum",
+        "record",
+        "module",
+        "type_alias"
+      ]
+    },
+    "TypeMoveSemantics": {
+      "type": "string",
+      "enum": [
+        "invalidating"
+      ]
+    },
+    "TypeParameterConstraint": {
+      "type": "object",
+      "properties": {
+        "constraint": {
+          "$ref": "#/$defs/StructuredTypeExpression"
+        },
+        "parameter": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "parameter",
+        "constraint"
+      ]
+    },
+    "TypeRef": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "arguments": {
+              "type": "array",
+              "default": [],
+              "items": {
+                "$ref": "#/$defs/TypeRef"
+              }
+            },
+            "kind": {
+              "type": "string",
+              "const": "named"
+            },
+            "name": {
+              "type": "string"
+            },
+            "nullable": {
+              "type": "boolean",
+              "default": false
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "name"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "arguments": {
+              "type": "array",
+              "default": [],
+              "items": {
+                "$ref": "#/$defs/TypeRef"
+              }
+            },
+            "id": {
+              "type": "string"
+            },
+            "kind": {
+              "type": "string",
+              "const": "declared"
+            },
+            "nullable": {
+              "type": "boolean",
+              "default": false
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "id"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "type_parameter"
+            },
+            "name": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "name"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "element": {
+              "$ref": "#/$defs/TypeRef"
+            },
+            "kind": {
+              "type": "string",
+              "const": "array"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "element"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "element": {
+              "$ref": "#/$defs/TypeRef"
+            },
+            "kind": {
+              "type": "string",
+              "const": "by_ref"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "element"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "element": {
+              "$ref": "#/$defs/TypeRef"
+            },
+            "kind": {
+              "type": "string",
+              "const": "pointer"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "element"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "element": {
+              "$ref": "#/$defs/TypeRef"
+            },
+            "kind": {
+              "type": "string",
+              "const": "slice"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "element"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "element": {
+              "$ref": "#/$defs/TypeRef"
+            },
+            "kind": {
+              "type": "string",
+              "const": "fixed_array"
+            },
+            "length": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "element",
+            "length"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "key": {
+              "$ref": "#/$defs/TypeRef"
+            },
+            "kind": {
+              "type": "string",
+              "const": "map"
+            },
+            "value": {
+              "$ref": "#/$defs/TypeRef"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "key",
+            "value"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "direction": {
+              "$ref": "#/$defs/ChannelDirection"
+            },
+            "element": {
+              "$ref": "#/$defs/TypeRef"
+            },
+            "kind": {
+              "type": "string",
+              "const": "channel"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "element",
+            "direction"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "bound": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/TypeRef"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "kind": {
+              "type": "string",
+              "const": "wildcard"
+            },
+            "variance": {
+              "$ref": "#/$defs/WildcardVariance"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "variance"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "elements": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/TypeRef"
+              }
+            },
+            "kind": {
+              "type": "string",
+              "const": "tuple"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "elements"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "function"
+            },
+            "parameters": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/Parameter"
+              }
+            },
+            "result": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/TypeRef"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "parameters"
+          ]
+        }
+      ]
+    },
+    "TypeValueSemantics": {
+      "description": "Reviewed value semantics for a declared type. Copy behavior and move\ninvalidation are independent because a type such as `std::string` can have\nboth a copy constructor and an invalidating move. Member references use\nstable declaration ids, never names or rendered signatures.",
+      "type": "object",
+      "properties": {
+        "copy": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TypeCopySemantics"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "move_semantics": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TypeMoveSemantics"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "VersionConstraint": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "requirement": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "requirement"
+      ]
+    },
+    "Visibility": {
+      "type": "string",
+      "enum": [
+        "public",
+        "protected",
+        "internal",
+        "protected_internal",
+        "package",
+        "private"
+      ]
+    },
+    "WildcardVariance": {
+      "type": "string",
+      "enum": [
+        "any",
+        "extends",
+        "super"
+      ]
+    }
+  }
+}

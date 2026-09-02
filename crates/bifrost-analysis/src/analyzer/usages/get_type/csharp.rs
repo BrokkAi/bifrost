@@ -120,6 +120,7 @@ fn csharp_candidates_outcome(
         types: vec![TypeLookupType {
             fqn,
             definitions: candidates,
+            semantic_model_id: None,
         }],
         diagnostics: if status == TypeLookupStatus::Ambiguous {
             vec![TypeLookupDiagnostic {

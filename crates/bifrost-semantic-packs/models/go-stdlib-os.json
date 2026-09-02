@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "pack_id": "bifrost.go.stdlib.os",
   "version": "1.0.0",
   "producer": {
@@ -13,7 +13,7 @@
     "toolchains": []
   },
   "provenance": {
-    "source": "https://pkg.go.dev/os",
+    "source": "https://go.dev/src/os/",
     "revision": "go1.26.0"
   },
   "license": "BSD-3-Clause",
@@ -779,6 +779,26 @@
                     ]
                   }
                 ]
+              }
+            ]
+          },
+          {
+            "id": "os-exec.exit-error-exit-code",
+            "target": {
+              "path": "src/os/exec/exec.go",
+              "symbol": "os/exec.ExitError.ExitCode()",
+              "has_receiver": true,
+              "parameter_count": 0
+            },
+            "completeness": "complete",
+            "normal_result_count": 1,
+            "transfers": [],
+            "preconditions": [
+              {
+                "input": {
+                  "kind": "receiver"
+                },
+                "predicate": "non_null"
               }
             ]
           }

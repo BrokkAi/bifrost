@@ -1,0 +1,16 @@
+{
+  "$profileSchema": "jvm-binary-identity",
+  "profileVersion": "0.1",
+  "module": "java.base",
+  "owner": "java/lang/String",
+  "binaryEntity": {
+    "kind": "method",
+    "name": "isBlank",
+    "descriptor": "()Z"
+  },
+  "variant": {
+    "entryPath": "java/lang/String.class",
+    "release": 0,
+    "classFileMajor": 61
+  }
+}

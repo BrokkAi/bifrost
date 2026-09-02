@@ -5,8 +5,9 @@ use super::{extract_name_segments, parse_ruby_tree, ruby_call_arguments, ruby_sy
 use crate::CancellationToken;
 use crate::analyzer::semantic_model::{
     ArtifactProducerLimits, BoundedProducerDiagnostics, HierarchyFact, HierarchyKind, Locator,
-    MemberFact, MemberIdentity, MemberKind, Parameter, ProducerDiagnostic, Signature, TypeFact,
-    TypeIdentity, TypeKind, TypeRef, Visibility, member_declaration_id, type_declaration_id,
+    MemberFact, MemberIdentity, MemberKind, Parameter, ProducerDiagnostic, Signature,
+    SuppressedDiagnostics, TypeFact, TypeIdentity, TypeKind, TypeRef, Visibility,
+    member_declaration_id, type_declaration_id,
 };
 use brokk_bifrost_ruby::declarations::ruby_node_text;
 
@@ -15,7 +16,7 @@ pub(crate) struct RubySourceProjection {
     pub types: Vec<TypeFact>,
     pub members: Vec<MemberFact>,
     pub diagnostics: Vec<ProducerDiagnostic>,
-    pub suppressed_diagnostics: usize,
+    pub suppressed_diagnostics: SuppressedDiagnostics,
     pub complete: bool,
     pub aliases: Vec<RubyMemberAlias>,
 }
@@ -286,6 +287,7 @@ fn project_constant_assignment(
         is_static: true,
         is_abstract: false,
         is_virtual: false,
+        implicit_operation: None,
         callable_family_complete: false,
         signature: Some(signature),
         receiver: None,
@@ -386,6 +388,7 @@ fn project_type<'tree>(
         type_parameters: Vec::new(),
         type_parameter_constraints: Vec::new(),
         underlying_type: None,
+        value_semantics: None,
         embedded_types: Vec::new(),
         hierarchy,
         aliases: Vec::new(),
@@ -469,6 +472,7 @@ fn project_method(
         is_static,
         is_abstract: false,
         is_virtual: true,
+        implicit_operation: None,
         callable_family_complete: false,
         signature: Some(signature),
         receiver: None,
@@ -575,6 +579,7 @@ fn project_call(
                 is_static: singleton_context,
                 is_abstract: false,
                 is_virtual: true,
+                implicit_operation: None,
                 callable_family_complete: false,
                 signature: Some(signature),
                 receiver: None,
@@ -635,6 +640,7 @@ fn source_parameters(parameters: Node<'_>, source: &str) -> Vec<Parameter> {
                 r#type: named("untyped".to_owned()),
                 optional: false,
                 variadic: false,
+                passing_mode: Default::default(),
             }),
             "optional_parameter"
             | "keyword_parameter"
@@ -651,6 +657,7 @@ fn source_parameters(parameters: Node<'_>, source: &str) -> Vec<Parameter> {
                     r#type: named("untyped".to_owned()),
                     optional: matches!(node.kind(), "optional_parameter" | "keyword_parameter"),
                     variadic: matches!(node.kind(), "splat_parameter" | "hash_splat_parameter"),
+                    passing_mode: Default::default(),
                 });
             }
             _ => {
@@ -860,7 +867,7 @@ fn finish(
         members,
         diagnostics,
         suppressed_diagnostics,
-        complete: complete && suppressed_diagnostics == 0,
+        complete: complete && suppressed_diagnostics.total() == 0,
         aliases,
     }
 }

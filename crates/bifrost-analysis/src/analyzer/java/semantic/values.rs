@@ -1,6 +1,33 @@
 use super::syntax::*;
 use super::*;
 
+/// Whether a local or formal parameter declaration structurally declares an
+/// array value. Java permits dimensions either in the type (`int[] values`)
+/// or after the declarator (`int values[]`); a spread parameter is an array in
+/// the callee even though its type child names only the component type.
+fn java_binding_declares_array(node: Node<'_>) -> bool {
+    if node.kind() == "spread_parameter" || node.child_by_field_name("dimensions").is_some() {
+        return true;
+    }
+    node.child_by_field_name("type")
+        .or_else(|| {
+            node.parent()
+                .and_then(|declaration| declaration.child_by_field_name("type"))
+        })
+        .is_some_and(java_type_syntax_is_array)
+}
+
+fn java_type_syntax_is_array(root: Node<'_>) -> bool {
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if matches!(node.kind(), "array_type" | "dimensions") {
+            return true;
+        }
+        stack.extend(named_children(node));
+    }
+    false
+}
+
 /// A resolved, unambiguous field declaration: its own name's source anchor,
 /// and whether it is `static` (or an interface `constant_declaration`,
 /// always implicitly `static final`). The `is_static` flag is what
@@ -12,6 +39,7 @@ use super::*;
 pub(super) struct FieldDeclarationAnchor {
     pub(super) anchor: SourceAnchor,
     pub(super) is_static: bool,
+    pub(super) is_array: bool,
 }
 
 pub(super) struct JavaDeclarationInventory {
@@ -60,6 +88,7 @@ pub(super) fn java_declaration_inventory(
             // `static` modifier is what `has_modifier` checks directly.
             let is_static = node.kind() == "constant_declaration" || has_modifier(node, "static");
             for declarator in children_by_field_name(node, "declarator") {
+                let is_array = java_binding_declares_array(declarator);
                 let Some(name) = declarator.child_by_field_name("name") else {
                     continue;
                 };
@@ -74,7 +103,11 @@ pub(super) fn java_declaration_inventory(
                 };
                 match field_anchors.entry((owner, text.into())) {
                     std::collections::hash_map::Entry::Vacant(entry) => {
-                        entry.insert(Some(FieldDeclarationAnchor { anchor, is_static }));
+                        entry.insert(Some(FieldDeclarationAnchor {
+                            anchor,
+                            is_static,
+                            is_array,
+                        }));
                     }
                     std::collections::hash_map::Entry::Occupied(mut entry) => {
                         entry.insert(None);
@@ -177,6 +210,9 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     }
                     self.local_type_nodes.insert(value, type_node);
                 }
+                if java_binding_declares_array(node) {
+                    self.array_values.insert(value);
+                }
                 if node.kind() == "catch_formal_parameter" {
                     self.non_null_values.insert(value);
                 }
@@ -227,22 +263,14 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         procedure_kind: ProcedureKind,
         properties: ProcedureProperties,
     ) -> Result<(), JavaLoweringError> {
-        let declaration_range = node_range(callable);
-        let layout = formal_parameter_slots(
+        let slots = formal_parameter_slots_for_owner_with_nodes(
             Language::Java,
-            self.prepared.tree().root_node(),
+            callable,
             self.prepared.source(),
-            &declaration_range,
         )
         .unwrap_or_default();
         let mut ordinal = 0_u32;
-        for slot in layout.slots {
-            let node = callable
-                .named_descendant_for_byte_range(
-                    slot.declaration_range.start_byte,
-                    slot.declaration_range.end_byte,
-                )
-                .unwrap_or(callable);
+        for (slot, node) in slots {
             let metadata = self.value_mapping(builder, node)?;
             let value = if slot.receiver {
                 let value = self.session.add_value_with_metadata(
@@ -265,6 +293,9 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 ordinal = ordinal.checked_add(1).ok_or_else(|| {
                     JavaLoweringError::Invalid("too many formal parameters".into())
                 })?;
+                if java_binding_declares_array(node) {
+                    self.array_values.insert(value);
+                }
                 value
             };
             for name in slot.names {
@@ -479,11 +510,10 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         if node.kind() != "identifier" {
             return None;
         }
-        // Java's own shadowing rule: a local or a parameter of the same name
-        // always wins over a field. Checking this here, not just trusting
-        // every caller to check first, makes the shadowing rule structurally
-        // impossible to bypass rather than merely a convention callers must
-        // remember.
+        // Java's own shadowing rule: a local or parameter wins for an
+        // unqualified identifier. Explicit `this.field` accesses do not use
+        // this path and remain fields even when a lexical binding shares the
+        // name.
         if self.lexical_reference_binding(node).is_some() {
             return None;
         }
@@ -492,8 +522,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         // there name an instance field.
         self.receiver?;
         let name = node_text(self.prepared.source(), node)?;
-        let owner = enclosing_type_name(self.prepared.source(), node)?;
-        let field = (*self.field_declaration_anchors.get(&(owner, name.into()))?)?;
+        let field = self.enclosing_field_declaration(node)?;
         if field.is_static {
             return None;
         }
@@ -944,6 +973,70 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         )
     }
 
+    /// Whether this exact field-access syntax is Java's built-in array
+    /// `length` property rather than an object field with the same name.
+    ///
+    /// The proof is intentionally syntax-backed: the field node must spell
+    /// `length`, and the receiver must either construct/cast an array here or
+    /// resolve to a lexical binding whose declaration contains array type
+    /// syntax. Unknown receiver types keep the ordinary FieldMemory lowering.
+    pub(super) fn field_access_is_array_length(&self, node: Node<'tree>) -> bool {
+        let Some(field) = node.child_by_field_name("field") else {
+            return false;
+        };
+        if node_text(self.prepared.source(), field) != Some("length") {
+            return false;
+        }
+        node.child_by_field_name("object")
+            .is_some_and(|object| self.expression_is_array(object))
+    }
+
+    fn expression_is_array(&self, node: Node<'tree>) -> bool {
+        match node.kind() {
+            "array_creation_expression" => true,
+            "identifier" => {
+                if let Some((value, _)) = self.lexical_reference_binding(node) {
+                    self.array_values.contains(&value)
+                } else {
+                    self.enclosing_field_declaration(node)
+                        .is_some_and(|field| field.is_array)
+                }
+            }
+            "field_access" => {
+                let Some(object) = node.child_by_field_name("object") else {
+                    return false;
+                };
+                let Some(field) = node.child_by_field_name("field") else {
+                    return false;
+                };
+                object.kind() == "this"
+                    && self
+                        .enclosing_field_declaration(field)
+                        .is_some_and(|field| field.is_array)
+            }
+            "parenthesized_expression" => {
+                first_named_child(node).is_some_and(|inner| self.expression_is_array(inner))
+            }
+            "cast_expression" => node
+                .child_by_field_name("type")
+                .is_some_and(java_type_syntax_is_array),
+            _ => false,
+        }
+    }
+
+    /// The unambiguous field declared directly on the type enclosing this
+    /// exact identifier. This fact is useful both for implicit-field memory
+    /// identity and for array-type proof; callers apply lexical-shadowing,
+    /// static, or receiver restrictions appropriate to their syntax shape.
+    fn enclosing_field_declaration(&self, node: Node<'tree>) -> Option<FieldDeclarationAnchor> {
+        if node.kind() != "identifier" {
+            return None;
+        }
+        let name = node_text(self.prepared.source(), node)?;
+        let owner = enclosing_type_name(self.prepared.source(), node)?;
+        *self.field_declaration_anchors.get(&(owner, name.into()))?
+    }
+
     fn root_identifier_is_value(&self, name: &str, access: Node<'tree>) -> bool {
         if self.local_at(name, access.start_byte()).is_some() || self.parameters.contains_key(name)
         {
@@ -976,6 +1069,12 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             })
             .and_then(|entry| *entry)
             .map(|field| field.anchor)
+            .or_else(|| {
+                (object.kind() == "this")
+                    .then(|| self.enclosing_field_declaration(node))
+                    .flatten()
+                    .map(|field| field.anchor)
+            })
             .or_else(|| self.array_element_field_anchor(object, node));
         let resolved = declaration_anchor.is_some();
         let anchor = declaration_anchor.unwrap_or(occurrence_anchor);

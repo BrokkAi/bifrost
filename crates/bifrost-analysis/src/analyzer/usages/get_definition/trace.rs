@@ -1676,7 +1676,7 @@ mod boundary_evidence_tests {
         members: serde_json::Value,
     ) -> serde_json::Value {
         serde_json::json!({
-            "schema_version": 1,
+            "schema_version": 2,
             "pack_id": pack_id,
             "version": "1.0.0",
             "producer": { "name": format!("{language}-fixture"), "version": "1.0.0" },
@@ -1931,6 +1931,7 @@ mod boundary_evidence_tests {
         );
     }
 
+    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
     #[test]
     fn a_kotlin_import_of_a_workspace_package_stays_a_plain_miss() {
         // The import target is the workspace's own package, so the failing
@@ -1949,6 +1950,7 @@ mod boundary_evidence_tests {
         assert_no_boundary_was_drawn("Helper? = null", &fixture);
     }
 
+    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
     #[test]
     fn a_kotlin_reference_with_no_import_at_all_stays_a_plain_miss() {
         let fixture = BoundaryFixture::new(

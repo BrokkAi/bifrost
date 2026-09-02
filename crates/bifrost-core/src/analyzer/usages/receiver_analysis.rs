@@ -309,6 +309,23 @@ pub struct ReceiverAnalysisReport<T> {
     pub candidates_truncated: bool,
 }
 
+/// The proof that a receiver expression denotes one exact value identity at a
+/// member-access site. Static type resolution alone is not such a proof: a
+/// mutable binding can retain the same declared type after being reassigned to
+/// a different runtime value.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum ReceiverIdentityProof {
+    /// Bounded receiver/value analysis produced one complete value identity.
+    ExactValueAnalysis,
+    /// The receiver syntax names one exact static type declaration.
+    ExactStaticTypeReference,
+    /// The receiver is a simple identifier bound by one immutable declaration.
+    ImmutableBinding {
+        file: ProjectFile,
+        declaration_range: Range,
+    },
+}
+
 /// A member-target resolution together with the receiver it was resolved against. The
 /// caller re-derives the member expression to validate the site; the provider re-derives it
 /// to answer, and reports back which receiver and member name it actually used so the two
@@ -316,7 +333,10 @@ pub struct ReceiverAnalysisReport<T> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReceiverMemberTargetReport {
     pub receiver_range: Range,
+    pub member_range: Range,
     pub member_name: String,
+    pub receiver_analysis: ReceiverAnalysisReport<ReceiverValue>,
+    pub receiver_identity: ReceiverAnalysisReport<ReceiverIdentityProof>,
     pub analysis: ReceiverAnalysisReport<CodeUnit>,
 }
 

@@ -1,0 +1,5 @@
+{
+  "kind": "runtime-declaration-binding",
+  "runtimeName": "execSync",
+  "declarationName": "execSync"
+}

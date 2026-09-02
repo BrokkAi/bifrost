@@ -1,0 +1,8 @@
+{
+  "kind": "compatibility",
+  "python": "vers:generic/>=3.9|<3.14",
+  "implementation": ["cpython"],
+  "abi": ["cp313"],
+  "platform": ["macosx_15_0_arm64"],
+  "extras": ["security"]
+}

@@ -845,6 +845,197 @@ mod header_language_attribution_tests {
     }
 }
 
+/// #2899: the transitive reverse translation-unit index. The build collapses
+/// the include graph's strongly connected components and unions each
+/// component's translation-unit bitset into its successors' in topological
+/// order, so what it costs is the graph's edges and not the reachability
+/// relation those edges carry. The worklist it replaced re-propagated a whole
+/// downstream closure for every unit that arrived late at a root, which is how
+/// envoy's 5.05M memberships came to take 1,362 s.
+#[cfg(test)]
+mod transitive_reverse_tu_index_tests {
+    use super::*;
+    use crate::analyzer::cpp::imports::{
+        TransitiveReverseTuIndex, build_transitive_reverse_tu_index,
+    };
+    use std::collections::VecDeque;
+
+    /// The index's answer as owned files, the shape the assertions compare.
+    fn reaching(index: &TransitiveReverseTuIndex, file: &ProjectFile) -> Vec<ProjectFile> {
+        index.reaching_translation_units(file).cloned().collect()
+    }
+
+    /// `header -> its direct includers` -- the shape `referencing_files_of`
+    /// produces and the index consumes -- from `(includer, target)` edges.
+    fn direct_reverse(
+        edges: &[(ProjectFile, ProjectFile)],
+    ) -> HashMap<ProjectFile, Arc<HashSet<ProjectFile>>> {
+        let mut includers: HashMap<ProjectFile, HashSet<ProjectFile>> = HashMap::default();
+        for (includer, target) in edges {
+            includers
+                .entry(target.clone())
+                .or_default()
+                .insert(includer.clone());
+        }
+        includers
+            .into_iter()
+            .map(|(target, set)| (target, Arc::new(set)))
+            .collect()
+    }
+
+    #[test]
+    fn a_deep_chain_under_many_units_visits_each_include_edge_once() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        // 300 translation units on the head of a 200-header chain: every unit
+        // reaches every header, so the relation is 60,000 memberships over 499
+        // edges. The worklist form re-walked the chain once per unit that
+        // arrived at its head.
+        let depth = 200;
+        let unit_count = 300;
+        let headers = (0..depth)
+            .map(|index| ProjectFile::new(root.clone(), format!("h{index:03}.h")))
+            .collect::<Vec<_>>();
+        // Zero-padded so path order and ordinal order agree, which is the
+        // index's contract for the units it is given.
+        let translation_units = (0..unit_count)
+            .map(|index| ProjectFile::new(root.clone(), format!("u{index:03}.cc")))
+            .collect::<Vec<_>>();
+        let mut edges = translation_units
+            .iter()
+            .map(|unit| (unit.clone(), headers[0].clone()))
+            .collect::<Vec<_>>();
+        edges.extend(
+            headers
+                .windows(2)
+                .map(|pair| (pair[0].clone(), pair[1].clone())),
+        );
+
+        let build = build_transitive_reverse_tu_index(&direct_reverse(&edges), &translation_units);
+
+        assert_eq!(
+            edges.len(),
+            build.edge_visits,
+            "the component ordering must look at each include edge once, not once per unit reaching it"
+        );
+        assert_eq!(
+            depth * unit_count + unit_count,
+            build.index.total_membership(),
+            "every header is reached by every unit, and every unit reaches itself"
+        );
+        for header in &headers {
+            assert_eq!(
+                translation_units,
+                reaching(&build.index, header),
+                "a chain header must report every unit, ascending by path: {header:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_closure_equals_a_breadth_first_search_from_every_translation_unit() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        let file = |name: &str| ProjectFile::new(root.clone(), name);
+        // A diamond, a second unit joining it halfway down, a mutually
+        // including pair below both, and a header nothing includes.
+        let edges = vec![
+            (file("a.cc"), file("top.h")),
+            (file("b.cc"), file("side.h")),
+            (file("top.h"), file("left.h")),
+            (file("top.h"), file("right.h")),
+            (file("side.h"), file("right.h")),
+            (file("left.h"), file("bottom.h")),
+            (file("right.h"), file("bottom.h")),
+            (file("bottom.h"), file("cycle_a.h")),
+            (file("cycle_a.h"), file("cycle_b.h")),
+            (file("cycle_b.h"), file("cycle_a.h")),
+        ];
+        let translation_units = vec![file("a.cc"), file("b.cc")];
+
+        let index =
+            build_transitive_reverse_tu_index(&direct_reverse(&edges), &translation_units).index;
+
+        // The oracle: walk forward from each unit and record where it arrives.
+        let mut forward: HashMap<ProjectFile, Vec<ProjectFile>> = HashMap::default();
+        for (includer, target) in &edges {
+            forward
+                .entry(includer.clone())
+                .or_default()
+                .push(target.clone());
+        }
+        let mut expected: HashMap<ProjectFile, Vec<ProjectFile>> = HashMap::default();
+        for unit in &translation_units {
+            let mut seen: HashSet<ProjectFile> = HashSet::default();
+            seen.insert(unit.clone());
+            let mut queue = VecDeque::from([unit.clone()]);
+            while let Some(current) = queue.pop_front() {
+                expected
+                    .entry(current.clone())
+                    .or_default()
+                    .push(unit.clone());
+                for target in forward.get(&current).into_iter().flatten() {
+                    if seen.insert(target.clone()) {
+                        queue.push_back(target.clone());
+                    }
+                }
+            }
+        }
+
+        let mut files = edges
+            .iter()
+            .flat_map(|(includer, target)| [includer.clone(), target.clone()])
+            .collect::<BTreeSet<_>>();
+        files.insert(file("orphan.h"));
+        for candidate in &files {
+            assert_eq!(
+                expected.get(candidate).cloned().unwrap_or_default(),
+                reaching(&index, candidate),
+                "the index must agree with a per-unit search at {candidate:?}"
+            );
+        }
+        // Not a vacuous agreement: the fixture has to produce a file both
+        // units reach, one only the diamond's own unit reaches, and one
+        // nothing reaches.
+        assert_eq!(translation_units, reaching(&index, &file("bottom.h")));
+        assert_eq!(vec![file("a.cc")], reaching(&index, &file("left.h")));
+        assert!(reaching(&index, &file("orphan.h")).is_empty());
+    }
+
+    #[test]
+    fn mutually_including_headers_report_the_same_reaching_units() {
+        let fixture = crate::inline_project::InlineTestProject::with_language(Language::Cpp)
+            .file(
+                "first.h",
+                "#ifndef FIRST_H\n#define FIRST_H\n#include \"second.h\"\nstruct First { int value; };\n#endif\n",
+            )
+            .file(
+                "second.h",
+                "#ifndef SECOND_H\n#define SECOND_H\n#include \"first.h\"\nstruct Second { int value; };\n#endif\n",
+            )
+            .file(
+                "unit.cc",
+                "#include \"first.h\"\nint unit_main() { return 0; }\n",
+            )
+            .build();
+        let analyzer = CppAnalyzer::from_project(fixture.project().clone());
+        let scope = AnalyzerQueryScope::new(&analyzer);
+        let token = scope.token();
+
+        let unit = fixture.file("unit.cc");
+        assert_eq!(
+            vec![unit.clone()],
+            analyzer.transitive_reaching_translation_units(token, &fixture.file("first.h")),
+            "the directly included half of the cycle is reached by the unit"
+        );
+        assert_eq!(
+            vec![unit],
+            analyzer.transitive_reaching_translation_units(token, &fixture.file("second.h")),
+            "so is the half that only the cycle reaches back into"
+        );
+    }
+}
+
 /// ExecPlan Milestone 3 (`.agents/plans/c-compilation-language-tag-scope.md`):
 /// a header blob is stored twice when its C and C++ readings disagree, and
 /// once when they agree.

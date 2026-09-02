@@ -117,7 +117,7 @@ pub use resolution::{
 pub use routes::{
     ALL_CANONICAL_SEGMENT_KINDS, ALL_IDENTITY_AXES, ALL_ROUTE_HOP_KINDS, ALL_ROUTE_TERMINATIONS,
     ALL_SEGMENT_RESOLUTION_STATUSES, CanonicalIdentity, CanonicalSegment, CanonicalSegmentKind,
-    DEEP_IDENTITY_AXES, IdentityAxis, IdentityRouteSupport, IdentitySupport,
+    CuratedExportSurface, DEEP_IDENTITY_AXES, IdentityAxis, IdentityRouteSupport, IdentitySupport,
     NO_IDENTITY_ROUTE_SUPPORT, RouteHopKind, RouteTermination, SegmentResolutionStatus,
 };
 pub use spec::{RoleSink, StructuralSpec};

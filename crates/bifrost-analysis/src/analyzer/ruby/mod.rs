@@ -183,6 +183,17 @@ impl RubyAnalyzer {
         self.semantic_facts.get().is_some()
     }
 
+    /// Store reader checkouts, one per relational batch this analyzer has run.
+    /// The definition-lookup cost pins in `analyzer_definition_lookup` read it
+    /// as a delta around one call.
+    #[cfg(test)]
+    pub(crate) fn relational_batch_reader_checkouts_for_test(&self) -> usize {
+        self.inner
+            .analyzer_store()
+            .relational_batch_counts_for_test()
+            .0
+    }
+
     pub(crate) fn declaration_candidates_by_identifier_limited(
         &self,
         identifier: &str,
@@ -360,6 +371,10 @@ impl CodeUnitIndex for RubyAnalyzer {
         self.inner.all_declarations()
     }
 
+    fn declarations_sharing_name(&self, unit: &CodeUnit) -> Vec<CodeUnit> {
+        self.inner.declarations_sharing_name(unit)
+    }
+
     fn declarations(&self, file: &ProjectFile) -> BTreeSet<CodeUnit> {
         self.inner.declarations(file)
     }
@@ -460,9 +475,7 @@ impl IAnalyzer for RubyAnalyzer {
         self
     }
 
-    fn invalidate_cached_file_identities(&self) {
-        self.inner.invalidate_cached_file_identities();
-    }
+    crate::analyzer::i_analyzer::forward_file_identity_invalidation!();
 
     fn working_tree_identity(&self) -> Option<std::sync::Arc<crate::gitblob::WorkingTreeIdentity>> {
         self.inner.working_tree_identity()
@@ -484,6 +497,12 @@ impl IAnalyzer for RubyAnalyzer {
         self.inner.workspace_file_index_cell()
     }
 
+    fn definition_lookup_memo(
+        &self,
+    ) -> Option<std::sync::Arc<crate::analyzer::DefinitionLookupMemo>> {
+        self.inner.definition_lookup_memo()
+    }
+
     fn structural_fact_providers(
         &self,
     ) -> Vec<&dyn crate::analyzer::structural::StructuralFactProvider> {
@@ -498,6 +517,12 @@ impl IAnalyzer for RubyAnalyzer {
         &self,
     ) -> Option<crate::analyzer::content_identity::WorkspaceContentIdentities> {
         self.inner.workspace_content_identities()
+    }
+
+    fn workspace_fact_indexes(
+        &self,
+    ) -> Vec<&dyn crate::analyzer::read_verification::WorkspaceFactIndex> {
+        self.inner.workspace_fact_indexes()
     }
 
     fn import_statements(&self, file: &ProjectFile) -> Vec<String> {

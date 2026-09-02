@@ -76,33 +76,49 @@ pub struct RelationExpansionSchema {
 pub fn relation_schema_catalog() -> RelationSchemaCatalog {
     let mut domains = ALL_DETAILED_CODE_QUERY_DOMAINS
         .iter()
-        .map(|domain| RelationDomainSchema {
-            domain: domain.label(),
-            fields: domain
-                .row_fields()
-                .iter()
-                .map(|field| RelationFieldSchema {
-                    name: field.name,
-                    scalar_type: scalar_type_label(field.scalar_type),
-                    nullable: field.nullable,
-                    stable_join_key: is_stable_join_key(field.scalar_type),
-                    values: match field.value_domain {
-                        Some(CodeQueryEnumDomain::Labels(labels)) => Some(labels),
-                        Some(CodeQueryEnumDomain::Unenumerable(_)) | None => None,
-                    },
-                    unenumerable_reason: match field.value_domain {
-                        Some(CodeQueryEnumDomain::Unenumerable(reason)) => Some(reason),
-                        Some(CodeQueryEnumDomain::Labels(_)) | None => None,
-                    },
-                })
-                .collect(),
-            expansions: admitted_expansions(*domain),
-        })
+        .map(|domain| published_schema(*domain))
         .collect::<Vec<_>>();
     domains.sort_by_key(|domain| domain.domain);
     RelationSchemaCatalog {
         format: RELATION_SCHEMA_FORMAT,
         domains,
+    }
+}
+
+/// The published projection of the one domain carrying this registry label.
+///
+/// The whole catalog and a single domain read the same projection, so the
+/// REPL's `:doc <row-domain>` and `bifrost --list-row-schemas` can never
+/// disagree about a field's type, nullability, or admitted expansions.
+pub fn relation_domain_schema(label: &str) -> Option<RelationDomainSchema> {
+    ALL_DETAILED_CODE_QUERY_DOMAINS
+        .iter()
+        .find(|domain| domain.label() == label)
+        .map(|domain| published_schema(*domain))
+}
+
+fn published_schema(domain: DetailedCodeQueryDomain) -> RelationDomainSchema {
+    RelationDomainSchema {
+        domain: domain.label(),
+        fields: domain
+            .row_fields()
+            .iter()
+            .map(|field| RelationFieldSchema {
+                name: field.name,
+                scalar_type: scalar_type_label(field.scalar_type),
+                nullable: field.nullable,
+                stable_join_key: is_stable_join_key(field.scalar_type),
+                values: match field.value_domain {
+                    Some(CodeQueryEnumDomain::Labels(labels)) => Some(labels),
+                    Some(CodeQueryEnumDomain::Unenumerable(_)) | None => None,
+                },
+                unenumerable_reason: match field.value_domain {
+                    Some(CodeQueryEnumDomain::Unenumerable(reason)) => Some(reason),
+                    Some(CodeQueryEnumDomain::Labels(_)) | None => None,
+                },
+            })
+            .collect(),
+        expansions: admitted_expansions(domain),
     }
 }
 
@@ -205,6 +221,22 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// One domain and the whole catalog are the same projection, so the REPL
+    /// and the CLI cannot publish different answers for the same label.
+    #[test]
+    fn one_domain_matches_its_entry_in_the_catalog() {
+        let catalog = relation_schema_catalog();
+        for entry in &catalog.domains {
+            assert_eq!(
+                relation_domain_schema(entry.domain).as_ref(),
+                Some(entry),
+                "`{}` must project identically alone and in the catalog",
+                entry.domain
+            );
+        }
+        assert_eq!(relation_domain_schema("no_such_domain"), None);
     }
 
     #[test]

@@ -219,6 +219,7 @@ pub(super) fn assert_serial_profile_reconciles(profile: &QueryExecutionProfile) 
     );
 }
 
+#[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
 #[test]
 fn public_explain_is_planning_only_and_exposes_shared_logical_dependencies() {
     let temp = tempfile::tempdir().expect("temp dir");
@@ -264,6 +265,7 @@ fn public_explain_is_planning_only_and_exposes_shared_logical_dependencies() {
     assert_eq!(shared_set.dependencies[0], shared_set.dependencies[1]);
 }
 
+#[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
 #[test]
 fn public_profile_nests_the_exact_ordered_ordinary_result() {
     let source = "class First {}\nclass Second {}\n";
@@ -419,6 +421,7 @@ fn shared_provenance_and_diagnostic_presentation_preserves_order_and_deduplicate
     );
 
     let rendered = CodeQueryResult {
+        session_subset: None,
         results: vec![item],
         truncated: false,
         diagnostics: vec![diagnostic],
@@ -480,6 +483,7 @@ fn semantic_result_contracts_serialize_render_and_retain_source_evidence() {
         boundary: None,
     };
     let result = CodeQueryResult {
+        session_subset: None,
         results: vec![
             CodeQueryResultItem {
                 value: CodeQueryResultValue::Procedure {
@@ -618,6 +622,7 @@ fn semantic_result_contracts_serialize_render_and_retain_source_evidence() {
             pipeline_rows: 3,
             ..CodeQueryExecutionWork::default()
         },
+        budgeted_work: CodeQueryBudgetedWork::default(),
         evidence: vec![
             evidence_for(
                 0,
@@ -652,6 +657,7 @@ fn semantic_result_contracts_serialize_render_and_retain_source_evidence() {
     detailed.assert_invariants();
 }
 
+#[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
 #[test]
 fn public_profile_retains_pre_execution_cancellation_observations() {
     let temp = tempfile::tempdir().expect("temp dir");
@@ -733,6 +739,7 @@ fn diagnostic_codes_have_exhaustive_stable_impacts_and_completion() {
 
     for (code, impact) in cases {
         let result = CodeQueryResult {
+            session_subset: None,
             results: Vec::new(),
             truncated: false,
             diagnostics: vec![diagnostic(code, impact)],
@@ -763,6 +770,7 @@ fn diagnostic_codes_have_exhaustive_stable_impacts_and_completion() {
 
     assert_eq!(
         CodeQueryResult {
+            session_subset: None,
             results: Vec::new(),
             truncated: true,
             diagnostics: Vec::new(),
@@ -770,6 +778,41 @@ fn diagnostic_codes_have_exhaustive_stable_impacts_and_completion() {
         .completion(),
         CodeQueryCompletion::Incomplete { codes: Vec::new() }
     );
+}
+
+#[test]
+fn published_label_inventories_are_the_wire_vocabulary() {
+    // The three inventories a non-Rust client mirrors (#2898). Each label must
+    // be exactly what serde reads and writes, or the inventory would publish a
+    // spelling no row ever carries.
+    for label in CodeQueryDiagnosticCode::LABELS {
+        let code: CodeQueryDiagnosticCode = serde_json::from_value(serde_json::Value::String(
+            (*label).to_string(),
+        ))
+        .unwrap_or_else(|error| panic!("diagnostic code {label} is not on the wire: {error}"));
+        assert_eq!(code.as_str(), *label);
+    }
+
+    for label in CodeQueryDiagnosticImpact::LABELS {
+        let impact: CodeQueryDiagnosticImpact =
+            serde_json::from_value(serde_json::Value::String((*label).to_string()))
+                .unwrap_or_else(|error| panic!("impact {label} is not on the wire: {error}"));
+        assert_eq!(impact.as_str(), *label);
+    }
+
+    let completions = [
+        CodeQueryCompletion::Complete,
+        CodeQueryCompletion::ProvenSubset { codes: Vec::new() },
+        CodeQueryCompletion::Incomplete { codes: Vec::new() },
+        CodeQueryCompletion::Cancelled,
+        CodeQueryCompletion::Invalid { codes: Vec::new() },
+    ];
+    assert_eq!(completions.len(), CodeQueryCompletion::KIND_LABELS.len());
+    for (completion, label) in completions.iter().zip(CodeQueryCompletion::KIND_LABELS) {
+        assert_eq!(completion.kind_label(), *label);
+        let serialized = serde_json::to_value(completion).expect("serialize completion");
+        assert_eq!(serialized["type"], *label);
+    }
 }
 
 #[test]
@@ -814,7 +857,7 @@ fn typed_diagnostic_producers_cover_budget_output_and_cancellation() {
         ]
     );
     assert!(matches!(
-        cancelled_query_result().completion(),
+        cancelled_query_result(None).completion(),
         CodeQueryCompletion::Cancelled
     ));
 }
@@ -1105,6 +1148,7 @@ fn outbound_uses_missing_reference_or_definitions_is_typed_incomplete() {
     assert_eq!(diagnostics[0].impact, CodeQueryDiagnosticImpact::Incomplete);
     assert!(matches!(
         CodeQueryResult {
+            session_subset: None,
             results: Vec::new(),
             truncated: false,
             diagnostics,
@@ -1527,6 +1571,7 @@ fn members_projection_reports_unindexed_direct_child_as_semantic_omission() {
     assert_eq!(diagnostics[0].impact, CodeQueryDiagnosticImpact::Incomplete);
     assert!(matches!(
         CodeQueryResult {
+            session_subset: None,
             results: Vec::new(),
             truncated: exhausted,
             diagnostics,
@@ -1587,6 +1632,7 @@ fn hierarchy_projection_keeps_exact_rows_and_reports_unindexed_relations() {
     assert_eq!(diagnostics[0].impact, CodeQueryDiagnosticImpact::Incomplete);
     assert!(matches!(
         CodeQueryResult {
+            session_subset: None,
             results: Vec::new(),
             truncated: exhausted,
             diagnostics,
@@ -1637,6 +1683,7 @@ fn enclosing_declaration_index_retains_exact_owner_and_reports_missing_real_rang
     );
     assert!(matches!(
         CodeQueryResult {
+            session_subset: None,
             results: Vec::new(),
             truncated: index.projection_omitted,
             diagnostics,

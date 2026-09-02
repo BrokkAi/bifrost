@@ -1,0 +1,10 @@
+{
+  "kind": "import-bindings",
+  "bindings": [
+    {
+      "name": "PageElement",
+      "bindingKind": "star-import-text",
+      "target": "page-element"
+    }
+  ]
+}

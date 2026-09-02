@@ -73,6 +73,7 @@ mod dispatch_mode_tests {
         analyzer.method_dispatch_mode(&method)
     }
 
+    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
     #[test]
     fn classifies_plain_instance_method() {
         let (_fixture, analyzer) = analyzer_with_source(
@@ -90,6 +91,7 @@ end
         );
     }
 
+    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
     #[test]
     fn classifies_explicit_self_singleton_method() {
         let (_fixture, analyzer) = analyzer_with_source(
@@ -107,6 +109,7 @@ end
         );
     }
 
+    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
     #[test]
     fn classifies_singleton_class_method() {
         let (_fixture, analyzer) = analyzer_with_source(
@@ -145,6 +148,7 @@ end
         );
     }
 
+    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
     #[test]
     fn classifies_named_module_function_method() {
         let (_fixture, analyzer) = analyzer_with_source(

@@ -144,6 +144,7 @@ def drive(car: Car):
     /// The two site shapes #1887 added both answer under the interactive
     /// budget: a member expression through its receiver's class, and a
     /// parameter annotated with a class imported from another workspace file.
+    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
     #[test]
     fn the_interactive_budget_answers_both_python_site_shapes() {
         let member = member_expression(INTERACTIVE_TYPE_LOOKUP_BUDGET);

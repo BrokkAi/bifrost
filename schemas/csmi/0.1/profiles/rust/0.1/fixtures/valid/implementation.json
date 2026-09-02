@@ -1,0 +1,69 @@
+{
+  "kind": "implementation",
+  "implementation": "displayImpl",
+  "implementationKind": "trait",
+  "implementingType": "recordType",
+  "trait": "displayTrait",
+  "identityKey": {
+    "kind": "implementation-key",
+    "trait": {
+      "artifactSelectors": [
+        {
+          "purl": "pkg:cargo/acme-codec@1.4.0"
+        }
+      ],
+      "scheme": "csmi.rust.source-item",
+      "schemeVersion": "0.1.0",
+      "stability": "portable",
+      "descriptors": [
+        {
+          "role": "namespace",
+          "name": "crate",
+          "disambiguator": "lib:acme_codec"
+        },
+        {
+          "role": "namespace",
+          "name": "format",
+          "disambiguator": "module"
+        },
+        {
+          "role": "type",
+          "name": "Display",
+          "disambiguator": "trait"
+        }
+      ]
+    },
+    "implementingType": {
+      "kind": "declared",
+      "symbol": {
+        "artifactSelectors": [
+          {
+            "purl": "pkg:cargo/acme-codec@1.4.0"
+          }
+        ],
+        "scheme": "csmi.rust.source-item",
+        "schemeVersion": "0.1.0",
+        "stability": "portable",
+        "descriptors": [
+          {
+            "role": "namespace",
+            "name": "crate",
+            "disambiguator": "lib:acme_codec"
+          },
+          {
+            "role": "type",
+            "name": "Record",
+            "disambiguator": "struct"
+          }
+        ]
+      }
+    },
+    "binders": []
+  },
+  "associatedItems": [
+    {
+      "providedItem": "recordDisplay",
+      "traitItem": "displayMethod"
+    }
+  ]
+}

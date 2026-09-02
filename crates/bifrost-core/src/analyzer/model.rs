@@ -636,6 +636,16 @@ pub struct SignatureMetadata {
     callable_arity: Option<CallableArity>,
     #[serde(default)]
     type_parameters: Vec<String>,
+    /// Whether the adapter that produced this metadata actually read the
+    /// declaration's type-parameter list.
+    ///
+    /// An empty `type_parameters` alone cannot say whether the declaration is
+    /// nongeneric or whether nobody looked, and a consumer that projects a
+    /// declaration's generic arity must not confuse the two: a recorded
+    /// absence is `Some(0)`, an unread list is `None`. Set only by
+    /// [`Self::with_recorded_type_parameters`].
+    #[serde(default)]
+    type_parameters_recorded: bool,
     #[serde(default)]
     bare_return_type_parameter: Option<String>,
     #[serde(default)]
@@ -1990,6 +2000,7 @@ impl SignatureMetadata {
             declaration_only: false,
             callable_arity: None,
             type_parameters: Vec::new(),
+            type_parameters_recorded: false,
             bare_return_type_parameter: None,
             callable_linkage: None,
             dispatch_extensibility: None,
@@ -2203,6 +2214,28 @@ impl SignatureMetadata {
         self
     }
 
+    /// Record the declaration's own type-parameter list, including the proof
+    /// that the list was read. An empty `type_parameters` passed here means a
+    /// declaration that declares none, not a declaration nobody asked about.
+    pub fn with_recorded_type_parameters(mut self, type_parameters: Vec<String>) -> Self {
+        self.type_parameters = type_parameters;
+        self.type_parameters_recorded = true;
+        self
+    }
+
+    /// Restore the persisted pair. The flag is stored beside the list, so a
+    /// row written before a language recorded type parameters reads back as
+    /// unrecorded rather than as a proven-empty list.
+    pub fn with_persisted_type_parameters(
+        mut self,
+        type_parameters: Vec<String>,
+        recorded: bool,
+    ) -> Self {
+        self.type_parameters = type_parameters;
+        self.type_parameters_recorded = recorded;
+        self
+    }
+
     pub fn with_bare_return_type_parameter(
         mut self,
         bare_return_type_parameter: Option<impl Into<String>>,
@@ -2326,6 +2359,12 @@ impl SignatureMetadata {
 
     pub fn type_parameters(&self) -> &[String] {
         &self.type_parameters
+    }
+
+    /// Whether [`Self::type_parameters`] is a read answer rather than a
+    /// default. See the field's documentation.
+    pub const fn type_parameters_recorded(&self) -> bool {
+        self.type_parameters_recorded
     }
 
     pub fn bare_return_type_parameter(&self) -> Option<&str> {

@@ -37,6 +37,14 @@ pub fn record_self_receiver_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     }
 }
 
+/// Record an editor-visible link through an explicit declared TypeScript
+/// contract without publishing it as an exact runtime usage.
+pub fn record_declared_reference_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    if let Some(hit) = build_hit(node, ctx) {
+        ctx.hits.insert(hit.into_declared_reference());
+    }
+}
+
 pub fn record_unproven_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     if let Some(hit) = build_hit(node, ctx) {
         ctx.unproven_hits.insert(hit.into_unproven());

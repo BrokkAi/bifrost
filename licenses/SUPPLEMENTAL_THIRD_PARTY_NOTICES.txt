@@ -1961,8 +1961,8 @@ SOFTWARE.
 brokk-tree-sitter-kotlin parser
 ================================================================================
 
-Rust package: brokk-tree-sitter-kotlin@0.4.1
-Package source: https://crates.io/crates/brokk-tree-sitter-kotlin/0.4.1
+Rust package: brokk-tree-sitter-kotlin@0.4.2
+Package source: https://crates.io/crates/brokk-tree-sitter-kotlin/0.4.2
 Source notice: LICENSE
 Inclusion: compiled into Bifrost on every release target
 

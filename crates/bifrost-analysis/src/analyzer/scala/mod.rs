@@ -38,9 +38,13 @@ use crate::analyzer::usages::get_definition::{
     BoundedResolution, DefinitionLookupOutcome, resolve_scala_bounded,
 };
 use crate::analyzer::usages::get_type::{TypeLookupOutcome, resolve_scala_type_bounded};
+use crate::analyzer::usages::inverted_edges::{
+    UsageEdgesCache, cached_dead_code_usage_edges, weight_usage_edges,
+};
 use crate::analyzer::usages::scala_graph::{
     ScalaDeadCodeBulkContext, ScalaDeadCodeBulkEligibility, ScalaUsageGraphStrategy,
-    build_inbound_scala_usage_edges, build_scala_usage_edge_weights, dead_code_bulk_eligibility,
+    build_inbound_scala_usage_edges_with_completeness, build_scala_usage_edge_weights,
+    dead_code_bulk_eligibility,
 };
 use crate::analyzer::usages::workspace_graph::UsageEcosystem;
 use crate::analyzer::weighted_cache::{
@@ -569,7 +573,7 @@ fn build_scala_project_types_from_frontier(
 pub struct ScalaAnalyzer {
     inner: TreeSitterAnalyzer<ScalaAdapter>,
     java_config: JvmAnalyzerConfig,
-    external_index: Arc<OnceLock<JvmExternalDeclarationIndex>>,
+    external_index: Arc<OnceLock<Arc<JvmExternalDeclarationIndex>>>,
     memo_budget: u64,
     imported_code_units: Cache<ProjectFile, Arc<HashSet<CodeUnit>>>,
     referencing_files: Cache<ProjectFile, Arc<HashSet<ProjectFile>>>,
@@ -584,8 +588,7 @@ pub struct ScalaAnalyzer {
     /// Analyzer-cached Scala usage/type-resolution support, built once per
     /// analyzer generation and reset on `update`/`update_all`.
     project_types: Arc<OnceLock<Arc<crate::analyzer::usages::scala_graph::ScalaProjectTypes>>>,
-    full_usage_edges:
-        Cache<Arc<[String]>, Arc<crate::analyzer::usages::inverted_edges::UsageEdges>>,
+    pub(crate) dead_code_usage_edges: UsageEdgesCache,
     project_types_build_count: Arc<AtomicUsize>,
     #[cfg(any(test, feature = "test-support"))]
     scala_query_parse_count: Arc<AtomicUsize>,
@@ -819,14 +822,20 @@ impl ScalaAnalyzer {
         clone.external_index = Arc::new(OnceLock::new());
         clone.file_dependency_index = Arc::new(OnceLock::new());
         clone.project_types = Arc::new(OnceLock::new());
-        clone.full_usage_edges =
-            build_weighted_cache(self.memo_budget / 8, weight_scala_usage_edges);
+        clone.dead_code_usage_edges =
+            build_weighted_cache(self.memo_budget / 8, weight_usage_edges);
         clone.project_types_build_count = Arc::new(AtomicUsize::new(0));
         #[cfg(any(test, feature = "test-support"))]
         {
             clone.scala_query_parse_count = Arc::new(AtomicUsize::new(0));
             clone.scala_query_walk_count = Arc::new(AtomicUsize::new(0));
         }
+        clone
+    }
+
+    pub(crate) fn clone_for_index_warm(&self, project: Arc<dyn Project>) -> Self {
+        let mut clone = self.clone();
+        clone.inner = clone.inner.clone_with_project(project);
         clone
     }
 
@@ -861,7 +870,7 @@ impl ScalaAnalyzer {
             same_package_reference_index: Arc::new(PoolSafeMemo::new()),
             lazy_hierarchy_index: Arc::new(OnceLock::new()),
             project_types: Arc::new(OnceLock::new()),
-            full_usage_edges: build_weighted_cache(memo_budget / 8, weight_scala_usage_edges),
+            dead_code_usage_edges: build_weighted_cache(memo_budget / 8, weight_usage_edges),
             project_types_build_count: Arc::new(AtomicUsize::new(0)),
             #[cfg(any(test, feature = "test-support"))]
             scala_query_parse_count: Arc::new(AtomicUsize::new(0)),
@@ -878,9 +887,14 @@ impl ScalaAnalyzer {
     }
 
     pub(crate) fn external_declaration_index(&self) -> &JvmExternalDeclarationIndex {
-        self.external_index.get_or_init(|| {
-            JvmExternalDeclarationIndex::build_for_project(&self.java_config, self.inner.project())
-        })
+        self.external_index
+            .get_or_init(|| {
+                JvmExternalDeclarationIndex::build_for_project(
+                    &self.java_config,
+                    self.inner.project(),
+                )
+            })
+            .as_ref()
     }
 
     /// The external declaration surface Scala resolution reads: the shared
@@ -1064,18 +1078,6 @@ impl ScalaAnalyzer {
             })
     }
 
-    #[cfg(test)]
-    pub(crate) fn full_usage_edges(
-        &self,
-        nodes: &HashSet<String>,
-        build: impl FnOnce() -> crate::analyzer::usages::inverted_edges::UsageEdges,
-    ) -> Arc<crate::analyzer::usages::inverted_edges::UsageEdges> {
-        let mut sorted_nodes = nodes.iter().cloned().collect::<Vec<_>>();
-        sorted_nodes.sort_unstable();
-        let key: Arc<[String]> = sorted_nodes.into();
-        self.full_usage_edges.get_with(key, || Arc::new(build()))
-    }
-
     #[cfg(any(test, feature = "test-support"))]
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn record_query_parse(&self) {
@@ -1186,41 +1188,6 @@ impl ScalaAnalyzer {
     }
 }
 
-fn weight_scala_usage_edges(
-    key: &Arc<[String]>,
-    edges: &Arc<crate::analyzer::usages::inverted_edges::UsageEdges>,
-) -> u32 {
-    use std::mem::size_of;
-
-    let key_bytes = size_of::<Arc<[String]>>()
-        + key
-            .iter()
-            .map(|item| size_of::<String>() + item.len())
-            .sum::<usize>();
-    let edge_bytes = edges
-        .edges
-        .iter()
-        .map(|((caller, callee), sites)| {
-            caller.len()
-                + callee.len()
-                + sites
-                    .iter()
-                    .map(|site| {
-                        size_of::<crate::analyzer::usages::inverted_edges::CallSite>()
-                            + site.path.len()
-                    })
-                    .sum::<usize>()
-        })
-        .sum::<usize>();
-    let summary_bytes = edges
-        .truncated
-        .keys()
-        .chain(edges.unproven_inbound.keys())
-        .map(|name| size_of::<String>() + name.len() + size_of::<usize>())
-        .sum::<usize>();
-    (key_bytes + edge_bytes + summary_bytes).clamp(1, u32::MAX as usize) as u32
-}
-
 /// A tier that stopped Scala's ladder because an import could bind the name and
 /// this analyzer cannot follow it to a declaration set.
 ///
@@ -1291,7 +1258,7 @@ impl ScalaSource for ScalaAnalyzer {
 
         let imports = self.inner.import_info_of(token, file);
         let imported = self.imported_code_units_of(file);
-        let retained = self.external_index.get();
+        let retained = self.external_index.get().map(Arc::as_ref);
         let declares_name = |declaration: &CodeUnit| {
             declaration.is_class() && declaration.short_name().trim_end_matches('$') == name
         };
@@ -1375,7 +1342,7 @@ impl ScalaSource for ScalaAnalyzer {
         if self.declares_simple_type(file, &package_name, name) {
             return ScalaNameProof::Workspace;
         }
-        let retained = self.external_index.get();
+        let retained = self.external_index.get().map(Arc::as_ref);
         if retained
             .is_some_and(|external| external.resolve_same_package(&package_name, name).is_some())
         {
@@ -1528,6 +1495,10 @@ impl CodeUnitIndex for ScalaAnalyzer {
         self.inner.all_declarations()
     }
 
+    fn declarations_sharing_name(&self, unit: &CodeUnit) -> Vec<CodeUnit> {
+        self.inner.declarations_sharing_name(unit)
+    }
+
     fn declarations(&self, file: &ProjectFile) -> BTreeSet<CodeUnit> {
         self.inner.declarations(file)
     }
@@ -1646,9 +1617,7 @@ impl IAnalyzer for ScalaAnalyzer {
         self
     }
 
-    fn invalidate_cached_file_identities(&self) {
-        self.inner.invalidate_cached_file_identities();
-    }
+    crate::analyzer::i_analyzer::forward_file_identity_invalidation!();
 
     fn working_tree_identity(&self) -> Option<std::sync::Arc<crate::gitblob::WorkingTreeIdentity>> {
         self.inner.working_tree_identity()
@@ -1670,6 +1639,12 @@ impl IAnalyzer for ScalaAnalyzer {
         self.inner.workspace_file_index_cell()
     }
 
+    fn definition_lookup_memo(
+        &self,
+    ) -> Option<std::sync::Arc<crate::analyzer::DefinitionLookupMemo>> {
+        self.inner.definition_lookup_memo()
+    }
+
     fn structural_fact_providers(
         &self,
     ) -> Vec<&dyn crate::analyzer::structural::StructuralFactProvider> {
@@ -1684,6 +1659,12 @@ impl IAnalyzer for ScalaAnalyzer {
         &self,
     ) -> Option<crate::analyzer::content_identity::WorkspaceContentIdentities> {
         self.inner.workspace_content_identities()
+    }
+
+    fn workspace_fact_indexes(
+        &self,
+    ) -> Vec<&dyn crate::analyzer::read_verification::WorkspaceFactIndex> {
+        self.inner.workspace_fact_indexes()
     }
 
     fn import_statements(&self, file: &ProjectFile) -> Vec<String> {
@@ -1833,13 +1814,12 @@ impl IAnalyzer for ScalaAnalyzer {
             return Vec::new();
         }
 
-        let all_candidates: Vec<CloneCandidateProfile> = self
-            .get_all_declarations()
-            .into_iter()
-            .filter(|code_unit| {
-                code_unit.is_function() && file_language(code_unit.source()) == Language::Scala
-            })
-            .filter_map(|code_unit| build_scala_clone_candidate_data(self, &code_unit, weights))
+        let corpus_units =
+            crate::analyzer::clone_detection::clone_corpus_function_units(self, Language::Scala);
+        let _query_scope = crate::analyzer::AnalyzerQueryScope::new(self);
+        let all_candidates: Vec<CloneCandidateProfile> = corpus_units
+            .iter()
+            .filter_map(|code_unit| build_scala_clone_candidate_data(self, code_unit, weights))
             .map(|candidate| CloneCandidateProfile::create(candidate, weights))
             .collect();
         if all_candidates.is_empty() {
@@ -2390,6 +2370,7 @@ mod knownness_tests {
 
     /// A diagnostic must never build the jar-backed external index: reading
     /// jars is package I/O, which #1615 forbids inside a request.
+    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
     #[test]
     fn a_name_proof_never_builds_the_external_declaration_index() {
         let (_temp, analyzer, consumer) = fixture();
@@ -2520,16 +2501,42 @@ impl DeadCodeBulkProof for ScalaDeadCodeBulk {
         }
     }
 
-    /// The full builder, not the workspace one every sibling uses: it has no `keep_file`
-    /// predicate, and its result is the analyzer-cached whole-project edge set.
     fn build(
         &self,
         analyzer: &dyn IAnalyzer,
         candidates: &[CodeUnit],
     ) -> Option<DeadCodeBulkEdges> {
-        let scope = AnalyzerQueryScope::new(analyzer);
-        let token = scope.token();
+        let scala = resolve_analyzer::<ScalaAnalyzer>(analyzer)?;
         let callees = candidate_fqns(candidates);
-        build_inbound_scala_usage_edges(analyzer, token, &callees).map(DeadCodeBulkEdges::Fqn)
+        cached_dead_code_usage_edges(analyzer, &scala.dead_code_usage_edges, &callees, |token| {
+            build_inbound_scala_usage_edges_with_completeness(analyzer, token, &callees)
+        })
+        .map(DeadCodeBulkEdges::Fqn)
+    }
+}
+
+#[cfg(test)]
+mod dead_code_cache_tests {
+    use super::*;
+    use crate::analyzer::usages::inverted_edges::UsageEdges;
+    use crate::inline_project::InlineTestProject;
+
+    #[test]
+    fn update_all_update_and_overlay_clone_start_with_empty_dead_code_caches() {
+        let fixture = InlineTestProject::with_language(Language::Scala)
+            .file("A.scala", "class A")
+            .build();
+        let analyzer = ScalaAnalyzer::from_project(fixture.project().clone());
+        let key: Arc<[String]> = vec!["A".to_string()].into();
+        analyzer
+            .dead_code_usage_edges
+            .insert(key.clone(), Arc::new(UsageEdges::default()));
+
+        let updated = analyzer.update(&BTreeSet::new());
+        assert!(updated.dead_code_usage_edges.get(&key).is_none());
+        let rebuilt = analyzer.update_all();
+        assert!(rebuilt.dead_code_usage_edges.get(&key).is_none());
+        let overlay = analyzer.clone_with_project(fixture.project_dyn());
+        assert!(overlay.dead_code_usage_edges.get(&key).is_none());
     }
 }

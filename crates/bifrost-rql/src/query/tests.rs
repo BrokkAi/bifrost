@@ -893,6 +893,84 @@ fn guard_steps_parse_and_lower_from_both_frontends() {
     assert_eq!(rql.to_canonical_json(), query.to_canonical_json());
 }
 
+#[test]
+fn switch_coverage_steps_parse_and_lower_from_both_frontends() {
+    let query = parse_ok(json!({
+        "schema_version": 1,
+        "match": { "kind": "function", "name": "coverage" },
+        "steps": [
+            { "op": "procedure_of" },
+            { "op": "switch_coverage" }
+        ]
+    }));
+    assert_eq!(
+        query.plan.steps,
+        vec![QueryStep::ProcedureOf, QueryStep::SwitchCoverage]
+    );
+    assert_eq!(
+        query.validate_steps().unwrap(),
+        QueryValueKind::SwitchCoverage
+    );
+
+    let rql =
+        CodeQuery::from_sexp("(switch-coverage (procedure-of (function :name \"coverage\")))")
+            .expect("switch coverage RQL should lower");
+    assert_eq!(rql.schema_version, SCHEMA_VERSION);
+    assert_eq!(rql.plan.steps, query.plan.steps);
+    assert_eq!(rql.to_canonical_json(), query.to_canonical_json());
+}
+
+#[test]
+fn concurrent_access_conflict_steps_parse_and_lower_from_both_frontends() {
+    let query = parse_ok(json!({
+        "schema_version": 1,
+        "match": { "kind": "function", "name": "race" },
+        "steps": [
+            { "op": "procedure_of" },
+            { "op": "concurrent_access_conflicts" }
+        ]
+    }));
+    assert_eq!(
+        query.plan.steps,
+        vec![QueryStep::ProcedureOf, QueryStep::ConcurrentAccessConflicts]
+    );
+    assert_eq!(
+        query.validate_steps().unwrap(),
+        QueryValueKind::ConcurrentAccessConflict
+    );
+
+    let rql = CodeQuery::from_sexp(
+        "(concurrent-access-conflicts (procedure-of (function :name \"race\")))",
+    )
+    .expect("concurrent access conflict RQL should lower");
+    assert_eq!(rql.to_canonical_json(), query.to_canonical_json());
+}
+
+#[test]
+fn detached_task_transfer_steps_parse_and_lower_from_both_frontends() {
+    let query = parse_ok(json!({
+        "schema_version": 1,
+        "match": { "kind": "function", "name": "spawn" },
+        "steps": [
+            { "op": "procedure_of" },
+            { "op": "detached_task_transfers" }
+        ]
+    }));
+    assert_eq!(
+        query.plan.steps,
+        vec![QueryStep::ProcedureOf, QueryStep::DetachedTaskTransfers]
+    );
+    assert_eq!(
+        query.validate_steps().unwrap(),
+        QueryValueKind::DetachedTaskTransfer
+    );
+
+    let rql =
+        CodeQuery::from_sexp("(detached-task-transfers (procedure-of (function :name \"spawn\")))")
+            .expect("detached task transfer RQL should lower");
+    assert_eq!(rql.to_canonical_json(), query.to_canonical_json());
+}
+
 /// The typed algebra refuses `guards_of` over anything but a procedure, and the
 /// step carries no option axis, so one borrowed from a sibling step is rejected
 /// on its own path rather than silently ignored.
@@ -1636,6 +1714,111 @@ fn receiver_analysis_projects_typed_outcome_and_evidence_rows() {
         evidence.to_canonical_json()["steps"][1]["op"],
         "receiver_evidence"
     );
+}
+
+#[test]
+fn field_write_value_parses_canonically_and_lowers_from_both_frontends() {
+    let json_query = parse_ok(json!({
+        "schema_version": SCHEMA_VERSION,
+        "match": {
+            "kind": "assignment",
+            "operator": { "text": { "regex": "^=$" } }
+        },
+        "steps": [
+            { "op": "member_targets" },
+            {
+                "op": "field_write_value",
+                "receiver_identity_id": "receiver-id-123",
+                "member_target_id": "member-id-456"
+            }
+        ]
+    }));
+    assert_eq!(
+        json_query.plan.steps,
+        vec![
+            QueryStep::MemberTargets(ReceiverTraversalFilter::default()),
+            QueryStep::FieldWriteValue(FieldWriteValueTraversal {
+                receiver_identity_id: Some("receiver-id-123".to_string()),
+                member_target_id: Some("member-id-456".to_string()),
+            }),
+        ]
+    );
+    assert_eq!(
+        json_query.validate_steps().unwrap(),
+        QueryValueKind::FieldWriteValue
+    );
+    assert_eq!(
+        json_query.to_canonical_json(),
+        json!({
+            "schema_version": SCHEMA_VERSION,
+            "match": {
+                "kind": "assignment",
+                "operator": { "text": { "regex": "^=$" } }
+            },
+            "limit": DEFAULT_LIMIT,
+            "result_detail": "compact",
+            "execution_mode": "results",
+            "steps": [
+                { "op": "member_targets" },
+                {
+                    "op": "field_write_value",
+                    "receiver_identity_id": "receiver-id-123",
+                    "member_target_id": "member-id-456"
+                }
+            ]
+        })
+    );
+    let canonical = json_query.to_canonical_json();
+    assert_eq!(parse_ok(canonical.clone()).to_canonical_json(), canonical);
+
+    let rql = CodeQuery::from_sexp(
+        r#"(field-write-value :receiver-identity-id "receiver-id-123"
+             :member-target-id "member-id-456"
+             (member-targets (assignment :operator (text/regex "^=$"))))"#,
+    )
+    .expect("field-write-value RQL should lower");
+    assert_eq!(
+        rql.validate_steps().unwrap(),
+        QueryValueKind::FieldWriteValue
+    );
+    assert_eq!(rql.plan.steps, json_query.plan.steps);
+    assert_eq!(rql.to_canonical_json(), json_query.to_canonical_json());
+}
+
+#[test]
+fn field_write_value_rejects_wrong_predecessors_and_malformed_options() {
+    let error = error_of(json!({
+        "schema_version": SCHEMA_VERSION,
+        "match": { "kind": "assignment" },
+        "steps": [{ "op": "field_write_value" }]
+    }));
+    assert_eq!(error.path, "steps[0]");
+    assert!(error.message.contains("requires member_target_analysis"));
+
+    for (field, value) in [
+        ("receiver_identity_id", json!("")),
+        ("member_target_id", json!(7)),
+    ] {
+        let mut query = json!({
+            "schema_version": SCHEMA_VERSION,
+            "match": { "kind": "assignment" },
+            "steps": [
+                { "op": "member_targets" },
+                { "op": "field_write_value" }
+            ]
+        });
+        query["steps"][1][field] = value;
+        let error = error_of(query);
+        assert_eq!(error.path, format!("steps[1].{field}"));
+        assert!(error.message.contains("exact identity string"));
+    }
+
+    for source in [
+        r#"(field-write-value :receiver-identity-id "" (member-targets (assignment)))"#,
+        r#"(field-write-value :member-target-id (member-targets (assignment)))"#,
+    ] {
+        assert!(CodeQuery::from_sexp(source).is_err(), "{source}");
+    }
 }
 
 #[test]
@@ -2620,6 +2803,7 @@ fn role_accessors_cover_every_role_category() {
         kwargs: vec![("named".to_string(), sub.clone())],
         left: Some(Box::new(sub.clone())),
         right: Some(Box::new(sub.clone())),
+        operator: Some(Box::new(sub.clone())),
         module: Some(Box::new(sub.clone())),
         decorators: vec![sub.clone()],
         object: Some(Box::new(sub.clone())),
@@ -2640,6 +2824,7 @@ fn role_accessors_cover_every_role_category() {
             | Role::Receiver
             | Role::Left
             | Role::Right
+            | Role::Operator
             | Role::Module
             | Role::Object
             | Role::Field

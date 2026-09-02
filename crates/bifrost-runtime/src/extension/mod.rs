@@ -56,13 +56,13 @@ pub use outcome::{
 };
 pub use relation::*;
 pub use version::{
-    ApiStability, EXTENSION_API_VERSION, ExtensionApiVersion, ExtensionCapabilityId,
-    ExtensionCompatibility, ExtensionCompatibilityError, NegotiatedExtensionApi,
-    negotiate_extension_api,
+    ApiStability, CapabilitySupport, EXTENSION_API_VERSION, ExtensionApiVersion,
+    ExtensionCapabilityId, ExtensionCompatibility, ExtensionCompatibilityError,
+    NegotiatedExtensionApi, PUBLISHED_OPERATIONS, PublishedOperation, negotiate_extension_api,
 };
 pub use workspace::{
-    CapabilitySupport, ExtensionCapabilityReport, ExtensionError, ExtensionPersistenceMode,
-    ExtensionStoreReport, ExtensionWorkspace, ExtensionWorkspaceDescription,
-    ExtensionWorkspaceError, ExtensionWorkspaceOptions, LanguageCapabilityReport,
-    OperationCapability, StructuralRequest, StructuralResult,
+    ExtensionCapabilityReport, ExtensionError, ExtensionPersistenceMode, ExtensionStoreReport,
+    ExtensionWorkspace, ExtensionWorkspaceDescription, ExtensionWorkspaceError,
+    ExtensionWorkspaceOptions, LanguageCapabilityReport, OperationCapability, StructuralRequest,
+    StructuralResult,
 };

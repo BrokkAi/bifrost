@@ -16,7 +16,7 @@ publish = true
 name = "brokk_bifrost_ruby"
 
 [dependencies]
-brokk-bifrost-core = { path = "../bifrost-core", version = "=0.10.8" }
+brokk-bifrost-core = { path = "../bifrost-core", version = "=0.10.9" }
 # The one dependency the seam census did not predict. Ruby persists a class or
 # module's superclass and its include/prepend/extend arguments through the
 # analyzer's `supertype_lookup_paths` column as a JSON object per relation
@@ -27,3 +27,6 @@ tree-sitter = "0.25.10"
 # tree-sitter-ruby is a grammar generation behind the fleet's 0.25 line, in the
 # same class as tree-sitter-php 0.23.11 and tree-sitter-c-sharp 0.23.1.
 tree-sitter-ruby = "0.23.1"
+
+[lints]
+workspace = true

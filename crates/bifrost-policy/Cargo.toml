@@ -2,14 +2,10 @@
 name = "brokk-bifrost-policy"
 version.workspace = true
 edition.workspace = true
-rust-version.workspace = true
 description = "Versioned static-analysis policy authoring, loading, evaluation, and reporting for brokk-bifrost"
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
-readme = "README.md"
-keywords.workspace = true
-categories.workspace = true
 publish = true
 
 [lib]
@@ -20,9 +16,9 @@ default = []
 test-support = ["brokk-bifrost-analysis/test-support"]
 
 [dependencies]
-brokk-bifrost-analysis = { path = "../bifrost-analysis", version = "=0.10.8" }
-brokk-bifrost-flow = { path = "../bifrost-flow", version = "=0.10.8" }
-brokk-bifrost-rql = { path = "../bifrost-rql", version = "=0.10.8" }
+brokk-bifrost-analysis = { path = "../bifrost-analysis", version = "=0.10.9" }
+brokk-bifrost-flow = { path = "../bifrost-flow", version = "=0.10.9" }
+brokk-bifrost-rql = { path = "../bifrost-rql", version = "=0.10.9" }
 cap-std = { version = "4.0.2", default-features = false }
 chrono = { version = "0.4.44", default-features = false, features = ["clock", "std"] }
 cvss = { version = "2.2.0", default-features = false, features = ["std", "v3", "v4"] }
@@ -36,9 +32,12 @@ tree-sitter = "0.25.10"
 url = { version = "2.5.8", default-features = false, features = ["std"] }
 
 [dev-dependencies]
-brokk-bifrost-analysis = { path = "../bifrost-analysis", version = "=0.10.8", features = ["test-support"] }
+brokk-bifrost-analysis = { path = "../bifrost-analysis", version = "=0.10.9", features = ["test-support"] }
 tempfile = "3.23.0"
 
 # Unix: the RQLP directory loader's symlink/permission tests inspect raw modes.
 [target.'cfg(unix)'.dev-dependencies]
 libc = "0.2"
+
+[lints]
+workspace = true

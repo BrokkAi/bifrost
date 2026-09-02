@@ -496,13 +496,15 @@ where
         return Vec::new();
     }
 
-    let all_candidates = analyzer
-        .get_all_declarations()
-        .into_iter()
-        .filter(|code_unit| {
-            code_unit.is_function() && language_for_file(code_unit.source()) == language
-        })
-        .filter_map(|code_unit| build_candidate(&code_unit))
+    let corpus_units = clone_corpus_function_units(analyzer, language);
+    // Hold one query scope over the whole corpus build: per-unit source
+    // assembly re-reads each file's declaration state once per function it
+    // declares, and the scope's file-state snapshot serves those repeats
+    // from memory instead of the store.
+    let _query_scope = crate::analyzer::AnalyzerQueryScope::new(analyzer);
+    let all_candidates = corpus_units
+        .iter()
+        .filter_map(build_candidate)
         .map(|candidate| CloneCandidateProfile::create(candidate, weights))
         .collect();
 
@@ -512,6 +514,22 @@ where
         weights,
         refine_clone_similarity_with_ast,
     )
+}
+
+/// The whole-workspace clone corpus: every function declaration of one
+/// language. Shared by the generic driver above and the language modules
+/// that build candidates with language-specific state.
+pub(crate) fn clone_corpus_function_units(
+    analyzer: &dyn IAnalyzer,
+    language: Language,
+) -> Vec<CodeUnit> {
+    analyzer
+        .get_all_declarations()
+        .into_iter()
+        .filter(|code_unit| {
+            code_unit.is_function() && language_for_file(code_unit.source()) == language
+        })
+        .collect()
 }
 
 fn compute_ast_label_multiset_similarity_percent(left: &str, right: &str) -> i32 {
@@ -629,7 +647,6 @@ mod tests {
     };
     use crate::analyzer::{CloneSmellWeights, CodeUnit, CodeUnitType, ProjectFile};
     use std::collections::HashSet;
-    use std::path::PathBuf;
 
     #[test]
     fn hashed_similarity_matches_string_shingle_similarity_for_identical_tokens() {
@@ -832,7 +849,9 @@ mod tests {
         tokens: &[&str],
         weights: CloneSmellWeights,
     ) -> CloneCandidateProfile {
-        let file = ProjectFile::new(PathBuf::from("/workspace"), path);
+        let project_root =
+            std::env::current_dir().expect("test working directory must be available");
+        let file = ProjectFile::new(project_root, path);
         let data = CloneCandidateData {
             unit: CodeUnit::new(file, CodeUnitType::Function, "", name),
             normalized_tokens: tokens.iter().map(|token| (*token).to_string()).collect(),

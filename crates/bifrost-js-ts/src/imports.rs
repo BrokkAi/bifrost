@@ -456,19 +456,57 @@ pub fn resolve_js_ts_module_specifier(
     candidates
 }
 
-/// The npm package a bare module specifier addresses, and the subpath below it.
+/// The scheme Node's module resolution puts in front of a builtin module name.
 ///
-/// `left-pad` -> (`left-pad`, none); `left-pad/dist/index` -> (`left-pad`,
-/// `dist/index`); `@scope/pkg/deep` -> (`@scope/pkg`, `deep`). A relative or
-/// absolute specifier addresses a workspace file rather than a package and
-/// yields `None`.
+/// `node:fs` and `fs` load the same builtin, so the scheme is spelling, not
+/// identity.
+const NODE_BUILTIN_SCHEME: &str = "node:";
+
+/// The module a JS/TS specifier addresses, in the one spelling every consumer
+/// must key on.
 ///
-/// The specifier is the whole structure here: npm has no AST above it, and the
-/// scope/name/subpath split is the specifier grammar npm itself defines, not a
-/// re-parse of source text. Discovery records exactly these package and module
-/// identities (see `js_ts::external::declaration_entries`), so callers that
-/// match retained evidence must split the same way.
-pub fn npm_package_of_module_specifier(specifier: &str) -> Option<(&str, Option<&str>)> {
+/// The three fields answer the three questions callers actually ask: what
+/// module is this (`specifier`), which package or builtin owns it (`package`),
+/// and what does it select inside that package (`subpath`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JsTsModuleIdentity<'a> {
+    /// The whole specifier with the `node:` scheme folded away: `fs`,
+    /// `fs/promises`, `left-pad/dist/index`, `@scope/pkg/deep`. This is the
+    /// owner a module-object binding mints, so `import fs from 'node:fs'` and
+    /// `import fs from 'fs'` mint exactly one owner.
+    pub specifier: &'a str,
+    /// The package or builtin root: `fs`, `left-pad`, `@scope/pkg`.
+    pub package: &'a str,
+    /// What the specifier selects below the root, when it selects anything.
+    pub subpath: Option<&'a str>,
+}
+
+/// Classify a JS/TS module specifier into the identity every consumer keys on.
+///
+/// A relative or absolute specifier (`./util`, `../util`, `/abs/util`)
+/// addresses a workspace file rather than a package, and yields `None`. Every
+/// other specifier yields its canonical identity:
+///
+///   * `node:fs` and `fs` -> both `fs`, package `fs`, no subpath. Node's module
+///     resolution defines `node:` as a scheme on the specifier that selects the
+///     builtin the bare name already selects, so the two spellings are one
+///     module and must mint one owner (#2609);
+///   * `node:fs/promises` -> `fs/promises`, package `fs`, subpath `promises`,
+///     exactly as `fs/promises` splits;
+///   * `left-pad/dist/index` -> package `left-pad`, subpath `dist/index`;
+///   * `@scope/pkg/deep` -> package `@scope/pkg`, subpath `deep`.
+///
+/// The specifier is the whole structure here: the AST hands it over as one
+/// string-literal value and has nothing below it. Recognizing the literal
+/// `node:` prefix and the scope/name/subpath slashes is reading the specifier
+/// grammar that Node and npm define, not a text search standing in for
+/// structure a parser could have supplied. Discovery records exactly these
+/// package and module identities (see `js_ts::external::declaration_entries`),
+/// so callers that match retained evidence must split the same way.
+pub fn js_ts_module_identity(specifier: &str) -> Option<JsTsModuleIdentity<'_>> {
+    let specifier = specifier
+        .strip_prefix(NODE_BUILTIN_SCHEME)
+        .unwrap_or(specifier);
     if specifier.is_empty() || specifier.starts_with('.') || specifier.starts_with('/') {
         return None;
     }
@@ -481,16 +519,33 @@ pub fn npm_package_of_module_specifier(specifier: &str) -> Option<(&str, Option<
     } else {
         specifier.find('/')
     };
-    match boundary {
-        Some(offset) => {
-            let subpath = specifier[offset + 1..].trim_start_matches('/');
-            Some((
-                &specifier[..offset],
-                (!subpath.is_empty()).then_some(subpath),
-            ))
-        }
-        None => Some((specifier, None)),
-    }
+    let Some(offset) = boundary else {
+        return Some(JsTsModuleIdentity {
+            specifier,
+            package: specifier,
+            subpath: None,
+        });
+    };
+    let package = &specifier[..offset];
+    let subpath = specifier[offset + 1..].trim_start_matches('/');
+    // A trailing slash names the package itself, so the identity is the package.
+    Some(JsTsModuleIdentity {
+        specifier: if subpath.is_empty() {
+            package
+        } else {
+            specifier
+        },
+        package,
+        subpath: (!subpath.is_empty()).then_some(subpath),
+    })
+}
+
+/// The npm package a bare module specifier addresses, and the subpath below it.
+///
+/// The `(package, subpath)` half of [`js_ts_module_identity`], for callers that
+/// key on the package rather than on the whole module.
+pub fn npm_package_of_module_specifier(specifier: &str) -> Option<(&str, Option<&str>)> {
+    js_ts_module_identity(specifier).map(|identity| (identity.package, identity.subpath))
 }
 
 fn extract_import_module_path(raw_import: &str) -> Option<String> {
@@ -512,6 +567,65 @@ fn extract_import_module_path(raw_import: &str) -> Option<String> {
     Some(path.trim_matches('\'').trim_matches('"').to_string())
 }
 
+/// The paths one module path could name, grouped in the order the resolver
+/// consults them: an explicit source extension alone; then, for a TypeScript
+/// runtime specifier, the source extensions it stands for; then every
+/// extension as both a sibling file and a directory index.
+///
+/// The grouping is what [`collect_candidate_paths`] stops on -- the first
+/// group that yields a file wins -- and it is also what a specifier that
+/// resolves to nothing has stat'ed in full, which is why the enumeration is
+/// stated once here and read by both the resolver and
+/// [`js_ts_module_specifier_probed_paths`]. A second enumeration would be a
+/// second set of paths, and a read set that named paths the resolver never
+/// probed would invalidate on files the resolver would never have found.
+fn candidate_path_groups(
+    root: &Path,
+    module_path: &Path,
+    language: Language,
+    extensions: &[&str],
+) -> Vec<Vec<ProjectFile>> {
+    if module_path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| extensions.contains(&ext))
+    {
+        return vec![vec![ProjectFile::new(
+            root.to_path_buf(),
+            module_path.to_path_buf(),
+        )]];
+    }
+    let mut groups = Vec::new();
+    if let Some(source_extensions) =
+        ts_source_extensions_for_runtime_specifier(module_path, language)
+    {
+        groups.push(
+            source_extensions
+                .iter()
+                .map(|source_extension| {
+                    ProjectFile::new(
+                        root.to_path_buf(),
+                        module_path.with_extension(source_extension),
+                    )
+                })
+                .collect(),
+        );
+    }
+    let mut by_extension = Vec::with_capacity(extensions.len() * 2);
+    for extension in extensions {
+        by_extension.push(ProjectFile::new(
+            root.to_path_buf(),
+            PathBuf::from(format!("{}.{}", module_path.to_string_lossy(), extension)),
+        ));
+        by_extension.push(ProjectFile::new(
+            root.to_path_buf(),
+            module_path.join(format!("index.{extension}")),
+        ));
+    }
+    groups.push(by_extension);
+    groups
+}
+
 fn collect_candidate_paths(
     root: &Path,
     module_path: &Path,
@@ -519,43 +633,54 @@ fn collect_candidate_paths(
     extensions: &[&str],
     out: &mut Vec<ProjectFile>,
 ) {
-    if module_path
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .is_some_and(|ext| extensions.contains(&ext))
-    {
-        let file = ProjectFile::new(root.to_path_buf(), module_path.to_path_buf());
-        if file.exists() {
-            out.push(file);
-        }
-        return;
-    }
-    if let Some(source_extensions) =
-        ts_source_extensions_for_runtime_specifier(module_path, language)
-    {
-        for source_extension in source_extensions {
-            let source_path = module_path.with_extension(source_extension);
-            let file = ProjectFile::new(root.to_path_buf(), source_path);
-            if file.exists() {
-                out.push(file);
-            }
-        }
+    for group in candidate_path_groups(root, module_path, language, extensions) {
+        out.extend(group.into_iter().filter(ProjectFile::exists));
         if !out.is_empty() {
             return;
         }
     }
-    for extension in extensions {
-        let with_ext = PathBuf::from(format!("{}.{}", module_path.to_string_lossy(), extension));
-        let direct = ProjectFile::new(root.to_path_buf(), with_ext);
-        if direct.exists() {
-            out.push(direct);
-        }
-        let index = module_path.join(format!("index.{extension}"));
-        let index_file = ProjectFile::new(root.to_path_buf(), index);
-        if index_file.exists() {
-            out.push(index_file);
-        }
-    }
+}
+
+/// Every path [`resolve_js_ts_module_specifier`] stats for a specifier that
+/// resolves to no file at all.
+///
+/// The negative answer "no workspace file answers this specifier" is exactly
+/// the absence of these paths, so a reader that recorded nothing when the
+/// specifier resolved to nothing would be reusable in a workspace where it
+/// now resolves. Only defined for the empty case: a specifier that resolved
+/// stops at the group that answered it, and the reader names the file it
+/// found instead.
+pub fn js_ts_module_specifier_probed_paths(
+    source_file: &ProjectFile,
+    module_specifier: &str,
+    language: Language,
+    aliases: Option<&AliasResolver>,
+) -> Vec<ProjectFile> {
+    debug_assert!(
+        resolve_js_ts_module_specifier(source_file, module_specifier, language, aliases).is_empty(),
+        "the probed-path set is the stat list of a specifier that resolved to nothing"
+    );
+    let exts = language.extensions();
+    let bases: Vec<PathBuf> = if module_specifier.starts_with('.') {
+        vec![source_file.parent().join(module_specifier)]
+    } else {
+        let Some(aliases) = aliases else {
+            return Vec::new();
+        };
+        aliases
+            .candidate_bases(source_file, module_specifier)
+            .into_iter()
+            .chain(aliases.workspace_package_bases(module_specifier))
+            .collect()
+    };
+    let mut probed = bases
+        .iter()
+        .flat_map(|base| candidate_path_groups(source_file.root(), base, language, exts))
+        .flatten()
+        .collect::<Vec<_>>();
+    probed.sort();
+    probed.dedup();
+    probed
 }
 
 fn ts_source_extensions_for_runtime_specifier(
@@ -809,5 +934,50 @@ mod tests {
         assert_eq!(None, split("/absolute"));
         // A scope with no package name is not an npm coordinate.
         assert_eq!(None, split("@scope"));
+    }
+
+    #[test]
+    fn folds_the_node_scheme_into_the_bare_builtin_identity() {
+        use super::js_ts_module_identity as classify;
+
+        let bare = classify("fs").expect("a bare builtin names a module");
+        let scheme = classify("node:fs").expect("a node: builtin names a module");
+        assert_eq!(bare, scheme, "one module, one identity");
+        assert_eq!("fs", scheme.specifier);
+        assert_eq!("fs", scheme.package);
+        assert_eq!(None, scheme.subpath);
+
+        // A builtin subpath keeps its bare root and splits like any other.
+        let bare_subpath = classify("fs/promises").expect("a builtin subpath names a module");
+        let scheme_subpath =
+            classify("node:fs/promises").expect("a node: builtin subpath names a module");
+        assert_eq!(bare_subpath, scheme_subpath);
+        assert_eq!("fs/promises", scheme_subpath.specifier);
+        assert_eq!("fs", scheme_subpath.package);
+        assert_eq!(Some("promises"), scheme_subpath.subpath);
+    }
+
+    #[test]
+    fn classifies_packages_subpaths_and_workspace_paths() {
+        use super::js_ts_module_identity as classify;
+
+        let scoped = classify("@scope/pkg").expect("a scoped package names a module");
+        assert_eq!("@scope/pkg", scoped.specifier);
+        assert_eq!("@scope/pkg", scoped.package);
+        assert_eq!(None, scoped.subpath);
+
+        let subpath = classify("pkg/sub").expect("a package subpath names a module");
+        assert_eq!("pkg/sub", subpath.specifier);
+        assert_eq!("pkg", subpath.package);
+        assert_eq!(Some("sub"), subpath.subpath);
+
+        // A trailing slash names the package itself, not an empty subpath.
+        let trailing = classify("pkg/").expect("a trailing slash still names the package");
+        assert_eq!("pkg", trailing.specifier);
+        assert_eq!("pkg", trailing.package);
+        assert_eq!(None, trailing.subpath);
+
+        assert_eq!(None, classify("./rel"));
+        assert_eq!(None, classify("/abs"));
     }
 }

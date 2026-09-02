@@ -765,26 +765,31 @@ impl<'a> OrdinaryFormalSlots<'a> {
                 .iter()
                 .copied()
                 .find(|(_, slot)| {
-                    slot.names
-                        .iter()
-                        .any(|candidate| names_match(candidate, name))
+                    slot.passing_mode.accepts_named()
+                        && slot
+                            .names
+                            .iter()
+                            .any(|candidate| names_match(candidate, name))
                 })
                 .or_else(|| {
-                    self.slots
-                        .iter()
-                        .copied()
-                        .rev()
-                        .find(|(_, slot)| slot.variadic.is_some_and(|kind| kind.accepts_keyword()))
+                    self.slots.iter().copied().rev().find(|(_, slot)| {
+                        slot.passing_mode.accepts_named()
+                            && slot.variadic.is_some_and(|kind| kind.accepts_keyword())
+                    })
                 });
         }
         position.and_then(|position| {
-            self.slots.get(position).copied().or_else(|| {
-                self.slots
-                    .iter()
-                    .copied()
-                    .rev()
-                    .find(|(_, slot)| slot.variadic.is_some_and(|kind| kind.accepts_positional()))
-            })
+            self.slots
+                .iter()
+                .copied()
+                .filter(|(_, slot)| slot.passing_mode.accepts_positional())
+                .nth(position)
+                .or_else(|| {
+                    self.slots.iter().copied().rev().find(|(_, slot)| {
+                        slot.passing_mode.accepts_positional()
+                            && slot.variadic.is_some_and(|kind| kind.accepts_positional())
+                    })
+                })
         })
     }
 }
@@ -802,7 +807,7 @@ pub(crate) fn canonical_parameter_name(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::analyzer::lexical_definitions::FormalVariadicKind;
+    use crate::analyzer::lexical_definitions::{FormalParameterPassingMode, FormalVariadicKind};
     use crate::analyzer::structural::extract::extract_file_facts;
     use crate::analyzer::structural::{FileFacts, NormalizedKind};
     use crate::analyzer::usages::call_shape::call_shape_for_call;
@@ -855,6 +860,7 @@ mod tests {
             declaration_range: zero_range(),
             receiver: false,
             variadic: None,
+            passing_mode: Default::default(),
             default_range: None,
         }
     }
@@ -864,6 +870,27 @@ mod tests {
             slots: names.iter().map(|name| slot(name)).collect(),
             python_binding: None,
         }
+    }
+
+    #[test]
+    fn formal_slots_enforce_positional_only_and_named_only_modes() {
+        let mut modes = layout(&["args", "shell"]);
+        modes.slots[0].passing_mode = FormalParameterPassingMode::PositionalOnly;
+        modes.slots[1].passing_mode = FormalParameterPassingMode::NamedOnly;
+        let slots = OrdinaryFormalSlots::of(&modes, false);
+
+        assert_eq!(
+            slots.slot_for(None, Some(0), false).map(|slot| slot.0),
+            Some(0)
+        );
+        assert_eq!(slots.slot_for(None, Some(1), false), None);
+        assert_eq!(slots.slot_for(Some("args"), None, false), None);
+        assert_eq!(
+            slots
+                .slot_for(Some("shell"), None, false)
+                .map(|slot| slot.0),
+            Some(1)
+        );
     }
 
     /// Every positional actual of an ordinary Java call binds the formal at its

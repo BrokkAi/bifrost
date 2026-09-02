@@ -16,14 +16,14 @@
 use brokk_bifrost_core::analyzer::capabilities::{
     DescendantIndexScope, DirectDescendantIndex, build_direct_descendant_index_from_candidates,
 };
-use brokk_bifrost_core::analyzer::model::{CodeUnit, ImportInfo};
+use brokk_bifrost_core::analyzer::model::{CodeUnit, ImportInfo, Range};
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_core::hash::{HashMap, HashSet};
 
 use crate::kotlin::graph_support::KotlinSource;
 use crate::kotlin::types::{
-    KotlinNameScope, KotlinTypeName, kotlin_realm_type_by_fqn, kotlin_realm_type_exists,
-    kotlin_scope_owners_for, resolve_kotlin_type_name,
+    KotlinNameScope, KotlinTypeName, kotlin_realm_type_by_fqn, kotlin_scope_owners_for_with,
+    resolve_kotlin_type_name,
 };
 use crate::realm::JvmSourceRealm;
 
@@ -40,6 +40,7 @@ const HIERARCHY_FACT_BATCH_SIZE: usize = 4_096;
 /// unmodified rows back for hydration.
 pub trait KotlinHierarchyFact: Clone {
     fn declaration(&self) -> &CodeUnit;
+    fn primary_range(&self) -> Option<Range>;
     fn imports(&self) -> &[ImportInfo];
     fn raw_supertypes(&self) -> &[String];
 }
@@ -62,7 +63,14 @@ pub fn kotlin_resolve_direct_ancestors(
         return Vec::new();
     }
     let imports = source.import_info_of(token, code_unit.source());
-    kotlin_resolve_ancestors_from_facts(source, token, code_unit, &raw_supertypes, &imports, realm)
+    kotlin_resolve_ancestors_from_facts(
+        source,
+        token,
+        code_unit,
+        &raw_supertypes,
+        &imports,
+        &mut |fqn| kotlin_realm_type_by_fqn(source, token, fqn, realm),
+    )
 }
 
 /// The uncached half of the analyzer's realm-keyed descendant-index cell: every
@@ -87,8 +95,36 @@ pub fn build_kotlin_direct_descendant_index<Fact>(
 where
     Fact: KotlinHierarchyFact,
 {
-    candidates.retain(|facts| scope.admits(facts.declaration()));
     candidates.sort_by(|left, right| left.declaration().cmp(right.declaration()));
+
+    // The candidate pass above is already the authoritative Kotlin class
+    // universe for this analyzer generation. Supertype resolution
+    // used to ignore it and issue one bounded point-definition query for every
+    // candidate name it tried. Common member queries therefore turned one
+    // descendant-index build into tens of thousands of repeated store reads.
+    // Keep the same source-position-first representative that an exact
+    // definition lookup returns; duplicate FQNs remain one JVM identity. Build
+    // this lookup before filtering traversal candidates so an excluded test
+    // declaration can still be the structurally real ancestor of an admitted
+    // production declaration without itself entering the published index.
+    let mut kotlin_types_by_fqn: HashMap<String, (CodeUnit, Option<Range>)> = HashMap::default();
+    for facts in &candidates {
+        let declaration = facts.declaration();
+        if declaration.is_synthetic() || !declaration.is_class() {
+            continue;
+        }
+        kotlin_types_by_fqn
+            .entry(declaration.fq_name())
+            .and_modify(|current| {
+                if hierarchy_definition_key(declaration, facts.primary_range())
+                    < hierarchy_definition_key(&current.0, current.1)
+                {
+                    *current = (declaration.clone(), facts.primary_range());
+                }
+            })
+            .or_insert_with(|| (declaration.clone(), facts.primary_range()));
+    }
+    candidates.retain(|facts| scope.admits(facts.declaration()));
 
     // Hydration is batched because each candidate needs two facts that are not
     // in the candidate row itself — the supertypes it spells and the file's
@@ -105,13 +141,26 @@ where
             continue;
         }
         for facts in &batch {
-            let resolved = kotlin_resolve_ancestors_from_facts(
-                source,
+            let resolved = source.resolved_ancestors_from_hydrated_facts(
                 token,
                 facts.declaration(),
                 facts.raw_supertypes(),
                 facts.imports(),
                 realm,
+                &mut |fqn| {
+                    kotlin_types_by_fqn
+                        .get(fqn)
+                        .map(|(unit, _)| unit.clone())
+                        .or_else(|| {
+                            realm?
+                                .peer_types_by_fqn(
+                                    fqn,
+                                    brokk_bifrost_core::analyzer::Language::Kotlin,
+                                )
+                                .into_iter()
+                                .next()
+                        })
+                },
             );
             if !resolved.is_empty() {
                 ancestors_by_owner.insert(facts.declaration().clone(), resolved);
@@ -136,19 +185,32 @@ where
     )
 }
 
+fn hierarchy_definition_key(
+    unit: &CodeUnit,
+    primary_range: Option<Range>,
+) -> (usize, String, String, String, String) {
+    (
+        primary_range.map_or(usize::MAX, |range| range.start_byte),
+        unit.source().to_string().to_ascii_lowercase(),
+        unit.fq_name().to_ascii_lowercase(),
+        unit.signature().unwrap_or("").to_ascii_lowercase(),
+        format!("{:?}", unit.kind()),
+    )
+}
+
 /// Resolve one declaration's ancestors from facts already in hand.
 ///
 /// A supertype that does not resolve yields no ancestor. Kotlin code routinely
 /// extends types from dependencies that are not on the configured classpath,
 /// and inventing a declaration for one would put a name in the hierarchy that
 /// no query can open.
-fn kotlin_resolve_ancestors_from_facts(
-    source: &dyn KotlinSource,
+pub fn kotlin_resolve_ancestors_from_facts<S: KotlinSource + ?Sized>(
+    source: &S,
     token: QueryToken<'_>,
     owner: &CodeUnit,
     raw_supertypes: &[String],
     imports: &[ImportInfo],
-    realm: Option<&JvmSourceRealm<'_>>,
+    type_by_fqn: &mut dyn FnMut(&str) -> Option<CodeUnit>,
 ) -> Vec<CodeUnit> {
     if raw_supertypes.is_empty() {
         return Vec::new();
@@ -156,19 +218,19 @@ fn kotlin_resolve_ancestors_from_facts(
     let scope = KotlinNameScope {
         package_name: owner.package_name(),
         imports,
-        scope_owners: kotlin_scope_owners_for(source, token, owner),
+        scope_owners: kotlin_scope_owners_for_with(source, token, owner, type_by_fqn),
     };
     let mut ancestors = Vec::new();
     let mut seen = HashSet::default();
     for spelled in raw_supertypes {
         let KotlinTypeName::Resolved(fqn) =
             resolve_kotlin_type_name(spelled, &scope, |candidate| {
-                kotlin_realm_type_exists(source, token, candidate, realm)
+                type_by_fqn(candidate).is_some()
             })
         else {
             continue;
         };
-        if let Some(unit) = kotlin_realm_type_by_fqn(source, token, &fqn, realm)
+        if let Some(unit) = type_by_fqn(&fqn)
             && seen.insert(unit.fq_name())
         {
             ancestors.push(unit);

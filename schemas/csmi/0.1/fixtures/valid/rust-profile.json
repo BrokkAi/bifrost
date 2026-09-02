@@ -1,0 +1,408 @@
+{
+  "documentType": "semantic-document",
+  "schema": "https://csmi.brokk.ai/schema/0.1/schema.json",
+  "semanticModelVersion": "0.1",
+  "serializationVersion": "0.1-json",
+  "defaultProvenance": "rustProfileAuthor",
+  "provenanceRecords": [
+    {
+      "id": "rustProfileAuthor",
+      "producer": {
+        "identifier": "https://csmi.brokk.ai/producers/rust-profile-fixture",
+        "version": "0.1.0"
+      },
+      "generationMethod": "manual-authoring"
+    }
+  ],
+  "semanticModels": [
+    {
+      "artifactSelectors": [
+        { "purl": "pkg:cargo/acme-codec@1.4.0" }
+      ],
+      "compatibilityConstraints": [
+        {
+          "vocabulary": "csmi.rust",
+          "version": "0.1.0",
+          "value": {
+            "kind": "configuration",
+            "edition": "2021",
+            "compiler": { "release": "1.85.0" },
+            "cargoResolver": "2",
+            "target": { "triple": "x86_64-unknown-linux-gnu" },
+            "compilationRole": "target",
+            "enabledFeatures": ["std"],
+            "cfgAtoms": [
+              { "key": "feature", "value": "std" },
+              { "key": "target_arch", "value": "x86_64" },
+              { "key": "target_os", "value": "linux" }
+            ]
+          }
+        }
+      ],
+      "vocabularyUses": [
+        {
+          "identifier": "csmi.rust",
+          "version": "0.1.0",
+          "schema": "https://csmi.brokk.ai/schema/profiles/rust/0.1/schema.json",
+          "requirement": "required",
+          "affects": [
+            {
+              "kind": "core-slot",
+              "slot": "artifact-compatibility",
+              "target": { "model": "pkg:cargo/acme-codec@1.4.0" }
+            },
+            {
+              "kind": "core-slot",
+              "slot": "symbol-identity",
+              "target": {
+                "scheme": "csmi.rust.source-item",
+                "schemeVersion": "0.1.0"
+              }
+            },
+            {
+              "kind": "fact-family",
+              "family": "crate-mappings",
+              "scope": { "model": "pkg:cargo/acme-codec@1.4.0" }
+            },
+            {
+              "kind": "fact-family",
+              "family": "reexports",
+              "scope": { "symbol": "root" }
+            },
+            {
+              "kind": "fact-family",
+              "family": "implementations",
+              "scope": { "symbol": "displayImpl" }
+            },
+            {
+              "kind": "fact-family",
+              "family": "generation",
+              "scope": { "symbol": "generatedParser" }
+            },
+            {
+              "kind": "fact-family",
+              "family": "native-mappings",
+              "scope": { "symbol": "recordParse" }
+            }
+          ]
+        }
+      ],
+      "symbols": [
+        {
+          "id": "root",
+          "scheme": "csmi.rust.source-item",
+          "schemeVersion": "0.1.0",
+          "stability": "portable",
+          "descriptors": [
+            { "role": "namespace", "name": "crate", "disambiguator": "lib:acme_codec" }
+          ]
+        },
+        {
+          "id": "formatModule",
+          "scheme": "csmi.rust.source-item",
+          "schemeVersion": "0.1.0",
+          "stability": "portable",
+          "descriptors": [
+            { "role": "namespace", "name": "crate", "disambiguator": "lib:acme_codec" },
+            { "role": "namespace", "name": "format", "disambiguator": "module" }
+          ]
+        },
+        {
+          "id": "displayTrait",
+          "scheme": "csmi.rust.source-item",
+          "schemeVersion": "0.1.0",
+          "stability": "portable",
+          "descriptors": [
+            { "role": "namespace", "name": "crate", "disambiguator": "lib:acme_codec" },
+            { "role": "namespace", "name": "format", "disambiguator": "module" },
+            { "role": "type", "name": "Display", "disambiguator": "trait" }
+          ]
+        },
+        {
+          "id": "displayMethod",
+          "scheme": "csmi.rust.source-item",
+          "schemeVersion": "0.1.0",
+          "stability": "portable",
+          "descriptors": [
+            { "role": "namespace", "name": "crate", "disambiguator": "lib:acme_codec" },
+            { "role": "namespace", "name": "format", "disambiguator": "module" },
+            { "role": "type", "name": "Display", "disambiguator": "trait" },
+            { "role": "callable", "name": "display", "disambiguator": "method" }
+          ]
+        },
+        {
+          "id": "recordType",
+          "scheme": "csmi.rust.source-item",
+          "schemeVersion": "0.1.0",
+          "stability": "portable",
+          "descriptors": [
+            { "role": "namespace", "name": "crate", "disambiguator": "lib:acme_codec" },
+            { "role": "type", "name": "Record", "disambiguator": "struct" }
+          ]
+        },
+        {
+          "id": "displayImpl",
+          "scheme": "csmi.rust.source-item",
+          "schemeVersion": "0.1.0",
+          "stability": "portable",
+          "descriptors": [
+            { "role": "namespace", "name": "crate", "disambiguator": "lib:acme_codec" },
+            {
+              "role": "meta",
+              "name": "impl",
+              "disambiguator": "jcs-sha256:0337086ec90aab98d0574d7c9ddf4f546f73f37b9a4a24015964ae595aaa34ab"
+            }
+          ]
+        },
+        {
+          "id": "recordDisplay",
+          "scheme": "csmi.rust.source-item",
+          "schemeVersion": "0.1.0",
+          "stability": "portable",
+          "descriptors": [
+            { "role": "namespace", "name": "crate", "disambiguator": "lib:acme_codec" },
+            {
+              "role": "meta",
+              "name": "impl",
+              "disambiguator": "jcs-sha256:0337086ec90aab98d0574d7c9ddf4f546f73f37b9a4a24015964ae595aaa34ab"
+            },
+            { "role": "callable", "name": "display", "disambiguator": "method" }
+          ]
+        },
+        {
+          "id": "recordParse",
+          "scheme": "csmi.rust.source-item",
+          "schemeVersion": "0.1.0",
+          "stability": "portable",
+          "descriptors": [
+            { "role": "namespace", "name": "crate", "disambiguator": "lib:acme_codec" },
+            { "role": "type", "name": "Record", "disambiguator": "struct" },
+            { "role": "callable", "name": "parse", "disambiguator": "associated-function" }
+          ]
+        },
+        {
+          "id": "recordParseT",
+          "scheme": "csmi.rust.source-item",
+          "schemeVersion": "0.1.0",
+          "stability": "portable",
+          "descriptors": [
+            { "role": "namespace", "name": "crate", "disambiguator": "lib:acme_codec" },
+            { "role": "type", "name": "Record", "disambiguator": "struct" },
+            { "role": "callable", "name": "parse", "disambiguator": "associated-function" },
+            { "role": "type-parameter", "name": "0", "disambiguator": "type-parameter" }
+          ]
+        },
+        {
+          "id": "deriveParser",
+          "scheme": "csmi.rust.source-item",
+          "schemeVersion": "0.1.0",
+          "stability": "portable",
+          "descriptors": [
+            { "role": "namespace", "name": "crate", "disambiguator": "lib:acme_codec" },
+            { "role": "meta", "name": "Parser", "disambiguator": "proc-macro-derive" }
+          ]
+        },
+        {
+          "id": "generatedParser",
+          "scheme": "csmi.rust.source-item",
+          "schemeVersion": "0.1.0",
+          "stability": "portable",
+          "origin": "generated",
+          "descriptors": [
+            { "role": "namespace", "name": "crate", "disambiguator": "lib:acme_codec" },
+            { "role": "type", "name": "GeneratedParser", "disambiguator": "struct" }
+          ]
+        }
+      ],
+      "declarations": [
+        { "symbol": "root", "category": "namespace" },
+        { "symbol": "formatModule", "category": "namespace", "owner": "root" },
+        { "symbol": "displayTrait", "category": "type", "owner": "formatModule" },
+        {
+          "symbol": "displayMethod",
+          "category": "callable",
+          "owner": "displayTrait",
+          "callable": {
+            "kind": "method",
+            "receiver": { "kind": "instance", "type": { "kind": "reference", "symbol": "displayTrait" } },
+            "parameters": [],
+            "results": [{ "position": 0, "type": { "kind": "unknown" } }]
+          }
+        },
+        { "symbol": "recordType", "category": "type", "owner": "root" },
+        { "symbol": "displayImpl", "category": "meta", "owner": "root" },
+        {
+          "symbol": "recordDisplay",
+          "category": "callable",
+          "owner": "displayImpl",
+          "callable": {
+            "kind": "method",
+            "receiver": { "kind": "instance", "type": { "kind": "reference", "symbol": "recordType" } },
+            "parameters": [],
+            "results": [{ "position": 0, "type": { "kind": "unknown" } }]
+          }
+        },
+        {
+          "symbol": "recordParse",
+          "category": "callable",
+          "owner": "recordType",
+          "genericParameters": [
+            { "position": 0, "symbol": "recordParseT", "kind": "type" }
+          ],
+          "callable": {
+            "kind": "function",
+            "parameters": [
+              { "position": 0, "binding": "positional-only", "required": true, "type": { "kind": "unknown" } }
+            ],
+            "results": [{ "position": 0, "type": { "kind": "reference", "symbol": "recordType" } }]
+          }
+        },
+        { "symbol": "recordParseT", "category": "type-parameter", "owner": "recordParse" },
+        { "symbol": "deriveParser", "category": "meta", "owner": "root" },
+        { "symbol": "generatedParser", "category": "type", "owner": "root" }
+      ],
+      "relationships": [
+        { "subject": "recordDisplay", "predicate": "implements", "object": "displayMethod" }
+      ],
+      "procedureSummaries": [
+        {
+          "callable": "recordParse",
+          "transfers": [
+            {
+              "source": { "root": { "phase": "input", "role": "parameter", "position": 0 } },
+              "destination": { "root": { "phase": "output", "role": "result", "position": 0 } }
+            }
+          ]
+        }
+      ],
+      "extensionFacts": [
+        {
+          "vocabulary": "csmi.rust",
+          "version": "0.1.0",
+          "family": "crate-mappings",
+          "scope": { "model": "pkg:cargo/acme-codec@1.4.0" },
+          "payload": {
+            "kind": "crate-target",
+            "packagePurl": "pkg:cargo/acme-codec@1.4.0",
+            "targetKind": "lib",
+            "targetName": "acme-codec",
+            "crateName": "acme_codec",
+            "compilationRole": "target"
+          }
+        },
+        {
+          "vocabulary": "csmi.rust",
+          "version": "0.1.0",
+          "family": "reexports",
+          "scope": { "symbol": "root" },
+          "payload": {
+            "kind": "reexport",
+            "exportingModule": "root",
+            "exportedName": "Display",
+            "namespace": "type",
+            "target": "displayTrait"
+          }
+        },
+        {
+          "vocabulary": "csmi.rust",
+          "version": "0.1.0",
+          "family": "implementations",
+          "scope": { "symbol": "displayImpl" },
+          "payload": {
+            "kind": "implementation",
+            "implementation": "displayImpl",
+            "implementationKind": "trait",
+            "implementingType": "recordType",
+            "trait": "displayTrait",
+            "identityKey": {
+              "kind": "implementation-key",
+              "trait": {
+                "artifactSelectors": [{ "purl": "pkg:cargo/acme-codec@1.4.0" }],
+                "scheme": "csmi.rust.source-item",
+                "schemeVersion": "0.1.0",
+                "stability": "portable",
+                "descriptors": [
+                  { "role": "namespace", "name": "crate", "disambiguator": "lib:acme_codec" },
+                  { "role": "namespace", "name": "format", "disambiguator": "module" },
+                  { "role": "type", "name": "Display", "disambiguator": "trait" }
+                ]
+              },
+              "implementingType": {
+                "kind": "declared",
+                "symbol": {
+                  "artifactSelectors": [{ "purl": "pkg:cargo/acme-codec@1.4.0" }],
+                  "scheme": "csmi.rust.source-item",
+                  "schemeVersion": "0.1.0",
+                  "stability": "portable",
+                  "descriptors": [
+                    { "role": "namespace", "name": "crate", "disambiguator": "lib:acme_codec" },
+                    { "role": "type", "name": "Record", "disambiguator": "struct" }
+                  ]
+                }
+              },
+              "binders": []
+            },
+            "associatedItems": [
+              { "providedItem": "recordDisplay", "traitItem": "displayMethod" }
+            ]
+          }
+        },
+        {
+          "vocabulary": "csmi.rust",
+          "version": "0.1.0",
+          "family": "generation",
+          "scope": { "symbol": "generatedParser" },
+          "payload": {
+            "kind": "generation",
+            "item": "generatedParser",
+            "generatorKind": "procedural-macro",
+            "generator": "deriveParser",
+            "portability": "portable",
+            "generatorArtifactSha256": "2da6839400de8f99e62c07bcd6054733a1ff85ef01fa0b3d60aeb0430ad8d4a2",
+            "inputSha256": "8932b8f53aa1514e42b6fcb970deda4778486c674f3c5c9e58873798c249a46c",
+            "outputSha256": "8a5d7a2b1cd671c63b69d15bf8b9953d169c6c532ff567aad01b998c294bebbe"
+          }
+        },
+        {
+          "vocabulary": "csmi.rust",
+          "version": "0.1.0",
+          "family": "native-mappings",
+          "scope": { "symbol": "recordParse" },
+          "payload": {
+            "kind": "native-mapping",
+            "source": "recordParse",
+            "nativeSystem": "rust-v0-symbol",
+            "nativeVersion": "1.85.0",
+            "artifactSha256": "f5c4dfcfeb14303ce8b38ea993bdd3c8a1bb20c1014731831e584a6bd081c29f",
+            "status": "exact",
+            "cardinality": "one-to-one",
+            "nativeIdentities": ["_ZN10acme_codec6Record5parse17h5fbe3d31aabc7f2eE"],
+            "compilerRelease": "1.85.0",
+            "targetTriple": "x86_64-unknown-linux-gnu"
+          }
+        }
+      ],
+      "completenessStatements": [
+        {
+          "family": "procedure-summaries",
+          "scope": { "callable": "recordParse" },
+          "status": "complete"
+        },
+        {
+          "vocabulary": "csmi.rust",
+          "version": "0.1.0",
+          "family": "reexports",
+          "scope": { "exportingModule": "root", "namespace": "type" },
+          "status": "complete"
+        },
+        {
+          "vocabulary": "csmi.rust",
+          "version": "0.1.0",
+          "family": "generation",
+          "scope": { "symbol": "generatedParser" },
+          "status": "complete"
+        }
+      ]
+    }
+  ]
+}

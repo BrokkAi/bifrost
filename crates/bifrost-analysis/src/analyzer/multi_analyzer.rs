@@ -22,7 +22,6 @@ use brokk_bifrost_jvm::realm::JvmSourceRealm;
 use rayon::prelude::*;
 use std::any::Any;
 use std::collections::{BTreeMap, BTreeSet};
-#[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -113,6 +112,23 @@ impl AnalyzerDelegate {
             Self::Scala(analyzer) => Self::Scala(analyzer.clone_with_project(project)),
             Self::Ruby(analyzer) => Self::Ruby(analyzer.clone_with_project(project)),
             Self::Kotlin(analyzer) => Self::Kotlin(analyzer.clone_with_project(project)),
+        }
+    }
+
+    pub(crate) fn clone_for_index_warm(&self, project: Arc<dyn Project>) -> Self {
+        match self {
+            Self::Java(analyzer) => Self::Java(analyzer.clone_for_index_warm(project)),
+            Self::CSharp(analyzer) => Self::CSharp(analyzer.clone_for_index_warm(project)),
+            Self::Cpp(analyzer) => Self::Cpp(analyzer.clone_with_project(project)),
+            Self::Go(analyzer) => Self::Go(analyzer.clone_with_project(project)),
+            Self::JavaScript(analyzer) => Self::JavaScript(analyzer.clone_with_project(project)),
+            Self::Php(analyzer) => Self::Php(analyzer.clone_with_project(project)),
+            Self::Python(analyzer) => Self::Python(analyzer.clone_with_project(project)),
+            Self::TypeScript(analyzer) => Self::TypeScript(analyzer.clone_with_project(project)),
+            Self::Rust(analyzer) => Self::Rust(analyzer.clone_with_project(project)),
+            Self::Scala(analyzer) => Self::Scala(analyzer.clone_for_index_warm(project)),
+            Self::Ruby(analyzer) => Self::Ruby(analyzer.clone_with_project(project)),
+            Self::Kotlin(analyzer) => Self::Kotlin(analyzer.clone_for_index_warm(project)),
         }
     }
 
@@ -345,6 +361,16 @@ impl WorkspaceBuildContext {
         self.store_context.store.db_path()
     }
 
+    /// The analyzer store this workspace reads from and publishes to.
+    ///
+    /// Everything a workspace derives is keyed by content, so a caller that
+    /// derives something of its own -- a policy evaluation unit -- publishes
+    /// it into the same store rather than opening a second one that would have
+    /// to be kept in step with this one.
+    pub(crate) fn store(&self) -> &Arc<crate::analyzer::store::AnalyzerStore> {
+        &self.store_context.store
+    }
+
     #[cfg(test)]
     pub(crate) fn with_startup_oid_batch_counter_for_test(
         mut self,
@@ -426,6 +452,10 @@ pub struct MultiAnalyzer {
     snapshot_caches: Arc<crate::analyzer::AnalyzerSnapshotCaches>,
     derived_layer_budget_bytes: u64,
     query_contexts: Mutex<Vec<Arc<crate::analyzer::AnalyzerQueryContext>>>,
+    /// How many of the open query contexts carry a read ledger. Tracks
+    /// `query_contexts`, which a clone starts empty, so it is minted fresh per
+    /// clone rather than shared.
+    attached_read_ledgers: AtomicUsize,
 }
 
 impl Default for MultiAnalyzer {
@@ -442,6 +472,7 @@ impl Clone for MultiAnalyzer {
             snapshot_caches: Arc::clone(&self.snapshot_caches),
             derived_layer_budget_bytes: self.derived_layer_budget_bytes,
             query_contexts: Mutex::new(Vec::new()),
+            attached_read_ledgers: AtomicUsize::new(0),
         }
     }
 }
@@ -482,6 +513,7 @@ impl MultiAnalyzer {
             )),
             derived_layer_budget_bytes,
             query_contexts: Mutex::new(Vec::new()),
+            attached_read_ledgers: AtomicUsize::new(0),
         }
     }
 
@@ -527,7 +559,27 @@ impl MultiAnalyzer {
             )),
             derived_layer_budget_bytes: self.derived_layer_budget_bytes,
             query_contexts: Mutex::new(Vec::new()),
+            attached_read_ledgers: AtomicUsize::new(0),
         }
+    }
+
+    pub(crate) fn clone_for_index_warm(&self, project: Arc<dyn Project>) -> Self {
+        let mut clone = self.clone();
+        clone.delegates = self
+            .delegates
+            .iter()
+            .map(|(language, delegate)| {
+                (
+                    *language,
+                    delegate.clone_for_index_warm(Arc::clone(&project)),
+                )
+            })
+            .collect();
+        clone.build_context = self
+            .build_context
+            .as_ref()
+            .map(|context| Arc::new(context.clone_with_project(project)));
+        clone
     }
 
     /// The delegate language a file's queries route to.
@@ -592,6 +644,65 @@ impl MultiAnalyzer {
             .has_peers_of(Language::Kotlin)
             .then_some((kotlin, realm))
     }
+
+    /// Union one lookup's answer across every delegate.
+    ///
+    /// Rayon's fan-out from a thread that is not already a pool worker injects
+    /// the job into the global pool and parks the caller on a latch until a
+    /// worker picks it up. That round trip is pure overhead for a workspace with
+    /// one language, which is one delegate and therefore one job, and every
+    /// symbol lookup paid it (#2115). Run the query inline in that case and fan
+    /// out only when there is more than one delegate to spread. Both arms share
+    /// this one definition so their results cannot drift.
+    fn merged_from_delegates(
+        &self,
+        query: impl Fn(&dyn IAnalyzer) -> BTreeSet<CodeUnit> + Sync,
+    ) -> BTreeSet<CodeUnit> {
+        if self.delegates.len() <= 1 {
+            let mut merged = BTreeSet::new();
+            for delegate in self.delegates.values() {
+                merged.extend(query(delegate.analyzer()));
+            }
+            return merged;
+        }
+        self.delegates
+            .values()
+            .collect::<Vec<_>>()
+            .into_par_iter()
+            .map(|delegate| query(delegate.analyzer()))
+            .reduce(BTreeSet::new, |mut acc, found| {
+                acc.extend(found);
+                acc
+            })
+    }
+}
+
+/// Record the importers answer for each file the caller asked about.
+///
+/// The answer is a whole-workspace relation: a new importer in a file the
+/// reader never mentions changes it while no per-file key the reader recorded
+/// moves. The digest is over workspace-relative paths only, so it is equal
+/// across two checkouts of the same content.
+///
+/// The batch form records one key per target carrying the digest of the merged
+/// answer rather than of that target's own share, because the merged set is
+/// what the batch actually answered; over-recording is the sound direction.
+fn record_importer_lookup(
+    analyzer: &dyn IAnalyzer,
+    targets: &[ProjectFile],
+    referencing: &HashSet<ProjectFile>,
+) {
+    if !analyzer.read_ledger_attached() {
+        return;
+    }
+    let digest = crate::analyzer::read_ledger::file_set_digest(referencing);
+    for target in targets {
+        analyzer.record_read(crate::analyzer::read_ledger::ReadKey::lookup(
+            crate::analyzer::read_ledger::LookupKind::Importers,
+            crate::analyzer::read_ledger::LookupQuestion::file(target),
+            digest,
+        ));
+    }
 }
 
 impl ImportAnalysisProvider for MultiAnalyzer {
@@ -612,11 +723,14 @@ impl ImportAnalysisProvider for MultiAnalyzer {
     }
 
     fn referencing_files_of(&self, file: &ProjectFile) -> HashSet<ProjectFile> {
-        self.delegates
+        let referencing: HashSet<ProjectFile> = self
+            .delegates
             .values()
             .filter_map(AnalyzerDelegate::import_analysis_provider)
             .flat_map(|provider| provider.referencing_files_of(file))
-            .collect()
+            .collect();
+        record_importer_lookup(self, std::slice::from_ref(file), &referencing);
+        referencing
     }
 
     fn referencing_files_of_targets(
@@ -634,6 +748,10 @@ impl ImportAnalysisProvider for MultiAnalyzer {
                 break;
             }
             referencing.extend(provider.referencing_files_of_targets(targets, cancellation));
+        }
+        if IAnalyzer::read_ledger_attached(self) {
+            let targets = targets.iter().cloned().collect::<Vec<_>>();
+            record_importer_lookup(self, &targets, &referencing);
         }
         referencing
     }
@@ -1008,6 +1126,16 @@ impl TypeHierarchyProvider for MultiAnalyzer {
                 scope,
             )?);
         }
+        if IAnalyzer::read_ledger_attached(self) {
+            // Descendants are a cross-file answer: a subclass added in a file
+            // the reader never mentions changes it, and no per-file key the
+            // reader recorded moves.
+            self.record_read(crate::analyzer::read_ledger::ReadKey::lookup(
+                crate::analyzer::read_ledger::LookupKind::Descendants,
+                crate::analyzer::read_ledger::LookupQuestion::declaration(code_unit),
+                crate::analyzer::read_ledger::declaration_set_digest(&descendants),
+            ));
+        }
         Some(descendants)
     }
 }
@@ -1238,6 +1366,16 @@ impl CodeUnitIndex for MultiAnalyzer {
         }
     }
 
+    /// Every delegate, not the one that owns `unit`: the workspace scan this
+    /// replaces spanned every language, so a name declared as a module in two
+    /// of them stayed visible in both.
+    fn declarations_sharing_name(&self, unit: &CodeUnit) -> Vec<CodeUnit> {
+        self.delegates
+            .values()
+            .flat_map(|delegate| delegate.analyzer().declarations_sharing_name(unit))
+            .collect()
+    }
+
     fn definitions(&self, fq_name: &str) -> Box<dyn Iterator<Item = CodeUnit> + '_> {
         let matches: Vec<_> = self
             .delegates
@@ -1314,15 +1452,7 @@ impl CodeUnitIndex for MultiAnalyzer {
     }
 
     fn search_definitions(&self, pattern: &str, auto_quote: bool) -> BTreeSet<CodeUnit> {
-        self.delegates
-            .values()
-            .collect::<Vec<_>>()
-            .into_par_iter()
-            .map(|delegate| delegate.analyzer().search_definitions(pattern, auto_quote))
-            .reduce(BTreeSet::new, |mut acc, definitions| {
-                acc.extend(definitions);
-                acc
-            })
+        self.merged_from_delegates(|analyzer| analyzer.search_definitions(pattern, auto_quote))
     }
 
     fn search_definitions_by_suffix_pattern(
@@ -1347,15 +1477,7 @@ impl CodeUnitIndex for MultiAnalyzer {
     }
 
     fn lookup_candidates_by_short_name(&self, symbol: &str) -> BTreeSet<CodeUnit> {
-        self.delegates
-            .values()
-            .collect::<Vec<_>>()
-            .into_par_iter()
-            .map(|delegate| delegate.analyzer().lookup_candidates_by_short_name(symbol))
-            .reduce(BTreeSet::new, |mut acc, candidates| {
-                acc.extend(candidates);
-                acc
-            })
+        self.merged_from_delegates(|analyzer| analyzer.lookup_candidates_by_short_name(symbol))
     }
 
     /// Every delegate must be able to answer from an index before a miss is
@@ -1369,19 +1491,7 @@ impl CodeUnitIndex for MultiAnalyzer {
     }
 
     fn lookup_candidates_by_identifier(&self, identifier: &str) -> BTreeSet<CodeUnit> {
-        self.delegates
-            .values()
-            .collect::<Vec<_>>()
-            .into_par_iter()
-            .map(|delegate| {
-                delegate
-                    .analyzer()
-                    .lookup_candidates_by_identifier(identifier)
-            })
-            .reduce(BTreeSet::new, |mut acc, candidates| {
-                acc.extend(candidates);
-                acc
-            })
+        self.merged_from_delegates(|analyzer| analyzer.lookup_candidates_by_identifier(identifier))
     }
 
     fn search_definitions_persisted(&self, pattern: &str) -> BTreeSet<CodeUnit> {
@@ -1389,15 +1499,7 @@ impl CodeUnitIndex for MultiAnalyzer {
         // FTS5 path is consulted per-language. The default impl on
         // `IAnalyzer` would otherwise re-dispatch through our own
         // `search_definitions` override, which only hits in-memory state.
-        self.delegates
-            .values()
-            .collect::<Vec<_>>()
-            .into_par_iter()
-            .map(|delegate| delegate.analyzer().search_definitions_persisted(pattern))
-            .reduce(BTreeSet::new, |mut acc, definitions| {
-                acc.extend(definitions);
-                acc
-            })
+        self.merged_from_delegates(|analyzer| analyzer.search_definitions_persisted(pattern))
     }
 
     fn signatures(&self, code_unit: &CodeUnit) -> Vec<String> {
@@ -1419,10 +1521,29 @@ impl IAnalyzer for MultiAnalyzer {
         self
     }
 
+    fn claimed_files(&self) -> Vec<ProjectFile> {
+        let mut files = self
+            .delegates
+            .values()
+            .flat_map(|delegate| delegate.analyzer().claimed_files())
+            .collect::<Vec<_>>();
+        files.sort();
+        files.dedup();
+        files
+    }
+
     fn invalidate_cached_file_identities(&self) {
         self.delegates
             .values()
             .for_each(|delegate| delegate.analyzer().invalidate_cached_file_identities());
+    }
+
+    fn invalidate_cached_file_identities_for(&self, changed_files: &BTreeSet<ProjectFile>) {
+        self.delegates.values().for_each(|delegate| {
+            delegate
+                .analyzer()
+                .invalidate_cached_file_identities_for(changed_files);
+        });
     }
 
     /// Every delegate shares one `Liveness`, and so one identity scan, for the
@@ -1440,6 +1561,9 @@ impl IAnalyzer for MultiAnalyzer {
             .expect("multi-analyzer query context mutex poisoned");
         if !contexts.iter().any(|active| Arc::ptr_eq(active, context)) {
             contexts.push(Arc::clone(context));
+            if context.read_ledger().is_some() {
+                self.attached_read_ledgers.fetch_add(1, Ordering::Relaxed);
+            }
         }
         drop(contexts);
         self.delegates
@@ -1451,10 +1575,43 @@ impl IAnalyzer for MultiAnalyzer {
         self.delegates
             .values()
             .for_each(|delegate| delegate.analyzer().end_query(context));
-        self.query_contexts
+        let mut contexts = self
+            .query_contexts
+            .lock()
+            .expect("multi-analyzer query context mutex poisoned");
+        let before = contexts.len();
+        contexts.retain(|active| !Arc::ptr_eq(active, context));
+        let retired = contexts.len() < before;
+        drop(contexts);
+        if retired && context.read_ledger().is_some() {
+            let before = self.attached_read_ledgers.fetch_sub(1, Ordering::Relaxed);
+            debug_assert!(before > 0, "an attached read ledger was retired twice");
+        }
+    }
+
+    /// Record one input read through this facade.
+    ///
+    /// The delegates keep their own registries and record their own funnels;
+    /// this reaches the ledgers of the contexts opened against the composite
+    /// so a key formed above the delegates is not lost. Forwarding to the
+    /// delegates as well would only re-record the same key on the same
+    /// ledgers, which a set-valued ledger would drop anyway.
+    fn record_read(&self, key: crate::analyzer::read_ledger::ReadKey) {
+        if !IAnalyzer::read_ledger_attached(self) {
+            return;
+        }
+        let contexts = self
+            .query_contexts
             .lock()
             .expect("multi-analyzer query context mutex poisoned")
-            .retain(|active| !Arc::ptr_eq(active, context));
+            .clone();
+        for context in contexts {
+            context.record_read(key.clone());
+        }
+    }
+
+    fn read_ledger_attached(&self) -> bool {
+        self.attached_read_ledgers.load(Ordering::Relaxed) > 0
     }
 
     fn active_query_cancellation(&self) -> Option<crate::CancellationToken> {
@@ -1581,6 +1738,21 @@ impl IAnalyzer for MultiAnalyzer {
             .next()?
             .analyzer()
             .workspace_file_index_cell()
+    }
+
+    /// The first delegate's memo, for the same reason as the cell above, and
+    /// safely shared with lookups built directly over that delegate: every memo
+    /// key names the language its answer was resolved in, and a
+    /// language-scoped relational request is projected to exactly that
+    /// delegate.
+    fn definition_lookup_memo(
+        &self,
+    ) -> Option<std::sync::Arc<crate::analyzer::DefinitionLookupMemo>> {
+        self.delegates
+            .values()
+            .next()?
+            .analyzer()
+            .definition_lookup_memo()
     }
 
     /// Recorded on this analyzer's own active contexts rather than forwarded to
@@ -1723,6 +1895,7 @@ impl IAnalyzer for MultiAnalyzer {
             snapshot_caches: Arc::clone(&self.snapshot_caches),
             derived_layer_budget_bytes: self.derived_layer_budget_bytes,
             query_contexts: Mutex::new(Vec::new()),
+            attached_read_ledgers: AtomicUsize::new(0),
         }
     }
 
@@ -2169,14 +2342,30 @@ impl IAnalyzer for MultiAnalyzer {
         &self,
     ) -> Option<crate::analyzer::content_identity::WorkspaceContentIdentities> {
         let mut entries = Vec::with_capacity(self.delegates.len());
-        for (language, delegate) in &self.delegates {
-            let identity = delegate
-                .analyzer()
-                .workspace_content_identities()
-                .and_then(|identities| identities.language(*language))?;
-            entries.push((*language, identity.digest()));
+        for delegate in self.delegates.values() {
+            // The delegates' own per-language digests, not their folded scope
+            // identities: folding twice here and once in the composite would
+            // make `language(Rust)` on this analyzer differ from
+            // `language(Rust)` on the delegate that answered, and a `Scope`
+            // read key recorded by one could never be verified by the other.
+            let identities = delegate.analyzer().workspace_content_identities()?;
+            entries.extend(identities.entries().iter().copied());
         }
         Some(crate::analyzer::content_identity::WorkspaceContentIdentities::new(entries))
+    }
+
+    /// One entry per delegate that publishes one, in delegate order.
+    ///
+    /// A delegate that publishes none is simply absent, which is why the
+    /// caller compares this against `languages()` rather than assuming the
+    /// missing language contributed nothing.
+    fn workspace_fact_indexes(
+        &self,
+    ) -> Vec<&dyn crate::analyzer::read_verification::WorkspaceFactIndex> {
+        self.delegates
+            .values()
+            .flat_map(|delegate| delegate.analyzer().workspace_fact_indexes())
+            .collect()
     }
 
     fn contains_tests(&self, file: &ProjectFile) -> bool {
@@ -2651,6 +2840,7 @@ mod tests {
         );
     }
 
+    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
     #[test]
     fn update_with_only_irrelevant_files_retains_snapshot_caches() {
         let (_temp, analyzer) = two_language_analyzer();
@@ -2671,6 +2861,7 @@ mod tests {
         );
     }
 
+    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
     #[test]
     fn update_touching_an_analyzed_file_carries_the_content_keyed_caches_forward() {
         let (_temp, analyzer) = two_language_analyzer();
@@ -2939,6 +3130,7 @@ mod tests {
         );
     }
 
+    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
     #[test]
     fn overlay_snapshot_allocates_fresh_snapshot_caches() {
         let (_temp, analyzer) = two_language_analyzer();

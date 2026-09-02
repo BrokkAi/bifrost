@@ -324,6 +324,13 @@ pub(super) fn execute_plan(
                     temporary_capacity_bytes_lower_bound =
                         instrumentation.temporary_capacity_bytes_lower_bound;
                 }
+                // `max_step_outputs` is enforced per step and has no counter
+                // of its own; a merge of per-seed executions can only see a
+                // per-step truncation if each execution reports what each step
+                // emitted. A retried set branch adds to its node's count, which
+                // is the honest total of rows that step produced.
+                state.step_outputs[node_id.index()] = state.step_outputs[node_id.index()]
+                    .saturating_add(u64::try_from(stepped.rows.len()).unwrap_or(u64::MAX));
                 if terminal_cap.is_some_and(|cap| stepped.rows.len() >= cap) {
                     push_operator_termination(
                         &mut terminations,
@@ -803,6 +810,7 @@ pub(super) fn execute_parallel_seed_union(
     );
     let analyzer = state.analyzer;
     let cancellation = state.cancellation;
+    let scope = state.scope;
     let receiver_budget_override = state.receiver_budget_override;
     let access_mode = state.access_mode;
     let retained_value_census = state.retained_value_census.clone();
@@ -822,6 +830,8 @@ pub(super) fn execute_parallel_seed_union(
                     // steps execute later against the parent workspace state.
                     workspace: None,
                     cancellation,
+                    scope,
+                    step_outputs: vec![0; plan.node_count()],
                     receiver_budget_override,
                     budget: base_budget,
                     seed_cache: HashMap::default(),

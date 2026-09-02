@@ -71,8 +71,17 @@ test("requires the policy pack and at least one policy from a successful MCP cal
     result: {
       isError: false,
       structuredContent: {
-        id: "bifrost.code-smells",
-        policies: [{ id: "bifrost.correctness.dynamic-evaluation" }],
+        schema_version: 1,
+        packs: [
+          {
+            id: "bifrost.code-smells",
+            policies: [{ id: "bifrost.correctness.dynamic-evaluation" }],
+          },
+          {
+            id: "bifrost.security",
+            policies: [{ id: "bifrost.security.java.servlet-parameter-to-jdbc" }],
+          },
+        ],
       },
     },
   };
@@ -82,8 +91,8 @@ test("requires the policy pack and at least one policy from a successful MCP cal
     /MCP error/u,
   );
   assert.throws(
-    () => assertPolicyCatalog({ result: { isError: false, structuredContent: { id: "bifrost.code-smells", policies: [] } } }, "Claude"),
-    /no policies/u,
+    () => assertPolicyCatalog({ result: { isError: false, structuredContent: { schema_version: 1, packs: [{ id: "bifrost.code-smells", policies: [] }] } } }, "Claude"),
+    /wrong policy catalog envelope|no security policies/u,
   );
 });
 

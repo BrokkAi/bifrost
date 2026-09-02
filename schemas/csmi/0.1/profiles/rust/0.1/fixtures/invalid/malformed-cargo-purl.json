@@ -1,0 +1,8 @@
+{
+  "kind": "crate-target",
+  "packagePurl": "pkg:cargo/acme-codec",
+  "targetKind": "lib",
+  "targetName": "acme-codec",
+  "crateName": "acme_codec",
+  "compilationRole": "target"
+}

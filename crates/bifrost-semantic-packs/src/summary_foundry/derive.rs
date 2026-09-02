@@ -491,7 +491,9 @@ fn foundry_selector(selector: &ValueFlowSelectorKey) -> FoundrySelector {
                 .unwrap_or_default()
                 .to_owned(),
         },
-        ValueFlowSelectorKey::ExactIndex(_) => FoundrySelector::ExactIndex,
+        ValueFlowSelectorKey::ExactIndex(_) | ValueFlowSelectorKey::ConstantIndex(_) => {
+            FoundrySelector::ExactIndex
+        }
         ValueFlowSelectorKey::AnyIndex => FoundrySelector::AnyIndex,
     }
 }

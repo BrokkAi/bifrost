@@ -553,6 +553,7 @@ def run(value: MissingType = missing_default):
         );
     }
 
+    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
     #[test]
     fn python_semantic_diagnostics_check_attribute_receiver_but_not_unproven_member() {
         let fixture = fixture(&[(
@@ -608,6 +609,7 @@ def run(value):
         );
     }
 
+    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
     #[test]
     fn python_semantic_diagnostics_resolve_builtins() {
         let fixture = fixture(&[(

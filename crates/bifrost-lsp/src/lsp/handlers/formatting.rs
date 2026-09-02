@@ -22,6 +22,15 @@ const MAX_ERROR_OUTPUT_CHARS: usize = 1_000;
 const MAX_FORMATTER_STDERR_BYTES: usize = 64 * 1024;
 const MAX_FORMATTER_STDOUT_BYTES: usize = 32 * 1024 * 1024;
 const FORMATTER_TIMEOUT: Duration = Duration::from_secs(30);
+/// Ceiling on what an editor waits for one on-type formatting trigger.
+///
+/// On-type formatting answers a keystroke, so it must never make the author
+/// wait the way an explicit whole-document format may. Only the pure,
+/// in-process S-expression formatters run on type, and they cannot be
+/// preempted, so this budget bounds the wait rather than the work: a trigger
+/// that has produced nothing by the deadline is answered with no edits and
+/// its late result is discarded.
+pub(crate) const ON_TYPE_FORMATTING_BUDGET: Duration = Duration::from_millis(50);
 const RQL_LANGUAGE_ID: &str = "bifrost-rql";
 const RQL_POLICY_LANGUAGE_ID: &str = "bifrost-rql-policy";
 const RUNE_IR_LANGUAGE_ID: &str = "bifrost-rune-ir";
@@ -171,24 +180,23 @@ pub(crate) fn format_bifrost_sexp(content: &str) -> Option<String> {
     )
 }
 
-pub(crate) fn run_prepared_with_cancellation(
-    prepared: PreparedFormatting,
+/// Run the prepared formatter over its buffer. Returns `None` when the
+/// formatter left the buffer byte-for-byte unchanged, so both the
+/// whole-document and the on-type caller answer with no edits.
+pub(crate) fn format_prepared_with_cancellation(
+    prepared: &PreparedFormatting,
     cancellation: &FormatterCancellation,
-) -> Result<Vec<TextEdit>, String> {
-    let PreparedFormatting {
-        operation,
-        content,
-        line_starts,
-    } = prepared;
-    let formatted = match operation {
+) -> Result<Option<String>, String> {
+    let content = prepared.content.as_str();
+    let formatted = match &prepared.operation {
         FormattingOperation::Command(command) => {
-            run_formatter_command(&command, &content, cancellation)?
+            run_formatter_command(command, content, cancellation)?
         }
         FormattingOperation::BuiltInSexp => {
             if cancellation.is_cancelled() {
                 return Err("S-expression formatting was cancelled".to_string());
             }
-            format_bifrost_sexp(&content).unwrap_or_else(|| content.clone())
+            format_bifrost_sexp(content).unwrap_or_else(|| content.to_string())
         }
         FormattingOperation::BuiltInPolicy => {
             if cancellation.is_cancelled() {
@@ -197,12 +205,24 @@ pub(crate) fn run_prepared_with_cancellation(
             // Source errors here mean that the editor buffer is incomplete or
             // syntactically invalid. Preserve it byte-for-byte and return no
             // edits while the author is still typing.
-            format_rqlp_source(&content).unwrap_or_else(|_| content.clone())
+            format_rqlp_source(content).unwrap_or_else(|_| content.to_string())
         }
     };
-    if formatted == content {
+    Ok((formatted != content).then_some(formatted))
+}
+
+pub(crate) fn run_prepared_with_cancellation(
+    prepared: PreparedFormatting,
+    cancellation: &FormatterCancellation,
+) -> Result<Vec<TextEdit>, String> {
+    let Some(formatted) = format_prepared_with_cancellation(&prepared, cancellation)? else {
         return Ok(Vec::new());
-    }
+    };
+    let PreparedFormatting {
+        content,
+        line_starts,
+        ..
+    } = prepared;
     let range = byte_range_to_lsp_range(
         &content,
         &line_starts,

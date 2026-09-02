@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "id": "bifrost.code-smells",
-  "version": "2.6.0",
+  "version": "2.10.0",
   "name": "Bifrost code smells",
   "description": "Curated structured RQLP checks for bug-prone and potentially expensive source patterns.",
   "policies": [
@@ -38,9 +38,28 @@
       "remediation": "Use a data-only format, then validate the decoded schema before use."
     },
     {
-      "path": "policies/go-result-used-before-success-check.rqlp",
-      "id": "bifrost.correctness.go-result-used-before-success-check",
-      "semantic_hash": "8723231e67bb0d77dbee1736c2b44ab0a598170e1e0d5c5c46f688dac1a48bbb",
+      "path": "policies/go-data-race.rqlp",
+      "id": "bifrost.correctness.go-data-race",
+      "semantic_hash": "dde932e5e433d813cfd60d5bafcbe8b4a1728496b92f04845229b9263b965424",
+      "category": "correctness",
+      "supported_languages": [
+        "go"
+      ],
+      "required_capabilities": [
+        "structural-match",
+        "normalized-concurrent-spawn",
+        "concurrent-access-conflicts",
+        "canonical-workspace-dispatch",
+        "heap-location-identity",
+        "reviewed-concurrency-models"
+      ],
+      "severity_rationale": "Two exact conflicting accesses without ordering or compatible protection violate Go's data-race-free execution contract and can produce undefined program behavior.",
+      "remediation": "Order the accesses with a channel or completed task group, protect both accesses with the same compatible mutex, use an appropriate atomic operation consistently, or stop sharing the location."
+    },
+    {
+      "path": "policies/go-nil-dereference.rqlp",
+      "id": "bifrost.correctness.go-nil-dereference",
+      "semantic_hash": "1ba11d2cee5c025a03683f037e07509ab70752b058710bcba350d050a7ba78a0",
       "category": "correctness",
       "supported_languages": [
         "go"
@@ -51,11 +70,32 @@
         "conditional-result-contracts",
         "operation-precondition-contracts",
         "result-contract-operation-uses",
+        "procedure-local-scalar-refinement",
+        "nilness-operations",
         "reaching-definitions",
         "guard-dominance"
       ],
-      "severity_rationale": "Using a success-gated result for an operation that requires a valid value before its reviewed success condition is proved can panic on the API's failure path.",
-      "remediation": "Establish the reviewed success condition before operations that require a valid result: check a paired error for nil, or check a directly nullable result for non-nil. Reviewed nil-tolerant operations need no such guard."
+      "severity_rationale": "Dereferencing a value that is nil on one or every reachable local path can panic, including a success-gated API result used before its reviewed condition is established.",
+      "remediation": "Prove the pointer non-nil before the operation, return from the nil path, or establish the API's reviewed success condition before using its result."
+    },
+    {
+      "path": "policies/go-wrong-error-on-failure-path.rqlp",
+      "id": "bifrost.correctness.go-wrong-error-on-failure-path",
+      "semantic_hash": "2e83c5bd2b4ad34ec4d9b5c1919c233728a231cb04ffa83deae4b7e67447b869",
+      "category": "correctness",
+      "supported_languages": [
+        "go"
+      ],
+      "required_capabilities": [
+        "structural-match",
+        "canonical-external-dispatch",
+        "conditional-result-contracts",
+        "result-contract-failure-uses",
+        "reaching-definitions",
+        "failure-edge-control"
+      ],
+      "severity_rationale": "Returning an error-construction call that receives a different, provably nil error binding on an exact API failure path can hide the actual cause and may itself return nil.",
+      "remediation": "Pass the reviewed API's exact failure result to the returned error-construction call, or deliberately establish and use a separate non-nil error."
     },
     {
       "path": "policies/loop-invariant-sort.rqlp",
@@ -82,7 +122,7 @@
     {
       "path": "policies/regex-compile-in-loop.rqlp",
       "id": "bifrost.performance.regex-compile-in-loop",
-      "semantic_hash": "cb9b5314f1b50b94e60243d1be67167973800445ece29158efaf85953ba675b5",
+      "semantic_hash": "c7347566fe5db86bf385d136b9585da5be6f8e3e8f4ef57922aadd22b306b165",
       "category": "performance",
       "supported_languages": [
         "python",
@@ -94,7 +134,9 @@
       "required_capabilities": [
         "structural-match",
         "declaration-bounded-containment",
-        "normalized-call-roles"
+        "normalized-call-roles",
+        "lexical-environment",
+        "origin-shape-assertion"
       ],
       "severity_rationale": "Compiling the same regular expression repeatedly adds avoidable parser and automaton construction work.",
       "remediation": "Compile loop-invariant expressions once and reuse the compiled pattern."
@@ -124,7 +166,7 @@
     {
       "path": "policies/serialization-in-loop.rqlp",
       "id": "bifrost.performance.serialization-in-loop",
-      "semantic_hash": "46827db52fc424b572e7ce5ca1d4e92183f3a02852062ee3f61f0b1decfee08c",
+      "semantic_hash": "aa047adba257c80f10812f857e4fd647344dab04d60ba1935f2fc4b13bf2e74c",
       "category": "performance",
       "supported_languages": [
         "python",
@@ -136,7 +178,9 @@
       "required_capabilities": [
         "structural-match",
         "declaration-bounded-containment",
-        "normalized-call-roles"
+        "normalized-call-roles",
+        "lexical-environment",
+        "origin-shape-assertion"
       ],
       "severity_rationale": "Repeated serialization can dominate loops through traversal, encoding, and allocation.",
       "remediation": "Move loop-invariant serialization out of the loop or batch records into one encoder call."
@@ -166,7 +210,7 @@
     {
       "path": "policies/database-call-in-loop.rqlp",
       "id": "bifrost.performance.database-call-in-loop",
-      "semantic_hash": "d8bf2d58accabcbe3d7aa818befcaba8e6673b1a3e88dad8ce6f85664125160a",
+      "semantic_hash": "f184707c0021d42dde7e6c4a77985a3854e5b7db970ec30ff109856ebd74da21",
       "category": "performance",
       "supported_languages": [
         "python",
@@ -177,7 +221,9 @@
       "required_capabilities": [
         "structural-match",
         "declaration-bounded-containment",
-        "normalized-call-roles"
+        "normalized-call-roles",
+        "lexical-environment",
+        "origin-shape-assertion"
       ],
       "severity_rationale": "A database round trip per iteration is a common N+1 query pattern.",
       "remediation": "Batch the operation, prefetch required rows, or use one set-oriented query."
@@ -185,7 +231,7 @@
     {
       "path": "policies/network-call-in-loop.rqlp",
       "id": "bifrost.performance.network-call-in-loop",
-      "semantic_hash": "a9c51b5e2174fd0b0c857e8f5ca308244dd73be7dea795b8f744f30420a18b0d",
+      "semantic_hash": "b48032b76b82c4c449aa2d2fa45aff95b36350314e4cbcefd6f4ed86de47cd83",
       "category": "performance",
       "supported_languages": [
         "python",
@@ -197,7 +243,9 @@
       "required_capabilities": [
         "structural-match",
         "declaration-bounded-containment",
-        "normalized-call-roles"
+        "normalized-call-roles",
+        "lexical-environment",
+        "origin-shape-assertion"
       ],
       "severity_rationale": "A serial network request per iteration amplifies latency and remote-service load.",
       "remediation": "Batch requests, prefetch data, or use explicitly bounded concurrency with backpressure."
@@ -205,7 +253,7 @@
     {
       "path": "policies/subprocess-in-loop.rqlp",
       "id": "bifrost.performance.subprocess-in-loop",
-      "semantic_hash": "ccc37c69280619685934cd92c7f3b6a795d830b9b695a3d2885dd3a7eb53fed8",
+      "semantic_hash": "0c264195a730138def1054723dffb3ec40ad13a0bc7c3bb7b74b72ea5996fd37",
       "category": "performance",
       "supported_languages": [
         "python",
@@ -216,7 +264,9 @@
       "required_capabilities": [
         "structural-match",
         "declaration-bounded-containment",
-        "normalized-call-roles"
+        "normalized-call-roles",
+        "lexical-environment",
+        "origin-shape-assertion"
       ],
       "severity_rationale": "Process creation is expensive and repeated launches can exhaust OS resources.",
       "remediation": "Move invariant work outside the loop, use one long-lived process, or batch subprocess input."
@@ -224,7 +274,7 @@
     {
       "path": "policies/sleep-in-loop.rqlp",
       "id": "bifrost.performance.sleep-in-loop",
-      "semantic_hash": "b0319247b09cacb3e1b43e0b3809f7b2ba6858a5522ba6de7bf3a7b8212901ad",
+      "semantic_hash": "16b1be4131f57ee9dff8c34d8a083241bbfbd0992cc0a6e215e9b142d7e551ab",
       "category": "performance",
       "supported_languages": [
         "python",
@@ -234,7 +284,9 @@
       "required_capabilities": [
         "structural-match",
         "declaration-bounded-containment",
-        "normalized-call-roles"
+        "normalized-call-roles",
+        "lexical-environment",
+        "origin-shape-assertion"
       ],
       "severity_rationale": "Sleeping for every iterated item throttles the whole batch in lockstep.",
       "remediation": "Prefer rate limiters or batching over per-item sleeps; keep deliberate poll and backoff sleeps in condition-controlled loops, which this rule does not flag."
@@ -242,7 +294,7 @@
     {
       "path": "policies/expensive-operation-in-nested-loop.rqlp",
       "id": "bifrost.performance.expensive-operation-in-nested-loop",
-      "semantic_hash": "64230279b7ca5fc6dcf52b3b34d99a2b56eecedef3b6bca33d03fbcb0a68a591",
+      "semantic_hash": "2bf75d3cc91deae0675196ee82c530b82f96096430aeafa2a2642faf7583bbc5",
       "category": "performance",
       "supported_languages": [
         "python",
@@ -254,7 +306,9 @@
       "required_capabilities": [
         "structural-match",
         "descendant-match",
-        "normalized-call"
+        "normalized-call",
+        "lexical-environment",
+        "origin-shape-assertion"
       ],
       "severity_rationale": "I/O, parsing, serialization, sorting, or remote work under two loop levels can grow multiplicatively.",
       "remediation": "Hoist invariant work, precompute indexes, batch external operations, or reduce the nested iteration space."

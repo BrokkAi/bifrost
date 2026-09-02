@@ -143,6 +143,12 @@ const LOMBOK_1_18_42_SHARDS: &[&[u8]] = &[include_bytes!(
 const GETSET_0_1_7_SHARDS: &[&[u8]] = &[include_bytes!(
     "../embedded/getset-0.1.7/shards/rust.getset.generated-getter.deflate"
 )];
+const NODE_CHILD_PROCESS_JAVASCRIPT_DECLARATION_SHARDS: &[&[u8]] = &[include_bytes!(
+    "../embedded/node-child-process-javascript-declarations/shards/declarations.child-process-exec-sync.json"
+)];
+const NODE_CHILD_PROCESS_TYPESCRIPT_DECLARATION_SHARDS: &[&[u8]] = &[include_bytes!(
+    "../embedded/node-child-process-typescript-declarations/shards/declarations.child-process-exec-sync.json"
+)];
 const GO_STDLIB_OS_SHARDS: &[&[u8]] = &[include_bytes!(
     "../embedded/go-stdlib-os/shards/go.stdlib.os.result-contracts.deflate"
 )];
@@ -153,7 +159,7 @@ const GO_STDLIB_ERRORS_SHARDS: &[&[u8]] = &[include_bytes!(
     "../embedded/go-stdlib-errors/shards/go.stdlib.errors.conditional-result-refinements.json"
 )];
 const GO_STDLIB_ERRORS_DECLARATION_SHARDS: &[&[u8]] = &[include_bytes!(
-    "../embedded/go-stdlib-errors-declarations/shards/go.stdlib.errors.declarations.json"
+    "../embedded/go-stdlib-errors-declarations/shards/go.stdlib.errors.declarations.deflate"
 )];
 const GO_STDLIB_LOG_SHARDS: &[&[u8]] = &[include_bytes!(
     "../embedded/go-stdlib-log/shards/go.stdlib.log.normal-continuation.deflate"
@@ -199,6 +205,24 @@ const GO_STDLIB_TESTING_SHARDS: &[&[u8]] = &[
         "../embedded/go-stdlib-testing/shards/go.stdlib.testing.normal-continuation.deflate"
     ),
 ];
+const GO_CONCURRENCY_SHARDS: &[&[u8]] = &[
+    include_bytes!("../embedded/go-concurrency/shards/go.concurrency.errgroup.deflate"),
+    include_bytes!("../embedded/go-concurrency/shards/go.concurrency.sync.deflate"),
+];
+const GO_CONCURRENCY_DECLARATION_SHARDS: &[&[u8]] = &[
+    include_bytes!(
+        "../embedded/go-concurrency-declarations/shards/go.concurrency.errgroup.declarations.deflate"
+    ),
+    include_bytes!(
+        "../embedded/go-concurrency-declarations/shards/go.concurrency.sync.declarations.deflate"
+    ),
+];
+const GO_STDLIB_SYNC_ATOMIC_SHARDS: &[&[u8]] = &[include_bytes!(
+    "../embedded/go-stdlib-sync-atomic/shards/go.stdlib.sync-atomic.concurrency.deflate"
+)];
+const GO_STDLIB_SYNC_ATOMIC_DECLARATION_SHARDS: &[&[u8]] = &[include_bytes!(
+    "../embedded/go-stdlib-sync-atomic-declarations/shards/go.stdlib.sync-atomic.declarations.deflate"
+)];
 const GO_TESTIFY_REQUIRE_SHARDS: &[&[u8]] = &[include_bytes!(
     "../embedded/go-testify-require/shards/go.testify.require.normal-return-refinements.json"
 )];
@@ -227,6 +251,16 @@ const BIFROST_EMBEDDED_PACK_ENTRIES: &[EmbeddedSemanticPack<'static>] = &[
         "bifrost.rust.getset@1.0.0",
         include_bytes!("../embedded/getset-0.1.7/manifest.json"),
         GETSET_0_1_7_SHARDS,
+    ),
+    EmbeddedSemanticPack::new(
+        "bifrost.node-child-process-javascript-declarations@0.2.0",
+        include_bytes!("../embedded/node-child-process-javascript-declarations/manifest.json"),
+        NODE_CHILD_PROCESS_JAVASCRIPT_DECLARATION_SHARDS,
+    ),
+    EmbeddedSemanticPack::new(
+        "bifrost.node-child-process-typescript-declarations@0.2.0",
+        include_bytes!("../embedded/node-child-process-typescript-declarations/manifest.json"),
+        NODE_CHILD_PROCESS_TYPESCRIPT_DECLARATION_SHARDS,
     ),
     EmbeddedSemanticPack::new(
         "bifrost.go.stdlib.os@1.0.0",
@@ -312,6 +346,26 @@ const BIFROST_EMBEDDED_PACK_ENTRIES: &[EmbeddedSemanticPack<'static>] = &[
         "bifrost.go.stdlib.testing@1.0.0",
         include_bytes!("../embedded/go-stdlib-testing/manifest.json"),
         GO_STDLIB_TESTING_SHARDS,
+    ),
+    EmbeddedSemanticPack::new(
+        "bifrost.go.concurrency@1.0.0",
+        include_bytes!("../embedded/go-concurrency/manifest.json"),
+        GO_CONCURRENCY_SHARDS,
+    ),
+    EmbeddedSemanticPack::new(
+        "bifrost.go.concurrency-declarations@1.0.0",
+        include_bytes!("../embedded/go-concurrency-declarations/manifest.json"),
+        GO_CONCURRENCY_DECLARATION_SHARDS,
+    ),
+    EmbeddedSemanticPack::new(
+        "bifrost.go.stdlib.sync-atomic@1.0.0",
+        include_bytes!("../embedded/go-stdlib-sync-atomic/manifest.json"),
+        GO_STDLIB_SYNC_ATOMIC_SHARDS,
+    ),
+    EmbeddedSemanticPack::new(
+        "bifrost.go.stdlib.sync-atomic-declarations@1.0.0",
+        include_bytes!("../embedded/go-stdlib-sync-atomic-declarations/manifest.json"),
+        GO_STDLIB_SYNC_ATOMIC_DECLARATION_SHARDS,
     ),
     EmbeddedSemanticPack::new(
         "bifrost.go.testify.require@1.0.0",
@@ -401,13 +455,15 @@ mod tests {
     use std::time::Duration;
 
     use brokk_bifrost_analysis::analyzer::semantic_model::{
-        CatalogCoordinate, CatalogOptions, CompiledConditionalResultRefinement,
+        CatalogCoordinate, CatalogOptions, CompiledConcurrencyEffect,
+        CompiledConditionalIndirectWrite, CompiledConditionalResultRefinement,
         CompiledDeclaredEffect, CompiledDeclaredEffectCertainty, CompiledDeclaredEffectTiming,
-        CompiledNormalReturnRefinement, CompiledOperationPrecondition,
+        CompiledIndirectWriteTarget, CompiledNormalReturnRefinement, CompiledOperationPrecondition,
         CompiledPredicateProofEffect, CompiledResultMemberContract, CompiledResultPredicate,
-        CompiledSummaryEffect, CompiledSummaryInput, CompiledSummaryOutput, CompilerOptions,
-        Completeness, DependencyDiscoveryOutcome, DependencyPackLimits, DurablePackSource,
-        DurablePackSourceKind, Locator, MemberIdentity, MemberKind, ProcedureSummaryMemberKey,
+        CompiledSummaryEffect, CompiledSummaryExitKind, CompiledSummaryInput,
+        CompiledSummaryOutput, CompiledSummaryTransfer, CompilerOptions, Completeness,
+        DependencyDiscoveryOutcome, DependencyPackLimits, DurablePackSource, DurablePackSourceKind,
+        Locator, MemberIdentity, MemberKind, ProcedureSummaryMemberKey,
         SemanticModelActivationEvidence, SemanticModelActivationRequest,
         SemanticModelMatchDisposition, SemanticModelRuntimeLimits, SemanticModelRuntimeOutcome,
         SemanticPackSelectorQuery, SourceFormat, TypeIdentity, TypeKind, TypeRef,
@@ -429,7 +485,7 @@ mod tests {
     use super::*;
 
     const PACK_SOURCE: &[u8] = br#"{
-      "schema_version": 1,
+      "schema_version": 2,
       "pack_id": "bifrost.fixture.embedded",
       "version": "1.0.0",
       "producer": { "name": "bifrost-fixture", "version": "1.0.0" },
@@ -545,6 +601,231 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
+        let concurrency = decoded
+            .iter()
+            .find(|pack| pack.manifest.pack_id == "bifrost.go.concurrency")
+            .expect("the reviewed Go concurrency pack ships");
+        let sync = concurrency
+            .shards
+            .iter()
+            .find(|shard| shard.descriptor.shard_id == "go.concurrency.sync")
+            .expect("the Go concurrency pack carries its sync shard");
+        let sync = decode_shard_for_manifest(
+            &concurrency.manifest,
+            &sync.descriptor,
+            &sync.bytes,
+            &DecodeLimits::default(),
+        )
+        .expect("the Go sync shard decodes");
+        let summaries = sync
+            .payload()
+            .procedure_summaries()
+            .expect("the Go sync shard carries procedure summaries");
+        assert_eq!(summaries.len(), 28);
+        assert!(summaries.iter().any(|summary| {
+            summary.id == "context.context.done"
+                && summary.transfers
+                    == [CompiledSummaryTransfer {
+                        input: CompiledSummaryInput::Receiver {},
+                        exit_kind: CompiledSummaryExitKind::Normal,
+                        output: CompiledSummaryOutput::NormalReturn {},
+                    }]
+        }));
+        assert!(summaries.iter().any(|summary| {
+            summary.id == "sync.waitgroup.go"
+                && matches!(
+                    summary.concurrency_effects.as_slice(),
+                    [CompiledConcurrencyEffect::TaskSpawn { .. }]
+                )
+        }));
+        let mut unsupported_sync_protocols = summaries
+            .iter()
+            .flat_map(|summary| &summary.concurrency_effects)
+            .filter_map(|effect| match effect {
+                CompiledConcurrencyEffect::Unsupported { protocol } => Some(protocol.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        unsupported_sync_protocols.sort_unstable();
+        unsupported_sync_protocols.dedup();
+        assert_eq!(
+            unsupported_sync_protocols,
+            [
+                "sync.Cond",
+                "sync.Map",
+                "sync.Mutex.TryLock",
+                "sync.Once",
+                "sync.RWMutex.TryLock",
+                "sync.RWMutex.TryRLock",
+            ]
+        );
+
+        let errgroup = concurrency
+            .shards
+            .iter()
+            .find(|shard| shard.descriptor.shard_id == "go.concurrency.errgroup")
+            .expect("the Go concurrency pack carries its errgroup shard");
+        let errgroup = decode_shard_for_manifest(
+            &concurrency.manifest,
+            &errgroup.descriptor,
+            &errgroup.bytes,
+            &DecodeLimits::default(),
+        )
+        .expect("the Go errgroup shard decodes");
+        let errgroup = errgroup
+            .payload()
+            .procedure_summaries()
+            .expect("the Go errgroup shard carries procedure summaries");
+        assert_eq!(errgroup.len(), 4);
+        assert!(errgroup.iter().any(|summary| {
+            summary.id == "errgroup.group.try-go"
+                && matches!(
+                    summary.concurrency_effects.as_slice(),
+                    [
+                        CompiledConcurrencyEffect::TaskSpawn { .. },
+                        CompiledConcurrencyEffect::Unsupported { protocol },
+                    ] if protocol == "errgroup.Group.TryGo"
+                )
+        }));
+        assert!(summaries.iter().any(|summary| {
+            summary.id == "sync.once.do"
+                && matches!(
+                    summary.concurrency_effects.as_slice(),
+                    [CompiledConcurrencyEffect::Unsupported { protocol }]
+                        if protocol == "sync.Once"
+                )
+        }));
+
+        let concurrency_declarations = decoded
+            .iter()
+            .find(|pack| pack.manifest.pack_id == "bifrost.go.concurrency-declarations")
+            .expect("the reviewed Go concurrency declaration pack ships");
+        assert_eq!(
+            concurrency_declarations.manifest.completeness,
+            Completeness::Partial
+        );
+        assert_eq!(concurrency_declarations.shards.len(), 2);
+        let mut declaration_type_count = 0;
+        let mut declaration_member_count = 0;
+        for artifact in &concurrency_declarations.shards {
+            let shard = decode_shard_for_manifest(
+                &concurrency_declarations.manifest,
+                &artifact.descriptor,
+                &artifact.bytes,
+                &DecodeLimits::default(),
+            )
+            .expect("a Go concurrency declaration shard decodes");
+            let (types, members, relations) = shard
+                .payload()
+                .declaration_facts()
+                .expect("a Go concurrency declaration shard carries declaration facts");
+            assert!(relations.is_empty());
+            for fact in types {
+                assert_eq!(
+                    fact.id,
+                    type_declaration_id(TypeIdentity {
+                        ecosystem: "go",
+                        name: &fact.name,
+                    }),
+                    "the authored concurrency type ID uses the canonical Go identity"
+                );
+            }
+            for member in members {
+                let signature = member
+                    .signature
+                    .as_ref()
+                    .unwrap_or_else(|| panic!("{} has a structured signature", member.name));
+                let parameter_types = signature
+                    .parameters
+                    .iter()
+                    .map(|parameter| parameter.r#type.clone())
+                    .collect::<Vec<_>>();
+                let parameter_variadics = signature
+                    .parameters
+                    .iter()
+                    .map(|parameter| parameter.variadic)
+                    .collect::<Vec<_>>();
+                let expected = member_declaration_id(MemberIdentity {
+                    owner_id: &member.owner,
+                    kind: member.member_kind,
+                    is_static: member.is_static,
+                    parameter_arity: parameter_types.len(),
+                    name: &member.name,
+                    generic_arity: signature.type_parameters.len(),
+                    parameter_types: &parameter_types,
+                    parameter_variadics: &parameter_variadics,
+                    return_type: signature.returns.as_ref(),
+                });
+                assert_eq!(
+                    member.id, expected,
+                    "the authored concurrency member ID uses the canonical Go identity"
+                );
+            }
+            declaration_type_count += types.len();
+            declaration_member_count += members.len();
+        }
+        assert_eq!(declaration_type_count, 11);
+        assert_eq!(declaration_member_count, 32);
+
+        let atomic = decoded
+            .iter()
+            .find(|pack| pack.manifest.pack_id == "bifrost.go.stdlib.sync-atomic")
+            .expect("the reviewed Go sync/atomic pack ships");
+        let atomic = decode_shard_for_manifest(
+            &atomic.manifest,
+            &atomic.shards[0].descriptor,
+            &atomic.shards[0].bytes,
+            &DecodeLimits::default(),
+        )
+        .expect("the Go sync/atomic shard decodes");
+        let atomic = atomic
+            .payload()
+            .procedure_summaries()
+            .expect("the Go sync/atomic shard carries procedure summaries");
+        assert_eq!(atomic.len(), 86, "the active exported surface is complete");
+        assert!(atomic.iter().all(|summary| {
+            matches!(
+                summary.concurrency_effects.as_slice(),
+                [CompiledConcurrencyEffect::Atomic { .. }]
+            )
+        }));
+
+        let atomic_declaration_pack = decoded
+            .iter()
+            .find(|pack| pack.manifest.pack_id == "bifrost.go.stdlib.sync-atomic-declarations")
+            .expect("the reviewed Go sync/atomic declaration pack ships");
+        assert_eq!(
+            atomic_declaration_pack.manifest.completeness,
+            Completeness::Partial
+        );
+        let [atomic_declarations] = atomic_declaration_pack.shards.as_slice() else {
+            panic!("the Go sync/atomic declaration pack has one shard");
+        };
+        let atomic_declarations = decode_shard_for_manifest(
+            &atomic_declaration_pack.manifest,
+            &atomic_declarations.descriptor,
+            &atomic_declarations.bytes,
+            &DecodeLimits::default(),
+        )
+        .expect("the Go sync/atomic declaration shard decodes");
+        let (atomic_types, atomic_members, atomic_relations) = atomic_declarations
+            .payload()
+            .declaration_facts()
+            .expect("the Go sync/atomic declaration shard carries declaration facts");
+        assert_eq!(atomic_types.len(), 9);
+        assert_eq!(atomic_members.len(), 86);
+        assert!(atomic_relations.is_empty());
+        for fact in atomic_types {
+            assert_eq!(
+                fact.id,
+                type_declaration_id(TypeIdentity {
+                    ecosystem: "go",
+                    name: &fact.name,
+                }),
+                "the generated sync/atomic type ID uses the canonical Go identity"
+            );
+        }
+
         for pack_id in [
             "bifrost.go.stdlib.os-declarations",
             "bifrost.go.stdlib.errors-declarations",
@@ -639,10 +920,10 @@ mod tests {
             .procedure_summaries()
             .expect("the Go shard carries procedure summaries");
 
-        assert_eq!(go.manifest.provenance.source, "https://pkg.go.dev/os");
+        assert_eq!(go.manifest.provenance.source, "https://go.dev/src/os/");
         assert_eq!(go.manifest.provenance.revision.as_deref(), Some("go1.26.0"));
 
-        assert_eq!(summaries.len(), 9);
+        assert_eq!(summaries.len(), 10);
         let exit = summaries
             .iter()
             .find(|summary| summary.id == "os.exit")
@@ -699,10 +980,21 @@ mod tests {
             &DecodeLimits::default(),
         )
         .expect("the Go os declaration shard decodes");
-        let (_, members, _) = shard
+        let (types, members, _) = shard
             .payload()
             .declaration_facts()
             .expect("the Go os declaration shard carries declaration facts");
+        let exit_error = types
+            .iter()
+            .find(|r#type| r#type.name == "os/exec.ExitError")
+            .expect("the os declaration pack carries os/exec.ExitError");
+        assert_eq!(
+            exit_error.id,
+            type_declaration_id(TypeIdentity {
+                ecosystem: "go",
+                name: "os/exec.ExitError",
+            })
+        );
         let matching = members
             .iter()
             .filter(|member| member.name == "IsNotExist")
@@ -805,6 +1097,44 @@ mod tests {
         assert_eq!(file_stat.target.symbol, "os.File.Stat()");
         assert!(file_stat.target.has_receiver);
         assert_eq!(file_stat.target.parameter_count, 0);
+
+        let exit_code = summaries
+            .iter()
+            .find(|summary| summary.id == "os-exec.exit-error-exit-code")
+            .expect("the receiver-sensitive ExitError.ExitCode summary is present");
+        assert_eq!(exit_code.target.symbol, "os/exec.ExitError.ExitCode()");
+        assert!(exit_code.target.has_receiver);
+        assert_eq!(exit_code.target.parameter_count, 0);
+        assert_eq!(
+            exit_code.preconditions,
+            Some(vec![CompiledOperationPrecondition {
+                input: CompiledSummaryInput::Receiver {},
+                predicate: CompiledResultPredicate::NonNull,
+            }])
+        );
+        let exit_code_declaration = members
+            .iter()
+            .find(|member| member.name == "ExitCode")
+            .expect("the os declaration pack carries ExitError.ExitCode");
+        assert_eq!(exit_code_declaration.owner, exit_error.id);
+        let signature = exit_code_declaration
+            .signature
+            .as_ref()
+            .expect("ExitError.ExitCode has a signature");
+        assert_eq!(
+            exit_code_declaration.id,
+            member_declaration_id(MemberIdentity {
+                owner_id: &exit_code_declaration.owner,
+                kind: exit_code_declaration.member_kind,
+                is_static: exit_code_declaration.is_static,
+                parameter_arity: signature.parameters.len(),
+                name: &exit_code_declaration.name,
+                generic_arity: signature.type_parameters.len(),
+                parameter_types: &[],
+                parameter_variadics: &[],
+                return_type: signature.returns.as_ref(),
+            })
+        );
 
         let receiver_non_null = || {
             Some(vec![CompiledOperationPrecondition {
@@ -941,9 +1271,10 @@ mod tests {
             .payload()
             .procedure_summaries()
             .expect("the Go errors shard carries procedure summaries");
-        let [errors_is] = summaries else {
-            panic!("the Go errors pack must carry only errors.Is: {summaries:#?}");
-        };
+        let errors_is = summaries
+            .iter()
+            .find(|summary| summary.id == "errors.is")
+            .unwrap_or_else(|| panic!("the Go errors pack must carry errors.Is: {summaries:#?}"));
         assert_eq!(errors_is.target.symbol, "errors.Is(err, target error)");
         assert!(!errors_is.target.has_receiver);
         assert_eq!(errors_is.target.parameter_count, 2);
@@ -956,6 +1287,23 @@ mod tests {
                 parameter_ordinal: 0,
                 predicate: CompiledResultPredicate::Null,
                 proof_effect: CompiledPredicateProofEffect::DoesNotEstablish,
+            }]
+        );
+        let errors_as = summaries
+            .iter()
+            .find(|summary| summary.id == "errors.as")
+            .unwrap_or_else(|| panic!("the Go errors pack must carry errors.As: {summaries:#?}"));
+        assert_eq!(errors_as.target.symbol, "errors.As(err error, target any)");
+        assert!(!errors_as.target.has_receiver);
+        assert_eq!(errors_as.target.parameter_count, 2);
+        assert_eq!(errors_as.normal_result_count, Some(1));
+        assert_eq!(
+            errors_as.conditional_indirect_writes,
+            [CompiledConditionalIndirectWrite {
+                result_ordinal: 0,
+                outcome: true,
+                parameter_ordinal: 1,
+                target: CompiledIndirectWriteTarget::Pointee,
             }]
         );
 
@@ -2617,7 +2965,10 @@ func methodExpression(t *testing.T) {
     fn activated_go_os_pack_binds_fd_only_to_the_reviewed_file_receiver() {
         let source = r#"package sample
 
-import "os"
+import (
+    "os"
+    "os/exec"
+)
 
 type localFile struct{}
 
@@ -2626,7 +2977,8 @@ func (*localFile) Fd() uintptr { return 0 }
 func calls(local *localFile) uintptr {
     file, _ := os.Open("sample.txt")
     descriptor := file.Fd()
-    return descriptor + local.Fd()
+    exitCode := uintptr((&exec.ExitError{}).ExitCode())
+    return descriptor + local.Fd() + exitCode
 }
 "#;
         let project = InlineTestProject::with_language(Language::Go)
@@ -2678,7 +3030,7 @@ func calls(local *localFile) uintptr {
             .structural_facts(&file)
             .expect("Go structural facts");
         let shapes = call_shapes_in_file(&facts, &file, usize::MAX);
-        assert_eq!(shapes.len(), 3, "fixture contains three calls: {shapes:#?}");
+        assert_eq!(shapes.len(), 5, "fixture contains five calls: {shapes:#?}");
         let source: Arc<str> = Arc::from(source);
         let lookups = shapes
             .iter()
@@ -2717,6 +3069,20 @@ func calls(local *localFile) uintptr {
         assert!(arm.key.has_receiver);
         assert_eq!(arm.key.parameter_count, 0);
         assert_eq!(arm.origin, ModeledCallTargetOrigin::UnmaterializedExternal);
+
+        let exit_code = &lookups["(&exec.ExitError{}).ExitCode()"];
+        assert_eq!(exit_code.coverage, ModeledCallTargetCoverage::Exhaustive);
+        assert_eq!(
+            exit_code.call_application,
+            ModeledCallApplication::BoundReceiver
+        );
+        let [arm] = exit_code.arms.as_slice() else {
+            panic!("one exact external arm for (*exec.ExitError).ExitCode: {exit_code:#?}");
+        };
+        assert_eq!(arm.key.owner, "os/exec.ExitError");
+        assert_eq!(arm.key.member, "ExitCode");
+        assert!(arm.key.has_receiver);
+        assert_eq!(arm.key.parameter_count, 0);
 
         let near_miss = &lookups["local.Fd()"];
         assert_eq!(

@@ -9,6 +9,7 @@ use sha2::{Digest, Sha256};
 
 use super::{
     ActivationSelector, CatalogCoordinate, CatalogMiss, CatalogPackSourceKind,
+    CompiledConcurrencyEffect, CompiledConditionalIndirectWrite,
     CompiledConditionalResultRefinement, CompiledDeclaredEffect, CompiledNormalReturnRefinement,
     CompiledOperationPrecondition, CompiledPackManifest, CompiledProcedureSummary,
     CompiledProcedureTarget, CompiledResultContract, CompiledShard, DeclarationGuard,
@@ -19,7 +20,7 @@ use crate::CancellationToken;
 use crate::analyzer::canonical_hash::{is_lower_sha256, parse_lower_sha256};
 use crate::analyzer::complete_value_cache::{CompleteValueAcquisition, CompleteValueCache};
 use crate::analyzer::semantic::{
-    SemanticLocator, StableDigest, UnmaterializedExternalTarget, split_qualified_member,
+    SemanticLocator, StableDigest, UnmaterializedExternalTarget, authored_procedure_target_identity,
 };
 use crate::analyzer::store::{
     AnalyzerStore, SemanticPackActivationSourceKind, SemanticPackActiveReference,
@@ -27,7 +28,7 @@ use crate::analyzer::store::{
 use crate::analyzer::{IAnalyzer, Language, LanguageDialect};
 use crate::hash::{HashMap, map_with_capacity};
 
-pub const SEMANTIC_MODEL_RUNTIME_REPRESENTATION_VERSION: u32 = 2;
+pub const SEMANTIC_MODEL_RUNTIME_REPRESENTATION_VERSION: u32 = 3;
 
 type DependencyEvidencePublication = (Box<[Language]>, super::DependencyDiscoveryEvidence);
 
@@ -201,6 +202,20 @@ pub struct ResolvedActiveSemanticModels {
     report: SemanticModelActivationReport,
 }
 
+/// Cost and retained size of the declaration overlay paired with one active
+/// semantic-model publication.
+///
+/// `publication_nanos` covers overlay construction and the wait to enter the
+/// publication critical section. It excludes work performed after the
+/// immutable snapshot is created. A cached acquisition returns the original
+/// measurement rather than timing a lookup as though it rebuilt the overlay.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SemanticModelOverlayMeasurement {
+    pub publication_nanos: u64,
+    pub retained_bytes: u64,
+}
+
 /// One immutable semantic-model publication captured under the runtime's
 /// publication lock.
 ///
@@ -211,16 +226,24 @@ pub struct ResolvedActiveSemanticModels {
 pub struct ActiveSemanticModelSnapshot {
     active_models: Arc<ResolvedActiveSemanticModels>,
     semantic_model_overlay: Option<Arc<SemanticModelOverlay>>,
+    overlay_measurement: Option<SemanticModelOverlayMeasurement>,
 }
 
 impl ActiveSemanticModelSnapshot {
     fn new(
         active_models: Arc<ResolvedActiveSemanticModels>,
         semantic_model_overlay: Option<Arc<SemanticModelOverlay>>,
+        overlay_measurement: Option<SemanticModelOverlayMeasurement>,
     ) -> Self {
+        debug_assert_eq!(
+            semantic_model_overlay.is_some(),
+            overlay_measurement.is_some(),
+            "a semantic-model overlay and its measurement are published atomically"
+        );
         Self {
             active_models,
             semantic_model_overlay,
+            overlay_measurement,
         }
     }
 
@@ -230,6 +253,10 @@ impl ActiveSemanticModelSnapshot {
 
     pub fn semantic_model_overlay(&self) -> Option<&Arc<SemanticModelOverlay>> {
         self.semantic_model_overlay.as_ref()
+    }
+
+    pub fn overlay_measurement(&self) -> Option<SemanticModelOverlayMeasurement> {
+        self.overlay_measurement
     }
 }
 
@@ -371,6 +398,47 @@ impl ResolvedActiveSemanticModels {
             target.has_receiver,
             target.parameter_count,
         )
+    }
+
+    /// Select an activated summary from an exact external declaration locator
+    /// when the resolver proves the artifact path and member declaration but
+    /// cannot publish a canonical owner FQN. Unlike member lookup, path and
+    /// the declaration segment jointly identify the authored target without
+    /// reconstructing a source spelling.
+    pub fn procedure_summaries_for_declaration(
+        &self,
+        target: ProcedureSummaryDeclarationKey<'_>,
+    ) -> ProcedureSummaryMatch<'_> {
+        let symbols = self
+            .indexes
+            .procedure_summaries_by_target
+            .get(target.language)
+            .and_then(|paths| paths.get(target.path));
+        let maximum_variadic_formals = target.parameter_count.saturating_add(1);
+        let postings = symbols.into_iter().flat_map(|symbols| {
+            symbols
+                .iter()
+                .filter(move |(symbol, _)| {
+                    authored_procedure_target_identity(target.path, symbol)
+                        .is_some_and(|(_, member)| member == target.member)
+                })
+                .flat_map(move |(_, shapes)| {
+                    shapes
+                        .fixed
+                        .get(&(target.has_receiver, target.parameter_count))
+                        .into_iter()
+                        .chain(
+                            shapes
+                                .variadic
+                                .range(
+                                    (target.has_receiver, 1)
+                                        ..=(target.has_receiver, maximum_variadic_formals),
+                                )
+                                .map(|(_, posting)| posting),
+                        )
+                })
+        });
+        resolve_procedure_postings(&self.shards, postings, procedure_declaration_claims_agree)
     }
 
     /// Whether this active set has any member whose exact matcher behavior can
@@ -518,6 +586,33 @@ pub struct ProcedureSummaryTargetKey<'a> {
     pub parameter_count: u32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ProcedureSummaryDeclarationKey<'a> {
+    pub language: &'a str,
+    pub path: &'a str,
+    pub member: &'a str,
+    pub has_receiver: bool,
+    pub parameter_count: u32,
+}
+
+impl<'a> ProcedureSummaryDeclarationKey<'a> {
+    pub fn new(
+        language: &'a str,
+        path: &'a str,
+        member: &'a str,
+        has_receiver: bool,
+        parameter_count: u32,
+    ) -> Self {
+        Self {
+            language,
+            path,
+            member,
+            has_receiver,
+            parameter_count,
+        }
+    }
+}
+
 impl<'a> ProcedureSummaryTargetKey<'a> {
     pub fn new(
         language: &'a str,
@@ -636,8 +731,11 @@ impl<'a> ActivatedProcedureSummary<'a> {
             || self.record.target.has_receiver != target.has_receiver()
             || !self.record.target.accepts_parameter_count(target.arity())
             || target.locator_for_arity(target.arity()) != *target.locator()
-            || split_qualified_member(&self.record.target.symbol)
-                != Some((target.owner_fqn(), target.member()))
+            || authored_procedure_target_identity(
+                &self.record.target.path,
+                &self.record.target.symbol,
+            )
+            .is_none_or(|(owner, member)| owner != target.owner_fqn() || member != target.member())
         {
             return None;
         }
@@ -667,6 +765,13 @@ impl<'a> ActivatedProcedureSummary<'a> {
         &self.record.declared_effects
     }
 
+    /// Reviewed task, synchronization, and atomic semantics for this exact
+    /// procedure. Inputs are formal ports that consumers project to call-site
+    /// receiver and argument values.
+    pub fn concurrency_effects(&self) -> &'a [CompiledConcurrencyEffect] {
+        &self.record.concurrency_effects
+    }
+
     /// Reviewed predicates required of this exact procedure invocation's
     /// receiver and parameters. `None` means the operation was not reviewed;
     /// `Some([])` means it was reviewed and has no input preconditions.
@@ -684,6 +789,12 @@ impl<'a> ActivatedProcedureSummary<'a> {
     /// its boolean normal results.
     pub fn conditional_result_refinements(&self) -> &'a [CompiledConditionalResultRefinement] {
         &self.record.conditional_result_refinements
+    }
+
+    /// Outcome-sensitive one-step indirect writes attributed to this
+    /// procedure's normal return.
+    pub fn conditional_indirect_writes(&self) -> &'a [CompiledConditionalIndirectWrite] {
+        &self.record.conditional_indirect_writes
     }
 
     /// Predicates this reviewed summary establishes for actual arguments on
@@ -1021,8 +1132,13 @@ impl MatcherIndexes {
                     )?;
                     // #1978: also index by canonical identity so an unmaterialized
                     // external callee -- which cannot present the authored path or
-                    // parameter-typed symbol -- can still find this summary.
-                    if let Some((owner, member)) = split_qualified_member(&summary.target.symbol) {
+                    // parameter-typed symbol -- can still find this summary. A bare
+                    // symbol is a module-level target, so its owner is the module the
+                    // authored path names (#2610).
+                    if let Some((owner, member)) = authored_procedure_target_identity(
+                        &summary.target.path,
+                        &summary.target.symbol,
+                    ) {
                         let member_key_bytes = active_shard
                             .manifest
                             .language
@@ -1035,7 +1151,7 @@ impl MatcherIndexes {
                             .procedure_summaries_by_member
                             .entry(active_shard.manifest.language.clone())
                             .or_default();
-                        let members = owners.entry(owner.to_owned()).or_default();
+                        let members = owners.entry(owner.into_owned()).or_default();
                         let shapes = members.entry(member.to_owned()).or_default();
                         insert_procedure_posting(
                             shapes,
@@ -1554,10 +1670,12 @@ fn procedure_claims_agree(
         && left.locations == right.locations
         && left.transfers == right.transfers
         && left.effects == right.effects
+        && left.concurrency_effects == right.concurrency_effects
         && left.declared_effects == right.declared_effects
         && left.preconditions == right.preconditions
         && left.result_contracts == right.result_contracts
         && left.conditional_result_refinements == right.conditional_result_refinements
+        && left.conditional_indirect_writes == right.conditional_indirect_writes
         && left.normal_return_refinements == right.normal_return_refinements
 }
 
@@ -1884,12 +2002,14 @@ impl SemanticModelRuntimeCache {
                 return Ok(Arc::clone(snapshot));
             }
         }
+        let overlay_started = Instant::now();
         let overlay = Arc::new(SemanticModelOverlay::build(
             analyzer,
             active,
             cancellation,
             max_combined_retained_bytes,
         )?);
+        let retained_bytes = overlay.retained_bytes_lower_bound();
         let mut published = self
             .published
             .lock()
@@ -1910,9 +2030,18 @@ impl SemanticModelRuntimeCache {
                 }
             }
         }
+        let overlay_measurement = SemanticModelOverlayMeasurement {
+            publication_nanos: overlay_started
+                .elapsed()
+                .as_nanos()
+                .try_into()
+                .unwrap_or(u64::MAX),
+            retained_bytes,
+        };
         let snapshot = Arc::new(ActiveSemanticModelSnapshot::new(
             Arc::clone(active),
             Some(overlay),
+            Some(overlay_measurement),
         ));
         published.snapshot = Some(Arc::clone(&snapshot));
         Ok(snapshot)
@@ -2139,6 +2268,20 @@ pub fn resolve_active_semantic_models(
         if loaded.shard.safety().review_required
             && control != Some(SemanticModelControlAction::Enable)
         {
+            // A shipped language-wide pack is an optional capability, not a
+            // rejected dependency decision for every workspace in that
+            // language. Keep it dormant and silent until a workspace names
+            // it. Coordinate-specific review gates remain visible because
+            // their matching evidence proves that the pack is relevant to a
+            // discovered dependency or toolchain.
+            if evidence_rank == EvidenceRank::Language
+                && matches!(
+                    loaded.source_kind,
+                    CatalogPackSourceKind::PreShipped | CatalogPackSourceKind::Embedded
+                )
+            {
+                continue;
+            }
             push_loaded_explanation(
                 &mut report,
                 request.limits,
@@ -2556,7 +2699,11 @@ fn runtime_outcome(
     match outcome {
         SemanticModelResolutionOutcome::Ready(active) => {
             let active = Arc::new(active);
-            let snapshot = Arc::new(ActiveSemanticModelSnapshot::new(Arc::clone(&active), None));
+            let snapshot = Arc::new(ActiveSemanticModelSnapshot::new(
+                Arc::clone(&active),
+                None,
+                None,
+            ));
             SemanticModelRuntimeOutcome::Ready {
                 active,
                 snapshot,
@@ -3238,7 +3385,7 @@ mod unmaterialized_call_shape_binding_tests {
     };
 
     const PACK: &[u8] = br#"{
-      "schema_version": 1,
+      "schema_version": 2,
       "pack_id": "test.call-shape",
       "version": "1.0.0",
       "producer": {"name": "test", "version": "1.0.0"},
@@ -3406,7 +3553,7 @@ mod active_model_set_identity_tests {
         evidence_rank: EvidenceRank,
     ) -> CandidateSelection {
         let source = serde_json::to_vec(&serde_json::json!({
-            "schema_version": 1,
+            "schema_version": 2,
             "pack_id": pack_id,
             "version": "1.0.0",
             "producer": {"name": "active-set-identity-test", "version": "1.0.0"},
@@ -3531,6 +3678,23 @@ mod active_model_set_identity_tests {
     }
 
     #[test]
+    fn value_semantics_schema_rotates_active_set_identity() {
+        assert_eq!(SEMANTIC_MODEL_RUNTIME_REPRESENTATION_VERSION, 3);
+        let mut previous = Sha256::new();
+        previous.update(b"bifrost.semantic-model.active-set.v2\0");
+        previous.update(2u32.to_be_bytes());
+        previous.update(0u64.to_be_bytes());
+        previous.update(0u64.to_be_bytes());
+        let previous = format!("{:x}", previous.finalize());
+
+        assert_ne!(
+            active_model_set_hash(&[], &[]),
+            previous,
+            "schema-v2 value semantics must not reuse the prior runtime identity"
+        );
+    }
+
+    #[test]
     fn matcher_precedence_that_reverses_a_proof_changes_active_set_identity() {
         let returning_low = procedure_selection("test.returning", false, EvidenceRank::Language);
         let nonreturn_high =
@@ -3574,12 +3738,12 @@ mod active_model_set_identity_tests {
 mod procedure_claim_agreement_tests {
     use super::*;
     use crate::analyzer::semantic_model::{
-        CompiledConditionalResultRefinement, CompiledDeclaredEffect,
-        CompiledDeclaredEffectCertainty, CompiledDeclaredEffectTiming,
-        CompiledPredicateProofEffect, CompiledProcedureSummary, CompiledProcedureTarget,
-        CompiledResultContract, CompiledResultPredicate, CompiledSummaryExitKind,
-        CompiledSummaryInput, CompiledSummaryLocation, CompiledSummaryLocationKind,
-        CompiledSummaryOutput, CompiledSummaryTransfer, Completeness,
+        CompiledConditionalIndirectWrite, CompiledConditionalResultRefinement,
+        CompiledDeclaredEffect, CompiledDeclaredEffectCertainty, CompiledDeclaredEffectTiming,
+        CompiledIndirectWriteTarget, CompiledPredicateProofEffect, CompiledProcedureSummary,
+        CompiledProcedureTarget, CompiledResultContract, CompiledResultPredicate,
+        CompiledSummaryExitKind, CompiledSummaryInput, CompiledSummaryLocation,
+        CompiledSummaryLocationKind, CompiledSummaryOutput, CompiledSummaryTransfer, Completeness,
     };
 
     fn transfer(input: CompiledSummaryInput) -> CompiledSummaryTransfer {
@@ -3613,10 +3777,12 @@ mod procedure_claim_agreement_tests {
             locations: Vec::new(),
             transfers: vec![transfer(CompiledSummaryInput::Parameter { ordinal: 0 })],
             effects: Vec::new(),
+            concurrency_effects: Vec::new(),
             declared_effects: Vec::new(),
             preconditions: None,
             result_contracts: Vec::new(),
             conditional_result_refinements: Vec::new(),
+            conditional_indirect_writes: Vec::new(),
             normal_return_refinements: Vec::new(),
         }
     }
@@ -3636,6 +3802,19 @@ mod procedure_claim_agreement_tests {
             procedure_claims_agree(&left, &right),
             "records differing only in id, model id, digest, and target spelling make one claim"
         );
+    }
+
+    #[test]
+    fn concurrency_claims_make_same_shape_records_disagree() {
+        let left = overload("1", "valueOf(java.lang.Object)");
+        let mut right = overload("2", "valueOf(int)");
+        right
+            .concurrency_effects
+            .push(CompiledConcurrencyEffect::TaskSpawn {
+                callable: CompiledSummaryInput::Parameter { ordinal: 0 },
+                group: None,
+            });
+        assert!(!procedure_claims_agree(&left, &right));
     }
 
     #[test]
@@ -3869,6 +4048,25 @@ mod procedure_claim_agreement_tests {
         assert!(
             !procedure_claims_agree(&left, &right),
             "the boolean result outcome is part of the modeled claim"
+        );
+    }
+
+    #[test]
+    fn a_different_conditional_indirect_write_is_a_disagreement() {
+        let mut left = overload("errors-as", "errors.As(error, any)");
+        left.normal_result_count = Some(1);
+        left.conditional_indirect_writes = vec![CompiledConditionalIndirectWrite {
+            result_ordinal: 0,
+            outcome: true,
+            parameter_ordinal: 0,
+            target: CompiledIndirectWriteTarget::Pointee,
+        }];
+        let mut right = left.clone();
+        right.conditional_indirect_writes[0].outcome = false;
+
+        assert!(
+            !procedure_claims_agree(&left, &right),
+            "the outcome controlling an indirect write is part of the modeled claim"
         );
     }
 }

@@ -10,7 +10,7 @@ use super::super::capabilities::SemanticCapabilities;
 use super::super::ids::{
     AllocationId, BlockId, CallSiteId, CaptureId, ControlEdgeId, EvidenceId, GuardId,
     LengthDelimitedDigest, MemoryLocationId, ProcedureId, ProgramPointId, SemanticArtifactKey,
-    SemanticGapId, SemanticLocator, SourceMappingId, StableDigest, ValueId,
+    SemanticGapId, SemanticLocator, SourceMappingId, StableDigest, SwitchFactId, ValueId,
 };
 use super::super::provider::{SemanticBudget, SemanticBudgetExceeded, SemanticWork};
 use super::model::*;
@@ -475,6 +475,26 @@ impl GuardFact {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SwitchCaseFact {
+    pub value: ValueId,
+    pub edge: ControlEdgeId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct SwitchFact {
+    pub id: SwitchFactId,
+    pub kind: SwitchFactKind,
+    pub point: ProgramPointId,
+    pub selector: Option<ValueId>,
+    pub selector_domain: SwitchSelectorDomain,
+    pub cases: Box<[SwitchCaseFact]>,
+    pub default_edge: Option<ControlEdgeId>,
+    pub default_present: bool,
+    pub source: SourceMappingId,
+    pub evidence: EvidenceId,
+}
+
 const PROCEDURE_MATERIALIZATION_ID_DOMAIN: &[u8] = b"bifrost-semantic-procedure-materialization-v1";
 const ARTIFACT_MATERIALIZATION_ID_DOMAIN: &[u8] = b"bifrost-semantic-artifact-materialization-v1";
 
@@ -605,6 +625,7 @@ pub struct ProcedureSemantics {
     blocks: Box<[BasicBlock]>,
     points: Box<[ProgramPoint]>,
     guard_facts: Box<[GuardFact]>,
+    switch_facts: Box<[SwitchFact]>,
     cfg: ControlFlowGraph,
     entry_point: ProgramPointId,
     normal_exit_point: ProgramPointId,
@@ -621,6 +642,7 @@ impl ProcedureSemantics {
         let cfg =
             ControlFlowGraph::try_from_edges(parts.id, parts.points.len(), parts.control_edges)?;
         let guard_facts = freeze_guard_facts(&cfg, &parts.guard_facts);
+        let switch_facts = freeze_switch_facts(&cfg, &parts.switch_facts);
         let (call_phase_points, call_result_sites) = index_call_phases(&parts.call_sites);
         let value_identity_ordinals =
             duplicate_value_ordinals(&parts.values, &parts.source_mappings);
@@ -647,6 +669,7 @@ impl ProcedureSemantics {
             blocks: parts.blocks.into_boxed_slice(),
             points: parts.points.into_boxed_slice(),
             guard_facts,
+            switch_facts,
             cfg,
             entry_point,
             normal_exit_point,
@@ -677,6 +700,7 @@ impl ProcedureSemantics {
         self.blocks.hash(&mut digest);
         self.points.hash(&mut digest);
         self.guard_facts.hash(&mut digest);
+        self.switch_facts.hash(&mut digest);
         self.cfg.edges.hash(&mut digest);
         self.entry_point.hash(&mut digest);
         self.normal_exit_point.hash(&mut digest);
@@ -819,6 +843,14 @@ impl ProcedureSemantics {
 
     pub fn guard_fact(&self, id: GuardId) -> Option<&GuardFact> {
         self.guard_facts.get(id.index())
+    }
+
+    pub fn switch_facts(&self) -> &[SwitchFact] {
+        &self.switch_facts
+    }
+
+    pub fn switch_fact(&self, id: SwitchFactId) -> Option<&SwitchFact> {
+        self.switch_facts.get(id.index())
     }
 
     pub fn cfg(&self) -> &ControlFlowGraph {
@@ -992,6 +1024,39 @@ fn freeze_guard_facts(cfg: &ControlFlowGraph, parts: &[GuardFactParts]) -> Box<[
         })
         .collect::<Vec<_>>()
         .into_boxed_slice()
+}
+
+fn freeze_switch_facts(cfg: &ControlFlowGraph, parts: &[SwitchFactParts]) -> Box<[SwitchFact]> {
+    let resolve = |edge: SwitchEdgeParts| {
+        cfg.successor_edges(edge.source_point)
+            .find(|(_, candidate)| {
+                candidate.target_point == edge.arm.target_point && candidate.kind == edge.arm.kind
+            })
+            .map(|(id, _)| id)
+            .expect("validated switch edge resolves in the frozen CFG")
+    };
+    parts
+        .iter()
+        .map(|fact| SwitchFact {
+            id: fact.id,
+            kind: fact.kind,
+            point: fact.point,
+            selector: fact.selector,
+            selector_domain: fact.selector_domain,
+            cases: fact
+                .cases
+                .iter()
+                .map(|case| SwitchCaseFact {
+                    value: case.value,
+                    edge: resolve(case.edge),
+                })
+                .collect(),
+            default_edge: fact.default_edge.map(resolve),
+            default_present: fact.default_present,
+            source: fact.source,
+            evidence: fact.evidence,
+        })
+        .collect()
 }
 
 fn duplicate_value_ordinals(
@@ -1558,6 +1623,8 @@ mod tests {
         SemanticCallSite {
             id: CallSiteId::new(id),
             point: ProgramPointId::new(id),
+            invocation_mode: CallInvocationMode::Ordinary,
+            execution_timing: ExecutionTiming::SameEvaluation,
             callee: ValueId::new(id),
             receiver: None,
             arguments: Box::new([]),

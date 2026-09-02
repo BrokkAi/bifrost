@@ -23,6 +23,8 @@ use super::finding::{
     completion_allows_diagnostic_impact, normalize_policy_diagnostics_bounded,
 };
 use super::finding_identity::{FindingIdentityStability, PolicyFindingId};
+// The reuse review is a report section, so it is re-exported here beside the
+// other reviews; it lives with the units it describes.
 use super::identity::{EndpointAnalysisProjectionHash, EndpointSemanticHash, PolicySemanticHash};
 use super::resolved::{
     EndpointDefinitionSchemaResolution, EndpointOrigin, LoadedPolicy, PolicyPrecedenceManifest,
@@ -34,6 +36,7 @@ use super::retained::{RetainedSize, retained_extra, retained_vec_size_from_parts
 use super::scope::{PolicyScopeReview, compare_scope_reviews};
 use super::source::{PolicySourceIdentity, PolicySourceRelatedDiagnostic};
 use super::suppression::{PolicyReportEvaluationContext, PolicySuppressionReview};
+pub use super::units::{PolicyIncrementalReview, PolicyIncrementalRun};
 
 const MAX_REPORT_TEXT_BYTES: usize = 4_096;
 const MAX_REPORT_RELATED_DIAGNOSTICS: usize = 64;
@@ -1734,10 +1737,15 @@ impl PolicyDiffReview {
             !degraded || (new_count == 0 && persisting_count == 0 && fixed.is_empty()),
             "a degraded diff review carries no classification: new {new_count}, persisting {persisting_count}, fixed {fixed:?}"
         );
-        fixed.sort_by(|left, right| {
-            (left.policy_id.as_str(), left.finding_id)
-                .cmp(&(right.policy_id.as_str(), right.finding_id))
-        });
+        // Sorted by the caller, not here: the caller truncates to
+        // `MAX_DIFF_FIXED_FINDINGS`, so ordering the list after truncation
+        // would leave the retained subset itself dependent on the order the
+        // caller enumerated its identities in.
+        debug_assert!(
+            fixed.is_sorted_by(|left, right| (left.policy_id.as_str(), left.finding_id)
+                <= (right.policy_id.as_str(), right.finding_id)),
+            "diff review fixed findings arrive sorted by (policy_id, finding_id), got {fixed:?}"
+        );
         tighten_vec(&mut fixed);
         let fixed_truncated =
             fixed_count > u64::try_from(fixed.len()).expect("bounded list length fits u64");
@@ -1783,6 +1791,21 @@ impl PolicyDiffReview {
 
     pub const fn fixed_truncated(&self) -> bool {
         self.fixed_truncated
+    }
+}
+
+impl RetainedSize for PolicyIncrementalRun {
+    fn retained_size(&self) -> usize {
+        size_of::<Self>().saturating_add(self.policy_id.as_str().len())
+    }
+}
+
+impl RetainedSize for PolicyIncrementalReview {
+    fn retained_size(&self) -> usize {
+        size_of::<Self>().saturating_add(retained_vec_size_from_parts(
+            self.policies(),
+            self.policies().len(),
+        ))
     }
 }
 
@@ -2047,6 +2070,7 @@ impl RetainedSize for PolicyPackActivationReview {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct PolicyOptionalReviews {
     diff: Option<PolicyDiffReview>,
+    incremental: Option<PolicyIncrementalReview>,
     packs: Option<PolicyPackActivationReview>,
     baseline: Option<PolicyBaselineReview>,
 }
@@ -2054,6 +2078,10 @@ pub(crate) struct PolicyOptionalReviews {
 impl PolicyOptionalReviews {
     const fn diff(&self) -> Option<&PolicyDiffReview> {
         self.diff.as_ref()
+    }
+
+    const fn incremental(&self) -> Option<&PolicyIncrementalReview> {
+        self.incremental.as_ref()
     }
 
     const fn packs(&self) -> Option<&PolicyPackActivationReview> {
@@ -2068,6 +2096,7 @@ impl PolicyOptionalReviews {
     /// in [`PolicyReportDocument`]'s manual `Serialize` impl.
     fn present_count(&self) -> usize {
         usize::from(self.diff.is_some())
+            + usize::from(self.incremental.is_some())
             + usize::from(self.packs.is_some())
             + usize::from(self.baseline.is_some())
     }
@@ -2077,6 +2106,7 @@ impl RetainedSize for PolicyOptionalReviews {
     fn retained_size(&self) -> usize {
         size_of::<Self>()
             .saturating_add(retained_extra(&self.diff))
+            .saturating_add(retained_extra(&self.incremental))
             .saturating_add(retained_extra(&self.packs))
             .saturating_add(retained_extra(&self.baseline))
     }
@@ -2249,6 +2279,18 @@ impl PolicyReportDocument {
         self.reviews.diff()
     }
 
+    /// What this run reused instead of recomputing, when it could reuse
+    /// anything at all.
+    ///
+    /// Additive, like the other reviews: a run without a diff base or with
+    /// `--no-incremental` keeps its exact schema-version-5 shape. Nothing here
+    /// is a statement about the workspace -- it is a measurement of the run,
+    /// which is why it is not a diagnostic, not a work metric, and not part of
+    /// what two runs of the same workspace must agree on.
+    pub const fn incremental(&self) -> Option<&PolicyIncrementalReview> {
+        self.reviews.incremental()
+    }
+
     pub const fn packs(&self) -> Option<&PolicyPackActivationReview> {
         self.reviews.packs()
     }
@@ -2293,6 +2335,9 @@ impl Serialize for PolicyReportDocument {
         state.serialize_field("scope", &self.scope)?;
         if let Some(diff) = self.reviews.diff() {
             state.serialize_field("diff", diff)?;
+        }
+        if let Some(incremental) = self.reviews.incremental() {
+            state.serialize_field("incremental", incremental)?;
         }
         if let Some(packs) = self.reviews.packs() {
             state.serialize_field("packs", packs)?;
@@ -3049,6 +3094,24 @@ impl PolicyReportBuilder {
         );
         self.ensure_review_fits(retained_extra(&diff))?;
         self.reviews.diff = Some(diff);
+        Ok(())
+    }
+
+    /// Retain the reuse review for this report.
+    ///
+    /// The review is bounded by the number of policies that ran; charging it
+    /// against the batch budget keeps every later retention decision aware of
+    /// its bytes, exactly as the diff review is charged.
+    pub fn set_incremental(
+        &mut self,
+        incremental: PolicyIncrementalReview,
+    ) -> Result<(), PolicyReportBuilderError> {
+        assert!(
+            self.reviews.incremental.is_none(),
+            "incremental review is set at most once"
+        );
+        self.ensure_review_fits(retained_extra(&incremental))?;
+        self.reviews.incremental = Some(incremental);
         Ok(())
     }
 

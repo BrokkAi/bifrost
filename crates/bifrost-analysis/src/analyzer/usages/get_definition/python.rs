@@ -1874,6 +1874,235 @@ pub(super) fn python_site_for_focus(
     site
 }
 
+/// Exact external callable selected by one explicit Python import.
+///
+/// Identity comes from the tree-sitter import binder and call expression, not
+/// from the local spelling. A proof exists only when that import is the one
+/// unconditional, module- or function-scoped binding visible at a static call.
+/// Rebinding, competing bindings, wildcard/class-local uncertainty, and the
+/// wrong attribute depth intentionally return no proof.
+pub(super) fn exact_python_imported_call(
+    source: &str,
+    tree: &Tree,
+    site: &ResolvedReferenceSite,
+) -> Option<ExactExternalCallProof> {
+    let root = tree.root_node();
+    let callee = smallest_named_node_covering(root, site.focus_start_byte, site.focus_end_byte)?;
+    if callee.kind() != "identifier" {
+        return None;
+    }
+    let parent = callee.parent()?;
+    let focused_chain = if parent.kind() == "attribute" {
+        (parent.child_by_field_name("attribute") == Some(callee)).then_some(parent)?
+    } else {
+        callee
+    };
+    let call = focused_chain.parent()?;
+    if call.kind() != "call"
+        || call
+            .child_by_field_name("function")
+            .is_none_or(|function| function.id() != focused_chain.id())
+    {
+        return None;
+    }
+
+    let path = python_static_call_path(call.child_by_field_name("function")?)?;
+    if path.last()?.id() != callee.id() {
+        return None;
+    }
+    let segments = path
+        .iter()
+        .copied()
+        .map(|node| python_slice(node, source))
+        .collect::<Vec<_>>();
+    if segments.iter().any(|segment| segment.is_empty()) {
+        return None;
+    }
+    let local_name = segments.first()?;
+    let final_segment = segments.last()?;
+
+    let bindings = python_import_bindings_from_tree(root, source);
+    let binding = python_visible_function_import_binding(&bindings, local_name, callee, source)
+        .or_else(|| {
+            python_visible_module_import_binding(root, &bindings, local_name, callee, source)
+        })?;
+
+    let arguments = call.child_by_field_name("arguments")?;
+    let parameter_count = {
+        let mut cursor = arguments.walk();
+        u32::try_from(arguments.named_children(&mut cursor).count()).ok()?
+    };
+    let canonical_callee = if path.len() == 1 {
+        (binding.consumed_attributes == 0).then(|| binding.qualified_name.clone())?
+    } else {
+        let attributes_after_local = path.len().checked_sub(1)?;
+        (attributes_after_local == binding.consumed_attributes + 1)
+            .then(|| format!("{}.{}", binding.qualified_name, final_segment))?
+    };
+    Some(ExactExternalCallProof::python_imported_call(
+        canonical_callee,
+        parameter_count,
+    ))
+}
+
+fn python_static_call_path<'tree>(mut node: Node<'tree>) -> Option<Vec<Node<'tree>>> {
+    if !matches!(node.kind(), "identifier" | "attribute") {
+        return None;
+    }
+    let mut path = Vec::new();
+    loop {
+        match node.kind() {
+            "identifier" => {
+                path.push(node);
+                break;
+            }
+            "attribute" => {
+                let attribute = node.child_by_field_name("attribute")?;
+                if attribute.kind() != "identifier" {
+                    return None;
+                }
+                path.push(attribute);
+                node = node.child_by_field_name("object")?;
+            }
+            _ => return None,
+        }
+    }
+    path.reverse();
+    Some(path)
+}
+
+fn python_visible_function_import_binding<'a>(
+    bindings: &'a [PythonImportBinding],
+    local_name: &str,
+    reference: Node<'_>,
+    source: &str,
+) -> Option<&'a PythonImportBinding> {
+    let reference_start = reference.start_byte();
+    let reference_end = reference.end_byte();
+    let visible = bindings
+        .iter()
+        .filter(|binding| {
+            binding.is_function_scoped()
+                && binding.scope_start_byte <= reference_start
+                && reference_end <= binding.scope_end_byte
+                && binding.start_byte <= reference_start
+                && binding.local_name == local_name
+        })
+        .collect::<Vec<_>>();
+    let binding = match visible.as_slice() {
+        [binding] => binding,
+        _ => return None,
+    };
+    let mut current = reference.parent();
+    while let Some(parent) = current {
+        if matches!(parent.kind(), "function_definition" | "lambda") {
+            if !python_function_import_is_unconditional(parent, binding) {
+                return None;
+            }
+            let inventory = python_lexical_scope_inventory_bounded(parent, source, || true)?;
+            return (!inventory.has_runtime_callable_binding_at(local_name, reference))
+                .then_some(binding);
+        }
+        current = parent.parent();
+    }
+    None
+}
+
+fn python_function_import_is_unconditional(
+    function: Node<'_>,
+    binding: &PythonImportBinding,
+) -> bool {
+    let Some(mut current) = function
+        .named_descendant_for_byte_range(binding.start_byte, binding.start_byte.saturating_add(1))
+    else {
+        return false;
+    };
+    while !matches!(current.kind(), "import_statement" | "import_from_statement") {
+        let Some(parent) = current.parent() else {
+            return false;
+        };
+        if parent.id() == function.id() {
+            return false;
+        }
+        current = parent;
+    }
+    while let Some(parent) = current.parent() {
+        if parent.id() == function.id() {
+            return true;
+        }
+        if parent.kind() != "block" {
+            return false;
+        }
+        current = parent;
+    }
+    false
+}
+
+fn python_visible_module_import_binding<'a>(
+    root: Node<'_>,
+    bindings: &'a [PythonImportBinding],
+    local_name: &str,
+    reference: Node<'_>,
+    source: &str,
+) -> Option<&'a PythonImportBinding> {
+    if python_name_shadowed_at(local_name, reference, source) {
+        return None;
+    }
+    let reference_start = reference.start_byte();
+    let candidates = bindings
+        .iter()
+        .filter(|binding| {
+            !binding.is_function_scoped()
+                && binding.start_byte <= reference_start
+                && binding.local_name == local_name
+                && python_import_binding_is_module_scoped(root, binding)
+        })
+        .collect::<Vec<_>>();
+    let binding = match candidates.as_slice() {
+        [binding] => binding,
+        _ => return None,
+    };
+
+    let timeline = collect_module_binding_timeline(root, source);
+    let visible = timeline
+        .get(local_name)?
+        .iter()
+        .filter(|event| event.visible_from <= reference_start)
+        .collect::<Vec<_>>();
+    let event = match visible.as_slice() {
+        [event] => event,
+        _ => return None,
+    };
+    if event.conditional {
+        return None;
+    }
+    matches!(
+        event.kind,
+        ModuleBindingEventKind::ImportModule { .. } | ModuleBindingEventKind::FromImport { .. }
+    )
+    .then_some(binding)
+}
+
+fn python_import_binding_is_module_scoped(root: Node<'_>, binding: &PythonImportBinding) -> bool {
+    let start = binding.start_byte;
+    let Some(mut current) = root.named_descendant_for_byte_range(start, start) else {
+        return false;
+    };
+    while let Some(parent) = current.parent() {
+        if matches!(
+            current.kind(),
+            "function_definition" | "lambda" | "class_definition"
+        ) {
+            return false;
+        }
+        if matches!(current.kind(), "import_statement" | "import_from_statement") {
+            return parent.kind() == "module";
+        }
+        current = parent;
+    }
+    false
+}
+
 #[allow(clippy::too_many_arguments)]
 fn python_visible_module_binding_candidates(
     analyzer: &dyn IAnalyzer,
@@ -3657,5 +3886,145 @@ def outer() -> None:
                 "{path}: {value:#?}"
             );
         }
+    }
+
+    fn imported_call_proof(source: &str, callee: &str) -> Option<ExactExternalCallProof> {
+        let tree = parse_python_tree(source).expect("Python tree");
+        let start_byte = source
+            .rfind(callee)
+            .unwrap_or_else(|| panic!("missing `{callee}` call in source"));
+        let end_byte = start_byte + callee.len();
+        let start_line = source[..start_byte]
+            .bytes()
+            .filter(|byte| *byte == b'\n')
+            .count()
+            + 1;
+        let site = ResolvedReferenceSite {
+            path: "caller.py".to_string(),
+            text: callee.to_string(),
+            range: Range {
+                start_byte,
+                end_byte,
+                start_line,
+                end_line: start_line,
+            },
+            focus_start_byte: start_byte,
+            focus_end_byte: end_byte,
+        };
+        exact_python_imported_call(source, &tree, &site)
+    }
+
+    fn assert_proof(source: &str, callee: &str, canonical_callee: &str, parameter_count: u32) {
+        let proof = imported_call_proof(source, callee)
+            .unwrap_or_else(|| panic!("missing exact proof for `{canonical_callee}`"));
+        assert_eq!(proof.canonical_callee(), canonical_callee);
+        assert_eq!(
+            proof.call_application(),
+            CallApplicationKind::PackageFunction
+        );
+        assert_eq!(proof.dispatch_extensibility(), None);
+        assert_eq!(proof.parameter_count(), parameter_count);
+    }
+
+    #[test]
+    fn exact_python_namespace_alias_and_dotted_import_calls_are_proved() {
+        assert_proof(
+            "import subprocess\nsubprocess.run(command)\n",
+            "run",
+            "subprocess.run",
+            1,
+        );
+        assert_proof(
+            "import subprocess as sp\nsp.run(command, shell=True)\n",
+            "run",
+            "subprocess.run",
+            2,
+        );
+        assert_proof(
+            "import os.path\nos.path.join(first, second)\n",
+            "join",
+            "os.path.join",
+            2,
+        );
+    }
+
+    #[test]
+    fn exact_python_from_import_calls_are_proved() {
+        assert_proof(
+            "from subprocess import run\nrun(command)\n",
+            "run",
+            "subprocess.run",
+            1,
+        );
+        assert_proof(
+            "from subprocess import run as execute\nexecute(command)\n",
+            "execute",
+            "subprocess.run",
+            1,
+        );
+        assert_proof(
+            "from os import path\npath.join(first, second)\n",
+            "join",
+            "os.path.join",
+            2,
+        );
+        assert_proof(
+            "def invoke(command):\n    from subprocess import run as execute\n    return execute(command)\n",
+            "execute",
+            "subprocess.run",
+            1,
+        );
+    }
+
+    #[test]
+    fn exact_python_import_call_refuses_shadowed_and_rebound_locals() {
+        let sources = [
+            "import subprocess as sp\nsp = FakeProcess()\nsp.run(command)\n",
+            "import subprocess as sp\ndef call(sp):\n    sp.run(command)\n",
+            "def call(factory):\n    import subprocess as sp\n    sp = factory()\n    sp.run(command)\n",
+        ];
+        for source in sources {
+            assert!(
+                imported_call_proof(source, "run").is_none(),
+                "shadowed call unexpectedly proved: {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn exact_python_import_call_refuses_ambiguous_and_unstructured_shapes() {
+        let sources = [
+            (
+                "import subprocess as sp\nimport fake as sp\nsp.run(command)\n",
+                "run",
+            ),
+            (
+                "import subprocess\nsubprocess.run.extra(command)\n",
+                "extra",
+            ),
+            ("from subprocess import *\nrun(command)\n", "run"),
+            ("run(command)\n", "run"),
+            (
+                "import subprocess\nvalue = subprocess\nvalue.run(command)\n",
+                "run",
+            ),
+        ];
+        for (source, callee) in sources {
+            assert!(
+                imported_call_proof(source, callee).is_none(),
+                "unstructured call unexpectedly proved: {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn exact_python_import_call_refuses_class_and_conditional_scopes() {
+        let class_source = "class Commands:\n    import subprocess as sp\n\n    def call(self):\n        sp.run(command)\n";
+        assert!(imported_call_proof(class_source, "run").is_none());
+        let conditional_source =
+            "import subprocess\nif enabled:\n    import fake as sp\nsp.run(command)\n";
+        assert!(imported_call_proof(conditional_source, "run").is_none());
+        let conditional_function_source = "def invoke(command, enabled):\n    if enabled:\n        from subprocess import run\n    return run(command)\n";
+        assert!(imported_call_proof(conditional_function_source, "run").is_none());
     }
 }

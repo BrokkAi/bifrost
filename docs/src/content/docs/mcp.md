@@ -255,7 +255,7 @@ Pass `--no-line-numbers` to remove rendered line and line-range prefixes from MC
 ## Discover and Run Policies
 
 The `extended` toolset's read-only `list_policies` tool returns the deterministic
-built-in manifest without constructing an analyzer. `run_policy` evaluates any
+built-in pack catalog without constructing an analyzer. `run_policy` evaluates any
 non-empty union of built-in selectors and workspace-relative `.rqlp` files:
 
 ```json
@@ -269,7 +269,7 @@ non-empty union of built-in selectors and workspace-relative `.rqlp` files:
 }
 ```
 
-The selector arrays form a deduplicated union in manifest order, and
+The selector arrays form a deduplicated union in catalog order, and
 `policy_files` adds explicit workspace roots to the same batch. All arrays are
 bounded and reject duplicate entries; unknown selectors are invalid parameters.
 The tool never discovers or runs every file under `.bifrost/policies/`. Add

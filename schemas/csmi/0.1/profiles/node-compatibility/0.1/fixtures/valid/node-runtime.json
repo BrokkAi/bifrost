@@ -1,0 +1,9 @@
+{
+  "kind": "node-runtime",
+  "versionInterval": {
+    "minimum": { "version": "20.0.0", "inclusive": true },
+    "maximum": { "version": "23.0.0", "inclusive": false }
+  },
+  "platforms": ["darwin", "linux"],
+  "architectures": ["arm64", "x64"]
+}

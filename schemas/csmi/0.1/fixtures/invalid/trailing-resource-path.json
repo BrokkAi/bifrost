@@ -1,0 +1,22 @@
+{
+  "documentType": "pack-manifest",
+  "schema": "https://csmi.brokk.ai/schema/0.1/schema.json",
+  "packFormatVersion": "0.1",
+  "assembler": {
+    "identifier": "https://example.org/tools/csmi-pack",
+    "version": "1.0.0"
+  },
+  "license": "Apache-2.0",
+  "resources": [
+    {
+      "path": "models/",
+      "role": "semantic-document",
+      "mediaType": "application/vnd.csmi.semantic-model.v0.1+json",
+      "size": 1,
+      "digest": {
+        "algorithm": "sha-256",
+        "value": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      }
+    }
+  ]
+}

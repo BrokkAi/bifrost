@@ -1,0 +1,10 @@
+{
+  "kind": "configuration",
+  "edition": "2024",
+  "compiler": { "release": "1.92.0-nightly" },
+  "cargoResolver": "3",
+  "target": { "triple": "x86_64-unknown-linux-gnu" },
+  "compilationRole": "target",
+  "enabledFeatures": [],
+  "cfgAtoms": []
+}

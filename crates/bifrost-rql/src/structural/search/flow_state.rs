@@ -114,6 +114,32 @@ impl Default for FlowStateTraversalCache {
     }
 }
 
+/// Record the semantic artifact one flow-state derivation was taken from.
+///
+/// The cache's own key carries a `ProjectFile`, which knows its workspace root,
+/// so it can never be the recorded identity. The artifact's public fingerprint
+/// can: it names the exact path, content, adapter, IR version, configuration
+/// and dependency identity the state was derived under, and nothing about
+/// where the checkout lives.
+fn record_flow_artifact_read(
+    workspace: &WorkspaceAnalyzer,
+    artifact: Option<&brokk_bifrost_analysis::analyzer::semantic::SemanticArtifact>,
+) {
+    let analyzer = workspace.analyzer();
+    if !analyzer.read_ledger_attached() {
+        return;
+    }
+    let Some(artifact) = artifact else {
+        return;
+    };
+    analyzer.record_read(crate::analyzer::ReadKey::artifact(
+        brokk_bifrost_analysis::analyzer::invalidation::DerivedArtifactId::semantic_artifact(
+            artifact.key().public_fingerprint(),
+        ),
+        Some(artifact.key().path().as_str()),
+    ));
+}
+
 impl FlowStateTraversalCache {
     /// Start one request cache from the activation snapshot its other semantic
     /// row families use.
@@ -138,6 +164,12 @@ impl FlowStateTraversalCache {
     }
 
     /// Derive (or replay) the flow state of one file.
+    ///
+    /// No read key is formed here: the semantic artifact this state is derived
+    /// from records its own `Artifact` key at the materialization funnel, which
+    /// runs below this call. The two materialized entry points below *do* form
+    /// one, because the caller already owns the artifact and this cache can
+    /// answer from a retained state without crossing that funnel again.
     pub(super) fn for_file(
         &mut self,
         workspace: &WorkspaceAnalyzer,
@@ -183,6 +215,7 @@ impl FlowStateTraversalCache {
             outcome: FlowStateOutcomeIdentity::for_outcome(&outcome),
         };
         let artifact = outcome.available_value().cloned();
+        record_flow_artifact_read(workspace, artifact.as_deref());
         if let (Some(wanted), Some(cached)) = (artifact.as_ref(), self.files.get(&key))
             && cached
                 .artifact
@@ -227,6 +260,7 @@ impl FlowStateTraversalCache {
             outcome: FlowStateOutcomeIdentity::for_outcome(&outcome),
         };
         let artifact = outcome.available_value().cloned();
+        record_flow_artifact_read(workspace, artifact.as_deref());
         if let Some(artifact) = artifact.as_ref() {
             assert!(
                 Arc::ptr_eq(artifact, procedure.artifact()),

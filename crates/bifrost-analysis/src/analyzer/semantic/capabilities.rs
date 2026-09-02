@@ -67,9 +67,11 @@ semantic_capabilities! {
     GeneratorSuspension => "generator_suspension",
     DeferredExecution => "deferred_execution",
     ConcurrentSpawn => "concurrent_spawn",
+    Synchronization => "synchronization",
     NonLocalControl => "non_local_control",
     ResourceManagement => "resource_management",
     GuardFacts => "guard_facts",
+    SwitchFacts => "switch_facts",
 }
 
 /// Whether an adapter completely, partially, or not at all supports a feature.

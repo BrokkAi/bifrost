@@ -928,6 +928,10 @@ fn hash_public_carrier_key(digest: &mut LengthDelimitedDigest, root: &ValueFlowC
                 digest.push(b"exact_index");
                 pending.push(Part::Carrier(index));
             }
+            Part::Selector(ValueFlowSelectorKey::ConstantIndex(index)) => {
+                digest.push(b"constant_index");
+                digest.push(&index.to_le_bytes());
+            }
             Part::Selector(ValueFlowSelectorKey::AnyIndex) => digest.push(b"any_index"),
         }
     }
@@ -1174,6 +1178,11 @@ pub(super) fn public_carrier_symbol(
                     ValueFlowSelectorKey::ExactIndex(index) => {
                         CodeQueryFlowSelectorSymbol::ExactIndex {
                             index: Box::new(public_carrier_symbol(workspace, index)),
+                        }
+                    }
+                    ValueFlowSelectorKey::ConstantIndex(index) => {
+                        CodeQueryFlowSelectorSymbol::ConstantIndex {
+                            index: index.to_string(),
                         }
                     }
                     ValueFlowSelectorKey::AnyIndex => CodeQueryFlowSelectorSymbol::AnyIndex,

@@ -3,7 +3,7 @@
   "suppressions": [
     {
       "policy_id": "bifrost.performance.expensive-operation-in-nested-loop",
-      "finding_id": "0148f080c0a175799f611282026a9eeadd5bc0a9e7b5bf691fafe5e633b404bf",
+      "finding_id": "8944220d329379e8c1cc6c88c34b40dce9b7688b81baa8578747a9e07f035950",
       "path": "tools/rename-eval/extract_pairs.py",
       "identity_stability": "strong",
       "status": "accepted",
@@ -75,18 +75,6 @@
     },
     {
       "policy_id": "bifrost.performance.file-read-in-loop",
-      "finding_id": "331f6aac55384d443a650d64362a01faf574b23f4a428b4fb70e00300f400e56",
-      "path": "crates/bifrost-semantic-packs/src/release_bundle.rs",
-      "identity_stability": "strong",
-      "status": "accepted",
-      "reason": "Loop iterates distinct files; one read per file is the intended operation and cannot be hoisted.",
-      "policy_hash_at_acceptance": "a1d83845a9a14d26d5c9de154727ac2cd32ca81365d1111bf966e209b4ed89c9",
-      "accepted_by": "dbakereffendi",
-      "accepted_at": "2026-08-04",
-      "expires_at": null
-    },
-    {
-      "policy_id": "bifrost.performance.file-read-in-loop",
       "finding_id": "44421bac99339eab1bd3d465b92df258d1f9a09f5c614dd564718075d2956088",
       "path": "crates/bifrost-analysis/src/analyzer/semantic_model/authoring.rs",
       "identity_stability": "strong",
@@ -111,18 +99,6 @@
     },
     {
       "policy_id": "bifrost.performance.parsing-in-loop",
-      "finding_id": "c53b98c1b774f7381f4f3fc2c9ff70dae70c3c343e61e193ed9028a84a0b852b",
-      "path": "src/bin/bifrost.rs",
-      "identity_stability": "strong",
-      "status": "accepted",
-      "reason": "Each iteration parses a distinct payload/line/file; the parse work is inherent to the loop and cannot be hoisted.",
-      "policy_hash_at_acceptance": "b9a5b20ef0958dde7ee5b5065f825543b6de07fd75dbfd488c99d7a242b74695",
-      "accepted_by": "dbakereffendi",
-      "accepted_at": "2026-08-04",
-      "expires_at": null
-    },
-    {
-      "policy_id": "bifrost.performance.parsing-in-loop",
       "finding_id": "fa5b34160bdb8cba222c37c31faeaaa589704e6d1fd27951f77f397aaafcb302",
       "path": "crates/bifrost-analysis/src/analyzer/rust/dependency_discovery.rs",
       "identity_stability": "strong",
@@ -135,7 +111,7 @@
     },
     {
       "policy_id": "bifrost.performance.regex-compile-in-loop",
-      "finding_id": "f022a7bc7f614bd42d07e4a6ee4628024016afa094ea167c909e581e805aed5f",
+      "finding_id": "0a4497c717b84ffe7abaa8274f336235ba4177c80f33ed60e4d810c6ea45fbd3",
       "path": "scripts/public/prepare-vscode-extension-manifest.mjs",
       "identity_stability": "strong",
       "status": "accepted",
@@ -147,7 +123,7 @@
     },
     {
       "policy_id": "bifrost.performance.serialization-in-loop",
-      "finding_id": "126ed189acaf5c391a45741b36aed0b1d02c60538d421e9105b5995e43307ae8",
+      "finding_id": "4fb0f1316d0af15c4bb07c7ecd209fa9afcf0c5b95cdc2a975af896ccd50d3c7",
       "path": "plugins/bifrost-agent/test/sync-release-version.test.mjs",
       "identity_stability": "strong",
       "status": "accepted",
@@ -159,31 +135,7 @@
     },
     {
       "policy_id": "bifrost.performance.serialization-in-loop",
-      "finding_id": "44a0e63ac251ccfe84741f809f989b07e9daf8dab467096b14bc88a1b4707bc3",
-      "path": "crates/bifrost-analysis/src/analyzer/go/dependency_discovery.rs",
-      "identity_stability": "strong",
-      "status": "accepted",
-      "reason": "Each iteration serializes a distinct item; the serialization is inherent to the loop and cannot be hoisted.",
-      "policy_hash_at_acceptance": "da0b97c9fccd69df43320804e18b2325952a603f136ad01af388816b2a49a4b4",
-      "accepted_by": "dbakereffendi",
-      "accepted_at": "2026-08-04",
-      "expires_at": null
-    },
-    {
-      "policy_id": "bifrost.performance.serialization-in-loop",
-      "finding_id": "8331ecad617e49aeedb23f90fdc30937812ea6d529478958ea813118519c1f39",
-      "path": "crates/bifrost-policy/src/catalog.rs",
-      "identity_stability": "strong",
-      "status": "accepted",
-      "reason": "Each iteration serializes a distinct item; the serialization is inherent to the loop and cannot be hoisted.",
-      "policy_hash_at_acceptance": "da0b97c9fccd69df43320804e18b2325952a603f136ad01af388816b2a49a4b4",
-      "accepted_by": "dbakereffendi",
-      "accepted_at": "2026-08-04",
-      "expires_at": null
-    },
-    {
-      "policy_id": "bifrost.performance.serialization-in-loop",
-      "finding_id": "93bc9ec9e1bdba890601598400bd2854571c96538c3954cec2d31b6ecf9c8f87",
+      "finding_id": "2175df8014fc064443d2425243532bed8e2ad9ee917ef165c8cd7e9a31adbfcf",
       "path": "crates/bifrost-analysis/src/searchtools/scan_usages.rs",
       "identity_stability": "strong",
       "status": "accepted",
@@ -194,20 +146,8 @@
       "expires_at": null
     },
     {
-      "policy_id": "bifrost.performance.serialization-in-loop",
-      "finding_id": "cf0279d757349d59ab654d860faf8edfe5397757d7781bdb14cd088d5d9ce2ec",
-      "path": "crates/bifrost-policy/src/catalog.rs",
-      "identity_stability": "strong",
-      "status": "accepted",
-      "reason": "Each iteration serializes a distinct item; the serialization is inherent to the loop and cannot be hoisted.",
-      "policy_hash_at_acceptance": "da0b97c9fccd69df43320804e18b2325952a603f136ad01af388816b2a49a4b4",
-      "accepted_by": "dbakereffendi",
-      "accepted_at": "2026-08-04",
-      "expires_at": null
-    },
-    {
       "policy_id": "bifrost.performance.sleep-in-loop",
-      "finding_id": "743e68db4ca9d2a6dde2ad28e5f1785add463454c3c74668fdaf1aaf66e3feef",
+      "finding_id": "fe639e787c5ab14fa523237e759da98dab58a64b440d731bbf5eccdc97e91ae2",
       "path": "scripts/public/mcp-replay.py",
       "identity_stability": "strong",
       "status": "accepted",
@@ -219,43 +159,7 @@
     },
     {
       "policy_id": "bifrost.performance.sleep-in-loop",
-      "finding_id": "5d6e566bc594a4f4a0e0f796f3d51ac6d5ffb816baadcc8de719f85a75c3a63d",
-      "path": "crates/bifrost-analysis/src/analyzer/usages/workspace_graph_cache.rs",
-      "identity_stability": "strong",
-      "status": "accepted",
-      "reason": "Deliberate retry/backoff or poll-until-deadline loop; the sleep is the mechanism, not a defect.",
-      "policy_hash_at_acceptance": "b0319247b09cacb3e1b43e0b3809f7b2ba6858a5522ba6de7bf3a7b8212901ad",
-      "accepted_by": "dbakereffendi",
-      "accepted_at": "2026-08-04",
-      "expires_at": null
-    },
-    {
-      "policy_id": "bifrost.performance.sleep-in-loop",
-      "finding_id": "60a8e1939348da29e01130e01b5aaa81c007a119f6535cddd7a0ea058a0853ab",
-      "path": "crates/bifrost-mcp/src/project_watcher.rs",
-      "identity_stability": "strong",
-      "status": "accepted",
-      "reason": "Deliberate retry/backoff or poll-until-deadline loop; the sleep is the mechanism, not a defect.",
-      "policy_hash_at_acceptance": "b0319247b09cacb3e1b43e0b3809f7b2ba6858a5522ba6de7bf3a7b8212901ad",
-      "accepted_by": "dbakereffendi",
-      "accepted_at": "2026-08-04",
-      "expires_at": null
-    },
-    {
-      "policy_id": "bifrost.performance.sleep-in-loop",
-      "finding_id": "c0e9526d5357c4c6c86b98a6c88955dbe3bba6b11f091374672516b1e861bd11",
-      "path": "crates/bifrost-analysis/src/analyzer/tree_sitter_analyzer.rs",
-      "identity_stability": "strong",
-      "status": "accepted",
-      "reason": "Deliberate retry/backoff or poll-until-deadline loop; the sleep is the mechanism, not a defect.",
-      "policy_hash_at_acceptance": "b0319247b09cacb3e1b43e0b3809f7b2ba6858a5522ba6de7bf3a7b8212901ad",
-      "accepted_by": "dbakereffendi",
-      "accepted_at": "2026-08-04",
-      "expires_at": null
-    },
-    {
-      "policy_id": "bifrost.performance.sleep-in-loop",
-      "finding_id": "9f5432c9703743e41742935912c1c2826bb4baec4234e346de0f664e6b04a4c2",
+      "finding_id": "f403bdcec718dab18ed1d1a20edb863dd8b49367067c90a81476312a5c2fd4b5",
       "path": "crates/bifrost-analysis/src/process.rs",
       "identity_stability": "strong",
       "status": "accepted",
@@ -266,80 +170,8 @@
       "expires_at": null
     },
     {
-      "policy_id": "bifrost.performance.sleep-in-loop",
-      "finding_id": "c5d10534d87007e0f0c0e1f7e4d2a695cf5c73cb87a61bebe104d3958d2e1805",
-      "path": "crates/bifrost-analysis/src/analyzer/tree_sitter_analyzer.rs",
-      "identity_stability": "strong",
-      "status": "accepted",
-      "reason": "Deliberate retry/backoff or poll-until-deadline loop; the sleep is the mechanism, not a defect.",
-      "policy_hash_at_acceptance": "b0319247b09cacb3e1b43e0b3809f7b2ba6858a5522ba6de7bf3a7b8212901ad",
-      "accepted_by": "dbakereffendi",
-      "accepted_at": "2026-08-04",
-      "expires_at": null
-    },
-    {
-      "policy_id": "bifrost.performance.sleep-in-loop",
-      "finding_id": "af0fa2cf8c555aaa710a052448a85973280d6a18851163b8422bdbcb411cd4d0",
-      "path": "crates/bifrost-analysis/src/analyzer/tree_sitter_analyzer.rs",
-      "identity_stability": "strong",
-      "status": "accepted",
-      "reason": "Deliberate retry/backoff or poll-until-deadline loop; the sleep is the mechanism, not a defect.",
-      "policy_hash_at_acceptance": "b0319247b09cacb3e1b43e0b3809f7b2ba6858a5522ba6de7bf3a7b8212901ad",
-      "accepted_by": "dbakereffendi",
-      "accepted_at": "2026-08-04",
-      "expires_at": null
-    },
-    {
-      "policy_id": "bifrost.performance.sleep-in-loop",
-      "finding_id": "cf1a641aa741ff2a9c74bfd80101e2841d00d0da8a483b121f77df63db073401",
-      "path": "crates/bifrost-analysis/src/analyzer/tree_sitter_analyzer.rs",
-      "identity_stability": "strong",
-      "status": "accepted",
-      "reason": "Deliberate retry/backoff or poll-until-deadline loop; the sleep is the mechanism, not a defect.",
-      "policy_hash_at_acceptance": "b0319247b09cacb3e1b43e0b3809f7b2ba6858a5522ba6de7bf3a7b8212901ad",
-      "accepted_by": "dbakereffendi",
-      "accepted_at": "2026-08-25",
-      "expires_at": null
-    },
-    {
-      "policy_id": "bifrost.performance.sleep-in-loop",
-      "finding_id": "ea94296f573b7889f5d6bec64824debee53f7c3ce245204a8c3f6aeac7e2e281",
-      "path": "crates/bifrost-analysis/src/analyzer/store/mod.rs",
-      "identity_stability": "strong",
-      "status": "accepted",
-      "reason": "Deliberate retry/backoff or poll-until-deadline loop; the sleep is the mechanism, not a defect.",
-      "policy_hash_at_acceptance": "b0319247b09cacb3e1b43e0b3809f7b2ba6858a5522ba6de7bf3a7b8212901ad",
-      "accepted_by": "dbakereffendi",
-      "accepted_at": "2026-08-04",
-      "expires_at": null
-    },
-    {
       "policy_id": "bifrost.performance.file-read-in-loop",
-      "finding_id": "a0e0ad299121abd7f4ace1a50bf71b850f6ebcd11a4528bc0f1fa803720da62d",
-      "path": "crates/bifrost-semantic-packs/src/summary_foundry/sanitizer_pack.rs",
-      "identity_stability": "strong",
-      "status": "accepted",
-      "reason": "Each iteration reads a different sanitizer candidate file selected by the current path. The read depends on that path and cannot be hoisted.",
-      "policy_hash_at_acceptance": "a1d83845a9a14d26d5c9de154727ac2cd32ca81365d1111bf966e209b4ed89c9",
-      "accepted_by": "jbellis",
-      "accepted_at": "2026-08-10",
-      "expires_at": null
-    },
-    {
-      "policy_id": "bifrost.performance.parsing-in-loop",
-      "finding_id": "7471e51bd207b7a211c16dc360b90fda99d27b2c64ecbb54b3d8341fbe512d63",
-      "path": "crates/bifrost-semantic-packs/src/summary_foundry/sanitizer_pack.rs",
-      "identity_stability": "strong",
-      "status": "accepted",
-      "reason": "Each iteration parses the bytes from a different sanitizer candidate file. The parse depends on that file and cannot be hoisted.",
-      "policy_hash_at_acceptance": "b9a5b20ef0958dde7ee5b5065f825543b6de07fd75dbfd488c99d7a242b74695",
-      "accepted_by": "jbellis",
-      "accepted_at": "2026-08-10",
-      "expires_at": null
-    },
-    {
-      "policy_id": "bifrost.performance.file-read-in-loop",
-      "finding_id": "3a3ef25c0e329d6fd7b46a009d3243aba3d543f746a59978e52b4939849267e8",
+      "finding_id": "f6bf4f8ae3b9b7ccf9fe5c2f19b197a8118ce386c0526afd9ace18b24967d6b8",
       "path": "crates/bifrost-semantic-packs/src/summary_foundry/framework_pack.rs",
       "identity_stability": "strong",
       "status": "accepted",
@@ -350,32 +182,8 @@
       "expires_at": null
     },
     {
-      "policy_id": "bifrost.performance.file-read-in-loop",
-      "finding_id": "2832e49165e510001cbeea2ae342b2ffdc1099d94ffe7ad8e4a69b55c9715317",
-      "path": "crates/bifrost-semantic-packs/src/summary_foundry/golden_pack.rs",
-      "identity_stability": "strong",
-      "status": "accepted",
-      "reason": "Each iteration reads a different golden candidate file selected by its path. The read depends on that path and cannot be hoisted.",
-      "policy_hash_at_acceptance": "a1d83845a9a14d26d5c9de154727ac2cd32ca81365d1111bf966e209b4ed89c9",
-      "accepted_by": "codex",
-      "accepted_at": "2026-08-11",
-      "expires_at": null
-    },
-    {
       "policy_id": "bifrost.performance.parsing-in-loop",
-      "finding_id": "3391b0d7fb7500bceb4960ea7e742329b5b913e3a06a3a6d47e3eb6477bafa61",
-      "path": "crates/bifrost-semantic-packs/src/summary_foundry/golden_pack.rs",
-      "identity_stability": "strong",
-      "status": "accepted",
-      "reason": "Each iteration parses a different golden candidate file. The parse depends on that file and cannot be hoisted.",
-      "policy_hash_at_acceptance": "b9a5b20ef0958dde7ee5b5065f825543b6de07fd75dbfd488c99d7a242b74695",
-      "accepted_by": "codex",
-      "accepted_at": "2026-08-11",
-      "expires_at": null
-    },
-    {
-      "policy_id": "bifrost.performance.parsing-in-loop",
-      "finding_id": "1473a5060381b2aa277184aa7aa22d873587aef250dcc8433b2a8a2e26c9f394",
+      "finding_id": "765b9b1c97c5a8a429eec7aeb3f814f8eb079edc1592bb4e22ab3598f13b7fc7",
       "path": "crates/bifrost-semantic-packs/src/summary_foundry/framework_pack.rs",
       "identity_stability": "strong",
       "status": "accepted",
@@ -471,7 +279,7 @@
     },
     {
       "policy_id": "bifrost.performance.serialization-in-loop",
-      "finding_id": "dfaa7eaabf6a176d010e2de3a3f89f4751b295adb550dfb8e4e795486086c92d",
+      "finding_id": "c38d89c961a105f90b4baedf10f4d96aab37eb5c48a053f76ffc85579e69f2bf",
       "path": "crates/bifrost-mcp/tests/conformance/extract-schemas.mjs",
       "identity_stability": "strong",
       "status": "accepted",
@@ -495,7 +303,7 @@
     },
     {
       "policy_id": "bifrost.performance.serialization-in-loop",
-      "finding_id": "fd741af979a212816211fb181b16128ed0661b91a150d6db4ce4c6fe5d859fd0",
+      "finding_id": "d3fed13fa7440db61108649c16e2875352fa7dcf6e330fcdb83e0e95902372e1",
       "path": "crates/bifrost-mcp/tests/conformance/bridge.mjs",
       "identity_stability": "strong",
       "status": "accepted",
@@ -507,7 +315,7 @@
     },
     {
       "policy_id": "bifrost.performance.serialization-in-loop",
-      "finding_id": "446b8344f3d3d29ede7359f2bab13427dbaa08371ee75fa9f7448b9845649ae9",
+      "finding_id": "4f509cf3591f491066615c579a174ce0cc61e6d4f155dd49af6f38d52dd0f8de",
       "path": "crates/bifrost-mcp/tests/conformance/bridge.mjs",
       "identity_stability": "strong",
       "status": "accepted",
@@ -542,18 +350,6 @@
       "expires_at": null
     },
     {
-      "policy_id": "bifrost.performance.regex-compile-in-loop",
-      "finding_id": "04f56533d4261d38cef60f90edff988bf750096b712e4585dcb9d1765f3cdbb5",
-      "path": "scripts/public/release-promotion-workflow.test.mjs",
-      "identity_stability": "strong",
-      "status": "accepted",
-      "reason": "Each iteration builds a pattern for a different OIDC claim name, so the compiled expression differs per iteration and cannot be hoisted. Assertion-only workflow test over a seven-element claim list.",
-      "policy_hash_at_acceptance": "cf97c430a496547a9ffc0731e412d5426e2d5d39effa872c433cbc7dd3c61578",
-      "accepted_by": "dbakereffendi",
-      "accepted_at": "2026-08-19",
-      "expires_at": null
-    },
-    {
       "policy_id": "bifrost.performance.parsing-in-loop",
       "finding_id": "1703e75f170cd77f697507628688a90814e9f8364828a4fd6f875693aa39c4b4",
       "path": "scripts/public/check-suppression-paths.mjs",
@@ -563,6 +359,66 @@
       "policy_hash_at_acceptance": "b9a5b20ef0958dde7ee5b5065f825543b6de07fd75dbfd488c99d7a242b74695",
       "accepted_by": "dbakereffendi",
       "accepted_at": "2026-08-25",
+      "expires_at": null
+    },
+    {
+      "policy_id": "bifrost.performance.parsing-in-loop",
+      "finding_id": "ea19ebbc43275b5b39fc633925f9fb9e2a28b2e3957f34d9efd0487737931d6c",
+      "path": "src/bin/bifrost.rs",
+      "identity_stability": "strong",
+      "status": "accepted",
+      "reason": "Each iteration parses a distinct payload/line/file; the parse work is inherent to the loop and cannot be hoisted.",
+      "policy_hash_at_acceptance": "b9a5b20ef0958dde7ee5b5065f825543b6de07fd75dbfd488c99d7a242b74695",
+      "accepted_by": "dbakereffendi",
+      "accepted_at": "2026-08-04",
+      "expires_at": null
+    },
+    {
+      "policy_id": "bifrost.performance.sleep-in-loop",
+      "finding_id": "50ead0cb6685c696835e1f5c172b998ee2dda31a6adfaecaec9d7430ccbfacdb",
+      "path": "crates/bifrost-analysis/src/analyzer/usages/workspace_graph_cache.rs",
+      "identity_stability": "strong",
+      "status": "accepted",
+      "reason": "Deliberate retry/backoff or poll-until-deadline loop; the sleep is the mechanism, not a defect.",
+      "policy_hash_at_acceptance": "b0319247b09cacb3e1b43e0b3809f7b2ba6858a5522ba6de7bf3a7b8212901ad",
+      "accepted_by": "dbakereffendi",
+      "accepted_at": "2026-08-04",
+      "expires_at": null
+    },
+    {
+      "policy_id": "bifrost.performance.file-read-in-loop",
+      "finding_id": "acb0521c4aa3dbf78dea9b63da91e5386f03a197e27aab9cd193034a49f43f2a",
+      "path": "crates/bifrost-semantic-packs/src/summary_foundry/sanitizer_pack.rs",
+      "identity_stability": "strong",
+      "status": "accepted",
+      "reason": "Each iteration reads a different sanitizer candidate file selected by the current path. The read depends on that path and cannot be hoisted.",
+      "policy_hash_at_acceptance": "a1d83845a9a14d26d5c9de154727ac2cd32ca81365d1111bf966e209b4ed89c9",
+      "accepted_by": "jbellis",
+      "accepted_at": "2026-08-10",
+      "expires_at": null
+    },
+    {
+      "policy_id": "bifrost.performance.parsing-in-loop",
+      "finding_id": "30025ecff7ca3cdc75dbe0ea63de7b610cb2109508b472a6350087aceec37f5e",
+      "path": "crates/bifrost-semantic-packs/src/summary_foundry/sanitizer_pack.rs",
+      "identity_stability": "strong",
+      "status": "accepted",
+      "reason": "Each iteration parses the bytes from a different sanitizer candidate file. The parse depends on that file and cannot be hoisted.",
+      "policy_hash_at_acceptance": "b9a5b20ef0958dde7ee5b5065f825543b6de07fd75dbfd488c99d7a242b74695",
+      "accepted_by": "jbellis",
+      "accepted_at": "2026-08-10",
+      "expires_at": null
+    },
+    {
+      "policy_id": "bifrost.performance.sleep-in-loop",
+      "finding_id": "71a4ce1b0d06b038885b50fe0092e8f0feb7ec60cb7bb7f40e7b0ba033f94177",
+      "path": "crates/bifrost-analysis/src/analyzer/store/mod.rs",
+      "identity_stability": "strong",
+      "status": "accepted",
+      "reason": "Deliberate retry/backoff between store write attempts for one prepared blob (PREPARED_WRITE_IMMEDIATE_RETRIES); the sleep is the mechanism, not a defect. Re-keyed after the #2632 reader-pool change moved the code above it.",
+      "policy_hash_at_acceptance": "16b1be4131f57ee9dff8c34d8a083241bbfbd0992cc0a6e215e9b142d7e551ab",
+      "accepted_by": "jbellis",
+      "accepted_at": "2026-09-02",
       "expires_at": null
     }
   ]

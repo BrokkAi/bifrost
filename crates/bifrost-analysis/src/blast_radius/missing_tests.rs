@@ -677,6 +677,7 @@ mod tests {
         fs::write(target, contents).expect("fixture source");
     }
 
+    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
     #[test]
     fn exact_usage_narrowing_distinguishes_siblings_and_follows_callers() {
         let temp = tempfile::tempdir().expect("temporary repository");

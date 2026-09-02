@@ -1,0 +1,8 @@
+{
+  "$profileSchema": "jvm-compatibility",
+  "profileVersion": "0.1",
+  "constraints": {
+    "jvmVendor": "https://adoptium.net/",
+    "javaRelease": { "minimum": 21 }
+  }
+}

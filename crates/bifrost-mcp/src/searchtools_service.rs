@@ -9,7 +9,7 @@ use crate::policy::{
 use crate::searchtools::get_symbol_sources;
 use crate::{
     AnalyzerConfig, CancellationToken, FilesystemProject, Project, ProjectChangeWatcher,
-    ProjectFile, WorkspaceAnalyzer, WorkspaceFileListingCache,
+    ProjectFile, SubsetCoverage, WorkspaceAnalyzer, WorkspaceFileListingCache,
     analyzer::IndexWarmer,
     analyzer::packs_document::{
         WORKSPACE_PACKS_DOCUMENT_PATH, WorkspaceActivationSources, WorkspacePacksActivation,
@@ -45,12 +45,12 @@ use crate::{
     policy::{
         BuiltInPolicySelection, ExplainError, ExplanationCandidate, ExplanationLimits,
         ExplanationTarget, NearMissCandidates, POLICY_EXIT_CLEAN, POLICY_EXIT_FINDING,
-        POLICY_EXIT_UNRELIABLE, PolicyBaselineOptions, PolicyBaselineSource, PolicyEvaluationDate,
-        PolicyEvaluationInput, PolicyEvaluationOptions, PolicyExplanation, PolicyFailOn,
-        PolicyFindingId, PolicyHostActivationContext, PolicyId, PolicyNearMissRanking,
-        PolicyReportDocument, PolicyScopeOptions, PolicyScopeSource, PolicyStageTiming,
-        PolicySuppressionOptions, PolicySuppressionSource, built_in_policy_catalog,
-        explain_policy_inputs, rank_policy_near_misses,
+        POLICY_EXIT_UNRELIABLE, PolicyBaselineOptions, PolicyBaselineSource, PolicyBatchOutcome,
+        PolicyEvaluationDate, PolicyEvaluationInput, PolicyEvaluationOptions, PolicyExplanation,
+        PolicyFailOn, PolicyFindingId, PolicyHostActivationContext, PolicyId,
+        PolicyNearMissRanking, PolicyReportDocument, PolicyScopeOptions, PolicyScopeSource,
+        PolicyStageTiming, PolicySuppressionOptions, PolicySuppressionSource,
+        built_in_policy_catalog, explain_policy_inputs, rank_policy_near_misses,
         workspace_snapshot_deadline_outcome_with_preflight,
     },
     profiling,
@@ -64,7 +64,7 @@ use crate::{
         get_type_by_location, list_symbols, most_relevant_files_with_cancellation, refresh_result,
         rename_symbol, scan_usages_by_location_with_cancellation,
         scan_usages_by_reference_with_cancellation, search_symbols_with_cancellation,
-        symbol_source_candidate_files, usage_graph,
+        session_subset, symbol_source_candidate_files, usage_graph,
     },
     searchtools_render::{RenderOptions, RenderText},
     workspace_document::{WorkspaceDocumentError, WorkspaceRoot, read_workspace_document},
@@ -502,7 +502,7 @@ mod workspace_semantic_model_configuration_tests {
     use crate::path_normalization::NormalizePath;
 
     const WORKSPACE_PACK: &str = r#"{
-  "schema_version": 1,
+  "schema_version": 2,
   "pack_id": "workspace.job-maker",
   "version": "1.0.0",
   "producer": { "name": "workspace", "version": "1.0.0" },
@@ -595,6 +595,7 @@ mod workspace_semantic_model_configuration_tests {
         );
     }
 
+    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
     #[test]
     fn absent_packs_document_uses_bound_workspace_defaults() {
         let temp = tempfile::tempdir().unwrap();
@@ -813,6 +814,11 @@ struct RunPolicyParams {
     #[serde(default)]
     fail_on: RunPolicyFailOn,
     diff_base: Option<String>,
+    /// Whether this run may reuse per-unit results an earlier run published
+    /// (`.agents/plans/impact-sliced-diff-base.md`). Absent means yes, which
+    /// is the same findings for less work; `false` forces the full evaluation
+    /// a caller compares against when diagnosing a difference.
+    incremental: Option<bool>,
     /// Opt-in wall-clock stage attribution (#2611). When set, the result
     /// carries a `stage_timings` sibling next to the canonical report; the
     /// report itself stays byte-identical either way.
@@ -1056,12 +1062,16 @@ enum UpdateStrategy {
     Manual,
 }
 
-type WatcherStarter =
-    Arc<dyn Fn(Arc<dyn Project>) -> Result<ProjectChangeWatcher, String> + Send + Sync + 'static>;
+type WatcherStarter = Arc<
+    dyn Fn(Arc<dyn Project>, &[ProjectFile]) -> Result<ProjectChangeWatcher, String>
+        + Send
+        + Sync
+        + 'static,
+>;
 type PendingWorkspaceBuild = JoinHandle<Result<(u64, PathBuf, WorkspaceSession), String>>;
 
 fn production_watcher_starter() -> WatcherStarter {
-    Arc::new(ProjectChangeWatcher::start)
+    Arc::new(ProjectChangeWatcher::start_with_claimed_files)
 }
 
 pub struct SearchToolsService {
@@ -1122,10 +1132,6 @@ struct WorkspaceSession {
     watcher: SessionWatcher,
     usage_index_warm: Option<JoinHandle<()>>,
     index_warmer: Arc<IndexWarmer>,
-    /// Initial optional query-index warming is deferred until the first tool
-    /// call has completed. This keeps a long-lived server's startup
-    /// accelerator from competing with an unrelated cold request.
-    initial_index_warm_scheduled: std::sync::atomic::AtomicBool,
 }
 
 enum SessionWatcher {
@@ -1976,22 +1982,7 @@ impl WorkspaceSession {
     /// Free when the snapshot is already warm (incremental updates whose
     /// sources were unchanged share the previous generation's indexes).
     fn schedule_index_warm(&self) {
-        self.initial_index_warm_scheduled
-            .store(true, Ordering::Release);
         self.index_warmer.schedule(Arc::clone(&self.snapshot));
-    }
-
-    /// Queue the initial optional warm once, after the first tool call has
-    /// completed. Unlike refresh/update warming, this is deliberately not
-    /// started while the first request is still paying for workspace startup.
-    fn schedule_initial_index_warm(&self) {
-        if self
-            .initial_index_warm_scheduled
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-        {
-            self.index_warmer.schedule(Arc::clone(&self.snapshot));
-        }
     }
 
     /// Whether a caller can ask a usage question without waiting behind the
@@ -2192,7 +2183,8 @@ fn decode_run_policy_arguments(
         PolicyEvaluationOptions::with_suppressions(params.evaluation_date, suppressions)
             .with_scope(scope)
             .with_baseline(baseline)
-            .with_fail_on(fail_on);
+            .with_fail_on(fail_on)
+            .with_incremental(params.incremental.unwrap_or(true));
     if let Some(revision) = params.diff_base {
         if revision.is_empty()
             || revision.len() > crate::mcp_extended::MAX_RUN_POLICY_DIFF_BASE_BYTES
@@ -2409,6 +2401,46 @@ impl SearchToolsService {
             .as_ref()
             .map(|session| Arc::clone(&session.snapshot))
             .ok_or_else(|| "no active workspace session".to_string())
+    }
+
+    /// Evaluate a policy batch against this service's immutable workspace
+    /// snapshot. Scoped one-shot CLI runs use this seam so their partial
+    /// `FileSetProject` is the only analyzer constructed.
+    pub fn evaluate_policy_inputs(
+        &self,
+        root: &Path,
+        policy_inputs: &[PolicyEvaluationInput],
+        options: &PolicyEvaluationOptions,
+    ) -> Result<PolicyBatchOutcome, String> {
+        loop {
+            let generation = self.workspace_generation();
+            let snapshot = self
+                .snapshot_for_query_with_cancellation(None)
+                .map_err(|error| error.to_string())?;
+            if generation != self.workspace_generation() {
+                continue;
+            }
+            let result = {
+                let runtime = CodeIntelligenceRuntime::new(&snapshot, &self.flow_state, None);
+                let runtime = match snapshot.pack_activation.as_deref() {
+                    Some(state) => {
+                        runtime.with_host_activation_context(PolicyHostActivationContext::new(
+                            state.config.as_deref(),
+                            state.activation.as_deref(),
+                            &state.ecosystems,
+                            state.failure.as_deref(),
+                        ))
+                    }
+                    None => runtime,
+                };
+                runtime
+                    .evaluate_policy_inputs(root, policy_inputs, options)
+                    .map_err(|error| SearchToolsServiceError::internal(error.to_string()))
+            };
+            return snapshot
+                .finish("evaluate_policy_inputs", result)
+                .map_err(|error| error.to_string());
+        }
     }
 
     /// Register one already-compiled protocol and pre-resolved binding plan for
@@ -2675,7 +2707,7 @@ impl SearchToolsService {
             }
             result => result,
         };
-        self.schedule_initial_index_warm();
+        self.schedule_index_warm_after_tool_call();
         result
     }
 
@@ -2723,7 +2755,7 @@ impl SearchToolsService {
             }
             result => result,
         };
-        self.schedule_initial_index_warm();
+        self.schedule_index_warm_after_tool_call();
         result
     }
 
@@ -2868,7 +2900,7 @@ impl SearchToolsService {
                     "failed to load built-in policy catalog: {error}"
                 ))
             })?;
-            return Self::structured_only(catalog.manifest());
+            return Self::structured_only(catalog.document());
         }
         if name == "run_policy" {
             return match self.prepare_run_policy_with_cancellation_and_preflight(
@@ -4324,10 +4356,6 @@ impl SearchToolsService {
             .analyzer()
             .project()
             .invalidate_cached_file_listing();
-        session
-            .snapshot
-            .analyzer()
-            .invalidate_cached_file_identities();
         let next = session.snapshot.update_all();
         session.snapshot = Arc::new(next);
         session.refresh_pack_activation();
@@ -4406,7 +4434,8 @@ impl SearchToolsService {
 
         if resolved == session.snapshot.analyzer().project().root() {
             let usage_index_ready = session.usage_index_ready();
-            return active_workspace_result(&resolved, usage_index_ready);
+            let session_subset = session_subset(session.snapshot.analyzer());
+            return active_workspace_result(&resolved, usage_index_ready, session_subset);
         }
 
         // Fully assemble the replacement before mutating either active field so
@@ -4444,6 +4473,7 @@ impl SearchToolsService {
         let old_session = std::mem::replace(session, new_session);
         session.schedule_index_warm();
         let usage_index_ready = session.usage_index_ready();
+        let session_subset = session_subset(session.snapshot.analyzer());
         *root = Some(resolved.clone());
         *self
             .file_listing
@@ -4457,7 +4487,7 @@ impl SearchToolsService {
         // The replacement session's background index warm has only just
         // started, so this reports the newly activated workspace's readiness,
         // not the closed one's.
-        active_workspace_result(&resolved, usage_index_ready)
+        active_workspace_result(&resolved, usage_index_ready, session_subset)
     }
 
     fn handle_get_active_workspace(
@@ -4473,6 +4503,7 @@ impl SearchToolsService {
         active_workspace_result(
             session.snapshot.analyzer().project().root(),
             session.usage_index_ready(),
+            session_subset(session.snapshot.analyzer()),
         )
     }
 
@@ -5266,10 +5297,16 @@ impl SearchToolsService {
             .map_err(|_| SearchToolsServiceError::internal("SearchToolsService lock poisoned"))
     }
 
-    /// Start the long-lived session's optional query-index warm after the
-    /// first tool call has finished. Initial workspace installation deliberately
-    /// leaves this unscheduled so unrelated cold requests retain priority.
-    fn schedule_initial_index_warm(&self) {
+    /// Start the long-lived session's optional query-index warm after a tool
+    /// call has finished. Initial workspace installation deliberately leaves
+    /// this unscheduled so unrelated cold requests retain priority.
+    ///
+    /// Every completed call, not only the first: a structural query makes its
+    /// provider's posting index outstanding, so the warm that builds it can
+    /// only be scheduled after that query returns (#2879). The warmer itself
+    /// returns immediately when nothing is outstanding, so the repeats cost a
+    /// pair of predicate calls.
+    fn schedule_index_warm_after_tool_call(&self) {
         if self.startup_index_warm != StartupIndexWarm::AtStartup {
             return;
         }
@@ -5278,7 +5315,7 @@ impl SearchToolsService {
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(session) = guard.as_ref() {
-            session.schedule_initial_index_warm();
+            session.schedule_index_warm();
         }
     }
 
@@ -5473,7 +5510,12 @@ fn assemble_session(
         WorkspaceRoot::open(project.root())
             .map_err(|error| format!("Failed to open workspace document root: {error}"))?,
     );
-    let watcher = start_session_watcher(Arc::clone(&project), update_strategy, watcher_starter)?;
+    let watcher = start_session_watcher(
+        Arc::clone(&project),
+        &workspace,
+        update_strategy,
+        watcher_starter,
+    )?;
     let snapshot = Arc::new(workspace);
     // Pre-build the lazy per-language usage indexes off the request path (issue
     // #1416): warmed here in the background, the first `scan_usages` call no
@@ -5507,25 +5549,25 @@ fn assemble_session(
         watcher,
         usage_index_warm,
         index_warmer: IndexWarmer::new(),
-        initial_index_warm_scheduled: std::sync::atomic::AtomicBool::new(
-            startup_index_warm == StartupIndexWarm::OnDemand,
-        ),
     })
 }
 
 fn start_session_watcher(
     project: Arc<dyn Project>,
+    workspace: &WorkspaceAnalyzer,
     update_strategy: UpdateStrategy,
     watcher_starter: &WatcherStarter,
 ) -> Result<SessionWatcher, String> {
     match update_strategy {
         UpdateStrategy::WatchFiles => {
-            let watcher = watcher_starter(Arc::clone(&project)).map_err(|error| {
-                format!(
-                    "Failed to start project watcher for {}: {error}",
-                    project.root().display()
-                )
-            })?;
+            let claimed_files = workspace.analyzer().claimed_files();
+            let watcher =
+                watcher_starter(Arc::clone(&project), &claimed_files).map_err(|error| {
+                    format!(
+                        "Failed to start project watcher for {}: {error}",
+                        project.root().display()
+                    )
+                })?;
             // Listing-cache fills that precede watcher registration (the
             // deferred index build, `find_filenames` during a pending build)
             // can miss changes the watcher never saw. Drop the cache now that
@@ -5563,10 +5605,12 @@ fn resolve_workspace_root(path: &Path) -> Result<PathBuf, String> {
 fn active_workspace_result(
     root: &Path,
     usage_index_ready: bool,
+    session_subset: Option<SubsetCoverage>,
 ) -> Result<ToolOutput, SearchToolsServiceError> {
     let structured = serde_json::to_value(ActiveWorkspaceResult {
         workspace_path: root.display().to_string(),
         usage_index_ready,
+        session_subset,
     })
     .map_err(|err| {
         SearchToolsServiceError::internal(format!("Failed to serialize tool result: {err}"))
@@ -5592,20 +5636,12 @@ mod watcher_startup_tests {
     fn workspace(file: &str, source: &str) -> (tempfile::TempDir, PathBuf) {
         let temp = tempfile::tempdir().unwrap();
         std::fs::write(temp.path().join(file), source).unwrap();
-        // Watcher/session tests do not exercise dependency-pack activation.
-        // Keep their persisted workspace build independent of the host JDK.
-        std::fs::create_dir_all(temp.path().join(".bifrost")).unwrap();
-        std::fs::write(
-            temp.path().join(".bifrost/packs.json"),
-            r#"{ "schema_version": 1, "ecosystems": [] }"#,
-        )
-        .unwrap();
         let root = temp.path().canonicalize().unwrap().normalize();
         (temp, root)
     }
 
     fn failing_starter(calls: Arc<AtomicUsize>) -> WatcherStarter {
-        Arc::new(move |_| {
+        Arc::new(move |_, _| {
             calls.fetch_add(1, Ordering::SeqCst);
             Err(WATCHER_FAILURE.to_string())
         })
@@ -5653,9 +5689,12 @@ mod watcher_startup_tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let starter: WatcherStarter = {
             let calls = Arc::clone(&calls);
-            Arc::new(move |project| {
+            Arc::new(move |project, claimed_files| {
                 calls.fetch_add(1, Ordering::SeqCst);
-                ProjectChangeWatcher::start_polling_for_tests(project)
+                ProjectChangeWatcher::start_polling_with_claimed_files_for_tests(
+                    project,
+                    claimed_files,
+                )
             })
         };
 
@@ -5757,6 +5796,7 @@ mod watcher_startup_tests {
     /// (the stdio server under `BIFROST_MCP_FILE_WATCHER=off`) has no watcher
     /// to invalidate a listing cache, so it must not carry one -- a stale
     /// listing there is user-visible across requests.
+    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
     #[test]
     fn a_long_lived_manual_service_carries_no_listing_cache() {
         let (_temp, root) = workspace("Manual.java", "class Manual {}\n");
@@ -5822,7 +5862,7 @@ mod watcher_startup_tests {
         let starter: WatcherStarter = {
             let calls = Arc::clone(&calls);
             let release_startup_rx = Arc::clone(&release_startup_rx);
-            Arc::new(move |project| {
+            Arc::new(move |project, claimed_files| {
                 calls.fetch_add(1, Ordering::SeqCst);
                 startup_started_tx
                     .send(())
@@ -5832,7 +5872,10 @@ mod watcher_startup_tests {
                     .unwrap()
                     .recv()
                     .expect("test should release watcher startup");
-                ProjectChangeWatcher::start_polling_for_tests(project)
+                ProjectChangeWatcher::start_polling_with_claimed_files_for_tests(
+                    project,
+                    claimed_files,
+                )
             })
         };
         let service = Arc::new(
@@ -5895,7 +5938,7 @@ mod watcher_startup_tests {
         let (startup_started_tx, startup_started_rx) = mpsc::channel();
         let (release_startup_tx, release_startup_rx) = mpsc::sync_channel(1);
         let release_startup_rx = Arc::new(Mutex::new(release_startup_rx));
-        let starter: WatcherStarter = Arc::new(move |project| {
+        let starter: WatcherStarter = Arc::new(move |project, claimed_files| {
             startup_started_tx
                 .send(())
                 .expect("test should observe watcher startup");
@@ -5904,7 +5947,7 @@ mod watcher_startup_tests {
                 .expect("release lock")
                 .recv()
                 .expect("test should release watcher startup");
-            ProjectChangeWatcher::start_polling_for_tests(project)
+            ProjectChangeWatcher::start_polling_with_claimed_files_for_tests(project, claimed_files)
         });
         let service = Arc::new(unbound_watching_service(starter));
         service
@@ -6063,7 +6106,7 @@ mod watcher_startup_tests {
         let (startup_started_tx, startup_started_rx) = mpsc::channel();
         let (release_startup_tx, release_startup_rx) = mpsc::sync_channel(1);
         let release_startup_rx = Arc::new(Mutex::new(release_startup_rx));
-        let starter: WatcherStarter = Arc::new(move |project| {
+        let starter: WatcherStarter = Arc::new(move |project, claimed_files| {
             startup_started_tx
                 .send(())
                 .expect("test should observe watcher startup");
@@ -6072,7 +6115,7 @@ mod watcher_startup_tests {
                 .expect("release lock")
                 .recv_timeout(Duration::from_secs(5))
                 .expect("test should release watcher startup");
-            ProjectChangeWatcher::start_polling_for_tests(project)
+            ProjectChangeWatcher::start_polling_with_claimed_files_for_tests(project, claimed_files)
         });
         let service = unbound_watching_service(starter);
         service
@@ -6163,7 +6206,7 @@ mod watcher_startup_tests {
         let (startup_started_tx, startup_started_rx) = mpsc::channel();
         let (release_startup_tx, release_startup_rx) = mpsc::sync_channel(1);
         let release_startup_rx = Arc::new(Mutex::new(release_startup_rx));
-        let starter: WatcherStarter = Arc::new(move |project| {
+        let starter: WatcherStarter = Arc::new(move |project, claimed_files| {
             startup_started_tx
                 .send(())
                 .expect("test should observe watcher startup");
@@ -6172,7 +6215,7 @@ mod watcher_startup_tests {
                 .expect("release lock")
                 .recv_timeout(Duration::from_secs(5))
                 .expect("test should release watcher startup");
-            ProjectChangeWatcher::start_polling_for_tests(project)
+            ProjectChangeWatcher::start_polling_with_claimed_files_for_tests(project, claimed_files)
         });
         let service = unbound_watching_service(starter);
         service
@@ -6290,7 +6333,7 @@ mod watcher_startup_tests {
         let (startup_started_tx, startup_started_rx) = mpsc::channel();
         let (release_startup_tx, release_startup_rx) = mpsc::sync_channel(1);
         let release_startup_rx = Arc::new(Mutex::new(release_startup_rx));
-        let starter: WatcherStarter = Arc::new(move |project| {
+        let starter: WatcherStarter = Arc::new(move |project, claimed_files| {
             startup_started_tx
                 .send(())
                 .expect("test should observe watcher startup");
@@ -6299,7 +6342,7 @@ mod watcher_startup_tests {
                 .expect("release lock")
                 .recv_timeout(Duration::from_secs(5))
                 .expect("test should release watcher startup");
-            ProjectChangeWatcher::start_polling_for_tests(project)
+            ProjectChangeWatcher::start_polling_with_claimed_files_for_tests(project, claimed_files)
         });
         let service = unbound_watching_service(starter);
         service
@@ -6356,7 +6399,7 @@ mod watcher_startup_tests {
         let release_startup_rx = Arc::new(Mutex::new(release_startup_rx));
         let starter: WatcherStarter = {
             let starts = Arc::clone(&starts);
-            Arc::new(move |project| {
+            Arc::new(move |project, claimed_files| {
                 starts.fetch_add(1, Ordering::SeqCst);
                 startup_started_tx
                     .send(())
@@ -6366,7 +6409,10 @@ mod watcher_startup_tests {
                     .expect("release lock")
                     .recv_timeout(Duration::from_secs(5))
                     .expect("test should release watcher startup");
-                ProjectChangeWatcher::start_polling_for_tests(project)
+                ProjectChangeWatcher::start_polling_with_claimed_files_for_tests(
+                    project,
+                    claimed_files,
+                )
             })
         };
         let service = Arc::new(unbound_watching_service(starter));
@@ -6480,7 +6526,7 @@ mod watcher_startup_tests {
         let (release_first_tx, release_first_rx) = mpsc::sync_channel(1);
         let release_first_rx = Arc::new(Mutex::new(release_first_rx));
         let (first_finished_tx, first_finished_rx) = mpsc::channel();
-        let starter: WatcherStarter = Arc::new(move |project| {
+        let starter: WatcherStarter = Arc::new(move |project, claimed_files| {
             if project.root() == blocked_root {
                 first_started_tx
                     .send(())
@@ -6490,13 +6536,19 @@ mod watcher_startup_tests {
                     .expect("release lock")
                     .recv_timeout(Duration::from_secs(5))
                     .expect("test should release the first build");
-                let watcher = ProjectChangeWatcher::start_polling_for_tests(project)?;
+                let watcher = ProjectChangeWatcher::start_polling_with_claimed_files_for_tests(
+                    project,
+                    claimed_files,
+                )?;
                 first_finished_tx
                     .send(())
                     .expect("test should observe the first build finishing");
                 Ok(watcher)
             } else {
-                ProjectChangeWatcher::start_polling_for_tests(project)
+                ProjectChangeWatcher::start_polling_with_claimed_files_for_tests(
+                    project,
+                    claimed_files,
+                )
             }
         });
         let service = unbound_watching_service(starter);
@@ -6535,11 +6587,14 @@ mod watcher_startup_tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let starter: WatcherStarter = {
             let calls = Arc::clone(&calls);
-            Arc::new(move |project| {
+            Arc::new(move |project, claimed_files| {
                 if calls.fetch_add(1, Ordering::SeqCst) == 0 {
                     Err(WATCHER_FAILURE.to_string())
                 } else {
-                    ProjectChangeWatcher::start_polling_for_tests(project)
+                    ProjectChangeWatcher::start_polling_with_claimed_files_for_tests(
+                        project,
+                        claimed_files,
+                    )
                 }
             })
         };
@@ -6726,6 +6781,7 @@ mod watcher_startup_tests {
     /// (#1758, d8920a38), so the build stays lazy and no warm thread is
     /// started at all. Such a session is ready by construction: with nothing
     /// outstanding there is nothing for a caller to wait for.
+    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
     #[test]
     fn a_one_shot_service_does_not_start_the_usage_index_warm_at_startup() {
         let (_temp, root) = workspace("lib.rs", "pub fn root() {}\npub fn run() { root(); }\n");
@@ -6818,11 +6874,14 @@ mod watcher_startup_tests {
         let (_old_temp, old_root) = workspace("Old.java", "class Old {}\n");
         let (_new_temp, new_root) = workspace("New.java", "class New {}\n");
         let failed_root = new_root.clone();
-        let starter: WatcherStarter = Arc::new(move |project| {
+        let starter: WatcherStarter = Arc::new(move |project, claimed_files| {
             if project.root() == failed_root {
                 Err(WATCHER_FAILURE.to_string())
             } else {
-                ProjectChangeWatcher::start_polling_for_tests(project)
+                ProjectChangeWatcher::start_polling_with_claimed_files_for_tests(
+                    project,
+                    claimed_files,
+                )
             }
         });
         let service = SearchToolsService::new_ephemeral_with_strategy_and_watcher_starter(
@@ -7146,7 +7205,6 @@ public partial class MudDialogContainer
                 watcher: SessionWatcher::Disabled,
                 usage_index_warm: None,
                 index_warmer: IndexWarmer::new(),
-                initial_index_warm_scheduled: std::sync::atomic::AtomicBool::new(true),
             })),
             workspace_generation: AtomicU64::new(1),
             flow_state: crate::flow::FlowWorkspaceState::new(),
@@ -7234,6 +7292,7 @@ public partial class MudDialogContainer
         );
     }
 
+    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
     #[test]
     fn get_symbol_sources_refreshes_new_member_from_indexed_owner() {
         let (_temp, root) = write_project();
@@ -7430,6 +7489,7 @@ mod client_roots_tests {
             .unwrap()
     }
 
+    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
     #[test]
     fn manual_persisted_sessions_leave_gc_for_explicit_maintenance() {
         let (_source_temp, source_root) = committed_workspace("Source.java", "class Source {}\n");
@@ -7459,6 +7519,7 @@ mod client_roots_tests {
         assert_eq!(gc_accounting(&target_db), (0, 0));
     }
 
+    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
     #[test]
     fn watched_persisted_sessions_still_run_automatic_gc() {
         let (_temp, root) = committed_workspace("Watched.java", "class Watched {}\n");
@@ -7486,6 +7547,7 @@ mod client_roots_tests {
         assert!(blobs_at_last_gc > 0);
     }
 
+    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
     #[test]
     fn explicit_gc_rejects_ephemeral_sessions() {
         let (_temp, root) = committed_workspace("Ephemeral.java", "class Ephemeral {}\n");

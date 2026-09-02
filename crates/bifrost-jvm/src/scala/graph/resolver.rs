@@ -37,7 +37,6 @@ pub struct TargetSpec {
     pub accepts_field_implementation: bool,
     pub is_object_type: bool,
     pub accepts_apply_role: bool,
-    pub accepts_term_field_role: bool,
     pub accepts_companion_apply_syntax: bool,
 }
 
@@ -54,7 +53,6 @@ impl TargetSpec {
             let is_object_type = !is_type_alias && target.short_name().ends_with('$');
             let accepts_apply_role =
                 !is_type_alias && types.class_accepts_apply_role(scala, target);
-            let accepts_term_field_role = types.has_term_field_declaration(target);
             return Some(Self {
                 target: target.clone(),
                 kind: TargetKind::Type,
@@ -72,7 +70,6 @@ impl TargetSpec {
                 accepts_field_implementation: false,
                 is_object_type,
                 accepts_apply_role,
-                accepts_term_field_role,
                 accepts_companion_apply_syntax: false,
             });
         }
@@ -163,7 +160,6 @@ impl TargetSpec {
             accepts_field_implementation,
             is_object_type: false,
             accepts_apply_role: false,
-            accepts_term_field_role: false,
             accepts_companion_apply_syntax,
         })
     }

@@ -1,19 +1,20 @@
 use crate::graph::CSharpGraphSource;
 use crate::graph::hits::{push_hit, push_self_receiver_hit, push_unproven_hit};
 use crate::graph::resolver::{
-    TargetKind, TargetSpec, UnqualifiedMethodGroupResolution,
-    applicable_member_candidates_for_owner, argument_count, binding_scope_node,
-    class_unit_for_fq_name, collection_target_element_type_node, enclosing_declared_type,
-    extension_visibility_site_key, first_type_child, is_type_reference_node,
+    CSharpBuiltinValueArguments, CSharpInitializerOwnerLookups, TargetKind, TargetSpec,
+    UnqualifiedMethodGroupResolution, applicable_member_candidates_for_owner, argument_count,
+    binding_scope_node, class_unit_for_fq_name, collection_target_element_type_node,
+    enclosing_declared_type, extension_visibility_site_key, first_type_child,
+    is_type_reference_node, member_declared_collection_element_type_fq_name,
     member_name_is_locally_bound, nearest_member_candidates_for_owner, node_text,
-    normalize_type_text, object_creation_collection_target, object_initializer_for_label,
-    object_initializer_owner_type_node, receiver_targets_owner, reference_type_text,
-    resolve_arity_free_type_fq_name_at, resolve_type_fq_name_at,
-    resolve_unqualified_method_group_for_owner, resolves_to_target, resolves_to_target_at,
-    same_node, seed_visible_bindings_at, type_identity_matches,
+    normalize_type_text, object_initializer_for_label, object_initializer_owners,
+    receiver_targets_owner, reference_type_text, resolve_arity_free_type_fq_name_at,
+    resolve_type_fq_name_at, resolve_unqualified_method_group_for_owner, resolves_to_target,
+    resolves_to_target_at, same_node, seed_visible_bindings_at, type_identity_matches,
     unqualified_member_has_local_binding, unqualified_member_has_structured_shadow,
-    unqualified_member_resolves_to_owner, usage_relational_generic_call_has_type_argument,
-    usage_unqualified_value_member_shadows_type, usage_visible_extension_method_candidates,
+    unqualified_member_resolves_to_owner, usage_member_declared_type_fq_name,
+    usage_relational_generic_call_has_type_argument, usage_unqualified_value_member_shadows_type,
+    usage_visible_extension_method_candidates,
 };
 use crate::graph_support::{self, CSharpSource};
 use crate::hierarchy;
@@ -176,7 +177,14 @@ pub(super) struct ScanCtx<'a> {
     using_aliases: &'a HashMap<String, String>,
 }
 
-type ExtensionTargetCacheKey = (Vec<String>, usize, Option<usize>, usize, usize);
+type ExtensionTargetCacheKey = (
+    Vec<String>,
+    usize,
+    Option<usize>,
+    usize,
+    usize,
+    CSharpBuiltinValueArguments,
+);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum TargetMemberResolution {
@@ -785,12 +793,16 @@ fn extension_call_resolution(
     normalized_receivers.sort();
     normalized_receivers.dedup();
     let (scope_start, scope_end) = extension_visibility_site_key(name);
+    // The scan can refute a candidate on an argument's proven type (#2225), so
+    // two sites that agree on receiver, arity and visibility scope can still
+    // reach different answers. The evidence that decides it belongs in the key.
     let cache_key = (
         normalized_receivers,
         call_arity,
         explicit_generic_arity,
         scope_start,
         scope_end,
+        CSharpBuiltinValueArguments::at_site(name, ctx.source),
     );
     if let Some(resolution) = ctx.extension_target_cache.get(&cache_key) {
         return *resolution;
@@ -1296,30 +1308,134 @@ fn object_initializer_label_owner_resolution(
     let Some(initializer) = object_initializer_for_label(node) else {
         return LabelOwnerResolution::NotLabel;
     };
-    let type_node = object_initializer_owner_type_node(initializer).or_else(|| {
-        let target = object_creation_collection_target(initializer)?;
-        collection_target_element_type_node(target, ctx.source)
-    });
-    let Some(type_node) = type_node else {
+    let owners = {
+        let mut lookups = InverseInitializerOwnerLookups { token, ctx };
+        match object_initializer_owners(initializer, lookups.ctx.source, &mut lookups) {
+            Some(resolved) => resolved.owners,
+            None => return LabelOwnerResolution::Unknown,
+        }
+    };
+    // A target the index resolved to several types names no owner: the forward
+    // direction reports that ambiguity with its candidates, and the inverse
+    // must not pick one of them as a proven usage.
+    let [owner] = owners.as_slice() else {
         return LabelOwnerResolution::Unknown;
     };
-    let Some(receiver_fqn) = resolve_type_fq_name_at(
-        ctx.csharp,
-        token,
-        ctx.file,
-        &ctx.class_ranges,
-        &reference_type_text(type_node, ctx.source),
-        type_node,
-        ctx.source,
-    ) else {
-        return LabelOwnerResolution::Unknown;
-    };
-    match receiver_fqn_target_member_resolution(&receiver_fqn, token, None, None, ctx) {
+    match receiver_fqn_target_member_resolution(&owner.fq_name(), token, None, None, ctx) {
         TargetMemberResolution::MatchesTarget | TargetMemberResolution::MatchesEnclosingTarget => {
             LabelOwnerResolution::MatchesTarget
         }
         TargetMemberResolution::KnownOther => LabelOwnerResolution::KnownOther,
         TargetMemberResolution::NotFound => LabelOwnerResolution::Unknown,
+    }
+}
+
+/// The inverse side of the shared object-initializer owner ladder. The ladder
+/// itself lives in `resolver::object_initializer_owners`; only these probes,
+/// which read the usage index rather than the definition provider's session,
+/// are direction-specific (#2173).
+struct InverseInitializerOwnerLookups<'a, 'ctx> {
+    token: QueryToken<'a>,
+    ctx: &'a mut ScanCtx<'ctx>,
+}
+
+impl CSharpInitializerOwnerLookups for InverseInitializerOwnerLookups<'_, '_> {
+    fn written_type_owners(&mut self, reference: &str, type_node: Node<'_>) -> Vec<CodeUnit> {
+        resolve_type_fq_name_at(
+            self.ctx.csharp,
+            self.token,
+            self.ctx.file,
+            &self.ctx.class_ranges,
+            reference,
+            type_node,
+            self.ctx.source,
+        )
+        .and_then(|fqn| class_unit_for_fq_name(self.ctx.csharp, self.token, &fqn))
+        .into_iter()
+        .collect()
+    }
+
+    fn collection_target_owners(&mut self, target: Node<'_>) -> Vec<CodeUnit> {
+        if let Some(type_node) = collection_target_element_type_node(target, self.ctx.source) {
+            let reference = reference_type_text(type_node, self.ctx.source);
+            return self.written_type_owners(&reference, type_node);
+        }
+        // The collection is a member rather than a local, so its element type
+        // comes from the indexed declaration the way it does forward. The walk
+        // stops at the first enclosing type that has the member: a member that
+        // states no unique element type fails closed there rather than letting
+        // a same-named member of an outer type answer.
+        let name = node_text(target, self.ctx.source);
+        let Some(mut owner) = enclosing_declared_type(
+            target,
+            self.ctx.csharp,
+            self.token,
+            self.ctx.file,
+            self.ctx.source,
+        ) else {
+            return Vec::new();
+        };
+        loop {
+            if !nearest_member_candidates_for_owner(
+                self.ctx.graph,
+                self.ctx.csharp,
+                self.token,
+                &owner,
+                name,
+                None,
+            )
+            .is_empty()
+            {
+                return member_declared_collection_element_type_fq_name(
+                    self.ctx.csharp,
+                    self.token,
+                    &owner,
+                    name,
+                )
+                .and_then(|fqn| class_unit_for_fq_name(self.ctx.csharp, self.token, &fqn))
+                .into_iter()
+                .collect();
+            }
+            match self.ctx.csharp.parent_of(&owner) {
+                Some(parent) => owner = parent,
+                None => return Vec::new(),
+            }
+        }
+    }
+
+    fn expression_owners(&mut self, target: Node<'_>) -> Vec<CodeUnit> {
+        let mut bindings = LocalInferenceEngine::new(LocalInferenceConfig::default());
+        seed_visible_bindings_at(
+            binding_scope_node(target),
+            target,
+            self.ctx.csharp,
+            self.token,
+            self.ctx.file,
+            self.ctx.source,
+            &mut bindings,
+        );
+        match receiver_targets_owner(
+            target,
+            self.ctx.graph,
+            self.ctx.csharp,
+            self.token,
+            self.ctx.file,
+            self.ctx.source,
+            &bindings,
+        ) {
+            SymbolResolution::Precise(targets) => targets
+                .iter()
+                .filter_map(|fqn| class_unit_for_fq_name(self.ctx.csharp, self.token, fqn))
+                .collect(),
+            SymbolResolution::Ambiguous | SymbolResolution::Unknown => Vec::new(),
+        }
+    }
+
+    fn member_type_owners(&mut self, owner: &CodeUnit, member: &str) -> Vec<CodeUnit> {
+        usage_member_declared_type_fq_name(self.ctx.csharp, self.token, owner, member)
+            .and_then(|fqn| class_unit_for_fq_name(self.ctx.csharp, self.token, &fqn))
+            .into_iter()
+            .collect()
     }
 }
 

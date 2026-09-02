@@ -42,6 +42,68 @@ pub enum ApiStability {
     Experimental { since_minor: u16 },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CapabilitySupport {
+    Complete,
+    Partial,
+    Unsupported,
+}
+impl CapabilitySupport {
+    pub(crate) const fn unsupported() -> Self {
+        Self::Unsupported
+    }
+    /// Whether this surface serves the capability at all. `Partial` bounds
+    /// coverage, not availability, so it negotiates exactly like `Complete`;
+    /// only `Unsupported` refuses.
+    pub const fn is_served(self) -> bool {
+        matches!(self, Self::Complete | Self::Partial)
+    }
+}
+
+/// One row of the published extension surface.
+///
+/// This table is the single definition of what the surface offers.
+/// `ExtensionWorkspace::open` projects it onto the wire capability report
+/// (`OperationCapability`), and `negotiate_extension_api` accepts exactly the
+/// rows whose support is served. Two hand-maintained lists are what went wrong
+/// before: the report advertised `experimental.semantic.value_dependence` while
+/// negotiation rejected it as a missing capability (#2328).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PublishedOperation {
+    pub id: &'static str,
+    pub stability: ApiStability,
+    pub support: CapabilitySupport,
+}
+
+pub const PUBLISHED_OPERATIONS: &[PublishedOperation] = &[
+    PublishedOperation {
+        id: "structural.query",
+        stability: ApiStability::Stable,
+        support: CapabilitySupport::Complete,
+    },
+    PublishedOperation {
+        id: "experimental.semantic.control_flow",
+        stability: ApiStability::Experimental { since_minor: 0 },
+        support: CapabilitySupport::Complete,
+    },
+    PublishedOperation {
+        id: "experimental.semantic.value_dependence",
+        stability: ApiStability::Experimental { since_minor: 0 },
+        support: CapabilitySupport::Partial,
+    },
+    // Typestate machinery exists in the engine but has no route on this
+    // surface yet. Advertising the operation as `Unsupported` rather than
+    // omitting it lets extensions distinguish "unsupported here" from "does
+    // not exist", while negotiation still refuses a client that requires it.
+    // Design: .agents/docs/extension-typestate-design-2026-08.md.
+    PublishedOperation {
+        id: "experimental.semantic.typestate",
+        stability: ApiStability::Experimental { since_minor: 0 },
+        support: CapabilitySupport::Unsupported,
+    },
+];
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExtensionCompatibility {
     pub major: u16,
@@ -106,11 +168,6 @@ pub fn negotiate_extension_api(
             supported: EXTENSION_API_VERSION.minor,
         });
     }
-    let supported = [
-        "structural.query",
-        "experimental.semantic.control_flow",
-        "experimental.semantic.value_dependence",
-    ];
     let mut seen = std::collections::BTreeSet::new();
     for capability in &requested.required_capabilities {
         if !seen.insert(capability.clone()) {
@@ -118,7 +175,10 @@ pub fn negotiate_extension_api(
                 capability.clone(),
             ));
         }
-        if !supported.contains(&capability.as_str()) {
+        let served = PUBLISHED_OPERATIONS
+            .iter()
+            .any(|operation| operation.id == capability.as_str() && operation.support.is_served());
+        if !served {
             return Err(ExtensionCompatibilityError::MissingCapability(
                 capability.clone(),
             ));
@@ -139,18 +199,43 @@ mod tests {
     }
     #[test]
     fn accepts_every_served_capability() {
-        let required = [
-            "structural.query",
-            "experimental.semantic.control_flow",
-            "experimental.semantic.value_dependence",
-        ]
-        .map(|id| ExtensionCapabilityId::new(id).unwrap());
+        let required: Box<[ExtensionCapabilityId]> = PUBLISHED_OPERATIONS
+            .iter()
+            .filter(|operation| operation.support.is_served())
+            .map(|operation| ExtensionCapabilityId::new(operation.id).unwrap())
+            .collect();
+        assert!(
+            !required.is_empty(),
+            "the surface must publish at least one served operation: {PUBLISHED_OPERATIONS:?}"
+        );
         let request = ExtensionCompatibility {
-            required_capabilities: required.clone().into(),
+            required_capabilities: required.clone(),
             ..Default::default()
         };
         let negotiated = negotiate_extension_api(&request).unwrap();
-        assert_eq!(negotiated.capabilities.as_ref(), required.as_slice());
+        assert_eq!(negotiated.capabilities, required);
+    }
+    #[test]
+    fn rejects_advertised_but_unsupported_capability() {
+        for operation in PUBLISHED_OPERATIONS
+            .iter()
+            .filter(|operation| !operation.support.is_served())
+        {
+            let request = ExtensionCompatibility {
+                required_capabilities: Box::new(
+                    [ExtensionCapabilityId::new(operation.id).unwrap()],
+                ),
+                ..Default::default()
+            };
+            assert!(
+                matches!(
+                    negotiate_extension_api(&request),
+                    Err(ExtensionCompatibilityError::MissingCapability(ref id))
+                        if id.as_str() == operation.id
+                ),
+                "{operation:?} is advertised as unsupported and must not negotiate"
+            );
+        }
     }
     #[test]
     fn rejects_unknown_capability() {

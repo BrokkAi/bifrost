@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 fn main() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let output = root.join("schemas/semantic-model-pack-v1.schema.json");
+    let output = root.join("schemas/semantic-model-pack-v2.schema.json");
     std::fs::write(&output, authoring_json_schema()).expect("write generated JSON Schema");
     println!("wrote {}", output.display());
 

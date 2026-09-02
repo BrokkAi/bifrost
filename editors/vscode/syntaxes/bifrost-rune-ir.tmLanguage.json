@@ -21,11 +21,11 @@
     },
     {
       "name": "entity.name.type.kind.bifrost-rune-ir",
-      "match": "\\b(?:declaration|callable|function|method|constructor|lambda|class|import|parameter|call|assignment|field_access|identifier|literal|string_literal|numeric_literal|boolean_literal|null_literal|collection_literal|jsx_element|jsx_attribute|jsx_spread_attribute|object_property|computed_property|spread_element|return|throw|catch|if|loop|for_loop|while_loop|decorator|block)\\b"
+      "match": "\\b(?:declaration|callable|function|method|constructor|lambda|class|import|parameter|module|call|concurrent_spawn|assignment|field_access|identifier|literal|string_literal|numeric_literal|boolean_literal|null_literal|collection_literal|jsx_element|jsx_attribute|jsx_spread_attribute|object_property|computed_property|spread_element|return|throw|catch|if|loop|for_loop|while_loop|decorator|block)\\b"
     },
     {
       "name": "variable.parameter.role.bifrost-rune-ir",
-      "match": "\\b(?:callee|receiver|args|kwargs|left|right|module|decorators|object|field|iterable|elements|tag|attributes|children|value|key)\\b"
+      "match": "\\b(?:callee|receiver|args|kwargs|left|right|operator|module|decorators|object|field|iterable|elements|tag|attributes|children|value|key)\\b"
     },
     {
       "name": "invalid.deprecated.truncated.bifrost-rune-ir",

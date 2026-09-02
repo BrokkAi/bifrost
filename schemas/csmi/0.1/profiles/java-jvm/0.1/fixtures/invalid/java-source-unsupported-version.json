@@ -1,0 +1,11 @@
+{
+  "$profileSchema": "java-source-identity",
+  "profileVersion": "0.2",
+  "language": "java",
+  "package": ["org", "example"],
+  "ownerPath": [],
+  "declaration": {
+    "kind": "type",
+    "name": "Unsupported"
+  }
+}

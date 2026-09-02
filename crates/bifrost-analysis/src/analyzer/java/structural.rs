@@ -99,6 +99,46 @@ mod structural_spec_tests {
         assert_occurrence_role(&found, at("label);"), OccurrenceRole::ValueReference);
     }
 
+    /// A qualified type spells its scope and its tail with the same node kind,
+    /// and only the tail is the type the chain denotes (#1644).
+    ///
+    /// `scoped_type_identifier` carries no grammar fields at all, so the
+    /// classifier cannot ask which child occupies a `name` field: that question
+    /// is false for every child, which made the tail a `path_segment` like its
+    /// qualifiers, dropped for want of a namespace, and left the whole
+    /// `Outer.Inner` reference invisible to the forward edge producer. The tail
+    /// is positionally the last named child, and it is a type operand wherever
+    /// the chain stands -- a declared type, an allocation, or a generic head.
+    /// The qualifiers stay path segments, including the package segments of
+    /// `java.util.List`, which is what keeps a package from becoming an edge
+    /// target.
+    #[test]
+    fn java_qualified_type_tails_are_type_operands_and_their_scopes_stay_segments() {
+        let source = concat!(
+            "package fixture;\n",
+            "class NestedHost {\n",
+            "    int run(java.util.List<String> xs) {\n",
+            "        Outer.Inner inner = new Outer.Inner();\n",
+            "        return inner.size() + xs.size();\n",
+            "    }\n",
+            "}\n",
+        );
+        let found = occurrence_roles_of(
+            &JAVA_STRUCTURAL_SPEC,
+            &tree_sitter_java::LANGUAGE.into(),
+            source,
+        );
+
+        let at = |needle: &str| source.find(needle).expect("fixture token");
+        assert_occurrence_role(&found, at("Outer.Inner inner"), OccurrenceRole::PathSegment);
+        assert_occurrence_role(&found, at("Inner inner"), OccurrenceRole::TypeOperand);
+        assert_occurrence_role(&found, at("Outer.Inner()"), OccurrenceRole::PathSegment);
+        assert_occurrence_role(&found, at("Inner()"), OccurrenceRole::TypeOperand);
+        assert_occurrence_role(&found, at("java.util"), OccurrenceRole::PathSegment);
+        assert_occurrence_role(&found, at("util.List"), OccurrenceRole::PathSegment);
+        assert_occurrence_role(&found, at("List<String>"), OccurrenceRole::TypeOperand);
+    }
+
     /// Support is a declaration, not a description of what happened to be
     /// emitted: every role Java emits must be one it declares.
     #[test]

@@ -327,6 +327,21 @@ impl JsTsLexicalBindingIndex {
             })
     }
 
+    /// Whether an assignment or update rebinds the active lexical binding of
+    /// `name` before its use at `byte`.
+    pub fn is_binding_reassigned_before_at(&self, name: &str, byte: usize) -> bool {
+        let Some(scope) = self.binding_scope_at(name, byte) else {
+            return false;
+        };
+        self.assignments_by_name
+            .get(name)
+            .is_some_and(|assignments| {
+                assignments.iter().any(|assignment| {
+                    *assignment < byte && self.binding_scope_at(name, *assignment) == Some(scope)
+                })
+            })
+    }
+
     fn record_assignment_targets(&mut self, target: Node<'_>, source: &str) {
         for binder in pattern_binder_identifiers(target) {
             let name = slice(binder, source);
@@ -1621,6 +1636,7 @@ function outer() {
   const stable = () => 1;
   {
     let stable = () => 2;
+    stable();
     stable = () => 3;
     stable();
   }
@@ -1629,12 +1645,22 @@ function outer() {
 "#;
         let tree = parse_javascript(source);
         let index = JsTsLexicalBindingIndex::build(tree.root_node(), source);
-        let inner_use = source.find("stable();").expect("inner stable use");
+        let inner_use_before_assignment = source.find("stable();").expect("first inner use");
+        let inner_use_after_assignment = source
+            .get(inner_use_before_assignment + 1..)
+            .and_then(|remaining| remaining.find("stable();"))
+            .map(|offset| inner_use_before_assignment + 1 + offset)
+            .expect("second inner use");
         let outer_use = source.rfind("stable();").expect("outer stable use");
 
-        assert!(index.is_binding_reassigned_at("stable", inner_use));
+        assert!(index.is_binding_reassigned_at("stable", inner_use_before_assignment));
+        assert!(index.is_binding_reassigned_at("stable", inner_use_after_assignment));
         assert!(!index.is_binding_reassigned_at("stable", outer_use));
         assert!(!index.is_binding_reassigned_at("missing", outer_use));
+        assert!(!index.is_binding_reassigned_before_at("stable", inner_use_before_assignment));
+        assert!(index.is_binding_reassigned_before_at("stable", inner_use_after_assignment));
+        assert!(!index.is_binding_reassigned_before_at("stable", outer_use));
+        assert!(!index.is_binding_reassigned_before_at("missing", outer_use));
     }
 
     #[test]

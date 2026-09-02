@@ -11,6 +11,7 @@ impl CodeQueryResult {
                 | CodeQueryResultValue::ProgramPoint { .. }
                 | CodeQueryResultValue::ControlEdge { .. }
                 | CodeQueryResultValue::TypestateFinding { .. }
+                | CodeQueryResultValue::ConcurrentAccessConflict { .. }
                 | CodeQueryResultValue::TypestateWitness { .. }
                 | CodeQueryResultValue::FlowEndpoint { .. }
                 | CodeQueryResultValue::FlowWitness { .. }
@@ -21,8 +22,10 @@ impl CodeQueryResult {
                 | CodeQueryResultValue::ExpressionSite { .. }
                 | CodeQueryResultValue::JsxAttributeValue { .. }
                 | CodeQueryResultValue::ReceiverAnalysis { .. }
+                | CodeQueryResultValue::MemberTargetAnalysis { .. }
                 | CodeQueryResultValue::ReceiverOutcome { .. }
                 | CodeQueryResultValue::ReceiverEvidence { .. }
+                | CodeQueryResultValue::FieldWriteValue { .. }
                 | CodeQueryResultValue::CallShape { .. }
                 | CodeQueryResultValue::CallResult { .. }
                 | CodeQueryResultValue::CallArgumentGroup { .. }
@@ -32,6 +35,9 @@ impl CodeQueryResult {
                 | CodeQueryResultValue::CallResultContract { .. }
                 | CodeQueryResultValue::ResultContractUse { .. }
                 | CodeQueryResultValue::ResultContractFailureUse { .. }
+                | CodeQueryResultValue::NilnessOperation { .. }
+                | CodeQueryResultValue::SwitchCoverage { .. }
+                | CodeQueryResultValue::DetachedTaskTransfer { .. }
                 | CodeQueryResultValue::ProcedureEffect { .. }
                 | CodeQueryResultValue::CallableSignature { .. }
                 | CodeQueryResultValue::SignatureParameter { .. }
@@ -278,6 +284,18 @@ impl CodeQueryResult {
                             out.push_str(&format!("  {detail}\n"));
                         }
                     }
+                    CodeQueryResultValue::MemberTargetAnalysis { value } => {
+                        out.push_str(&format!(
+                            "{}:{}:{} [member target analysis; {}; {}] targets={}; site={}\n",
+                            value.path,
+                            value.receiver_range.start_line,
+                            value.receiver_range.start_column,
+                            value.outcome,
+                            value.coverage,
+                            value.member_targets.len(),
+                            value.site_id,
+                        ));
+                    }
                     CodeQueryResultValue::ReceiverOutcome { value } => {
                         out.push_str(&format!(
                             "{}:{}:{} [receiver outcome; {}; {}; {}] candidates={}; site={}\n",
@@ -299,6 +317,18 @@ impl CodeQueryResult {
                             value.completeness,
                             value.site_id,
                             value.id
+                        ));
+                    }
+                    CodeQueryResultValue::FieldWriteValue { value } => {
+                        out.push_str(&format!(
+                            "{}:{}:{} [field write value; {}; {}] `{}` -> {}\n",
+                            value.path,
+                            value.range.start_line,
+                            value.range.start_column,
+                            value.proof,
+                            value.coverage,
+                            value.text,
+                            value.member_target.fq_name,
                         ));
                     }
                     CodeQueryResultValue::DispatchOutcome { value } => {
@@ -542,6 +572,55 @@ impl CodeQueryResult {
                             value.coverage,
                             value.operand_value_id,
                             value.failure_edge_id.as_deref().unwrap_or("open"),
+                        ));
+                    }
+                    CodeQueryResultValue::NilnessOperation { value } => {
+                        out.push_str(&format!(
+                            "{}:{}:{} [nilness operation; {}; {}; {}] {}\n",
+                            value.path,
+                            value.range.start_line,
+                            value.range.start_column,
+                            value.use_kind,
+                            value.fact,
+                            value.coverage,
+                            value.reason.unwrap_or(value.origin),
+                        ));
+                    }
+                    CodeQueryResultValue::SwitchCoverage { value } => {
+                        out.push_str(&format!(
+                            "{}:{}:{} [switch coverage; {}; {}; {}] {}\n",
+                            value.path,
+                            value.range.start_line,
+                            value.range.start_column,
+                            value.kind,
+                            value.verdict,
+                            value.proof,
+                            value.reason.unwrap_or(value.selector_domain),
+                        ));
+                    }
+                    CodeQueryResultValue::ConcurrentAccessConflict { value } => {
+                        out.push_str(&format!(
+                            "{}:{}:{} [concurrent access conflict; {}; {}; {}; {}] {}\n",
+                            value.path,
+                            value.range.start_line,
+                            value.range.start_column,
+                            value.task_relation,
+                            value.ordering,
+                            value.protection,
+                            value.proof,
+                            value.location_kind,
+                        ));
+                    }
+                    CodeQueryResultValue::DetachedTaskTransfer { value } => {
+                        out.push_str(&format!(
+                            "{}:{}:{} [detached task transfer; {}; {}; {}] {}\n",
+                            value.path,
+                            value.range.start_line,
+                            value.range.start_column,
+                            value.role,
+                            value.proof,
+                            value.coverage,
+                            value.reason.unwrap_or(value.timing),
                         ));
                     }
                     CodeQueryResultValue::ProcedureEffect { value } => {

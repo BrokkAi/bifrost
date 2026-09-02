@@ -2075,26 +2075,46 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let body_entry = self.point(builder, body.unwrap_or(node), Vec::new())?;
         let loop_scope =
             self.push_loop_scope(builder, scope, next, test, ControlEdgeKind::LoopBack);
-        for (capability, kind, detail) in [
-            (
-                SemanticCapability::Calls,
-                SemanticGapKind::Unknown,
-                "foreach iterator acquisition and advancement calls require runtime refinement",
-            ),
-            (
-                SemanticCapability::ExceptionalControlFlow,
-                SemanticGapKind::Unsupported,
-                "foreach iterator and destructuring failures are not lowered",
-            ),
-        ] {
-            self.add_gap(
-                builder,
-                test,
-                SemanticGapSubject::Point,
-                capability,
-                kind,
-                detail,
-            )?;
+        // A native PHP array is traversed by the language itself: acquiring
+        // and advancing the foreach cursor invokes no user-defined iterator
+        // methods. The simple targets accepted by `php_foreach_targets` also
+        // need no destructuring or by-reference assignment protocol. Their
+        // value flow was emitted above, so this exact structured shape has no
+        // omitted call or exceptional transfer. Objects, references, and
+        // destructuring retain the gaps because their runtime protocols can
+        // execute user code or fail.
+        let (_, unlowered_target) = php_foreach_targets(node);
+        let locally_bound_array = iterable.kind() == "variable_name" && {
+            let name = php_variable_name(self.prepared.source(), iterable);
+            self.locals
+                .get(name)
+                .is_some_and(|binding| binding.declaration_start < iterable.start_byte())
+                && self.local_type_of(iterable) == Some(PhpLocalType::Array)
+        };
+        let native_array_iteration = !unlowered_target
+            && (iterable.kind() == "array_creation_expression" || locally_bound_array);
+        if !native_array_iteration {
+            for (capability, kind, detail) in [
+                (
+                    SemanticCapability::Calls,
+                    SemanticGapKind::Unknown,
+                    "foreach iterator acquisition and advancement calls require runtime refinement",
+                ),
+                (
+                    SemanticCapability::ExceptionalControlFlow,
+                    SemanticGapKind::Unsupported,
+                    "foreach iterator and destructuring failures are not lowered",
+                ),
+            ] {
+                self.add_gap(
+                    builder,
+                    test,
+                    SemanticGapSubject::Point,
+                    capability,
+                    kind,
+                    detail,
+                )?;
+            }
         }
         self.edge(
             builder,
@@ -3584,7 +3604,12 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 let location = self.session.add_memory_location(
                     builder,
                     point,
-                    MemoryLocationKind::Index { base, index },
+                    MemoryLocationKind::Index {
+                        base,
+                        index,
+                        constant_index: None,
+                        identity: crate::analyzer::semantic::IndexedLocationIdentity::Element,
+                    },
                 )?;
                 if index.is_none() {
                     self.add_dynamic_index_gap(
@@ -3733,7 +3758,12 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let location = self.session.add_memory_location(
             builder,
             point,
-            MemoryLocationKind::Index { base, index: None },
+            MemoryLocationKind::Index {
+                base,
+                index: None,
+                constant_index: None,
+                identity: crate::analyzer::semantic::IndexedLocationIdentity::Aggregate,
+            },
         )?;
         for result in slots {
             self.append_effect(

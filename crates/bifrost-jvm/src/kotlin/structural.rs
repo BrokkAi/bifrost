@@ -39,7 +39,7 @@
 
 use brokk_bifrost_core::analyzer::Language;
 use brokk_bifrost_core::analyzer::structural::adapter_helpers::{
-    attach_role_with_derived_name, attach_terminal_callee, field_name_in_parent, first_named_child,
+    attach_role_with_derived_name, attach_terminal_callee, first_named_child,
 };
 use brokk_bifrost_core::analyzer::structural::callable::CallSiteContext;
 use brokk_bifrost_core::analyzer::structural::edges::{
@@ -106,6 +106,12 @@ pub const KOTLIN_KIND_TABLE: &[(&str, NormalizedKind)] = &[
     ("object_declaration", NormalizedKind::Class),
     ("companion_object", NormalizedKind::Class),
     ("object_literal", NormalizedKind::Class),
+    // A `typealias` declares a type, so its fact is a type-namespace
+    // declaration and its name inherits `Namespace::Type` through
+    // `declared_fact_kind`. Absent from the table, the alias name had no
+    // declaring fact at all and landed in the value namespace beside a
+    // same-named `val` (#2892).
+    ("type_alias", NormalizedKind::Class),
     // bindings
     ("property_declaration", NormalizedKind::Assignment),
     ("assignment", NormalizedKind::Assignment),
@@ -302,8 +308,19 @@ fn kotlin_occurrence_role(node: Node<'_>) -> Option<OccurrenceRole> {
             "value_argument" if kotlin_named_argument_label(parent, node) => {
                 return Some(OccurrenceRole::LabelOrKey);
             }
-            "class_declaration" | "object_declaration" | "function_declaration"
-                if field_name_in_parent(parent, current) == Some("name") =>
+            // The token a declaration names itself with, read through the
+            // shared `declaration_name_node` -- which is also what sets the
+            // fact's name pointer, so the role and the namespace it inherits
+            // are decided by one rule. Asking for a `name` *field* instead
+            // never matched: this grammar spells no field on any declaration,
+            // so every Kotlin declaration name fell through to
+            // `ValueReference` (#2892).
+            "class_declaration"
+            | "object_declaration"
+            | "companion_object"
+            | "type_alias"
+            | "function_declaration"
+                if declaration_name_node(parent) == Some(current) =>
             {
                 return Some(OccurrenceRole::DeclarationName);
             }
@@ -371,10 +388,18 @@ fn enclosing_class_name_node<'tree>(constructor: Node<'tree>) -> Option<Node<'tr
     None
 }
 
+/// The identifier token a declaration names itself with.
+///
+/// This grammar spells no `name` field on any declaration -- a class writes
+/// `alias($.simple_identifier, $.type_identifier)` positionally -- so the name
+/// is the declaration's first identifier child of the kind that form uses. A
+/// `type_alias` names itself the way a class does, with the aliased type
+/// following as a `user_type`, `nullable_type` or `function_type` rather than
+/// as a second bare `type_identifier`.
 fn declaration_name_node<'tree>(declaration: Node<'tree>) -> Option<Node<'tree>> {
     match declaration.kind() {
         "function_declaration" => first_named_child_of_kind(declaration, "simple_identifier"),
-        "class_declaration" | "object_declaration" | "companion_object" => {
+        "class_declaration" | "object_declaration" | "companion_object" | "type_alias" => {
             first_named_child_of_kind(declaration, "type_identifier")
         }
         "primary_constructor" | "secondary_constructor" => enclosing_class_name_node(declaration),

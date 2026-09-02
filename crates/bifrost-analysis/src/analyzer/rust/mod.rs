@@ -65,6 +65,7 @@ use brokk_bifrost_rust::usage_walks::RustWalkCaches;
 /// generation component retires the whole cache when extraction semantics move.
 type RustFactCacheKey = (Option<crate::analyzer::store::GenerationId>, git2::Oid);
 use brokk_bifrost_rust::cargo_routes::{RustCargoRouteIndex, RustCargoTargetRelation};
+use brokk_bifrost_rust::crate_naming;
 pub(crate) use brokk_bifrost_rust::declarations::{rust_package_name, rust_type_identifiers};
 pub use brokk_bifrost_rust::field_roles::rust_is_field_declaration_name;
 pub use brokk_bifrost_rust::graph::ast::rust_reference_namespace;
@@ -164,7 +165,12 @@ pub struct RustAnalyzer {
     /// analyzer stays small: nine `Cache` handles inline would make this struct
     /// the outsized variant of `AnalyzerDelegate`.
     walk_caches: Arc<RustWalkCaches>,
-    hierarchy_index: Arc<OnceLock<RustHierarchyIndex>>,
+    /// `PoolSafeMemo`, not `OnceLock`: the build parses every workspace
+    /// file and is reached from request-path rayon workers through
+    /// `TypeHierarchyProvider` and `member_family`. It runs on the
+    /// dedicated build pool so a global-pool worker parks on it instead of
+    /// building the whole workspace hierarchy inline (#1772).
+    hierarchy_index: Arc<PoolSafeMemo<RustHierarchyIndex>>,
     #[allow(dead_code)]
     type_relations: Arc<OnceLock<Vec<TypeRelation>>>,
 }
@@ -547,7 +553,7 @@ impl RustAnalyzer {
 
     #[cfg(test)]
     pub(crate) fn hierarchy_index_built_for_test(&self) -> bool {
-        self.hierarchy_index.get().is_some()
+        self.hierarchy_index.is_ready()
     }
 
     /// Files the Cargo-route build recovered by parsing. The structural claim of
@@ -626,6 +632,7 @@ impl RustAnalyzer {
     }
 
     pub fn new_with_config(project: Arc<dyn Project>, config: AnalyzerConfig) -> Self {
+        crate_naming::invalidate();
         let memo_budget = config.memo_cache_budget_bytes();
         Self {
             inner: TreeSitterAnalyzer::new_with_config(project, RustAdapter, config),
@@ -645,7 +652,7 @@ impl RustAnalyzer {
             declaration_facts: build_weighted_cache(memo_budget / 8, weight_declaration_facts),
             fact_catch_up: Arc::new(fact_catch_up::RustFactCatchUp::new()),
             walk_caches: Arc::new(RustWalkCaches::new(memo_budget)),
-            hierarchy_index: Arc::new(OnceLock::new()),
+            hierarchy_index: Arc::new(PoolSafeMemo::new()),
             type_relations: Arc::new(OnceLock::new()),
         }
     }
@@ -656,6 +663,7 @@ impl RustAnalyzer {
         store_context: AnalyzerStoreContext,
         progress: Option<BuildProgress>,
     ) -> Result<Self, crate::analyzer::store::StoreError> {
+        crate_naming::invalidate();
         let memo_budget = config.memo_cache_budget_bytes();
         let inner = TreeSitterAnalyzer::new_with_config_storage_context_and_progress(
             project,
@@ -682,7 +690,7 @@ impl RustAnalyzer {
             declaration_facts: build_weighted_cache(memo_budget / 8, weight_declaration_facts),
             fact_catch_up: Arc::new(fact_catch_up::RustFactCatchUp::new()),
             walk_caches: Arc::new(RustWalkCaches::new(memo_budget)),
-            hierarchy_index: Arc::new(OnceLock::new()),
+            hierarchy_index: Arc::new(PoolSafeMemo::new()),
             type_relations: Arc::new(OnceLock::new()),
         })
     }
@@ -969,6 +977,10 @@ impl CodeUnitIndex for RustAnalyzer {
         self.inner.all_declarations()
     }
 
+    fn declarations_sharing_name(&self, unit: &CodeUnit) -> Vec<CodeUnit> {
+        self.inner.declarations_sharing_name(unit)
+    }
+
     fn declarations(&self, file: &ProjectFile) -> BTreeSet<CodeUnit> {
         self.inner.declarations(file)
     }
@@ -1084,9 +1096,7 @@ impl IAnalyzer for RustAnalyzer {
         self
     }
 
-    fn invalidate_cached_file_identities(&self) {
-        self.inner.invalidate_cached_file_identities();
-    }
+    crate::analyzer::i_analyzer::forward_file_identity_invalidation!();
 
     fn working_tree_identity(&self) -> Option<std::sync::Arc<crate::gitblob::WorkingTreeIdentity>> {
         self.inner.working_tree_identity()
@@ -1112,6 +1122,12 @@ impl IAnalyzer for RustAnalyzer {
         self.inner.workspace_file_index_cell()
     }
 
+    fn definition_lookup_memo(
+        &self,
+    ) -> Option<std::sync::Arc<crate::analyzer::DefinitionLookupMemo>> {
+        self.inner.definition_lookup_memo()
+    }
+
     fn import_statements(&self, file: &ProjectFile) -> Vec<String> {
         self.inner.import_statements(file)
     }
@@ -1127,6 +1143,11 @@ impl IAnalyzer for RustAnalyzer {
     /// wait on the other: on a 401k-file workspace the hierarchy build had not
     /// returned sixteen minutes in (#1757), and a usage query must not inherit
     /// that wait.
+    ///
+    /// The hierarchy half builds on the dedicated build pool (#1772), so this
+    /// scope's own thread only parks on it: neither the warm nor a request
+    /// that reaches the same memo spends a global-pool worker on the build's
+    /// parallelism.
     fn warm_query_indexes(&self) {
         std::thread::scope(|scope| {
             scope.spawn(|| self.warm_usage_facts());
@@ -1135,10 +1156,14 @@ impl IAnalyzer for RustAnalyzer {
     }
 
     fn query_indexes_warm(&self) -> bool {
-        self.hierarchy_index.get().is_some() && self.rust_usage_facts_warm()
+        self.hierarchy_index.is_ready() && self.rust_usage_facts_warm()
     }
 
     fn update(&self, changed_files: &BTreeSet<ProjectFile>) -> Self {
+        // Before the early return: a `Cargo.toml` edit renames a crate without
+        // changing a single Rust source, so the manifest memos must be dropped
+        // even on the update that hands back a clone.
+        crate_naming::invalidate();
         if rust_indexed_sources_unchanged(self, changed_files) {
             return self.clone();
         }
@@ -1161,12 +1186,13 @@ impl IAnalyzer for RustAnalyzer {
             declaration_facts: build_weighted_cache(self.memo_budget / 8, weight_declaration_facts),
             fact_catch_up: Arc::new(fact_catch_up::RustFactCatchUp::new()),
             walk_caches: Arc::new(RustWalkCaches::new(self.memo_budget)),
-            hierarchy_index: Arc::new(OnceLock::new()),
+            hierarchy_index: Arc::new(PoolSafeMemo::new()),
             type_relations: Arc::new(OnceLock::new()),
         }
     }
 
     fn update_all(&self) -> Self {
+        crate_naming::invalidate();
         Self {
             inner: self.inner.update_all(),
             memo_budget: self.memo_budget,
@@ -1185,7 +1211,7 @@ impl IAnalyzer for RustAnalyzer {
             declaration_facts: build_weighted_cache(self.memo_budget / 8, weight_declaration_facts),
             fact_catch_up: Arc::new(fact_catch_up::RustFactCatchUp::new()),
             walk_caches: Arc::new(RustWalkCaches::new(self.memo_budget)),
-            hierarchy_index: Arc::new(OnceLock::new()),
+            hierarchy_index: Arc::new(PoolSafeMemo::new()),
             type_relations: Arc::new(OnceLock::new()),
         }
     }
@@ -1259,6 +1285,12 @@ impl IAnalyzer for RustAnalyzer {
         &self,
     ) -> Option<crate::analyzer::content_identity::WorkspaceContentIdentities> {
         self.inner.workspace_content_identities()
+    }
+
+    fn workspace_fact_indexes(
+        &self,
+    ) -> Vec<&dyn crate::analyzer::read_verification::WorkspaceFactIndex> {
+        self.inner.workspace_fact_indexes()
     }
 
     fn test_detection_provider(&self) -> Option<&dyn TestDetectionProvider> {
@@ -1662,5 +1694,76 @@ impl DeadCodeBulkProof for RustDeadCodeBulk {
         );
         build_rust_usage_edges(analyzer, &nodes, |_| true)
             .map(|edges| DeadCodeBulkEdges::Fqn(Arc::new(edges)))
+    }
+}
+
+/// The generation boundary for crate naming.
+///
+/// `brokk_bifrost_rust::crate_naming` memoizes the manifest walk for a whole
+/// analyzer generation instead of stat-ing a `Cargo.toml` on every question
+/// (#2632), so the `invalidate` calls above are the only thing that makes a
+/// manifest edit visible. This test pins that wiring: without it a renamed
+/// crate would keep its old name until the process exited.
+#[cfg(test)]
+mod tests {
+    use crate::analyzer::{IAnalyzer, Language, ProjectFile, TestProject};
+    use brokk_bifrost_rust::declarations::rust_package_name;
+    use std::collections::BTreeSet;
+
+    fn write(root: &std::path::Path, relative: &str, contents: &str) {
+        let path = root.join(relative);
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("create dirs");
+        std::fs::write(&path, contents).expect("write fixture");
+    }
+
+    fn rust_analyzer(root: &std::path::Path) -> super::RustAnalyzer {
+        super::RustAnalyzer::from_project(TestProject::new(root.to_path_buf(), Language::Rust))
+    }
+
+    #[test]
+    fn a_manifest_rename_reaches_naming_at_the_next_generation() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().canonicalize().expect("canonical root");
+        write(
+            &root,
+            "Cargo.toml",
+            "[package]\nname = \"before\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        );
+        write(&root, "src/lib.rs", "pub struct Marker;\n");
+        let library = ProjectFile::new(root.clone(), "src/lib.rs");
+
+        let analyzer = rust_analyzer(&root);
+        assert_eq!(rust_package_name(&library), "before");
+
+        write(
+            &root,
+            "Cargo.toml",
+            "[package]\nname = \"after\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        );
+        // A manifest edit changes no Rust source, so this is the `update` that
+        // hands back a clone. The naming memo must still be dropped.
+        let updated = analyzer.update(&BTreeSet::from([ProjectFile::new(
+            root.clone(),
+            "Cargo.toml",
+        )]));
+        assert_eq!(
+            rust_package_name(&library),
+            "after",
+            "update starts a generation, so it re-reads the manifest",
+        );
+        drop(updated);
+
+        write(
+            &root,
+            "Cargo.toml",
+            "[package]\nname = \"renamed-again\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        );
+        let rebuilt = rust_analyzer(&root);
+        assert_eq!(
+            rust_package_name(&library),
+            "renamed_again",
+            "constructing an analyzer starts a generation too",
+        );
+        drop(rebuilt);
     }
 }

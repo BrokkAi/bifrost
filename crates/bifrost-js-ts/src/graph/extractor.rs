@@ -1,6 +1,6 @@
 use crate::graph::hits::{
-    record_hit, record_import_hit, record_reexport_hit, record_self_receiver_hit,
-    record_unproven_hit,
+    record_declared_reference_hit, record_hit, record_import_hit, record_reexport_hit,
+    record_self_receiver_hit, record_unproven_hit,
 };
 use crate::graph::receiver_analysis::JsTsReceiverFactProvider;
 use crate::graph::resolver::{
@@ -300,13 +300,19 @@ pub fn scan_files_for_seeds(
         }
     });
 
-    let hits = collected
+    let mut hits = collected
         .into_inner()
         .expect("usage hit collector mutex poisoned");
-    let unproven_hits = unproven_collected
+    let mut unproven_hits = unproven_collected
         .into_inner()
         .expect("usage unproven hit collector mutex poisoned");
-    hits.into_iter().chain(unproven_hits).collect()
+    // A site can carry an editor-only proven edge and an independent runtime
+    // uncertainty edge. UsageHit identity intentionally ignores proof and kind,
+    // so remove the duplicate explicitly before merging; BTreeSet collection
+    // order is not a proof-precedence contract.
+    unproven_hits.retain(|hit| !hits.contains(hit));
+    hits.extend(unproven_hits);
+    hits
 }
 
 fn function_target_has_non_program_local_receiver(
@@ -448,6 +454,13 @@ enum LocalBinding {
     Other,
     KnownUnrelated,
     TargetReceiver,
+    /// The declared TypeScript contract names the target, while precise runtime
+    /// evidence names a different structurally compatible owner. This is an
+    /// editor navigation edge, not an exact runtime usage.
+    DeclaredTargetReceiver,
+    /// Runtime evidence is unresolved, so the exact usage remains unproven,
+    /// while the untouched declared contract still supplies an editor edge.
+    ConflictedDeclaredTargetReceiver,
     /// The symbol's visible constructor assignments name two different
     /// classes. This inference is flow-insensitive, so it cannot say which
     /// assignment reaches a later use; the symbol stays declared and
@@ -2388,7 +2401,12 @@ fn handle_nested_type_identifier(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     {
         match type_qualification_owner_match_status(module, ctx) {
             ReceiverMatchStatus::Proven => record_hit(name, ctx),
+            ReceiverMatchStatus::Declared => record_declared_reference_hit(name, ctx),
             ReceiverMatchStatus::Unproven => record_unproven_hit(name, ctx),
+            ReceiverMatchStatus::UnprovenDeclared => {
+                record_unproven_hit(name, ctx);
+                record_declared_reference_hit(name, ctx);
+            }
             ReceiverMatchStatus::NoMatch => {}
         }
         return;
@@ -2581,7 +2599,12 @@ fn handle_member_expression(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         // property is the requested member.
         match member_object_match_status(object, object_text, ctx) {
             ReceiverMatchStatus::Proven => record_hit(property, ctx),
+            ReceiverMatchStatus::Declared => record_declared_reference_hit(property, ctx),
             ReceiverMatchStatus::Unproven => record_unproven_hit(property, ctx),
+            ReceiverMatchStatus::UnprovenDeclared => {
+                record_unproven_hit(property, ctx);
+                record_declared_reference_hit(property, ctx);
+            }
             ReceiverMatchStatus::NoMatch => {}
         }
     }
@@ -2794,7 +2817,9 @@ pub fn rightmost_jsx_identifier<'a>(
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ReceiverMatchStatus {
     Proven,
+    Declared,
     Unproven,
+    UnprovenDeclared,
     NoMatch,
 }
 
@@ -2831,6 +2856,8 @@ fn member_object_match_status(
     }) {
         return match binding {
             LocalBinding::TargetReceiver => ReceiverMatchStatus::Proven,
+            LocalBinding::DeclaredTargetReceiver => ReceiverMatchStatus::Declared,
+            LocalBinding::ConflictedDeclaredTargetReceiver => ReceiverMatchStatus::UnprovenDeclared,
             LocalBinding::Conflicted => ReceiverMatchStatus::Unproven,
             LocalBinding::KnownUnrelated if ctx.language == Language::TypeScript => {
                 receiver_fact_match_status(node, ctx)
@@ -2987,19 +3014,38 @@ pub fn simple_identifier_text<'a>(node: Node<'_>, source: &'a str) -> Option<&'a
 fn infer_receiver_binding(node: Node<'_>, ctx: &ScanCtx<'_>) -> Option<LocalBinding> {
     let value = node.child_by_field_name("value")?;
     let (reassigned_target, reassigned_other) = reassignment_class_evidence(node, ctx);
-    // A TypeScript annotation constrains structure, not nominal runtime
-    // identity. A later write may therefore satisfy the annotation while
-    // naming an unrelated class with the same members; never let the original
-    // annotation bypass conflicting write evidence (#2495).
-    if has_target_type_annotation(node, ctx) {
-        return Some(if reassigned_other {
-            LocalBinding::Conflicted
-        } else {
-            LocalBinding::TargetReceiver
-        });
-    }
     let value_names_target = expression_is_target_constructor(value, ctx)
         || expression_resolves_to_target_owner(value, ctx);
+    let value_names_unrelated = expression_resolves_to_unrelated_owner(value, ctx);
+    let contextual_object_names_target = value.kind() == "object"
+        && ctx.target_owner.is_some_and(|target_owner| {
+            contextual_object_literal_owners(value, ctx)
+                .iter()
+                .any(|owner| {
+                    owner.source() == target_owner.source()
+                        && owner.fq_name() == target_owner.fq_name()
+                })
+        });
+    // A TypeScript annotation constrains structure, not nominal runtime
+    // identity. The initializer is the first runtime write and may satisfy the
+    // annotation while naming an unrelated class with the same members. Prove
+    // this target only when the initializer and every later visible write name
+    // it; otherwise retain an explicit conflict (#2495).
+    if has_target_type_annotation(node, ctx) || contextual_object_names_target {
+        return Some(
+            match (
+                value_names_target || contextual_object_names_target,
+                value_names_unrelated,
+                reassigned_target,
+                reassigned_other,
+            ) {
+                (true, _, _, false) => LocalBinding::TargetReceiver,
+                (false, true, false, false) => LocalBinding::DeclaredTargetReceiver,
+                (false, false, false, false) => LocalBinding::ConflictedDeclaredTargetReceiver,
+                _ => LocalBinding::Conflicted,
+            },
+        );
+    }
     if value_names_target || reassigned_target || value.kind() == "new_expression" {
         let names_target = value_names_target || reassigned_target;
         let names_other = !value_names_target || reassigned_other;
@@ -3124,6 +3170,21 @@ fn expression_resolves_to_target_owner(node: Node<'_>, ctx: &ScanCtx<'_>) -> boo
             if values.iter().any(|value| {
                 let resolved = value.owner();
                 resolved.source() == owner.source() && resolved.fq_name() == owner.fq_name()
+            })
+    )
+}
+
+fn expression_resolves_to_unrelated_owner(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
+    let Some(owner) = ctx.target_owner else {
+        return false;
+    };
+    matches!(
+        ctx.receiver_facts
+            .resolve_receiver_node(node, ReceiverAnalysisBudget::default()),
+        ReceiverAnalysisOutcome::Precise(values)
+            if !values.is_empty() && values.iter().all(|value| {
+                let resolved = value.owner();
+                resolved.source() != owner.source() || resolved.fq_name() != owner.fq_name()
             })
     )
 }

@@ -6,12 +6,19 @@ pub use brokk_bifrost_analysis::analyzer;
 pub use brokk_bifrost_analysis::path_utils;
 pub use brokk_bifrost_core::{cancellation, hash, text_utils};
 
+pub mod concurrency;
 pub mod dataflow;
+pub mod detached_task;
 pub mod flow_state;
+pub mod scalar_state;
 mod semantic_summary;
 pub mod taint;
 pub mod typestate;
 pub mod value_flow;
+
+#[cfg(test)]
+#[path = "../../../test-support/inline_project.rs"]
+mod inline_project;
 
 pub use semantic_summary::{
     ExactProcedureSummaryBoundary, ExactProcedureSummaryParameter, ExactProcedureSummaryReceiver,

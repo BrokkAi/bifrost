@@ -18,7 +18,7 @@ use super::classification::{
     ClassificationProvenance, FindingClassification, OrganizationalRiskAssessment,
 };
 use super::cvss::{CvssAssessmentSet, VulnerabilityIdentity};
-use super::definition::{FindingSeverity, PolicyAnalysisType, PolicyId};
+use super::definition::{FindingSeverity, PolicyAnalysisType, PolicyId, UnknownVerdict};
 use super::finding_identity::{
     EvidenceRef, FindingIdentityStability, MatchFindingAnchor, MatchResultDomain, PolicyFindingId,
     StableSemanticIdentity, WitnessId,
@@ -1089,6 +1089,22 @@ pub enum PolicyQueryResultRef {
         element_identity: String,
         coverage: String,
     },
+    MemberTargetAnalysis {
+        location: PolicySourceLocation,
+        outcome: String,
+        coverage: String,
+        capture: Option<String>,
+    },
+    FieldWriteValue {
+        location: PolicySourceLocation,
+        assignment_ast_id: String,
+        rhs_ast_id: String,
+        receiver_identity_id: String,
+        member_target_id: String,
+        proof: String,
+        completeness: String,
+        coverage: String,
+    },
     ReceiverAnalysis {
         location: PolicySourceLocation,
         analysis_kind: String,
@@ -1115,7 +1131,10 @@ impl PolicyQueryResultRef {
             Self::CallSite { .. } => Some(MatchResultDomain::CallSite),
             Self::ExpressionSite { .. } => Some(MatchResultDomain::ExpressionSite),
             Self::JsxAttributeValue { .. } => Some(MatchResultDomain::JsxAttributeValue),
-            Self::ReceiverAnalysis { .. } | Self::Unsupported { .. } => None,
+            Self::FieldWriteValue { .. } => Some(MatchResultDomain::FieldWriteValue),
+            Self::MemberTargetAnalysis { .. }
+            | Self::ReceiverAnalysis { .. }
+            | Self::Unsupported { .. } => None,
         }
     }
 
@@ -1127,6 +1146,8 @@ impl PolicyQueryResultRef {
             | Self::CallSite { location, .. }
             | Self::ExpressionSite { location, .. }
             | Self::JsxAttributeValue { location, .. }
+            | Self::MemberTargetAnalysis { location, .. }
+            | Self::FieldWriteValue { location, .. }
             | Self::ReceiverAnalysis { location, .. } => Some(location),
             Self::File { .. } => None,
             Self::Unsupported { location, .. } => location.as_ref(),
@@ -1205,6 +1226,42 @@ impl PolicyQueryResultRef {
                 validate_report_identifier(element_identity)?;
                 validate_report_identifier(coverage)?;
             }
+            Self::MemberTargetAnalysis {
+                location,
+                outcome,
+                coverage,
+                capture,
+            } => {
+                require_span_bearing(location)?;
+                validate_report_identifier(outcome)?;
+                validate_report_identifier(coverage)?;
+                if let Some(capture) = capture {
+                    validate_report_prose(capture)?;
+                }
+            }
+            Self::FieldWriteValue {
+                location,
+                assignment_ast_id,
+                rhs_ast_id,
+                receiver_identity_id,
+                member_target_id,
+                proof,
+                completeness,
+                coverage,
+            } => {
+                require_span_bearing(location)?;
+                for id in [
+                    assignment_ast_id,
+                    rhs_ast_id,
+                    receiver_identity_id,
+                    member_target_id,
+                ] {
+                    validate_report_identifier(id)?;
+                }
+                validate_report_identifier(proof)?;
+                validate_report_identifier(completeness)?;
+                validate_report_identifier(coverage)?;
+            }
             Self::ReceiverAnalysis {
                 location,
                 analysis_kind,
@@ -1277,6 +1334,36 @@ impl PolicyQueryResultRef {
             } => {
                 tighten_string(ast_id);
                 tighten_string(element_identity);
+                tighten_string(coverage);
+            }
+            Self::MemberTargetAnalysis {
+                outcome,
+                coverage,
+                capture,
+                ..
+            } => {
+                tighten_string(outcome);
+                tighten_string(coverage);
+                if let Some(capture) = capture {
+                    tighten_string(capture);
+                }
+            }
+            Self::FieldWriteValue {
+                assignment_ast_id,
+                rhs_ast_id,
+                receiver_identity_id,
+                member_target_id,
+                proof,
+                completeness,
+                coverage,
+                ..
+            } => {
+                tighten_string(assignment_ast_id);
+                tighten_string(rhs_ast_id);
+                tighten_string(receiver_identity_id);
+                tighten_string(member_target_id);
+                tighten_string(proof);
+                tighten_string(completeness);
                 tighten_string(coverage);
             }
             Self::ReceiverAnalysis {
@@ -1358,6 +1445,32 @@ impl RetainedSize for PolicyQueryResultRef {
             } => retained_extra(location)
                 .saturating_add(ast_id.capacity())
                 .saturating_add(element_identity.capacity())
+                .saturating_add(coverage.capacity()),
+            Self::MemberTargetAnalysis {
+                location,
+                outcome,
+                coverage,
+                capture,
+            } => retained_extra(location)
+                .saturating_add(outcome.capacity())
+                .saturating_add(coverage.capacity())
+                .saturating_add(retained_extra(capture)),
+            Self::FieldWriteValue {
+                location,
+                assignment_ast_id,
+                rhs_ast_id,
+                receiver_identity_id,
+                member_target_id,
+                proof,
+                completeness,
+                coverage,
+            } => retained_extra(location)
+                .saturating_add(assignment_ast_id.capacity())
+                .saturating_add(rhs_ast_id.capacity())
+                .saturating_add(receiver_identity_id.capacity())
+                .saturating_add(member_target_id.capacity())
+                .saturating_add(proof.capacity())
+                .saturating_add(completeness.capacity())
                 .saturating_add(coverage.capacity()),
             Self::ReceiverAnalysis {
                 location,
@@ -2067,6 +2180,10 @@ pub enum PolicyDiagnosticCode {
     /// selection is still a correct verdict -- but the report says the
     /// selection was empty instead of looking identical to a proven-clean run.
     EmptySelection,
+    /// The policy declared `(on-unknown :verdict fail-closed)` and its run
+    /// could not reach a verdict, so the blocked verdict gates as a failure
+    /// and this diagnostic names the unknowns that blocked it (#2506).
+    UnknownVerdictFailClosed,
     BatchFindingLimit,
     ReportRetentionBudget,
     CvssVariantBudget,
@@ -2085,6 +2202,7 @@ impl PolicyDiagnosticCode {
             Self::EndpointDominanceUndecidable => "endpoint_dominance_undecidable".to_owned(),
             Self::EvaluationFailure => "evaluation_failure".to_owned(),
             Self::EmptySelection => "empty_selection".to_owned(),
+            Self::UnknownVerdictFailClosed => "unknown_verdict_fail_closed".to_owned(),
             Self::BatchFindingLimit => "batch_finding_limit".to_owned(),
             Self::ReportRetentionBudget => "report_retention_budget".to_owned(),
             Self::CvssVariantBudget => "cvss_variant_budget".to_owned(),
@@ -3052,6 +3170,30 @@ pub struct PolicyRun {
     /// is `ProvenBySummary`. Empty for every other tier.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     authored_arm_closures: Vec<AuthoredArmClosureEvidence>,
+    /// The policy's declared non-default handling of a blocked verdict, set
+    /// only once it actually applied: the run is `Inconclusive` and the policy
+    /// authored something other than the default `abstain` (#2506). `None`
+    /// therefore reads as "today's fail-safe behavior", and a present value is
+    /// the typed marker a reader needs to know that these findings stand on an
+    /// incomplete run the gate did not fail on.
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_unknown_verdict"
+    )]
+    unknown_verdict: Option<UnknownVerdict>,
+}
+
+fn serialize_unknown_verdict<S>(
+    value: &Option<UnknownVerdict>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    match value {
+        Some(verdict) => serializer.serialize_str(verdict.label()),
+        None => serializer.serialize_none(),
+    }
 }
 
 impl PolicyRun {
@@ -3143,6 +3285,7 @@ impl PolicyRun {
             omitted_obligations_lower_bound: 0,
             work,
             authored_arm_closures: Vec::new(),
+            unknown_verdict: None,
         };
         run.refresh_retained_bytes();
         if run.retained_size() > budget.max_retained_report_bytes() {
@@ -3263,6 +3406,63 @@ impl PolicyRun {
         tighten_vec(&mut closures);
         self.authored_arm_closures = closures;
         self.refresh_retained_bytes();
+    }
+
+    /// The policy's declared non-default handling of a blocked verdict, once
+    /// it applied to this run.
+    pub const fn unknown_verdict(&self) -> Option<UnknownVerdict> {
+        self.unknown_verdict
+    }
+
+    /// Apply the policy's declared handling of a verdict blocked by unknown or
+    /// incomplete evidence (#2506).
+    ///
+    /// A declaration only ever applies to an `Inconclusive` run. A `Failed` or
+    /// `Unsupported` run is an engine outcome rather than a policy verdict, and
+    /// no authored preference may launder one into a gate the batch passes.
+    pub(crate) fn apply_unknown_verdict(
+        &mut self,
+        verdict: UnknownVerdict,
+        budget: &PolicyBudget,
+    ) -> Result<(), PolicyRunError> {
+        let PolicyRunCompletion::Inconclusive { reasons } = &self.completion else {
+            return Ok(());
+        };
+        match verdict {
+            UnknownVerdict::Abstain => return Ok(()),
+            UnknownVerdict::WarnUnreliable => {}
+            UnknownVerdict::FailClosed => {
+                let named = reasons
+                    .iter()
+                    .map(|reason| reason.label())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                self.diagnostics.push(PolicyDiagnostic::new_bounded(
+                    PolicyDiagnosticCode::UnknownVerdictFailClosed,
+                    PolicyDiagnosticSeverity::Error,
+                    PolicyDiagnosticImpact::RunIncomplete,
+                    format!(
+                        "the policy declares (on-unknown :verdict fail-closed) and this run reached no verdict: {named}"
+                    ),
+                ));
+                self.diagnostics.sort_by(compare_policy_diagnostics);
+                self.diagnostics.dedup();
+                if self.diagnostics.len() > budget.max_diagnostics() {
+                    return Err(PolicyRunError::TooManyDiagnostics {
+                        max: budget.max_diagnostics(),
+                    });
+                }
+                tighten_vec(&mut self.diagnostics);
+            }
+        }
+        self.unknown_verdict = Some(verdict);
+        self.refresh_retained_bytes();
+        if self.retained_size() > budget.max_retained_report_bytes() {
+            return Err(PolicyRunError::RetainedReportBytesExceeded {
+                max: budget.max_retained_report_bytes(),
+            });
+        }
+        Ok(())
     }
 
     pub(crate) fn replace_incomplete_reason(

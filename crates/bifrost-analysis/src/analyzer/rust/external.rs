@@ -6,8 +6,8 @@ use crate::analyzer::semantic_model::{
     AuthoredSemanticModelPack, CatalogCoordinate, Compatibility, Completeness,
     DependencyArtifactRole, DependencyPackAdapter, DependencyPackProduction,
     ExactDependencyArtifact, ExternalArtifactKind, NameSelector, Producer, ProducerDiagnostic,
-    ProducerDiagnosticSeverity, Provenance, ResolvedDependency, Safety, VersionConstraint,
-    normalize_artifact_locator_paths,
+    ProducerDiagnosticSeverity, Provenance, ResolvedDependency, Safety, SuppressedDiagnostics,
+    VersionConstraint, normalize_artifact_locator_paths,
 };
 
 use super::RustdocJsonPackProducer;
@@ -81,6 +81,7 @@ impl DependencyPackAdapter for RustDependencyPackAdapter {
                     code: "rust.rustdoc.feature_set_narrower_than_resolved".to_owned(),
                     severity: ProducerDiagnosticSeverity::Warning,
                     location: None,
+                    source_entry: None,
                     declaration: None,
                     message: format!(
                         "rustdoc ran without the Cargo-resolved features {missing:?}, so items they gate are absent from this surface"
@@ -334,12 +335,13 @@ fn failed_production(code: &str, message: &str) -> DependencyPackProduction {
         pack: None,
         diagnostics: vec![ProducerDiagnostic {
             severity: ProducerDiagnosticSeverity::Error,
+            source_entry: None,
             code: code.to_owned(),
             location: None,
             declaration: None,
             message: message.to_owned(),
         }],
-        suppressed_diagnostics: 0,
+        suppressed_diagnostics: SuppressedDiagnostics::default(),
     }
 }
 

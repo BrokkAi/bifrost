@@ -8676,6 +8676,7 @@ mod bounded_tests {
         );
     }
 
+    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
     #[test]
     fn opaque_macro_keeps_structured_qualified_path_resolution() {
         assert_opaque_macro_reference_resolves(
@@ -8686,6 +8687,7 @@ mod bounded_tests {
         );
     }
 
+    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
     #[test]
     fn opaque_macro_keeps_structured_receiver_member_resolution() {
         assert_opaque_macro_reference_resolves(
@@ -8706,6 +8708,7 @@ mod bounded_tests {
         );
     }
 
+    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
     #[test]
     fn opaque_macro_keeps_structured_tuple_constructor_resolution() {
         assert_opaque_macro_reference_resolves(

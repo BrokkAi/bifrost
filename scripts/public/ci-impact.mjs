@@ -3,7 +3,7 @@ import { spawnSync } from "node:child_process";
 import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 
-export const SCHEMA_VERSION = "2";
+export const SCHEMA_VERSION = "3";
 
 export const COMPONENTS = Object.freeze([
   "dependency_licenses",
@@ -12,6 +12,7 @@ export const COMPONENTS = Object.freeze([
   "external_fixture",
   "vscode",
   "pi_package",
+  "csmi",
   "rust",
   "python",
   "semantic_pack_jvm",
@@ -50,6 +51,12 @@ const SEMANTIC_PACK_SOURCE_COMPONENTS = new Set([
   "semantic_pack_python",
   "semantic_pack_typescript",
   "semantic_pack_rust",
+]);
+const CSMI_COMPONENTS = new Set(["csmi"]);
+const CSMI_RUST_COMPONENTS = new Set(["csmi", "rust"]);
+const CSMI_SEMANTIC_PACK_SOURCE_COMPONENTS = new Set([
+  ...SEMANTIC_PACK_SOURCE_COMPONENTS,
+  "csmi",
 ]);
 const PINNED_SEMANTIC_PACK_PATHS = [
   {
@@ -237,6 +244,7 @@ function isRustPath(path) {
     "crates/bifrost-policy/src/",
     "crates/bifrost-rql/src/",
     "crates/bifrost-semantic-packs/src/",
+    "crates/bifrost-semantic-packs/tests/",
     "tests/",
     "examples/",
   ]);
@@ -274,6 +282,21 @@ function classifyPath(path) {
       documentation: true,
       reason: "documentation-only surface",
     };
+  }
+  if (
+    path.startsWith("crates/bifrost-analysis/src/analyzer/semantic_model/csmi/") ||
+    path === "crates/bifrost-semantic-packs/src/bin/bifrost-semantic-pack.rs"
+  ) {
+    return {
+      components: CSMI_SEMANTIC_PACK_SOURCE_COMPONENTS,
+      reason: "CSMI implementation or CLI source",
+    };
+  }
+  if (path.startsWith("schemas/csmi/")) {
+    return { components: CSMI_COMPONENTS, reason: "CSMI schema or fixture" };
+  }
+  if (path === "crates/bifrost-semantic-packs/tests/authoring_cli.rs") {
+    return { components: CSMI_RUST_COMPONENTS, reason: "CSMI authoring CLI test surface" };
   }
   if (path.startsWith("crates/bifrost-semantic-packs/src/")) {
     return {

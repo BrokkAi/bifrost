@@ -51,6 +51,8 @@ pub const CSHARP_KIND_TABLE: &[(&str, NormalizedKind)] = &[
     ("struct_declaration", NormalizedKind::Class),
     ("enum_declaration", NormalizedKind::Class),
     ("record_declaration", NormalizedKind::Class),
+    ("namespace_declaration", NormalizedKind::Module),
+    ("file_scoped_namespace_declaration", NormalizedKind::Module),
     ("property_declaration", NormalizedKind::Declaration),
     ("variable_declarator", NormalizedKind::Assignment),
     ("assignment_expression", NormalizedKind::Assignment),
@@ -452,9 +454,15 @@ impl StructuralSpec for CSharpStructuralSpec {
             | NormalizedKind::Method
             | NormalizedKind::Constructor
             | NormalizedKind::Class
+            | NormalizedKind::Module
             | NormalizedKind::Declaration => {
+                // A namespace's `name` is a `qualified_name` for
+                // `namespace App.Support`, so the fact takes the terminal
+                // segment the same way a qualified callee or import does.
+                // Every other declaration head names a bare identifier, which
+                // `expression_name_node` returns unchanged.
                 if let Some(name) = node.child_by_field_name("name") {
-                    sink.set_name(name);
+                    sink.set_name(expression_name_node(name).unwrap_or(name));
                 }
                 attach_decorators(sink, node);
             }

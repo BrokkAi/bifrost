@@ -38,10 +38,10 @@ use std::sync::Arc;
 
 use crate::analyzer::common::language_for_file;
 use crate::analyzer::i_analyzer::IAnalyzer;
-use crate::analyzer::semantic::LengthDelimitedDigest;
 use crate::analyzer::semantic::cfg_algorithms::{
     CfgAlgorithmBudget, CfgAlgorithmRequest, DenseBidirectionalGraph, strongly_connected_components,
 };
+use crate::analyzer::semantic::{ExecutionTiming, LengthDelimitedDigest};
 use crate::analyzer::semantic_model::{
     CompiledDeclaredEffect, CompiledDeclaredEffectCertainty, CompiledDeclaredEffectTiming,
 };
@@ -103,11 +103,11 @@ effect_enum! {
 }
 
 effect_enum! {
-    /// When the effect happens relative to the call that establishes it.
+    /// When the effect happens relative to the modeled call that declares it.
     ///
-    /// This is the pack's own claim, propagated unchanged along call edges. An
-    /// effect reached only through a `Deferred` declaration stays deferred: the
-    /// join below never launders `Deferred` into `Immediate`.
+    /// This is the semantic pack's authored schedule and the stable schema-v1
+    /// `timing` vocabulary. Source execution never rewrites it; the additive
+    /// canonical `execution_timing` fact carries that composition instead.
     EffectTiming, ALL_EFFECT_TIMINGS {
         Immediate => "immediate",
         Deferred => "deferred",
@@ -259,12 +259,6 @@ impl EffectCertainty {
 }
 
 impl EffectTiming {
-    /// The join of two timings reaching one procedure for one effect.
-    ///
-    /// Equal timings survive; a disagreement becomes `Unknown`. Nothing ever
-    /// becomes `Immediate` that was not already immediate on every retained
-    /// path, which is what keeps a deferred callback from being laundered into
-    /// a synchronous claim.
     pub const fn join(self, other: Self) -> Self {
         match (self, other) {
             (Self::Immediate, Self::Immediate) => Self::Immediate,
@@ -279,6 +273,17 @@ impl EffectTiming {
             CompiledDeclaredEffectTiming::Deferred => Self::Deferred,
             CompiledDeclaredEffectTiming::Unknown => Self::Unknown,
         }
+    }
+}
+
+const fn declared_effect_execution_timing(timing: CompiledDeclaredEffectTiming) -> ExecutionTiming {
+    match timing {
+        // A pack's `immediate` promise is only that the effect happens before
+        // the modeled call returns. It does not make the call and effect one
+        // indivisible program-point evaluation.
+        CompiledDeclaredEffectTiming::Immediate => ExecutionTiming::SameInvocation,
+        CompiledDeclaredEffectTiming::Deferred => ExecutionTiming::DeferredCallback,
+        CompiledDeclaredEffectTiming::Unknown => ExecutionTiming::Unknown,
     }
 }
 
@@ -594,7 +599,8 @@ fn project_modeled_call_target_lookup(
                 residual = residual.saturating_add(1);
                 potentially_modeled_residual = true;
             }
-            CallDispatchBoundaryKind::Unresolved(status) => {
+            CallDispatchBoundaryKind::Unresolved(status)
+            | CallDispatchBoundaryKind::UnresolvedWithTarget { status, .. } => {
                 residual = residual.saturating_add(1);
                 if lookup.adjudicated_no_target
                     && matches!(
@@ -677,6 +683,7 @@ impl ModeledProcedureKey {
 pub struct BoundDeclaredEffect {
     pub effect_id: String,
     pub timing: EffectTiming,
+    pub execution_timing: ExecutionTiming,
     pub certainty: EffectCertainty,
     pub pack_id: String,
     pub model_id: String,
@@ -693,6 +700,7 @@ impl BoundDeclaredEffect {
         Self {
             effect_id: effect.id.clone(),
             timing: EffectTiming::from_compiled(effect.timing),
+            execution_timing: declared_effect_execution_timing(effect.timing),
             certainty: EffectCertainty::from_compiled(effect.certainty),
             pack_id: pack_id.into(),
             model_id: model_id.into(),
@@ -717,6 +725,9 @@ pub struct CallEffectArm {
     pub proof: EffectProof,
     /// Whether the arm's own evidence is complete, from the dispatch answer.
     pub complete: bool,
+    /// When this exact source call executes relative to its registering
+    /// construct, copied from the semantic call site.
+    pub execution_timing: ExecutionTiming,
     /// What the activated pack lookup answered for this arm.
     pub lookup: ArmLookup,
 }
@@ -778,6 +789,7 @@ pub struct CallEffectRow {
     pub effect_id: Option<String>,
     pub classification: EffectClassification,
     pub timing: Option<EffectTiming>,
+    pub execution_timing: Option<ExecutionTiming>,
     pub certainty: Option<EffectCertainty>,
     pub proof: Option<EffectProof>,
     pub derivation: EffectDerivation,
@@ -917,6 +929,7 @@ pub fn call_effect_report(
             effect_id: None,
             classification: EffectClassification::Direct,
             timing: None,
+            execution_timing: None,
             certainty: None,
             proof: None,
             derivation,
@@ -970,6 +983,7 @@ fn declared_call_effect_row(
         effect_id: Some(effect.effect_id.clone()),
         classification: EffectClassification::Direct,
         timing: Some(effect.timing),
+        execution_timing: Some(arm.execution_timing.compose(effect.execution_timing)),
         certainty: Some(effect.certainty.meet(dispatch_certainty)),
         proof: Some(arm.proof),
         derivation: EffectDerivation::Declared,
@@ -1101,6 +1115,8 @@ pub struct EffectGraphEdge {
     pub site_id: String,
     /// Whether dispatch proved this exact edge and nothing else.
     pub certainty: EffectCertainty,
+    /// When the callee invocation executes relative to the caller.
+    pub execution_timing: ExecutionTiming,
 }
 
 /// The reachable call graph of one query's procedures.
@@ -1129,6 +1145,7 @@ pub struct ProcedureEffectRow {
     pub classification: Option<EffectClassification>,
     pub certainty: Option<EffectCertainty>,
     pub timing: Option<EffectTiming>,
+    pub execution_timing: Option<ExecutionTiming>,
     /// Call hops from this procedure to the procedure the pack declares the
     /// effect on. `0` means the pack declares it on this procedure itself.
     pub depth: Option<usize>,
@@ -1188,6 +1205,7 @@ struct AttributedEffect {
     depth: usize,
     certainty: EffectCertainty,
     timing: EffectTiming,
+    execution_timing: ExecutionTiming,
     witness: Vec<EffectWitnessStep>,
     witness_truncated: bool,
     pack_id: String,
@@ -1213,6 +1231,11 @@ impl AttributedEffect {
         let timing = self.timing.join(other.timing);
         if timing != self.timing {
             self.timing = timing;
+            changed = true;
+        }
+        let execution_timing = self.execution_timing.join(other.execution_timing);
+        if execution_timing != self.execution_timing {
+            self.execution_timing = execution_timing;
             changed = true;
         }
         let better =
@@ -1360,6 +1383,7 @@ pub fn summarize_procedure_effects(
                             depth: 0,
                             certainty: declared.certainty,
                             timing: declared.timing,
+                            execution_timing: declared.execution_timing,
                             witness: Vec::new(),
                             witness_truncated: false,
                             pack_id: declared.pack_id.clone(),
@@ -1416,6 +1440,9 @@ pub fn summarize_procedure_effects(
                             depth,
                             certainty: source.certainty.meet(edge.certainty),
                             timing: source.timing,
+                            execution_timing: edge
+                                .execution_timing
+                                .compose(source.execution_timing),
                             witness,
                             witness_truncated,
                             pack_id: source.pack_id.clone(),
@@ -1529,6 +1556,7 @@ pub fn summarize_procedure_effects(
                     }),
                     certainty: Some(effect.certainty),
                     timing: Some(effect.timing),
+                    execution_timing: Some(effect.execution_timing),
                     depth: Some(effect.depth),
                     derivation: EffectDerivation::Declared,
                     reason: None,
@@ -1551,6 +1579,7 @@ pub fn summarize_procedure_effects(
                     classification: None,
                     certainty: None,
                     timing: None,
+                    execution_timing: None,
                     depth: None,
                     derivation: if node_coverage == EffectCoverage::Unsupported {
                         EffectDerivation::Unsupported
@@ -1592,15 +1621,35 @@ fn procedure_effect_row_id(declaration_id: &str, effect_id: Option<&str>) -> Str
     digest.finish().to_string()
 }
 
+/// The owner of a module-level declaration, or `None` when the declaration is
+/// not module-level (#2610).
+///
+/// A declaration whose fully-qualified name has no owner segment is qualified
+/// by whatever scope encloses it. When the adapter also recorded no package --
+/// JavaScript and TypeScript never mint one, Ruby never does, and PHP does only
+/// inside a `namespace` -- that scope is the file itself, and the declaration's
+/// owner is its module identity. A unit that does carry a package is already
+/// qualified by it, so it keeps whatever its own name says and never falls back
+/// to a path.
+fn module_level_owner(unit: &CodeUnit) -> Option<String> {
+    if !unit.package_name().is_empty() {
+        return None;
+    }
+    crate::analyzer::semantic::module_identity_owner(unit.source().rel_path())
+}
+
 /// The canonical procedure key for one workspace declaration, or `None` when
-/// the declaration carries no qualified owner.
+/// the declaration has no qualified owner at all.
 ///
 /// The owner and member come from the declaration's own fully-qualified name
-/// and never from a rendered call-site text, and the receiver shape and
-/// parameter count come from the persisted signature contract. When the adapter
-/// never recorded modifiers, the receiver shape is unknown and no key is built:
-/// guessing would bind a static member's declaration to an instance member's
-/// summary.
+/// and never from a rendered call-site text, except that a module-level
+/// declaration -- one whose name carries no owner segment and whose adapter
+/// minted no package -- is owned by its module identity, the same identity an
+/// authored summary names through its target `path` (#2610). The receiver shape
+/// and parameter count come from the persisted signature contract. When the
+/// adapter never recorded modifiers, the receiver shape is unknown and no key
+/// is built: guessing would bind a static member's declaration to an instance
+/// member's summary.
 pub fn modeled_procedure_key(
     language: &str,
     unit: &CodeUnit,
@@ -1608,11 +1657,14 @@ pub fn modeled_procedure_key(
     parameter_count: Option<u32>,
 ) -> Option<ModeledProcedureKey> {
     let fq_name = unit.fq_name();
-    let (owner, member) = crate::analyzer::semantic::split_qualified_member(&fq_name)?;
+    let (owner, member) = match crate::analyzer::semantic::split_qualified_member(&fq_name) {
+        Some((owner, member)) => (owner.to_owned(), member.to_owned()),
+        None => (module_level_owner(unit)?, unit.terminal_name().to_owned()),
+    };
     Some(ModeledProcedureKey {
         language: language.to_owned(),
-        owner: owner.to_owned(),
-        member: member.to_owned(),
+        owner,
+        member,
         has_receiver: has_receiver?,
         parameter_count: parameter_count?,
     })
@@ -1669,10 +1721,22 @@ mod tests {
         }
     }
 
-    fn declared(id: &str, timing: EffectTiming, certainty: EffectCertainty) -> BoundDeclaredEffect {
+    fn declared(
+        id: &str,
+        execution_timing: ExecutionTiming,
+        certainty: EffectCertainty,
+    ) -> BoundDeclaredEffect {
+        let timing = match execution_timing {
+            ExecutionTiming::SameEvaluation | ExecutionTiming::SameInvocation => {
+                EffectTiming::Immediate
+            }
+            ExecutionTiming::DeferredCallback => EffectTiming::Deferred,
+            _ => EffectTiming::Unknown,
+        };
         BoundDeclaredEffect {
             effect_id: id.to_owned(),
             timing,
+            execution_timing,
             certainty,
             pack_id: "acme.effects".to_owned(),
             model_id: "acme.effects/1.0.0".to_owned(),
@@ -1693,6 +1757,7 @@ mod tests {
             }),
             proof,
             complete: proof == EffectProof::Proven,
+            execution_timing: ExecutionTiming::SameEvaluation,
             lookup,
         }
     }
@@ -2220,7 +2285,7 @@ func caller() {
                 EffectProof::Proven,
                 ArmLookup::Declared(vec![declared(
                     "acme.network_io",
-                    EffectTiming::Immediate,
+                    ExecutionTiming::SameEvaluation,
                     EffectCertainty::Definite,
                 )]),
             )],
@@ -2230,8 +2295,89 @@ func caller() {
         assert_eq!(row.derivation, EffectDerivation::Declared);
         assert_eq!(row.certainty, Some(EffectCertainty::Definite));
         assert_eq!(row.classification, EffectClassification::Direct);
+        assert_eq!(row.timing, Some(EffectTiming::Immediate));
+        assert_eq!(row.execution_timing, Some(ExecutionTiming::SameEvaluation));
         assert_eq!(report.coverage, EffectCoverage::Exhaustive);
         assert!(!row.terminal);
+    }
+
+    #[test]
+    fn exact_call_execution_composes_with_declared_effect_timing() {
+        for (call_timing, effect_timing, expected) in [
+            (
+                ExecutionTiming::SameEvaluation,
+                ExecutionTiming::SameInvocation,
+                ExecutionTiming::SameInvocation,
+            ),
+            (
+                ExecutionTiming::SameInvocation,
+                ExecutionTiming::SameInvocation,
+                ExecutionTiming::SameInvocation,
+            ),
+            (
+                ExecutionTiming::DifferentTask,
+                ExecutionTiming::SameInvocation,
+                ExecutionTiming::DifferentTask,
+            ),
+            (
+                ExecutionTiming::DifferentTask,
+                ExecutionTiming::DeferredCallback,
+                ExecutionTiming::Unknown,
+            ),
+            (
+                ExecutionTiming::Unknown,
+                ExecutionTiming::SameInvocation,
+                ExecutionTiming::Unknown,
+            ),
+        ] {
+            let authored_timing = match effect_timing {
+                ExecutionTiming::DeferredCallback => EffectTiming::Deferred,
+                ExecutionTiming::Unknown => EffectTiming::Unknown,
+                _ => EffectTiming::Immediate,
+            };
+            let mut effect_arm = arm(
+                "target",
+                EffectProof::Proven,
+                ArmLookup::Declared(vec![declared(
+                    "acme.network_io",
+                    effect_timing,
+                    EffectCertainty::Definite,
+                )]),
+            );
+            effect_arm.execution_timing = call_timing;
+            let report = call_effect_report(
+                &file(),
+                "site",
+                "ast",
+                range(),
+                CallEffectSiteStatus::Answered {
+                    coverage: EffectCoverage::Exhaustive,
+                },
+                &[effect_arm],
+            );
+            assert_eq!(report.rows[0].timing, Some(authored_timing));
+            assert_eq!(report.rows[0].execution_timing, Some(expected));
+        }
+    }
+
+    #[test]
+    fn authored_immediate_effect_means_before_return_not_same_program_point() {
+        assert_eq!(
+            EffectTiming::from_compiled(CompiledDeclaredEffectTiming::Immediate),
+            EffectTiming::Immediate
+        );
+        assert_eq!(
+            declared_effect_execution_timing(CompiledDeclaredEffectTiming::Immediate),
+            ExecutionTiming::SameInvocation
+        );
+        assert_eq!(
+            declared_effect_execution_timing(CompiledDeclaredEffectTiming::Deferred),
+            ExecutionTiming::DeferredCallback
+        );
+        assert_eq!(
+            declared_effect_execution_timing(CompiledDeclaredEffectTiming::Unknown),
+            ExecutionTiming::Unknown
+        );
     }
 
     #[test]
@@ -2249,7 +2395,7 @@ func caller() {
                 EffectProof::Unproven,
                 ArmLookup::Declared(vec![declared(
                     "acme.network_io",
-                    EffectTiming::Immediate,
+                    ExecutionTiming::SameEvaluation,
                     EffectCertainty::Definite,
                 )]),
             )],
@@ -2273,7 +2419,7 @@ func caller() {
                 EffectProof::Proven,
                 ArmLookup::Declared(vec![declared(
                     "acme.network_io",
-                    EffectTiming::Immediate,
+                    ExecutionTiming::SameEvaluation,
                     EffectCertainty::Possible,
                 )]),
             )],
@@ -2361,6 +2507,7 @@ func caller() {
             callee,
             site_id: site.to_owned(),
             certainty: EffectCertainty::Definite,
+            execution_timing: ExecutionTiming::SameEvaluation,
         }
     }
 
@@ -2373,7 +2520,7 @@ func caller() {
                     "AcmeHttpClient.send",
                     vec![declared(
                         "acme.network_io",
-                        EffectTiming::Immediate,
+                        ExecutionTiming::SameEvaluation,
                         EffectCertainty::Definite,
                     )],
                 ),
@@ -2401,7 +2548,7 @@ func caller() {
                     "AcmeHttpClient.send",
                     vec![declared(
                         "acme.network_io",
-                        EffectTiming::Immediate,
+                        ExecutionTiming::SameEvaluation,
                         EffectCertainty::Definite,
                     )],
                 ),
@@ -2436,7 +2583,7 @@ func caller() {
                     "AcmeHttpClient.send",
                     vec![declared(
                         "acme.network_io",
-                        EffectTiming::Immediate,
+                        ExecutionTiming::SameEvaluation,
                         EffectCertainty::Definite,
                     )],
                 ),
@@ -2470,7 +2617,7 @@ func caller() {
                     "AcmeScheduler.schedule",
                     vec![declared(
                         "acme.network_io",
-                        EffectTiming::Deferred,
+                        ExecutionTiming::DeferredCallback,
                         EffectCertainty::Definite,
                     )],
                 ),
@@ -2480,6 +2627,79 @@ func caller() {
         };
         let reports = summarize_procedure_effects(&graph, ProcedureEffectBudget::default());
         assert_eq!(reports[0].rows[0].timing, Some(EffectTiming::Deferred));
+        assert_eq!(
+            reports[0].rows[0].execution_timing,
+            Some(ExecutionTiming::DeferredCallback)
+        );
+    }
+
+    #[test]
+    fn call_edge_execution_timing_survives_transitive_propagation() {
+        for (execution_timing, expected) in [
+            (
+                ExecutionTiming::SameInvocation,
+                ExecutionTiming::SameInvocation,
+            ),
+            (
+                ExecutionTiming::DifferentTask,
+                ExecutionTiming::DifferentTask,
+            ),
+            (ExecutionTiming::Unknown, ExecutionTiming::Unknown),
+        ] {
+            let mut call = edge(0, 1, "site.call");
+            call.execution_timing = execution_timing;
+            let graph = EffectGraph {
+                procedures: vec![
+                    procedure("App.run", Vec::new()),
+                    procedure(
+                        "AcmeClient.send",
+                        vec![declared(
+                            "acme.network_io",
+                            ExecutionTiming::SameInvocation,
+                            EffectCertainty::Definite,
+                        )],
+                    ),
+                ],
+                edges: vec![call],
+                truncated: false,
+            };
+            let reports = summarize_procedure_effects(&graph, ProcedureEffectBudget::default());
+            assert_eq!(reports[0].rows[0].timing, Some(EffectTiming::Immediate));
+            assert_eq!(reports[0].rows[0].execution_timing, Some(expected));
+        }
+    }
+
+    #[test]
+    fn authored_timing_propagates_unchanged_and_disagreeing_origins_join_unknown() {
+        let graph = EffectGraph {
+            procedures: vec![
+                procedure("App.run", Vec::new()),
+                procedure(
+                    "AcmeClient.sendNow",
+                    vec![declared(
+                        "acme.network_io",
+                        ExecutionTiming::SameInvocation,
+                        EffectCertainty::Definite,
+                    )],
+                ),
+                procedure(
+                    "AcmeClient.sendLater",
+                    vec![declared(
+                        "acme.network_io",
+                        ExecutionTiming::DeferredCallback,
+                        EffectCertainty::Definite,
+                    )],
+                ),
+            ],
+            edges: vec![edge(0, 1, "site.now"), edge(0, 2, "site.later")],
+            truncated: false,
+        };
+        let reports = summarize_procedure_effects(&graph, ProcedureEffectBudget::default());
+        assert_eq!(reports[0].rows[0].timing, Some(EffectTiming::Unknown));
+        assert_eq!(
+            reports[0].rows[0].execution_timing,
+            Some(ExecutionTiming::Unknown)
+        );
     }
 
     #[test]
@@ -2493,7 +2713,7 @@ func caller() {
                     "AcmeHttpClient.send",
                     vec![declared(
                         "acme.network_io",
-                        EffectTiming::Immediate,
+                        ExecutionTiming::SameEvaluation,
                         EffectCertainty::Definite,
                     )],
                 ),
@@ -2535,7 +2755,7 @@ func caller() {
             "java.io.Writer.write/1+recv",
             vec![declared(
                 "io.stream_write",
-                EffectTiming::Immediate,
+                ExecutionTiming::SameEvaluation,
                 EffectCertainty::Definite,
             )],
         );
@@ -2600,7 +2820,7 @@ func caller() {
                     "AcmeHttpClient.send",
                     vec![declared(
                         "acme.network_io",
-                        EffectTiming::Immediate,
+                        ExecutionTiming::SameEvaluation,
                         EffectCertainty::Definite,
                     )],
                 ),
@@ -2631,7 +2851,7 @@ func caller() {
                 "AcmeHttpClient.send",
                 vec![declared(
                     "acme.network_io",
-                    EffectTiming::Immediate,
+                    ExecutionTiming::SameEvaluation,
                     EffectCertainty::Definite,
                 )],
             ),

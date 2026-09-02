@@ -4,21 +4,25 @@
   :name "Subprocess creation inside a loop"
   :message "Review whether this lexically nested subprocess launch repeats per iteration"
   :severity note
-  :description "A subprocess call lexically nested under a loop may repeat expensive process creation. This structural prompt also includes deferred nested bodies; verify execution before reusing a process or batching input."
+  :description "A subprocess call lexically nested under a loop may repeat expensive process creation. This structural prompt also includes deferred nested bodies; verify execution before reusing a process or batching input. A for-each loop whose iterated expression provably resolves to a collection literal with at most eight elements is excluded; the proof covers declarator-established bindings (JS/TS const/let/var, Rust let, Java locals), so field-, assignment-, or call-produced iterables still report."
   :help-uri "https://bifrost.brokk.ai/static-analysis-policies/#built-in-code-smell-pack"
   :tags ["performance" "subprocess" "loop" "code-smell"]
   :analysis
     (analysis
-      :type match
-      :selector
+      :type assertion
+      :subject
         (rql
           :schema-version 1
           (union
             (language python
-              (inside-decl (loop) (call :receiver (name "subprocess") :callee (name "run"))))
+              (inside-decl (loop :capture "region") (call :receiver (name "subprocess") :callee (name "run") :capture "smell")))
             (language java
-              (inside-decl (loop) (call :receiver (name "runtime") :callee (name "exec"))))
+              (inside-decl (loop :capture "region") (call :receiver (name "runtime") :callee (name "exec") :capture "smell")))
             (language javascript
-              (inside-decl (loop) (call :receiver (name "child_process") :callee (name "execSync"))))
+              (inside-decl (loop :capture "region") (call :receiver (name "child_process") :callee (name "execSync") :capture "smell")))
             (language typescript
-              (inside-decl (loop) (call :receiver (name "child_process") :callee (name "execSync"))))))))
+              (inside-decl (loop :capture "region") (call :receiver (name "child_process") :callee (name "execSync") :capture "smell")))))
+      :asserts [
+        (assert-origin-shape :id small-literal-iterable :at "region" :anchor "smell"
+                             :role value_reference :shape collection-literal :max-elements 8)
+      ]))

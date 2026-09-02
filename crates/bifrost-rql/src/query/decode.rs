@@ -4,17 +4,18 @@ use super::ir::{
     CodeQuery, CodeQueryPlan, CodeQueryPlanSource, CodeQueryResultDetail, CodeQuerySeed,
     ControlRelationFilter, DEFAULT_LIMIT, DeclarationStateFilter, DecoratorBindingFilter,
     EdgeFilter, ExportFilter, ExportSeed, FailureUseConsumer, FailureUseProvenance,
-    FlowRelationFilter, GenerationSiteFilter, GenerationSiteSeed, HierarchyTraversal,
-    JsxAttributeValueTraversal, MAX_ARITY, MAX_BINDING_NAME_LENGTH, MAX_CAPTURE_LENGTH,
-    MAX_DECORATOR_BINDING_FILTER_LENGTH, MAX_ENVIRONMENT_FILTER_ENTRIES, MAX_GLOB_LENGTH,
-    MAX_KIND_LIST_ENTRIES, MAX_KWARG_NAME_LENGTH, MAX_KWARGS, MAX_LANGUAGE_FILTERS, MAX_LIMIT,
-    MAX_OCCURRENCE_FILTER_ENTRIES, MAX_PATTERN_DEPTH, MAX_PATTERN_NODES, MAX_QUERY_BRANCHES,
-    MAX_QUERY_PLAN_DEPTH, MAX_QUERY_PLAN_NODES, MAX_QUERY_STEPS, MAX_ROLE_LIST_ENTRIES,
-    MAX_STRING_PREDICATE_LENGTH, MAX_WHERE_GLOBS, OccurrenceFilter, OccurrenceSeed, PathFilter,
-    PathSeed, Pattern, QueryError, QueryStep, ReceiverTraversalFilter, ReferenceTraversalFilter,
-    ResultContractFailureUseFilter, RewritePathFilter, ScopeFilter, ScopeSeed, SegmentsOfOptions,
-    SetOperator, StateEventFilter, StringPredicate, TaintTraversal, TypestateTraversal,
-    UNATTRIBUTED_TIER_LABEL, ValueFlowTraversal, WitnessTraversal,
+    FieldWriteValueTraversal, FlowRelationFilter, GenerationSiteFilter, GenerationSiteSeed,
+    HierarchyTraversal, JsxAttributeValueTraversal, MAX_ARITY, MAX_BINDING_NAME_LENGTH,
+    MAX_CAPTURE_LENGTH, MAX_DECORATOR_BINDING_FILTER_LENGTH, MAX_ENVIRONMENT_FILTER_ENTRIES,
+    MAX_GLOB_LENGTH, MAX_KIND_LIST_ENTRIES, MAX_KWARG_NAME_LENGTH, MAX_KWARGS,
+    MAX_LANGUAGE_FILTERS, MAX_LIMIT, MAX_OCCURRENCE_FILTER_ENTRIES, MAX_PATTERN_DEPTH,
+    MAX_PATTERN_NODES, MAX_QUERY_BRANCHES, MAX_QUERY_PLAN_DEPTH, MAX_QUERY_PLAN_NODES,
+    MAX_QUERY_STEPS, MAX_ROLE_LIST_ENTRIES, MAX_STRING_PREDICATE_LENGTH, MAX_WHERE_GLOBS,
+    OccurrenceFilter, OccurrenceSeed, PathFilter, PathSeed, Pattern, QueryError, QueryStep,
+    ReceiverTraversalFilter, ReferenceTraversalFilter, ResultContractFailureUseFilter,
+    RewritePathFilter, ScopeFilter, ScopeSeed, SegmentsOfOptions, SetOperator, StateEventFilter,
+    StringPredicate, TaintTraversal, TypestateTraversal, UNATTRIBUTED_TIER_LABEL,
+    ValueFlowTraversal, WitnessTraversal,
 };
 use super::schema::{
     ALL_QUERY_STEP_OPS, CodeQueryExecutionMode, PatternField, QueryField, QueryStepField,
@@ -1302,6 +1303,7 @@ fn decode_steps(value: &Value, path: &str) -> Result<Vec<QueryStep>, QueryError>
         );
         let call_input = matches!(step, QueryStep::CallInput(_));
         let jsx_attribute_value = matches!(step, QueryStep::JsxAttributeValue(_));
+        let field_write_value = matches!(step, QueryStep::FieldWriteValue(_));
         let receiver = matches!(
             step,
             QueryStep::ReceiverTargets(_) | QueryStep::PointsTo(_) | QueryStep::MemberTargets(_)
@@ -1344,6 +1346,8 @@ fn decode_steps(value: &Value, path: &str) -> Result<Vec<QueryStep>, QueryError>
                     | QueryStepField::ElementName
                     | QueryStepField::PropertyName,
                 ) if jsx_attribute_value => {}
+                Some(QueryStepField::ReceiverIdentityId | QueryStepField::MemberTargetId)
+                    if field_write_value => {}
                 Some(QueryStepField::Capture) if receiver => {}
                 Some(QueryStepField::ProtocolRef) if typestate => {}
                 Some(QueryStepField::PlanRef) if value_flow => {}
@@ -1411,6 +1415,8 @@ fn decode_steps(value: &Value, path: &str) -> Result<Vec<QueryStep>, QueryError>
                     | QueryStepField::ElementName
                     | QueryStepField::PropertyName
                     | QueryStepField::Capture
+                    | QueryStepField::ReceiverIdentityId
+                    | QueryStepField::MemberTargetId
                     | QueryStepField::ProtocolRef
                     | QueryStepField::PlanRef
                     | QueryStepField::TaintRef
@@ -1783,6 +1789,28 @@ fn decode_steps(value: &Value, path: &str) -> Result<Vec<QueryStep>, QueryError>
                 identity,
                 element_name: decode_name("element_name")?,
                 property_name: decode_name("property_name")?,
+            });
+        } else if field_write_value {
+            let decode_identity = |field: &str| {
+                object
+                    .get(field)
+                    .map(|value| {
+                        value
+                            .as_str()
+                            .filter(|value| !value.is_empty())
+                            .map(str::to_owned)
+                            .ok_or_else(|| {
+                                QueryError::new(
+                                    child_path(&entry_path, field),
+                                    "expected a non-empty exact identity string",
+                                )
+                            })
+                    })
+                    .transpose()
+            };
+            step = QueryStep::FieldWriteValue(FieldWriteValueTraversal {
+                receiver_identity_id: decode_identity("receiver_identity_id")?,
+                member_target_id: decode_identity("member_target_id")?,
             });
         } else if receiver {
             let capture = object
@@ -2334,6 +2362,7 @@ fn decode_role_fields(
                 Role::Receiver => pattern.receiver = Some(sub_pattern),
                 Role::Left => pattern.left = Some(sub_pattern),
                 Role::Right => pattern.right = Some(sub_pattern),
+                Role::Operator => pattern.operator = Some(sub_pattern),
                 Role::Module => pattern.module = Some(sub_pattern),
                 Role::Object => pattern.object = Some(sub_pattern),
                 Role::Field => pattern.field = Some(sub_pattern),
@@ -2385,6 +2414,7 @@ fn decode_role_fields(
                 | Role::Kwarg
                 | Role::Left
                 | Role::Right
+                | Role::Operator
                 | Role::Module
                 | Role::Object
                 | Role::Field

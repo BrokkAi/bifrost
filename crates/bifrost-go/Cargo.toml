@@ -16,7 +16,7 @@ publish = true
 name = "brokk_bifrost_go"
 
 [dependencies]
-brokk-bifrost-core = { path = "../bifrost-core", version = "=0.10.8" }
+brokk-bifrost-core = { path = "../bifrost-core", version = "=0.10.9" }
 rayon = "1.10.0"
 regex = "1.12.2"
 tree-sitter = "0.25.10"
@@ -33,3 +33,6 @@ default = []
 # every workspace build would be a real cost. Analysis turns the feature on
 # through its dev-dependency so its Go hierarchy test can assert them.
 test-support = []
+
+[lints]
+workspace = true

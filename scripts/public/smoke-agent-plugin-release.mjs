@@ -373,9 +373,27 @@ async function assertMcpRootsWorkspaceBinding(codexLaunch, workspaceRoot, env) {
       params: { name: "list_policies", arguments: {} },
     });
     assert.equal(catalog.result?.isError, false, `MCP list_policies returned an error: ${JSON.stringify(catalog)}`);
-    assert.equal(catalog.result?.structuredContent?.id, "bifrost.code-smells");
-    const policies = catalog.result?.structuredContent?.policies;
-    assert.ok(Array.isArray(policies) && policies.length > 0, "MCP list_policies returned no built-in policies");
+    const catalogContent = catalog.result?.structuredContent;
+    assert.equal(catalogContent?.schema_version, 1);
+    const packs = catalogContent?.packs;
+    assert.ok(Array.isArray(packs) && packs.length === 2, "MCP list_policies returned the wrong catalog envelope");
+    const codeSmells = packs.find((pack) => pack.id === "bifrost.code-smells");
+    const security = packs.find((pack) => pack.id === "bifrost.security");
+    assert.ok(codeSmells, "MCP list_policies omitted bifrost.code-smells");
+    assert.ok(security, "MCP list_policies omitted bifrost.security");
+    assert.ok(
+      Array.isArray(codeSmells.policies) && codeSmells.policies.length > 0,
+      "MCP list_policies returned no code-smell policies",
+    );
+    assert.ok(
+      Array.isArray(security.policies) && security.policies.length > 0,
+      "MCP list_policies returned no security policies",
+    );
+    assert.ok(
+      security.policies.some((entry) => entry.id === "bifrost.security.java.servlet-parameter-to-jdbc"),
+      "MCP list_policies omitted the Java security policy",
+    );
+    const policies = codeSmells.policies;
     const policyIds = policies.map((entry) => entry.id);
     assert.equal(new Set(policyIds).size, policyIds.length, "MCP list_policies returned duplicate policy IDs");
     assert.ok(

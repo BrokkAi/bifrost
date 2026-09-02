@@ -253,8 +253,21 @@ impl CSharpVisitor<'_, '_> {
         );
         self.parsed.add_signature_with_metadata(
             code_unit.clone(),
+            // Recorded, not merely present: canonical identity reads a type
+            // declaration's arity, so a nongeneric type must be a proven zero
+            // rather than an unread list (#1651).
             SignatureMetadata::new(csharp_type_signature(node, self.source), Vec::new())
-                .with_type_parameters(csharp_declaration_type_parameters(node, self.source)),
+                .with_recorded_type_parameters(csharp_declaration_type_parameters(
+                    node,
+                    self.source,
+                ))
+                // Interface-ness is a declaration fact a bounded consumer
+                // cannot recover from the indexed identity: a class, a struct
+                // and an interface are all `CodeUnitType::Class` rows, and
+                // telling them apart otherwise means reparsing the declaring
+                // file. The C# extension-argument refutation asks exactly this
+                // question about a candidate's parameter type (#2225).
+                .with_class_like_interface(node.kind() == "interface_declaration"),
         );
         self.visit_primary_constructor(node, scope, &code_unit, &name);
 
@@ -874,6 +887,7 @@ fn csharp_signature_metadata<'tree>(
                     .any(|parameter| parameter == receiver)
                 && !csharp_method_type_parameter_has_constraints(node, source, receiver)
         });
+    let parameter_types = csharp_callable_parameter_types(node, source);
     let parameter_text = csharp_rendered_parameter_text(node, source);
     let metadata = if let Some(parameters_start) = signature.find(&parameter_text) {
         let parameters_end = parameters_start + parameter_text.len();
@@ -895,6 +909,7 @@ fn csharp_signature_metadata<'tree>(
             .collect();
         SignatureMetadata::new(signature, parameters)
             .with_callable_arity(callable_arity)
+            .with_callable_parameter_types(parameter_types)
             .with_type_parameters(type_parameters)
             .with_return_type_text(return_type_text)
             .with_return_type_identity(return_type_identity)
@@ -907,6 +922,7 @@ fn csharp_signature_metadata<'tree>(
     } else {
         SignatureMetadata::new(signature, Vec::new())
             .with_callable_arity(callable_arity)
+            .with_callable_parameter_types(parameter_types)
             .with_type_parameters(type_parameters)
             .with_return_type_text(return_type_text)
             .with_return_type_identity(return_type_identity)
@@ -1306,6 +1322,45 @@ fn csharp_rendered_parameter_text(node: Node<'_>, source: &str) -> String {
         .unwrap_or_else(|| "()".to_string())
 }
 
+/// The written type of each parameter of a callable, in declaration order.
+///
+/// Read from the parameter `type` nodes, so the spelling is the declaration's
+/// own and no caller has to recover it from the rendered signature label. The
+/// trailing `params` parameter is not a `parameter` node -- the grammar
+/// flattens it into the parameter list's own `type` and `name` fields -- so it
+/// is appended the same way [`csharp_parameter_label_nodes`] appends its label,
+/// and the two lists stay index-aligned.
+///
+/// A parameter with no `type` field contributes an empty spelling rather than
+/// disappearing, because dropping it would shift every later parameter's index.
+fn csharp_callable_parameter_types(node: Node<'_>, source: &str) -> Vec<String> {
+    let Some(parameters) = csharp_parameter_list_node(node) else {
+        return Vec::new();
+    };
+    let mut types = Vec::new();
+    let mut cursor = parameters.walk();
+    for child in parameters.named_children(&mut cursor) {
+        if child.kind() != "parameter" {
+            continue;
+        }
+        types.push(
+            child
+                .child_by_field_name("type")
+                .map(|type_node| csharp_type_node_identity(type_node, source))
+                .unwrap_or_default(),
+        );
+    }
+    if csharp_parameter_list_has_params(parameters) {
+        types.push(
+            parameters
+                .child_by_field_name("type")
+                .map(|type_node| csharp_type_node_identity(type_node, source))
+                .unwrap_or_default(),
+        );
+    }
+    types
+}
+
 fn csharp_parameter_label_nodes(node: Node<'_>) -> Vec<Node<'_>> {
     let Some(parameters) = csharp_parameter_list_node(node) else {
         return Vec::new();
@@ -1454,7 +1509,6 @@ fn last_named_child(node: Node<'_>) -> Option<Node<'_>> {
 #[cfg(test)]
 mod structured_supertype_tests {
     use super::*;
-    use std::path::PathBuf;
     use tree_sitter::Parser;
 
     /// The structured hierarchy facts the coarse file graph follows from a
@@ -1470,7 +1524,10 @@ public class Outer<T> : Example.Base<Example.Model.Value>, System.IDisposable {
     public void Dispose() {}
 }
 "#;
-        let file = ProjectFile::new(PathBuf::from("/workspace"), "src/Feature.cs");
+        let file = ProjectFile::new(
+            std::env::current_dir().expect("test working directory must be available"),
+            "src/Feature.cs",
+        );
         let mut parser = Parser::new();
         parser
             .set_language(&tree_sitter_c_sharp::LANGUAGE.into())
@@ -1490,6 +1547,60 @@ public class Outer<T> : Example.Base<Example.Model.Value>, System.IDisposable {
                 "Example.Base`1".to_string(),
                 "System.IDisposable".to_string(),
             ])
+        );
+    }
+}
+
+#[cfg(test)]
+mod type_parameter_metadata_tests {
+    use super::*;
+    use tree_sitter::Parser;
+
+    /// A C# type declaration records its own type-parameter list, so a
+    /// nongeneric type is a proven zero rather than the unread list an empty
+    /// `type_parameters` used to mean (#1651).
+    #[test]
+    fn csharp_type_declarations_record_their_type_parameters() {
+        let source = r#"
+namespace Example;
+
+public class Foo {}
+public class Foo<T> {}
+public interface IFoo<K, V> {}
+public struct Point {}
+public enum Colour { Red }
+"#;
+        let file = ProjectFile::new(
+            std::env::current_dir().expect("test working directory must be available"),
+            "src/Feature.cs",
+        );
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_c_sharp::LANGUAGE.into())
+            .expect("C# grammar");
+        let tree = parser.parse(source, None).expect("C# tree");
+        let parsed = parse_csharp_file(&file, source, &tree);
+
+        let mut recorded = parsed
+            .signature_metadata
+            .iter()
+            .flat_map(|(unit, metadata)| {
+                metadata
+                    .iter()
+                    .filter(|entry| entry.type_parameters_recorded())
+                    .map(|entry| (unit.short_name().to_string(), entry.type_parameters().len()))
+            })
+            .collect::<Vec<_>>();
+        recorded.sort();
+        assert_eq!(
+            recorded,
+            vec![
+                ("Colour".to_string(), 0),
+                ("Foo".to_string(), 0),
+                ("Foo`1".to_string(), 1),
+                ("IFoo`2".to_string(), 2),
+                ("Point".to_string(), 0),
+            ]
         );
     }
 }

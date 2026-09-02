@@ -1,6 +1,7 @@
 use crate::call_match::{
-    CppArgType, cpp_filter_candidates_by_args_with_parameter_types, cpp_literal_arg_type,
-    cpp_signature_param_types, cpp_type_text_pointer_depth, normalize_cpp_type_name,
+    CppArgType, cpp_filter_candidates_by_args_with_parameter_types, cpp_forwarding_call_argument,
+    cpp_literal_arg_type, cpp_signature_param_types, cpp_type_text_pointer_depth,
+    normalize_cpp_type_name,
 };
 use crate::declarations::{
     CppSentinelRecoveredClass, cpp_active_template_type_parameter, cpp_export_macro_token,
@@ -12,8 +13,9 @@ use crate::graph::callable_definitions_share_identity_evidence as cpp_callable_d
 use crate::graph::callable_definitions_share_identity_evidence_with_visibility as cpp_callable_definitions_share_identity_evidence_with_visibility;
 use crate::graph::hits::{
     enclosing_context, is_member_field_own_declarator, push_declaration_reference_hit,
-    push_definition_hit, push_hit, push_recursive_reference_hit, push_self_receiver_hit,
-    push_type_hit, push_type_hit_range, push_unproven_definition_hit, push_unproven_hit,
+    push_definition_hit, push_hit, push_recursive_reference_hit, push_reference_hit_range,
+    push_self_receiver_hit, push_type_hit, push_type_hit_range, push_unproven_definition_hit,
+    push_unproven_hit, push_unproven_reference_hit_range,
 };
 use crate::graph::resolver::*;
 use crate::graph::syntax::{object_macro_replacement_type_references, qualified_callable_value};
@@ -25,7 +27,7 @@ use brokk_bifrost_core::analyzer::tree_walk::ParentIndex;
 use brokk_bifrost_core::analyzer::usages::common::same_node;
 use brokk_bifrost_core::analyzer::usages::inverted_edges::ClassRangeIndex;
 use brokk_bifrost_core::analyzer::usages::local_inference::{
-    LocalInferenceConfig, LocalInferenceEngine,
+    LocalInferenceConfig, LocalInferenceEngine, SymbolResolution,
 };
 use brokk_bifrost_core::analyzer::usages::model::UsageHit;
 use brokk_bifrost_core::analyzer::{CodeUnit, ProjectFile, Range};
@@ -5793,7 +5795,11 @@ fn maybe_record_constructor_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
                 }
             }
         }
-        push_hit(node, ctx);
+        match constructor_overload_selection(node, ctx) {
+            ConstructorOverloadSelection::Target => push_hit(node, ctx),
+            ConstructorOverloadSelection::Ambiguous => push_unproven_hit(node, ctx),
+            ConstructorOverloadSelection::OtherOverload => {}
+        }
         return;
     }
     if node.kind() == "declaration" {
@@ -5804,7 +5810,11 @@ fn maybe_record_constructor_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
                 .callable_arity_at(node.start_byte())
                 .is_none_or(|expected| expected.accepts(declaration_constructor_arity(node, ctx)))
         {
-            push_hit(node, ctx);
+            match constructor_overload_selection(node, ctx) {
+                ConstructorOverloadSelection::Target => push_hit(node, ctx),
+                ConstructorOverloadSelection::Ambiguous => push_unproven_hit(node, ctx),
+                ConstructorOverloadSelection::OtherOverload => {}
+            }
         }
         return;
     }
@@ -5830,6 +5840,14 @@ fn maybe_record_constructor_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
                 return;
             }
         }
+    }
+    match constructor_overload_selection(node, ctx) {
+        ConstructorOverloadSelection::Target => {}
+        ConstructorOverloadSelection::Ambiguous => {
+            push_unproven_hit(hit_node, ctx);
+            return;
+        }
+        ConstructorOverloadSelection::OtherOverload => return,
     }
     let structured_resolution = resolve_type_node_lexically_for_target(
         type_node,
@@ -5860,6 +5878,107 @@ fn maybe_record_constructor_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         push_hit(hit_node, ctx);
     } else {
         push_unproven_hit(hit_node, ctx);
+    }
+}
+
+/// What the overload filter says about a construction site relative to the
+/// constructor being scanned.
+enum ConstructorOverloadSelection {
+    /// The arguments leave the scan target as the only viable constructor, or
+    /// the filter has no evidence to apply here. Either way nothing about the
+    /// arguments argues against the site, so the rest of the scan decides it.
+    Target,
+    /// More than one of the owner's constructors stays viable, so the site
+    /// cannot be proven to belong to the target.
+    Ambiguous,
+    /// The arguments select a sibling constructor and not the target.
+    OtherOverload,
+}
+
+/// Which of the owner's constructors the arguments at a construction site
+/// select, for every shape `maybe_record_constructor_hit` accepts: `T(args)`,
+/// `T{args}`, `new T(args)`, the member initializer `: field(args)`, and the
+/// `T var(args)` declaration.
+///
+/// This is the inverse reading of the forward direction's overload choice. The
+/// candidate set is the owner's arity-compatible constructors, the arguments are
+/// typed by the same `expression_arg_type` the method and free-function scan
+/// paths use, and `cpp_filter_candidates_by_args_with_parameter_types` applies
+/// the same exact-then-conversion ranking (#2894). Selecting a constructor by
+/// arity alone made a scan of one overload claim every same-arity sibling's call
+/// (#2908).
+fn constructor_overload_selection(
+    node: Node<'_>,
+    ctx: &ScanCtx<'_>,
+) -> ConstructorOverloadSelection {
+    let Some(owner) = ctx.spec.owner.as_ref() else {
+        return ConstructorOverloadSelection::Target;
+    };
+    if ctx.spec.param_types.is_none() {
+        return ConstructorOverloadSelection::Target;
+    }
+    // A `T var(args)` declaration keeps its arguments under the declarator or the
+    // init declarator's value; every other shape spells an argument list that the
+    // shared call helpers find, and its argument count needs the macro-aware
+    // arity evidence.
+    let (arity, arg_types) = if node.kind() == "declaration" {
+        match declaration_constructor_initializer(node) {
+            DeclarationConstructorInitializer::Arguments(arguments) => (
+                argument_children(arguments).count(),
+                argument_list_types(arguments, ctx),
+            ),
+            DeclarationConstructorInitializer::Expression(value) => {
+                (1, vec![expression_arg_type(value, ctx)])
+            }
+            DeclarationConstructorInitializer::Empty => (0, Vec::new()),
+        }
+    } else {
+        let Some(arity) = ctx
+            .visibility
+            .call_arity_evidence(ctx.file, node, ctx.source)
+            .exact()
+        else {
+            return ConstructorOverloadSelection::Target;
+        };
+        (arity, call_argument_types(node, ctx))
+    };
+    let mut candidates = ctx
+        .visibility
+        .visible_members_for_owner_name(ctx.file, owner, &ctx.spec.member_name)
+        .into_iter()
+        .filter(|unit| unit.is_function())
+        .cloned()
+        .collect::<Vec<_>>();
+    candidates.retain(|unit| cpp_callable_arity(&ctx.analyzer, unit).accepts(arity));
+    if !candidates
+        .iter()
+        .any(|candidate| same_visible_symbol(candidate, &ctx.spec.target))
+    {
+        return ConstructorOverloadSelection::Target;
+    }
+    let filtered = cpp_filter_candidates_by_args_with_parameter_types(
+        candidates,
+        &arg_types,
+        &|candidate| cpp_callable_parameter_types(&ctx.analyzer, candidate),
+        &|name| ctx.visibility.resolve_type(ctx.file, name),
+        &|left, right| same_visible_symbol(left, right),
+    );
+    if !filtered
+        .iter()
+        .any(|candidate| same_visible_symbol(candidate, &ctx.spec.target))
+    {
+        return ConstructorOverloadSelection::OtherOverload;
+    }
+    // A header declaration and its out-of-line body are one constructor even
+    // when their persisted signature strings spell a parameter differently, so
+    // `same_logical_callable` decides what counts as a surviving sibling (#2010).
+    if filtered.iter().all(|candidate| {
+        ctx.visibility
+            .same_logical_callable(&ctx.analyzer, candidate, &ctx.spec.target)
+    }) {
+        ConstructorOverloadSelection::Target
+    } else {
+        ConstructorOverloadSelection::Ambiguous
     }
 }
 
@@ -6174,17 +6293,21 @@ fn free_function_call_may_target(call: Node<'_>, text: &str, ctx: &ScanCtx<'_>) 
         .any(|candidate| same_visible_symbol(candidate, &ctx.spec.target))
 }
 
-fn call_argument_types(call: Node<'_>, ctx: &ScanCtx<'_>) -> Vec<Option<CppArgType>> {
-    let Some(args) = call
-        .child_by_field_name("arguments")
-        .or_else(|| call.child_by_field_name("parameters"))
-        .or_else(|| call.child_by_field_name("value"))
-    else {
-        return Vec::new();
-    };
-    argument_children(args)
+/// The types of the arguments an `argument_list` or `initializer_list` supplies,
+/// in order.
+///
+/// A `None` entry is an argument the index cannot type; one of them makes
+/// `cpp_filter_candidates_by_args` keep every candidate rather than guess.
+fn argument_list_types(arguments: Node<'_>, ctx: &ScanCtx<'_>) -> Vec<Option<CppArgType>> {
+    argument_children(arguments)
         .map(|arg| expression_arg_type(arg, ctx))
         .collect()
+}
+
+fn call_argument_types(call: Node<'_>, ctx: &ScanCtx<'_>) -> Vec<Option<CppArgType>> {
+    call_arguments_node(call)
+        .map(|arguments| argument_list_types(arguments, ctx))
+        .unwrap_or_default()
 }
 
 fn expression_arg_type(node: Node<'_>, ctx: &ScanCtx<'_>) -> Option<CppArgType> {
@@ -6194,15 +6317,38 @@ fn expression_arg_type(node: Node<'_>, ctx: &ScanCtx<'_>) -> Option<CppArgType> 
             literal.unit = ctx.visibility.resolve_type(ctx.file, &literal.name);
             literal
         }),
-        "identifier" => ctx
-            .bindings
-            .resolve_symbol(node_text(node, ctx.source))
-            .as_precise()
-            .and_then(|bindings| bindings.iter().find_map(CppScanBinding::as_arg_type)),
+        "identifier" => identifier_arg_type(node, node_text(node, ctx.source), ctx),
+        // `T v(x);` is the vexing parse: the grammar reads it as a function
+        // declaration whose one parameter is `x` spelled as a type. A parameter
+        // declaration that is nothing but a type identifier is that reading, and
+        // the identifier it holds is the constructor argument.
+        "parameter_declaration" => {
+            let declared = node.child_by_field_name("type")?;
+            (node.child_by_field_name("declarator").is_none()
+                && declared.kind() == "type_identifier")
+                .then(|| identifier_arg_type(declared, node_text(declared, ctx.source), ctx))
+                .flatten()
+        }
+        // `this->m_params` names the same data member as the bare `m_params`.
+        "field_expression" => {
+            let receiver = node
+                .child_by_field_name("argument")
+                .or_else(|| node.named_child(0))?;
+            let field = node.child_by_field_name("field")?;
+            (receiver.kind() == "this")
+                .then(|| enclosing_member_field_arg_type(node, node_text(field, ctx.source), ctx))
+                .flatten()
+        }
         "parenthesized_expression" => node
             .child_by_field_name("argument")
             .or_else(|| node.named_child(0))
             .and_then(|inner| expression_arg_type(inner, ctx)),
+        // `std::move(t)` and `std::forward<T>(t)` have the type of what they
+        // forward (#2552).
+        "call_expression" => {
+            let forwarded = cpp_forwarding_call_argument(node, ctx.source)?;
+            expression_arg_type(forwarded, ctx)
+        }
         "pointer_expression" => {
             let delta = match node.child_by_field_name("operator")?.kind() {
                 "&" => 1,
@@ -6218,6 +6364,59 @@ fn expression_arg_type(node: Node<'_>, ctx: &ScanCtx<'_>) -> Option<CppArgType> 
         }
         _ => None,
     }
+}
+
+/// The type of a bare value name used as a call argument: the local or
+/// parameter binding when one is in scope, otherwise the enclosing class's data
+/// member of that name.
+///
+/// Unqualified lookup reaches a local before a data member, so a local of the
+/// same name ends the search rather than falling through to the field. This
+/// mirrors `cpp_identifier_value_type` on the forward side, which is what keeps
+/// the two directions agreeing about which overload a member-field argument
+/// selects (#2894).
+fn identifier_arg_type(node: Node<'_>, name: &str, ctx: &ScanCtx<'_>) -> Option<CppArgType> {
+    match ctx.bindings.resolve_symbol(name) {
+        SymbolResolution::Precise(bindings) => {
+            bindings.iter().find_map(CppScanBinding::as_arg_type)
+        }
+        SymbolResolution::Ambiguous => None,
+        SymbolResolution::Unknown => (!ctx.local_shadows.is_shadowed(name))
+            .then(|| enclosing_member_field_arg_type(node, name, ctx))
+            .flatten(),
+    }
+}
+
+/// The declared type of `name` read as a data member of the class that lexically
+/// owns `node`.
+///
+/// `None` when there is no enclosing class, when the name is not one data member
+/// of it, or when the member's declared type does not resolve. An unknown
+/// argument type makes the overload filter keep every candidate, which is the
+/// honest answer for a field the index cannot type.
+fn enclosing_member_field_arg_type(
+    node: Node<'_>,
+    name: &str,
+    ctx: &ScanCtx<'_>,
+) -> Option<CppArgType> {
+    let owner = enclosing_context(node, ctx).owner?;
+    let fields = ctx
+        .visibility
+        .visible_members_for_owner_name(ctx.file, &owner, name)
+        .into_iter()
+        .filter(|unit| unit.is_field())
+        .collect::<Vec<_>>();
+    let [field] = fields.as_slice() else {
+        return None;
+    };
+    let (type_name, unit, indirection) =
+        field_declared_type_binding(&ctx.analyzer, ctx.visibility, ctx.file, field)?;
+    Some(CppArgType {
+        name: type_name,
+        unit,
+        indirection,
+        pointee_const: false,
+    })
 }
 
 /// Record a *non-call* reference to a free function used as a value: `&foo`,
@@ -6354,6 +6553,10 @@ fn maybe_record_free_function_definition_hit(node: Node<'_>, ctx: &mut ScanCtx<'
 }
 
 fn maybe_record_method_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    if node.kind() == "preproc_arg" {
+        maybe_record_function_macro_replacement_method_hits(node, ctx);
+        return;
+    }
     if node.kind() == "using_declaration" {
         maybe_record_using_callable_hit(node, ctx);
         return;
@@ -6520,6 +6723,268 @@ fn maybe_record_method_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         }
         MethodReceiverTargetResolution::Missing => {}
     }
+}
+
+/// Report member calls written inside a function-like macro's replacement.
+///
+/// Tree-sitter keeps the whole replacement of `#define NAME(a) ...` as one
+/// opaque `preproc_arg`, so the ordinary member-call path never sees the calls
+/// it contains (#2549). The resolver's shared sentinel parse recovers them as
+/// structure, and every hit is reported at the bytes the member spells inside
+/// that token.
+fn maybe_record_function_macro_replacement_method_hits(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    let Some(definition) = node.parent().filter(|parent| {
+        parent.kind() == "preproc_function_def"
+            && parent
+                .child_by_field_name("value")
+                .is_some_and(|value| same_node(value, node))
+    }) else {
+        return;
+    };
+    let Some(body) = ctx
+        .visibility
+        .function_macro_replacement_body(ctx.file, definition, ctx.source)
+    else {
+        return;
+    };
+    let Some(statements) = body.statements() else {
+        return;
+    };
+    // Collect the candidate calls before typing anything: a replacement that
+    // never names the queried member must not pay for its declarations.
+    let mut candidates = Vec::new();
+    let mut stack = vec![statements];
+    while let Some(current) = stack.pop() {
+        for index in (0..current.named_child_count()).rev() {
+            if let Some(child) = current.named_child(index) {
+                stack.push(child);
+            }
+        }
+        if current.kind() != "call_expression" {
+            continue;
+        }
+        let Some(function) = current
+            .child_by_field_name("function")
+            .filter(|function| function.kind() == "field_expression")
+        else {
+            continue;
+        };
+        let Some(member) = function.child_by_field_name("field") else {
+            continue;
+        };
+        if !name_matches_callable(node_text(member, &body.source), &ctx.spec.member_name) {
+            continue;
+        }
+        let Some(receiver) = function
+            .child_by_field_name("argument")
+            .or_else(|| function.child_by_field_name("object"))
+            .or_else(|| function.named_child(0))
+        else {
+            continue;
+        };
+        candidates.push((current, member, receiver));
+    }
+    if candidates.is_empty() {
+        return;
+    }
+    let locals = macro_replacement_local_receivers(statements, &body, ctx);
+    for (current, member, receiver) in candidates {
+        if *ctx.limit_exceeded {
+            return;
+        }
+        let range = body.file_range(member, node.start_byte());
+        debug_assert_eq!(
+            ctx.source.get(range.clone()),
+            Some(node_text(member, &body.source)),
+            "macro replacement member range must spell the member name"
+        );
+        *ctx.raw_match_count += 1;
+        // The replacement's own macro environment is the one at the definition,
+        // not at the sentinel offsets the recovered call carries.
+        let arity_evidence = ctx.visibility.call_arity_evidence_at(
+            ctx.file,
+            current,
+            &body.source,
+            definition.start_byte(),
+        );
+        if let Some(expected) = ctx.spec.callable_arity_at(range.start) {
+            match arity_evidence.accepts(expected) {
+                Some(true) => {}
+                Some(false) => continue,
+                None => {
+                    push_unproven_reference_hit_range(node, range.start, range.end, ctx);
+                    continue;
+                }
+            }
+        }
+        let declaring_owner = match macro_replacement_receiver(receiver, &body, &locals, node, ctx)
+        {
+            MacroReplacementReceiver::Parameter => {
+                if target_member_is_visible_candidate(ctx) {
+                    push_unproven_reference_hit_range(node, range.start, range.end, ctx);
+                }
+                continue;
+            }
+            MacroReplacementReceiver::Unknown => continue,
+            MacroReplacementReceiver::Units(units) => {
+                declaring_owner_from_receiver_units(units, range.start, arity_evidence.exact(), ctx)
+            }
+        };
+        match declaring_owner_target_resolution(declaring_owner, range.start, ctx) {
+            MethodReceiverTargetResolution::Target => {
+                push_reference_hit_range(node, range.start, range.end, ctx);
+            }
+            MethodReceiverTargetResolution::Missing => {
+                push_unproven_reference_hit_range(node, range.start, range.end, ctx);
+            }
+            MethodReceiverTargetResolution::NonTarget
+            | MethodReceiverTargetResolution::Ambiguous => {}
+        }
+    }
+}
+
+enum MacroReplacementReceiver {
+    /// The receiver is one of the macro's parameters. Its type is supplied by
+    /// each invocation, so a member call on it can never be proven here.
+    Parameter,
+    /// The receiver's declared type resolved to these units.
+    Units(Vec<CodeUnit>),
+    /// The receiver has a shape this path does not type.
+    Unknown,
+}
+
+fn macro_replacement_receiver(
+    receiver: Node<'_>,
+    body: &ParsedReplacementBody,
+    locals: &HashMap<String, Option<CodeUnit>>,
+    anchor: Node<'_>,
+    ctx: &ScanCtx<'_>,
+) -> MacroReplacementReceiver {
+    let mut current = receiver;
+    while matches!(
+        current.kind(),
+        "parenthesized_expression" | "pointer_expression"
+    ) {
+        let Some(inner) = current
+            .child_by_field_name("argument")
+            .or_else(|| current.named_child(0))
+        else {
+            return MacroReplacementReceiver::Unknown;
+        };
+        current = inner;
+    }
+    if !matches!(current.kind(), "identifier" | "field_identifier") {
+        return MacroReplacementReceiver::Unknown;
+    }
+    let name = node_text(current, &body.source);
+    if body.parameters.iter().any(|parameter| parameter == name) {
+        return MacroReplacementReceiver::Parameter;
+    }
+    if let Some(local) = locals.get(name) {
+        return match local {
+            Some(unit) => MacroReplacementReceiver::Units(vec![unit.clone()]),
+            None => MacroReplacementReceiver::Unknown,
+        };
+    }
+    // Neither a parameter nor a replacement-local: an ordinary name the macro
+    // definition site sees, resolved exactly as the ordinary receiver path
+    // resolves a bare identifier.
+    let global_fields = ctx
+        .visibility
+        .visible_identifier_candidates(ctx.file, name)
+        .filter(|unit| has_persisted_global_field_identity(unit) && unit.identifier() == name)
+        .collect::<Vec<_>>();
+    if !global_fields.is_empty() {
+        return MacroReplacementReceiver::Units(receiver_units_from_declared_fields(
+            global_fields,
+            anchor,
+            ctx,
+        ));
+    }
+    MacroReplacementReceiver::Units(
+        ctx.visibility
+            .resolve_type(ctx.file, name)
+            .into_iter()
+            .collect(),
+    )
+}
+
+/// Type the locals a macro replacement declares, keyed by declared name.
+///
+/// `Catch::AssertionHandler h(expr); h.handleExpr(expr);` is the shape this
+/// serves: the receiver's type is stated inside the replacement itself. A name
+/// whose declared type does not resolve is kept with no unit, so a call on it
+/// stays silent instead of falling through to file-scope name lookup.
+fn macro_replacement_local_receivers(
+    statements: Node<'_>,
+    body: &ParsedReplacementBody,
+    ctx: &ScanCtx<'_>,
+) -> HashMap<String, Option<CodeUnit>> {
+    let mut locals = HashMap::default();
+    let mut stack = vec![statements];
+    while let Some(current) = stack.pop() {
+        for index in (0..current.named_child_count()).rev() {
+            if let Some(child) = current.named_child(index) {
+                stack.push(child);
+            }
+        }
+        if current.kind() != "declaration" {
+            continue;
+        }
+        let Some(type_node) = current
+            .child_by_field_name("type")
+            .or_else(|| first_type_child(current))
+        else {
+            continue;
+        };
+        let unit = macro_replacement_declared_unit(type_node, body, ctx);
+        let mut cursor = current.walk();
+        for child in current.named_children(&mut cursor) {
+            let declarator = if child.kind() == "init_declarator" {
+                child.child_by_field_name("declarator")
+            } else {
+                is_declarator_node(child).then_some(child)
+            };
+            let Some(name) =
+                declarator.and_then(|declarator| extract_variable_name(declarator, &body.source))
+            else {
+                continue;
+            };
+            locals.insert(name, unit.clone());
+        }
+    }
+    locals
+}
+
+fn macro_replacement_declared_unit(
+    type_node: Node<'_>,
+    body: &ParsedReplacementBody,
+    ctx: &ScanCtx<'_>,
+) -> Option<CodeUnit> {
+    let name = normalize_cpp_type_name(node_text(type_node, &body.source));
+    let unit = match ctx
+        .visibility
+        .resolve_type_node_result(ctx.file, type_node, &body.source)
+    {
+        Ok(Some(unit)) => Some(unit),
+        Ok(None) => ctx
+            .visibility
+            .canonical_type_for_reference(ctx.file, &name)
+            .or_else(|| ctx.visibility.resolve_type(ctx.file, &name)),
+        Err(_) => None,
+    }?;
+    canonical_receiver_unit(&unit, ctx)
+}
+
+/// Whether the queried member is a candidate this file can see.
+///
+/// A macro parameter receiver has no type at the definition, so a member call
+/// on it is at most unproven. Requiring the target to be visible here keeps a
+/// same-named member of an unrelated translation unit out of the result.
+fn target_member_is_visible_candidate(ctx: &ScanCtx<'_>) -> bool {
+    ctx.visibility
+        .visible_identifier_candidates(ctx.file, &ctx.spec.member_name)
+        .any(|candidate| same_visible_symbol(candidate, &ctx.spec.target))
 }
 
 fn maybe_record_recovered_relational_template_method_hit(
@@ -6991,6 +7456,25 @@ fn first_descendant_of_kind<'tree>(node: Node<'tree>, kind: &str) -> Option<Node
     None
 }
 
+/// Whether a name leaf the field scans reached sits in a value position.
+///
+/// Every kind those scans admit already names a value except `type_identifier`.
+/// tree-sitter spells a non-type template argument with type syntax, so the
+/// constant `N` in `std::array<W, N>` is a `type_identifier` exactly like the
+/// type argument `W` beside it ([`is_type_shaped_template_argument_name`]).
+/// Admit that leaf only where no visible type explains the spelling, which is
+/// the order forward navigation applies before it reads the leaf in the value
+/// namespace (#2556). Every other `type_identifier` is a type reference and
+/// belongs to the type scan.
+fn scan_leaf_is_value_position(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
+    node.kind() != "type_identifier"
+        || (is_type_shaped_template_argument_name(node)
+            && ctx
+                .visibility
+                .resolve_type(ctx.file, node_text(node, ctx.source))
+                .is_none())
+}
+
 fn maybe_record_global_field_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     if matches!(node.kind(), "identifier" | "field_identifier")
         && designated_initializer_owner(ctx.visibility, ctx.file, ctx.source, node).is_some()
@@ -6999,8 +7483,9 @@ fn maybe_record_global_field_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     }
     if !matches!(
         node.kind(),
-        "identifier" | "field_identifier" | "qualified_identifier"
+        "identifier" | "field_identifier" | "qualified_identifier" | "type_identifier"
     ) || !name_matches_terminal(node_text(node, ctx.source), &ctx.spec.member_name)
+        || !scan_leaf_is_value_position(node, ctx)
         || is_declaration_name(node)
         || is_member_field_own_declarator(node, ctx)
         || is_selected_field_expression_member_descendant(node)
@@ -7029,9 +7514,20 @@ fn is_selected_field_expression_member_descendant(mut node: Node<'_>) -> bool {
             if let Some(field) = parent.child_by_field_name("field")
                 && node_is_within(field, candidate)
             {
-                let selected_name = match field.kind() {
-                    "template_method" => field.child_by_field_name("name").unwrap_or(field),
+                // The `template` disambiguator in `receiver.template f<Arg>()`
+                // wraps the selected member in a `dependent_name` whose single
+                // named child is the `template_*` node the plain spelling puts
+                // directly under `field`. Unwrap it so both spellings reach the
+                // same name/arguments split (#2196).
+                let selected = match field.kind() {
+                    "dependent_name" => field.named_child(0).unwrap_or(field),
                     _ => field,
+                };
+                let selected_name = match selected.kind() {
+                    "template_method" | "template_function" | "template_type" => {
+                        selected.child_by_field_name("name").unwrap_or(selected)
+                    }
+                    _ => selected,
                 };
                 if node_is_within(selected_name, candidate) {
                     return true;
@@ -7220,9 +7716,14 @@ fn maybe_record_member_field_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
                 .is_some_and(|terminal| node_text(terminal, ctx.source) == ctx.spec.member_name);
     if !matches!(
         node.kind(),
-        "identifier" | "field_identifier" | "qualified_identifier" | "scoped_identifier"
+        "identifier"
+            | "field_identifier"
+            | "qualified_identifier"
+            | "scoped_identifier"
+            | "type_identifier"
     ) || (!name_matches_terminal(node_text(node, ctx.source), &ctx.spec.member_name)
         && !qualified_member_name_matches)
+        || !scan_leaf_is_value_position(node, ctx)
         || is_declaration_name(node)
         || is_member_field_own_declarator(node, ctx)
         || is_selected_field_expression_member_descendant(node)
@@ -7385,33 +7886,41 @@ fn namespace_value_shadows(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
     )
 }
 
+/// Whether `node` is a component of an enclosing qualified identifier's own
+/// `scope`/`name` path, so the outer `qualified_identifier` is the single
+/// reference surfaced for it.
+///
+/// A qualified identifier owns only that path. Everything else beneath it is an
+/// independent reference that its own target scanner must resolve:
+///
+/// - `Owner::Template<argument>` holds each template argument outside the path.
+/// - Error recovery can hang a complete member initializer off an `ERROR` child
+///   of a synthetic qualified identifier, where no structured path exists.
+/// - The grammar accepts a `pointer_type_declarator` as a qualified
+///   identifier's `name`, so `EXPORT_MACRO Result *fn(unsigned int len = kMax);`
+///   folds a whole parameter list under one `qualified_identifier`. Parameter
+///   default values there are ordinary value expressions (#2548).
+///
+/// Follow the structured `scope`/`name` links rather than every ancestor, which
+/// covers all three cases with one rule.
 fn is_nested_in_qualified_identifier(node: Node<'_>) -> bool {
     if node.kind() == "qualified_identifier" {
         return false;
     }
-    let mut current = node.parent();
-    while let Some(parent) = current {
-        // A malformed declaration can place a complete member initializer
-        // inside an ERROR child of a synthetic qualified_identifier.  The
-        // qualified-identifier filter is correct for a well-formed `A::b`
-        // path, but not for that recovered subtree: there is no structured
-        // scope/name path to collapse, and the indexed enclosing member is
-        // the authoritative owner.  Stop at the recovery boundary so these
-        // identifiers reach the normal member-owner resolver.
-        if parent.kind() == "ERROR" {
-            return false;
-        }
-        // A qualified template owns only its scope/name path. References in
-        // `Owner::Template<argument>` are independent expressions or types,
-        // not nested components of `Owner::Template`; let their own target
-        // scanners resolve them instead of suppressing them as duplicates.
-        if parent.kind() == "template_argument_list" {
+    let mut current = node;
+    while let Some(parent) = current.parent() {
+        let on_name_path = ["scope", "name"].into_iter().any(|field| {
+            parent
+                .child_by_field_name(field)
+                .is_some_and(|component| same_node(component, current))
+        });
+        if !on_name_path {
             return false;
         }
         if parent.kind() == "qualified_identifier" {
             return true;
         }
-        current = parent.parent();
+        current = parent;
     }
     false
 }
@@ -7476,14 +7985,35 @@ fn receiver_type_units_with_budget(
                             .filter(CodeUnit::is_class)
                     });
                 if let Some(owner) = owner {
-                    let implicit_fields = ctx
-                        .visibility
-                        .visible_members_for_owner_name(ctx.file, &owner, name)
-                        .into_iter()
-                        .filter(|unit| unit.is_field())
-                        .collect::<Vec<_>>();
-                    if !implicit_fields.is_empty() {
-                        break receiver_units_from_declared_fields(implicit_fields, current, ctx);
+                    // The enclosing class is only the search root: an implicit
+                    // member-field receiver can be declared on any base, so the
+                    // declaring owner comes from the same hierarchy walk the
+                    // member chain below uses, not from an exact-parent match.
+                    let declaring_owner = match resolve_declaring_member_owner(
+                        &ctx.analyzer,
+                        ctx.visibility,
+                        ctx.file,
+                        &owner,
+                        name,
+                    ) {
+                        EnclosingMemberOwnerResolution::Owner(owner) => Some(owner),
+                        EnclosingMemberOwnerResolution::Missing => None,
+                        EnclosingMemberOwnerResolution::Ambiguous => return Vec::new(),
+                    };
+                    if let Some(declaring_owner) = declaring_owner {
+                        let implicit_fields = ctx
+                            .visibility
+                            .visible_members_for_owner_name(ctx.file, &declaring_owner, name)
+                            .into_iter()
+                            .filter(|unit| unit.is_field())
+                            .collect::<Vec<_>>();
+                        if !implicit_fields.is_empty() {
+                            break receiver_units_from_declared_fields(
+                                implicit_fields,
+                                current,
+                                ctx,
+                            );
+                        }
                     }
                 }
                 let global_fields = ctx
@@ -8081,11 +8611,30 @@ fn declaring_owner_for_explicit_receiver(
     if receiver_is_self_like(receiver, ctx.analyzer.reference_uses_c_semantics(ctx.file)) {
         return EnclosingMemberOwnerResolution::Missing;
     }
-    let receiver_units = receiver_type_units(receiver, ctx.source, ctx);
+    declaring_owner_from_receiver_units(
+        receiver_type_units(receiver, ctx.source, ctx),
+        receiver.start_byte(),
+        call_arity,
+        ctx,
+    )
+}
+
+/// The owner that declares the queried member for a receiver already typed.
+///
+/// `reference_byte` is the reference's position in the scanned file, which
+/// decides which declarations are visible there. A receiver recovered from a
+/// macro replacement is typed against the sentinel parse but still reported at
+/// its bytes in the defining file, so the two arrive separately.
+fn declaring_owner_from_receiver_units(
+    receiver_units: Vec<CodeUnit>,
+    reference_byte: usize,
+    call_arity: Option<usize>,
+    ctx: &ScanCtx<'_>,
+) -> EnclosingMemberOwnerResolution {
     let mut declaring_owner = None;
     for receiver_owner in receiver_units {
         if ctx.spec.owner.as_ref().is_some_and(|target_owner| {
-            receiver_owner_matches_target(&receiver_owner, target_owner, receiver.start_byte(), ctx)
+            receiver_owner_matches_target(&receiver_owner, target_owner, reference_byte, ctx)
         }) {
             if declaring_owner
                 .as_ref()
@@ -8159,22 +8708,13 @@ fn method_receiver_target_resolution(
     declaring_owner: EnclosingMemberOwnerResolution,
     ctx: &ScanCtx<'_>,
 ) -> MethodReceiverTargetResolution {
-    let Some(target_owner) = ctx.spec.owner.as_ref() else {
-        return MethodReceiverTargetResolution::Missing;
-    };
     match declaring_owner {
-        EnclosingMemberOwnerResolution::Owner(owner)
-            if receiver_owner_matches_target(&owner, target_owner, node.start_byte(), ctx) =>
-        {
-            MethodReceiverTargetResolution::Target
+        EnclosingMemberOwnerResolution::Owner(_) | EnclosingMemberOwnerResolution::Ambiguous => {
+            declaring_owner_target_resolution(declaring_owner, node.start_byte(), ctx)
         }
-        EnclosingMemberOwnerResolution::Owner(owner)
-            if receiver_owner_is_known_non_target(&owner, target_owner, node.start_byte(), ctx) =>
-        {
-            MethodReceiverTargetResolution::NonTarget
+        EnclosingMemberOwnerResolution::Missing if ctx.spec.owner.is_none() => {
+            MethodReceiverTargetResolution::Missing
         }
-        EnclosingMemberOwnerResolution::Owner(_) => MethodReceiverTargetResolution::Missing,
-        EnclosingMemberOwnerResolution::Ambiguous => MethodReceiverTargetResolution::Ambiguous,
         EnclosingMemberOwnerResolution::Missing if receiver_matches_target(node, ctx) => {
             MethodReceiverTargetResolution::Target
         }
@@ -8182,6 +8722,38 @@ fn method_receiver_target_resolution(
             MethodReceiverTargetResolution::NonTarget
         }
         EnclosingMemberOwnerResolution::Missing => MethodReceiverTargetResolution::Missing,
+    }
+}
+
+/// Decide the queried member against a receiver's declaring owner alone.
+///
+/// This is the part of receiver typing that needs nothing but the owner and
+/// the reference's position, so a member call recovered from a macro
+/// replacement reaches the same verdict as ordinary code even though its
+/// syntax lives in a separate sentinel parse.
+fn declaring_owner_target_resolution(
+    declaring_owner: EnclosingMemberOwnerResolution,
+    reference_byte: usize,
+    ctx: &ScanCtx<'_>,
+) -> MethodReceiverTargetResolution {
+    let Some(target_owner) = ctx.spec.owner.as_ref() else {
+        return MethodReceiverTargetResolution::Missing;
+    };
+    match declaring_owner {
+        EnclosingMemberOwnerResolution::Owner(owner)
+            if receiver_owner_matches_target(&owner, target_owner, reference_byte, ctx) =>
+        {
+            MethodReceiverTargetResolution::Target
+        }
+        EnclosingMemberOwnerResolution::Owner(owner)
+            if receiver_owner_is_known_non_target(&owner, target_owner, reference_byte, ctx) =>
+        {
+            MethodReceiverTargetResolution::NonTarget
+        }
+        EnclosingMemberOwnerResolution::Owner(_) | EnclosingMemberOwnerResolution::Missing => {
+            MethodReceiverTargetResolution::Missing
+        }
+        EnclosingMemberOwnerResolution::Ambiguous => MethodReceiverTargetResolution::Ambiguous,
     }
 }
 

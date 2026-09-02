@@ -91,6 +91,7 @@ mod tests {
     /// associated function `Shared::helper` is the false positive the
     /// verification exists to reject: it carries the right short name and no
     /// module-scope identity.
+    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
     #[test]
     fn identities_named_covers_every_declaring_file_for_a_shared_name() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -176,6 +177,7 @@ mod tests {
                 .join(", ")
         )
     }
+    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
     #[test]
     fn dbg_visibility_probe() {
         let temp = tempfile::tempdir().expect("tempdir");

@@ -23,7 +23,8 @@
 use crate::kotlin::syntax::{
     kotlin_binding_type_components, kotlin_binding_type_text,
     kotlin_declared_return_type_components, kotlin_declared_return_type_text,
-    kotlin_extension_receiver_components, kotlin_extension_receiver_text,
+    kotlin_declared_type_parameter_names, kotlin_extension_receiver_components,
+    kotlin_extension_receiver_text,
 };
 use brokk_bifrost_core::analyzer::common::{
     collapse_whitespace, node_source_text as node_text,
@@ -225,6 +226,7 @@ impl<'a> KotlinVisitor<'a> {
             "secondary_constructor" => self.visit_secondary_constructor(node, parent),
             "type_alias" => self.visit_type_alias(node, parent),
             "enum_entry" => self.visit_enum_entry(node, parent, stack),
+            "infix_expression" => self.visit_misparsed_object(node, parent, stack),
             "ERROR" => stack.push(KotlinWork {
                 node,
                 parent: parent.cloned(),
@@ -273,8 +275,17 @@ impl<'a> KotlinVisitor<'a> {
             return;
         }
         let code_unit = self.declare(CodeUnitType::Class, SegmentKind::Type, name, node, parent);
-        self.parsed
-            .add_signature(code_unit.clone(), kotlin_class_signature(node, self.source));
+        // The declaration's own parameter list is what canonical identity reads
+        // as generic arity, so a class that writes none records a zero rather
+        // than leaving the arity unread (#1651).
+        self.parsed.add_signature_with_metadata(
+            code_unit.clone(),
+            SignatureMetadata::new(kotlin_class_signature(node, self.source), Vec::new())
+                .with_recorded_type_parameters(kotlin_declared_type_parameter_names(
+                    node,
+                    self.source,
+                )),
+        );
         self.record_supertypes(&code_unit, node);
 
         if let Some(primary) = first_named_child(node, "primary_constructor") {
@@ -315,6 +326,11 @@ impl<'a> KotlinVisitor<'a> {
         // renders as written. The `Companion` identity default above is a
         // name-resolution rule and must not leak into rendered source text.
         let signature = kotlin_class_signature(node, self.source);
+        // An `object` writes no type parameters, so this is always a recorded
+        // zero; reading the list rather than assuming it keeps one rule for
+        // every Kotlin type declaration.
+        let metadata = SignatureMetadata::new(signature, Vec::new())
+            .with_recorded_type_parameters(kotlin_declared_type_parameter_names(node, self.source));
         if companion {
             // Companion-ness is not derivable from the indexed identity: a
             // companion and an ordinary nested `object` are both nested classes,
@@ -325,16 +341,76 @@ impl<'a> KotlinVisitor<'a> {
             // owner.
             self.parsed.add_signature_with_metadata(
                 code_unit.clone(),
-                SignatureMetadata::new(signature, Vec::new()).with_companion_object(true),
+                metadata.with_companion_object(true),
             );
         } else {
-            self.parsed.add_signature(code_unit.clone(), signature);
+            self.parsed
+                .add_signature_with_metadata(code_unit.clone(), metadata);
         }
         self.record_supertypes(&code_unit, node);
 
         if let Some(body) = first_named_child(node, "class_body") {
             stack.push(KotlinWork {
                 node: body,
+                parent: Some(code_unit),
+            });
+        }
+    }
+
+    /// Recover `object Name { members }` written with the body on one line.
+    ///
+    /// The pinned grammar misparses that spelling as an infix expression: a
+    /// bare `object_literal` operand, the declared name as the infix operator,
+    /// and the body as a `lambda_literal`. The shape is unambiguous evidence
+    /// of the misparse, in scripts too: `object` with neither a body nor a
+    /// delegation is not a Kotlin expression, so a childless `object_literal`
+    /// in operand position can only be a swallowed `object_declaration`
+    /// header. Recovered here so the object and its members keep their
+    /// declared identities; the real fix belongs in the grammar
+    /// (BrokkAi/tree-sitter-kotlin).
+    fn visit_misparsed_object<'tree>(
+        &mut self,
+        node: Node<'tree>,
+        parent: Option<&CodeUnit>,
+        stack: &mut Vec<KotlinWork<'tree>>,
+    ) {
+        let children = named_children_of(node);
+        let [literal, name_node, body] = children[..] else {
+            return;
+        };
+        if literal.kind() != "object_literal"
+            || literal.named_child_count() != 0
+            || name_node.kind() != "simple_identifier"
+            || body.kind() != "lambda_literal"
+        {
+            return;
+        }
+        let name = kotlin_identifier_text(name_node, self.source);
+        if name.is_empty() {
+            return;
+        }
+
+        let code_unit = self.declare(CodeUnitType::Class, SegmentKind::Type, name, node, parent);
+        // The header slice mirrors `kotlin_class_signature`, with the
+        // misparsed `lambda_literal` standing in for the class body.
+        let header = collapse_whitespace(
+            self.source
+                .get(node.start_byte()..body.start_byte())
+                .unwrap_or_default(),
+        );
+        self.parsed.add_signature_with_metadata(
+            code_unit.clone(),
+            SignatureMetadata::new(format!("{header} {{"), Vec::new())
+                .with_recorded_type_parameters(kotlin_declared_type_parameter_names(
+                    node,
+                    self.source,
+                )),
+        );
+        // A delegated header (`object Name : Base { ... }`) parses as a real
+        // `object_declaration`, so this shape never carries supertypes.
+        if let Some(statements) = first_named_child(body, "statements") {
+            stack.push(KotlinWork {
+                node: statements,
                 parent: Some(code_unit),
             });
         }
@@ -557,6 +633,16 @@ impl<'a> KotlinVisitor<'a> {
         }
     }
 
+    /// A `typealias` declares a type, so it mints the way every other Kotlin
+    /// type declaration does: a [`CodeUnitType::Class`] carrying a
+    /// [`SegmentKind::Type`] segment, exactly what [`Self::visit_class`] and
+    /// [`Self::visit_object_like`] pass to [`Self::declare`].
+    ///
+    /// It used to mint a `Field`/`Member` unit, which is byte-for-byte what
+    /// [`Self::visit_property`] mints for a `val` of the same name in the same
+    /// owner. `declaration_id` hashes segment kinds, so
+    /// `typealias MaxVal = Int` beside `val MaxVal = 1` produced one CodeUnit
+    /// instead of two and the `val` was unreachable (#2892).
     fn visit_type_alias(&mut self, node: Node<'_>, parent: Option<&CodeUnit>) {
         let Some(name_node) = first_named_child(node, "type_identifier") else {
             return;
@@ -565,10 +651,14 @@ impl<'a> KotlinVisitor<'a> {
         if name.is_empty() {
             return;
         }
-        let code_unit = self.declare(CodeUnitType::Field, SegmentKind::Member, name, node, parent);
-        self.parsed.add_signature(
+        let code_unit = self.declare(CodeUnitType::Class, SegmentKind::Type, name, node, parent);
+        self.parsed.add_signature_with_metadata(
             code_unit.clone(),
-            collapse_whitespace(node_text(node, self.source)),
+            SignatureMetadata::new(
+                collapse_whitespace(node_text(node, self.source)),
+                Vec::new(),
+            )
+            .with_recorded_type_parameters(kotlin_declared_type_parameter_names(node, self.source)),
         );
         self.parsed.mark_type_alias(code_unit);
     }
@@ -937,6 +1027,39 @@ mod tests {
         names
     }
 
+    /// The grammar misparses a single-line `object Name { members }` as an
+    /// infix expression (a bare `object_literal`, the name, a
+    /// `lambda_literal`); the visitor recovers the declaration from that
+    /// shape. Statement-position infix expressions must stay untouched.
+    #[test]
+    fn recovers_single_line_object_declarations_from_the_infix_misparse() {
+        let source = "package api\n\nobject Registry { fun register() {} }\n";
+        let (_, parsed) = parse(source);
+        assert_eq!(
+            fq_names(&parsed),
+            vec![
+                "api.Registry".to_string(),
+                "api.Registry.register".to_string(),
+            ]
+        );
+        let registry = parsed
+            .declarations()
+            .iter()
+            .find(|unit| unit.fq_name() == "api.Registry")
+            .expect("recovered object declaration")
+            .clone();
+        assert!(registry.is_class());
+        assert_eq!(
+            parsed.signatures.get(&registry).cloned(),
+            Some(vec!["object Registry {".to_string()])
+        );
+
+        // A real infix expression in a script stays an expression: its left
+        // operand is not a childless `object_literal`.
+        let (_, script) = parse("val p = 1 to 2\n");
+        assert_eq!(fq_names(&script), vec!["p".to_string()]);
+    }
+
     #[test]
     fn extracts_principal_declarations_with_source_level_identities() {
         let source = r#"package com.example
@@ -1165,5 +1288,62 @@ println(shoutGreeting())
         assert!(names.iter().any(|name| name == "ScriptHelper.help"));
         // The trailing println statement is script code, not a declaration.
         assert!(!names.iter().any(|name| name.contains("println")));
+    }
+}
+
+#[cfg(test)]
+mod type_parameter_metadata_tests {
+    use super::*;
+    use tree_sitter::Parser;
+
+    /// A Kotlin type declaration records its own type-parameter list, so a
+    /// nongeneric class is a proven zero rather than the unread list an empty
+    /// `type_parameters` used to mean (#1651). An `object` and a `companion
+    /// object` cannot be generic, and record that as the zero it is.
+    #[test]
+    fn kotlin_type_declarations_record_their_type_parameters() {
+        let source = r#"package com.example
+
+class Foo
+class Box<T>(val value: T)
+interface Pair<K, V>
+object Registry
+typealias Rows<T> = List<T>
+
+fun <T> identity(value: T): T = value
+"#;
+        let file = ProjectFile::new(
+            std::env::temp_dir().join("kotlin-type-parameter-metadata-tests"),
+            "sample/Sample.kt",
+        );
+        let mut parser = Parser::new();
+        parser
+            .set_language(&crate::kotlin::language::LANGUAGE.into())
+            .expect("load Kotlin grammar");
+        let tree = parser.parse(source, None).expect("parse Kotlin source");
+        let parsed = parse_kotlin_file(&file, source, &tree);
+
+        let mut recorded = parsed
+            .signature_metadata
+            .iter()
+            .flat_map(|(unit, metadata)| {
+                metadata
+                    .iter()
+                    .filter(|entry| entry.type_parameters_recorded())
+                    .map(|entry| (unit.short_name().to_string(), entry.type_parameters().len()))
+            })
+            .collect::<Vec<_>>();
+        recorded.sort();
+        assert_eq!(
+            recorded,
+            vec![
+                ("Box".to_string(), 1),
+                ("Foo".to_string(), 0),
+                ("Pair".to_string(), 2),
+                ("Registry".to_string(), 0),
+                ("Rows".to_string(), 1),
+            ],
+            "a generic function's own parameters stay a callable fact, unrecorded here"
+        );
     }
 }

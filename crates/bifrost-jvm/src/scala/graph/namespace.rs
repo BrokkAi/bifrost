@@ -51,8 +51,11 @@ pub fn scala_qualified_type_root(mut node: Node<'_>) -> Node<'_> {
 /// resolver computed them to decide it could not choose, so an answer that
 /// drops them is strictly less useful than what the resolver knew. The list is
 /// empty in exactly one case: the tie was inherited from a supertype whose own
-/// NAME is ambiguous, so this level never held a declaration of the name being
-/// resolved and there is nothing about that name to report.
+/// NAME is ambiguous AND whose competing declarations the producer could not
+/// name, so this level never held a declaration of the name being resolved and
+/// there is nothing about that name to report. A tie whose declarations ARE
+/// known is decided per name instead, and reaches this outcome only when more
+/// than one of them declares that name (#2229).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ScalaTypeNamespaceResolution {
     NoMatch,
@@ -81,21 +84,68 @@ pub enum ScalaQualifiedTypeRootResolution {
     AuthoritativeMiss,
 }
 
+/// The competing declarations behind one owner's ambiguous supertype name.
+///
+/// `Named` lets a walk ask the question #2229 turns on: does this tie declare
+/// the one name being looked up? `Unnamed` is the honest answer of a producer
+/// that proved the tie from a name table and never held the declarations, so
+/// that question cannot be asked of it and the walk must fail closed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ScalaTiedSupertypes {
+    Named(Vec<CodeUnit>),
+    Unnamed,
+}
+
 /// Outcome of resolving one owner's direct supertypes to exact declarations.
 ///
 /// The two negative outcomes are not the same thing, and conflating them was
 /// the #1849/#1851 defect. `Ambiguous` means a supertype NAME has more than one
 /// indexed declaration: the workspace holds the member, it just cannot say
-/// which declaration owns it, so a walk that needs that level must fail closed.
-/// `Incomplete` means a supertype is not indexed here at all: it can never
-/// contribute a member this workspace could name, so a walk carries on over the
-/// ancestors it did resolve. Only a caller that must report why an answer is
-/// unproven needs to tell `Incomplete` from `Resolved`.
+/// which declaration owns it. `Incomplete` means a supertype is not indexed
+/// here at all: it can never contribute a member this workspace could name, so
+/// a walk carries on over the ancestors it did resolve. Only a caller that must
+/// report why an answer is unproven needs to tell `Incomplete` from `Resolved`.
+///
+/// `Ambiguous` keeps the tier whole: `resolved` holds the supertypes at that
+/// tier whose names DID single out one declaration, and `tied` holds the
+/// competing declarations of the one that did not. A tie is disqualifying only
+/// for the names its declarations could supply (#2229), so a walk needs both
+/// halves to decide one name at that tier.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ScalaDirectAncestorResolution {
     Resolved(Vec<CodeUnit>),
-    Ambiguous,
+    Ambiguous {
+        resolved: Vec<CodeUnit>,
+        tied: ScalaTiedSupertypes,
+    },
     Incomplete(Vec<CodeUnit>),
+}
+
+/// What a tied supertype tier declares for one looked-up name.
+///
+/// This is the whole of the #2229 rule, stated once for every walk that meets a
+/// tie. A tie between supertype declarations says nothing about a name none of
+/// them declares, so ask each tied declaration for the name exactly as the walk
+/// asks a resolved ancestor at the same tier, and hand the answers back to that
+/// tier's ordinary one/many decision: none declares it and the walk continues
+/// outward, exactly one declares it and that declaration is the answer, more
+/// than one declares it and the tier is genuinely ambiguous with those
+/// declarations as its contenders (#2167).
+///
+/// Tied declarations answer for their own tier and are never expanded past it:
+/// which of them the compiler actually sees is unknown, so their own
+/// hierarchies are not this workspace's to walk.
+pub fn scala_tied_tier_declarations<DirectMembers>(
+    tied: &[CodeUnit],
+    name: &str,
+    mut direct_members: DirectMembers,
+) -> Vec<CodeUnit>
+where
+    DirectMembers: FnMut(&CodeUnit, &str) -> Vec<CodeUnit>,
+{
+    tied.iter()
+        .flat_map(|declaration| direct_members(declaration, name))
+        .collect()
 }
 
 /// Resolve an unqualified Scala type name against exact enclosing owners.
@@ -106,6 +156,10 @@ pub enum ScalaDirectAncestorResolution {
 /// exact `CodeUnit` is retained throughout: the same base reached through a
 /// diamond is deduplicated, while distinct declarations at the winning tier
 /// are ambiguous even when they render the same fqn.
+///
+/// A tier whose supertype name tied is not a stop: its tied declarations join
+/// that tier through [`scala_tied_tier_declarations`] and the same one/many
+/// rule decides (#2229).
 pub fn resolve_exact_lexical_type_namespace<Owners, DirectMembers, DirectAncestors>(
     owners_nearest_first: Owners,
     name: &str,
@@ -132,20 +186,29 @@ where
             [] => {}
         }
 
-        let mut level = match direct_ancestors(&owner) {
+        let (mut level, mut tied) = match direct_ancestors(&owner) {
             ScalaDirectAncestorResolution::Resolved(ancestors)
-            | ScalaDirectAncestorResolution::Incomplete(ancestors) => ancestors,
+            | ScalaDirectAncestorResolution::Incomplete(ancestors) => (ancestors, Vec::new()),
+            ScalaDirectAncestorResolution::Ambiguous {
+                resolved,
+                tied: ScalaTiedSupertypes::Named(tied),
+            } => (resolved, tied),
             // no contenders: the tie is the SUPERTYPE name's, not this name's,
-            // so no declaration of `name` was ever in hand here (#2167).
-            ScalaDirectAncestorResolution::Ambiguous => {
+            // and this producer cannot name the declarations behind it, so
+            // whether they declare `name` is unknowable here (#2167).
+            ScalaDirectAncestorResolution::Ambiguous {
+                tied: ScalaTiedSupertypes::Unnamed,
+                ..
+            } => {
                 return ScalaTypeNamespaceResolution::Ambiguous(Vec::new());
             }
         };
         let mut seen = HashSet::from_iter([owner]);
-        while !level.is_empty() {
-            let mut matches = Vec::new();
+        while !level.is_empty() || !tied.is_empty() {
+            let mut matches = scala_tied_tier_declarations(&tied, name, &mut direct_members);
             let mut next = Vec::new();
-            let mut next_is_ambiguous = false;
+            let mut next_tied = Vec::new();
+            let mut next_tie_is_unnamed = false;
             for ancestor in level {
                 if !seen.insert(ancestor.clone()) {
                     continue;
@@ -156,7 +219,17 @@ where
                     | ScalaDirectAncestorResolution::Incomplete(ancestors) => {
                         next.extend(ancestors)
                     }
-                    ScalaDirectAncestorResolution::Ambiguous => next_is_ambiguous = true,
+                    ScalaDirectAncestorResolution::Ambiguous {
+                        resolved,
+                        tied: ScalaTiedSupertypes::Named(tied),
+                    } => {
+                        next.extend(resolved);
+                        next_tied.extend(tied);
+                    }
+                    ScalaDirectAncestorResolution::Ambiguous {
+                        tied: ScalaTiedSupertypes::Unnamed,
+                        ..
+                    } => next_tie_is_unnamed = true,
                 }
             }
             let matches = unique_units(matches);
@@ -166,10 +239,13 @@ where
                 }
                 [_, _, ..] => return ScalaTypeNamespaceResolution::Ambiguous(matches),
                 // no contenders: see the direct-ancestor arm above.
-                [] if next_is_ambiguous => {
+                [] if next_tie_is_unnamed => {
                     return ScalaTypeNamespaceResolution::Ambiguous(Vec::new());
                 }
-                [] => level = next,
+                [] => {
+                    level = next;
+                    tied = next_tied;
+                }
             }
         }
     }

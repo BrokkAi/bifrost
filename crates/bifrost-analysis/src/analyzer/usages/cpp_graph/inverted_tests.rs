@@ -75,6 +75,7 @@ ABSL_NAMESPACE_END
         );
     }
 
+    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
     #[test]
     fn inverted_edges_record_ordinary_object_macro_references() {
         let source = r#"#define LIMIT 7

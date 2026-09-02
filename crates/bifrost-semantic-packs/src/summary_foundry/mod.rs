@@ -554,7 +554,7 @@ fn round_trip(
         Completeness::Partial
     };
     let pack = AuthoredSemanticModelPack {
-        schema_version: 1,
+        schema_version: 2,
         pack_id: format!("bifrost.summary-foundry.{}", corpus.as_str()),
         version: "0.0.0".to_owned(),
         producer: Producer {

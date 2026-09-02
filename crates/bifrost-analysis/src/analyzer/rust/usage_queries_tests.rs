@@ -67,6 +67,7 @@ mod tests {
     /// The store rows must reproduce the projection the v1 index built from a
     /// live syntax tree. If this drifts, `module_at_byte` silently changes
     /// answers, which is the migration's whole risk.
+    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
     #[test]
     fn module_extents_from_the_store_match_the_syntax_tree_projection() {
         let (_temp, analyzer, lib, _worker) = analyzer_with_fixture();
@@ -94,6 +95,7 @@ mod tests {
     /// The same equivalence for a file whose package name is non-empty: the
     /// stored names are relative to the file root, so getting the composition
     /// wrong here produces a module key that resolves to the wrong crate path.
+    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
     #[test]
     fn module_extents_compose_the_live_package_into_the_stored_relative_names() {
         let (_temp, analyzer, _lib, _worker) = analyzer_with_fixture();
@@ -118,6 +120,7 @@ mod tests {
         }
     }
 
+    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
     #[test]
     fn module_at_byte_picks_the_narrowest_enclosing_module() {
         let (_temp, analyzer, lib, _worker) = analyzer_with_fixture();
@@ -139,6 +142,7 @@ mod tests {
         );
     }
 
+    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
     #[test]
     fn re_exports_come_from_the_rows() {
         let (_temp, analyzer, lib, _worker) = analyzer_with_fixture();
@@ -157,6 +161,7 @@ mod tests {
         );
     }
 
+    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
     #[test]
     fn import_bindings_reproduce_the_paths_and_lexical_reach() {
         let (_temp, analyzer, lib, worker) = analyzer_with_fixture();
@@ -189,6 +194,7 @@ mod tests {
         );
     }
 
+    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
     #[test]
     fn repeated_import_binding_reads_decode_one_file_once() {
         let (_temp, analyzer, lib, _worker) = analyzer_with_fixture();
@@ -201,6 +207,7 @@ mod tests {
         assert_eq!(queries.import_binding_computations(), 1);
     }
 
+    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
     #[test]
     fn prederived_module_keys_match_the_canonical_constructor() {
         let (_temp, analyzer, lib, worker) = analyzer_with_fixture();
@@ -228,6 +235,7 @@ mod tests {
     /// find the files that mention a name, filter by context so a prose
     /// mention is not offered to a reference search, and stay one indexed
     /// lookup rather than a workspace walk.
+    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
     #[test]
     fn inverted_lookups_return_live_candidate_files_filtered_by_context() {
         let (_temp, analyzer, lib, worker) = analyzer_with_fixture();

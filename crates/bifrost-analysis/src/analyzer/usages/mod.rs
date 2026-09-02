@@ -108,5 +108,8 @@ use crate::analyzer::{CodeUnit, IAnalyzer};
 /// Convenience equivalent to [`crate::analyzer::IAnalyzer::find_usages`] for callers that
 /// only hold a `&dyn IAnalyzer`.
 pub fn find_usages(analyzer: &dyn IAnalyzer, overloads: &[CodeUnit]) -> FuzzyResult {
-    UsageFinder::new().find_usages(analyzer, overloads, DEFAULT_MAX_FILES, DEFAULT_MAX_USAGES)
+    let result =
+        UsageFinder::new().find_usages(analyzer, overloads, DEFAULT_MAX_FILES, DEFAULT_MAX_USAGES);
+    crate::analyzer::i_analyzer::record_usage_lookup(analyzer, overloads, &result);
+    result
 }

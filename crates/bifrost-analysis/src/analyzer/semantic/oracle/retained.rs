@@ -116,7 +116,8 @@ fn visit_retained_artifacts<'a>(
                         AccessSelector::Index(IndexSelector::Exact(index)) => {
                             stack.push(RetainedNode::Procedure(index.procedure()));
                         }
-                        AccessSelector::Index(IndexSelector::Any) => {}
+                        AccessSelector::Index(IndexSelector::Constant(_))
+                        | AccessSelector::Index(IndexSelector::Any) => {}
                     }
                 }
                 stack.push(RetainedNode::AccessRoot(path.root()));

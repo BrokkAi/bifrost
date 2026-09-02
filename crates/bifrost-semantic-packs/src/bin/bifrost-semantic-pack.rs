@@ -5,6 +5,10 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use brokk_bifrost_analysis::CancellationToken;
+use brokk_bifrost_analysis::analyzer::semantic_model::csmi::{
+    CsmiDiagnostic, CsmiDocument, CsmiProfileValidation, CsmiResourceError, CsmiResourceResolver,
+    CsmiVocabularySupport, validate_csmi_document, validate_csmi_pack,
+};
 use brokk_bifrost_analysis::analyzer::semantic_model::{
     CatalogCoordinate, CatalogOpenMode, CatalogOptions, CompilerOptions,
     SemanticModelActivationControl, SemanticModelActivationEvidence,
@@ -36,6 +40,7 @@ use serde::Serialize;
 use serde_json::json;
 
 const CLI_ERROR_FORMAT: &str = "bifrost_semantic_model_cli_error/v1";
+const CSMI_CHECK_FORMAT: &str = "bifrost_csmi_check/v2";
 const MAX_INVENTORY_PACKS: usize = 65_536;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -80,6 +85,7 @@ fn run(mut arguments: Vec<OsString>) -> Result<u8, CommandFailure> {
     match command.as_str() {
         "validate" => validate_command(arguments, format),
         "lint" => lint_command(arguments, format),
+        "csmi-check" => csmi_check_command(arguments, format),
         "compile" => compile_command(arguments, format),
         "list" => list_command(arguments, format),
         "workspace-check" => workspace_check_command(arguments, format),
@@ -93,6 +99,186 @@ fn run(mut arguments: Vec<OsString>) -> Result<u8, CommandFailure> {
         "golden-summary-pack" => golden_summary_pack_command(arguments, format),
         _ => Err(failure(2, usage(), format)),
     }
+}
+
+fn csmi_check_command(
+    arguments: Vec<OsString>,
+    format: OutputFormat,
+) -> Result<u8, CommandFailure> {
+    let [input] = arguments.as_slice() else {
+        return Err(failure(2, usage(), format));
+    };
+    let input = PathBuf::from(input);
+    let bytes = read(&input, format)?;
+    let is_manifest = serde_json::from_slice::<serde_json::Value>(&bytes)
+        .ok()
+        .and_then(|value| value.get("documentType")?.as_str().map(str::to_owned))
+        .is_some_and(|document_type| document_type == "pack-manifest");
+    let support = CsmiVocabularySupport::empty();
+    let report = if is_manifest {
+        let root = input.parent().unwrap_or_else(|| Path::new("."));
+        let result = validate_csmi_pack(&bytes, &DirectoryCsmiResources { root }, &support);
+        CsmiCheckReport {
+            format: CSMI_CHECK_FORMAT,
+            input_kind: "pack",
+            structural_valid: result.structural_valid,
+            semantic_valid: result.semantic_valid,
+            integrity_valid: Some(result.integrity_valid),
+            interpretable: result.interpretable,
+            valid: result.valid(),
+            profiles: result.profiles.into_iter().map(Into::into).collect(),
+            diagnostics: result.diagnostics,
+        }
+    } else {
+        let result = validate_csmi_document(&bytes, &support);
+        let input_kind = match result.document.as_ref() {
+            Some(CsmiDocument::Manifest(_)) => "pack",
+            Some(CsmiDocument::Semantic(_)) | None => "document",
+        };
+        CsmiCheckReport {
+            format: CSMI_CHECK_FORMAT,
+            input_kind,
+            structural_valid: result.structural_valid,
+            semantic_valid: result.semantic_valid,
+            integrity_valid: None,
+            interpretable: result.interpretable,
+            valid: result.valid(),
+            profiles: result.profiles.into_iter().map(Into::into).collect(),
+            diagnostics: result.diagnostics,
+        }
+    };
+    match format {
+        OutputFormat::Json => print_json(&report),
+        OutputFormat::Human => {
+            println!(
+                "CSMI {}: {} (structural={}, semantic={}, integrity={}, interpretable={})",
+                report.input_kind,
+                if report.valid { "valid" } else { "invalid" },
+                report.structural_valid,
+                report.semantic_valid,
+                report
+                    .integrity_valid
+                    .map_or("not-applicable".to_owned(), |value| value.to_string()),
+                report.interpretable,
+            );
+            for diagnostic in &report.diagnostics {
+                println!(
+                    "error {} at {}: {}",
+                    diagnostic.code, diagnostic.path, diagnostic.message
+                );
+            }
+            for profile in &report.profiles {
+                println!(
+                    "profile {} {}: schema-recognized={}, structural={}, semantic-support={}",
+                    profile.identifier,
+                    profile.version,
+                    profile.schema_recognized,
+                    profile.structural_valid,
+                    profile.semantically_supported,
+                );
+            }
+        }
+    }
+    Ok(u8::from(!report.valid))
+}
+
+struct DirectoryCsmiResources<'a> {
+    root: &'a Path,
+}
+
+impl CsmiResourceResolver for DirectoryCsmiResources<'_> {
+    fn read_resource(&self, path: &str, expected_size: u64) -> Result<Vec<u8>, CsmiResourceError> {
+        let mut resource_path = self.root.to_path_buf();
+        for component in Path::new(path).components() {
+            let std::path::Component::Normal(component) = component else {
+                return Err(CsmiResourceError::InvalidPath {
+                    path: path.to_owned(),
+                    reason: "resource path must contain only normal relative components".to_owned(),
+                });
+            };
+            resource_path.push(component);
+            let metadata =
+                fs::symlink_metadata(&resource_path).map_err(|_| CsmiResourceError::Missing {
+                    path: path.to_owned(),
+                })?;
+            if metadata.file_type().is_symlink() {
+                return Err(CsmiResourceError::InvalidPath {
+                    path: path.to_owned(),
+                    reason: "resource path must not traverse a symbolic link".to_owned(),
+                });
+            }
+        }
+        let bytes = fs::read(resource_path).map_err(|_| CsmiResourceError::Missing {
+            path: path.to_owned(),
+        })?;
+        let actual = u64::try_from(bytes.len()).expect("resource length fits u64");
+        if actual != expected_size {
+            return Err(CsmiResourceError::SizeMismatch {
+                path: path.to_owned(),
+                expected: expected_size,
+                actual,
+            });
+        }
+        Ok(bytes)
+    }
+}
+
+#[derive(Serialize)]
+struct CsmiCheckReport {
+    format: &'static str,
+    input_kind: &'static str,
+    structural_valid: bool,
+    semantic_valid: bool,
+    integrity_valid: Option<bool>,
+    interpretable: bool,
+    valid: bool,
+    profiles: Vec<CsmiCheckProfileReport>,
+    #[serde(serialize_with = "serialize_csmi_diagnostics")]
+    diagnostics: Vec<CsmiDiagnostic>,
+}
+
+#[derive(Serialize)]
+struct CsmiCheckProfileReport {
+    identifier: String,
+    version: String,
+    schema: String,
+    schema_recognized: bool,
+    structural_valid: bool,
+    semantically_supported: bool,
+}
+
+impl From<CsmiProfileValidation> for CsmiCheckProfileReport {
+    fn from(profile: CsmiProfileValidation) -> Self {
+        Self {
+            identifier: profile.identifier,
+            version: profile.version,
+            schema: profile.schema,
+            schema_recognized: profile.recognized,
+            structural_valid: profile.structural_valid,
+            semantically_supported: profile.semantically_supported,
+        }
+    }
+}
+
+fn serialize_csmi_diagnostics<S>(
+    diagnostics: &[CsmiDiagnostic],
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    diagnostics
+        .iter()
+        .map(|diagnostic| {
+            json!({
+                "severity": "error",
+                "code": diagnostic.code,
+                "path": diagnostic.path,
+                "message": diagnostic.message,
+            })
+        })
+        .collect::<Vec<_>>()
+        .serialize(serializer)
 }
 
 fn validate_command(arguments: Vec<OsString>, format: OutputFormat) -> Result<u8, CommandFailure> {
@@ -919,5 +1105,5 @@ impl ActivationControlInput {
 }
 
 fn usage() -> &'static str {
-    "usage:\n  bifrost-semantic-pack validate SOURCE [--format human|json]\n  bifrost-semantic-pack lint SOURCE [--format human|json]\n  bifrost-semantic-pack compile SOURCE OUTPUT [--format human|json]\n  bifrost-semantic-pack list CATALOG [ACTIVATION.json] [--format human|json]\n  bifrost-semantic-pack workspace-check WORKSPACE [--format human|json]\n  bifrost-semantic-pack generate OUTPUT SPEC ARTIFACT [SPEC ARTIFACT ...]\n  bifrost-semantic-pack merge OUTPUT INPUT...\n  bifrost-semantic-pack verify OUTPUT\n  bifrost-semantic-pack install BUNDLE CATALOG\n  bifrost-semantic-pack summary-corpus-join PINS CODEQL_MODELS JOERN_SOURCE REPORT.json [JVM_SOURCES]\n  bifrost-semantic-pack sanitizer-pack CANDIDATES_DIR OUTPUT_ROOT\n  bifrost-semantic-pack framework-decl-pack CANDIDATES_DIR OUTPUT_ROOT\n  bifrost-semantic-pack golden-summary-pack CANDIDATES_DIR OUTPUT_ROOT REALM"
+    "usage:\n  bifrost-semantic-pack validate SOURCE [--format human|json]\n  bifrost-semantic-pack lint SOURCE [--format human|json]\n  bifrost-semantic-pack csmi-check FILE [--format human|json]\n  bifrost-semantic-pack compile SOURCE OUTPUT [--format human|json]\n  bifrost-semantic-pack list CATALOG [ACTIVATION.json] [--format human|json]\n  bifrost-semantic-pack workspace-check WORKSPACE [--format human|json]\n  bifrost-semantic-pack generate OUTPUT SPEC ARTIFACT [SPEC ARTIFACT ...]\n  bifrost-semantic-pack merge OUTPUT INPUT...\n  bifrost-semantic-pack verify OUTPUT\n  bifrost-semantic-pack install BUNDLE CATALOG\n  bifrost-semantic-pack summary-corpus-join PINS CODEQL_MODELS JOERN_SOURCE REPORT.json [JVM_SOURCES]\n  bifrost-semantic-pack sanitizer-pack CANDIDATES_DIR OUTPUT_ROOT\n  bifrost-semantic-pack framework-decl-pack CANDIDATES_DIR OUTPUT_ROOT\n  bifrost-semantic-pack golden-summary-pack CANDIDATES_DIR OUTPUT_ROOT REALM"
 }

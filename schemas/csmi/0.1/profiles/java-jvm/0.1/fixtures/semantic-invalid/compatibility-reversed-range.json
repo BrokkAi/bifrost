@@ -1,0 +1,7 @@
+{
+  "$profileSchema": "jvm-compatibility",
+  "profileVersion": "0.1",
+  "constraints": {
+    "javaRelease": { "minimum": 21, "maximum": 17 }
+  }
+}

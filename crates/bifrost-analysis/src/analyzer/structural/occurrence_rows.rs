@@ -1197,24 +1197,52 @@ mod tests {
         }
     }
 
+    /// An adapter that classifies one role and no others reports incomplete for
+    /// the roles it cannot name, and covers exactly the one it can.
+    ///
+    /// PHP declares `member_position` and nothing else, so the roles it stays
+    /// silent about must never come back as a clean empty answer. This guard
+    /// used to point at Scala, which declared no roles at all until #1597
+    /// graduated it.
     #[test]
-    fn an_adapter_without_occurrence_roles_reports_incomplete_not_empty_complete() {
-        let source = "class Widget { def render(label: String): String = label }\n";
-        let fixture = Fixture::new(Language::Scala, "src/app.scala", source);
+    fn an_adapter_with_a_partial_role_table_reports_incomplete_not_empty_complete() {
+        let source = concat!(
+            "<?php\n",
+            "class Widget {\n",
+            "    public function render(Helper $helper): int {\n",
+            "        return $helper->build();\n",
+            "    }\n",
+            "}\n",
+        );
+        let fixture = Fixture::new(Language::Php, "src/widget.php", source);
         let result = fixture.result();
 
-        assert!(result.rows.is_empty());
+        assert!(
+            result
+                .rows
+                .iter()
+                .all(|row| row.role == OccurrenceRole::MemberPosition),
+            "php must publish only the role it declares: {:?}",
+            result.rows
+        );
         match &result.completeness {
             OccurrenceCompleteness::Incomplete {
                 unsupported_roles, ..
             } => {
-                assert_eq!(unsupported_roles.len(), ALL_OCCURRENCE_ROLES.len());
-                for role in ALL_OCCURRENCE_ROLES {
+                assert_eq!(unsupported_roles.len(), ALL_OCCURRENCE_ROLES.len() - 1);
+                assert!(
+                    result.completeness.covers(OccurrenceRole::MemberPosition),
+                    "the one declared role is covered"
+                );
+                for role in ALL_OCCURRENCE_ROLES
+                    .iter()
+                    .filter(|role| **role != OccurrenceRole::MemberPosition)
+                {
                     assert!(!result.completeness.covers(*role), "{role} claimed covered");
                 }
             }
             OccurrenceCompleteness::Complete => {
-                panic!("an all-unsupported adapter must never report Complete")
+                panic!("an adapter with unsupported roles must never report Complete")
             }
         }
     }
@@ -1611,6 +1639,7 @@ mod tests {
     /// Python and JS/TS reach the shared outcome constructors but no tier of
     /// their resolvers reports what it discarded, so their traces say so
     /// instead of letting an absent rejection row read as "nothing lost".
+    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
     #[test]
     fn a_language_without_tier_tracing_reports_selection_only() {
         let python = Fixture::new(
@@ -1639,6 +1668,10 @@ mod tests {
     /// An adapter that has not learned the candidate axes must surface that
     /// through the capability spine. An empty trace from an uninstrumented
     /// language would read exactly like "the resolver considered nothing".
+    ///
+    /// Scala classifies occurrence roles since #1597, so the rows themselves
+    /// are real; what it still does not do is record a considered set, and
+    /// that is what the axes and the trace completeness must keep saying.
     #[test]
     fn an_uninstrumented_language_reports_the_candidate_axes_unsupported() {
         let fixture = Fixture::new(
@@ -1657,12 +1690,17 @@ mod tests {
 
         let result = fixture.traced_result();
         assert!(
-            !result.completeness.is_complete(),
-            "an adapter with no occurrence roles can never report Complete"
+            !result.rows.is_empty(),
+            "Scala classifies occurrence roles, so the rows are real"
         );
         assert!(
-            result.rows.is_empty(),
-            "no rows means no traces, which is the honest answer here"
+            result
+                .rows
+                .iter()
+                .filter_map(|row| row.candidates.as_ref())
+                .all(|trace| !trace.completeness.covers_rejections()),
+            "a language that claims neither candidate axis must never publish a considered set: {:?}",
+            result.rows
         );
     }
 

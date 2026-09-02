@@ -1,0 +1,6 @@
+{
+  "kind": "dependency-binding",
+  "dependentCrate": "acmeCliCrate",
+  "binding": "codec",
+  "targetCrate": "acmeCodecCrate"
+}

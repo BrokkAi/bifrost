@@ -4,6 +4,7 @@
 //! analyzer-backed evaluation, canonical report assembly, and CLI status
 //! selection. Renderers consume only the returned [`PolicyReportDocument`].
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -19,7 +20,10 @@ use brokk_bifrost_analysis::analyzer::packs_document::{
     WorkspacePacksActivation, WorkspacePacksConfig, activate_workspace_semantic_sources,
     load_workspace_packs_config, load_workspace_packs_config_at,
 };
-use brokk_bifrost_analysis::analyzer::semantic::{WorkspaceRelativePath, split_qualified_member};
+use brokk_bifrost_analysis::analyzer::semantic::ids::StableDigest;
+use brokk_bifrost_analysis::analyzer::semantic::{
+    WorkspaceRelativePath, authored_procedure_target_identity,
+};
 use brokk_bifrost_analysis::analyzer::semantic_model::{
     ActiveSemanticModelShard, ActiveSemanticModelSnapshot, CatalogPackSourceKind,
     ResolvedActiveSemanticModels, SemanticModelActivationExplanation,
@@ -28,13 +32,18 @@ use brokk_bifrost_analysis::analyzer::semantic_model::{
     WORKSPACE_SEMANTIC_MODEL_DIRECTORY, acquire_active_semantic_models,
     workspace_semantic_models_not_active,
 };
+use brokk_bifrost_analysis::analyzer::store::policy_units::{
+    PolicyEvaluationRow, PolicyEvaluationRowKey, PolicyUnitRow,
+};
 use brokk_bifrost_analysis::analyzer::usages::effects::ModeledProcedureKey;
 use brokk_bifrost_analysis::analyzer::usages::effects::modeled_procedure_key_for_unit;
 use brokk_bifrost_analysis::analyzer::{
-    AnalyzerConfig, AnalyzerQueryScope, CodeUnit, DependencyPackEcosystem, FilesystemProject,
-    GoDependencyDiscoveryMode, Project, WorkspaceAnalyzer,
+    AnalyzerConfig, AnalyzerQueryScope, ChangedFacts, CodeUnit, DependencyPackEcosystem,
+    FilesystemProject, GoDependencyDiscoveryMode, Project, WorkspaceAnalyzer,
 };
-use brokk_bifrost_analysis::diff_analysis::export_revision;
+use brokk_bifrost_analysis::diff_analysis::{
+    RevisionExport, RevisionWorkspace, export_revision, resolve_revision_subtree,
+};
 use brokk_bifrost_analysis::schema_version::SchemaVersionOrigin;
 use brokk_bifrost_analysis::workspace_document::WorkspaceRoot;
 
@@ -44,7 +53,9 @@ use super::baseline::{
     load_policy_baseline_from_root,
 };
 use super::catalog::{CatalogRegistryLimits, TaintCatalogRegistry};
-use super::definition::{FindingSeverity, PolicyCategoryId, PolicyId, RqlpDocument};
+use super::definition::{
+    FindingSeverity, PolicyCategoryId, PolicyId, RqlpDocument, UnknownVerdict,
+};
 use super::evaluator::{DefaultPolicyEvaluator, PolicyEvaluationContext, PolicyEvaluator};
 use super::finding::{FindingDiffDisposition, PolicyFindingDiff};
 use super::finding::{
@@ -84,6 +95,11 @@ use super::suppression::{
     PolicySuppressionPreflight, PolicySuppressionRecord, PolicySuppressionReview,
     PolicySuppressionSourceState, PolicySuppressionTemporalState,
     load_policy_suppressions_from_root,
+};
+use super::units::{
+    InMemoryPolicyUnitStore, IncrementalBaseState, PersistedPolicyUnitStore,
+    PolicyIncrementalContext, PolicyIncrementalReview, PolicyUnitStore, WorkspaceUnitInputs,
+    product_of_row, row_key,
 };
 
 use super::taint_policy::ProductionTaintPolicyEvaluator;
@@ -131,6 +147,15 @@ pub struct PolicyEvaluationOptions {
     require_explicit_schema_versions: bool,
     fail_on: PolicyFailOn,
     diff_base: Option<String>,
+    /// Whether this batch may reuse persisted per-unit evaluation results.
+    ///
+    /// The coordinator does not read this yet: Milestone 2 of
+    /// `.agents/plans/impact-sliced-diff-base.md` wires it to the sliced
+    /// evaluation path. `false` forces the full dual-snapshot evaluation, which
+    /// is what every run does today, so the two settings are the same run until
+    /// that milestone lands. It exists now so the equivalence harness can pin
+    /// the contract the sliced path must meet before the sliced path exists.
+    incremental: bool,
 }
 
 impl PolicyEvaluationOptions {
@@ -143,6 +168,7 @@ impl PolicyEvaluationOptions {
             require_explicit_schema_versions: false,
             fail_on: PolicyFailOn::Never,
             diff_base: None,
+            incremental: true,
         }
     }
 
@@ -160,6 +186,7 @@ impl PolicyEvaluationOptions {
             require_explicit_schema_versions: false,
             fail_on: PolicyFailOn::Never,
             diff_base: None,
+            incremental: true,
         }
     }
 
@@ -193,6 +220,16 @@ impl PolicyEvaluationOptions {
         self
     }
 
+    /// Allow or forbid reuse of persisted per-unit evaluation results.
+    ///
+    /// See the field: nothing reads it before Milestone 2, and `false` is the
+    /// forced full dual-snapshot evaluation the equivalence harness compares
+    /// against.
+    pub const fn with_incremental(mut self, incremental: bool) -> Self {
+        self.incremental = incremental;
+        self
+    }
+
     pub const fn evaluation_date(&self) -> PolicyEvaluationDate {
         self.evaluation_date
     }
@@ -219,6 +256,10 @@ impl PolicyEvaluationOptions {
 
     pub fn diff_base(&self) -> Option<&str> {
         self.diff_base.as_deref()
+    }
+
+    pub const fn incremental(&self) -> bool {
+        self.incremental
     }
 }
 
@@ -248,11 +289,32 @@ pub struct PolicyBatchOutcome {
     exit_status: u8,
     max_retained_report_bytes: usize,
     max_serialized_report_bytes: usize,
+    /// What this batch reused instead of recomputing, when it was allowed to
+    /// reuse anything.
+    ///
+    /// Out of band exactly as the stage timings are: the canonical report
+    /// stays byte-identical whether or not a run reused a unit, so the reuse
+    /// telemetry cannot live inside it. Milestone 3 of
+    /// `.agents/plans/impact-sliced-diff-base.md` adds the report section.
+    incremental: Option<PolicyIncrementalReview>,
 }
 
 impl PolicyBatchOutcome {
     pub const fn report(&self) -> &PolicyReportDocument {
         &self.report
+    }
+
+    /// What this batch reused, per policy, or `None` when it could not reuse
+    /// anything: no diff base, or `incremental` off.
+    pub const fn incremental(&self) -> Option<&PolicyIncrementalReview> {
+        self.incremental.as_ref()
+    }
+
+    /// How many evaluation units this batch reused instead of recomputing.
+    pub fn reused_units(&self) -> u64 {
+        self.incremental
+            .as_ref()
+            .map_or(0, PolicyIncrementalReview::reused_units)
     }
 
     pub fn into_report(self) -> PolicyReportDocument {
@@ -509,6 +571,7 @@ pub fn evaluate_policy_inputs(
         None,
         None,
         None,
+        None,
     )
 }
 
@@ -529,6 +592,7 @@ pub fn evaluate_policy_inputs_with_analyzer(
         PolicyRegistryLimits::default(),
         Some(workspace),
         Some(flow_state),
+        None,
         None,
         None,
         cancellation,
@@ -556,6 +620,7 @@ pub fn evaluate_policy_inputs_with_analyzer_and_host_activation(
         Some(flow_state),
         None,
         Some(host_activation),
+        None,
         cancellation,
     )
 }
@@ -614,6 +679,7 @@ pub fn evaluate_policy_inputs_with_analyzer_and_semantic_models(
         Some(workspace),
         Some(flow_state),
         Some(semantic_models),
+        None,
         None,
         cancellation,
     )
@@ -801,6 +867,7 @@ pub fn suppression_preflight_failure_outcome(
         exit_status: POLICY_EXIT_UNRELIABLE,
         max_retained_report_bytes: batch_budget.max_retained_report_bytes(),
         max_serialized_report_bytes: batch_budget.max_serialized_report_bytes(),
+        incremental: None,
     })
 }
 
@@ -948,6 +1015,7 @@ fn deadline_before_evaluation_outcome(
         exit_status: POLICY_EXIT_UNRELIABLE,
         max_retained_report_bytes: batch_budget.max_retained_report_bytes(),
         max_serialized_report_bytes: batch_budget.max_serialized_report_bytes(),
+        incremental: None,
     })
 }
 
@@ -991,6 +1059,7 @@ fn evaluate_policy_files_with_limits(
         None,
         None,
         None,
+        None,
     )
 }
 
@@ -1005,6 +1074,7 @@ fn evaluate_policy_inputs_with_limits(
     supplied_flow_state: Option<&brokk_bifrost_flow::FlowWorkspaceState>,
     semantic_models: Option<PolicySemanticModelContext<'_>>,
     host_activation: Option<PolicyHostActivationContext<'_>>,
+    supplied_incremental: Option<&PolicyIncrementalContext<'_>>,
     cancellation: Option<&CancellationToken>,
 ) -> Result<PolicyBatchOutcome, PolicyCoordinatorError> {
     if policy_inputs.is_empty() {
@@ -1043,6 +1113,7 @@ fn evaluate_policy_inputs_with_limits(
         semantic_models,
         host_activation,
         None,
+        supplied_incremental,
         cancellation,
     )
 }
@@ -1142,6 +1213,7 @@ fn evaluate_policy_inputs_with_analyzer_and_suppression_preflight_impl(
         None,
         host_activation,
         Some(suppression_preflight),
+        None,
         cancellation,
     )
 }
@@ -1291,19 +1363,19 @@ fn procedure_summary_match_evidence(
     active: &ResolvedActiveSemanticModels,
 ) -> BTreeMap<String, Vec<PolicyPackProcedureSummaryEvidence>> {
     let mut counts = BTreeMap::<(String, String), u64>::new();
-    let mut target_members = HashSet::new();
     let mut target_member_identifiers = HashSet::new();
     let mut summaries_by_key = HashMap::<ModeledProcedureKey, Vec<(String, String)>>::new();
     for shard in active.shards() {
         if let Some(summaries) = shard.shard.payload().procedure_summaries() {
             for summary in summaries {
-                if let Some((owner, member)) = split_qualified_member(&summary.target.symbol) {
-                    target_members.insert((owner.to_owned(), member.to_owned()));
+                if let Some((owner, member)) =
+                    authored_procedure_target_identity(&summary.target.path, &summary.target.symbol)
+                {
                     target_member_identifiers.insert(member.to_owned());
                     summaries_by_key
                         .entry(ModeledProcedureKey {
                             language: shard.manifest.language.clone(),
-                            owner: owner.to_owned(),
+                            owner: owner.into_owned(),
                             member: member.to_owned(),
                             has_receiver: summary.target.has_receiver,
                             parameter_count: summary.target.parameter_count,
@@ -1318,14 +1390,12 @@ fn procedure_summary_match_evidence(
             }
         }
     }
+    // The candidate set is already narrowed to declarations whose terminal name
+    // one active summary names. The canonical key is what decides the rest, so
+    // there is no second owner derivation here to disagree with it -- the
+    // duplicate that #2610 found dropped every module-level declaration before
+    // the shared key path ever saw it.
     for unit in procedure_summary_candidate_declarations(analyzer, &target_member_identifiers) {
-        let fq_name = unit.fq_name();
-        let Some((owner, member)) = split_qualified_member(&fq_name) else {
-            continue;
-        };
-        if !target_members.contains(&(owner.to_owned(), member.to_owned())) {
-            continue;
-        }
         let Some(key) = modeled_procedure_key_for_unit(analyzer, &unit) else {
             continue;
         };
@@ -1799,6 +1869,7 @@ fn evaluate_prepared_policy_inputs(
     semantic_models: Option<PolicySemanticModelContext<'_>>,
     host_activation: Option<PolicyHostActivationContext<'_>>,
     suppression_preflight: Option<PolicySuppressionPreflight>,
+    supplied_incremental: Option<&PolicyIncrementalContext<'_>>,
     cancellation: Option<&CancellationToken>,
 ) -> Result<PolicyBatchOutcome, PolicyCoordinatorError> {
     let registration_started = Instant::now();
@@ -2181,6 +2252,12 @@ fn evaluate_prepared_policy_inputs(
     }
 
     let preparation_started = Instant::now();
+    // One store per batch, and only where reuse is possible at all: the base
+    // publishes into it and the head reads from it. Without a diff base there
+    // is nothing published to reuse, and unit-wise execution would only add
+    // per-execution overhead until Milestone 3 persists units across runs.
+    let unit_store = (options.incremental() && options.diff_base().is_some())
+        .then(|| BatchUnitStore::of(workspace));
     let mut runs = HashMap::with_capacity(runnable_ids.len());
     let owned_flow_state = supplied_flow_state
         .is_none()
@@ -2321,6 +2398,88 @@ fn evaluate_prepared_policy_inputs(
         );
     }
     let evaluation_started = Instant::now();
+    // The base evaluates before the head loop: its units must exist before the
+    // head can verify and reuse them, and the runnable policy set that filters
+    // its inputs is known as soon as registration is done.
+    let diff_baseline = match options.diff_base() {
+        Some(revision) => {
+            let base_inputs = diff_base_sources
+                .iter()
+                .filter(|(policy_id, _, _)| runnable_ids.contains(policy_id))
+                .map(|(_, source, bytes)| {
+                    PolicyEvaluationInput::embedded(source.clone(), bytes.as_str())
+                })
+                .collect::<Vec<_>>();
+            let runnable_policies = registry
+                .policies()
+                .filter(|policy| runnable_ids.contains(&policy.definition().metadata.id))
+                .collect::<Vec<_>>();
+            let evaluation_key = workspace.map(|head| {
+                base_evaluation_key(
+                    &runnable_policies,
+                    options,
+                    batch_budget,
+                    registry_limits,
+                    WorkspaceUnitInputs::of(head, icfg_active_semantic_model_snapshot.as_deref()),
+                )
+            });
+            // An earlier run may have evaluated this exact base already. When
+            // it did, its units are the base's own answer and replaying them
+            // costs no export, no build and no execution.
+            let reused = match (workspace, unit_store.as_ref(), evaluation_key.as_ref()) {
+                (Some(head), Some(store), Some(key)) => reuse_persisted_diff_baseline(
+                    root,
+                    head,
+                    revision,
+                    &runnable_policies,
+                    store,
+                    key,
+                    batch_budget,
+                ),
+                _ => None,
+            };
+            match reused {
+                Some(outcome) => Some(outcome),
+                None => Some(evaluate_policy_diff_baseline(
+                    root,
+                    workspace,
+                    revision,
+                    options,
+                    base_inputs,
+                    batch_budget,
+                    registry_limits,
+                    &runnable_policies,
+                    evaluation_key,
+                    unit_store.as_ref(),
+                    cancellation,
+                )?),
+            }
+        }
+        None => None,
+    };
+    // A head unit is reusable only against the base the units were published
+    // from, so the head slices exactly when that comparison exists.
+    let head_incremental_owned = match (&unit_store, &diff_baseline, workspace) {
+        (Some(store), Some(baseline), Some(head)) => baseline.changed.as_ref().map(|changed| {
+            PolicyIncrementalContext::new(
+                store.units(),
+                head,
+                changed,
+                WorkspaceUnitInputs::of(head, icfg_active_semantic_model_snapshot.as_deref()),
+                baseline.state,
+            )
+        }),
+        _ => None,
+    };
+    // Exactly one of the two exists: the base half of a diff run is handed its
+    // caller's context and configures no diff base of its own, and the head
+    // half builds one and is handed none.
+    assert!(
+        supplied_incremental.is_none() || head_incremental_owned.is_none(),
+        "a policy batch evaluates either its own head units or a caller's base units, never both"
+    );
+    let head_incremental = supplied_incremental.or(head_incremental_owned.as_ref());
+    let mut fail_closed_gate = false;
     let mut completed_policy_ids = Vec::with_capacity(evaluation_policy_ids.len());
     let mut active_policy_id = None;
     let mut pending_policy_ids = Vec::new();
@@ -2346,6 +2505,7 @@ fn evaluate_prepared_policy_inputs(
             cancellation,
             cvss_overlays: &[],
             organizational_risk: &[],
+            incremental: head_incremental,
         };
         let mut run = match evaluator.evaluate(policy, &context, &mut evaluation_budget) {
             Ok(run) => run,
@@ -2384,40 +2544,58 @@ fn evaluate_prepared_policy_inputs(
         } else if active_policy_id.is_none() {
             completed_policy_ids.push(policy.definition().metadata.id.clone());
         }
+        // The policy's declared handling of a blocked verdict is applied once
+        // the run's completion is final, so an unrelated cause of
+        // inconclusiveness -- an empty workspace, a deadline -- is covered by
+        // the same declaration (#2506).
+        let verdict = policy.definition().on_unknown.verdict;
+        run.apply_unknown_verdict(verdict, &evaluation_budget)
+            .map_err(|error| {
+                PolicyCoordinatorError::new(format!(
+                    "failed to apply the declared unknown-result verdict: {error}"
+                ))
+            })?;
+        // A fail-closed run gates exactly as a finding at the policy's own
+        // severity would, so the threshold is read from the same option the
+        // findings are read with.
+        if run.unknown_verdict() == Some(UnknownVerdict::FailClosed)
+            && options
+                .fail_on()
+                .matches(super::evaluator::finding_severity(
+                    &policy.definition().metadata.severity,
+                    None,
+                ))
+        {
+            fail_closed_gate = true;
+        }
         runs.insert(policy.definition().metadata.id.clone(), run);
     }
-    let diff_baseline = match options.diff_base() {
-        Some(revision) => {
-            let base_inputs = diff_base_sources
-                .iter()
-                .filter(|(policy_id, _, _)| runnable_ids.contains(policy_id))
-                .map(|(_, source, bytes)| {
-                    PolicyEvaluationInput::embedded(source.clone(), bytes.as_str())
-                })
-                .collect::<Vec<_>>();
-            Some(evaluate_policy_diff_baseline(
-                root,
-                revision,
-                options,
-                base_inputs,
-                batch_budget,
-                registry_limits,
-                cancellation,
-            )?)
-        }
-        None => None,
-    };
     let evaluation_elapsed = evaluation_started.elapsed();
     let report_started = Instant::now();
     if policy_deadline_reached(cancellation)? {
         deadline_stage.get_or_insert(PolicyExecutionStage::ReportConstruction);
     }
+    // Every policy has run, so the units this batch computed describe work
+    // that finished. A run that stopped early publishes nothing: its units
+    // would be indistinguishable from complete ones on a later run, and the
+    // whole reuse claim rests on being unable to confuse the two.
+    if let Some(store) = unit_store.as_ref()
+        && deadline_stage.is_none()
+    {
+        store.flush();
+        if let Some(publication) = diff_baseline
+            .as_ref()
+            .and_then(|outcome| outcome.publication.as_ref())
+        {
+            store.publish_evaluation(publication);
+        }
+    }
 
     let diff_review = match &diff_baseline {
-        Some(baseline) => Some(apply_policy_diff(baseline, &mut runs)?),
+        Some(baseline) => Some(apply_policy_diff(&baseline.baseline, &mut runs)?),
         None => None,
     };
-    if let Some(baseline) = &diff_baseline
+    if let Some(baseline) = diff_baseline.as_ref().map(|outcome| &outcome.baseline)
         && let Some(detail) = &baseline.unreliable_detail
     {
         secondary_diagnostics.push(report_diagnostic(
@@ -2513,20 +2691,30 @@ fn evaluate_prepared_policy_inputs(
     let diff_gating = diff_review
         .as_ref()
         .is_some_and(|review| !review.degraded());
-    let threshold_exceeded = runs.values().flat_map(PolicyRun::findings).any(|finding| {
-        finding.suppression().is_none()
-            && finding.scope().is_none()
-            && finding.baseline().is_none()
-            && options.fail_on().matches(finding.severity())
-            && (!diff_gating
-                || finding
-                    .diff()
-                    .is_some_and(|diff| diff.disposition() == FindingDiffDisposition::New))
-    });
+    let threshold_exceeded = fail_closed_gate
+        || runs.values().flat_map(PolicyRun::findings).any(|finding| {
+            finding.suppression().is_none()
+                && finding.scope().is_none()
+                && finding.baseline().is_none()
+                && options.fail_on().matches(finding.severity())
+                && (!diff_gating
+                    || finding
+                        .diff()
+                        .is_some_and(|diff| diff.disposition() == FindingDiffDisposition::New))
+        });
     if let Some(review) = diff_review {
         builder.set_diff(review).map_err(|error| {
             PolicyCoordinatorError::new(format!("failed to retain the policy diff review: {error}"))
         })?;
+    }
+    if let Some(incremental) = head_incremental {
+        builder
+            .set_incremental(incremental.review())
+            .map_err(|error| {
+                PolicyCoordinatorError::new(format!(
+                    "failed to retain the incremental reuse review: {error}"
+                ))
+            })?;
     }
     if let Some(review) = packs_review {
         builder.set_packs(review).map_err(|error| {
@@ -2752,7 +2940,287 @@ fn evaluate_prepared_policy_inputs(
         exit_status,
         max_retained_report_bytes: batch_budget.max_retained_report_bytes(),
         max_serialized_report_bytes: batch_budget.max_serialized_report_bytes(),
+        incremental: head_incremental.map(PolicyIncrementalContext::review),
     })
+}
+
+/// Where one batch's evaluation units live.
+///
+/// A persisted workspace publishes into the repository's own analyzer cache,
+/// so the next run finds them; an ephemeral one keeps them in this process,
+/// which is exactly as long as its store would have lasted anyway. Nothing
+/// above this distinction knows which one it is holding.
+enum BatchUnitStore {
+    Memory(RefCell<InMemoryPolicyUnitStore>),
+    Persisted(RefCell<PersistedPolicyUnitStore>),
+}
+
+impl BatchUnitStore {
+    fn of(workspace: Option<&WorkspaceAnalyzer>) -> Self {
+        let persisted = workspace
+            .filter(|workspace| workspace.persisted_store_path().is_some())
+            .and_then(WorkspaceAnalyzer::store);
+        match persisted {
+            Some(store) => Self::Persisted(RefCell::new(PersistedPolicyUnitStore::new(
+                Arc::clone(store),
+            ))),
+            None => Self::Memory(RefCell::new(InMemoryPolicyUnitStore::new())),
+        }
+    }
+
+    fn units(&self) -> &RefCell<dyn PolicyUnitStore> {
+        match self {
+            Self::Memory(store) => store,
+            Self::Persisted(store) => store,
+        }
+    }
+
+    fn persisted(&self) -> Option<&RefCell<PersistedPolicyUnitStore>> {
+        match self {
+            Self::Memory(_) => None,
+            Self::Persisted(store) => Some(store),
+        }
+    }
+
+    /// Write every unit this batch published.
+    ///
+    /// A failure here loses reuse and nothing else -- the cache is derived
+    /// data, and the next run recomputes exactly what this one computed -- so
+    /// it is reported and the run continues rather than failing a correct
+    /// evaluation over a cache write.
+    fn flush(&self) {
+        let Some(store) = self.persisted() else {
+            return;
+        };
+        match store.borrow_mut().flush() {
+            Ok(written) => brokk_bifrost_analysis::profiling::note_with(|| {
+                format!("policy.units published={written}")
+            }),
+            Err(error) => brokk_bifrost_analysis::profiling::note_with(|| {
+                format!("policy.units publish_failed={error}")
+            }),
+        }
+    }
+
+    /// Record that this run's base evaluation is complete and reusable.
+    fn publish_evaluation(&self, evaluation: &PolicyEvaluationRow) {
+        let Some(store) = self.persisted() else {
+            return;
+        };
+        let published = store
+            .borrow()
+            .store()
+            .publish_policy_evaluation(evaluation.clone());
+        brokk_bifrost_analysis::profiling::note_with(|| match &published {
+            Ok(true) => "policy.units base_evaluation=published".to_string(),
+            Ok(false) => "policy.units base_evaluation=incomplete".to_string(),
+            Err(error) => format!("policy.units base_evaluation_failed={error}"),
+        });
+    }
+}
+
+/// Everything a base evaluation was asked, beyond the tree it read.
+///
+/// The tree id fixes the bytes; these fix the question. Two runs that agree on
+/// all of them would produce the same base findings, which is what licenses
+/// replaying one run's answer for the other.
+fn base_evaluation_key(
+    policies: &[&LoadedPolicy],
+    options: &PolicyEvaluationOptions,
+    batch_budget: PolicyBatchBudget,
+    registry_limits: PolicyRegistryLimits,
+    inputs: WorkspaceUnitInputs,
+) -> PolicyEvaluationRowKey {
+    let mut policy_set = policies
+        .iter()
+        .map(|policy| {
+            format!(
+                "{}\u{1}{}\u{1}{}",
+                policy.definition().metadata.id,
+                StableDigest::from_array(*policy.semantic_hash().as_bytes()),
+                StableDigest::from_array(*policy.source_hash().as_bytes()),
+            )
+        })
+        .collect::<Vec<_>>();
+    policy_set.sort();
+    // The base's own options, not the head's: it evaluates with the head's
+    // suppression, scope and gate configuration deliberately stripped, and the
+    // budgets and registry limits it inherits decide what it retains.
+    let base_options = format!(
+        "{:?}\u{1}{}\u{1}{batch_budget:?}\u{1}{registry_limits:?}",
+        options.evaluation_date(),
+        options.require_explicit_schema_versions(),
+    );
+    PolicyEvaluationRowKey {
+        base_tree_oid: String::new(),
+        policy_set_digest: StableDigest::sha256(policy_set.join("\u{2}")).to_string(),
+        options_digest: StableDigest::sha256(base_options).to_string(),
+        configuration_fingerprint: inputs.configuration().to_string(),
+        active_model_set_hash: inputs.models().to_string(),
+        engine_epoch: inputs.epoch().to_string(),
+    }
+}
+
+/// Replay a base evaluation an earlier run already completed, without
+/// exporting or building the base.
+///
+/// `None` means there is nothing to replay and the caller must evaluate the
+/// base: no persisted store, no row for this exact question, an evaluation
+/// whose units the cache has since reclaimed, or a head whose difference from
+/// the base cannot be established from the store alone. Every one of those is
+/// reported, because "the base was evaluated again" is a fact a reader needs
+/// to explain a slow run.
+fn reuse_persisted_diff_baseline(
+    head_root: &Path,
+    head_workspace: &WorkspaceAnalyzer,
+    revision: &str,
+    policies: &[&LoadedPolicy],
+    store: &BatchUnitStore,
+    key: &PolicyEvaluationRowKey,
+    batch_budget: PolicyBatchBudget,
+) -> Option<PolicyDiffBaselineOutcome> {
+    let persisted = store.persisted()?;
+    let subtree = match resolve_revision_subtree(head_root, revision) {
+        Ok(subtree) => subtree,
+        Err(error) => {
+            // The cold path resolves the same revision and reports the failure
+            // in its own words, which is the one place this error belongs.
+            brokk_bifrost_analysis::profiling::note_with(|| {
+                format!("policy.units base_unresolved={error}")
+            });
+            return None;
+        }
+    };
+    let key = PolicyEvaluationRowKey {
+        base_tree_oid: subtree.tree_id().to_string(),
+        ..key.clone()
+    };
+    let evaluation = match persisted.borrow().store().policy_evaluation_for_key(&key) {
+        Ok(Some(evaluation)) => evaluation,
+        Ok(None) => return None,
+        Err(error) => {
+            brokk_bifrost_analysis::profiling::note_with(|| {
+                format!("policy.units base_lookup_failed={error}")
+            });
+            return None;
+        }
+    };
+    if !evaluation.is_complete() {
+        brokk_bifrost_analysis::profiling::note_with(|| {
+            format!(
+                "policy.units base_incomplete recorded={} loaded={}",
+                evaluation.recorded_unit_count,
+                evaluation.loaded_unit_count()
+            )
+        });
+        return None;
+    }
+    // The head verifies the replayed units against what moved since the base.
+    // The base's own facts come from the store, because the base workspace
+    // this would otherwise need is exactly what is not being built.
+    let changed = ChangedFacts::from_committed_tree(head_workspace, subtree.blobs(), &|blob| {
+        subtree.source(blob)
+    });
+    if !changed.is_complete() {
+        let (unenumerated, without_index) = changed.incompleteness();
+        brokk_bifrost_analysis::profiling::note_with(|| {
+            format!(
+                "policy.units base_facts_incomplete unenumerated={unenumerated:?} \
+                 languages_without_index={without_index:?}"
+            )
+        });
+        return None;
+    }
+    let budget = batch_budget.per_policy().scaled_for_workspace(
+        evaluation.analyzed_source_bytes,
+        evaluation.analyzed_file_count as usize,
+    );
+    let mut units_by_policy: HashMap<&str, &Vec<PolicyUnitRow>> = HashMap::new();
+    for (policy_id, units) in &evaluation.units {
+        units_by_policy.insert(policy_id.as_str(), units);
+    }
+    let mut identities: HashMap<PolicyId, HashSet<PolicyFindingId>> = HashMap::new();
+    for policy in policies {
+        let policy_id = &policy.definition().metadata.id;
+        // A policy with no published unit had none to publish: its family is
+        // whole-policy, or its plan enumerated no seed file. Either way it
+        // contributed no base finding, which is what a run of zero units
+        // reproduces.
+        let Some(rows) = units_by_policy.get(policy_id.as_str()) else {
+            continue;
+        };
+        let mut products = Vec::with_capacity(rows.len());
+        for row in rows.iter() {
+            match product_of_row(row) {
+                Ok(product) => products.push(product),
+                Err(error) => {
+                    brokk_bifrost_analysis::profiling::note_with(|| {
+                        format!("policy.units base_unit_unreadable policy={policy_id} {error}")
+                    });
+                    return None;
+                }
+            }
+        }
+        let run = match super::evaluator::match_run_from_units(policy, products, &budget) {
+            Ok(run) => run,
+            Err(error) => {
+                brokk_bifrost_analysis::profiling::note_with(|| {
+                    format!("policy.units base_replay_failed policy={policy_id} {error:?}")
+                });
+                return None;
+            }
+        };
+        for finding in run.findings() {
+            if finding.identity_stability() == FindingIdentityStability::Strong {
+                identities
+                    .entry(policy_id.clone())
+                    .or_default()
+                    .insert(finding.id());
+            }
+        }
+    }
+    Some(PolicyDiffBaselineOutcome {
+        baseline: PolicyDiffBaseline {
+            requested_revision: revision.to_string(),
+            resolved_commit: evaluation.resolved_commit.clone(),
+            identities,
+            unreliable_detail: None,
+        },
+        changed: Some(changed),
+        publication: None,
+        state: IncrementalBaseState::Reused,
+    })
+}
+
+/// What the base evaluation produced for the head that follows it.
+///
+/// `changed` is what moved between the base workspace and the head, computed
+/// while both analyzers are alive and retained after the base analyzer is
+/// dropped. `None` means the base never built a workspace -- an unreliable or
+/// empty base -- so the head has nothing published to verify against and
+/// evaluates exactly as a run without a diff base does.
+struct PolicyDiffBaselineOutcome {
+    baseline: PolicyDiffBaseline,
+    changed: Option<ChangedFacts>,
+    /// What to record about this base evaluation once the run completes, or
+    /// `None` when there is nothing a later run could replay: a base that
+    /// published no units, a base that was replayed rather than evaluated, or
+    /// an ephemeral workspace whose store outlives nothing.
+    publication: Option<PolicyEvaluationRow>,
+    /// How this run obtained the base, for the review.
+    state: IncrementalBaseState,
+}
+
+impl PolicyDiffBaselineOutcome {
+    /// A base that produced no workspace, and therefore no units.
+    const fn without_units(baseline: PolicyDiffBaseline) -> Self {
+        Self {
+            baseline,
+            changed: None,
+            publication: None,
+            state: IncrementalBaseState::Evaluated,
+        }
+    }
 }
 
 /// Base-revision evaluation summary consumed by the diff join.
@@ -2768,6 +3236,42 @@ struct PolicyDiffBaseline {
     unreliable_detail: Option<String>,
 }
 
+/// Build the analyzer over the exported base revision, with the very
+/// configuration the head workspace was built with.
+///
+/// The analyzer configuration selects dependency discovery, dispatch expansion
+/// and per-language behavior, and it is folded into every content identity the
+/// build publishes. A base built with a configuration of its own therefore
+/// answers a different question than the head whose findings it is joined
+/// with, and a finding that persists could be reported as fixed plus new. A
+/// head workspace assembled without a build context was never built from a
+/// configuration and behaves as the defaults describe, so the base takes the
+/// same defaults and parity still holds.
+///
+/// The base analyzes the whole exported revision through the *head*
+/// repository's shared content-addressed cache: the export's own root is a
+/// self-deleting temp directory that no cache funnel can resolve, while the
+/// revision's blobs are immutable committed content whose parsed facts the
+/// worktree build and every later base run reuse (#2769). The caller must keep
+/// `export` alive for the whole lifetime of the returned workspace.
+///
+/// The configuration is returned with the workspace because base semantic-pack
+/// activation must use the same one.
+fn build_diff_base_workspace(
+    export: &RevisionExport,
+    head_root: &Path,
+    head_workspace: &WorkspaceAnalyzer,
+) -> Result<(RevisionWorkspace, AnalyzerConfig), String> {
+    let config = head_workspace.config().cloned().unwrap_or_default();
+    let base = export.build_workspace(head_root, config.clone())?;
+    debug_assert_eq!(
+        base.workspace().config(),
+        Some(&config),
+        "a revision workspace must report the configuration it was built with"
+    );
+    Ok((base, config))
+}
+
 /// Materialize the base revision and evaluate the head's policy sources
 /// against it, collecting the strong finding identities and the base run's
 /// reliability verdict.
@@ -2776,22 +3280,27 @@ struct PolicyDiffBaseline {
 /// error: an unresolvable base is an unreliable diff request, never a silent
 /// full run. An unreliable base *evaluation* instead degrades, so a broken
 /// base cannot mask new findings.
+#[allow(clippy::too_many_arguments)]
 fn evaluate_policy_diff_baseline(
     head_root: &Path,
+    head_workspace: Option<&WorkspaceAnalyzer>,
     revision: &str,
     head_options: &PolicyEvaluationOptions,
     base_inputs: Vec<PolicyEvaluationInput>,
     batch_budget: PolicyBatchBudget,
     registry_limits: PolicyRegistryLimits,
+    policies: &[&LoadedPolicy],
+    evaluation_key: Option<PolicyEvaluationRowKey>,
+    unit_store: Option<&BatchUnitStore>,
     cancellation: Option<&CancellationToken>,
-) -> Result<PolicyDiffBaseline, PolicyCoordinatorError> {
+) -> Result<PolicyDiffBaselineOutcome, PolicyCoordinatorError> {
     let export = export_revision(head_root, revision).map_err(|error| {
         PolicyCoordinatorError::new(format!(
             "failed to materialize diff base `{revision}`: {error}"
         ))
     })?;
     if base_inputs.is_empty() {
-        return Ok(PolicyDiffBaseline {
+        return Ok(PolicyDiffBaselineOutcome::without_units(PolicyDiffBaseline {
             requested_revision: revision.to_string(),
             resolved_commit: export.commit_id().to_string(),
             identities: HashMap::new(),
@@ -2799,19 +3308,19 @@ fn evaluate_policy_diff_baseline(
                 "the head evaluation has no runnable policy, so the base revision was not evaluated"
                     .to_string(),
             ),
-        });
+        }));
     }
-    // The base analyzes the whole exported revision through the *head*
-    // repository's shared content-addressed cache: the export's own root is a
-    // self-deleting temp directory that no cache funnel can resolve, while the
-    // revision's blobs are immutable committed content whose parsed facts the
-    // worktree build and every later base run reuse (#2769). The export must
-    // outlive the workspace, and it does: it is declared above.
-    let base = export.build_workspace(head_root).map_err(|error| {
-        PolicyCoordinatorError::new(format!(
-            "failed to build the diff base analyzer for `{revision}`: {error}"
-        ))
-    })?;
+    // A runnable policy is what puts an input in `base_inputs`, and a runnable
+    // policy needed an analyzer snapshot to close over, so a base with anything
+    // to evaluate always has a head workspace whose configuration it copies.
+    let head_workspace = head_workspace
+        .expect("a runnable policy input implies the head analyzer workspace that closed it");
+    let (base, base_analyzer_config) =
+        build_diff_base_workspace(&export, head_root, head_workspace).map_err(|error| {
+            PolicyCoordinatorError::new(format!(
+                "failed to build the diff base analyzer for `{revision}`: {error}"
+            ))
+        })?;
     // The base activates the packs its own committed document names and the
     // reviewed semantic models its own tree checks in, the same way it loads
     // its own committed suppressions (#1868, #2493). Both sides of the
@@ -2825,7 +3334,6 @@ fn evaluate_policy_diff_baseline(
     // the same document, reports `packs-load-failed`, and the baseline
     // degrades through the standard unreliability path.
     {
-        let base_analyzer_config = owned_policy_analyzer_config();
         let base_packs = load_workspace_packs_config_at(export.root()).ok().flatten();
         let uncancelled = CancellationToken::default();
         if let Err(error) = activate_workspace_semantic_sources(
@@ -2835,19 +3343,21 @@ fn evaluate_policy_diff_baseline(
                 catalog_root: head_root,
                 workspace_model_root: Some(export.root()),
                 config: base_packs.as_ref(),
-                intrinsic_shipped_models: true,
+                intrinsic_shipped_models: base_activates_shipped_models(head_workspace),
             },
             cancellation.unwrap_or(&uncancelled),
         ) {
-            return Ok(PolicyDiffBaseline {
-                requested_revision: revision.to_string(),
-                resolved_commit: export.commit_id().to_string(),
-                identities: HashMap::new(),
-                unreliable_detail: Some(format!(
-                    "base pack activation failed, so base findings would misstate the configured \
+            return Ok(PolicyDiffBaselineOutcome::without_units(
+                PolicyDiffBaseline {
+                    requested_revision: revision.to_string(),
+                    resolved_commit: export.commit_id().to_string(),
+                    identities: HashMap::new(),
+                    unreliable_detail: Some(format!(
+                        "base pack activation failed, so base findings would misstate the configured \
                      external surface: {error}"
-                )),
-            });
+                    )),
+                },
+            ));
         }
     }
     // The base run needs raw identities only: no diff base (which would
@@ -2855,6 +3365,30 @@ fn evaluate_policy_diff_baseline(
     // configuration deliberately not forwarded.
     let base_options = PolicyEvaluationOptions::new(head_options.evaluation_date())
         .with_required_schema_versions(head_options.require_explicit_schema_versions());
+    // The base evaluates unit by unit for the same reason the head does: a
+    // whole execution cannot attribute its reads to seed files, so unit-wise
+    // execution is the only way to publish a per-unit read set at all. Its
+    // store starts empty, so every unit is computed here and published; the
+    // changed facts it verifies against are the base compared with itself,
+    // which states exactly that nothing moved.
+    let base_changed =
+        unit_store.map(|_| ChangedFacts::between(base.workspace(), base.workspace()));
+    let base_incremental = match (unit_store, base_changed.as_ref()) {
+        (Some(store), Some(changed)) => Some(PolicyIncrementalContext::new(
+            store.units(),
+            base.workspace(),
+            changed,
+            WorkspaceUnitInputs::of(
+                base.workspace(),
+                base.workspace()
+                    .analyzer()
+                    .active_semantic_model_snapshot()
+                    .as_deref(),
+            ),
+            IncrementalBaseState::Evaluated,
+        )),
+        _ => None,
+    };
     let outcome = evaluate_policy_inputs_with_limits(
         export.root(),
         &base_inputs,
@@ -2865,16 +3399,22 @@ fn evaluate_policy_diff_baseline(
         None,
         None,
         None,
+        base_incremental.as_ref(),
         cancellation,
     )?;
     let report = outcome.report();
     if outcome.exit_status() == POLICY_EXIT_UNRELIABLE {
-        return Ok(PolicyDiffBaseline {
-            requested_revision: revision.to_string(),
-            resolved_commit: export.commit_id().to_string(),
-            identities: HashMap::new(),
-            unreliable_detail: Some(diff_base_unreliable_detail(report)),
-        });
+        // An unreliable base classified nothing, so nothing it published may
+        // be reused: the head must not verify units against a base whose own
+        // evaluation the run refuses to trust.
+        return Ok(PolicyDiffBaselineOutcome::without_units(
+            PolicyDiffBaseline {
+                requested_revision: revision.to_string(),
+                resolved_commit: export.commit_id().to_string(),
+                identities: HashMap::new(),
+                unreliable_detail: Some(diff_base_unreliable_detail(report)),
+            },
+        ));
     }
     let mut identities: HashMap<PolicyId, HashSet<PolicyFindingId>> = HashMap::new();
     for run in report.runs() {
@@ -2889,12 +3429,121 @@ fn evaluate_policy_diff_baseline(
             }
         }
     }
-    Ok(PolicyDiffBaseline {
-        requested_revision: revision.to_string(),
-        resolved_commit: export.commit_id().to_string(),
-        identities,
-        unreliable_detail: None,
+    // Computed here, while both analyzers are alive: the head verifies its
+    // units against it after the base analyzer and its export are gone.
+    let changed = head_workspace_changed_facts(unit_store, base.workspace(), head_workspace);
+    let publication =
+        base_incremental
+            .as_ref()
+            .zip(evaluation_key)
+            .and_then(|(incremental, key)| {
+                base_evaluation_publication(
+                    incremental,
+                    key,
+                    export.tree_id(),
+                    export.commit_id(),
+                    base.workspace(),
+                    policies,
+                )
+            });
+    Ok(PolicyDiffBaselineOutcome {
+        baseline: PolicyDiffBaseline {
+            requested_revision: revision.to_string(),
+            resolved_commit: export.commit_id().to_string(),
+            identities,
+            unreliable_detail: None,
+        },
+        changed,
+        publication,
+        state: IncrementalBaseState::Evaluated,
     })
+}
+
+/// What this base evaluation records for a later run to replay, or `None` when
+/// it cannot be replayed.
+///
+/// A replay reproduces the base's findings by merging its units, so it needs
+/// every runnable policy's units, in the order that policy merged them. A
+/// policy that published nothing -- a whole-policy family, a widened
+/// evaluation that could not publish, a policy the base refused -- leaves a
+/// hole no merge can fill, and one hole makes the whole evaluation
+/// unreplayable rather than partly wrong.
+///
+/// The analyzed volume travels with the row because it scaled the base's
+/// per-policy budget, and a replay that scaled a different budget could retain
+/// a different prefix of the same findings.
+fn base_evaluation_publication(
+    incremental: &PolicyIncrementalContext<'_>,
+    key: PolicyEvaluationRowKey,
+    tree_id: brokk_bifrost_analysis::analyzer::Oid,
+    resolved_commit: &str,
+    base_workspace: &WorkspaceAnalyzer,
+    policies: &[&LoadedPolicy],
+) -> Option<PolicyEvaluationRow> {
+    let published = incremental.published_units();
+    let covered = published
+        .iter()
+        .map(|(policy_id, _)| policy_id)
+        .collect::<HashSet<_>>();
+    for policy in policies {
+        if !covered.contains(&policy.definition().metadata.id) {
+            brokk_bifrost_analysis::profiling::note_with(|| {
+                format!(
+                    "policy.units base_unpublishable policy={}",
+                    policy.definition().metadata.id
+                )
+            });
+            return None;
+        }
+    }
+    let (analyzed_source_bytes, analyzed_file_count) = analyzed_source_volume(base_workspace);
+    Some(PolicyEvaluationRow {
+        key: PolicyEvaluationRowKey {
+            base_tree_oid: tree_id.to_string(),
+            ..key
+        },
+        resolved_commit: resolved_commit.to_string(),
+        analyzed_source_bytes,
+        analyzed_file_count: analyzed_file_count as u64,
+        units: published
+            .iter()
+            .map(|(policy_id, keys)| {
+                (
+                    policy_id.to_string(),
+                    keys.iter().map(row_key).collect::<Vec<_>>(),
+                )
+            })
+            .collect(),
+    })
+}
+
+/// Whether the base activates the shipped semantic models.
+///
+/// It mirrors the head, for the reason every other base input mirrors it: the
+/// base must see the head's universe or the two sides classify against
+/// different worlds. A head the coordinator built activates them and publishes
+/// an active snapshot; a head a host supplied activated whatever its host
+/// chose, and a host that activated nothing has no snapshot at all -- so a
+/// base that activated the shipped models would model calls the head never
+/// modelled, and every finding that depends on one would classify as fixed
+/// plus new.
+fn base_activates_shipped_models(head_workspace: &WorkspaceAnalyzer) -> bool {
+    head_workspace
+        .analyzer()
+        .active_semantic_model_snapshot()
+        .is_some()
+}
+
+/// What moved between the base the units were published from and the head.
+///
+/// `None` where no store exists, because nothing was published and the head
+/// has nothing to verify.
+fn head_workspace_changed_facts(
+    unit_store: Option<&BatchUnitStore>,
+    base: &WorkspaceAnalyzer,
+    head: &WorkspaceAnalyzer,
+) -> Option<ChangedFacts> {
+    unit_store.map(|_| ChangedFacts::between(base, head))
 }
 
 /// Summarize why a base evaluation was unreliable, for the degradation
@@ -2979,20 +3628,33 @@ fn apply_policy_diff(
                 })?;
         }
     }
-    let mut fixed_count = 0_u64;
-    let mut fixed = Vec::new();
+    // Collect every unmatched identity before truncating. The baseline is a
+    // hash map, so taking the first `MAX_DIFF_FIXED_FINDINGS` in iteration
+    // order would retain a process-dependent subset once more than that many
+    // identities are fixed. Sorting first makes the retained subset the 256
+    // smallest identities under the report's own ordering, which is the same
+    // in every process.
+    let mut unmatched: Vec<(&PolicyId, PolicyFindingId)> = Vec::new();
     for (policy_id, identities) in &baseline.identities {
         let consumed = matched.get(policy_id);
         for finding_id in identities {
             if consumed.is_some_and(|ids| ids.contains(finding_id)) {
                 continue;
             }
-            fixed_count = fixed_count.saturating_add(1);
-            if fixed.len() < MAX_DIFF_FIXED_FINDINGS {
-                fixed.push(PolicyDiffFixedFinding::new(policy_id.clone(), *finding_id));
-            }
+            unmatched.push((policy_id, *finding_id));
         }
     }
+    let fixed_count = u64::try_from(unmatched.len()).expect("fixed identity count fits u64");
+    unmatched.sort_unstable_by(
+        |(left_policy, left_finding), (right_policy, right_finding)| {
+            (left_policy.as_str(), left_finding).cmp(&(right_policy.as_str(), right_finding))
+        },
+    );
+    unmatched.truncate(MAX_DIFF_FIXED_FINDINGS);
+    let fixed = unmatched
+        .into_iter()
+        .map(|(policy_id, finding_id)| PolicyDiffFixedFinding::new(policy_id.clone(), finding_id))
+        .collect::<Vec<_>>();
     Ok(PolicyDiffReview::new(
         baseline.requested_revision.clone(),
         baseline.resolved_commit.clone(),
@@ -3175,9 +3837,10 @@ fn apply_policy_scope(
     // all-policies entry.
     let policy_categories = match super::builtin::built_in_policy_catalog() {
         Ok(catalog) => catalog
-            .manifest()
-            .policies
+            .document()
+            .packs
             .iter()
+            .flat_map(|pack| pack.policies.iter())
             .filter_map(|entry| {
                 let id = PolicyId::new(&entry.id).ok()?;
                 let category = PolicyCategoryId::new(&entry.category).ok()?;
@@ -3761,6 +4424,12 @@ fn report_exit_status(report: &PolicyReportDocument, threshold_exceeded: bool) -
     // without claiming the run could not be trusted: whether an inert model
     // matters is decided by the evaluation that runs without it, which reports
     // its own incompleteness when it has any.
+    // A run whose policy declared a non-default handling of unknown results
+    // (#2506) has already had that declaration applied: `warn-unreliable` asked
+    // for the findings' own status and `fail-closed` already contributed to the
+    // finding gate, so neither may also condemn the batch for being incomplete.
+    // The marker is set only on an `Inconclusive` run, so a failed or
+    // unsupported run still exits unreliable whatever the policy declared.
     let unreliable = report.execution().termination().is_some()
         || report
             .diagnostics()
@@ -3770,12 +4439,11 @@ fn report_exit_status(report: &PolicyReportDocument, threshold_exceeded: bool) -
         || report
             .runs()
             .iter()
-            .any(|run| !run.completion().is_reliable())
+            .any(|run| !run.completion().is_reliable() && run.unknown_verdict().is_none())
         || (!threshold_exceeded
-            && report
-                .runs()
-                .iter()
-                .any(|run| !run.completion().permits_clean_negative()));
+            && report.runs().iter().any(|run| {
+                !run.completion().permits_clean_negative() && run.unknown_verdict().is_none()
+            }));
     if unreliable {
         return POLICY_EXIT_UNRELIABLE;
     }
@@ -3852,6 +4520,7 @@ mod tests {
     use std::fs;
 
     use brokk_bifrost_analysis::analyzer::DependencyPackActivationOutcome;
+    use brokk_bifrost_analysis::analyzer::DispatchHierarchyExpansion;
     use brokk_bifrost_analysis::analyzer::Language;
     use brokk_bifrost_analysis::analyzer::packs_document::parse_workspace_packs_config;
     use brokk_bifrost_analysis::analyzer::semantic_model::{
@@ -3891,7 +4560,7 @@ mod tests {
     }
 
     const REVIEW_SUMMARY_MODEL: &str = r#"{
-  "schema_version": 1,
+  "schema_version": 2,
   "pack_id": "test.review-summary",
   "version": "1.0.0",
   "producer": { "name": "bifrost-test", "version": "1.0.0" },
@@ -4060,6 +4729,31 @@ mod tests {
         );
         assert!(
             pack_activation_review(None, Some(&fixture.activation), None, None, None).is_none()
+        );
+    }
+
+    /// The base activates the shipped semantic models exactly when the head
+    /// has an active model snapshot at all.
+    ///
+    /// A coordinator-built head activates them and publishes a snapshot, so
+    /// its base must too. A host-supplied head that activated nothing has no
+    /// snapshot, and a base that activated the shipped models there would
+    /// model calls the head never modelled: every finding that depended on one
+    /// would classify as fixed plus new, which is the asymmetry Milestone 0
+    /// removed for configuration and ignore rules and this removes for models.
+    #[test]
+    fn the_base_activates_the_shipped_models_exactly_when_the_head_has_them() {
+        let bare = summary_project(false);
+        let unactivated = bare.workspace_analyzer(AnalyzerConfig::default());
+        assert!(
+            !base_activates_shipped_models(&unactivated),
+            "a head whose host activated nothing gets a base that activates nothing"
+        );
+
+        let activated = intrinsic_summary_activation();
+        assert!(
+            base_activates_shipped_models(&activated.workspace),
+            "a head with an active model snapshot gets a base that activates the shipped models"
         );
     }
 
@@ -5672,6 +6366,87 @@ mod tests {
         assert!(!reversed.fixed_truncated());
     }
 
+    /// A truncated fixed list must retain the same 256 identities in every
+    /// process. The baseline is a hash map, so before the join sorted its
+    /// candidates the retained subset was whatever iteration order handed it
+    /// first, which made two runs of the same build over the same inputs
+    /// disagree on the reported list while agreeing on the count.
+    #[test]
+    fn truncated_fixed_list_retains_the_smallest_identities_deterministically() {
+        const IDENTITIES_PER_POLICY: usize = 150;
+
+        // Two policies so the ordering exercises both comparator components.
+        // The identity hex is the index, so identity order is index order and
+        // the expected retained subset is computable by hand.
+        let policy_ids =
+            ["test.diff-a", "test.diff-b"].map(|id| PolicyId::new(id).expect("fixture policy id"));
+        let finding_ids = (0..IDENTITIES_PER_POLICY)
+            .map(|index| {
+                format!("{index:064x}")
+                    .parse::<PolicyFindingId>()
+                    .expect("fixture finding id")
+            })
+            .collect::<Vec<_>>();
+        let expected = policy_ids
+            .iter()
+            .flat_map(|policy_id| {
+                finding_ids
+                    .iter()
+                    .map(move |finding_id| (policy_id.clone(), *finding_id))
+            })
+            .take(MAX_DIFF_FIXED_FINDINGS)
+            .collect::<Vec<_>>();
+
+        // Two baselines built in opposite insertion orders. `HashMap` gives
+        // them different iteration orders, so an implementation that truncated
+        // before sorting would retain different identities in the two joins.
+        let baseline_of = |reversed: bool| {
+            let mut identities: HashMap<PolicyId, HashSet<PolicyFindingId>> = HashMap::new();
+            for policy_id in &policy_ids {
+                let entry = identities.entry(policy_id.clone()).or_default();
+                if reversed {
+                    entry.extend(finding_ids.iter().rev().copied());
+                } else {
+                    entry.extend(finding_ids.iter().copied());
+                }
+            }
+            PolicyDiffBaseline {
+                requested_revision: "HEAD".to_string(),
+                resolved_commit: "0".repeat(40),
+                identities,
+                unreliable_detail: None,
+            }
+        };
+
+        let mut reviews = Vec::new();
+        for reversed in [false, true] {
+            let baseline = baseline_of(reversed);
+            let mut runs = HashMap::new();
+            reviews.push(apply_policy_diff(&baseline, &mut runs).expect("diff join"));
+        }
+        let [first, second] = &reviews[..] else {
+            panic!("two joins produce two reviews");
+        };
+
+        assert_eq!(first.new_count(), 0);
+        assert_eq!(first.persisting_count(), 0);
+        assert_eq!(
+            first.fixed_count(),
+            u64::try_from(2 * IDENTITIES_PER_POLICY).expect("fixture count fits u64"),
+        );
+        assert_eq!(first.fixed().len(), MAX_DIFF_FIXED_FINDINGS);
+        assert!(first.fixed_truncated());
+        assert_eq!(
+            first
+                .fixed()
+                .iter()
+                .map(|entry| (entry.policy_id().clone(), entry.finding_id()))
+                .collect::<Vec<_>>(),
+            expected,
+        );
+        assert_eq!(first.fixed(), second.fixed());
+    }
+
     #[test]
     fn diff_base_gates_only_new_findings_and_reports_fixed() {
         let workspace = tempfile::tempdir().expect("workspace");
@@ -5769,6 +6544,79 @@ mod tests {
         );
         assert_eq!(review.fixed().len(), 1);
         assert_eq!(review.fixed()[0].policy_id().as_str(), "test.diff");
+    }
+
+    /// The base of a `--diff-base` run must be analyzed the way the head was.
+    /// The analyzer configuration selects dependency discovery, dispatch
+    /// expansion and per-language behavior, and it is folded into every content
+    /// identity a build publishes, so a base that built with a configuration of
+    /// its own would answer a different question than the head it is joined
+    /// with. The head here is host-supplied and carries a configuration neither
+    /// the defaults nor the coordinator's owned configuration would produce.
+    #[test]
+    fn the_diff_base_analyzer_is_built_with_the_head_configuration() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        init_git_workspace(workspace.path());
+        fs::write(
+            workspace.path().join("app.ts"),
+            "export function target() {}\n",
+        )
+        .expect("source fixture");
+        write_policy(
+            workspace.path(),
+            "policies/diff.rqlp",
+            &match_policy("test.diff", "Diff test"),
+        );
+        commit_everything(workspace.path(), "base");
+
+        let mut head_config = owned_policy_analyzer_config();
+        head_config.dispatch_hierarchy_expansion = DispatchHierarchyExpansion::CONCRETE_OVERRIDES;
+        assert_ne!(
+            head_config,
+            AnalyzerConfig::default(),
+            "the fixture only means something if the head configuration is not the default"
+        );
+        let project: Arc<dyn Project> =
+            Arc::new(FilesystemProject::new(workspace.path()).expect("head project"));
+        let head = WorkspaceAnalyzer::build_persisted(project, head_config.clone())
+            .expect("head analyzer");
+        assert_eq!(head.config(), Some(&head_config));
+
+        // The whole host-supplied diff path still runs and joins.
+        let gating_date = PolicyEvaluationDate::from_ymd(2026, 7, 27).expect("fixed test date");
+        let diff_options = PolicyEvaluationOptions::new(gating_date)
+            .with_fail_on(PolicyFailOn::Warning)
+            .with_diff_base("HEAD".to_string());
+        let outcome = evaluate_policy_inputs_with_analyzer(
+            workspace.path(),
+            &[PolicyEvaluationInput::workspace_file(PathBuf::from(
+                "policies/diff.rqlp",
+            ))],
+            &head,
+            &brokk_bifrost_flow::FlowWorkspaceState::new(),
+            &diff_options,
+            None,
+        )
+        .expect("diff evaluation over a host-supplied head workspace");
+        assert_eq!(outcome.exit_status(), POLICY_EXIT_CLEAN);
+        let review = outcome.report().diff().expect("diff review");
+        assert!(!review.degraded());
+        assert_eq!(
+            (
+                review.new_count(),
+                review.persisting_count(),
+                review.fixed_count()
+            ),
+            (0, 1, 0)
+        );
+
+        // That run's base came from this function, which takes its
+        // configuration from the head workspace rather than choosing one.
+        let export = export_revision(workspace.path(), "HEAD").expect("export the base revision");
+        let (base, base_config) = build_diff_base_workspace(&export, workspace.path(), &head)
+            .expect("base analyzer workspace");
+        assert_eq!(base_config, head_config);
+        assert_eq!(base.workspace().config(), head.config());
     }
 
     #[test]

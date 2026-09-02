@@ -1,0 +1,20 @@
+{
+  "$profileSchema": "jvm-binary-identity",
+  "profileVersion": "0.1",
+  "owner": "com/acme/shaded/org/example/Codec",
+  "binaryEntity": {
+    "kind": "method",
+    "name": "decode",
+    "descriptor": "([B)Ljava/lang/String;"
+  },
+  "variant": {
+    "entryPath": "com/acme/shaded/org/example/Codec.class",
+    "release": 0,
+    "classFileMajor": 61
+  },
+  "relocation": {
+    "originalOwner": "org/example/Codec",
+    "rule": "shade-prefix",
+    "evidenceDigest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  }
+}

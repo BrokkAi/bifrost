@@ -1,7 +1,9 @@
-use crate::analyzer::common::language_for_file;
+use crate::analyzer::common::{IdentifierSeek, decorated_identifier_seeks, language_for_file};
+use crate::analyzer::languages::language_support;
 use crate::analyzer::lexical_definitions::{
     LexicalBindingResolution, LexicalDefinition, resolve_lexical_binding,
 };
+use crate::analyzer::read_ledger::{IndexFamily, ReadKey};
 use crate::analyzer::structural::resolution::{BoundaryStatus, PrecedenceTier, RejectionReason};
 use crate::analyzer::usages::common::namespace_prefixes;
 use crate::analyzer::usages::cpp_graph::{
@@ -18,15 +20,14 @@ use crate::analyzer::usages::cpp_graph::{
     extract_variable_name, is_globally_qualified_cpp_name, normalize_cpp_type_text,
 };
 use crate::analyzer::usages::csharp_graph::{
-    csharp_argument_count, csharp_collection_target_element_type_node,
-    csharp_extension_invocation_return_type_fq_name, csharp_first_type_child,
-    csharp_is_declaration_name, csharp_is_type_reference_node,
+    CSharpInitializerOwnerLookups, CSharpInitializerOwnerTarget, csharp_argument_count,
+    csharp_collection_target_element_type_node, csharp_extension_invocation_return_type_fq_name,
+    csharp_first_type_child, csharp_is_declaration_name, csharp_is_type_reference_node,
     csharp_member_declared_collection_element_type_fq_name,
     csharp_member_declared_collection_element_type_fq_name_in_session,
     csharp_member_declared_type_fq_name, csharp_method_return_type_fq_name_for_arity,
-    csharp_node_text, csharp_object_created_type, csharp_object_creation_assignment_target,
-    csharp_object_creation_collection_target, csharp_object_initializer_for_label,
-    csharp_object_initializer_owner_type_node, csharp_reference_type_text,
+    csharp_node_text, csharp_object_created_type, csharp_object_initializer_for_label,
+    csharp_object_initializer_owners, csharp_reference_type_text,
     csharp_type_parameter_shadows_reference, csharp_visible_extension_method_candidates,
     member_access_name as csharp_member_access_name,
     member_access_receiver as csharp_member_access_receiver, seed_csharp_bindings_before,
@@ -525,6 +526,23 @@ impl ExactExternalCallProof {
         }
     }
 
+    pub(crate) fn python_imported_call(
+        canonical_callee: impl Into<Box<str>>,
+        parameter_count: u32,
+    ) -> Self {
+        let canonical_callee = canonical_callee.into();
+        assert!(
+            !canonical_callee.is_empty(),
+            "an imported Python callable must be named"
+        );
+        Self {
+            canonical_callee,
+            call_application: CallApplicationKind::PackageFunction,
+            dispatch_extensibility: None,
+            parameter_count,
+        }
+    }
+
     pub(crate) fn canonical_callee(&self) -> &str {
         &self.canonical_callee
     }
@@ -737,6 +755,13 @@ fn resolve_navigation_requests<'a>(
         .iter()
         .map(|request| language_for_file(&request.file))
         .collect();
+    // The reference file each outcome answers for. C++ navigation needs it to
+    // build the visibility index its identity comparisons read, and the
+    // requests are consumed by the resolution below.
+    let reference_files: Vec<_> = requests
+        .iter()
+        .map(|request| request.file.clone())
+        .collect();
     let outcomes = resolve_definition_requests(
         analyzer,
         token,
@@ -748,9 +773,18 @@ fn resolve_navigation_requests<'a>(
     );
     languages
         .into_iter()
+        .zip(reference_files)
         .zip(outcomes)
-        .map(|(language, outcome)| {
-            navigation_lookup_outcome(analyzer, token, context, outcome, language, operation)
+        .map(|((language, reference_file), outcome)| {
+            navigation_lookup_outcome(
+                analyzer,
+                token,
+                context,
+                &reference_file,
+                outcome,
+                language,
+                operation,
+            )
         })
         .collect()
 }
@@ -786,6 +820,132 @@ fn resolve_definition_requests<'a>(
     )
 }
 
+/// Record what every request in one batch probes, before any of them runs.
+///
+/// The entry is the only place a batch can name its inputs unconditionally.
+/// A resolver that reaches a declaration names its own probes on the way, but
+/// one that reaches nothing -- an import specifier that named no file, a
+/// receiver with no proven type, a name in no visible scope -- returns before
+/// any funnel runs, and a memoized answer skips the funnel a second time. So
+/// every request names its keys here, once, before the loop.
+fn record_definition_batch_probe_reads(
+    analyzer: &dyn IAnalyzer,
+    context: &mut DefinitionBatchContext<'_>,
+    requests: &[DefinitionLookupRequest],
+) {
+    if !analyzer.read_ledger_attached() {
+        return;
+    }
+    let _scope = profiling::scope("get_definition::record_batch_probe_reads");
+    for request in requests {
+        let language = language_for_file(&request.file);
+        if language == Language::None {
+            continue;
+        }
+        let source = match context.source(&request.file) {
+            Ok(source) => source,
+            // The request's own file is not there to resolve in. That is a
+            // negative answer about one path, and a head that has the path
+            // answers differently, so the reader names the path rather than
+            // staying silent about it.
+            Err(_) => {
+                analyzer.record_read(ReadKey::path_absent(
+                    language,
+                    rel_path_string(&request.file).as_str(),
+                ));
+                continue;
+            }
+        };
+        let tree = context.tree(&request.file, language, &source);
+        // An unresolvable location is an answer about this file's own bytes,
+        // which the reader that produced the request already named.
+        if let Ok(site) = focused_reference_site(context, request, language, &source, tree.as_ref())
+        {
+            record_definition_probe_reads(analyzer, language, &site, &source);
+        }
+    }
+}
+
+/// Record the index keys one definition request probes, whatever answer the
+/// resolution reaches.
+///
+/// A resolution that finds a declaration records its own probes: every store
+/// funnel names the index key it read, so its read set is already exact. A
+/// resolution that finds nothing often records nothing at all, because it
+/// returns before any funnel runs -- the import specifier named no file, the
+/// receiver had no proven type, the name was in no visible scope. That
+/// negative answer still depends on the workspace: a file added later that
+/// declares the name would answer it, and a read set that stayed silent would
+/// let the unit be reused where the name now resolves. So the request names
+/// the keys the funnels would have named, at the site, before the language
+/// resolvers can return.
+///
+/// Two spellings are named, because a request may focus any segment of a
+/// qualified reference (`qualified_paths` builds one request per segment):
+/// the focused token, which is the identifier every declaration of that name
+/// publishes, and the whole reference expression, which is the exact
+/// qualified name an exact-name probe uses. A declaration added anywhere
+/// under either spelling is in the changed-key set, and it is spelled there
+/// by the store's own row builders, which is why the bytes here are the
+/// site's own text and the adapter's own normalization of it rather than any
+/// second interpretation.
+///
+/// One seek cannot be named exactly. A language whose index stores decorated
+/// identifiers as a *prefix* range rather than as keys (C# generic arity)
+/// probes that range, and exact-key membership can verify no range, so such a
+/// request records the whole-language scope -- the same coarse, honest key
+/// the identifier funnel itself records for that seek.
+///
+/// Recording at the site over-records for a reference that turns out to be a
+/// parameter or a local, whose answer is a function of its own file. That is
+/// the sound direction: naming an input the request did not read costs reuse,
+/// while learning that it was a local only after the resolver ran would mean
+/// recording behind the early return this exists to get in front of.
+fn record_definition_probe_reads(
+    analyzer: &dyn IAnalyzer,
+    language: Language,
+    site: &ResolvedReferenceSite,
+    source: &str,
+) {
+    if !analyzer.read_ledger_attached() {
+        return;
+    }
+    debug_assert!(
+        source
+            .get(site.focus_start_byte..site.focus_end_byte)
+            .is_some(),
+        "a reference site's focus is a range of the source it was resolved in"
+    );
+    let identifier = source
+        .get(site.focus_start_byte..site.focus_end_byte)
+        .unwrap_or(site.text.as_str());
+    analyzer.record_read(ReadKey::index(
+        IndexFamily::DefinitionIdentifier,
+        identifier,
+    ));
+    analyzer.record_read(ReadKey::index(IndexFamily::DefinitionExact, &site.text));
+    let normalized = language_support(language)
+        .and_then(|support| support.forward_query_provider(analyzer))
+        .map_or_else(
+            || site.text.clone(),
+            |provider| provider.normalize_rendered_name(&site.text),
+        );
+    analyzer.record_read(ReadKey::index(
+        IndexFamily::DefinitionNormalizedTail,
+        normalized,
+    ));
+    for seek in decorated_identifier_seeks(language, identifier) {
+        match seek {
+            IdentifierSeek::Exact(spelling) => {
+                analyzer.record_read(ReadKey::index(IndexFamily::DefinitionIdentifier, spelling))
+            }
+            IdentifierSeek::Prefix(_) => {
+                analyzer.record_read(analyzer.workspace_scope_read_key(&[language]))
+            }
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn resolve_definition_requests_traced<'a>(
     analyzer: &'a dyn IAnalyzer,
@@ -799,6 +959,7 @@ fn resolve_definition_requests_traced<'a>(
     traces: &mut Vec<Vec<TraceCandidate>>,
 ) -> Vec<DefinitionLookupOutcome> {
     let _query_scope = AnalyzerQueryScope::new(analyzer);
+    record_definition_batch_probe_reads(analyzer, context, &requests);
     let mut remaining_python_requests: HashMap<ProjectFile, usize> = HashMap::default();
     for request in &requests {
         if language_for_file(&request.file) == Language::Python {
@@ -925,7 +1086,15 @@ pub fn navigation_declaration_site_targets(
     }
     let scope = AnalyzerQueryScope::new(analyzer);
     let mut context = DefinitionBatchContext::new(analyzer, scope.token(), false);
-    cpp::select_navigation_targets(&mut context, token, &[candidate], operation).targets
+    let reference_file = candidate.source().clone();
+    cpp::select_navigation_targets(
+        &mut context,
+        token,
+        &reference_file,
+        &[candidate],
+        operation,
+    )
+    .targets
 }
 
 pub fn navigation_declaration_site_at_offset(
@@ -981,6 +1150,7 @@ pub fn resolve_call_target_batch_with_source(
             requests.iter().all(|request| request.file == file),
             "one call-target source batch must contain requests for that source file"
         );
+        record_definition_batch_probe_reads(analyzer, &mut context, &requests);
 
         // Namespace discovery is one all-or-nothing bounded answer for this
         // source file. Never let a stopped session publish partial aliases or
@@ -1097,7 +1267,7 @@ pub fn resolve_call_target_batch_with_source(
     }
     if matches!(
         language_for_file(&file),
-        Language::JavaScript | Language::TypeScript
+        Language::JavaScript | Language::TypeScript | Language::Python
     ) {
         let scope = AnalyzerQueryScope::new(analyzer);
         let mut context = DefinitionBatchContext::new(analyzer, scope.token(), requests.len() > 1);
@@ -1106,6 +1276,7 @@ pub fn resolve_call_target_batch_with_source(
             requests.iter().all(|request| request.file == file),
             "one call-target source batch must contain requests for that source file"
         );
+        record_definition_batch_probe_reads(analyzer, &mut context, &requests);
         return requests
             .into_iter()
             .take_while(|_| !cancellation.is_some_and(CancellationToken::is_cancelled))
@@ -1278,6 +1449,7 @@ struct DefinitionBatchContext<'a> {
     cpp_class_ranges: HashMap<ProjectFile, Arc<ClassRangeIndex>>,
     enclosing_owner_chains: HashMap<CodeUnit, Arc<Vec<CodeUnit>>>,
     python_contexts: HashMap<ProjectFile, Arc<python::PythonDefinitionContext>>,
+    navigation_operation: Option<NavigationOperation>,
     navigation_target_limit: usize,
     exact_token_focus: bool,
     #[cfg(test)]
@@ -1312,6 +1484,7 @@ impl<'a> DefinitionBatchContext<'a> {
             cpp_class_ranges: HashMap::default(),
             enclosing_owner_chains: HashMap::default(),
             python_contexts: HashMap::default(),
+            navigation_operation: None,
             navigation_target_limit: 256,
             exact_token_focus: false,
             #[cfg(test)]
@@ -1607,6 +1780,44 @@ impl<'a> DefinitionBatchContext<'a> {
     }
 }
 
+/// The reference site one request names, focused the way the language's own
+/// resolver focuses it.
+///
+/// Stated once because two readers must agree on it by construction: the
+/// resolver, which resolves the focused token, and the batch entry, which
+/// records the index keys that token probes before any resolver can return
+/// without probing. A second spelling of this in either place would record a
+/// name the resolver never asked for and, worse, miss the one it did.
+fn focused_reference_site(
+    context: &mut DefinitionBatchContext<'_>,
+    request: &DefinitionLookupRequest,
+    language: Language,
+    source: &str,
+    tree: Option<&Tree>,
+) -> Result<ResolvedReferenceSite, String> {
+    let _scope = profiling::scope("get_definition::reference_site");
+    let line_starts = context.line_starts(&request.file, source);
+    let site = resolve_reference_site_with_line_starts(
+        &request.as_source_location(),
+        source,
+        &line_starts,
+        tree.map(Tree::root_node),
+    )?;
+    let site = match tree {
+        Some(tree) if matches!(language, Language::JavaScript | Language::TypeScript) => {
+            js_ts::jsts_site_for_focus(site, tree.root_node(), source, language)
+        }
+        Some(tree) if language == Language::Python => {
+            python::python_site_for_focus(site, tree, source, request.start_byte, request.end_byte)
+        }
+        _ => site,
+    };
+    Ok(match (language, tree) {
+        (Language::Ruby, Some(tree)) => ruby::ruby_site_for_focus(site, tree, source),
+        _ => site,
+    })
+}
+
 fn resolve_one<'a>(
     analyzer: &'a dyn IAnalyzer,
     token: QueryToken<'_>,
@@ -1641,6 +1852,7 @@ fn resolve_one_with_evidence<'a>(
     go_session: Option<&ResolutionSession>,
 ) -> DefinitionResolution {
     let _scope = profiling::scope("get_definition::resolve_one");
+    context.navigation_operation = operation;
     let language = language_for_file(&request.file);
     context.bounded_support.set_language(language);
     if profiling::enabled() {
@@ -1675,42 +1887,16 @@ fn resolve_one_with_evidence<'a>(
         context.tree(&request.file, language, &source)
     };
 
-    let site = {
-        let _scope = profiling::scope("get_definition::reference_site");
-        let line_starts = context.line_starts(&request.file, &source);
-        match resolve_reference_site_with_line_starts(
-            &request.as_source_location(),
-            &source,
-            &line_starts,
-            tree.as_ref().map(Tree::root_node),
-        ) {
-            Ok(site) => site,
-            Err(message) => {
-                return diagnostic_outcome(
-                    DefinitionLookupStatus::InvalidLocation,
-                    "invalid_location",
-                    message,
-                )
-                .into();
-            }
+    let site = match focused_reference_site(context, &request, language, &source, tree.as_ref()) {
+        Ok(site) => site,
+        Err(message) => {
+            return diagnostic_outcome(
+                DefinitionLookupStatus::InvalidLocation,
+                "invalid_location",
+                message,
+            )
+            .into();
         }
-    };
-    let site = match tree.as_ref() {
-        Some(tree) if matches!(language, Language::JavaScript | Language::TypeScript) => {
-            js_ts::jsts_site_for_focus(site, tree.root_node(), &source, language)
-        }
-        Some(tree) if language == Language::Python => {
-            python::python_site_for_focus(site, tree, &source, request.start_byte, request.end_byte)
-        }
-        _ => site,
-    };
-
-    let site = if language == Language::Ruby {
-        tree.as_ref()
-            .map(|tree| ruby::ruby_site_for_focus(site.clone(), tree, &source))
-            .unwrap_or(site)
-    } else {
-        site
     };
     if let Some(tree) = tree.as_ref()
         && !(!allow_rust_field_receiver_lexical
@@ -1737,6 +1923,7 @@ fn resolve_one_with_evidence<'a>(
             None => {}
         }
     }
+    record_definition_probe_reads(analyzer, language, &site, &source);
     let _dispatch_scope = profiling::scope("get_definition::language_dispatch");
     let mut call_application = CallApplicationKind::Unknown;
     let mut dispatch_extensibility = None;
@@ -1889,15 +2076,30 @@ fn resolve_one_with_evidence<'a>(
             tree.as_ref(),
             &site,
         ),
-        Language::Python => python::resolve_python(
-            analyzer,
-            token,
-            context,
-            &request.file,
-            &source,
-            tree.as_ref(),
-            &site,
-        ),
+        Language::Python => {
+            let mut outcome = python::resolve_python(
+                analyzer,
+                token,
+                context,
+                &request.file,
+                &source,
+                tree.as_ref(),
+                &site,
+            );
+            if outcome.status == DefinitionLookupStatus::UnresolvableImportBoundary
+                && let Some(proof) = tree.as_ref().and_then(|tree| {
+                    python::exact_python_imported_call(source.as_ref(), tree, &site)
+                })
+            {
+                let mut reference = outcome.reference.take().unwrap_or_else(|| site.clone());
+                reference.text = proof.canonical_callee().to_owned();
+                outcome.reference = Some(reference);
+                call_application = proof.call_application();
+                dispatch_extensibility = proof.dispatch_extensibility();
+                exact_external_call = Some(proof);
+            }
+            outcome
+        }
         Language::CSharp => resolve_analyzer::<CSharpAnalyzer>(analyzer).map_or_else(
             || no_definition("csharp_analyzer_unavailable", "C# analyzer is unavailable"),
             |csharp_analyzer| {
@@ -2164,10 +2366,12 @@ fn finalize_navigation_outcome(
     outcome
 }
 
+#[allow(clippy::too_many_arguments)]
 fn navigation_lookup_outcome(
     _analyzer: &dyn IAnalyzer,
     token: QueryToken<'_>,
     context: &mut DefinitionBatchContext<'_>,
+    reference_file: &ProjectFile,
     outcome: DefinitionLookupOutcome,
     language: Language,
     operation: NavigationOperation,
@@ -2179,28 +2383,30 @@ fn navigation_lookup_outcome(
         lexical_definition,
         mut diagnostics,
     } = outcome;
-    let (mut targets, structure_unavailable, unproven_link_unit, mut truncated) =
-        if language == Language::Cpp {
-            let selection = cpp::select_navigation_targets(context, token, &definitions, operation);
-            (
-                selection.targets,
-                selection.structure_unavailable,
-                selection.unproven_link_unit,
-                selection.truncated,
-            )
-        } else {
-            let mut targets: Vec<_> = definitions
-                .iter()
-                .cloned()
-                .map(|code_unit| NavigationTarget {
-                    code_unit,
-                    declaration_range: None,
-                })
-                .collect();
-            let truncated = targets.len() > context.navigation_target_limit;
-            targets.truncate(context.navigation_target_limit);
-            (targets, false, false, truncated)
-        };
+    let (mut targets, structure_unavailable, unproven_link_unit, mut truncated) = if language
+        == Language::Cpp
+    {
+        let selection =
+            cpp::select_navigation_targets(context, token, reference_file, &definitions, operation);
+        (
+            selection.targets,
+            selection.structure_unavailable,
+            selection.unproven_link_unit,
+            selection.truncated,
+        )
+    } else {
+        let mut targets: Vec<_> = definitions
+            .iter()
+            .cloned()
+            .map(|code_unit| NavigationTarget {
+                code_unit,
+                declaration_range: None,
+            })
+            .collect();
+        let truncated = targets.len() > context.navigation_target_limit;
+        targets.truncate(context.navigation_target_limit);
+        (targets, false, false, truncated)
+    };
     targets.sort_by(|left, right| {
         (&left.code_unit, left.declaration_range).cmp(&(&right.code_unit, right.declaration_range))
     });

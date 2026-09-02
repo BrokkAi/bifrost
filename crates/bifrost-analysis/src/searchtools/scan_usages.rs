@@ -98,7 +98,16 @@ impl ScanUsagesSurface {
 #[derive(Debug, Clone, Serialize)]
 pub struct ScanUsagesScope {
     pub include_tests: bool,
+    /// Whether the *request* named paths. This stays request-level: it also
+    /// gates whether the semantic-model overlay contributes authored
+    /// references, so it is not a statement about the session's file set. A
+    /// scoped session that names no paths still answers `true` here and names
+    /// its file set in `session_subset` instead (#2770).
     pub whole_workspace: bool,
+    /// Present only when this session covers an explicitly named subset of the
+    /// workspace, in which case this answer is relative to that many files.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_subset: Option<SubsetCoverage>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub paths: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -777,6 +786,7 @@ pub(super) struct ScanUsagesQueryScope {
     path_filter: Option<Arc<ScanUsagesPathFilter>>,
     include_tests: bool,
     ignored_paths: usize,
+    session_subset: Option<SubsetCoverage>,
 }
 
 impl ScanUsagesQueryScope {
@@ -786,6 +796,7 @@ impl ScanUsagesQueryScope {
             path_filter: built.filter,
             include_tests,
             ignored_paths: built.ignored_paths,
+            session_subset: session_subset(analyzer),
         }
     }
 
@@ -802,6 +813,7 @@ impl ScanUsagesQueryScope {
         ScanUsagesScope {
             include_tests: self.include_tests,
             whole_workspace: self.whole_workspace(),
+            session_subset: self.session_subset,
             paths,
             paths_omitted,
             ignored_paths: some_if_nonzero(self.ignored_paths),
@@ -1641,16 +1653,30 @@ pub(super) fn scan_usages_location_diagnostic(
     )
 }
 
+/// Every declaration `file` owns, each listed once.
+///
+/// The member walk enumerates declarations, not paths to them. A nested
+/// declaration is reachable from every enclosing declaration the analyzer also
+/// lists at file scope -- a C++ method is reachable as itself, through its
+/// class, and through its namespace -- so a walk without a visited set emits
+/// one copy per path and the count grows with nesting depth. Those copies are
+/// the same `CodeUnit`, so every consumer downstream repeats identical work:
+/// `resolve_location_target` hands three identical overloads to the usage
+/// query, and the C++ inverse scan then scans every candidate file once per
+/// copy (#1496).
 pub(super) fn declarations_in_file(analyzer: &dyn IAnalyzer, file: &ProjectFile) -> Vec<CodeUnit> {
-    let mut declarations: Vec<CodeUnit> = analyzer
-        .location_declarations(file)
-        .into_iter()
-        .filter(|unit| unit.source() == file)
-        .collect();
-    let mut stack = declarations.clone();
+    let mut declarations: Vec<CodeUnit> = Vec::new();
+    let mut seen: HashSet<CodeUnit> = HashSet::default();
+    let mut stack: Vec<CodeUnit> = Vec::new();
+    for unit in analyzer.location_declarations(file) {
+        if unit.source() == file && seen.insert(unit.clone()) {
+            stack.push(unit.clone());
+            declarations.push(unit);
+        }
+    }
     while let Some(unit) = stack.pop() {
         for child in analyzer.get_members_in_class(&unit) {
-            if child.source() != file {
+            if child.source() != file || !seen.insert(child.clone()) {
                 continue;
             }
             stack.push(child.clone());
@@ -2721,6 +2747,10 @@ pub struct UsageGraphIncompleteReason {
 #[derive(Debug, Clone, Serialize)]
 pub struct UsageGraphResult {
     pub complete: bool,
+    /// Present only when this session covers an explicitly named subset of the
+    /// workspace, in which case the graph spans that many files (#2770).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_subset: Option<SubsetCoverage>,
     pub nodes: Vec<UsageGraphNode>,
     pub edges: Vec<UsageGraphEdge>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
@@ -3536,6 +3566,7 @@ pub fn usage_graph(analyzer: &dyn IAnalyzer, params: UsageGraphParams) -> UsageG
     }
     UsageGraphResult {
         complete: incomplete_reasons.is_empty(),
+        session_subset: session_subset(analyzer),
         nodes,
         edges,
         truncated_symbols,

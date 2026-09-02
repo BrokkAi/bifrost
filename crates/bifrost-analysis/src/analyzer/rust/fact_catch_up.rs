@@ -345,6 +345,7 @@ mod tests {
     /// still not drag the hierarchy index in behind it, which is what kept the
     /// warms separate (#1757, d8920a38). The reference contexts it used to be
     /// paired with no longer exist to be built: resolution is per site.
+    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
     #[test]
     fn warming_the_usage_facts_does_not_build_the_hierarchy() {
         let (_temp, analyzer) = workspace_of(1);

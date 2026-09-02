@@ -252,7 +252,7 @@ policy_records! {
     Group { labels: ["group"], layout: Mixed, owner: OwnerApplicability::POLICY_ASSERTION, signature: "(group :name NAME :by (BINDING.FIELD...) (aggregate ...) ...)", description: "Group joined rows by registered fields and compute named aggregates." }
     Aggregate { labels: ["aggregate"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_ASSERTION, signature: "(aggregate :name NAME :op min|max|count|count-distinct|any|all|ordered-equal [:value BINDING.FIELD] [:left (BINDING.POSITION BINDING.VALUE) :right (BINDING.POSITION BINDING.VALUE)] [:where ((BINDING.FIELD OP VALUE)...)] )", description: "Compute one bounded typed aggregate within a row group." }
     CallArgument { labels: ["call-argument"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_ASSERTION, signature: "(call-argument :over NAME :formal-name \"NAME\") | (call-argument :over NAME :formal-index N)", description: "Select actual call arguments bound exactly to one formal name or index. The in-place lowering also requires exhaustive coverage, a non-terminal row, and a source argument identity." }
-    Call { labels: ["call"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_ASSERTION, signature: "(call :over NAME :resolves-to MODEL_ID|QUALIFIED_NAME :proof exact|declared [:receiver-type MODEL_TYPE_ID|QUALIFIED_TYPE])", description: "Select call-binding rows for one exact semantic-model identity or a quoted qualified locator resolved to one workspace/model identity, optionally constrained to an exact receiver owner type. `exact` requires typed selector proof, either derived singular dispatch or one exact complete authored summary contract. `declared` requires complete, unambiguous semantic-model provenance plus an exact signature and actual-to-formal binding, while leaving runtime dispatch coverage independent." }
+    Call { labels: ["call"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_ASSERTION, signature: "(call :over NAME :resolves-to MODEL_ID|QUALIFIED_NAME :proof exact|declared [:receiver-type MODEL_TYPE_ID|QUALIFIED_TYPE])", description: "Select call-binding rows for one exact semantic-model callable family or a quoted qualified locator resolved to one workspace/model identity, optionally constrained to an exact receiver owner type. `exact` requires typed selector proof plus an exact formal layout, without requiring one overload record when a complete family shares that layout. `declared` additionally requires complete, unambiguous semantic-model record provenance and one exact selected signature, while leaving runtime dispatch coverage independent." }
     RowAssert { labels: ["assert"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_ASSERTION, signature: "(assert [:id ID] :group NAME :value NAME :cardinality (exactly|at-least|at-most N))", description: "Assert a cardinality over one named aggregate in every row group." }
     RowAssertSelectedInWinningTier { labels: ["assert-selected-in-winning-tier"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_ASSERTION, signature: "(assert-selected-in-winning-tier :id ID :site NAME :candidates NAME [:cardinality (exactly|at-least|at-most N)])", description: "Require the selected candidate of every overload-selection row to sit in the winning applicability tier, meaning the set of candidates the resolver's own applicability check accepted. Authoring sugar: it lowers to one inner join on site_ast_id, one group keyed on the site, one counting aggregate over selected applicable candidates, and one cardinality assertion, and adds no evaluation rule of its own." }
     Assert { labels: ["assert"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_ASSERTION, signature: "(assert :id ID :at CAPTURE :role ROLE :expect declaration|reference|binding|none [:cardinality (exactly N)] [:namespace NAMESPACE] [:require-target true|false])", description: "Require or forbid occurrences at one captured AST node with exact cardinality." }
@@ -308,6 +308,7 @@ policy_records! {
     SubjectSet { labels: ["subject-set"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_TYPESTATE, signature: "(subject-set [:include-matches [...]] [:entries [...]])", description: "Compose the values newly tracked by a typestate policy." }
     Subject { labels: ["subject"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_TYPESTATE, signature: "(subject :id ID :selector SELECTOR :subject BINDING)", description: "Declare one policy-local typestate seed and its bound subject." }
     CallModeling { labels: ["call-modeling"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_TAINT_TYPESTATE_OR_FLOW, signature: "(call-modeling :unmodeled paranoid|optimistic|require-model)", description: "Choose fallback semantics for call arms without an executable body or applicable model." }
+    OnUnknown { labels: ["on-unknown"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_ALL, signature: "(on-unknown :verdict abstain|warn-unreliable|fail-closed)", description: "Declare what the run does when unknown or incomplete evidence blocked a verdict." }
     Uncertainty { labels: ["uncertainty"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_TYPESTATE, signature: "(uncertainty :escape inconclusive)", description: "Make escape capability gaps explicit." }
     Automaton { labels: ["automaton"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_TYPESTATE, signature: "(automaton :states [...] :initial STATE :accepting-states [...] :error-states [...] :events [...] :transitions [...] [:terminal-expectations [...]])", description: "Define the public typestate states, events, transitions, and terminal obligations." }
     Event { labels: ["event"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_TYPESTATE, signature: "(event :id ID (:calls CALLS | :matches MATCH-SET | :on SEMANTIC-EVENT) ...)", description: "Define one direct-call, endpoint, or semantic typestate event." }
@@ -514,6 +515,7 @@ macro_rules! value_shapes {
                     }
                     Self::TaintMode => Some(AtomDomain::TaintMode),
                     Self::UnmodeledCallBehavior => Some(AtomDomain::UnmodeledCallBehavior),
+                    Self::UnknownVerdict => Some(AtomDomain::UnknownVerdict),
                     Self::TrustBoundary => Some(AtomDomain::TrustBoundary),
                     Self::SystemEntry => Some(AtomDomain::SystemEntry),
                     Self::DirectoryScope => Some(AtomDomain::DirectoryScope),
@@ -615,6 +617,7 @@ macro_rules! value_shapes {
                     | Self::FindingCombinations
                     | Self::SubjectSet
                     | Self::CallModelingSpec
+                    | Self::OnUnknownSpec
                     | Self::UncertaintySpec
                     | Self::AutomatonSpec
                     | Self::CallsTrigger
@@ -728,6 +731,7 @@ macro_rules! value_shapes {
                     Self::FindingCombinations => &[PolicyRecord::FindingCombination],
                     Self::SubjectSet => &[PolicyRecord::SubjectSet],
                     Self::CallModelingSpec => &[PolicyRecord::CallModeling],
+                    Self::OnUnknownSpec => &[PolicyRecord::OnUnknown],
                     Self::UncertaintySpec => &[PolicyRecord::Uncertainty],
                     Self::AutomatonSpec => &[PolicyRecord::Automaton],
                     Self::CallsTrigger => &[PolicyRecord::Calls],
@@ -823,6 +827,7 @@ macro_rules! value_shapes {
                     | Self::EndpointRole
                     | Self::TaintMode
                     | Self::UnmodeledCallBehavior
+                    | Self::UnknownVerdict
                     | Self::TrustBoundary
                     | Self::SystemEntry
                     | Self::DirectoryScope
@@ -926,6 +931,7 @@ value_shapes! {
     PolicyPort => "matched-value, receiver, return-value, an indexed result record, or an argument record",
     TaintMode => "the may analysis mode",
     UnmodeledCallBehavior => "paranoid, optimistic, or require-model",
+    UnknownVerdict => "abstain, warn-unreliable, or fail-closed",
     TaintEndpointSet => "an endpoint-set record",
     MatchEndpointSet => "a match-directory or match-endpoints record",
     CategoryPredicate => "an exact any or all category predicate",
@@ -980,6 +986,7 @@ value_shapes! {
     FindingCombinations => "finding-combination records",
     SubjectSet => "a subject-set record",
     CallModelingSpec => "a call-modeling record",
+    OnUnknownSpec => "an on-unknown record",
     UncertaintySpec => "an uncertainty record",
     AutomatonSpec => "an automaton record",
     CallsTrigger => "a calls record",
@@ -1138,6 +1145,7 @@ policy_fields! {
     AnalysisSelector { record: Analysis, labels: ["selector"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: Selector, owner: OwnerApplicability::POLICY_MATCH, signature: ":selector (rql ...)|(rql-file ...)", description: "Select positive location-bearing match results." }
     AnalysisMode { record: Analysis, labels: ["mode"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: TaintMode, owner: OwnerApplicability::POLICY_TAINT_TYPESTATE_OR_FLOW, signature: ":mode may", description: "Select the schema-version-1 may analysis mode." }
     AnalysisCallModeling { record: Analysis, labels: ["call-modeling"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: CallModelingSpec, owner: OwnerApplicability::POLICY_TAINT_TYPESTATE_OR_FLOW, signature: ":call-modeling (call-modeling :unmodeled paranoid|optimistic|require-model)", description: "Choose fallback behavior for unmodeled calls; omission defaults to paranoid." }
+    AnalysisOnUnknown { record: Analysis, labels: ["on-unknown"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: OnUnknownSpec, owner: OwnerApplicability::POLICY_ALL, signature: ":on-unknown (on-unknown :verdict abstain|warn-unreliable|fail-closed)", description: "Choose what a verdict blocked by unknown evidence does; omission defaults to abstain." }
     AnalysisSources { record: Analysis, labels: ["sources"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: TaintEndpointSet, owner: OwnerApplicability::POLICY_TAINT, child_context: TaintSources, signature: ":sources (endpoint-set ...)", description: "Compose the complete taint source set." }
     AnalysisSinks { record: Analysis, labels: ["sinks"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: TaintEndpointSet, owner: OwnerApplicability::POLICY_TAINT, child_context: TaintSinks, signature: ":sinks (endpoint-set ...)", description: "Compose the complete taint sink set." }
     AnalysisSanitizers { record: Analysis, labels: ["sanitizers"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: TaintEndpointSet, owner: OwnerApplicability::POLICY_TAINT, child_context: TaintSanitizers, signature: ":sanitizers (endpoint-set ...)", description: "Compose optional sanitizer models; omission is empty." }
@@ -1178,7 +1186,7 @@ policy_fields! {
     CallArgumentFormalIndex { record: CallArgument, labels: ["formal-index"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: NonNegativeInteger, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":formal-index N", description: "Select the zero-based formal index; mutually exclusive with formal-name." }
     CallOver { record: Call, labels: ["over"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: RowName, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":over NAME", description: "Name the call_binding relation to filter in place." }
     CallResolvesTo { record: Call, labels: ["resolves-to"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: Name, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":resolves-to MODEL_ID|QUALIFIED_NAME", description: "Name a stable semantic-model identity, or quote one qualified callable locator for resolution at the loaded-policy boundary. A qualified locator is never compared as a rendered name." }
-    CallProof { record: Call, labels: ["proof"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: Name, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":proof exact|declared", description: "Require either typed exact selector proof or exact declared overload evidence. Declared proof does not claim runtime dispatch is closed." }
+    CallProof { record: Call, labels: ["proof"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: Name, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":proof exact|declared", description: "Require either typed exact callable-family and formal-layout proof or exact declared overload-record evidence. Declared proof does not claim runtime dispatch is closed." }
     CallReceiverType { record: Call, labels: ["receiver-type"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: Name, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":receiver-type MODEL_TYPE_ID|QUALIFIED_TYPE", description: "Constrain the exact receiver to a stable semantic-model type identity, or quote one qualified type locator for loaded-policy resolution. A qualified locator is never compared as a rendered name." }
     RowAssertId { record: RowAssert, labels: ["id"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: LocalEntryId, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":id ID", description: "Optionally override the stable assertion identity derived from group and aggregate names." }
     RowAssertGroup { record: RowAssert, labels: ["group"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: RowName, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":group NAME", description: "Name the row group being asserted." }
@@ -1309,6 +1317,7 @@ policy_fields! {
     SubjectSelector { record: Subject, labels: ["selector"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: Selector, owner: OwnerApplicability::POLICY_TYPESTATE, signature: ":selector SELECTOR", description: "Select values that begin typestate tracking." }
     SubjectBinding { record: Subject, labels: ["subject"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: TypestateBinding, owner: OwnerApplicability::POLICY_TYPESTATE, signature: ":subject BINDING", description: "Bind the newly tracked value." }
     CallModelingUnmodeled { record: CallModeling, labels: ["unmodeled"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: UnmodeledCallBehavior, owner: OwnerApplicability::POLICY_TAINT_TYPESTATE_OR_FLOW, signature: ":unmodeled paranoid|optimistic|require-model", description: "Choose conservative propagation, preserve-only propagation, or abstention when no call model applies." }
+    OnUnknownVerdict { record: OnUnknown, labels: ["verdict"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: UnknownVerdict, owner: OwnerApplicability::POLICY_ALL, signature: ":verdict abstain|warn-unreliable|fail-closed", description: "Abstain and exit unreliable, keep the findings but gate on them alone, or treat the blocked verdict as a gate failure." }
     UncertaintyEscape { record: Uncertainty, labels: ["escape"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: InconclusivePolicy, owner: OwnerApplicability::POLICY_TYPESTATE, signature: ":escape inconclusive", description: "Mark subjects escaping the analysis root as incomplete." }
     AutomatonStates { record: Automaton, labels: ["states"], placement: FieldPlacement::Keyword, required: Required, multiplicity: NON_EMPTY_SET_256, shape: StateIds, owner: OwnerApplicability::POLICY_TYPESTATE, signature: ":states [STATE...]", description: "Declare every typestate state." }
     AutomatonInitial { record: Automaton, labels: ["initial"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: StateId, owner: OwnerApplicability::POLICY_TYPESTATE, signature: ":initial STATE", description: "Select the declared initial state." }
@@ -1528,6 +1537,7 @@ pub enum AtomDomain {
     CallPort,
     TaintMode,
     UnmodeledCallBehavior,
+    UnknownVerdict,
     TrustBoundary,
     SystemEntry,
     DirectoryScope,
@@ -1654,6 +1664,9 @@ atom_values! {
     UnmodeledCallParanoid { domain: UnmodeledCallBehavior, spellings: ["paranoid"], owner: OwnerApplicability::POLICY_TAINT_OR_TYPESTATE, description: "Conservatively propagate every transfer justified by structured call-site metadata." }
     UnmodeledCallOptimistic { domain: UnmodeledCallBehavior, spellings: ["optimistic"], owner: OwnerApplicability::POLICY_TAINT_OR_TYPESTATE, description: "Preserve existing facts without adding flows through the unseen body." }
     UnmodeledCallRequireModel { domain: UnmodeledCallBehavior, spellings: ["require-model"], owner: OwnerApplicability::POLICY_TAINT_OR_TYPESTATE, description: "Abstain from input-dependent transfer when no exact or curated model applies." }
+    UnknownVerdictAbstain { domain: UnknownVerdict, spellings: ["abstain"], owner: OwnerApplicability::POLICY_ALL, description: "Keep the findings, publish the inconclusive completion, and exit unreliable. The default." }
+    UnknownVerdictWarnUnreliable { domain: UnknownVerdict, spellings: ["warn-unreliable"], owner: OwnerApplicability::POLICY_ALL, description: "Keep the findings and the inconclusive completion, mark them unreliable, and exit on the findings alone." }
+    UnknownVerdictFailClosed { domain: UnknownVerdict, spellings: ["fail-closed"], owner: OwnerApplicability::POLICY_ALL, description: "Treat the blocked verdict as a gate failure at the policy severity, and name the unknown that caused it." }
     TrustExternal { domain: TrustBoundary, spellings: ["external"], owner: OwnerApplicability::BOTH, description: "The value crosses an external trust boundary." }
     TrustInternal { domain: TrustBoundary, spellings: ["internal"], owner: OwnerApplicability::BOTH, description: "The value originates inside the system trust boundary." }
     TrustSameZone { domain: TrustBoundary, spellings: ["same-trust-zone"], owner: OwnerApplicability::BOTH, description: "The value remains in the same trust zone." }
@@ -2102,6 +2115,8 @@ mod tests {
             AtomDomain::Port,
             AtomDomain::CallPort,
             AtomDomain::TaintMode,
+            AtomDomain::UnmodeledCallBehavior,
+            AtomDomain::UnknownVerdict,
             AtomDomain::TrustBoundary,
             AtomDomain::SystemEntry,
             AtomDomain::DirectoryScope,

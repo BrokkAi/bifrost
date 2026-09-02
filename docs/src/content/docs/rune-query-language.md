@@ -95,7 +95,7 @@ a quoted string is ordinary text, not a comment.
   (call :callee (name "eval"))) ; exclude generated paths in a real query
 ```
 
-Head symbols such as `call`, `function`, `class`, and `import` map to normalized structural kinds. Keyword fields such as `:callee`, `:args`, `:module`, `:decorators`, `:iterable`, and `:elements` map to normalized roles.
+Head symbols such as `call`, `function`, `class`, `module`, and `import` map to normalized structural kinds. Keyword fields such as `:callee`, `:args`, `:module`, `:decorators`, `:iterable`, and `:elements` map to normalized roles. Position decides which vocabulary a spelling belongs to: `(module :name "tests")` is the module-declaration kind, while `(import :module (name "fmt"))` constrains the module role of an import.
 
 Predicate forms constrain fields on a pattern:
 
@@ -390,6 +390,10 @@ The raw `call_result_contract` fields preserve the authored shape.
 present or absent together. `result_success_predicate` records a reviewed
 predicate on the protected result: it is required for a direct contract and
 may also record an independently reviewed correlation for a paired contract.
+Both fields use the finite `null`, `non_null`, `true`, and `false` vocabulary.
+For Boolean results, only a guard over the exact retained result identity
+selects the corresponding true or false control edge; an overwrite or an
+ambiguous reaching definition remains open.
 A positive direct row therefore has `result_ordinal` and
 `result_success_predicate`, but omits `condition_result_ordinal` and
 `predicate`. A terminal row has `terminal = true`, omits all result ordinals

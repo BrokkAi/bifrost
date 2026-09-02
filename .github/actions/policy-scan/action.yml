@@ -19,7 +19,7 @@ inputs:
       install and uses a release or debug `bifrost` binary from the checkout,
       otherwise the `bifrost` already on PATH.
     required: false
-    default: v0.10.8
+    default: v0.10.9
   policy-packs:
     description: Space-separated built-in pack IDs to run.
     required: false
@@ -142,14 +142,27 @@ runs:
         # executable lives inside it, next to the license files.
         echo "bifrost_bin=${dir}/${stage}/${bin}" >> "${GITHUB_OUTPUT}"
 
+    - name: Resolve analyzer cache identity
+      id: analyzer-cache-identity
+      if: inputs.cache == 'true'
+      shell: bash
+      env:
+        BIFROST_BIN: ${{ steps.install.outputs.bifrost_bin }}
+      run: |
+        set -euo pipefail
+        identity=$("${BIFROST_BIN}" --build-identity)
+        if [[ ! "${identity}" =~ ^[0-9a-f]{40}$ ]]; then
+          echo "::error::Bifrost returned an invalid build identity: ${identity}"
+          exit 1
+        fi
+        echo "value=${identity}" >> "${GITHUB_OUTPUT}"
+
     - name: Analyzer cache
       if: inputs.cache == 'true'
       uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
       with:
         path: .bifrost/cache
-        key: bifrost-policy-cache-${{ runner.os }}-${{ runner.arch }}-${{ inputs.version }}-${{ github.run_id }}
-        restore-keys: |
-          bifrost-policy-cache-${{ runner.os }}-${{ runner.arch }}-${{ inputs.version }}-
+        key: bifrost-policy-cache-${{ runner.os }}-${{ runner.arch }}-${{ inputs.version }}-${{ steps.analyzer-cache-identity.outputs.value }}
 
     - name: Run policies
       id: run

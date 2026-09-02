@@ -125,6 +125,22 @@ pub enum TypestateObjectKey {
     External(SemanticLocator),
 }
 
+impl TypestateObjectKey {
+    pub fn for_object(object: &AbstractObject) -> Self {
+        typestate_object_key(object)
+    }
+
+    /// Render the source-facing stable object identity without the absolute
+    /// workspace mount. This is the object-only counterpart of
+    /// `TypestateSubjectKey::public_canonical_rendering`.
+    pub fn public_canonical_rendering(&self) -> String {
+        let mut value = serde_json::to_value(canonical_object_key(self))
+            .expect("canonical typestate object identities are serializable");
+        remove_canonical_mounts(&mut value);
+        serde_json::to_string(&value).expect("public typestate object identities are serializable")
+    }
+}
+
 /// Stable semantic identity for one tracked subject class and abstract object.
 ///
 /// The object key is derived from validated semantic handles. Callers cannot
@@ -140,7 +156,7 @@ impl TypestateSubjectKey {
     pub fn for_object(class: TypestateSubjectClassKey, object: &AbstractObject) -> Self {
         Self {
             class,
-            object: typestate_object_key(object),
+            object: TypestateObjectKey::for_object(object),
         }
     }
 

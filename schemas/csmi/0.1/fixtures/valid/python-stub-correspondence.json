@@ -1,0 +1,123 @@
+{
+  "documentType": "semantic-document",
+  "schema": "https://csmi.brokk.ai/schema/0.1/schema.json",
+  "semanticModelVersion": "0.1",
+  "serializationVersion": "0.1-json",
+  "provenanceRecords": [
+    {
+      "id": "typeshed-parser",
+      "producer": {
+        "identifier": "https://example.org/typeshed-consumer",
+        "version": "1.0.0"
+      },
+      "generationMethod": "source-analysis",
+      "inputs": [
+        {
+          "role": "typeshed-snapshot",
+          "purl": "pkg:github/python/typeshed@0123456789abcdef0123456789abcdef01234567"
+        }
+      ]
+    }
+  ],
+  "defaultProvenance": "typeshed-parser",
+  "semanticModels": [
+    {
+      "artifactSelectors": [
+        {
+          "purl": "pkg:github/python/typeshed@0123456789abcdef0123456789abcdef01234567"
+        }
+      ],
+      "vocabularyUses": [
+        {
+          "identifier": "csmi.python",
+          "version": "0.1.0",
+          "schema": "https://csmi.brokk.ai/schema/profiles/python/0.1/schema.json",
+          "requirement": "required",
+          "affects": [
+            {
+              "kind": "core-slot",
+              "slot": "symbol-identity-scheme",
+              "target": { "model": "self" }
+            },
+            {
+              "kind": "fact-family",
+              "family": "declaration-correspondence",
+              "scope": {
+                "declarationArtifact": "model",
+                "runtimeArtifact": "pkg:generic/python-runtime@3.13.0?component=stdlib&implementation=cpython"
+              }
+            }
+          ]
+        }
+      ],
+      "symbols": [
+        {
+          "id": "stub-path",
+          "scheme": "csmi.python",
+          "schemeVersion": "0.1.0",
+          "stability": "portable",
+          "descriptors": [
+            { "role": "namespace", "name": "pathlib" },
+            { "role": "type", "name": "Path" }
+          ]
+        },
+        {
+          "id": "runtime-path",
+          "artifactSelectors": [
+            {
+              "purl": "pkg:generic/python-runtime@3.13.0?component=stdlib&implementation=cpython"
+            }
+          ],
+          "scheme": "csmi.python",
+          "schemeVersion": "0.1.0",
+          "stability": "portable",
+          "descriptors": [
+            { "role": "namespace", "name": "pathlib" },
+            { "role": "type", "name": "Path" }
+          ]
+        }
+      ],
+      "declarations": [
+        { "symbol": "stub-path", "category": "type" },
+        { "symbol": "runtime-path", "category": "type" }
+      ],
+      "extensionFacts": [
+        {
+          "vocabulary": "csmi.python",
+          "version": "0.1.0",
+          "family": "declaration-correspondence",
+          "scope": {
+            "declarationArtifact": "model",
+            "runtimeArtifact": "pkg:generic/python-runtime@3.13.0?component=stdlib&implementation=cpython"
+          },
+          "payload": {
+            "kind": "declaration-correspondence",
+            "mappings": [
+              {
+                "declaration": "stub-path",
+                "runtime": "runtime-path",
+                "relation": "describes",
+                "conditions": {
+                  "python": "3.13.0",
+                  "implementation": ["cpython"]
+                }
+              }
+            ]
+          }
+        }
+      ],
+      "completenessStatements": [
+        {
+          "vocabulary": "csmi.python",
+          "version": "0.1.0",
+          "family": "declaration-correspondence",
+          "scope": {
+            "declarationArtifact": "model",
+            "runtimeArtifact": "pkg:generic/python-runtime@3.13.0?component=stdlib&implementation=cpython"
+          },
+          "status": "complete"
+        }
+      ]
+    }
+  ]
+}

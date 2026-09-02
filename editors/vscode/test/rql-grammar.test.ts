@@ -245,12 +245,17 @@ void test("highlights semantic traversal forms and options", async () => {
 void test("highlights receiver traversal forms and capture options", async () => {
   const tokens = tokenizeGrammar(
     await grammar(),
-    "(receiver-targets (call)) (points-to :capture service (call :receiver (capture service))) (member-targets (field-access))"
+    "(receiver-targets (call)) (points-to :capture service (call :receiver (capture service))) " +
+      '(field-write-value :receiver-identity-id "type-id" :member-target-id "member-id" ' +
+      "(member-targets (field-access)))"
   );
   assertScoped(tokens, "receiver-targets", "support.function.wrapper.bifrost-rql");
   assertScoped(tokens, "points-to", "support.function.wrapper.bifrost-rql");
   assertScoped(tokens, ":capture", "variable.parameter.role.bifrost-rql");
   assertScoped(tokens, "member-targets", "support.function.wrapper.bifrost-rql");
+  assertScoped(tokens, "field-write-value", "support.function.wrapper.bifrost-rql");
+  assertScoped(tokens, ":receiver-identity-id", "variable.parameter.role.bifrost-rql");
+  assertScoped(tokens, ":member-target-id", "variable.parameter.role.bifrost-rql");
 });
 
 void test("highlights schema-v3 CFG forms and aliases", async () => {

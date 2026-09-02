@@ -511,7 +511,7 @@ impl PackIdentity {
         members: Vec<MemberFact>,
     ) -> AuthoredSemanticModelPack {
         AuthoredSemanticModelPack {
-            schema_version: 1,
+            schema_version: 2,
             pack_id: self.pack_id.clone(),
             version: PACK_CONTENT_VERSION.to_owned(),
             producer: Producer {

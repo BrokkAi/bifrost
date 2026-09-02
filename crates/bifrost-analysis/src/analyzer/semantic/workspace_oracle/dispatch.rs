@@ -175,7 +175,7 @@ impl PreparedWorkspaceDispatchSession<'_> {
                 "prepared dispatch call must belong to the exact semantic artifact allocation",
             ));
         }
-        if let Some(outcome) = self.resolve_declared_js_ts_binding_call(call, request)? {
+        if let Some(outcome) = self.resolve_declared_indirect_local_call(call, request)? {
             return Ok(outcome);
         }
         let call_span = exact_call_range(call)?;
@@ -261,20 +261,22 @@ impl PreparedWorkspaceDispatchSession<'_> {
         outcome
     }
 
-    /// Materialize a JS/TS adapter-proven same-artifact target without asking
+    /// Materialize an adapter-proven same-artifact indirect target without asking
     /// a source-level definition resolver to rediscover a lexical callable
     /// value binding it does not model. Direct callable syntax stays on the
     /// ordinary resolver route. The semantic artifact validation already
     /// proved the local procedure ID, and dispatch provenance below retains
     /// the exact call and target evidence just like that route.
-    fn resolve_declared_js_ts_binding_call(
+    fn resolve_declared_indirect_local_call(
         &mut self,
         call: &CallSiteHandle,
         request: &mut SemanticRequest<'_>,
     ) -> Result<Option<SemanticOutcome<DispatchResult>>, SemanticProviderError> {
         if !matches!(
             self.artifact.key().language(),
-            LanguageDialect::Standard(Language::JavaScript | Language::TypeScript)
+            LanguageDialect::Standard(
+                Language::JavaScript | Language::TypeScript | Language::Kotlin
+            )
         ) {
             return Ok(None);
         }
@@ -2436,17 +2438,34 @@ fn low_level_boundary(
                 },
             }
         }
-        CallDispatchBoundaryKind::Unresolved(status) => DispatchBoundary {
-            kind: DispatchBoundaryKind::Unresolved,
-            exact_external_target: None,
-            unmaterialized_external_target: None,
-            proof: ProofStatus::Unproven(
-                format!("exact dispatch status is {}", status.as_str()).into(),
-            ),
-            completeness: EvidenceCompleteness::Partial(
-                "no materialized workspace target is available".into(),
-            ),
-            provenance: Box::new([]),
+        CallDispatchBoundaryKind::Unresolved(status) => unresolved_dispatch_boundary(*status),
+        CallDispatchBoundaryKind::UnresolvedWithTarget {
+            status,
+            callee_text,
+            normalized_static_owner,
+        } => match semantic_call.and_then(|semantic_call| {
+            synthetic_unmaterialized_external(
+                callee_text,
+                language,
+                semantic_call,
+                exact_external_call,
+                normalized_static_owner.as_deref(),
+            )
+        }) {
+            Some(target) => DispatchBoundary {
+                kind: DispatchBoundaryKind::External(Some(target.locator().clone())),
+                exact_external_target: None,
+                unmaterialized_external_target: Some(target),
+                proof: ProofStatus::Unproven(
+                    format!("exact dispatch status is {}", status.as_str()).into(),
+                ),
+                completeness: EvidenceCompleteness::Partial(
+                    "the retained canonical callee does not prove one resolved dispatch target"
+                        .into(),
+                ),
+                provenance: Box::new([]),
+            },
+            None => unresolved_dispatch_boundary(*status),
         },
         CallDispatchBoundaryKind::UnprovenTargetIdentity => DispatchBoundary {
             kind: DispatchBoundaryKind::Unresolved,
@@ -2461,6 +2480,21 @@ fn low_level_boundary(
             provenance: Box::new([]),
         },
         CallDispatchBoundaryKind::Truncated => truncated_dispatch_boundary(),
+    }
+}
+
+fn unresolved_dispatch_boundary(status: DefinitionLookupStatus) -> DispatchBoundary {
+    DispatchBoundary {
+        kind: DispatchBoundaryKind::Unresolved,
+        exact_external_target: None,
+        unmaterialized_external_target: None,
+        proof: ProofStatus::Unproven(
+            format!("exact dispatch status is {}", status.as_str()).into(),
+        ),
+        completeness: EvidenceCompleteness::Partial(
+            "no materialized workspace target is available".into(),
+        ),
+        provenance: Box::new([]),
     }
 }
 
@@ -2493,7 +2527,9 @@ fn low_level_boundary(
 /// source alias such as `files.Open` with the structured canonical import path
 /// `os.Open` before classification. JS/TS direct named imports likewise arrive
 /// with the module specifier and imported symbol proven by the import binder,
-/// even though the source call itself is bare.
+/// even though the source call itself is bare. Any resolver-owned exact proof
+/// may carry a single-segment owner: Python's explicit import binder proves
+/// `subprocess.run` without treating that spelling as a global API.
 fn synthetic_unmaterialized_external(
     callee_text: &str,
     language: SemanticLanguage,
@@ -2503,8 +2539,11 @@ fn synthetic_unmaterialized_external(
 ) -> Option<UnmaterializedExternalTarget> {
     let (owner_fqn, member) = split_canonical_qualified_callee(callee_text, language.language())?;
     let canonical_go_import = language == SemanticLanguage::Standard(Language::Go);
+    let resolver_owned_identity =
+        exact_external_call.is_some_and(|proof| proof.canonical_callee() == callee_text);
     if !owner_fqn.contains('.')
         && !canonical_go_import
+        && !resolver_owned_identity
         && !language_support(language.language())
             .is_some_and(LanguageSupport::publishes_single_segment_external_owners)
     {
@@ -2606,10 +2645,10 @@ fn dispatch_coverage(
         .any(|boundary| boundary.kind == DispatchBoundaryKind::Truncated)
     {
         CandidateCoverage::Truncated
-    } else if boundaries
-        .iter()
-        .any(|boundary| boundary.kind == DispatchBoundaryKind::Unresolved)
-    {
+    } else if boundaries.iter().any(|boundary| {
+        boundary.kind == DispatchBoundaryKind::Unresolved
+            || matches!(boundary.proof, ProofStatus::Unproven(_))
+    }) {
         CandidateCoverage::Open
     } else {
         match status {
@@ -3028,13 +3067,23 @@ impl<'a> ProcedureLookupProgress<'a> {
     }
 
     fn examine(&mut self) -> Result<(), ProcedureRangeLookupStatus> {
+        self.examine_many(1)
+    }
+
+    /// Charge `count` examination steps at once.
+    ///
+    /// A caller that knows the cost of the whole unit it is about to inspect
+    /// charges it here instead of looping over [`Self::examine`], so the
+    /// budget sees one decision per unit.
+    fn examine_many(&mut self, count: usize) -> Result<(), ProcedureRangeLookupStatus> {
         if self.cancellation.is_cancelled() {
             return Err(ProcedureRangeLookupStatus::Cancelled);
         }
-        if self.examined >= self.max_examined {
+        let examined = self.examined.saturating_add(count);
+        if examined > self.max_examined {
             return Err(ProcedureRangeLookupStatus::BudgetExhausted);
         }
-        self.examined = self.examined.saturating_add(1);
+        self.examined = examined;
         Ok(())
     }
 
@@ -3162,6 +3211,42 @@ pub fn procedures_for_source_ranges(
         if let Some(handle) = artifact.procedure_handle(procedure.id()) {
             handles.push(handle);
         }
+    }
+    ProcedureRangeLookup {
+        handles,
+        examined: progress.examined,
+        status: ProcedureRangeLookupStatus::Complete,
+    }
+}
+
+/// Every procedure in one file artifact, charged against the shared traversal
+/// budget.
+///
+/// Policy call binding uses this instead of narrowing by procedure-anchor
+/// containment. Narrowing loses calls in languages whose procedure anchors
+/// cover only the declaration header: Ruby anchors `def name`, not the body,
+/// so no procedure ever contains a body span (#1953 for taint, #1957 for
+/// typestate). The call site's own source anchor, which the caller compares
+/// when it selects a call, is the identity that decides the binding.
+///
+/// Each procedure costs `1 + call_sites().len()` because the caller inspects
+/// every call site of every returned procedure.
+pub fn procedures_in_artifact(
+    artifact: &Arc<SemanticArtifact>,
+    max_examined: usize,
+    cancellation: &CancellationToken,
+) -> ProcedureRangeLookup {
+    let mut progress = ProcedureLookupProgress::new(max_examined, cancellation);
+    let mut handles = Vec::with_capacity(artifact.procedures().len());
+    for procedure in artifact.procedures() {
+        if let Err(status) = progress.examine_many(1 + procedure.call_sites().len()) {
+            return progress.failed(status);
+        }
+        handles.push(
+            artifact
+                .procedure_handle(procedure.id())
+                .expect("validated artifact procedure has a scoped handle"),
+        );
     }
     ProcedureRangeLookup {
         handles,
@@ -3515,6 +3600,61 @@ mod tests {
     }
 
     #[test]
+    fn unresolved_canonical_callee_is_model_bindable_but_stays_open() {
+        let (_fixture, call) = semantic_call_fixture_for_language(
+            Language::Java,
+            "Caller.java",
+            "class Caller { void call() { com.example.Missing.run(); } }\n",
+        );
+        let semantic_call = call
+            .procedure()
+            .semantics()
+            .call_site(call.id())
+            .expect("fixture call belongs to its procedure");
+        let named = low_level_boundary(
+            &CallDispatchBoundaryKind::UnresolvedWithTarget {
+                status: DefinitionLookupStatus::NotFound,
+                callee_text: "com.example.Missing.run".into(),
+                normalized_static_owner: Some("com.example.Missing".into()),
+            },
+            SemanticLanguage::Standard(Language::Java),
+            Some(semantic_call),
+            None,
+        );
+
+        let target = named
+            .unmaterialized_external_target()
+            .expect("structured callee and semantic call mint a model key");
+        assert_eq!(target.owner_fqn(), "com.example.Missing");
+        assert_eq!(target.member(), "run");
+        assert!(!target.has_receiver());
+        assert!(matches!(
+            named.kind,
+            DispatchBoundaryKind::External(Some(ref locator)) if locator == target.locator()
+        ));
+        assert!(matches!(named.proof, ProofStatus::Unproven(_)));
+        assert!(matches!(
+            named.completeness,
+            EvidenceCompleteness::Partial(_)
+        ));
+        assert_eq!(
+            dispatch_coverage(Some(DefinitionLookupStatus::NotFound), &[named]),
+            CandidateCoverage::Open,
+            "a bindable model key must not turn an unresolved lookup exhaustive"
+        );
+
+        let unnamed = low_level_boundary(
+            &CallDispatchBoundaryKind::Unresolved(DefinitionLookupStatus::NotFound),
+            SemanticLanguage::Standard(Language::Java),
+            Some(semantic_call),
+            None,
+        );
+        assert_eq!(unnamed.kind, DispatchBoundaryKind::Unresolved);
+        assert!(unnamed.target_locator().is_none());
+        assert!(unnamed.unmaterialized_external_target().is_none());
+    }
+
+    #[test]
     fn adapter_proven_local_callback_bypasses_source_rediscovery() {
         let source = "export function caller() { const callback = () => 1; callback(); }\n";
         let (fixture, call) = semantic_call_fixture_for("callback.ts", source);
@@ -3555,6 +3695,48 @@ mod tests {
         assert!(session.retained_bytes() >= source.len());
     }
 
+    #[test]
+    fn kotlin_adapter_proven_local_callback_bypasses_source_rediscovery() {
+        let source = "fun caller() { val callback = { 1 }; callback() }\n";
+        let (fixture, call) =
+            semantic_call_fixture_for_language(Language::Kotlin, "callback.kt", source);
+        let declared_target = match &call
+            .procedure()
+            .semantics()
+            .call_site(call.id())
+            .expect("call belongs to its procedure")
+            .declared_targets
+        {
+            CallableTargetResolution::Proven(CallableTarget::Local(target)) => *target,
+            other => panic!("expected one adapter-proven local callback, got {other:?}"),
+        };
+        let artifact = Arc::clone(call.procedure().artifact());
+        let mut session = fixture
+            .analyzer
+            .semantic_oracle_provider()
+            .prepare_call_dispatch_session(artifact);
+        let cancellation = CancellationToken::default();
+        let mut budget = SemanticBudget::default();
+        let outcome = session
+            .resolve_call(&call, &mut SemanticRequest::new(&mut budget, &cancellation))
+            .expect("adapter-proven Kotlin callback dispatch");
+        let SemanticOutcome::Complete { value, .. } = outcome else {
+            panic!("adapter-proven Kotlin local dispatch must be complete: {outcome:?}");
+        };
+
+        assert_eq!(value.coverage(), CandidateCoverage::Exhaustive);
+        assert_eq!(value.candidates().len(), 1);
+        assert_eq!(value.candidates()[0].target().id(), declared_target);
+        assert_eq!(value.candidates()[0].proof(), &ProofStatus::Proven);
+        assert_eq!(
+            value.candidates()[0].completeness(),
+            &EvidenceCompleteness::Complete
+        );
+        assert!(!value.candidates()[0].provenance().is_empty());
+        assert_eq!(budget.used().source_bytes, source.len());
+        assert!(session.retained_bytes() >= source.len());
+    }
+
     fn assert_declared_binding_shortcut_is_skipped(language: Language, name: &str, source: &str) {
         let (fixture, call) = semantic_call_fixture_for_language(language, name, source);
         assert!(matches!(
@@ -3573,7 +3755,7 @@ mod tests {
         let cancellation = CancellationToken::default();
         let mut budget = SemanticBudget::default();
         let outcome = session
-            .resolve_declared_js_ts_binding_call(
+            .resolve_declared_indirect_local_call(
                 &call,
                 &mut SemanticRequest::new(&mut budget, &cancellation),
             )
@@ -3585,7 +3767,7 @@ mod tests {
     }
 
     #[test]
-    fn non_js_ts_local_target_stays_on_source_resolver_route() {
+    fn go_local_target_stays_on_source_resolver_route() {
         assert_declared_binding_shortcut_is_skipped(
             Language::Go,
             "call.go",
@@ -3929,6 +4111,29 @@ mod tests {
             tuple_target.arity(),
             2,
             "the semantic fixture has no written arguments; arity comes from the resolver proof"
+        );
+        let python_proof = ExactExternalCallProof::python_imported_call("subprocess.run", 2);
+        let python_target = synthetic_unmaterialized_external(
+            "subprocess.run",
+            SemanticLanguage::Standard(Language::Python),
+            semantic_call,
+            Some(&python_proof),
+            None,
+        )
+        .expect("the Python resolver-owned import identity admits a single-segment module");
+        assert_eq!(python_target.owner_fqn(), "subprocess");
+        assert_eq!(python_target.member(), "run");
+        assert_eq!(python_target.arity(), 2);
+        assert!(
+            synthetic_unmaterialized_external(
+                "subprocess.run",
+                SemanticLanguage::Standard(Language::Python),
+                semantic_call,
+                None,
+                None,
+            )
+            .is_none(),
+            "the same Python spelling without import proof stays unsupported"
         );
         assert!(
             synthetic_unmaterialized_external(
@@ -5642,6 +5847,70 @@ pub fn prelude(text: &str) {
                 (
                     "std::str::from_utf8(bytes)".to_owned(),
                     Some(("std.str".to_owned(), "from_utf8".to_owned(), 1, false))
+                ),
+            ]
+        );
+    }
+
+    /// The C++ fixture behind the #2606 acceptance. It holds one external call
+    /// per qualification shape plus the two workspace-defined controls that
+    /// must keep resolving in the workspace.
+    const CPP_EXTERNAL_CALL_SOURCE: &str = r#"namespace app {
+
+struct Local {
+    static int stat(const char* p) { return 1; }
+};
+
+int helper(const char* p) { return 2; }
+
+int run(const char* p) {
+    return std::filesystem::exists(p)
+        + ns::Type::method(p)
+        + ns::f(p)
+        + app::Local::stat(p)
+        + app::helper(p);
+}
+
+}
+"#;
+
+    /// #2606: a `::`-qualified C++ callee with no workspace definition
+    /// publishes the dot-joined canonical identity an authored
+    /// `std.filesystem.exists` summary is posted under.
+    ///
+    /// The cut takes the last separator, so `ns::Type::method` is owner
+    /// `ns.Type` and member `method`, never owner `ns` and member
+    /// `Type::method`.
+    ///
+    /// `has_receiver` is `false` for all of them: C++ lowers a call receiver
+    /// only for a `field_expression` target (`obj.method()`), never for a
+    /// `qualified_identifier`, so an authored C++ summary for a qualified
+    /// callee must declare `"has_receiver": false`.
+    ///
+    /// A single-segment owner (`ns::f`) names no identity. C++ does not
+    /// publish single-segment external owners (#2598) and has no import binder
+    /// that could expand one, so such a call keeps the boundary it had.
+    #[test]
+    fn a_qualified_cpp_callee_publishes_a_dot_joined_external_identity() {
+        let identities =
+            external_call_identities(Language::Cpp, "app.cpp", CPP_EXTERNAL_CALL_SOURCE);
+        assert_eq!(
+            identities,
+            vec![
+                // Defined in this workspace, so it resolves rather than
+                // minting an external identity.
+                ("app::Local::stat(p)".to_owned(), None),
+                ("app::helper(p)".to_owned(), None),
+                (
+                    "ns::Type::method(p)".to_owned(),
+                    Some(("ns.Type".to_owned(), "method".to_owned(), 1, false))
+                ),
+                // A single-segment owner is out of scope for the same reason
+                // Rust's prelude spelling is.
+                ("ns::f(p)".to_owned(), None),
+                (
+                    "std::filesystem::exists(p)".to_owned(),
+                    Some(("std.filesystem".to_owned(), "exists".to_owned(), 1, false))
                 ),
             ]
         );

@@ -251,11 +251,38 @@ class SearchSymbolsFile:
 
 
 @dataclass(frozen=True)
+class SessionSubset:
+    """How many files a scoped session covers.
+
+    Present on a cross-file result only when the session was built over an
+    explicitly named subset of the workspace -- ``Session(root, sources=[...])``,
+    the CLI ``--sources`` flag, or their git-revision forms. ``None`` means the
+    session covers the whole workspace, so a negative answer is a
+    whole-workspace negative.
+    """
+
+    files: int
+
+    @classmethod
+    def from_dict(cls, data: dict) -> SessionSubset:
+        return cls(files=int(data["files"]))
+
+    def render_text(self) -> str:
+        return f"session scope: {self.files} file(s)"
+
+
+def _session_subset(data: dict) -> SessionSubset | None:
+    subset = data.get("session_subset")
+    return SessionSubset.from_dict(subset) if subset is not None else None
+
+
+@dataclass(frozen=True)
 class SearchSymbolsResult:
     patterns: list[str]
     truncated: bool
     total_files: int
     files: list[SearchSymbolsFile]
+    session_subset: SessionSubset | None = None
     render_line_numbers: bool = True
     rendered_text: str | None = None
 
@@ -271,6 +298,7 @@ class SearchSymbolsResult:
                 SearchSymbolsFile.from_dict(item, render_line_numbers)
                 for item in data["files"]
             ],
+            session_subset=_session_subset(data),
             render_line_numbers=render_line_numbers,
             rendered_text=rendered_text,
         )
@@ -439,6 +467,16 @@ class CodeQueryProvenance:
 
 def _query_provenance(data: dict) -> list[CodeQueryProvenance]:
     return [CodeQueryProvenance.from_dict(item) for item in data.get("provenance", [])]
+
+
+def _optional_range(data: dict, key: str) -> CodeQueryRange | None:
+    value = data.get(key)
+    return CodeQueryRange.from_dict(value) if value is not None else None
+
+
+def _optional_declaration(data: dict, key: str) -> CodeQueryDeclaration | None:
+    value = data.get(key)
+    return CodeQueryDeclaration.from_dict(value) if value is not None else None
 
 
 @dataclass(frozen=True)
@@ -2538,33 +2576,6 @@ class CodeQueryRewritePath:
         return "\n".join(lines)
 
 
-CodeQueryResultItem = (
-    CodeQueryMatch
-    | CodeQueryDeclaration
-    | CodeQueryProcedure
-    | CodeQueryProgramPoint
-    | CodeQueryControlEdge
-    | CodeQueryTypestateFinding
-    | CodeQueryTypestateWitness
-    | CodeQueryFlowEndpoint
-    | CodeQueryFlowWitness
-    | CodeQueryTaintFinding
-    | CodeQueryFile
-    | CodeQueryReferenceSite
-    | CodeQueryCallSite
-    | CodeQueryExpressionSite
-    | CodeQueryReceiverAnalysis
-    | CodeQueryOccurrence
-    | CodeQueryLexicalScope
-    | CodeQueryBinding
-    | CodeQueryResolutionCandidate
-    | CodeQueryReferenceEdge
-    | CodeQueryStateEvent
-    | CodeQueryFlowRelation
-    | CodeQueryRewritePath
-)
-
-
 @dataclass(frozen=True)
 class CodeQueryQualifiedPath:
     """One qualified-path chain: a linear sequence of segments (#1475).
@@ -2674,31 +2685,6 @@ class CodeQueryPathSegment:
         if details:
             return "\n".join([header, *(f"  {line}" for line in details)])
         return header
-
-
-CodeQueryResultItem = (
-    CodeQueryMatch
-    | CodeQueryDeclaration
-    | CodeQueryProcedure
-    | CodeQueryProgramPoint
-    | CodeQueryControlEdge
-    | CodeQueryTypestateFinding
-    | CodeQueryTypestateWitness
-    | CodeQueryFlowEndpoint
-    | CodeQueryFlowWitness
-    | CodeQueryTaintFinding
-    | CodeQueryFile
-    | CodeQueryReferenceSite
-    | CodeQueryCallSite
-    | CodeQueryExpressionSite
-    | CodeQueryReceiverAnalysis
-    | CodeQueryOccurrence
-    | CodeQueryLexicalScope
-    | CodeQueryBinding
-    | CodeQueryResolutionCandidate
-    | CodeQueryQualifiedPath
-    | CodeQueryPathSegment
-)
 
 
 @dataclass(frozen=True)
@@ -2875,65 +2861,2474 @@ class CodeQueryDeclarationState:
         return header
 
 
+@dataclass(frozen=True)
+class CodeQueryJsxAttributeValue:
+    """One exact operand projected from a JSX attribute.
+
+    ``range`` and ``ast_id`` belong to the normalized operand, not to the
+    enclosing attribute, which is what makes the row usable as a policy sink
+    subject. ``coverage`` states whether the projection saw the whole
+    attribute; ``reason`` says why when it did not.
+    """
+
+    id: str
+    ast_id: str
+    path: str
+    language: str
+    range: CodeQueryRange
+    text: str
+    element_identity: str
+    attribute_kind: str
+    coverage: str
+    element_name: str | None = None
+    attribute_name: str | None = None
+    property_name: str | None = None
+    reason: str | None = None
+    component: CodeQueryDeclaration | None = None
+    attribute_target: CodeQueryDeclaration | None = None
+    provenance: list[CodeQueryProvenance] = field(default_factory=list)
+    provenance_truncated: bool = False
+
+    @classmethod
+    def from_dict(cls, data: dict) -> CodeQueryJsxAttributeValue:
+        return cls(
+            id=data["id"],
+            ast_id=data["ast_id"],
+            path=data["path"],
+            language=data["language"],
+            range=CodeQueryRange.from_dict(data["range"]),
+            text=data["text"],
+            element_identity=data["element_identity"],
+            attribute_kind=data["attribute_kind"],
+            coverage=data["coverage"],
+            element_name=data.get("element_name"),
+            attribute_name=data.get("attribute_name"),
+            property_name=data.get("property_name"),
+            reason=data.get("reason"),
+            component=_optional_declaration(data, "component"),
+            attribute_target=_optional_declaration(data, "attribute_target"),
+            provenance=_query_provenance(data),
+            provenance_truncated=bool(data.get("provenance_truncated", False)),
+        )
+
+    def render_text(self) -> str:
+        attribute = self.attribute_name or self.attribute_kind
+        return (
+            f"{self.path}:{self.range.start_line}:{self.range.start_column} "
+            f"[jsx attribute value; {self.element_identity}; {self.coverage}] "
+            f"{self.element_name or 'unnamed'}.{attribute} = `{self.text}`"
+        )
+
+
+@dataclass(frozen=True)
+class CodeQueryMemberTarget:
+    """One member a member-target analysis resolved to.
+
+    The declaration fields are absent when the workspace indexes no
+    declaration for the member, which is why ``name``, ``fq_name`` and
+    ``kind`` are the only guaranteed identity.
+
+    The row's ``semantic_model`` and ``receiver_semantic_model`` provenance
+    objects are not mirrored here, the same choice
+    :class:`CodeQueryDeclaration` makes: model provenance is a nested
+    document rather than a row field, and ``model_id``/``pack_id`` on the
+    evidence rows carry the identities a policy joins on.
+    """
+
+    id: str
+    name: str
+    fq_name: str
+    kind: str
+    path: str | None = None
+    language: str | None = None
+    start_line: int | None = None
+    end_line: int | None = None
+    signature: str | None = None
+    node_range: CodeQueryRange | None = None
+    receiver_id: str | None = None
+    receiver_fq_name: str | None = None
+    receiver_kind: str | None = None
+    receiver_declaration: CodeQueryDeclaration | None = None
+    receiver_proof: str | None = None
+    receiver_binding_path: str | None = None
+    receiver_binding_range: CodeQueryRange | None = None
+    declaration: CodeQueryDeclaration | None = None
+
+    @classmethod
+    def from_dict(cls, data: dict) -> CodeQueryMemberTarget:
+        return cls(
+            id=data["id"],
+            name=data["name"],
+            fq_name=data["fq_name"],
+            kind=data["kind"],
+            path=data.get("path"),
+            language=data.get("language"),
+            start_line=_optional_int(data, "start_line"),
+            end_line=_optional_int(data, "end_line"),
+            signature=data.get("signature"),
+            node_range=_optional_range(data, "node_range"),
+            receiver_id=data.get("receiver_id"),
+            receiver_fq_name=data.get("receiver_fq_name"),
+            receiver_kind=data.get("receiver_kind"),
+            receiver_declaration=_optional_declaration(data, "receiver_declaration"),
+            receiver_proof=data.get("receiver_proof"),
+            receiver_binding_path=data.get("receiver_binding_path"),
+            receiver_binding_range=_optional_range(data, "receiver_binding_range"),
+            declaration=_optional_declaration(data, "declaration"),
+        )
+
+    def render_text(self) -> str:
+        rendered = f"{self.fq_name} [{self.kind}]"
+        if self.receiver_fq_name is not None:
+            rendered += f" on {self.receiver_fq_name}"
+        return rendered
+
+
+@dataclass(frozen=True)
+class CodeQueryMemberTargetAnalysis:
+    """One analyzed member-access site and the members it resolved to.
+
+    ``coverage`` is the axis a policy must read before treating
+    ``member_targets`` as the complete member set.
+    """
+
+    site_id: str
+    path: str
+    language: str
+    range: CodeQueryRange
+    text: str
+    input_kind: str
+    outcome: str
+    coverage: str
+    site_ast_id: str | None = None
+    member_range: CodeQueryRange | None = None
+    capture: str | None = None
+    member_targets: list[CodeQueryMemberTarget] = field(default_factory=list)
+    reason: str | None = None
+    limit: str | None = None
+    provenance: list[CodeQueryProvenance] = field(default_factory=list)
+    provenance_truncated: bool = False
+
+    @classmethod
+    def from_dict(cls, data: dict) -> CodeQueryMemberTargetAnalysis:
+        return cls(
+            site_id=data["site_id"],
+            path=data["path"],
+            language=data["language"],
+            range=CodeQueryRange.from_dict(data["range"]),
+            text=data["text"],
+            input_kind=data["input_kind"],
+            outcome=data["outcome"],
+            coverage=data["coverage"],
+            site_ast_id=data.get("site_ast_id"),
+            member_range=_optional_range(data, "member_range"),
+            capture=data.get("capture"),
+            member_targets=[
+                CodeQueryMemberTarget.from_dict(item)
+                for item in data.get("member_targets", [])
+            ],
+            reason=data.get("reason"),
+            limit=data.get("limit"),
+            provenance=_query_provenance(data),
+            provenance_truncated=bool(data.get("provenance_truncated", False)),
+        )
+
+    def render_text(self) -> str:
+        lines = [
+            f"{self.path}:{self.range.start_line}:{self.range.start_column} "
+            f"[member target analysis; {self.outcome}; {self.coverage}] `{self.text}`"
+        ]
+        lines.extend(f"  member -> {target.render_text()}" for target in self.member_targets)
+        if self.reason is not None:
+            lines.append(f"  reason -> {self.reason}")
+        if self.limit is not None:
+            lines.append(f"  limit -> {self.limit}")
+        return "\n".join(lines)
+
+
+@dataclass(frozen=True)
+class CodeQueryReceiverOutcome:
+    """The mandatory terminal row for one analyzed receiver or member site.
+
+    The row exists even when the site resolved to nothing, and ``coverage``
+    states whether that emptiness is exhaustive. Reading ``candidate_count``
+    without ``coverage`` turns an unknown site into a proven-empty one.
+    """
+
+    id: str
+    site_id: str
+    path: str
+    language: str
+    range: CodeQueryRange
+    analysis_kind: str
+    outcome: str
+    coverage: str
+    candidate_count: int
+    candidates_truncated: bool
+    setup_nodes: int
+    summary_expansions: int
+    scope_nodes: int
+    site_ast_id: str | None = None
+    reason: str | None = None
+    limit: str | None = None
+    semantic_unsupported: str | None = None
+    provenance: list[CodeQueryProvenance] = field(default_factory=list)
+    provenance_truncated: bool = False
+
+    @classmethod
+    def from_dict(cls, data: dict) -> CodeQueryReceiverOutcome:
+        return cls(
+            id=data["id"],
+            site_id=data["site_id"],
+            path=data["path"],
+            language=data["language"],
+            range=CodeQueryRange.from_dict(data["range"]),
+            analysis_kind=data["analysis_kind"],
+            outcome=data["outcome"],
+            coverage=data["coverage"],
+            candidate_count=int(data["candidate_count"]),
+            candidates_truncated=bool(data["candidates_truncated"]),
+            setup_nodes=int(data["setup_nodes"]),
+            summary_expansions=int(data["summary_expansions"]),
+            scope_nodes=int(data["scope_nodes"]),
+            site_ast_id=data.get("site_ast_id"),
+            reason=data.get("reason"),
+            limit=data.get("limit"),
+            semantic_unsupported=data.get("semantic_unsupported"),
+            provenance=_query_provenance(data),
+            provenance_truncated=bool(data.get("provenance_truncated", False)),
+        )
+
+    def render_text(self) -> str:
+        header = (
+            f"{self.path}:{self.range.start_line}:{self.range.start_column} "
+            f"[receiver outcome; {self.analysis_kind}; {self.outcome}; {self.coverage}] "
+            f"{self.candidate_count} candidate"
+            f"{'' if self.candidate_count == 1 else 's'}"
+        )
+        if self.candidates_truncated:
+            header += " (truncated)"
+        details = []
+        if self.reason is not None:
+            details.append(f"reason {self.reason}")
+        if self.limit is not None:
+            details.append(f"limit {self.limit}")
+        if self.semantic_unsupported is not None:
+            details.append(f"unsupported {self.semantic_unsupported}")
+        if details:
+            return f"{header}\n  {', '.join(details)}"
+        return header
+
+
+@dataclass(frozen=True)
+class CodeQueryReceiverEvidence:
+    """One typed receiver value retained for a site.
+
+    Evidence rows are meaningful only beside their site's
+    ``receiver_outcome`` row: an empty evidence set alone never proves an
+    empty value set. Factory chains are parent-linked through
+    ``parent_evidence_id`` rather than nested.
+    """
+
+    id: str
+    site_id: str
+    path: str
+    range: CodeQueryRange
+    ordinal: int
+    chain_hop: int
+    evidence_kind: str
+    proof: str
+    completeness: str
+    site_ast_id: str | None = None
+    parent_evidence_id: str | None = None
+    declaration_id: str | None = None
+    declaration_fq_name: str | None = None
+    declaration_kind: str | None = None
+    model_id: str | None = None
+    pack_id: str | None = None
+    factory_id: str | None = None
+    provenance: list[CodeQueryProvenance] = field(default_factory=list)
+    provenance_truncated: bool = False
+
+    @classmethod
+    def from_dict(cls, data: dict) -> CodeQueryReceiverEvidence:
+        return cls(
+            id=data["id"],
+            site_id=data["site_id"],
+            path=data["path"],
+            range=CodeQueryRange.from_dict(data["range"]),
+            ordinal=int(data["ordinal"]),
+            chain_hop=int(data["chain_hop"]),
+            evidence_kind=data["evidence_kind"],
+            proof=data["proof"],
+            completeness=data["completeness"],
+            site_ast_id=data.get("site_ast_id"),
+            parent_evidence_id=data.get("parent_evidence_id"),
+            declaration_id=data.get("declaration_id"),
+            declaration_fq_name=data.get("declaration_fq_name"),
+            declaration_kind=data.get("declaration_kind"),
+            model_id=data.get("model_id"),
+            pack_id=data.get("pack_id"),
+            factory_id=data.get("factory_id"),
+            provenance=_query_provenance(data),
+            provenance_truncated=bool(data.get("provenance_truncated", False)),
+        )
+
+    def render_text(self) -> str:
+        target = self.declaration_fq_name or self.model_id or "unresolved"
+        return (
+            f"{self.path}:{self.range.start_line}:{self.range.start_column} "
+            f"[receiver evidence; {self.evidence_kind}; {self.proof}/{self.completeness}] "
+            f"#{self.ordinal} hop {self.chain_hop} -> {target}"
+        )
+
+
+@dataclass(frozen=True)
+class CodeQueryFieldWriteValue:
+    """The exact value written by one proven static-member assignment.
+
+    ``range`` and ``text`` belong to the right-hand operand, so the row is
+    the ``matched-value`` subject; the other ranges retain the write relation
+    without changing that.
+    """
+
+    id: str
+    write_site_id: str
+    assignment_ast_id: str
+    left_ast_id: str
+    receiver_ast_id: str
+    member_ast_id: str
+    rhs_ast_id: str
+    path: str
+    language: str
+    range: CodeQueryRange
+    text: str
+    assignment_range: CodeQueryRange
+    receiver_range: CodeQueryRange
+    member_range: CodeQueryRange
+    receiver_identity_id: str
+    member_target_id: str
+    member_target: CodeQueryMemberTarget
+    proof: str
+    completeness: str
+    coverage: str
+    provenance: list[CodeQueryProvenance] = field(default_factory=list)
+    provenance_truncated: bool = False
+
+    @classmethod
+    def from_dict(cls, data: dict) -> CodeQueryFieldWriteValue:
+        return cls(
+            id=data["id"],
+            write_site_id=data["write_site_id"],
+            assignment_ast_id=data["assignment_ast_id"],
+            left_ast_id=data["left_ast_id"],
+            receiver_ast_id=data["receiver_ast_id"],
+            member_ast_id=data["member_ast_id"],
+            rhs_ast_id=data["rhs_ast_id"],
+            path=data["path"],
+            language=data["language"],
+            range=CodeQueryRange.from_dict(data["range"]),
+            text=data["text"],
+            assignment_range=CodeQueryRange.from_dict(data["assignment_range"]),
+            receiver_range=CodeQueryRange.from_dict(data["receiver_range"]),
+            member_range=CodeQueryRange.from_dict(data["member_range"]),
+            receiver_identity_id=data["receiver_identity_id"],
+            member_target_id=data["member_target_id"],
+            member_target=CodeQueryMemberTarget.from_dict(data["member_target"]),
+            proof=data["proof"],
+            completeness=data["completeness"],
+            coverage=data["coverage"],
+            provenance=_query_provenance(data),
+            provenance_truncated=bool(data.get("provenance_truncated", False)),
+        )
+
+    def render_text(self) -> str:
+        return (
+            f"{self.path}:{self.range.start_line}:{self.range.start_column} "
+            f"[field write value; {self.proof}/{self.completeness}; {self.coverage}] "
+            f"{self.member_target.fq_name} = `{self.text}`"
+        )
+
+
+@dataclass(frozen=True)
+class CodeQueryCallShape:
+    """The mandatory structured outcome row for one exact call site.
+
+    Group and argument rows may be empty; ``coverage`` is what says how much
+    of the shape the analyzer could see.
+    """
+
+    id: str
+    site_id: str
+    site_ast_id: str
+    path: str
+    language: str
+    range: CodeQueryRange
+    call_kind: str
+    coverage: str
+    group_count: int
+    argument_count: int
+    callee_range: CodeQueryRange | None = None
+    callee_name: str | None = None
+    provenance: list[CodeQueryProvenance] = field(default_factory=list)
+    provenance_truncated: bool = False
+
+    @classmethod
+    def from_dict(cls, data: dict) -> CodeQueryCallShape:
+        return cls(
+            id=data["id"],
+            site_id=data["site_id"],
+            site_ast_id=data["site_ast_id"],
+            path=data["path"],
+            language=data["language"],
+            range=CodeQueryRange.from_dict(data["range"]),
+            call_kind=data["call_kind"],
+            coverage=data["coverage"],
+            group_count=int(data["group_count"]),
+            argument_count=int(data["argument_count"]),
+            callee_range=_optional_range(data, "callee_range"),
+            callee_name=data.get("callee_name"),
+            provenance=_query_provenance(data),
+            provenance_truncated=bool(data.get("provenance_truncated", False)),
+        )
+
+    def render_text(self) -> str:
+        return (
+            f"{self.path}:{self.range.start_line}:{self.range.start_column} "
+            f"[call shape; {self.call_kind}; {self.coverage}] "
+            f"{self.callee_name or 'unnamed'} "
+            f"({self.group_count} group"
+            f"{'' if self.group_count == 1 else 's'}, "
+            f"{self.argument_count} argument"
+            f"{'' if self.argument_count == 1 else 's'})"
+        )
+
+
+@dataclass(frozen=True)
+class CodeQueryCallArgumentGroup:
+    """One ordered argument-list group of a call shape."""
+
+    id: str
+    site_id: str
+    path: str
+    range: CodeQueryRange
+    group_index: int
+    kind: str
+    argument_count: int
+    provenance: list[CodeQueryProvenance] = field(default_factory=list)
+    provenance_truncated: bool = False
+
+    @classmethod
+    def from_dict(cls, data: dict) -> CodeQueryCallArgumentGroup:
+        return cls(
+            id=data["id"],
+            site_id=data["site_id"],
+            path=data["path"],
+            range=CodeQueryRange.from_dict(data["range"]),
+            group_index=int(data["group_index"]),
+            kind=data["kind"],
+            argument_count=int(data["argument_count"]),
+            provenance=_query_provenance(data),
+            provenance_truncated=bool(data.get("provenance_truncated", False)),
+        )
+
+    def render_text(self) -> str:
+        return (
+            f"{self.path}:{self.range.start_line}:{self.range.start_column} "
+            f"[argument group; {self.kind}] #{self.group_index} "
+            f"{self.argument_count} argument"
+            f"{'' if self.argument_count == 1 else 's'}"
+        )
+
+
+@dataclass(frozen=True)
+class CodeQueryCallShapeArgument:
+    """One ordered argument inside one argument-list group.
+
+    This is the ``call_argument`` row of the call-shape family. It is not the
+    same shape as :class:`CodeQueryCallArgument`, which travels inline on a
+    ``call_site`` row.
+    """
+
+    id: str
+    group_id: str
+    site_id: str
+    path: str
+    range: CodeQueryRange
+    argument_index: int
+    spread: bool
+    name: str | None = None
+    provenance: list[CodeQueryProvenance] = field(default_factory=list)
+    provenance_truncated: bool = False
+
+    @classmethod
+    def from_dict(cls, data: dict) -> CodeQueryCallShapeArgument:
+        return cls(
+            id=data["id"],
+            group_id=data["group_id"],
+            site_id=data["site_id"],
+            path=data["path"],
+            range=CodeQueryRange.from_dict(data["range"]),
+            argument_index=int(data["argument_index"]),
+            spread=bool(data["spread"]),
+            name=data.get("name"),
+            provenance=_query_provenance(data),
+            provenance_truncated=bool(data.get("provenance_truncated", False)),
+        )
+
+    def render_text(self) -> str:
+        name = f" {self.name}" if self.name is not None else ""
+        spread = " spread" if self.spread else ""
+        return (
+            f"{self.path}:{self.range.start_line}:{self.range.start_column} "
+            f"[argument] #{self.argument_index}{name}{spread}"
+        )
+
+
+@dataclass(frozen=True)
+class CodeQueryCallBinding:
+    """One normalized actual-to-formal binding of one exact call site.
+
+    ``site_id``, ``group_id`` and ``argument_id`` are call-shape identities,
+    so a policy reaches "the actual passed to formal `timeout`" by joining
+    ids rather than by comparing ranges or callee text. ``terminal`` marks
+    the row that states the call's status when no pair could be produced, so
+    an empty binding set is never a claim that the call binds nothing.
+    """
+
+    id: str
+    site_id: str
+    site_ast_id: str
+    path: str
+    language: str
+    range: CodeQueryRange
+    dispatch_outcome: str
+    dispatch_coverage: str
+    dispatch_target_count: int
+    dispatch_targets_truncated: bool
+    selector_exact: bool
+    mapping: str
+    coverage: str
+    actual_count: int
+    bound_count: int
+    terminal: bool
+    group_id: str | None = None
+    argument_id: str | None = None
+    target: CodeQueryDeclaration | None = None
+    semantic_target_id: str | None = None
+    target_origin: str | None = None
+    dispatch_proof: str | None = None
+    dispatch_completeness: str | None = None
+    selector_proof: str | None = None
+    selector_summary_id: str | None = None
+    selector_summary_model_id: str | None = None
+    selector_summary_pack_id: str | None = None
+    selector_summary_active_set_hash: str | None = None
+    selector_summary_pack_digest: str | None = None
+    selector_summary_pack_version: str | None = None
+    selector_summary_record_id: str | None = None
+    selector_summary_origin: str | None = None
+    selector_summary_model_proof: str | None = None
+    selector_summary_completeness: str | None = None
+    selector_summary_producer: str | None = None
+    selector_summary_producer_version: str | None = None
+    signature_id: str | None = None
+    model_callable_id: str | None = None
+    formal_layout_id: str | None = None
+    model_id: str | None = None
+    receiver_type_id: str | None = None
+    pack_id: str | None = None
+    model_active_set_hash: str | None = None
+    model_pack_digest: str | None = None
+    model_pack_version: str | None = None
+    model_record_id: str | None = None
+    model_activation_status: str | None = None
+    model_activation_reason: str | None = None
+    model_activation_source_kind: str | None = None
+    model_activation_source_id: str | None = None
+    model_origin: str | None = None
+    model_proof: str | None = None
+    model_completeness: str | None = None
+    model_ambiguous: bool | None = None
+    model_producer: str | None = None
+    model_producer_version: str | None = None
+    actual_index: int | None = None
+    actual_name: str | None = None
+    formal_index: int | None = None
+    formal_name: str | None = None
+    binding_kind: str | None = None
+    conversion: str | None = None
+    reason: str | None = None
+    provenance: list[CodeQueryProvenance] = field(default_factory=list)
+    provenance_truncated: bool = False
+
+    @classmethod
+    def from_dict(cls, data: dict) -> CodeQueryCallBinding:
+        model_ambiguous = data.get("model_ambiguous")
+        return cls(
+            id=data["id"],
+            site_id=data["site_id"],
+            site_ast_id=data["site_ast_id"],
+            path=data["path"],
+            language=data["language"],
+            range=CodeQueryRange.from_dict(data["range"]),
+            dispatch_outcome=data["dispatch_outcome"],
+            dispatch_coverage=data["dispatch_coverage"],
+            dispatch_target_count=int(data["dispatch_target_count"]),
+            dispatch_targets_truncated=bool(data["dispatch_targets_truncated"]),
+            selector_exact=bool(data["selector_exact"]),
+            mapping=data["mapping"],
+            coverage=data["coverage"],
+            actual_count=int(data["actual_count"]),
+            bound_count=int(data["bound_count"]),
+            terminal=bool(data["terminal"]),
+            group_id=data.get("group_id"),
+            argument_id=data.get("argument_id"),
+            target=_optional_declaration(data, "target"),
+            semantic_target_id=data.get("semantic_target_id"),
+            target_origin=data.get("target_origin"),
+            dispatch_proof=data.get("dispatch_proof"),
+            dispatch_completeness=data.get("dispatch_completeness"),
+            selector_proof=data.get("selector_proof"),
+            selector_summary_id=data.get("selector_summary_id"),
+            selector_summary_model_id=data.get("selector_summary_model_id"),
+            selector_summary_pack_id=data.get("selector_summary_pack_id"),
+            selector_summary_active_set_hash=data.get(
+                "selector_summary_active_set_hash"
+            ),
+            selector_summary_pack_digest=data.get("selector_summary_pack_digest"),
+            selector_summary_pack_version=data.get("selector_summary_pack_version"),
+            selector_summary_record_id=data.get("selector_summary_record_id"),
+            selector_summary_origin=data.get("selector_summary_origin"),
+            selector_summary_model_proof=data.get("selector_summary_model_proof"),
+            selector_summary_completeness=data.get("selector_summary_completeness"),
+            selector_summary_producer=data.get("selector_summary_producer"),
+            selector_summary_producer_version=data.get(
+                "selector_summary_producer_version"
+            ),
+            signature_id=data.get("signature_id"),
+            model_callable_id=data.get("model_callable_id"),
+            formal_layout_id=data.get("formal_layout_id"),
+            model_id=data.get("model_id"),
+            receiver_type_id=data.get("receiver_type_id"),
+            pack_id=data.get("pack_id"),
+            model_active_set_hash=data.get("model_active_set_hash"),
+            model_pack_digest=data.get("model_pack_digest"),
+            model_pack_version=data.get("model_pack_version"),
+            model_record_id=data.get("model_record_id"),
+            model_activation_status=data.get("model_activation_status"),
+            model_activation_reason=data.get("model_activation_reason"),
+            model_activation_source_kind=data.get("model_activation_source_kind"),
+            model_activation_source_id=data.get("model_activation_source_id"),
+            model_origin=data.get("model_origin"),
+            model_proof=data.get("model_proof"),
+            model_completeness=data.get("model_completeness"),
+            model_ambiguous=None if model_ambiguous is None else bool(model_ambiguous),
+            model_producer=data.get("model_producer"),
+            model_producer_version=data.get("model_producer_version"),
+            actual_index=_optional_int(data, "actual_index"),
+            actual_name=data.get("actual_name"),
+            formal_index=_optional_int(data, "formal_index"),
+            formal_name=data.get("formal_name"),
+            binding_kind=data.get("binding_kind"),
+            conversion=data.get("conversion"),
+            reason=data.get("reason"),
+            provenance=_query_provenance(data),
+            provenance_truncated=bool(data.get("provenance_truncated", False)),
+        )
+
+    def render_text(self) -> str:
+        if self.terminal:
+            subject = "terminal"
+        else:
+            actual = self.actual_name or (
+                "#" + str(self.actual_index) if self.actual_index is not None else "?"
+            )
+            subject = f"{actual} -> {self.formal_name or '?'}"
+        header = (
+            f"{self.path}:{self.range.start_line}:{self.range.start_column} "
+            f"[call binding; {self.mapping}; {self.coverage}] {subject}"
+        )
+        detail = (
+            f"  dispatch {self.dispatch_outcome}/{self.dispatch_coverage}, "
+            f"{self.bound_count} of {self.actual_count} bound"
+        )
+        if self.reason is not None:
+            detail += f", reason {self.reason}"
+        return f"{header}\n{detail}"
+
+
+@dataclass(frozen=True)
+class CodeQueryCallEffect:
+    """One source-derived direct effect of one exact call site.
+
+    Nothing here is read off source text: ``proof`` and ``coverage`` are the
+    dispatch oracle's own words, and the effect itself is what an activated
+    semantic-model pack declares for the callee. ``terminal`` marks the row
+    that states the site's status when no declaration applies.
+    """
+
+    id: str
+    site_id: str
+    site_ast_id: str
+    path: str
+    language: str
+    range: CodeQueryRange
+    classification: str
+    derivation: str
+    coverage: str
+    arm_count: int
+    modeled_arm_count: int
+    terminal: bool
+    target_id: str | None = None
+    callee: CodeQueryDeclaration | None = None
+    callee_symbol: str | None = None
+    effect_id: str | None = None
+    timing: str | None = None
+    execution_timing: str | None = None
+    certainty: str | None = None
+    proof: str | None = None
+    reason: str | None = None
+    pack_id: str | None = None
+    model_id: str | None = None
+    summary_id: str | None = None
+    provenance: list[CodeQueryProvenance] = field(default_factory=list)
+    provenance_truncated: bool = False
+
+    @classmethod
+    def from_dict(cls, data: dict) -> CodeQueryCallEffect:
+        return cls(
+            id=data["id"],
+            site_id=data["site_id"],
+            site_ast_id=data["site_ast_id"],
+            path=data["path"],
+            language=data["language"],
+            range=CodeQueryRange.from_dict(data["range"]),
+            classification=data["classification"],
+            derivation=data["derivation"],
+            coverage=data["coverage"],
+            arm_count=int(data["arm_count"]),
+            modeled_arm_count=int(data["modeled_arm_count"]),
+            terminal=bool(data["terminal"]),
+            target_id=data.get("target_id"),
+            callee=_optional_declaration(data, "callee"),
+            callee_symbol=data.get("callee_symbol"),
+            effect_id=data.get("effect_id"),
+            timing=data.get("timing"),
+            execution_timing=data.get("execution_timing"),
+            certainty=data.get("certainty"),
+            proof=data.get("proof"),
+            reason=data.get("reason"),
+            pack_id=data.get("pack_id"),
+            model_id=data.get("model_id"),
+            summary_id=data.get("summary_id"),
+            provenance=_query_provenance(data),
+            provenance_truncated=bool(data.get("provenance_truncated", False)),
+        )
+
+    def render_text(self) -> str:
+        subject = self.effect_id or "terminal"
+        header = (
+            f"{self.path}:{self.range.start_line}:{self.range.start_column} "
+            f"[call effect; {self.derivation}; {self.coverage}] {subject}"
+        )
+        detail = (
+            f"  {self.callee_symbol or 'unmodeled callee'}, "
+            f"{self.modeled_arm_count} of {self.arm_count} arm"
+            f"{'' if self.arm_count == 1 else 's'} modeled"
+        )
+        if self.reason is not None:
+            detail += f", reason {self.reason}"
+        return f"{header}\n{detail}"
+
+
+@dataclass(frozen=True)
+class CodeQueryCallResult:
+    """One typed result value produced by one exact call site."""
+
+    id: str
+    site_id: str
+    site_ast_id: str
+    call_id: str
+    procedure_id: str
+    point_id: str
+    path: str
+    language: str
+    range: CodeQueryRange
+    ordinal: int
+    value_id: int
+    proof: str
+    completeness: str
+    provenance: list[CodeQueryProvenance] = field(default_factory=list)
+    provenance_truncated: bool = False
+
+    @classmethod
+    def from_dict(cls, data: dict) -> CodeQueryCallResult:
+        return cls(
+            id=data["id"],
+            site_id=data["site_id"],
+            site_ast_id=data["site_ast_id"],
+            call_id=data["call_id"],
+            procedure_id=data["procedure_id"],
+            point_id=data["point_id"],
+            path=data["path"],
+            language=data["language"],
+            range=CodeQueryRange.from_dict(data["range"]),
+            ordinal=int(data["ordinal"]),
+            value_id=int(data["value_id"]),
+            proof=data["proof"],
+            completeness=data["completeness"],
+            provenance=_query_provenance(data),
+            provenance_truncated=bool(data.get("provenance_truncated", False)),
+        )
+
+    def render_text(self) -> str:
+        return (
+            f"{self.path}:{self.range.start_line}:{self.range.start_column} "
+            f"[call result; {self.proof}/{self.completeness}] "
+            f"#{self.ordinal} value {self.value_id}"
+        )
+
+
+@dataclass(frozen=True)
+class CodeQueryCallResultContract:
+    """One reviewed condition a normal call result must satisfy before use.
+
+    At least one row exists per call shape; ``terminal`` marks the row that
+    states why no contract was established. ``use_validation_coverage`` says
+    whether ``result_use_count`` and ``unguarded_result_use_count`` are exact
+    or a lower bound.
+    """
+
+    id: str
+    site_id: str
+    site_ast_id: str
+    path: str
+    language: str
+    range: CodeQueryRange
+    coverage: str
+    arm_count: int
+    modeled_arm_count: int
+    terminal: bool
+    success_guard_count: int
+    fresh_allocation: bool
+    member_contract_count: int
+    target_id: str | None = None
+    callee: CodeQueryDeclaration | None = None
+    callee_symbol: str | None = None
+    result_ordinal: int | None = None
+    condition_result_ordinal: int | None = None
+    predicate: str | None = None
+    result_success_predicate: str | None = None
+    proof: str | None = None
+    reason: str | None = None
+    pack_id: str | None = None
+    model_id: str | None = None
+    summary_id: str | None = None
+    result_use_count: int | None = None
+    unguarded_result_use_count: int | None = None
+    use_validation: str | None = None
+    use_validation_coverage: str | None = None
+    provenance: list[CodeQueryProvenance] = field(default_factory=list)
+    provenance_truncated: bool = False
+
+    @classmethod
+    def from_dict(cls, data: dict) -> CodeQueryCallResultContract:
+        return cls(
+            id=data["id"],
+            site_id=data["site_id"],
+            site_ast_id=data["site_ast_id"],
+            path=data["path"],
+            language=data["language"],
+            range=CodeQueryRange.from_dict(data["range"]),
+            coverage=data["coverage"],
+            arm_count=int(data["arm_count"]),
+            modeled_arm_count=int(data["modeled_arm_count"]),
+            terminal=bool(data["terminal"]),
+            success_guard_count=int(data["success_guard_count"]),
+            fresh_allocation=bool(data["fresh_allocation"]),
+            member_contract_count=int(data["member_contract_count"]),
+            target_id=data.get("target_id"),
+            callee=_optional_declaration(data, "callee"),
+            callee_symbol=data.get("callee_symbol"),
+            result_ordinal=_optional_int(data, "result_ordinal"),
+            condition_result_ordinal=_optional_int(data, "condition_result_ordinal"),
+            predicate=data.get("predicate"),
+            result_success_predicate=data.get("result_success_predicate"),
+            proof=data.get("proof"),
+            reason=data.get("reason"),
+            pack_id=data.get("pack_id"),
+            model_id=data.get("model_id"),
+            summary_id=data.get("summary_id"),
+            result_use_count=_optional_int(data, "result_use_count"),
+            unguarded_result_use_count=_optional_int(
+                data, "unguarded_result_use_count"
+            ),
+            use_validation=data.get("use_validation"),
+            use_validation_coverage=data.get("use_validation_coverage"),
+            provenance=_query_provenance(data),
+            provenance_truncated=bool(data.get("provenance_truncated", False)),
+        )
+
+    def render_text(self) -> str:
+        subject = self.predicate or "terminal"
+        header = (
+            f"{self.path}:{self.range.start_line}:{self.range.start_column} "
+            f"[call result contract; {self.coverage}] {subject}"
+        )
+        detail = (
+            f"  {self.callee_symbol or 'unmodeled callee'}, "
+            f"{self.success_guard_count} success guard"
+            f"{'' if self.success_guard_count == 1 else 's'}"
+        )
+        if self.reason is not None:
+            detail += f", reason {self.reason}"
+        return f"{header}\n{detail}"
+
+
+@dataclass(frozen=True)
+class CodeQueryResultContractUse:
+    """One exact operation on a protected result, anchored at the operation.
+
+    The acquisition identities join the row back to its
+    ``call_result_contract`` row without comparing ranges.
+    """
+
+    id: str
+    acquisition_id: str
+    acquisition_site_id: str
+    acquisition_site_ast_id: str
+    operation_point_id: str
+    path: str
+    language: str
+    range: CodeQueryRange
+    result_ordinal: int
+    use_kind: str
+    timing: str
+    applicability: str
+    guard: str
+    coverage: str
+    operation_site_id: str | None = None
+    operation_site_ast_id: str | None = None
+    ast_id: str | None = None
+    condition_result_ordinal: int | None = None
+    acquisition_predicate: str | None = None
+    result_success_predicate: str | None = None
+    required_predicate: str | None = None
+    member: str | None = None
+    parameter_count: int | None = None
+    parameter_ordinal: int | None = None
+    pack_id: str | None = None
+    model_id: str | None = None
+    summary_id: str | None = None
+    provenance: list[CodeQueryProvenance] = field(default_factory=list)
+    provenance_truncated: bool = False
+
+    @classmethod
+    def from_dict(cls, data: dict) -> CodeQueryResultContractUse:
+        return cls(
+            id=data["id"],
+            acquisition_id=data["acquisition_id"],
+            acquisition_site_id=data["acquisition_site_id"],
+            acquisition_site_ast_id=data["acquisition_site_ast_id"],
+            operation_point_id=data["operation_point_id"],
+            path=data["path"],
+            language=data["language"],
+            range=CodeQueryRange.from_dict(data["range"]),
+            result_ordinal=int(data["result_ordinal"]),
+            use_kind=data["use_kind"],
+            timing=data["timing"],
+            applicability=data["applicability"],
+            guard=data["guard"],
+            coverage=data["coverage"],
+            operation_site_id=data.get("operation_site_id"),
+            operation_site_ast_id=data.get("operation_site_ast_id"),
+            ast_id=data.get("ast_id"),
+            condition_result_ordinal=_optional_int(data, "condition_result_ordinal"),
+            acquisition_predicate=data.get("acquisition_predicate"),
+            result_success_predicate=data.get("result_success_predicate"),
+            required_predicate=data.get("required_predicate"),
+            member=data.get("member"),
+            parameter_count=_optional_int(data, "parameter_count"),
+            parameter_ordinal=_optional_int(data, "parameter_ordinal"),
+            pack_id=data.get("pack_id"),
+            model_id=data.get("model_id"),
+            summary_id=data.get("summary_id"),
+            provenance=_query_provenance(data),
+            provenance_truncated=bool(data.get("provenance_truncated", False)),
+        )
+
+    def render_text(self) -> str:
+        return (
+            f"{self.path}:{self.range.start_line}:{self.range.start_column} "
+            f"[result contract use; {self.use_kind}; {self.guard}; {self.coverage}] "
+            f"result #{self.result_ordinal} {self.applicability} ({self.timing})"
+        )
+
+
+@dataclass(frozen=True)
+class CodeQueryResultContractFailureUse:
+    """One consumption of a value established only on a contract's failure edge."""
+
+    id: str
+    acquisition_id: str
+    acquisition_site_id: str
+    acquisition_site_ast_id: str
+    procedure_id: str
+    condition_result_ordinal: int
+    consumer_point_id: str
+    path: str
+    language: str
+    range: CodeQueryRange
+    operand_value_id: int
+    failure_provenance: str
+    consumer: str
+    proof: str
+    coverage: str
+    condition_value_id: int | None = None
+    failure_edge_id: str | None = None
+    consumer_call_id: str | None = None
+    consumer_site_id: str | None = None
+    consumer_site_ast_id: str | None = None
+    ast_id: str | None = None
+    binding_value_id: int | None = None
+    establishment_point_id: str | None = None
+    establishment_value_id: int | None = None
+    argument_ordinal: int | None = None
+    pack_id: str | None = None
+    model_id: str | None = None
+    summary_id: str | None = None
+    provenance: list[CodeQueryProvenance] = field(default_factory=list)
+    provenance_truncated: bool = False
+
+    @classmethod
+    def from_dict(cls, data: dict) -> CodeQueryResultContractFailureUse:
+        return cls(
+            id=data["id"],
+            acquisition_id=data["acquisition_id"],
+            acquisition_site_id=data["acquisition_site_id"],
+            acquisition_site_ast_id=data["acquisition_site_ast_id"],
+            procedure_id=data["procedure_id"],
+            condition_result_ordinal=int(data["condition_result_ordinal"]),
+            consumer_point_id=data["consumer_point_id"],
+            path=data["path"],
+            language=data["language"],
+            range=CodeQueryRange.from_dict(data["range"]),
+            operand_value_id=int(data["operand_value_id"]),
+            failure_provenance=data["failure_provenance"],
+            consumer=data["consumer"],
+            proof=data["proof"],
+            coverage=data["coverage"],
+            condition_value_id=_optional_int(data, "condition_value_id"),
+            failure_edge_id=data.get("failure_edge_id"),
+            consumer_call_id=data.get("consumer_call_id"),
+            consumer_site_id=data.get("consumer_site_id"),
+            consumer_site_ast_id=data.get("consumer_site_ast_id"),
+            ast_id=data.get("ast_id"),
+            binding_value_id=_optional_int(data, "binding_value_id"),
+            establishment_point_id=data.get("establishment_point_id"),
+            establishment_value_id=_optional_int(data, "establishment_value_id"),
+            argument_ordinal=_optional_int(data, "argument_ordinal"),
+            pack_id=data.get("pack_id"),
+            model_id=data.get("model_id"),
+            summary_id=data.get("summary_id"),
+            provenance=_query_provenance(data),
+            provenance_truncated=bool(data.get("provenance_truncated", False)),
+        )
+
+    def render_text(self) -> str:
+        return (
+            f"{self.path}:{self.range.start_line}:{self.range.start_column} "
+            f"[result contract failure use; {self.consumer}; {self.proof}; "
+            f"{self.coverage}] condition #{self.condition_result_ordinal} "
+            f"via {self.failure_provenance}"
+        )
+
+
+@dataclass(frozen=True)
+class CodeQueryNilnessOperation:
+    """One operation on a value whose nilness the flow analysis decided."""
+
+    id: str
+    procedure_id: str
+    operation_point_id: str
+    subject_value_id: int
+    path: str
+    language: str
+    range: CodeQueryRange
+    use_kind: str
+    fact: str
+    origin: str
+    proof: str
+    coverage: str
+    ast_id: str | None = None
+    reason: str | None = None
+    provenance: list[CodeQueryProvenance] = field(default_factory=list)
+    provenance_truncated: bool = False
+
+    @classmethod
+    def from_dict(cls, data: dict) -> CodeQueryNilnessOperation:
+        return cls(
+            id=data["id"],
+            procedure_id=data["procedure_id"],
+            operation_point_id=data["operation_point_id"],
+            subject_value_id=int(data["subject_value_id"]),
+            path=data["path"],
+            language=data["language"],
+            range=CodeQueryRange.from_dict(data["range"]),
+            use_kind=data["use_kind"],
+            fact=data["fact"],
+            origin=data["origin"],
+            proof=data["proof"],
+            coverage=data["coverage"],
+            ast_id=data.get("ast_id"),
+            reason=data.get("reason"),
+            provenance=_query_provenance(data),
+            provenance_truncated=bool(data.get("provenance_truncated", False)),
+        )
+
+    def render_text(self) -> str:
+        rendered = (
+            f"{self.path}:{self.range.start_line}:{self.range.start_column} "
+            f"[nilness operation; {self.use_kind}; {self.fact}; {self.proof}/"
+            f"{self.coverage}] origin {self.origin}"
+        )
+        if self.reason is not None:
+            rendered += f", reason {self.reason}"
+        return rendered
+
+
+@dataclass(frozen=True)
+class CodeQuerySwitchCoverage:
+    """One switch and whether its cases exhaust the selector's domain."""
+
+    id: str
+    procedure_id: str
+    switch_fact_id: int
+    path: str
+    language: str
+    range: CodeQueryRange
+    kind: str
+    selector_domain: str
+    case_count: int
+    has_true_case: bool
+    has_false_case: bool
+    default_present: bool
+    verdict: str
+    proof: str
+    ast_id: str | None = None
+    selector_value_id: int | None = None
+    reason: str | None = None
+    provenance: list[CodeQueryProvenance] = field(default_factory=list)
+    provenance_truncated: bool = False
+
+    @classmethod
+    def from_dict(cls, data: dict) -> CodeQuerySwitchCoverage:
+        return cls(
+            id=data["id"],
+            procedure_id=data["procedure_id"],
+            switch_fact_id=int(data["switch_fact_id"]),
+            path=data["path"],
+            language=data["language"],
+            range=CodeQueryRange.from_dict(data["range"]),
+            kind=data["kind"],
+            selector_domain=data["selector_domain"],
+            case_count=int(data["case_count"]),
+            has_true_case=bool(data["has_true_case"]),
+            has_false_case=bool(data["has_false_case"]),
+            default_present=bool(data["default_present"]),
+            verdict=data["verdict"],
+            proof=data["proof"],
+            ast_id=data.get("ast_id"),
+            selector_value_id=_optional_int(data, "selector_value_id"),
+            reason=data.get("reason"),
+            provenance=_query_provenance(data),
+            provenance_truncated=bool(data.get("provenance_truncated", False)),
+        )
+
+    def render_text(self) -> str:
+        rendered = (
+            f"{self.path}:{self.range.start_line}:{self.range.start_column} "
+            f"[switch coverage; {self.kind}; {self.verdict}; {self.proof}] "
+            f"{self.case_count} case"
+            f"{'' if self.case_count == 1 else 's'} over {self.selector_domain}"
+        )
+        if self.default_present:
+            rendered += " with default"
+        if self.reason is not None:
+            rendered += f", reason {self.reason}"
+        return rendered
+
+
+@dataclass(frozen=True)
+class CodeQueryConcurrentAccessConflict:
+    """One pair of accesses to the same location that may run concurrently.
+
+    ``verdict`` is the conclusion, and ``proof``/``coverage`` are what say
+    whether it can support a negative claim. ``reasons`` lists the typed
+    reasons the analysis recorded, and is empty for a clean verdict.
+    """
+
+    id: str
+    root_procedure_id: str
+    path: str
+    language: str
+    range: CodeQueryRange
+    location_id: str
+    location_kind: str
+    first_procedure_id: str
+    first_point_id: int
+    first_access: str
+    first_path: str
+    first_range: CodeQueryRange
+    second_procedure_id: str
+    second_point_id: int
+    second_access: str
+    second_path: str
+    second_range: CodeQueryRange
+    task_relation: str
+    ordering: str
+    protection: str
+    verdict: str
+    proof: str
+    coverage: str
+    ast_id: str | None = None
+    reasons: list[str] = field(default_factory=list)
+    provenance: list[CodeQueryProvenance] = field(default_factory=list)
+    provenance_truncated: bool = False
+
+    @classmethod
+    def from_dict(cls, data: dict) -> CodeQueryConcurrentAccessConflict:
+        return cls(
+            id=data["id"],
+            root_procedure_id=data["root_procedure_id"],
+            path=data["path"],
+            language=data["language"],
+            range=CodeQueryRange.from_dict(data["range"]),
+            location_id=data["location_id"],
+            location_kind=data["location_kind"],
+            first_procedure_id=data["first_procedure_id"],
+            first_point_id=int(data["first_point_id"]),
+            first_access=data["first_access"],
+            first_path=data["first_path"],
+            first_range=CodeQueryRange.from_dict(data["first_range"]),
+            second_procedure_id=data["second_procedure_id"],
+            second_point_id=int(data["second_point_id"]),
+            second_access=data["second_access"],
+            second_path=data["second_path"],
+            second_range=CodeQueryRange.from_dict(data["second_range"]),
+            task_relation=data["task_relation"],
+            ordering=data["ordering"],
+            protection=data["protection"],
+            verdict=data["verdict"],
+            proof=data["proof"],
+            coverage=data["coverage"],
+            ast_id=data.get("ast_id"),
+            reasons=list(data.get("reasons", [])),
+            provenance=_query_provenance(data),
+            provenance_truncated=bool(data.get("provenance_truncated", False)),
+        )
+
+    def render_text(self) -> str:
+        header = (
+            f"{self.path}:{self.range.start_line}:{self.range.start_column} "
+            f"[concurrent access conflict; {self.verdict}; {self.proof}/"
+            f"{self.coverage}] {self.location_kind} {self.location_id}"
+        )
+        detail = (
+            f"  {self.first_access} at {self.first_path}:"
+            f"{self.first_range.start_line} vs {self.second_access} at "
+            f"{self.second_path}:{self.second_range.start_line}; "
+            f"{self.task_relation}, {self.ordering}, {self.protection}"
+        )
+        if self.reasons:
+            detail += f"; reasons {', '.join(self.reasons)}"
+        return f"{header}\n{detail}"
+
+
+@dataclass(frozen=True)
+class CodeQueryDetachedTaskTransfer:
+    """One value transferred into or out of a detached task."""
+
+    id: str
+    procedure_id: str
+    call_id: str
+    call_point_id: str
+    path: str
+    language: str
+    range: CodeQueryRange
+    role: str
+    value_id: str
+    timing: str
+    proof: str
+    coverage: str
+    ast_id: str | None = None
+    ordinal: int | None = None
+    object_id: str | None = None
+    object_cardinality: str | None = None
+    reason: str | None = None
+    provenance: list[CodeQueryProvenance] = field(default_factory=list)
+    provenance_truncated: bool = False
+
+    @classmethod
+    def from_dict(cls, data: dict) -> CodeQueryDetachedTaskTransfer:
+        return cls(
+            id=data["id"],
+            procedure_id=data["procedure_id"],
+            call_id=data["call_id"],
+            call_point_id=data["call_point_id"],
+            path=data["path"],
+            language=data["language"],
+            range=CodeQueryRange.from_dict(data["range"]),
+            role=data["role"],
+            value_id=data["value_id"],
+            timing=data["timing"],
+            proof=data["proof"],
+            coverage=data["coverage"],
+            ast_id=data.get("ast_id"),
+            ordinal=_optional_int(data, "ordinal"),
+            object_id=data.get("object_id"),
+            object_cardinality=data.get("object_cardinality"),
+            reason=data.get("reason"),
+            provenance=_query_provenance(data),
+            provenance_truncated=bool(data.get("provenance_truncated", False)),
+        )
+
+    def render_text(self) -> str:
+        rendered = (
+            f"{self.path}:{self.range.start_line}:{self.range.start_column} "
+            f"[detached task transfer; {self.role}; {self.timing}; "
+            f"{self.proof}/{self.coverage}] value {self.value_id}"
+        )
+        if self.object_id is not None:
+            rendered += f" object {self.object_id} ({self.object_cardinality})"
+        if self.reason is not None:
+            rendered += f", reason {self.reason}"
+        return rendered
+
+
+@dataclass(frozen=True)
+class CodeQueryProcedureEffect:
+    """One effect attributed to a procedure, directly or transitively.
+
+    ``witness_available`` says whether the attribution can be replayed; a
+    ``terminal`` row states why no effect was attributed at all.
+    """
+
+    id: str
+    procedure_id: str
+    procedure_name: str
+    path: str
+    language: str
+    range: CodeQueryRange
+    derivation: str
+    coverage: str
+    witness_available: bool
+    witness_steps: int
+    witness_truncated: bool
+    terminal: bool
+    effect_id: str | None = None
+    classification: str | None = None
+    certainty: str | None = None
+    timing: str | None = None
+    execution_timing: str | None = None
+    depth: int | None = None
+    reason: str | None = None
+    witness_site_id: str | None = None
+    witness_effect_site_id: str | None = None
+    witness_chain: str | None = None
+    pack_id: str | None = None
+    model_id: str | None = None
+    summary_id: str | None = None
+    provenance: list[CodeQueryProvenance] = field(default_factory=list)
+    provenance_truncated: bool = False
+
+    @classmethod
+    def from_dict(cls, data: dict) -> CodeQueryProcedureEffect:
+        return cls(
+            id=data["id"],
+            procedure_id=data["procedure_id"],
+            procedure_name=data["procedure_name"],
+            path=data["path"],
+            language=data["language"],
+            range=CodeQueryRange.from_dict(data["range"]),
+            derivation=data["derivation"],
+            coverage=data["coverage"],
+            witness_available=bool(data["witness_available"]),
+            witness_steps=int(data["witness_steps"]),
+            witness_truncated=bool(data["witness_truncated"]),
+            terminal=bool(data["terminal"]),
+            effect_id=data.get("effect_id"),
+            classification=data.get("classification"),
+            certainty=data.get("certainty"),
+            timing=data.get("timing"),
+            execution_timing=data.get("execution_timing"),
+            depth=_optional_int(data, "depth"),
+            reason=data.get("reason"),
+            witness_site_id=data.get("witness_site_id"),
+            witness_effect_site_id=data.get("witness_effect_site_id"),
+            witness_chain=data.get("witness_chain"),
+            pack_id=data.get("pack_id"),
+            model_id=data.get("model_id"),
+            summary_id=data.get("summary_id"),
+            provenance=_query_provenance(data),
+            provenance_truncated=bool(data.get("provenance_truncated", False)),
+        )
+
+    def render_text(self) -> str:
+        subject = self.effect_id or "terminal"
+        header = (
+            f"{self.path}:{self.range.start_line}:{self.range.start_column} "
+            f"[procedure effect; {self.derivation}; {self.coverage}] "
+            f"{self.procedure_name} -> {subject}"
+        )
+        detail = f"  witness {'available' if self.witness_available else 'absent'}"
+        if self.witness_available:
+            detail += f", {self.witness_steps} step"
+            detail += "" if self.witness_steps == 1 else "s"
+            if self.witness_truncated:
+                detail += " (truncated)"
+        if self.reason is not None:
+            detail += f", reason {self.reason}"
+        return f"{header}\n{detail}"
+
+
+@dataclass(frozen=True)
+class CodeQueryCallableSignature:
+    """One published parameter list of one callable declaration.
+
+    ``coverage`` states how much of the declared shape the analyzer read; an
+    absent ``required_arity`` is unrecorded, never zero.
+    """
+
+    id: str
+    path: str
+    language: str
+    range: CodeQueryRange
+    declaration: CodeQueryDeclaration
+    ordinal: int
+    coverage: str
+    role: str
+    repeated: bool
+    generic_arity: int
+    declaration_only: bool
+    parameter_count: int
+    label: str | None = None
+    required_arity: int | None = None
+    total_arity: int | None = None
+    receiver_contract: str | None = None
+    return_type: str | None = None
+    provenance: list[CodeQueryProvenance] = field(default_factory=list)
+    provenance_truncated: bool = False
+
+    @classmethod
+    def from_dict(cls, data: dict) -> CodeQueryCallableSignature:
+        return cls(
+            id=data["id"],
+            path=data["path"],
+            language=data["language"],
+            range=CodeQueryRange.from_dict(data["range"]),
+            declaration=CodeQueryDeclaration.from_dict(data["declaration"]),
+            ordinal=int(data["ordinal"]),
+            coverage=data["coverage"],
+            role=data["role"],
+            repeated=bool(data["repeated"]),
+            generic_arity=int(data["generic_arity"]),
+            declaration_only=bool(data["declaration_only"]),
+            parameter_count=int(data["parameter_count"]),
+            label=data.get("label"),
+            required_arity=_optional_int(data, "required_arity"),
+            total_arity=_optional_int(data, "total_arity"),
+            receiver_contract=data.get("receiver_contract"),
+            return_type=data.get("return_type"),
+            provenance=_query_provenance(data),
+            provenance_truncated=bool(data.get("provenance_truncated", False)),
+        )
+
+    def render_text(self) -> str:
+        arity = (
+            f"{self.required_arity}..{self.total_arity}"
+            if self.required_arity is not None or self.total_arity is not None
+            else "unrecorded arity"
+        )
+        return (
+            f"{self.path}:{self.range.start_line}:{self.range.start_column} "
+            f"[callable signature; {self.role}; {self.coverage}] "
+            f"{self.declaration.fq_name} #{self.ordinal} {arity}, "
+            f"{self.parameter_count} parameter"
+            f"{'' if self.parameter_count == 1 else 's'}"
+        )
+
+
+@dataclass(frozen=True)
+class CodeQuerySignatureParameter:
+    """One declared parameter of one callable signature."""
+
+    id: str
+    signature_id: str
+    path: str
+    range: CodeQueryRange
+    parameter_index: int
+    label: str
+    label_start_byte: int
+    label_end_byte: int
+    declared_type: str | None = None
+    optional: bool | None = None
+    repeated: bool | None = None
+    provenance: list[CodeQueryProvenance] = field(default_factory=list)
+    provenance_truncated: bool = False
+
+    @classmethod
+    def from_dict(cls, data: dict) -> CodeQuerySignatureParameter:
+        optional = data.get("optional")
+        repeated = data.get("repeated")
+        return cls(
+            id=data["id"],
+            signature_id=data["signature_id"],
+            path=data["path"],
+            range=CodeQueryRange.from_dict(data["range"]),
+            parameter_index=int(data["parameter_index"]),
+            label=data["label"],
+            label_start_byte=int(data["label_start_byte"]),
+            label_end_byte=int(data["label_end_byte"]),
+            declared_type=data.get("declared_type"),
+            optional=None if optional is None else bool(optional),
+            repeated=None if repeated is None else bool(repeated),
+            provenance=_query_provenance(data),
+            provenance_truncated=bool(data.get("provenance_truncated", False)),
+        )
+
+    def render_text(self) -> str:
+        declared = f": {self.declared_type}" if self.declared_type is not None else ""
+        return (
+            f"{self.path}:{self.range.start_line}:{self.range.start_column} "
+            f"[parameter] #{self.parameter_index} {self.label}{declared}"
+        )
+
+
+@dataclass(frozen=True)
+class CodeQueryDecoratedParameter:
+    """One parameter and the decorator that annotates it.
+
+    ``binding_status`` and ``completion`` are separate axes: a bound
+    decorator whose module nobody resolved is still an incomplete answer.
+    """
+
+    id: str
+    parameter_id: str
+    path: str
+    language: str
+    range: CodeQueryRange
+    decorator_range: CodeQueryRange
+    decorator_name: str
+    binding_status: str
+    boundary: str
+    completion: str
+    coverage: str
+    terminal: bool
+    decorator_id: str | None = None
+    owner_id: str | None = None
+    procedure_id: str | None = None
+    value_id: str | None = None
+    parameter_ordinal: int | None = None
+    port_id: str | None = None
+    local_name: str | None = None
+    imported_name: str | None = None
+    module: str | None = None
+    reason: str | None = None
+    provenance: list[CodeQueryProvenance] = field(default_factory=list)
+    provenance_truncated: bool = False
+
+    @classmethod
+    def from_dict(cls, data: dict) -> CodeQueryDecoratedParameter:
+        return cls(
+            id=data["id"],
+            parameter_id=data["parameter_id"],
+            path=data["path"],
+            language=data["language"],
+            range=CodeQueryRange.from_dict(data["range"]),
+            decorator_range=CodeQueryRange.from_dict(data["decorator_range"]),
+            decorator_name=data["decorator_name"],
+            binding_status=data["binding_status"],
+            boundary=data["boundary"],
+            completion=data["completion"],
+            coverage=data["coverage"],
+            terminal=bool(data["terminal"]),
+            decorator_id=data.get("decorator_id"),
+            owner_id=data.get("owner_id"),
+            procedure_id=data.get("procedure_id"),
+            value_id=data.get("value_id"),
+            parameter_ordinal=_optional_int(data, "parameter_ordinal"),
+            port_id=data.get("port_id"),
+            local_name=data.get("local_name"),
+            imported_name=data.get("imported_name"),
+            module=data.get("module"),
+            reason=data.get("reason"),
+            provenance=_query_provenance(data),
+            provenance_truncated=bool(data.get("provenance_truncated", False)),
+        )
+
+    def render_text(self) -> str:
+        rendered = (
+            f"{self.path}:{self.range.start_line}:{self.range.start_column} "
+            f"[decorated parameter; {self.binding_status}; {self.completion}; "
+            f"{self.coverage}] @{self.decorator_name}"
+        )
+        if self.local_name is not None:
+            rendered += f" on {self.local_name}"
+        if self.module is not None:
+            rendered += f" from {self.module}"
+        if self.reason is not None:
+            rendered += f", reason {self.reason}"
+        return rendered
+
+
+@dataclass(frozen=True)
+class CodeQueryCallableApplicability:
+    """One candidate the resolver considered for one call site.
+
+    ``selected`` and ``verdict`` are independent: a selected candidate with
+    an ``unknown`` verdict means the seam bound something no applicability
+    check measured. A refused overload keeps its row and its typed reason.
+    """
+
+    id: str
+    site_ast_id: str
+    path: str
+    language: str
+    range: CodeQueryRange
+    ordinal: int
+    verdict: str
+    selected: bool
+    candidate: CodeQueryCandidateRef
+    reason: str | None = None
+    tier: str | None = None
+    provenance: list[CodeQueryProvenance] = field(default_factory=list)
+    provenance_truncated: bool = False
+
+    @classmethod
+    def from_dict(cls, data: dict) -> CodeQueryCallableApplicability:
+        return cls(
+            id=data["id"],
+            site_ast_id=data["site_ast_id"],
+            path=data["path"],
+            language=data["language"],
+            range=CodeQueryRange.from_dict(data["range"]),
+            ordinal=int(data["ordinal"]),
+            verdict=data["verdict"],
+            selected=bool(data["selected"]),
+            candidate=CodeQueryCandidateRef.from_dict(data["candidate"]),
+            reason=data.get("reason"),
+            tier=data.get("tier"),
+            provenance=_query_provenance(data),
+            provenance_truncated=bool(data.get("provenance_truncated", False)),
+        )
+
+    def render_text(self) -> str:
+        rendered = (
+            f"{self.path}:{self.range.start_line}:{self.range.start_column} "
+            f"[callable applicability; {self.verdict}"
+            f"{'; selected' if self.selected else ''}] "
+            f"#{self.ordinal} {self.candidate.name}"
+        )
+        if self.tier is not None:
+            rendered += f" (tier {self.tier})"
+        if self.reason is not None:
+            rendered += f", reason {self.reason}"
+        return rendered
+
+
+@dataclass(frozen=True)
+class CodeQueryOverloadSelection:
+    """The mandatory overload-selection summary for one reference occurrence.
+
+    ``resolution`` is computed from the verdict counts alone: zero applicable
+    candidates stay ``unresolved`` and several equal winners stay
+    ``ambiguous``. ``supported`` is false when the language reports no
+    callable axis at all, which forces ``unknown_shape``.
+    """
+
+    id: str
+    site_ast_id: str
+    path: str
+    language: str
+    range: CodeQueryRange
+    resolution: str
+    supported: bool
+    considered_count: int
+    applicable_count: int
+    inapplicable_count: int
+    unknown_count: int
+    provenance: list[CodeQueryProvenance] = field(default_factory=list)
+    provenance_truncated: bool = False
+
+    @classmethod
+    def from_dict(cls, data: dict) -> CodeQueryOverloadSelection:
+        return cls(
+            id=data["id"],
+            site_ast_id=data["site_ast_id"],
+            path=data["path"],
+            language=data["language"],
+            range=CodeQueryRange.from_dict(data["range"]),
+            resolution=data["resolution"],
+            supported=bool(data["supported"]),
+            considered_count=int(data["considered_count"]),
+            applicable_count=int(data["applicable_count"]),
+            inapplicable_count=int(data["inapplicable_count"]),
+            unknown_count=int(data["unknown_count"]),
+            provenance=_query_provenance(data),
+            provenance_truncated=bool(data.get("provenance_truncated", False)),
+        )
+
+    def render_text(self) -> str:
+        return (
+            f"{self.path}:{self.range.start_line}:{self.range.start_column} "
+            f"[overload selection; {self.resolution}"
+            f"{'' if self.supported else '; unsupported'}] "
+            f"{self.applicable_count} applicable, "
+            f"{self.inapplicable_count} inapplicable, "
+            f"{self.unknown_count} unknown of {self.considered_count} considered"
+        )
+
+
+@dataclass(frozen=True)
+class CodeQueryMemberSelection:
+    """The mandatory member-selection summary for one reference occurrence.
+
+    The row exists even when the file records no resolver trace, which is
+    what keeps an empty candidate relation from reading as a proven-empty
+    selection: ``trace_completeness`` of ``absent`` with ``coverage`` of
+    ``unsupported`` says the language records no trace at all.
+    """
+
+    id: str
+    site_ast_id: str
+    path: str
+    language: str
+    range: CodeQueryRange
+    member: str
+    role: str
+    outcome: str
+    selected_count: int
+    candidate_count: int
+    trace_completeness: str
+    coverage: str
+    provenance: list[CodeQueryProvenance] = field(default_factory=list)
+    provenance_truncated: bool = False
+
+    @classmethod
+    def from_dict(cls, data: dict) -> CodeQueryMemberSelection:
+        return cls(
+            id=data["id"],
+            site_ast_id=data["site_ast_id"],
+            path=data["path"],
+            language=data["language"],
+            range=CodeQueryRange.from_dict(data["range"]),
+            member=data["member"],
+            role=data["role"],
+            outcome=data["outcome"],
+            selected_count=int(data["selected_count"]),
+            candidate_count=int(data["candidate_count"]),
+            trace_completeness=data["trace_completeness"],
+            coverage=data["coverage"],
+            provenance=_query_provenance(data),
+            provenance_truncated=bool(data.get("provenance_truncated", False)),
+        )
+
+    def render_text(self) -> str:
+        return (
+            f"{self.path}:{self.range.start_line}:{self.range.start_column} "
+            f"[member selection; {self.role}; {self.outcome}; "
+            f"{self.trace_completeness}/{self.coverage}] {self.member} "
+            f"{self.selected_count} selected of {self.candidate_count} candidate"
+            f"{'' if self.candidate_count == 1 else 's'}"
+        )
+
+
+@dataclass(frozen=True)
+class CodeQueryDispatchOutcome:
+    """The mandatory terminal row for one bounded-dispatch site.
+
+    Target rows may be empty, and this row states the semantic outcome that
+    produced that emptiness. ``coverage`` is ``exhaustive`` only when the
+    oracle itself reported exhaustive coverage.
+    """
+
+    id: str
+    site_id: str
+    path: str
+    language: str
+    range: CodeQueryRange
+    outcome: str
+    coverage: str
+    call_site_count: int
+    target_count: int
+    targets_truncated: bool
+    site_ast_id: str | None = None
+    semantic_unsupported: str | None = None
+    exceeded_limit: str | None = None
+    provenance: list[CodeQueryProvenance] = field(default_factory=list)
+    provenance_truncated: bool = False
+
+    @classmethod
+    def from_dict(cls, data: dict) -> CodeQueryDispatchOutcome:
+        return cls(
+            id=data["id"],
+            site_id=data["site_id"],
+            path=data["path"],
+            language=data["language"],
+            range=CodeQueryRange.from_dict(data["range"]),
+            outcome=data["outcome"],
+            coverage=data["coverage"],
+            call_site_count=int(data["call_site_count"]),
+            target_count=int(data["target_count"]),
+            targets_truncated=bool(data["targets_truncated"]),
+            site_ast_id=data.get("site_ast_id"),
+            semantic_unsupported=data.get("semantic_unsupported"),
+            exceeded_limit=data.get("exceeded_limit"),
+            provenance=_query_provenance(data),
+            provenance_truncated=bool(data.get("provenance_truncated", False)),
+        )
+
+    def render_text(self) -> str:
+        rendered = (
+            f"{self.path}:{self.range.start_line}:{self.range.start_column} "
+            f"[dispatch outcome; {self.outcome}; {self.coverage}] "
+            f"{self.target_count} target"
+            f"{'' if self.target_count == 1 else 's'} "
+            f"from {self.call_site_count} call site"
+            f"{'' if self.call_site_count == 1 else 's'}"
+        )
+        if self.targets_truncated:
+            rendered += " (truncated)"
+        if self.semantic_unsupported is not None:
+            rendered += f", unsupported {self.semantic_unsupported}"
+        if self.exceeded_limit is not None:
+            rendered += f", exceeded {self.exceeded_limit}"
+        return rendered
+
+
+@dataclass(frozen=True)
+class CodeQueryDispatchTarget:
+    """One bounded dispatch arm of one call site.
+
+    ``dispatch`` is the honest conjunction of ``proof``, ``completeness`` and
+    the site's ``coverage``; it is ``proven_dispatch`` only for a proven,
+    complete arm inside an exhaustive set. A row with a ``boundary_kind`` is
+    a boundary the oracle named a target for, not a materialized candidate.
+    """
+
+    id: str
+    site_id: str
+    path: str
+    ordinal: int
+    target_id: str
+    target_path: str
+    proof: str
+    completeness: str
+    coverage: str
+    dispatch: str
+    site_ast_id: str | None = None
+    target_declaration: CodeQueryDeclaration | None = None
+    boundary_kind: str | None = None
+    provenance: list[CodeQueryProvenance] = field(default_factory=list)
+    provenance_truncated: bool = False
+
+    @classmethod
+    def from_dict(cls, data: dict) -> CodeQueryDispatchTarget:
+        return cls(
+            id=data["id"],
+            site_id=data["site_id"],
+            path=data["path"],
+            ordinal=int(data["ordinal"]),
+            target_id=data["target_id"],
+            target_path=data["target_path"],
+            proof=data["proof"],
+            completeness=data["completeness"],
+            coverage=data["coverage"],
+            dispatch=data["dispatch"],
+            site_ast_id=data.get("site_ast_id"),
+            target_declaration=_optional_declaration(data, "target_declaration"),
+            boundary_kind=data.get("boundary_kind"),
+            provenance=_query_provenance(data),
+            provenance_truncated=bool(data.get("provenance_truncated", False)),
+        )
+
+    def render_text(self) -> str:
+        target = (
+            self.target_declaration.fq_name
+            if self.target_declaration is not None
+            else self.target_path
+        )
+        rendered = (
+            f"{self.path} [dispatch target; {self.dispatch}; "
+            f"{self.proof}/{self.completeness}; {self.coverage}] "
+            f"#{self.ordinal} -> {target}"
+        )
+        if self.boundary_kind is not None:
+            rendered += f" (boundary {self.boundary_kind})"
+        return rendered
+
+
+@dataclass(frozen=True)
+class CodeQueryMemberFamily:
+    """The mandatory terminal row for one member's canonical method family.
+
+    Edge rows may be empty, and ``outcome`` says why: ``no_family`` is a
+    member the language excludes outright, while ``incomplete`` and
+    ``unsupported`` are honest failures that carry no ``family_id``.
+    """
+
+    id: str
+    member_id: str
+    path: str
+    language: str
+    range: CodeQueryRange
+    outcome: str
+    capability: str
+    coverage: str
+    overrides_count: int
+    implements_count: int
+    overridden_by_count: int
+    implemented_by_count: int
+    edge_count: int
+    root_count: int
+    member: CodeQueryDeclaration | None = None
+    reason: str | None = None
+    family_id: str | None = None
+    provenance: list[CodeQueryProvenance] = field(default_factory=list)
+    provenance_truncated: bool = False
+
+    @classmethod
+    def from_dict(cls, data: dict) -> CodeQueryMemberFamily:
+        return cls(
+            id=data["id"],
+            member_id=data["member_id"],
+            path=data["path"],
+            language=data["language"],
+            range=CodeQueryRange.from_dict(data["range"]),
+            outcome=data["outcome"],
+            capability=data["capability"],
+            coverage=data["coverage"],
+            overrides_count=int(data["overrides_count"]),
+            implements_count=int(data["implements_count"]),
+            overridden_by_count=int(data["overridden_by_count"]),
+            implemented_by_count=int(data["implemented_by_count"]),
+            edge_count=int(data["edge_count"]),
+            root_count=int(data["root_count"]),
+            member=_optional_declaration(data, "member"),
+            reason=data.get("reason"),
+            family_id=data.get("family_id"),
+            provenance=_query_provenance(data),
+            provenance_truncated=bool(data.get("provenance_truncated", False)),
+        )
+
+    def render_text(self) -> str:
+        subject = self.member.fq_name if self.member is not None else self.member_id
+        rendered = (
+            f"{self.path}:{self.range.start_line}:{self.range.start_column} "
+            f"[member family; {self.outcome}; {self.capability}; {self.coverage}] "
+            f"{subject} {self.edge_count} edge"
+            f"{'' if self.edge_count == 1 else 's'}"
+        )
+        if self.reason is not None:
+            rendered += f", reason {self.reason}"
+        return rendered
+
+
+@dataclass(frozen=True)
+class CodeQueryMemberFamilyEdge:
+    """One typed edge of one member's method family.
+
+    Inverse rows (``overridden_by``, ``implemented_by``) are the bounded
+    inversion of the forward edges, never an independent resolution, so the
+    same two declarations appear from either end with the relation reversed.
+    """
+
+    id: str
+    member_id: str
+    path: str
+    range: CodeQueryRange
+    ordinal: int
+    target_id: str
+    relation: str
+    hierarchy_depth: int
+    proof: str
+    completeness: str
+    coverage: str
+    source: CodeQueryDeclaration | None = None
+    target: CodeQueryDeclaration | None = None
+    family_id: str | None = None
+    provenance: list[CodeQueryProvenance] = field(default_factory=list)
+    provenance_truncated: bool = False
+
+    @classmethod
+    def from_dict(cls, data: dict) -> CodeQueryMemberFamilyEdge:
+        return cls(
+            id=data["id"],
+            member_id=data["member_id"],
+            path=data["path"],
+            range=CodeQueryRange.from_dict(data["range"]),
+            ordinal=int(data["ordinal"]),
+            target_id=data["target_id"],
+            relation=data["relation"],
+            hierarchy_depth=int(data["hierarchy_depth"]),
+            proof=data["proof"],
+            completeness=data["completeness"],
+            coverage=data["coverage"],
+            source=_optional_declaration(data, "source"),
+            target=_optional_declaration(data, "target"),
+            family_id=data.get("family_id"),
+            provenance=_query_provenance(data),
+            provenance_truncated=bool(data.get("provenance_truncated", False)),
+        )
+
+    def render_text(self) -> str:
+        source = self.source.fq_name if self.source is not None else self.member_id
+        target = self.target.fq_name if self.target is not None else self.target_id
+        return (
+            f"{self.path}:{self.range.start_line}:{self.range.start_column} "
+            f"[family edge; {self.relation}; {self.proof}/"
+            f"{self.completeness}; {self.coverage}] "
+            f"#{self.ordinal} {source} -> {target} (depth {self.hierarchy_depth})"
+        )
+
+
+@dataclass(frozen=True)
+class CodeQueryCandidateHop:
+    """One hop of the route that produced one resolution candidate.
+
+    ``source`` and ``target`` carry the wire's ``from`` and ``to`` keys,
+    which cannot be Python attribute names.
+    """
+
+    id: str
+    candidate_id: str
+    ast_id: str
+    path: str
+    language: str
+    range: CodeQueryRange
+    start_byte: int
+    end_byte: int
+    hop: int
+    relation: str
+    source: CodeQueryDeclaration | None = None
+    target: CodeQueryDeclaration | None = None
+    provenance: list[CodeQueryProvenance] = field(default_factory=list)
+    provenance_truncated: bool = False
+
+    @classmethod
+    def from_dict(cls, data: dict) -> CodeQueryCandidateHop:
+        return cls(
+            id=data["id"],
+            candidate_id=data["candidate_id"],
+            ast_id=data["ast_id"],
+            path=data["path"],
+            language=data["language"],
+            range=CodeQueryRange.from_dict(data["range"]),
+            start_byte=int(data["start_byte"]),
+            end_byte=int(data["end_byte"]),
+            hop=int(data["hop"]),
+            relation=data["relation"],
+            source=_optional_declaration(data, "from"),
+            target=_optional_declaration(data, "to"),
+            provenance=_query_provenance(data),
+            provenance_truncated=bool(data.get("provenance_truncated", False)),
+        )
+
+    def render_text(self) -> str:
+        source = self.source.fq_name if self.source is not None else "unresolved"
+        target = self.target.fq_name if self.target is not None else "unresolved"
+        return (
+            f"{self.path}:{self.range.start_line}:{self.range.start_column} "
+            f"[candidate_hop; {self.relation}] #{self.hop} {source} -> {target}"
+        )
+
+
+@dataclass(frozen=True)
+class CodeQueryControlRelation:
+    """One derived control relation between two program points.
+
+    ``completeness`` and ``uncovered_relations`` are what say whether an
+    absent relation is a proven absence: an incomplete derivation names the
+    relations it could not decide.
+    """
+
+    id: str
+    procedure_id: str
+    path: str
+    language: str
+    range: CodeQueryRange
+    relation: str
+    certainty: str
+    exit_partition: str
+    source: CodeQueryProgramPointRef
+    target: CodeQueryProgramPointRef
+    completeness: str
+    generation: int
+    controlling_edge_id: str | None = None
+    uncovered_relations: list[str] = field(default_factory=list)
+    provenance: list[CodeQueryProvenance] = field(default_factory=list)
+    provenance_truncated: bool = False
+
+    @classmethod
+    def from_dict(cls, data: dict) -> CodeQueryControlRelation:
+        return cls(
+            id=data["id"],
+            procedure_id=data["procedure_id"],
+            path=data["path"],
+            language=data["language"],
+            range=CodeQueryRange.from_dict(data["range"]),
+            relation=data["relation"],
+            certainty=data["certainty"],
+            exit_partition=data["exit_partition"],
+            source=CodeQueryProgramPointRef.from_dict(data["source"]),
+            target=CodeQueryProgramPointRef.from_dict(data["target"]),
+            completeness=data["completeness"],
+            generation=int(data["generation"]),
+            controlling_edge_id=data.get("controlling_edge_id"),
+            uncovered_relations=list(data.get("uncovered_relations", [])),
+            provenance=_query_provenance(data),
+            provenance_truncated=bool(data.get("provenance_truncated", False)),
+        )
+
+    def render_text(self) -> str:
+        rendered = (
+            f"{self.path}:{self.range.start_line}:{self.range.start_column} "
+            f"[control_relation; {self.relation}; {self.certainty}; "
+            f"{self.completeness}] {self.source.id} -> {self.target.id} "
+            f"({self.exit_partition})"
+        )
+        if self.uncovered_relations:
+            rendered += f", uncovered {', '.join(self.uncovered_relations)}"
+        return rendered
+
+
+@dataclass(frozen=True)
+class CodeQueryGuard:
+    """One normalized branch condition and the edges it selects."""
+
+    id: str
+    procedure_id: str
+    path: str
+    language: str
+    range: CodeQueryRange
+    point: CodeQueryProgramPointRef
+    predicate: str
+    proof: str
+    completeness: str
+    constant: bool | None = None
+    null_on_true: bool | None = None
+    null_target_id: str | None = None
+    equality_negated: bool | None = None
+    constant_value: int | None = None
+    opaque_digest: int | None = None
+    subject_value: int | None = None
+    true_edge_id: str | None = None
+    true_target_id: str | None = None
+    false_edge_id: str | None = None
+    false_target_id: str | None = None
+    provenance: list[CodeQueryProvenance] = field(default_factory=list)
+    provenance_truncated: bool = False
+
+    @classmethod
+    def from_dict(cls, data: dict) -> CodeQueryGuard:
+        constant = data.get("constant")
+        null_on_true = data.get("null_on_true")
+        equality_negated = data.get("equality_negated")
+        return cls(
+            id=data["id"],
+            procedure_id=data["procedure_id"],
+            path=data["path"],
+            language=data["language"],
+            range=CodeQueryRange.from_dict(data["range"]),
+            point=CodeQueryProgramPointRef.from_dict(data["point"]),
+            predicate=data["predicate"],
+            proof=data["proof"],
+            completeness=data["completeness"],
+            constant=None if constant is None else bool(constant),
+            null_on_true=None if null_on_true is None else bool(null_on_true),
+            null_target_id=data.get("null_target_id"),
+            equality_negated=(
+                None if equality_negated is None else bool(equality_negated)
+            ),
+            constant_value=_optional_int(data, "constant_value"),
+            opaque_digest=_optional_int(data, "opaque_digest"),
+            subject_value=_optional_int(data, "subject_value"),
+            true_edge_id=data.get("true_edge_id"),
+            true_target_id=data.get("true_target_id"),
+            false_edge_id=data.get("false_edge_id"),
+            false_target_id=data.get("false_target_id"),
+            provenance=_query_provenance(data),
+            provenance_truncated=bool(data.get("provenance_truncated", False)),
+        )
+
+    def render_text(self) -> str:
+        return (
+            f"{self.path}:{self.range.start_line}:{self.range.start_column} "
+            f"[guard; {self.predicate}; {self.proof}/{self.completeness}] "
+            f"at {self.point.id}"
+        )
+
+
+@dataclass(frozen=True)
+class CodeQuerySourceSet:
+    """One compilation input set the build declares.
+
+    The row's existence is the statement "the build says this file compiles
+    here"; a file no build file claims produces a diagnostic, never a row
+    derived from its path. ``build_file`` is the anchor because the build
+    file is what makes the claim true.
+    """
+
+    id: str
+    name: str
+    build_file: str
+    completeness: str
+    target_id: str | None = None
+    provenance: list[CodeQueryProvenance] = field(default_factory=list)
+    provenance_truncated: bool = False
+
+    @classmethod
+    def from_dict(cls, data: dict) -> CodeQuerySourceSet:
+        return cls(
+            id=data["id"],
+            name=data["name"],
+            build_file=data["build_file"],
+            completeness=data["completeness"],
+            target_id=data.get("target_id"),
+            provenance=_query_provenance(data),
+            provenance_truncated=bool(data.get("provenance_truncated", False)),
+        )
+
+    def render_text(self) -> str:
+        rendered = (
+            f"{self.build_file} [source_set; {self.completeness}] {self.name}"
+        )
+        if self.target_id is not None:
+            rendered += f" -> target {self.target_id}"
+        return rendered
+
+
+@dataclass(frozen=True)
+class CodeQueryBuildTarget:
+    """One artifact the build declares."""
+
+    id: str
+    name: str
+    build_file: str
+    completeness: str
+    build_project_id: str | None = None
+    provenance: list[CodeQueryProvenance] = field(default_factory=list)
+    provenance_truncated: bool = False
+
+    @classmethod
+    def from_dict(cls, data: dict) -> CodeQueryBuildTarget:
+        return cls(
+            id=data["id"],
+            name=data["name"],
+            build_file=data["build_file"],
+            completeness=data["completeness"],
+            build_project_id=data.get("build_project_id"),
+            provenance=_query_provenance(data),
+            provenance_truncated=bool(data.get("provenance_truncated", False)),
+        )
+
+    def render_text(self) -> str:
+        rendered = (
+            f"{self.build_file} [build_target; {self.completeness}] {self.name}"
+        )
+        if self.build_project_id is not None:
+            rendered += f" in project {self.build_project_id}"
+        return rendered
+
+
+@dataclass(frozen=True)
+class CodeQueryTopologyEdge:
+    """One dependency the build declares between two targets.
+
+    ``from_id`` and ``to_id`` are ``build_target`` row ids, so an
+    architecture rule relates two targets by id equality rather than by
+    comparing names read out of two different places. An absent ``to_id``
+    means the depended-on coordinate is not a declared target here.
+    """
+
+    id: str
+    from_id: str
+    from_name: str
+    to_name: str
+    scope: str
+    build_file: str
+    completeness: str
+    to_id: str | None = None
+    provenance: list[CodeQueryProvenance] = field(default_factory=list)
+    provenance_truncated: bool = False
+
+    @classmethod
+    def from_dict(cls, data: dict) -> CodeQueryTopologyEdge:
+        return cls(
+            id=data["id"],
+            from_id=data["from_id"],
+            from_name=data["from_name"],
+            to_name=data["to_name"],
+            scope=data["scope"],
+            build_file=data["build_file"],
+            completeness=data["completeness"],
+            to_id=data.get("to_id"),
+            provenance=_query_provenance(data),
+            provenance_truncated=bool(data.get("provenance_truncated", False)),
+        )
+
+    def render_text(self) -> str:
+        return (
+            f"{self.build_file} [topology_edge; {self.scope}; {self.completeness}] "
+            f"{self.from_name} -> {self.to_name}"
+        )
+
+
+CodeQueryResultItem = (
+    CodeQueryMatch
+    | CodeQueryDeclaration
+    | CodeQueryProcedure
+    | CodeQueryProgramPoint
+    | CodeQueryControlEdge
+    | CodeQueryTypestateFinding
+    | CodeQueryConcurrentAccessConflict
+    | CodeQueryTypestateWitness
+    | CodeQueryFlowEndpoint
+    | CodeQueryFlowWitness
+    | CodeQueryTaintFinding
+    | CodeQueryFile
+    | CodeQueryReferenceSite
+    | CodeQueryCallSite
+    | CodeQueryExpressionSite
+    | CodeQueryJsxAttributeValue
+    | CodeQueryReceiverAnalysis
+    | CodeQueryMemberTargetAnalysis
+    | CodeQueryReceiverOutcome
+    | CodeQueryReceiverEvidence
+    | CodeQueryFieldWriteValue
+    | CodeQueryCallShape
+    | CodeQueryCallResult
+    | CodeQueryCallArgumentGroup
+    | CodeQueryCallShapeArgument
+    | CodeQueryCallBinding
+    | CodeQueryCallEffect
+    | CodeQueryCallResultContract
+    | CodeQueryResultContractUse
+    | CodeQueryResultContractFailureUse
+    | CodeQueryNilnessOperation
+    | CodeQuerySwitchCoverage
+    | CodeQueryDetachedTaskTransfer
+    | CodeQueryProcedureEffect
+    | CodeQueryCallableSignature
+    | CodeQuerySignatureParameter
+    | CodeQueryDecoratedParameter
+    | CodeQueryCallableApplicability
+    | CodeQueryOverloadSelection
+    | CodeQueryMemberSelection
+    | CodeQueryDispatchOutcome
+    | CodeQueryDispatchTarget
+    | CodeQueryMemberFamily
+    | CodeQueryMemberFamilyEdge
+    | CodeQueryOccurrence
+    | CodeQueryLexicalScope
+    | CodeQueryBinding
+    | CodeQueryResolutionCandidate
+    | CodeQueryCandidateHop
+    | CodeQueryGenerationSite
+    | CodeQueryExport
+    | CodeQueryDeclarationState
+    | CodeQueryReferenceEdge
+    | CodeQueryStateEvent
+    | CodeQueryFlowRelation
+    | CodeQueryControlRelation
+    | CodeQueryGuard
+    | CodeQueryRewritePath
+    | CodeQueryQualifiedPath
+    | CodeQueryPathSegment
+    | CodeQuerySourceSet
+    | CodeQueryBuildTarget
+    | CodeQueryTopologyEdge
+)
+
+_CODE_QUERY_RESULT_ITEM_TYPES = {
+    "structural_match": CodeQueryMatch,
+    "declaration": CodeQueryDeclaration,
+    "procedure": CodeQueryProcedure,
+    "program_point": CodeQueryProgramPoint,
+    "control_edge": CodeQueryControlEdge,
+    "typestate_finding": CodeQueryTypestateFinding,
+    "concurrent_access_conflict": CodeQueryConcurrentAccessConflict,
+    "typestate_witness": CodeQueryTypestateWitness,
+    "flow_endpoint": CodeQueryFlowEndpoint,
+    "flow_witness": CodeQueryFlowWitness,
+    "taint_finding": CodeQueryTaintFinding,
+    "file": CodeQueryFile,
+    "reference_site": CodeQueryReferenceSite,
+    "call_site": CodeQueryCallSite,
+    "expression_site": CodeQueryExpressionSite,
+    "jsx_attribute_value": CodeQueryJsxAttributeValue,
+    "receiver_analysis": CodeQueryReceiverAnalysis,
+    "member_target_analysis": CodeQueryMemberTargetAnalysis,
+    "receiver_outcome": CodeQueryReceiverOutcome,
+    "receiver_evidence": CodeQueryReceiverEvidence,
+    "field_write_value": CodeQueryFieldWriteValue,
+    "call_shape": CodeQueryCallShape,
+    "call_result": CodeQueryCallResult,
+    "call_argument_group": CodeQueryCallArgumentGroup,
+    "call_argument": CodeQueryCallShapeArgument,
+    "call_binding": CodeQueryCallBinding,
+    "call_effect": CodeQueryCallEffect,
+    "call_result_contract": CodeQueryCallResultContract,
+    "result_contract_use": CodeQueryResultContractUse,
+    "result_contract_failure_use": CodeQueryResultContractFailureUse,
+    "nilness_operation": CodeQueryNilnessOperation,
+    "switch_coverage": CodeQuerySwitchCoverage,
+    "detached_task_transfer": CodeQueryDetachedTaskTransfer,
+    "procedure_effect": CodeQueryProcedureEffect,
+    "callable_signature": CodeQueryCallableSignature,
+    "signature_parameter": CodeQuerySignatureParameter,
+    "decorated_parameter": CodeQueryDecoratedParameter,
+    "callable_applicability": CodeQueryCallableApplicability,
+    "overload_selection": CodeQueryOverloadSelection,
+    "member_selection": CodeQueryMemberSelection,
+    "dispatch_outcome": CodeQueryDispatchOutcome,
+    "dispatch_target": CodeQueryDispatchTarget,
+    "member_family": CodeQueryMemberFamily,
+    "member_family_edge": CodeQueryMemberFamilyEdge,
+    "occurrence": CodeQueryOccurrence,
+    "lexical_scope": CodeQueryLexicalScope,
+    "binding": CodeQueryBinding,
+    "resolution_candidate": CodeQueryResolutionCandidate,
+    "candidate_hop": CodeQueryCandidateHop,
+    "generation_site": CodeQueryGenerationSite,
+    "export": CodeQueryExport,
+    "declaration_state": CodeQueryDeclarationState,
+    "reference_edge": CodeQueryReferenceEdge,
+    "state_event": CodeQueryStateEvent,
+    "flow_relation": CodeQueryFlowRelation,
+    "control_relation": CodeQueryControlRelation,
+    "guard": CodeQueryGuard,
+    "rewrite_path": CodeQueryRewritePath,
+    "qualified_path": CodeQueryQualifiedPath,
+    "path_segment": CodeQueryPathSegment,
+    "source_set": CodeQuerySourceSet,
+    "build_target": CodeQueryBuildTarget,
+    "topology_edge": CodeQueryTopologyEdge,
+}
+
+
 def _code_query_result_item(data: dict) -> CodeQueryResultItem:
     result_type = data.get("result_type")
-    if result_type == "structural_match":
-        return CodeQueryMatch.from_dict(data)
-    if result_type == "declaration":
-        return CodeQueryDeclaration.from_dict(data)
-    if result_type == "procedure":
-        return CodeQueryProcedure.from_dict(data)
-    if result_type == "program_point":
-        return CodeQueryProgramPoint.from_dict(data)
-    if result_type == "control_edge":
-        return CodeQueryControlEdge.from_dict(data)
-    if result_type == "typestate_finding":
-        return CodeQueryTypestateFinding.from_dict(data)
-    if result_type == "typestate_witness":
-        return CodeQueryTypestateWitness.from_dict(data)
-    if result_type == "flow_endpoint":
-        return CodeQueryFlowEndpoint.from_dict(data)
-    if result_type == "flow_witness":
-        return CodeQueryFlowWitness.from_dict(data)
-    if result_type == "taint_finding":
-        return CodeQueryTaintFinding.from_dict(data)
-    if result_type == "file":
-        return CodeQueryFile.from_dict(data)
-    if result_type == "reference_site":
-        return CodeQueryReferenceSite.from_dict(data)
-    if result_type == "call_site":
-        return CodeQueryCallSite.from_dict(data)
-    if result_type == "expression_site":
-        return CodeQueryExpressionSite.from_dict(data)
-    if result_type == "receiver_analysis":
-        return CodeQueryReceiverAnalysis.from_dict(data)
-    if result_type == "occurrence":
-        return CodeQueryOccurrence.from_dict(data)
-    if result_type == "lexical_scope":
-        return CodeQueryLexicalScope.from_dict(data)
-    if result_type == "binding":
-        return CodeQueryBinding.from_dict(data)
-    if result_type == "resolution_candidate":
-        return CodeQueryResolutionCandidate.from_dict(data)
-    if result_type == "generation_site":
-        return CodeQueryGenerationSite.from_dict(data)
-    if result_type == "export":
-        return CodeQueryExport.from_dict(data)
-    if result_type == "declaration_state":
-        return CodeQueryDeclarationState.from_dict(data)
-    if result_type == "reference_edge":
-        return CodeQueryReferenceEdge.from_dict(data)
-    if result_type == "state_event":
-        return CodeQueryStateEvent.from_dict(data)
-    if result_type == "flow_relation":
-        return CodeQueryFlowRelation.from_dict(data)
-    if result_type == "rewrite_path":
-        return CodeQueryRewritePath.from_dict(data)
-    if result_type == "qualified_path":
-        return CodeQueryQualifiedPath.from_dict(data)
-    if result_type == "path_segment":
-        return CodeQueryPathSegment.from_dict(data)
-    raise ValueError(f"unknown code query result_type: {result_type!r}")
+    item_type = (
+        _CODE_QUERY_RESULT_ITEM_TYPES.get(result_type)
+        if isinstance(result_type, str)
+        else None
+    )
+    if item_type is None:
+        raise ValueError(f"unknown code query result_type: {result_type!r}")
+    return item_type.from_dict(data)
 
 
 class CodeQueryDiagnosticCode(StrEnum):
@@ -2947,6 +5342,7 @@ class CodeQueryDiagnosticCode(StrEnum):
     NO_ENCLOSING_PROCEDURE = "no_enclosing_procedure"
     SEMANTIC_CAPABILITY_UNSUPPORTED = "semantic_capability_unsupported"
     SEMANTIC_ANALYSIS_PARTIAL = "semantic_analysis_partial"
+    CALL_BINDING_DISPATCH_PARTIAL = "call_binding_dispatch_partial"
     SEMANTIC_BUDGET_EXHAUSTED = "semantic_budget_exhausted"
     SEMANTIC_PROVIDER_FAILED = "semantic_provider_failed"
     UNRESOLVED_PROTOCOL_REFERENCE = "unresolved_protocol_reference"
@@ -2968,6 +5364,13 @@ class CodeQueryDiagnosticCode(StrEnum):
     VALUE_FLOW_PROVIDER_FAILED = "value_flow_provider_failed"
     VALUE_FLOW_SOLVER_BUDGET_EXHAUSTED = "value_flow_solver_budget_exhausted"
     VALUE_FLOW_WITNESS_TRUNCATED = "value_flow_witness_truncated"
+    UNRESOLVED_TAINT_RESULT_REFERENCE = "unresolved_taint_result_reference"
+    TAINT_REGISTRATION_STALE = "taint_registration_stale"
+    TAINT_HANDLE_STALE = "taint_handle_stale"
+    TAINT_ROOT_MISMATCH = "taint_root_mismatch"
+    TAINT_PLAN_REPORT_MISMATCH = "taint_plan_report_mismatch"
+    TAINT_PROJECTION_FAILED = "taint_projection_failed"
+    TAINT_FINDING_TRUNCATED = "taint_finding_truncated"
     RECEIVER_ANALYSIS_PARTIAL = "receiver_analysis_partial"
     RECEIVER_ANALYSIS_FAILED = "receiver_analysis_failed"
     CALL_RELATION_BUDGET_EXHAUSTED = "call_relation_budget_exhausted"
@@ -3001,20 +5404,34 @@ class CodeQueryDiagnosticCode(StrEnum):
     RESOLUTION_TRACE_INCOMPLETE = "resolution_trace_incomplete"
     EDGE_AXIS_UNSUPPORTED = "edge_axis_unsupported"
     EDGE_DERIVATION_INCOMPLETE = "edge_derivation_incomplete"
+    FLOW_STATE_AXIS_UNSUPPORTED = "flow_state_axis_unsupported"
+    FLOW_STATE_DERIVATION_INCOMPLETE = "flow_state_derivation_incomplete"
+    REWRITE_DOMAIN_UNSUPPORTED = "rewrite_domain_unsupported"
+    REWRITE_PATH_DERIVATION_INCOMPLETE = "rewrite_path_derivation_incomplete"
+    CONTROL_RELATION_DERIVATION_INCOMPLETE = "control_relation_derivation_incomplete"
+    CONTROL_RELATION_EXIT_PARTITION_PARTIAL = "control_relation_exit_partition_partial"
+    TOPOLOGY_DERIVATION_INCOMPLETE = "topology_derivation_incomplete"
+    TOPOLOGY_OWNERSHIP_AMBIGUOUS = "topology_ownership_ambiguous"
     IDENTITY_AXIS_UNSUPPORTED = "identity_axis_unsupported"
     PATH_DERIVATION_INCOMPLETE = "path_derivation_incomplete"
+    EFFECT_DERIVATION_INCOMPLETE = "effect_derivation_incomplete"
+    RESULT_CONTRACT_DERIVATION_INCOMPLETE = "result_contract_derivation_incomplete"
+    EFFECT_BUDGET_EXHAUSTED = "effect_budget_exhausted"
+    JSX_PROJECTION_INCOMPLETE = "jsx_projection_incomplete"
     RESULT_LIMIT_REACHED = "result_limit_reached"
     BROAD_QUERY = "broad_query"
 
 
 class CodeQueryDiagnosticImpact(StrEnum):
     ADVISORY = "advisory"
+    DECLARED_NON_EXHAUSTIVE = "declared_non_exhaustive"
     INCOMPLETE = "incomplete"
     INVALID = "invalid"
 
 
 class CodeQueryCompletionKind(StrEnum):
     COMPLETE = "complete"
+    PROVEN_SUBSET = "proven_subset"
     INCOMPLETE = "incomplete"
     CANCELLED = "cancelled"
     INVALID = "invalid"
@@ -3054,6 +5471,7 @@ class CodeQueryResult:
     results: list[CodeQueryResultItem]
     truncated: bool
     diagnostics: list[CodeQueryDiagnostic] = field(default_factory=list)
+    session_subset: SessionSubset | None = None
     rendered_text: str | None = None
 
     @classmethod
@@ -3067,6 +5485,7 @@ class CodeQueryResult:
                 CodeQueryDiagnostic.from_dict(item)
                 for item in data.get("diagnostics", [])
             ],
+            session_subset=_session_subset(data),
             rendered_text=rendered_text,
         )
 
@@ -3076,6 +5495,14 @@ class CodeQueryResult:
 
     @property
     def completion(self) -> CodeQueryCompletion:
+        """Derive whether this result can support a complete negative claim.
+
+        The order mirrors the Rust ``code_query_completion``: invalid, then
+        cancelled, then incomplete, then the declared-non-exhaustive subset.
+        ``PROVEN_SUBSET`` is a complete answer over a domain the producer
+        declared narrower than the whole workspace, which is why it is not
+        ``INCOMPLETE`` and not ``COMPLETE``.
+        """
         invalid = self._codes_with_impact(CodeQueryDiagnosticImpact.INVALID)
         if invalid:
             return CodeQueryCompletion(CodeQueryCompletionKind.INVALID, invalid)
@@ -3087,6 +5514,13 @@ class CodeQueryResult:
         incomplete = self._codes_with_impact(CodeQueryDiagnosticImpact.INCOMPLETE)
         if self.truncated or incomplete:
             return CodeQueryCompletion(CodeQueryCompletionKind.INCOMPLETE, incomplete)
+        declared_non_exhaustive = self._codes_with_impact(
+            CodeQueryDiagnosticImpact.DECLARED_NON_EXHAUSTIVE
+        )
+        if declared_non_exhaustive:
+            return CodeQueryCompletion(
+                CodeQueryCompletionKind.PROVEN_SUBSET, declared_non_exhaustive
+            )
         return CodeQueryCompletion(CodeQueryCompletionKind.COMPLETE)
 
     def _codes_with_impact(
@@ -5266,6 +7700,7 @@ class MostRelevantFilesResult:
     complete: bool = True
     ranking_mode_used: MostRelevantFilesRankingModeValue = "cascade"
     incomplete_reason: MostRelevantFilesIncompleteReasonValue | None = None
+    session_subset: SessionSubset | None = None
     render_line_numbers: bool = True
     rendered_text: str | None = None
 
@@ -5284,6 +7719,7 @@ class MostRelevantFilesResult:
             incomplete_reason=_most_relevant_files_incomplete_reason(
                 data.get("incomplete_reason")
             ),
+            session_subset=_session_subset(data),
             render_line_numbers=render_line_numbers,
             rendered_text=rendered_text,
         )
@@ -5433,6 +7869,7 @@ class UsageGraphResult:
     nodes: list[UsageGraphNode]
     edges: list[UsageGraphEdge]
     truncated_symbols: list[UsageGraphTruncatedSymbol]
+    session_subset: SessionSubset | None = None
     rendered_text: str | None = None
 
     @classmethod
@@ -5446,6 +7883,7 @@ class UsageGraphResult:
                 UsageGraphTruncatedSymbol.from_dict(item)
                 for item in data.get("truncated_symbols", [])
             ],
+            session_subset=_session_subset(data),
             rendered_text=rendered_text,
         )
 
@@ -6368,13 +8806,19 @@ class WorkspaceResult:
     """The active workspace root (``activate_workspace`` / ``get_active_workspace``)."""
 
     workspace_path: str
+    session_subset: SessionSubset | None = None
 
     @classmethod
     def from_dict(cls, data: dict) -> WorkspaceResult:
-        return cls(workspace_path=data["workspace_path"])
+        return cls(
+            workspace_path=data["workspace_path"],
+            session_subset=_session_subset(data),
+        )
 
     def render_text(self) -> str:
-        return self.workspace_path
+        if self.session_subset is None:
+            return self.workspace_path
+        return f"{self.workspace_path} ({self.session_subset.render_text()})"
 
 
 # ---------------------------------------------------------------------------

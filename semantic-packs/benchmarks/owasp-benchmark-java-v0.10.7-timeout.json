@@ -1,0 +1,79 @@
+{
+  "schema": "bifrost.owasp-benchmark-java.non-scorable-run.v1",
+  "status": "non_scorable",
+  "reason": "Every category exceeded its per-category deadline before producing a taint run. All 1,572 cases are NotAnalyzed, so zero findings, zero false positives, zero false greens, and the naive zero rates are not accuracy measurements.",
+  "bifrost": {
+    "version": "0.10.7",
+    "commit": "587ecf2c53f35f1d9a7821f023fe2a12907c1f54"
+  },
+  "benchmark": {
+    "repo": "https://github.com/OWASP-Benchmark/BenchmarkJava",
+    "commit": "007786f86b965a9ea8e4a7613baa5f90adbbd611",
+    "version": "1.2",
+    "expected_results": "expectedresults-1.2.csv"
+  },
+  "protocol": {
+    "date": "2026-08-31",
+    "timeout_seconds_per_category": 3600,
+    "case_limit": null,
+    "cases": 1572,
+    "real_cases": 819,
+    "fake_cases": 753,
+    "dependency_jars": 132,
+    "analyzed_files": 2770,
+    "analyzed_source_bytes": 11633213,
+    "scored_categories": [
+      "sqli",
+      "cmdi",
+      "ldapi",
+      "pathtraver",
+      "xpathi",
+      "xss"
+    ],
+    "environment_note": "The local macOS host was contended. Deadlines use wall-clock time, so this run is diagnostic evidence about runner completion under that environment and is not suitable for performance or accuracy comparison."
+  },
+  "packs": {
+    "activated": [
+      "bifrost.java-sanitizers",
+      "bifrost.esapi-sanitizers",
+      "bifrost.javax.servlet-api-framework-decls",
+      "bifrost.jdk-golden-summaries",
+      "bifrost.javax.servlet-api-summaries",
+      "bifrost.jdk-framework-summaries",
+      "bifrost.encoder-sanitizers",
+      "bifrost.commons-text-sanitizers",
+      "bifrost.guava-sanitizers",
+      "bifrost.spring-web-sanitizers",
+      "bifrost.jdk"
+    ],
+    "skipped": [],
+    "esapi_artifact_sha256": "2288e84a6c93a457c5215eb8028c87ebd4326a515e21545d2e02db8356d6ccff",
+    "jdk_pack_version": "21.0.8",
+    "jdk_pack_gaps": 3791
+  },
+  "outcome": {
+    "reliably_decided_cases": 0,
+    "not_analyzed_cases": 1572,
+    "taint_roots": 0,
+    "findings": 0,
+    "honest_metrics": null,
+    "category_runs": [
+      { "category": "sqli", "completion": "no_taint_run", "termination": "DeadlineExceeded", "retained_analyses": 0 },
+      { "category": "cmdi", "completion": "no_taint_run", "termination": "DeadlineExceeded", "retained_analyses": 0 },
+      { "category": "ldapi", "completion": "no_taint_run", "termination": "DeadlineExceeded", "retained_analyses": 0 },
+      { "category": "pathtraver", "completion": "no_taint_run", "termination": "DeadlineExceeded", "retained_analyses": 0 },
+      { "category": "xpathi", "completion": "no_taint_run", "termination": "DeadlineExceeded", "retained_analyses": 0 },
+      { "category": "xss", "completion": "no_taint_run", "termination": "DeadlineExceeded", "retained_analyses": 0 }
+    ]
+  },
+  "artifacts": {
+    "full_result_sha256": "303adb065bbe2447b8e670b632f6958b53e6abe6ce4218ff40d89b7dbc0725e1",
+    "per_case_tsv_sha256": "83f50fe17f524627732628b7254ed29dc475fbbe7ecce8dfb2d4463465d93522",
+    "per_case_rows": 1572
+  },
+  "comparison": {
+    "usable_baseline": "owasp-benchmark-java-v2.json",
+    "baseline_bifrost_version": "0.9.5",
+    "note": "This record does not replace or update the usable baseline because it contains no completed case verdicts."
+  }
+}

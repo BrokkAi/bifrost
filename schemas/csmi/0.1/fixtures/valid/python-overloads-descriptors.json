@@ -1,0 +1,166 @@
+{
+  "documentType": "semantic-document",
+  "schema": "https://csmi.brokk.ai/schema/0.1/schema.json",
+  "semanticModelVersion": "0.1",
+  "serializationVersion": "0.1-json",
+  "provenanceRecords": [
+    {
+      "id": "stub-parser",
+      "producer": {
+        "identifier": "https://example.org/python-stub-parser",
+        "version": "1.0.0"
+      },
+      "generationMethod": "source-analysis",
+      "inputs": [
+        {
+          "role": "inline-pyi",
+          "purl": "pkg:pypi/example-client@2.0.0"
+        }
+      ]
+    }
+  ],
+  "defaultProvenance": "stub-parser",
+  "semanticModels": [
+    {
+      "artifactSelectors": [
+        { "purl": "pkg:pypi/example-client@2.0.0" }
+      ],
+      "vocabularyUses": [
+        {
+          "identifier": "csmi.python",
+          "version": "0.1.0",
+          "schema": "https://csmi.brokk.ai/schema/profiles/python/0.1/schema.json",
+          "requirement": "required",
+          "affects": [
+            {
+              "kind": "core-slot",
+              "slot": "symbol-identity-scheme",
+              "target": { "model": "self" }
+            }
+          ]
+        }
+      ],
+      "symbols": [
+        {
+          "id": "client",
+          "scheme": "csmi.python",
+          "schemeVersion": "0.1.0",
+          "stability": "portable",
+          "descriptors": [
+            { "role": "namespace", "name": "example_client" },
+            { "role": "type", "name": "Client" }
+          ]
+        },
+        {
+          "id": "timeout",
+          "scheme": "csmi.python",
+          "schemeVersion": "0.1.0",
+          "stability": "portable",
+          "descriptors": [
+            { "role": "namespace", "name": "example_client" },
+            { "role": "type", "name": "Client" },
+            { "role": "term", "name": "timeout" }
+          ]
+        },
+        {
+          "id": "timeout-get",
+          "scheme": "csmi.python",
+          "schemeVersion": "0.1.0",
+          "stability": "portable",
+          "descriptors": [
+            { "role": "namespace", "name": "example_client" },
+            { "role": "type", "name": "Client" },
+            { "role": "term", "name": "timeout" },
+            { "role": "callable", "name": "get" }
+          ]
+        },
+        {
+          "id": "parse-runtime",
+          "scheme": "csmi.python",
+          "schemeVersion": "0.1.0",
+          "stability": "portable",
+          "descriptors": [
+            { "role": "namespace", "name": "example_client" },
+            { "role": "callable", "name": "parse" }
+          ]
+        },
+        {
+          "id": "parse-str-overload",
+          "scheme": "csmi.python",
+          "schemeVersion": "0.1.0",
+          "stability": "portable",
+          "descriptors": [
+            { "role": "namespace", "name": "example_client" },
+            {
+              "role": "callable",
+              "name": "parse",
+              "disambiguator": "typing-overload:{\"parameters\":[{\"kind\":\"positional-or-named\",\"required\":true,\"type\":\"builtins.str\"}],\"result\":\"builtins.str\"}"
+            }
+          ]
+        },
+        {
+          "id": "parse-bytes-overload",
+          "scheme": "csmi.python",
+          "schemeVersion": "0.1.0",
+          "stability": "portable",
+          "descriptors": [
+            { "role": "namespace", "name": "example_client" },
+            {
+              "role": "callable",
+              "name": "parse",
+              "disambiguator": "typing-overload:{\"parameters\":[{\"kind\":\"positional-or-named\",\"required\":true,\"type\":\"builtins.bytes\"}],\"result\":\"builtins.bytes\"}"
+            }
+          ]
+        }
+      ],
+      "declarations": [
+        { "symbol": "client", "category": "type" },
+        { "symbol": "timeout", "category": "value", "owner": "client" },
+        {
+          "symbol": "timeout-get",
+          "category": "callable",
+          "owner": "timeout",
+          "callable": {
+            "kind": "accessor",
+            "receiver": { "kind": "instance" },
+            "parameters": [],
+            "results": [{ "position": 0 }]
+          }
+        },
+        {
+          "symbol": "parse-runtime",
+          "category": "callable",
+          "callable": {
+            "kind": "function",
+            "parameters": [
+              {
+                "position": 0,
+                "binding": "positional-or-named",
+                "label": "value",
+                "required": true
+              }
+            ],
+            "results": [{ "position": 0 }]
+          }
+        },
+        { "symbol": "parse-str-overload", "category": "callable" },
+        { "symbol": "parse-bytes-overload", "category": "callable" }
+      ],
+      "procedureSummaries": [
+        {
+          "callable": "parse-runtime",
+          "transfers": [
+            {
+              "source": {
+                "root": { "phase": "input", "role": "parameter", "position": 0 }
+              },
+              "destination": {
+                "root": { "phase": "output", "role": "result", "position": 0 }
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

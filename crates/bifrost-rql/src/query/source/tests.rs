@@ -365,6 +365,159 @@ fn boolean_value_help_suggestions_and_validation_ranges_are_schema_driven() {
     }
 }
 
+/// `module` is spelled by both a normalized kind and a role (issue #2518),
+/// so the source surface has to keep them apart by position: a head symbol
+/// (or a `kind` value) is the declaration kind, a `:module` keyword is the
+/// import role.
+#[test]
+fn module_kind_and_module_role_keep_separate_help_and_validation() {
+    let kind_source = r#"(module :name "tests")"#;
+    assert!(
+        validate_query_source(kind_source).is_empty(),
+        "{:#?}",
+        validate_query_source(kind_source)
+    );
+    let kind_help = query_source_help_at(kind_source, kind_source.find("module").unwrap())
+        .expect("module kind help");
+    assert_eq!(&kind_source[kind_help.range], "module");
+    assert!(
+        kind_help.description.contains("module or namespace"),
+        "{}",
+        kind_help.description
+    );
+
+    let role_source = r#"(import :module (name "fmt"))"#;
+    assert!(
+        validate_query_source(role_source).is_empty(),
+        "{:#?}",
+        validate_query_source(role_source)
+    );
+    let role_help = query_source_help_at(role_source, role_source.find(":module").unwrap())
+        .expect("module role help");
+    assert_eq!(&role_source[role_help.range], ":module");
+    assert!(
+        role_help
+            .description
+            .contains("module referenced by an import"),
+        "{}",
+        role_help.description
+    );
+
+    let json_source = r#"{"match":{"kind":"module","name":"tests"}}"#;
+    assert!(
+        validate_query_source(json_source).is_empty(),
+        "{:#?}",
+        validate_query_source(json_source)
+    );
+
+    // The role is not valid on a module pattern, so constraining it is a
+    // query error rather than a silent narrowing.
+    let invalid = r#"(module :module (name "fmt"))"#;
+    let diagnostic = validate_query_source(invalid)
+        .into_iter()
+        .find(|diagnostic| diagnostic.message.contains("not valid for kind"))
+        .unwrap_or_else(|| panic!("missing role-compatibility diagnostic for {invalid}"));
+    assert_eq!(&invalid[diagnostic.range], ":module");
+}
+
+/// The iteration vocabulary added for issue #2647: the `collection_literal`
+/// kind, the single-valued `iterable` role, and the ordered `elements` role.
+/// Every surface is registry-driven, so both spellings lint, hover, and
+/// misspell identically, and each role is constrained to the one kind it is
+/// declared valid for.
+#[test]
+fn iteration_vocabulary_help_suggestions_and_validation_ranges_are_schema_driven() {
+    for (source, token, needle) in [
+        (
+            "(for_loop :iterable (identifier))",
+            ":iterable",
+            "for-each loop iterates",
+        ),
+        (
+            r#"{"match":{"kind":"for_loop","iterable":{"kind":"identifier"}}}"#,
+            r#""iterable""#,
+            "for-each loop iterates",
+        ),
+        (
+            "(collection_literal :elements [(string_literal)])",
+            ":elements",
+            "elements of a collection literal",
+        ),
+        (
+            r#"{"match":{"kind":"collection_literal","elements":[{"kind":"string_literal"}]}}"#,
+            r#""elements""#,
+            "elements of a collection literal",
+        ),
+    ] {
+        assert!(
+            validate_query_source(source).is_empty(),
+            "{source}: {:#?}",
+            validate_query_source(source)
+        );
+        let offset = source.find(token).expect("help token");
+        let help = query_source_help_at(source, offset).expect("iteration role help");
+        assert_eq!(&source[help.range], token);
+        assert!(help.description.contains(needle), "{}", help.description);
+    }
+
+    let literal = "(collection_literal :elements [(string_literal)])";
+    let kind_help = query_source_help_at(literal, literal.find("collection_literal").unwrap())
+        .expect("collection_literal kind help");
+    assert_eq!(&literal[kind_help.range], "collection_literal");
+    assert!(
+        kind_help.description.contains("collection display literal"),
+        "{}",
+        kind_help.description
+    );
+
+    // `iterable` takes one pattern and `elements` an ordered list, so the
+    // opposite shape is a value-shape error at the offending value.
+    for (source, invalid) in [
+        ("(for_loop :iterable [(identifier)])", "[(identifier)]"),
+        (
+            "(collection_literal :elements (string_literal))",
+            "(string_literal)",
+        ),
+    ] {
+        let diagnostic = validate_query_source(source)
+            .into_iter()
+            .find(|diagnostic| diagnostic.code == "wrong-value-shape")
+            .unwrap_or_else(|| panic!("missing shape diagnostic for {source}"));
+        assert_eq!(&source[diagnostic.range], invalid);
+    }
+
+    // Each role is declared valid for exactly one kind, so naming it on any
+    // other pattern is an error rather than a silent narrowing.
+    for (source, token) in [
+        ("(while_loop :iterable (identifier))", ":iterable"),
+        ("(call :elements [(string_literal)])", ":elements"),
+    ] {
+        let diagnostic = validate_query_source(source)
+            .into_iter()
+            .find(|diagnostic| diagnostic.message.contains("not valid for kind"))
+            .unwrap_or_else(|| panic!("missing role-compatibility diagnostic for {source}"));
+        assert_eq!(&source[diagnostic.range], token);
+    }
+
+    for (source, needle) in [
+        ("(for_loop :iterble (identifier))", "iterable"),
+        (
+            r#"{"match":{"kind":"collection_literal","element":[{"kind":"string_literal"}]}}"#,
+            "elements",
+        ),
+    ] {
+        let diagnostic = validate_query_source(source)
+            .into_iter()
+            .find(|diagnostic| diagnostic.message.contains("Did you mean"))
+            .unwrap_or_else(|| panic!("missing suggestion for {source}"));
+        assert!(
+            diagnostic.message.contains(needle),
+            "{}",
+            diagnostic.message
+        );
+    }
+}
+
 #[test]
 fn typed_pipeline_help_and_json_diagnostics_use_shared_schema() {
     let rql = "(file-of (enclosing-decl (call)))";

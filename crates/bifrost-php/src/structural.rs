@@ -57,6 +57,7 @@ pub const PHP_KIND_TABLE: &[(&str, NormalizedKind)] = &[
     ("interface_declaration", NormalizedKind::Class),
     ("trait_declaration", NormalizedKind::Class),
     ("enum_declaration", NormalizedKind::Class),
+    ("namespace_definition", NormalizedKind::Module),
     ("property_element", NormalizedKind::Assignment),
     ("const_element", NormalizedKind::Assignment),
     ("assignment_expression", NormalizedKind::Assignment),
@@ -492,9 +493,14 @@ impl StructuralSpec for PhpStructuralSpec {
             NormalizedKind::Function
             | NormalizedKind::Method
             | NormalizedKind::Constructor
-            | NormalizedKind::Class => {
+            | NormalizedKind::Class
+            | NormalizedKind::Module => {
+                // A namespace's `name` is a `namespace_name`, so the fact
+                // takes its terminal segment the same way a qualified call or
+                // import does. Every other declaration head names a bare
+                // `name`, which `expression_name_node` returns unchanged.
                 if let Some(name) = node.child_by_field_name("name") {
-                    sink.set_name(name);
+                    sink.set_name(expression_name_node(name).unwrap_or(name));
                 }
                 attach_decorators(sink, node);
             }

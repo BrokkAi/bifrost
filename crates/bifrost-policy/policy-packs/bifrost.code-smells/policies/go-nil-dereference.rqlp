@@ -1,0 +1,34 @@
+; General procedure-local Go nilness plus the reviewed result/error-contract
+; origin retained from the predecessor policy.
+;
+; `nilness-operations` publishes only structured dereferences, field accesses,
+; and receiver calls whose exact operation model requires a non-null receiver.
+; Nil and MaybeNil are complete positive scalar facts. Unknown rows remain
+; queryable evidence but cannot become findings.
+;
+; Reviewed result/error contracts are composed into the same relation by the
+; engine, so this policy has one finding identity and one quality gate.
+(policy
+  :schema-version 1
+  :id "bifrost.correctness.go-nil-dereference"
+  :name "Go nil dereference"
+  :message "this Go operation may dereference a nil value on a reachable path"
+  :severity error
+  :description "A structured pointer dereference, field access, or reviewed receiver operation is reached with an exact Nil or MaybeNil fact. Reviewed API result contracts are also retained as a nilness origin when an operation requiring a valid result occurs before its success condition is proved. Unknown scalar facts, nil-tolerant methods, and unreviewed receiver operations are not findings."
+  :help-uri "https://bifrost.brokk.ai/static-analysis-policies/#built-in-code-smell-pack"
+  :tags ["correctness" "go" "nil" "error-handling"]
+  :analysis (analysis
+    :type assertion
+    (bind :name nil-use
+      :query (rql :schema-version 1
+        (language go
+          (nilness-operations
+            (procedure-of
+              (callable))))))
+    (filter :over nil-use
+      :where ((nil-use.fact in (nil maybe_nil))
+              (nil-use.proof eq exact)
+              (nil-use.coverage eq exhaustive)))
+    (group :name by-nil-operation :by (nil-use.id)
+      (aggregate :name nil-violations :op count))
+    (assert :group by-nil-operation :value nil-violations :cardinality (exactly 0))))

@@ -4,19 +4,23 @@
   :name "Sleep inside a collection-iteration loop"
   :message "Review whether this sleep throttles every iterated item"
   :severity note
-  :description "A sleep call lexically nested under a for-each loop delays every iterated item, which can signal lockstep throttling of a whole batch. Condition-controlled while loops are excluded: a sleep there is usually the deliberate mechanism of a poll or bounded-backoff loop. This structural prompt also includes deferred nested bodies; verify execution before restructuring."
+  :description "A sleep call lexically nested under a for-each loop delays every iterated item, which can signal lockstep throttling of a whole batch. Condition-controlled while loops are excluded: a sleep there is usually the deliberate mechanism of a poll or bounded-backoff loop. This structural prompt also includes deferred nested bodies; verify execution before restructuring. A for-each loop whose iterated expression provably resolves to a collection literal with at most eight elements is also excluded; the proof covers declarator-established bindings (JS/TS const/let/var, Rust let, Java locals), so field-, assignment-, or call-produced iterables still report."
   :help-uri "https://bifrost.brokk.ai/static-analysis-policies/#built-in-code-smell-pack"
   :tags ["performance" "throttling" "loop" "code-smell"]
   :analysis
     (analysis
-      :type match
-      :selector
+      :type assertion
+      :subject
         (rql
           :schema-version 1
           (union
             (language python
-              (inside-decl (for_loop) (call :receiver (name "time") :callee (name "sleep"))))
+              (inside-decl (for_loop :capture "region") (call :receiver (name "time") :callee (name "sleep") :capture "smell")))
             (language java
-              (inside-decl (for_loop) (call :receiver (name "Thread") :callee (name "sleep"))))
+              (inside-decl (for_loop :capture "region") (call :receiver (name "Thread") :callee (name "sleep") :capture "smell")))
             (language rust
-              (inside-decl (for_loop) (call :receiver (name "thread") :callee (name "sleep"))))))))
+              (inside-decl (for_loop :capture "region") (call :receiver (name "thread") :callee (name "sleep") :capture "smell")))))
+      :asserts [
+        (assert-origin-shape :id small-literal-iterable :at "region" :anchor "smell"
+                             :role value_reference :shape collection-literal :max-elements 8)
+      ]))

@@ -1,0 +1,81 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://csmi.brokk.ai/schema/profiles/javascript-typescript/0.1/schema.json",
+  "title": "CSMI JavaScript and TypeScript profile 0.1 payloads",
+  "oneOf": [
+    { "$ref": "#/$defs/moduleBinding" },
+    { "$ref": "#/$defs/runtimeDeclarationBinding" }
+  ],
+  "$defs": {
+    "localId": {
+      "type": "string",
+      "pattern": "^[A-Za-z][A-Za-z0-9._-]*$"
+    },
+    "nonEmptyString": {
+      "type": "string",
+      "minLength": 1
+    },
+    "specifier": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["form", "value"],
+      "properties": {
+        "form": {
+          "enum": [
+            "commonjs-require",
+            "commonjs-property",
+            "esm-default",
+            "esm-named",
+            "esm-namespace"
+          ]
+        },
+        "value": { "$ref": "#/$defs/nonEmptyString" }
+      }
+    },
+    "moduleBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "canonicalModule",
+        "exportName",
+        "acceptedSpecifiers"
+      ],
+      "properties": {
+        "kind": { "const": "module-binding" },
+        "canonicalModule": {
+          "type": "string",
+          "pattern": "^(?:node:[a-z0-9_-]+(?:/[a-z0-9_-]+)*|\\.|\\./[^/](?:.*[^/])?)$"
+        },
+        "exportName": { "$ref": "#/$defs/nonEmptyString" },
+        "acceptedSpecifiers": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/specifier" }
+        }
+      }
+    },
+    "runtimeDeclarationBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "runtimeSymbol",
+        "declarationSymbols",
+        "relation"
+      ],
+      "properties": {
+        "kind": { "const": "runtime-declaration-binding" },
+        "runtimeSymbol": { "$ref": "#/$defs/localId" },
+        "declarationSymbols": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/localId" }
+        },
+        "relation": { "const": "describes-runtime-binding" }
+      }
+    }
+  }
+}

@@ -1161,3 +1161,28 @@ def tool_descriptors(
     if not isinstance(decoded, list):
         raise SearchToolsError("Native tool descriptor call did not return a JSON array")
     return decoded
+
+
+def code_query_variant_inventory(
+    *, library_path: Path | str | None = None
+) -> dict[str, list[str]]:
+    """The complete ``query_code`` vocabulary the loaded native build emits.
+
+    The four lists are ``result_types``, ``diagnostic_codes``,
+    ``diagnostic_impacts`` and ``completion_kinds``, each read live from the
+    producing registry rather than from a copy. ``models.py`` mirrors every
+    name, so comparing the two is how a client learns it is behind the engine
+    before a user's call raises (#2898).
+
+    The lists name the vocabularies, not the fields of a row: a row's shape
+    is what its dataclass in ``models.py`` states.
+    """
+    native = _load_native_module(
+        Path(library_path).expanduser().resolve() if library_path is not None else None
+    )
+    decoded = json.loads(native.code_query_variant_inventory_json())
+    if not isinstance(decoded, dict):
+        raise SearchToolsError(
+            "Native code-query inventory call did not return a JSON object"
+        )
+    return decoded

@@ -409,20 +409,43 @@ mod tests {
         assert_eq!(decoded.work_item_count(), 0);
     }
 
-    /// An adapter that declares no occurrence roles must emit none: a table and
-    /// an extraction pass that disagree would turn "we cannot classify this"
-    /// into a clean, empty, and wrong answer (#1473).
+    /// An adapter must emit only the occurrence roles its table declares: a
+    /// table and an extraction pass that disagree would turn "we cannot
+    /// classify this" into a clean, empty, and wrong answer (#1473).
+    ///
+    /// PHP is the narrowest table left in the workspace -- it declares
+    /// `member_position` and nothing else -- so it is where an undeclared
+    /// emission would show. This guard used to point at Scala, which declared
+    /// no roles at all until #1597 graduated it.
     #[test]
-    fn adapters_declaring_no_occurrence_roles_emit_none() {
-        let spec = &brokk_bifrost_jvm::scala::structural::SCALA_STRUCTURAL_SPEC;
-        assert!(spec.occurrence_role_support().is_empty());
+    fn an_adapter_emits_only_the_occurrence_roles_it_declares() {
+        let spec = &brokk_bifrost_php::structural::PHP_STRUCTURAL_SPEC;
+        let support = spec.occurrence_role_support();
+        assert!(support.is_supported(OccurrenceRole::MemberPosition));
 
-        let grammar = brokk_bifrost_jvm::scala::language::LANGUAGE.into();
-        let source = "class Widget(label: String) {\n  def render(): String = label\n}\n";
-        let facts =
-            extract_file_facts(spec, &grammar, source).expect("scala fixture extracts facts");
+        let grammar = tree_sitter_php::LANGUAGE_PHP.into();
+        let source = concat!(
+            "<?php\n",
+            "class Widget {\n",
+            "    public function render(Helper $helper): int {\n",
+            "        return $helper->build();\n",
+            "    }\n",
+            "}\n",
+        );
+        let facts = extract_file_facts(spec, &grammar, source).expect("php fixture extracts facts");
         assert!(facts.nodes().len() > 1, "fixture should produce facts");
-        assert_eq!(facts.occurrence_role_count(), 0);
+        assert!(
+            facts.occurrence_role_count() > 0,
+            "the fixture must exercise the classifier"
+        );
+        for id in 0..facts.nodes().len() as u32 {
+            for role in facts.occurrence_roles(id) {
+                assert!(
+                    support.is_supported(*role),
+                    "php emitted undeclared role {role:?}"
+                );
+            }
+        }
     }
 
     /// Occurrence roles survive relational persistence with their node addressing

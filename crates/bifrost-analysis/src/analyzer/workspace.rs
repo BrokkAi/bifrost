@@ -1120,6 +1120,23 @@ impl WorkspaceAnalyzer {
         }
     }
 
+    /// Clone this analyzer onto a frozen view of the same source generation for
+    /// background index warming. Unlike a request overlay clone, the result
+    /// shares the generation-owned cells that the warmer is expected to fill.
+    #[doc(hidden)]
+    pub fn clone_for_index_warm(&self, project: Arc<dyn Project>) -> Self {
+        debug_assert_eq!(self.analyzer().project().root(), project.root());
+        debug_assert_eq!(
+            self.analyzer().project().analysis_generation(),
+            project.analysis_generation(),
+            "an index-warm project must describe the analyzer's source generation"
+        );
+        match self {
+            Self::Empty(analyzer) => Self::Empty(analyzer.clone_with_project(project)),
+            Self::Multi(analyzer) => Self::Multi(Box::new(analyzer.clone_for_index_warm(project))),
+        }
+    }
+
     /// Language-restricted [`Self::build_ephemeral_footgun`], and a footgun for
     /// the same reason: read that function's doc before calling this one. The
     /// persisted equivalent is [`Self::build_persisted_for_languages`].
@@ -1483,6 +1500,24 @@ impl WorkspaceAnalyzer {
         }
     }
 
+    /// The [`AnalyzerConfig`] this workspace was built from, or `None` for a
+    /// workspace assembled without a build context -- an empty analyzer, or one
+    /// composed directly from delegates -- which was never built from a
+    /// configuration and behaves as the defaults describe.
+    ///
+    /// A caller that must analyze a *second* snapshot the way this one was
+    /// analyzed (the base revision of a `--diff-base` run) reads the
+    /// configuration here instead of choosing one of its own, so both snapshots
+    /// discover dependencies, dispatch, and per-language behavior identically
+    /// and the facts they publish are comparable.
+    pub fn config(&self) -> Option<&AnalyzerConfig> {
+        let build_context = match self {
+            Self::Empty(analyzer) => analyzer.build_context.as_deref(),
+            Self::Multi(analyzer) => analyzer.build_context(),
+        };
+        build_context.map(WorkspaceBuildContext::config)
+    }
+
     #[cfg(test)]
     pub(crate) fn startup_oid_batch_count_for_test(&self) -> usize {
         match self {
@@ -1517,6 +1552,23 @@ impl WorkspaceAnalyzer {
         build_context
             .and_then(WorkspaceBuildContext::store_db_path)
             .map(std::path::Path::to_path_buf)
+    }
+
+    /// The analyzer store this workspace reads from and publishes to.
+    ///
+    /// `None` for a workspace assembled without a build context, which has no
+    /// store at all. A caller that derives something of its own from this
+    /// workspace -- a policy evaluation unit, which is keyed by the content it
+    /// read -- publishes it here, into the same content-addressed database the
+    /// analyzer's own facts live in, and reads it back on a later run through
+    /// [`Self::persisted_store_path`], which is what says whether "a later
+    /// run" can exist at all.
+    pub fn store(&self) -> Option<&Arc<crate::analyzer::store::AnalyzerStore>> {
+        let build_context = match self {
+            Self::Empty(analyzer) => analyzer.build_context.as_deref(),
+            Self::Multi(analyzer) => analyzer.build_context(),
+        };
+        build_context.map(WorkspaceBuildContext::store)
     }
 
     /// Number of files in the project, i.e. an upper bound on the distinct
@@ -1598,6 +1650,29 @@ impl WorkspaceAnalyzer {
             Self::Empty(_) => None,
             Self::Multi(analyzer) => analyzer.program_semantics_provider_for_file(file),
         }
+    }
+
+    /// The public fingerprint of the semantic artifact this workspace would
+    /// derive for `file` right now, without materializing it.
+    ///
+    /// Read-set verification asks exactly this: a unit that consumed an
+    /// artifact is reusable only while the head would derive the same one, and
+    /// the public fingerprint is the identity that says so without folding the
+    /// workspace mount.
+    pub(crate) fn current_semantic_artifact_fingerprint(
+        &self,
+        file: &crate::analyzer::ProjectFile,
+        max_source_bytes: usize,
+    ) -> Result<
+        Option<crate::analyzer::semantic::ids::StableDigest>,
+        crate::analyzer::semantic::SemanticProviderError,
+    > {
+        let Some(provider) = self.program_semantics_provider_for_file(file) else {
+            return Ok(None);
+        };
+        Ok(provider
+            .current_artifact_source(file, max_source_bytes)?
+            .map(|current| current.key().public_fingerprint()))
     }
 
     /// Check a retained semantic handle against the complete identity of the
@@ -1720,11 +1795,34 @@ impl WorkspaceAnalyzer {
         self.analyzer().query_indexes_warm()
     }
 
+    /// Build the structural posting index every provider a structural query
+    /// has already asked to reuse still owes. Idempotent; see
+    /// `IAnalyzer::warm_structural_indexes`.
+    pub fn warm_structural_indexes(&self) {
+        let _scope = profiling::scope("WorkspaceAnalyzer::warm_structural_indexes");
+        // Same read-cache reason as `warm_query_indexes`: the build reads the
+        // store per file, and without a query context every read misses
+        // memoization.
+        let snapshot = self.clone();
+        let context = Arc::new(crate::analyzer::AnalyzerQueryContext::default());
+        snapshot.begin_query(&context);
+        snapshot.analyzer().warm_structural_indexes();
+        snapshot.end_query(&context);
+    }
+
+    /// Whether every posting index `warm_structural_indexes` would build is
+    /// already built or already rejected.
+    pub fn structural_indexes_warm(&self) -> bool {
+        self.analyzer().structural_indexes_warm()
+    }
+
     pub fn update(&self, changed_files: &BTreeSet<crate::analyzer::ProjectFile>) -> Self {
         let _scope = profiling::scope("WorkspaceAnalyzer::update");
         if profiling::enabled() {
             profiling::note(format!("changed_files={}", changed_files.len()));
         }
+        self.analyzer()
+            .invalidate_cached_file_identities_for(changed_files);
         match self {
             Self::Empty(analyzer) => {
                 let Some(build_context) = analyzer.build_context.as_ref() else {
@@ -1756,6 +1854,7 @@ impl WorkspaceAnalyzer {
 
     pub fn update_all(&self) -> Self {
         let _scope = profiling::scope("WorkspaceAnalyzer::update_all");
+        self.analyzer().invalidate_cached_file_identities();
         match self {
             Self::Empty(analyzer) => {
                 let Some(build_context) = analyzer.build_context.as_ref() else {
@@ -1813,7 +1912,7 @@ mod tests {
         let pack = compile_source(
             SourceFormat::Json,
             br#"{
-              "schema_version": 1,
+              "schema_version": 2,
               "pack_id": "test.go.intrinsic",
               "version": "1.0.0",
               "producer": {"name": "test", "version": "1.0.0"},
@@ -2162,6 +2261,78 @@ mod tests {
         assert!(!multi.query_indexes_warm());
         multi.warm_query_indexes();
         assert!(multi.query_indexes_warm());
+    }
+
+    #[test]
+    fn index_warm_clone_freezes_source_and_publishes_every_generation_warm_cell() {
+        let fixture = InlineTestProject::new()
+            .file(
+                "src/lib.rs",
+                "pub trait Runnable {}\npub struct Worker;\nimpl Runnable for Worker {}\n",
+            )
+            .file("src/JavaWorker.java", "class JavaWorker {}\n")
+            .file("src/KotlinWorker.kt", "class KotlinWorker\n")
+            .file("src/ScalaWorker.scala", "class ScalaWorker\n")
+            .file("src/CSharpWorker.cs", "class CSharpWorker {}\n")
+            .build();
+        assert_eq!(
+            fixture.languages(),
+            BTreeSet::from([
+                Language::CSharp,
+                Language::Java,
+                Language::Kotlin,
+                Language::Rust,
+                Language::Scala,
+            ])
+        );
+
+        let rust_file = fixture.file("src/lib.rs");
+        let scheduled_source =
+            "pub trait Scheduled {}\npub struct Worker;\nimpl Scheduled for Worker {}\n";
+        let live_project = Arc::new(OverlayProject::new(fixture.project_dyn()));
+        assert!(live_project.set(rust_file.abs_path(), scheduled_source.to_owned()));
+        let workspace = WorkspaceAnalyzer::build_ephemeral_footgun(
+            Arc::clone(&live_project) as Arc<dyn Project>,
+            AnalyzerConfig::default(),
+        )
+        .expect("mixed ephemeral workspace should build");
+        assert!(!workspace.query_indexes_warm());
+
+        let frozen_project: Arc<dyn Project> = Arc::new(live_project.snapshot());
+        let warm_snapshot = workspace.clone_for_index_warm(frozen_project);
+        assert!(!warm_snapshot.query_indexes_warm());
+        warm_snapshot.warm_query_indexes();
+        assert!(warm_snapshot.query_indexes_warm());
+        assert!(
+            workspace.query_indexes_warm(),
+            "warming the frozen clone must publish into every live generation-owned cell"
+        );
+
+        assert!(live_project.set(
+            rust_file.abs_path(),
+            "pub trait Later {}\npub struct Worker;\nimpl Later for Worker {}\n".to_owned(),
+        ));
+        assert_eq!(
+            warm_snapshot
+                .analyzer()
+                .project()
+                .read_source(&rust_file)
+                .unwrap(),
+            scheduled_source
+        );
+        let WorkspaceAnalyzer::Multi(multi) = &warm_snapshot else {
+            panic!("five-language workspace must have delegates");
+        };
+        assert_eq!(
+            multi
+                .build_context()
+                .expect("workspace build context")
+                .project()
+                .read_source(&rust_file)
+                .unwrap(),
+            scheduled_source,
+            "future delegate construction must retain the frozen source view"
+        );
     }
 
     /// The two Rust usage predicates a caller can ask a workspace, and the

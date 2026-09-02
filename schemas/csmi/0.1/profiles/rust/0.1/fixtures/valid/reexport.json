@@ -1,0 +1,7 @@
+{
+  "kind": "reexport",
+  "exportingModule": "root",
+  "exportedName": "Display",
+  "namespace": "type",
+  "target": "displayTrait"
+}

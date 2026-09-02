@@ -4,21 +4,25 @@
   :name "Database call inside a loop"
   :message "Review whether this lexically nested database call repeats per iteration"
   :severity note
-  :description "A database call lexically nested under a loop can signal an N+1 pattern. This structural prompt also includes deferred nested bodies; verify execution before batching or prefetching."
+  :description "A database call lexically nested under a loop can signal an N+1 pattern. This structural prompt also includes deferred nested bodies; verify execution before batching or prefetching. A for-each loop whose iterated expression provably resolves to a collection literal with at most eight elements is excluded; the proof covers declarator-established bindings (JS/TS const/let/var, Rust let, Java locals), so field-, assignment-, or call-produced iterables still report."
   :help-uri "https://bifrost.brokk.ai/static-analysis-policies/#built-in-code-smell-pack"
   :tags ["performance" "database" "n-plus-one" "loop" "code-smell"]
   :analysis
     (analysis
-      :type match
-      :selector
+      :type assertion
+      :subject
         (rql
           :schema-version 1
           (union
             (language python
-              (inside-decl (loop) (call :receiver (name "cursor") :callee (name "execute"))))
+              (inside-decl (loop :capture "region") (call :receiver (name "cursor") :callee (name "execute") :capture "smell")))
             (language java
-              (inside-decl (loop) (call :receiver (name "statement") :callee (name "executeQuery"))))
+              (inside-decl (loop :capture "region") (call :receiver (name "statement") :callee (name "executeQuery") :capture "smell")))
             (language javascript
-              (inside-decl (loop) (call :receiver (name "db") :callee (name "query"))))
+              (inside-decl (loop :capture "region") (call :receiver (name "db") :callee (name "query") :capture "smell")))
             (language typescript
-              (inside-decl (loop) (call :receiver (name "db") :callee (name "query"))))))))
+              (inside-decl (loop :capture "region") (call :receiver (name "db") :callee (name "query") :capture "smell")))))
+      :asserts [
+        (assert-origin-shape :id small-literal-iterable :at "region" :anchor "smell"
+                             :role value_reference :shape collection-literal :max-elements 8)
+      ]))

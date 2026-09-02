@@ -1,0 +1,77 @@
+{
+  "documentType": "semantic-document",
+  "schema": "https://csmi.brokk.ai/schema/0.1/schema.json",
+  "semanticModelVersion": "0.1",
+  "serializationVersion": "0.1-json",
+  "defaultProvenance": "fixtureAuthor",
+  "provenanceRecords": [
+    {
+      "id": "fixtureAuthor",
+      "producer": {
+        "identifier": "https://csmi.brokk.ai/producers/conformance-fixtures",
+        "version": "0.1.0"
+      },
+      "generationMethod": "manual-authoring"
+    }
+  ],
+  "semanticModels": [
+    {
+      "artifactSelectors": [{ "purl": "pkg:cargo/identity-errors@1.0.0" }],
+      "vocabularyUses": [
+        {
+          "identifier": "csmi.rust",
+          "version": "0.1.0",
+          "schema": "https://csmi.brokk.ai/schema/profiles/rust/0.1/schema.json",
+          "requirement": "required",
+          "affects": [
+            {
+              "kind": "core-slot",
+              "slot": "symbol-identity",
+              "target": {
+                "scheme": "csmi.rust.source-item",
+                "schemeVersion": "0.1.0"
+              }
+            }
+          ]
+        }
+      ],
+      "symbols": [
+        {
+          "id": "badRoot",
+          "scheme": "csmi.rust.source-item",
+          "schemeVersion": "0.1.0",
+          "stability": "portable",
+          "descriptors": [
+            { "role": "namespace", "name": "crate", "disambiguator": "lib:identity%3aerrors" }
+          ]
+        },
+        {
+          "id": "rawModule",
+          "scheme": "csmi.rust.source-item",
+          "schemeVersion": "0.1.0",
+          "stability": "portable",
+          "descriptors": [
+            { "role": "namespace", "name": "crate", "disambiguator": "lib:identity_errors" },
+            { "role": "namespace", "name": "r#type", "disambiguator": "module" }
+          ]
+        },
+        {
+          "id": "genericT",
+          "scheme": "csmi.rust.source-item",
+          "schemeVersion": "0.1.0",
+          "stability": "portable",
+          "descriptors": [
+            { "role": "namespace", "name": "crate", "disambiguator": "lib:identity_errors" },
+            { "role": "callable", "name": "decode", "disambiguator": "function" },
+            { "role": "type-parameter", "name": "T", "disambiguator": "type-parameter" }
+          ]
+        }
+      ],
+      "declarations": [
+        { "symbol": "badRoot", "category": "namespace" },
+        { "symbol": "rawModule", "category": "namespace" },
+        { "symbol": "genericT", "category": "type-parameter" }
+      ]
+    }
+  ]
+}

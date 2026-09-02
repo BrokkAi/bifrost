@@ -1,0 +1,48 @@
+{
+  "documentType": "semantic-document",
+  "schema": "https://csmi.brokk.ai/schema/0.1/schema.json",
+  "semanticModelVersion": "0.1",
+  "serializationVersion": "0.1-json",
+  "provenanceRecords": [
+    {
+      "id": "first",
+      "producer": {
+        "identifier": "https://example.org/process/first",
+        "version": "1"
+      },
+      "generationMethod": "manual-authoring"
+    },
+    {
+      "id": "second",
+      "producer": {
+        "identifier": "https://example.org/process/second",
+        "version": "1"
+      },
+      "generationMethod": "manual-authoring"
+    }
+  ],
+  "semanticModels": [
+    {
+      "artifactSelectors": [
+        { "purl": "pkg:generic/example@1.0.0" }
+      ],
+      "completenessStatements": [
+        {
+          "family": "procedure-summaries",
+          "scope": { "callable": "f" },
+          "status": "unknown",
+          "provenance": ["first"]
+        },
+        {
+          "family": "procedure-summaries",
+          "scope": { "callable": "f" },
+          "status": "partial",
+          "limitations": [
+            { "kind": "coverage-limited" }
+          ],
+          "provenance": ["second"]
+        }
+      ]
+    }
+  ]
+}

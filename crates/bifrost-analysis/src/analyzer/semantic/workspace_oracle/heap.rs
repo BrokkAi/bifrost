@@ -29,8 +29,8 @@ use crate::analyzer::semantic::{
     ProcedurePortHandle, ProofStatus, SemanticCallSite, SemanticCapability, SemanticEffect,
     SemanticGap, SemanticGapDischarge, SemanticGapImpact, SemanticGapSubject, SemanticOutcome,
     SemanticProviderError, SemanticRequest, SemanticValueKind, SemanticWork, StoreAtPoint,
-    StrongUpdateEvidence, UpdateEligibility, ValueAtPoint, ValueFlowKind, ValueFlowOracle,
-    ValueHandle, WeakUpdateReason,
+    StrongUpdateEvidence, TransferKind, UpdateEligibility, ValueAtPoint, ValueFlowKind,
+    ValueFlowOracle, ValueHandle, WeakUpdateReason, assignment_transfer,
 };
 use crate::hash::{HashMap, HashSet};
 
@@ -40,6 +40,21 @@ struct ObjectDraft {
     evidence: Vec<EvidenceHandle>,
     proof: ProofStatus,
     completeness: EvidenceCompleteness,
+}
+
+fn transfer_stops_identity_trace(
+    effect: &SemanticEffect,
+    value: crate::analyzer::semantic::ValueId,
+) -> bool {
+    matches!(
+        effect,
+        SemanticEffect::ValueFlow {
+            kind: ValueFlowKind::Transfer(transfer),
+            source,
+            target,
+        } if *target == value
+            || (*source == value && matches!(transfer.kind, TransferKind::Move { .. }))
+    )
 }
 
 #[derive(Clone)]
@@ -998,6 +1013,30 @@ fn resolve_objects(
                 }
                 continue;
             }
+            if transfer_stops_identity_trace(&event.effect, state.value) {
+                // A producer emits Assignment plus a transfer marker for one
+                // identity-separating by-value transfer (e.g. a Go array
+                // assignment). The later marker overrides that generic
+                // dependence for identity: stop before the reverse scan can
+                // follow the duplicate Assignment into the source storage. A
+                // move is also a boundary for the moved-from source: after the
+                // event neither invalidation contract permits recovering its
+                // old object identity through an earlier producer.
+                open = true;
+                let value = value_handle(procedure, state.value)
+                    .map_err(InterruptionOrProvider::Provider)?;
+                let evidence = dedup_evidence(
+                    inherited_evidence.iter().cloned().chain(std::iter::once(
+                        evidence_handle(procedure, event.evidence)
+                            .map_err(InterruptionOrProvider::Provider)?,
+                    )),
+                );
+                let draft = symbolic_object(procedure, value, evidence)
+                    .map_err(InterruptionOrProvider::Provider)?;
+                push_object(&mut drafts, draft.object, draft.evidence);
+                producer = Some((state.value, index, Vec::new()));
+                break;
+            }
             let source = match event.effect {
                 SemanticEffect::Assignment { target, value } if target == state.value => {
                     Some(value)
@@ -1857,6 +1896,7 @@ fn effect_names_any(
         SemanticEffect::Entry
         | SemanticEffect::NormalExit
         | SemanticEffect::ExceptionalExit
+        | SemanticEffect::Synchronization { .. }
         | SemanticEffect::Allocation { .. }
         | SemanticEffect::Gap { .. } => false,
     }
@@ -2021,10 +2061,20 @@ fn resolve_fresh_object_publications(
                 Interruption::Cancelled,
             ));
         }
-        for event in &point.events {
+        for (event_index, event) in point.events.iter().enumerate() {
             match event.effect {
                 SemanticEffect::Assignment { target, value }
-                | SemanticEffect::ValueFlow {
+                    if assignment_transfer(&point.events, event_index, value, target).is_none() =>
+                {
+                    copies.push(NameCopy {
+                        source: value,
+                        target,
+                        evidence: evidence_handle(procedure, event.evidence)
+                            .map_err(InterruptionOrProvider::Provider)?,
+                        identity_preserving: true,
+                    })
+                }
+                SemanticEffect::ValueFlow {
                     kind: ValueFlowKind::Local,
                     source: value,
                     target,
@@ -2411,9 +2461,13 @@ fn object_escape_status(
         if cancellation.is_cancelled() {
             return Err(Interruption::Cancelled);
         }
-        for event in &point.events {
+        for (event_index, event) in point.events.iter().enumerate() {
             match event.effect {
-                SemanticEffect::Assignment { target, value } => copies.push((value, target)),
+                SemanticEffect::Assignment { target, value }
+                    if assignment_transfer(&point.events, event_index, value, target).is_none() =>
+                {
+                    copies.push((value, target))
+                }
                 SemanticEffect::ValueFlow {
                     kind: crate::analyzer::semantic::ValueFlowKind::Local,
                     source,
@@ -3129,10 +3183,42 @@ impl HeapOracle for WorkspaceSemanticOracle<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::analyzer::semantic::{OracleCallContext, SemanticBudget, SemanticRequest};
+    use crate::analyzer::semantic::{
+        MoveInvalidation, OracleCallContext, SemanticBudget, SemanticRequest, TransferKind,
+        TransferOperation, ValueTransfer,
+    };
     use crate::analyzer::{Language, ProjectFile};
     use crate::cancellation::CancellationToken;
     use crate::test_support::AnalyzerFixture;
+
+    #[test]
+    fn moves_stop_identity_traces_on_both_sides() {
+        let source = crate::analyzer::semantic::ValueId::new(0);
+        let target = crate::analyzer::semantic::ValueId::new(1);
+        for invalidation in [MoveInvalidation::Invalidated, MoveInvalidation::Unknown] {
+            let effect = SemanticEffect::ValueFlow {
+                kind: ValueFlowKind::Transfer(ValueTransfer {
+                    kind: TransferKind::Move { invalidation },
+                    operation: TransferOperation::None,
+                }),
+                source,
+                target,
+            };
+            assert!(transfer_stops_identity_trace(&effect, source));
+            assert!(transfer_stops_identity_trace(&effect, target));
+        }
+
+        let copy = SemanticEffect::ValueFlow {
+            kind: ValueFlowKind::Transfer(ValueTransfer {
+                kind: TransferKind::Copy,
+                operation: TransferOperation::None,
+            }),
+            source,
+            target,
+        };
+        assert!(!transfer_stops_identity_trace(&copy, source));
+        assert!(transfer_stops_identity_trace(&copy, target));
+    }
 
     #[test]
     fn go_assignment_conversion_retains_a_candidate_field_publication() {
@@ -3256,6 +3342,90 @@ func assign(holder *Holder) {
             publication.completeness(),
             EvidenceCompleteness::Partial(_)
         ));
+    }
+
+    #[test]
+    fn go_array_copy_does_not_reuse_the_source_allocation_identity() {
+        let fixture = AnalyzerFixture::new_for_language(
+            Language::Go,
+            &[(
+                "main.go",
+                r#"package main
+
+func inspect() {
+    first := [1]int{}
+    second := first
+    _ = second
+}
+"#,
+            )],
+        );
+        let file = ProjectFile::new(fixture.project_root(), "main.go");
+        let cancellation = CancellationToken::default();
+        let mut materialization_budget = SemanticBudget::default();
+        let artifact = fixture
+            .analyzer
+            .materialize_program_semantics(
+                &file,
+                &mut SemanticRequest::new(&mut materialization_budget, &cancellation),
+            )
+            .expect("Go semantic materialization runs")
+            .available_value()
+            .cloned()
+            .expect("Go semantic artifact is available");
+        let (semantics, point, target) = artifact
+            .procedures()
+            .iter()
+            .find_map(|semantics| {
+                semantics.points().iter().find_map(|point| {
+                    point.events.iter().find_map(|event| match event.effect {
+                        SemanticEffect::ValueFlow {
+                            kind:
+                                ValueFlowKind::Transfer(ValueTransfer {
+                                    kind: TransferKind::AggregateCopy,
+                                    ..
+                                }),
+                            target,
+                            ..
+                        } => Some((semantics, point.id, target)),
+                        _ => None,
+                    })
+                })
+            })
+            .expect("array assignment publishes an aggregate-copy boundary");
+        let procedure = artifact
+            .procedure_handle(semantics.id())
+            .expect("inspect procedure handle");
+        let query = ValueAtPoint::new(
+            procedure
+                .value_handle(target)
+                .expect("array-copy target value"),
+            procedure.point_handle(point).expect("array-copy point"),
+            ObservationPhase::AfterEffects,
+            OracleCallContext::empty(),
+        )
+        .expect("array-copy observation");
+        let mut budget = SemanticBudget::default();
+        let outcome = fixture
+            .analyzer
+            .semantic_oracle_provider()
+            .pointees(
+                &query,
+                &mut SemanticRequest::new(&mut budget, &cancellation),
+            )
+            .expect("array-copy points-to query runs");
+        let objects = outcome
+            .available_value()
+            .expect("open array-copy result retains its symbolic candidate")
+            .objects();
+        assert_eq!(objects.coverage(), CandidateCoverage::Open);
+        assert!(
+            objects.candidates().iter().all(|candidate| !matches!(
+                candidate.value().identity(),
+                AbstractObjectIdentity::Allocation(_)
+            )),
+            "a by-value array copy must not reuse its source allocation: {outcome:#?}"
+        );
     }
 
     #[test]

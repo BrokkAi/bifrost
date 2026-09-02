@@ -181,6 +181,11 @@ pub(super) fn semantic_model_overlay_array_schema(
 pub struct SearchSymbolsResult {
     pub patterns: Vec<String>,
     pub truncated: bool,
+    /// Present only when this session covers an explicitly named subset of the
+    /// workspace, in which case the patterns were matched against that many
+    /// files rather than against the whole workspace (#2770).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_subset: Option<SubsetCoverage>,
     pub total_files: usize,
     pub files: Vec<SearchSymbolsFile>,
     pub total_model_symbols: usize,
@@ -461,6 +466,7 @@ pub(super) fn search_symbols_with_cap(
             // The same `complete = false` reporting `scan_usages` uses for
             // `TooManyCallsites`: the answer is deliberately partial.
             truncated: true,
+            session_subset: session_subset(analyzer),
             total_files: 0,
             files: Vec::new(),
             total_model_symbols: 0,
@@ -651,6 +657,7 @@ pub(super) fn search_symbols_with_cap(
     SearchSymbolsResult {
         patterns,
         truncated,
+        session_subset: session_subset(analyzer),
         total_files,
         files,
         total_model_symbols,
@@ -712,83 +719,74 @@ pub fn get_symbol_locations_with_cancellation(
 ) -> SymbolLocationsResult {
     let scope = AnalyzerQueryScope::new(analyzer);
     let token = scope.token();
-    let mut outcomes: Vec<_> = params
-        .symbols
-        .into_par_iter()
-        .enumerate()
-        .filter_map(|(index, symbol)| {
-            if cancellation.is_some_and(crate::CancellationToken::is_cancelled) {
-                return None;
-            }
-            if symbol.trim().is_empty() {
-                return None;
-            }
+    let outcomes = map_request_batch(params.symbols, |symbol| {
+        if cancellation.is_some_and(crate::CancellationToken::is_cancelled) {
+            return None;
+        }
+        if symbol.trim().is_empty() {
+            return None;
+        }
 
-            // Every distinct definition the selector names is reported, not
-            // just a lone one. A location row carries the definition's own
-            // display symbol, so a name that several definitions answer (fmt's
-            // `vformat`, which is both `fmt::vformat` and `fmt::detail::vformat`)
-            // is answered completely here and has nothing for the caller to
-            // disambiguate. The content-rendering surfaces still ambiguate:
-            // they must choose one definition to render.
-            let code_units = match resolve_selectable_definition_groups(
-                analyzer,
-                token,
-                &symbol,
-                resolve_codeunit_fuzzy,
-            ) {
-                SelectableDefinitionGroups::Groups(groups) => Some(
-                    groups
-                        .into_iter()
-                        .flat_map(|(_, units)| units)
-                        .collect::<Vec<_>>(),
-                ),
-                SelectableDefinitionGroups::NotFound(_) => None,
-            };
-            let Some(code_units) = code_units else {
-                return Some((
-                    index,
-                    Err(path_like_symbol_not_found_input(
-                        symbol,
-                        PathLikeSymbolGuidanceContext::SymbolLookup,
-                    )),
-                ));
-            };
-            if cancellation.is_some_and(crate::CancellationToken::is_cancelled) {
-                return None;
-            }
-            let locations: Vec<_> = code_units
-                .into_iter()
-                .filter_map(|code_unit| {
-                    let primary_range = primary_range(analyzer, &code_unit)?;
-                    // Line count is rendering metadata for an already-resolved
-                    // unit; the analyzed snapshot the unit was resolved
-                    // against is the consistent source, not a fresh disk read.
-                    let loc = analyzer
-                        .indexed_source(code_unit.source())
-                        .map(|content| line_count(&content))
-                        .unwrap_or(0);
-                    Some(SymbolLocation {
-                        symbol: display_symbol_for_target(&code_unit),
-                        path: rel_path_string(code_unit.source()),
-                        loc,
-                        start_line: primary_range.start_line,
-                        end_line: primary_range.end_line,
-                    })
+        // Every distinct definition the selector names is reported, not
+        // just a lone one. A location row carries the definition's own
+        // display symbol, so a name that several definitions answer (fmt's
+        // `vformat`, which is both `fmt::vformat` and `fmt::detail::vformat`)
+        // is answered completely here and has nothing for the caller to
+        // disambiguate. The content-rendering surfaces still ambiguate:
+        // they must choose one definition to render.
+        let code_units = match resolve_selectable_definition_groups(
+            analyzer,
+            token,
+            &symbol,
+            resolve_codeunit_fuzzy,
+        ) {
+            SelectableDefinitionGroups::Groups(groups) => Some(
+                groups
+                    .into_iter()
+                    .flat_map(|(_, units)| units)
+                    .collect::<Vec<_>>(),
+            ),
+            SelectableDefinitionGroups::NotFound(_) => None,
+        };
+        let Some(code_units) = code_units else {
+            return Some(Err(path_like_symbol_not_found_input(
+                symbol,
+                PathLikeSymbolGuidanceContext::SymbolLookup,
+            )));
+        };
+        if cancellation.is_some_and(crate::CancellationToken::is_cancelled) {
+            return None;
+        }
+        let locations: Vec<_> = code_units
+            .into_iter()
+            .filter_map(|code_unit| {
+                let primary_range = primary_range(analyzer, &code_unit)?;
+                // Line count is rendering metadata for an already-resolved
+                // unit; the analyzed snapshot the unit was resolved
+                // against is the consistent source, not a fresh disk read.
+                let loc = analyzer
+                    .indexed_source(code_unit.source())
+                    .map(|content| line_count(&content))
+                    .unwrap_or(0);
+                Some(SymbolLocation {
+                    symbol: display_symbol_for_target(&code_unit),
+                    path: rel_path_string(code_unit.source()),
+                    loc,
+                    start_line: primary_range.start_line,
+                    end_line: primary_range.end_line,
                 })
-                .collect();
-            if locations.is_empty() {
-                Some((index, Err(renderable_not_found_input(symbol))))
-            } else {
-                Some((index, Ok(locations)))
-            }
-        })
-        .collect();
-    outcomes.sort_by_key(|(index, _)| *index);
+            })
+            .collect();
+        if locations.is_empty() {
+            Some(Err(renderable_not_found_input(symbol)))
+        } else {
+            Some(Ok(locations))
+        }
+    });
 
     let mut locations = Vec::new();
     let mut not_found = Vec::new();
-    for (_, outcome) in outcomes {
+    for outcome in outcomes.into_iter().flatten() {
         match outcome {
             Ok(found) => locations.extend(found),
             Err(symbol) => not_found.push(symbol),
@@ -1576,7 +1574,18 @@ pub(super) fn render_definition_lookup(
                     matched = overlay.symbols_named(target);
                 }
                 if matched.records.is_empty() && target.contains("::") {
-                    matched = overlay.symbols_named(&target.replace("::", "."));
+                    let dotted_target = target.replace("::", ".");
+                    if language_for_file(file) == Language::Rust {
+                        let crates = crate::analyzer::RustOverlayCrates::new(Some(&overlay));
+                        if let Some(symbol) = crates.referenceable_symbol(&dotted_target) {
+                            matched.records.push(symbol);
+                            matched.disposition = crate::analyzer::semantic_model::SemanticModelOverlayDisposition::Unique;
+                        }
+                    } else {
+                        // Ruby constant navigation shares this rendering arm,
+                        // but Cargo crate-root visibility is Rust-specific.
+                        matched = overlay.symbols_named(&dotted_target);
+                    }
                 }
                 if matched.records.is_empty() && target.contains('#') {
                     matched = overlay.symbols_named(&target.replace('#', "."));

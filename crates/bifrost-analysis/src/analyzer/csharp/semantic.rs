@@ -1712,6 +1712,8 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             MemoryLocationKind::Index {
                 base: base_value,
                 index,
+                constant_index: None,
+                identity: crate::analyzer::semantic::IndexedLocationIdentity::Element,
             },
         )?;
         Ok(Some(MemoryTarget {

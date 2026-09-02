@@ -52,9 +52,10 @@ use std::sync::{Arc, OnceLock};
 pub(crate) use adapter::CppAdapter;
 use brokk_bifrost_cpp::clones::cpp_clone_parser;
 use brokk_bifrost_cpp::compile_context::{CppCompileContext, CppCompileContexts};
+pub(crate) use brokk_bifrost_cpp::declarations::CppRecoveredExportClassIndex;
 use brokk_bifrost_cpp::graph::CppWorkspaceSource;
 use brokk_bifrost_cpp::graph::extractor::build_source_using_index;
-use brokk_bifrost_cpp::graph::resolver::SourceUsingIndex;
+use brokk_bifrost_cpp::graph::resolver::{CppClassDeclarationStrength, SourceUsingIndex};
 use brokk_bifrost_cpp::graph_support::CppSource;
 use brokk_bifrost_cpp::identity::{
     CppReconcileCandidates, CppReconcileGroupKey, CppReconciledDefinitionIndex,
@@ -76,6 +77,7 @@ use brokk_bifrost_cpp::identity::cpp_callable_unit_role;
 pub(crate) use brokk_bifrost_cpp::identity::{
     CppCallableUnitRole, CppOccurrenceClassifier, CppOccurrenceRole, cpp_indexed_callable_linkage,
     cpp_is_range_for_binding_name, cpp_occurrence_role_for_range,
+    cpp_range_is_pure_virtual_declaration,
 };
 pub use brokk_bifrost_cpp::identity::{
     cpp_is_constructor_or_destructor_declarator_name, cpp_is_conversion_operator_target_type,
@@ -87,6 +89,7 @@ pub(crate) use identity::{
     cpp_header_body_files_are_related,
 };
 pub(crate) use imports::HeaderLanguageAttribution;
+use imports::TransitiveReverseTuIndex;
 #[derive(Clone)]
 pub struct CppAnalyzer {
     inner: TreeSitterAnalyzer<CppAdapter>,
@@ -102,6 +105,17 @@ pub struct CppAnalyzer {
     /// amalgamation's AST once per candidate (issue #1927).
     source_using_index_by_file: Cache<ProjectFile, Arc<SourceUsingIndex>>,
     unconditional_include_reachability: Cache<(ProjectFile, ProjectFile, bool), bool>,
+    /// The declaration-strength answer behind
+    /// [`CppSource::cached_class_declaration_strength`]. Memoized here rather
+    /// than per query for the same reason as `source_using_index_by_file`: the
+    /// C++ inverse scan asks it once per declaration seed, and on a translation
+    /// unit the parser could not fully recover each ask re-derives the
+    /// export-macro recovery shapes from the file's `ERROR` subtrees (#1496).
+    class_declaration_strength: Cache<CodeUnit, CppClassDeclarationStrength>,
+    /// The per-file embedded export-macro class recovery behind
+    /// [`CppSource::recovered_export_class_index`], memoized here for the same
+    /// reason as `source_using_index_by_file` (#1496).
+    recovered_export_class_index_by_file: Cache<ProjectFile, Arc<CppRecoveredExportClassIndex>>,
     /// The C reading of a header blob, when the store holds one (#1970). See
     /// [`projection::CppCReading`]. `None` is a real, memoized answer: it says
     /// the two readings of that blob agree, so every question about the C view
@@ -128,11 +142,13 @@ pub struct CppAnalyzer {
     reverse_include_index: Arc<PoolSafeMemo<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>>,
     /// The transitive answer over [`Self::reverse_include_index`]: for a
     /// header, every workspace translation unit (`.c`/`.cc`/`.cpp`/`.cxx`)
-    /// whose include closure reaches it. Built as one iterative fixed point
-    /// (`imports::build_transitive_reverse_tu_index`), not per-header BFS, so
-    /// this memo holds the whole map exactly like `reverse_include_index`
-    /// does. Backs [`Self::header_language_attribution`].
-    transitive_reverse_tu_index: Arc<PoolSafeMemo<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>>,
+    /// whose include closure reaches it. Built once over the whole include
+    /// graph (`imports::build_transitive_reverse_tu_index`), not per-header
+    /// BFS, so this memo holds the whole relation exactly like
+    /// `reverse_include_index` does -- as bitsets over the graph's SCC
+    /// condensation, which is what took envoy's build from 1,362 s to seconds
+    /// (#2899). Backs [`Self::header_language_attribution`].
+    transitive_reverse_tu_index: Arc<PoolSafeMemo<TransitiveReverseTuIndex>>,
     /// `PoolSafeMemo`, not `OnceLock`: this whole-workspace build is reached
     /// from rayon workers during cold scans, and a blocking `get_or_init` parks
     /// every one of them behind the single initializer for its full duration.
@@ -284,6 +300,14 @@ impl CppAnalyzer {
             unconditional_include_reachability: build_weighted_cache(
                 memo_budget / 8,
                 weight_include_reachability,
+            ),
+            class_declaration_strength: build_weighted_cache(
+                memo_budget / 8,
+                cache::weight_class_declaration_strength,
+            ),
+            recovered_export_class_index_by_file: build_weighted_cache(
+                memo_budget / 8,
+                cache::weight_recovered_export_class_index,
             ),
             c_readings_by_file: build_weighted_cache(memo_budget / 8, cache::weight_c_reading),
             reconcile_candidates_by_identifier: build_weighted_cache(
@@ -470,6 +494,14 @@ impl CppAnalyzer {
             unconditional_include_reachability: build_weighted_cache(
                 self.memo_budget / 8,
                 weight_include_reachability,
+            ),
+            class_declaration_strength: build_weighted_cache(
+                self.memo_budget / 8,
+                cache::weight_class_declaration_strength,
+            ),
+            recovered_export_class_index_by_file: build_weighted_cache(
+                self.memo_budget / 8,
+                cache::weight_recovered_export_class_index,
             ),
             c_readings_by_file: build_weighted_cache(self.memo_budget / 8, cache::weight_c_reading),
             reconcile_candidates_by_identifier: build_weighted_cache(
@@ -1061,6 +1093,39 @@ impl CppSource for CppAnalyzer {
         );
     }
 
+    fn recovered_export_class_index(
+        &self,
+        token: QueryToken<'_>,
+        file: &ProjectFile,
+    ) -> Arc<CppRecoveredExportClassIndex> {
+        self.recovered_export_class_index_by_file
+            .get_with_by_ref(file, || {
+                let Some(prepared) = self.prepared_syntax(token, file) else {
+                    return Arc::new(CppRecoveredExportClassIndex::default());
+                };
+                Arc::new(CppRecoveredExportClassIndex::build(
+                    prepared.tree().root_node(),
+                    prepared.source(),
+                ))
+            })
+    }
+
+    fn cached_class_declaration_strength(
+        &self,
+        candidate: &CodeUnit,
+    ) -> Option<CppClassDeclarationStrength> {
+        self.class_declaration_strength.get(candidate)
+    }
+
+    fn cache_class_declaration_strength(
+        &self,
+        candidate: &CodeUnit,
+        strength: CppClassDeclarationStrength,
+    ) {
+        self.class_declaration_strength
+            .insert(candidate.clone(), strength);
+    }
+
     fn structural_parent_of(&self, code_unit: &CodeUnit) -> Option<CodeUnit> {
         let scope = AnalyzerQueryScope::new(self);
         let token = scope.token();
@@ -1078,16 +1143,12 @@ impl CppSource for CppAnalyzer {
         CppAnalyzer::compile_contexts_for(self, file)
     }
 
+    /// Ascending by path, which the index's ordinal contract already
+    /// guarantees: ordinals are positions in a sorted unit list.
     fn reaching_translation_units(&self, file: &ProjectFile) -> Vec<ProjectFile> {
         let scope = AnalyzerQueryScope::new(self);
         let token = scope.token();
-        let mut translation_units = self
-            .transitive_reaching_translation_units(token, file)
-            .iter()
-            .cloned()
-            .collect::<Vec<_>>();
-        translation_units.sort();
-        translation_units
+        self.transitive_reaching_translation_units(token, file)
     }
 
     fn header_uses_c_semantics(&self, file: &ProjectFile) -> bool {
@@ -1226,6 +1287,10 @@ impl CodeUnitIndex for CppAnalyzer {
     /// identities of one declaration site without a Rust-side workspace map.
     fn all_declarations(&self) -> Box<dyn Iterator<Item = CodeUnit> + '_> {
         self.inner.all_declarations()
+    }
+
+    fn declarations_sharing_name(&self, unit: &CodeUnit) -> Vec<CodeUnit> {
+        self.inner.declarations_sharing_name(unit)
     }
 
     fn declarations(&self, file: &ProjectFile) -> BTreeSet<CodeUnit> {
@@ -1544,9 +1609,7 @@ impl IAnalyzer for CppAnalyzer {
         crate::analyzer::RelationalBatchOutcome::Complete(results)
     }
 
-    fn invalidate_cached_file_identities(&self) {
-        self.inner.invalidate_cached_file_identities();
-    }
+    crate::analyzer::i_analyzer::forward_file_identity_invalidation!();
 
     fn working_tree_identity(&self) -> Option<std::sync::Arc<crate::gitblob::WorkingTreeIdentity>> {
         self.inner.working_tree_identity()
@@ -1555,6 +1618,10 @@ impl IAnalyzer for CppAnalyzer {
     #[cfg(any(test, feature = "test-support"))]
     fn test_hooks(&self) -> &dyn crate::analyzer::AnalyzerTestHooks {
         self
+    }
+
+    fn claimed_files(&self) -> Vec<ProjectFile> {
+        self.inner.claimed_files()
     }
 
     fn begin_query(&self, context: &Arc<crate::analyzer::AnalyzerQueryContext>) {
@@ -1571,6 +1638,12 @@ impl IAnalyzer for CppAnalyzer {
 
     fn workspace_file_index_cell(&self) -> Option<crate::analyzer::WorkspaceFileIndexCell> {
         self.inner.workspace_file_index_cell()
+    }
+
+    fn definition_lookup_memo(
+        &self,
+    ) -> Option<std::sync::Arc<crate::analyzer::DefinitionLookupMemo>> {
+        self.inner.definition_lookup_memo()
     }
 
     fn import_statements(&self, file: &ProjectFile) -> Vec<String> {
@@ -1665,6 +1738,12 @@ impl IAnalyzer for CppAnalyzer {
         self.inner.workspace_content_identities()
     }
 
+    fn workspace_fact_indexes(
+        &self,
+    ) -> Vec<&dyn crate::analyzer::read_verification::WorkspaceFactIndex> {
+        self.inner.workspace_fact_indexes()
+    }
+
     fn contains_tests(&self, file: &ProjectFile) -> bool {
         self.inner.contains_tests(file)
     }
@@ -1711,14 +1790,18 @@ impl IAnalyzer for CppAnalyzer {
         let requested_file_set: HashSet<ProjectFile> = requested_files.iter().cloned().collect();
 
         let mut parser = cpp_clone_parser();
-        let all_candidates: Vec<CloneCandidateProfile> = self
+        let corpus_units: Vec<CodeUnit> = self
             .get_all_declarations()
             .into_iter()
             .filter(|code_unit| {
                 code_unit.is_function() && requested_file_set.contains(code_unit.source())
             })
+            .collect();
+        let _query_scope = crate::analyzer::AnalyzerQueryScope::new(self);
+        let all_candidates: Vec<CloneCandidateProfile> = corpus_units
+            .iter()
             .filter_map(|code_unit| {
-                build_clone_candidate_data(self, &code_unit, weights, &mut parser)
+                build_clone_candidate_data(self, code_unit, weights, &mut parser)
             })
             .map(|candidate| CloneCandidateProfile::create(candidate, weights))
             .collect();
@@ -1812,6 +1895,10 @@ impl LanguageSupport for CppSupport {
     }
 
     fn package_separator(&self) -> &'static str {
+        "::"
+    }
+
+    fn qualified_call_separator(&self) -> &'static str {
         "::"
     }
 

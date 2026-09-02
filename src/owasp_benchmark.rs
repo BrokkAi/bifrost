@@ -27,7 +27,8 @@
 //! artifact it writes is committed.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -611,9 +612,9 @@ fn category_sinks(category: InjectionCategory) -> Vec<Sink> {
         ],
         InjectionCategory::Xpathi => vec![s("evaluate", 0), s("compile", 0)],
         InjectionCategory::Xss => vec![
-            s("println", 0),
-            s("print", 0),
-            s("write", 0),
+            exact("println", "member.printwriter.println-string", "x"),
+            exact("print", "member.printwriter.print-string", "s"),
+            exact("write", "member.printwriter.write-string", "s"),
             exact("format", "member.printwriter.format-format", "format"),
             exact("format", "member.printwriter.format-format", "args"),
             exact(
@@ -957,7 +958,7 @@ pub struct RunConfig {
     /// control (every shipped pack declares `safety.review_required`, so an
     /// enable control is what lets it resolve as active).
     pub packs: Vec<PackSpec>,
-    /// Wall-clock budget for the whole taint run.
+    /// Wall-clock budget for each category's taint run.
     pub timeout: Duration,
     /// Optional cap on the number of cases scored, for a smoke run. `None`
     /// scores the whole subset.
@@ -969,6 +970,10 @@ pub struct RunConfig {
     /// path (`activate_jdk_dependency_pack`), not as a curated session pack.
     /// Opened read-only: a run never installs into or otherwise mutates it.
     pub jdk_catalog_root: PathBuf,
+    /// Optional append-only JSON Lines progress stream. The binary initializes
+    /// this with run provenance; the live runner then syncs category start and
+    /// completion records as they occur.
+    pub progress_path: Option<PathBuf>,
 }
 
 /// A pack to load: its id, its JSON on disk, and the coordinate evidence to
@@ -1038,6 +1043,46 @@ pub struct CategoryRunStatus {
     /// calibrating the workspace-scaled budget lanes against a real corpus,
     /// which is what the lane model was missing (#1936).
     pub work: BTreeMap<String, u64>,
+}
+
+#[derive(Serialize)]
+#[serde(tag = "event", rename_all = "snake_case")]
+enum CategoryProgressRecord<'a> {
+    PacksActivated {
+        activated: &'a [String],
+        skipped: &'a [(String, String)],
+        jdk_pack_gaps: usize,
+    },
+    CategoryStarted {
+        category: &'a str,
+        ordinal: usize,
+        total: usize,
+        timeout_secs: u64,
+    },
+    CategoryCompleted {
+        ordinal: usize,
+        total: usize,
+        #[serde(flatten)]
+        status: &'a CategoryRunStatus,
+    },
+}
+
+fn append_progress(path: Option<&Path>, record: &CategoryProgressRecord<'_>) -> Result<(), String> {
+    let Some(path) = path else {
+        return Ok(());
+    };
+    let mut rendered = serde_json::to_vec(record)
+        .map_err(|error| format!("serialize OWASP progress record: {error}"))?;
+    rendered.push(b'\n');
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|error| format!("open OWASP progress {}: {error}", path.display()))?;
+    file.write_all(&rendered)
+        .map_err(|error| format!("append OWASP progress {}: {error}", path.display()))?;
+    file.sync_data()
+        .map_err(|error| format!("sync OWASP progress {}: {error}", path.display()))
 }
 
 /// One diagnostic as the artifact records it, with the number of diagnostics it
@@ -1221,6 +1266,18 @@ pub fn run(config: &RunConfig) -> Result<RunResult, String> {
         .iter()
         .map(|pack| pack.gaps)
         .sum();
+    append_progress(
+        config.progress_path.as_deref(),
+        &CategoryProgressRecord::PacksActivated {
+            activated: &activated_pack_ids,
+            skipped: &skipped_packs,
+            jdk_pack_gaps,
+        },
+    )?;
+    eprintln!(
+        "[owasp-progress] activated packs: {:?}; skipped packs: {:?}; JDK gaps: {jdk_pack_gaps}",
+        activated_pack_ids, skipped_packs
+    );
 
     let options = PolicyEvaluationOptions::new(
         PolicyEvaluationDate::from_ymd(2026, 1, 1).expect("a fixed evaluation date"),
@@ -1238,7 +1295,7 @@ pub fn run(config: &RunConfig) -> Result<RunResult, String> {
     let mut category_runs = Vec::new();
     let flow_state = brokk_bifrost_flow::FlowWorkspaceState::new();
 
-    for category in InjectionCategory::ALL {
+    for (category_index, category) in InjectionCategory::ALL.into_iter().enumerate() {
         // One deadline per category, not one shared across all six. A single
         // token minted before the loop is an absolute wall-clock deadline, so
         // whichever categories the earlier ones did not leave time for are
@@ -1247,6 +1304,21 @@ pub fn run(config: &RunConfig) -> Result<RunResult, String> {
         // That is a measurement artifact, not a Bifrost verdict, so each
         // category gets its own budget and the artifact records when one is
         // hit.
+        let ordinal = category_index + 1;
+        append_progress(
+            config.progress_path.as_deref(),
+            &CategoryProgressRecord::CategoryStarted {
+                category: category.label(),
+                ordinal,
+                total: InjectionCategory::ALL.len(),
+                timeout_secs: config.timeout.as_secs(),
+            },
+        )?;
+        eprintln!(
+            "[owasp-progress] category {ordinal}/{} started: {}",
+            InjectionCategory::ALL.len(),
+            category.label()
+        );
         let cancellation = CancellationToken::new().with_timeout(config.timeout);
         let policy = build_policy(category);
         let inputs = [PolicyEvaluationInput::embedded(
@@ -1347,7 +1419,7 @@ pub fn run(config: &RunConfig) -> Result<RunResult, String> {
             .and_then(|value| value.parse::<usize>().ok())
             .unwrap_or(6);
         sample_diagnostics.truncate(sample_cap);
-        category_runs.push(CategoryRunStatus {
+        let category_status = CategoryRunStatus {
             category: category.label().to_owned(),
             completion: completion_label,
             termination,
@@ -1355,8 +1427,7 @@ pub fn run(config: &RunConfig) -> Result<RunResult, String> {
             retained_analyses: outcome.taint_analysis_results().len(),
             sample_diagnostics,
             work,
-        });
-
+        };
         // A finding on a case's file, in this category's run, flags that case
         // for this category.
         for finding in outcome.taint_findings() {
@@ -1448,6 +1519,25 @@ pub fn run(config: &RunConfig) -> Result<RunResult, String> {
             }
             merge_completion(&mut case_completion, name, completion);
         }
+
+        append_progress(
+            config.progress_path.as_deref(),
+            &CategoryProgressRecord::CategoryCompleted {
+                ordinal,
+                total: InjectionCategory::ALL.len(),
+                status: &category_status,
+            },
+        )?;
+        eprintln!(
+            "[owasp-progress] category {ordinal}/{} completed: {} completion={} termination={:?} findings={} retained={}",
+            InjectionCategory::ALL.len(),
+            category_status.category,
+            category_status.completion,
+            category_status.termination,
+            category_status.findings,
+            category_status.retained_analyses
+        );
+        category_runs.push(category_status);
     }
 
     let observations: Vec<CaseObservation> = label_set
@@ -1697,6 +1787,52 @@ mod tests {
     }
 
     #[test]
+    fn progress_records_append_as_independent_json_lines() {
+        let scratch = tempfile::tempdir().expect("scratch dir");
+        let path = scratch.path().join("progress.jsonl");
+        let status = CategoryRunStatus {
+            category: "sqli".to_owned(),
+            completion: "no_taint_run".to_owned(),
+            termination: Some("DeadlineExceeded".to_owned()),
+            findings: 0,
+            retained_analyses: 0,
+            sample_diagnostics: Vec::new(),
+            work: BTreeMap::new(),
+        };
+
+        append_progress(
+            Some(&path),
+            &CategoryProgressRecord::CategoryStarted {
+                category: "sqli",
+                ordinal: 1,
+                total: InjectionCategory::ALL.len(),
+                timeout_secs: 3_600,
+            },
+        )
+        .expect("append category start");
+        append_progress(
+            Some(&path),
+            &CategoryProgressRecord::CategoryCompleted {
+                ordinal: 1,
+                total: InjectionCategory::ALL.len(),
+                status: &status,
+            },
+        )
+        .expect("append category completion");
+
+        let lines = fs::read_to_string(path).expect("read progress stream");
+        let records = lines
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("valid JSON line"))
+            .collect::<Vec<_>>();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0]["event"], "category_started");
+        assert_eq!(records[0]["timeout_secs"], 3_600);
+        assert_eq!(records[1]["event"], "category_completed");
+        assert_eq!(records[1]["termination"], "DeadlineExceeded");
+    }
+
+    #[test]
     fn parse_expected_results_narrows_to_taint_subset() {
         let csv = "# header line\n\
                    BenchmarkTest00001,pathtraver,true,22\n\
@@ -1753,7 +1889,7 @@ mod tests {
     #[test]
     fn promotion_pins_every_activation() {
         let staged = r#"{
-            "schema_version": 1,
+            "schema_version": 2,
             "pack_id": "bifrost.esapi-sanitizers",
             "provenance": { "source": "staged", "revision": "k3" },
             "shards": [
@@ -1791,7 +1927,7 @@ mod tests {
         };
 
         const GAP_UNACCOUNTED_PARTIAL_JDK_PACK: &str = r#"{
-          "schema_version": 1,
+          "schema_version": 2,
           "pack_id": "test.fail-before.jdk",
           "version": "21.0.2",
           "producer": { "name": "bifrost-fixture", "version": "1.0.0" },

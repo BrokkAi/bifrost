@@ -47,6 +47,7 @@ impl ExternalArtifactPackProducer for JdkJmodSetPackProducer {
             return ArtifactProduction::failed(
                 ProducerDiagnostic {
                     severity: ProducerDiagnosticSeverity::Error,
+                    source_entry: None,
                     code: "artifact.cancelled".to_owned(),
                     location: None,
                     declaration: None,
@@ -77,6 +78,7 @@ impl JdkJmodSetPackProducer {
             return ArtifactProduction::failed(
                 ProducerDiagnostic {
                     severity: ProducerDiagnosticSeverity::Error,
+                    source_entry: None,
                     code: "artifact.kind".to_owned(),
                     location: None,
                     declaration: None,
@@ -89,6 +91,7 @@ impl JdkJmodSetPackProducer {
             return ArtifactProduction::failed(
                 ProducerDiagnostic {
                     severity: ProducerDiagnosticSeverity::Error,
+                    source_entry: None,
                     code: "jdk.activation.missing".to_owned(),
                     location: None,
                     declaration: None,
@@ -102,6 +105,7 @@ impl JdkJmodSetPackProducer {
             return ArtifactProduction::failed(
                 ProducerDiagnostic {
                     severity: ProducerDiagnosticSeverity::Error,
+                    source_entry: None,
                     code: "artifact.source_set_empty".to_owned(),
                     location: Some(artifact.path().to_string_lossy().into_owned()),
                     declaration: None,
@@ -377,7 +381,7 @@ impl JdkJmodSetPackProducer {
             return failed_with_diagnostics(artifact.sha256(), diagnostics);
         }
         let (diagnostics, suppressed_diagnostics) = diagnostics.finish();
-        let completeness = if diagnostics.is_empty() && suppressed_diagnostics == 0 {
+        let completeness = if diagnostics.is_empty() && suppressed_diagnostics.total() == 0 {
             Completeness::Complete
         } else {
             Completeness::Partial
@@ -821,6 +825,7 @@ fn unsupported_direct_production(
     ArtifactProduction::failed(
         ProducerDiagnostic {
             severity: ProducerDiagnosticSeverity::Error,
+            source_entry: None,
             code: "artifact.source_set_required".to_owned(),
             location: Some(request.path.to_string_lossy().into_owned()),
             declaration: None,
@@ -834,6 +839,7 @@ fn cancelled_production(limits: &ArtifactProducerLimits) -> ArtifactProduction {
     ArtifactProduction::failed(
         ProducerDiagnostic {
             severity: ProducerDiagnosticSeverity::Error,
+            source_entry: None,
             code: "artifact.cancelled".to_owned(),
             location: None,
             declaration: None,

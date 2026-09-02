@@ -20,16 +20,16 @@ use super::workspace_oracle::{
     WorkspaceSemanticOracle, exact_source_for_procedure, semantic_locator_work,
 };
 use super::{
-    CallContinuationKind, CallSiteHandle, CallSiteId, CandidateCoverage, ControlContinuation,
-    ControlEdgeKind, DeferredInvocationKind, DispatchBoundary, DispatchBoundaryKind,
-    DispatchOracle, DispatchResult, EvidenceCompleteness, EvidenceHandle, FormalMultiplicity,
-    LengthDelimitedDigest, OracleLimits, OracleRelationArena, OracleRelationHandle,
-    OracleRelationId, OracleRelationKind, OracleRelationOwner, OracleRelationRecord,
-    OracleRelationSubject, ProcedureHandle, ProcedureInvocationKind, ProgramPointHandle,
-    ProgramPointId, ProofStatus, SemanticBudgetExceeded, SemanticCallSite, SemanticCapability,
-    SemanticGap, SemanticGapDischarge, SemanticGapImpact, SemanticGapKind, SemanticGapSubject,
-    SemanticLanguage, SemanticOutcome, SemanticProviderError, SemanticRequest, SemanticValue,
-    SemanticValueKind, SemanticWork, StableDigest,
+    CallContinuationKind, CallInvocationMode, CallSiteHandle, CallSiteId, CandidateCoverage,
+    ControlContinuation, ControlEdgeKind, DeferredInvocationKind, DispatchBoundary,
+    DispatchBoundaryKind, DispatchOracle, DispatchResult, EvidenceCompleteness, EvidenceHandle,
+    FormalMultiplicity, LengthDelimitedDigest, OracleLimits, OracleRelationArena,
+    OracleRelationHandle, OracleRelationId, OracleRelationKind, OracleRelationOwner,
+    OracleRelationRecord, OracleRelationSubject, ProcedureHandle, ProcedureInvocationKind,
+    ProgramPointHandle, ProgramPointId, ProofStatus, SemanticBudgetExceeded, SemanticCallSite,
+    SemanticCapability, SemanticGap, SemanticGapDischarge, SemanticGapImpact, SemanticGapKind,
+    SemanticGapSubject, SemanticLanguage, SemanticOutcome, SemanticProviderError, SemanticRequest,
+    SemanticValue, SemanticValueKind, SemanticWork, StableDigest,
 };
 
 const DEFAULT_ICFG_PROVIDER_BEHAVIOR_DOMAIN: &[u8] = b"bifrost-icfg-provider/default-behavior/v1";
@@ -42,9 +42,10 @@ const WORKSPACE_ICFG_PROVIDER_BEHAVIOR_DOMAIN: &[u8] =
 /// The external member key intentionally collapses same-arity overloads, and
 /// an unmaterialized boundary does not carry async/generator invocation
 /// semantics. Go has neither overloads nor deferred callable invocation at an
-/// emitted outer call site: spawned calls are withheld by lowering, while a
-/// supported `defer` emits its call only on the cleanup route where it really
-/// executes. Broaden this predicate only with an equally structured proof.
+/// ordinary emitted call site. A supported `defer` emits on its cleanup route,
+/// while a spawned call carries `DifferentTask` timing and never becomes a
+/// synchronous body transfer. Broaden this predicate only with an equally
+/// structured proof.
 const fn supports_authored_normal_continuation_absence(language: SemanticLanguage) -> bool {
     matches!(language, SemanticLanguage::Standard(Language::Go))
 }
@@ -144,6 +145,17 @@ pub enum CallToReturnModel {
     Normal,
     Exceptional,
     NormalAndExceptional,
+}
+
+const fn boundary_call_to_return_model(
+    invocation_mode: CallInvocationMode,
+    normal_continuation_absent: bool,
+) -> CallToReturnModel {
+    match (invocation_mode, normal_continuation_absent) {
+        (CallInvocationMode::Detached, _) => CallToReturnModel::Normal,
+        (CallInvocationMode::Ordinary, true) => CallToReturnModel::Exceptional,
+        (CallInvocationMode::Ordinary, false) => CallToReturnModel::NormalAndExceptional,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -1131,16 +1143,62 @@ impl IcfgProvider for WorkspaceIcfgProvider<'_> {
                     CallBoundary {
                         origin: origin.clone(),
                         dispatch,
-                        model: if normal_continuation_absent {
-                            CallToReturnModel::Exceptional
-                        } else {
-                            CallToReturnModel::NormalAndExceptional
-                        },
+                        model: boundary_call_to_return_model(
+                            semantic_call.invocation_mode,
+                            normal_continuation_absent,
+                        ),
                     }
                 })
                 .collect::<Vec<_>>();
             for candidate in candidates.into_vec() {
                 let properties = candidate.target.semantics().properties();
+                if semantic_call.invocation_mode == CallInvocationMode::Detached {
+                    let previous_reason_bytes = completeness_reason_bytes(&candidate.completeness);
+                    let completeness = EvidenceCompleteness::Partial(
+                        "callee body executes in a different task".into(),
+                    );
+                    let added_reason_bytes = completeness_reason_bytes(&completeness)
+                        .saturating_sub(previous_reason_bytes);
+                    let target = candidate.target.semantics().locator().clone();
+                    let boundary_kind = DispatchBoundaryKind::Deferred {
+                        target: target.clone(),
+                        kind: DeferredInvocationKind::Async,
+                    };
+                    let (provenance, provenance_work) = deferred_boundary_provenance(
+                        &origin,
+                        &boundary_kind,
+                        &candidate.provenance,
+                        *self.oracle.limits(),
+                    )?;
+                    boundaries.push(CallBoundary {
+                        origin: origin.clone(),
+                        dispatch: DispatchBoundary {
+                            kind: boundary_kind,
+                            exact_external_target: None,
+                            unmaterialized_external_target: None,
+                            proof: candidate.proof,
+                            completeness,
+                            provenance,
+                        },
+                        // Starting the task returns normally to the registering
+                        // procedure. The spawned body's exits never rejoin it.
+                        model: CallToReturnModel::Normal,
+                    });
+                    additional_work = sum_semantic_work(
+                        additional_work,
+                        sum_semantic_work(
+                            semantic_locator_work(&target),
+                            sum_semantic_work(
+                                provenance_work,
+                                SemanticWork {
+                                    owned_text_bytes: added_reason_bytes,
+                                    ..SemanticWork::default()
+                                },
+                            ),
+                        ),
+                    );
+                    continue;
+                }
                 if properties.invocation == ProcedureInvocationKind::Deferred {
                     let previous_reason_bytes = completeness_reason_bytes(&candidate.completeness);
                     let completeness = EvidenceCompleteness::Partial(
@@ -2736,6 +2794,13 @@ pub fn validate_call_transfer_set(
     let origin = caller
         .call_site_handle(semantic_call.id)
         .ok_or_else(|| SemanticProviderError::internal("failed to scope ICFG transfer call"))?;
+    if semantic_call.invocation_mode == CallInvocationMode::Detached
+        && !transfers.transfers.is_empty()
+    {
+        return Err(SemanticProviderError::internal(
+            "detached call transfer set cannot enter a callee body synchronously",
+        ));
+    }
     for transfer in &transfers.transfers {
         if transfer.origin != origin {
             return Err(SemanticProviderError::internal(
@@ -2772,6 +2837,13 @@ pub fn validate_call_transfer_set(
                     "ICFG call boundary has invalid dispatch provenance: {error}"
                 ))
             })?;
+        if semantic_call.invocation_mode == CallInvocationMode::Detached
+            && boundary.model != CallToReturnModel::Normal
+        {
+            return Err(SemanticProviderError::internal(
+                "detached call boundary must retain only the caller's normal continuation",
+            ));
+        }
     }
     Ok(())
 }
@@ -2810,6 +2882,27 @@ mod tests {
             completeness: EvidenceCompleteness::Complete,
             boundary: None,
         }
+    }
+
+    #[test]
+    fn detached_external_call_keeps_parent_normal_continuation() {
+        assert_eq!(
+            boundary_call_to_return_model(CallInvocationMode::Detached, true),
+            CallToReturnModel::Normal,
+            "a nonreturning target summary describes the detached body, not spawn registration"
+        );
+        assert_eq!(
+            boundary_call_to_return_model(CallInvocationMode::Detached, false),
+            CallToReturnModel::Normal
+        );
+        assert_eq!(
+            boundary_call_to_return_model(CallInvocationMode::Ordinary, true),
+            CallToReturnModel::Exceptional
+        );
+        assert_eq!(
+            boundary_call_to_return_model(CallInvocationMode::Ordinary, false),
+            CallToReturnModel::NormalAndExceptional
+        );
     }
 
     #[test]

@@ -16,7 +16,7 @@ publish = true
 name = "brokk_bifrost_php"
 
 [dependencies]
-brokk-bifrost-core = { path = "../bifrost-core", version = "=0.10.8" }
+brokk-bifrost-core = { path = "../bifrost-core", version = "=0.10.9" }
 mago-allocator = "=1.43.0"
 mago-database = "=1.43.0"
 mago-phpdoc-syntax = "=1.43.0"
@@ -29,3 +29,6 @@ tree-sitter = "0.25.10"
 # exporting two language constants; every site here names `LANGUAGE_PHP` (the
 # HTML-embedding dialect), never `LANGUAGE_PHP_ONLY`.
 tree-sitter-php = "0.23.11"
+
+[lints]
+workspace = true

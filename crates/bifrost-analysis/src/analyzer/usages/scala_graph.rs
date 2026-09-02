@@ -11,7 +11,7 @@ use brokk_bifrost_core::analyzer::query_token::QueryToken;
 pub(crate) use brokk_bifrost_jvm::scala::graph::{inverted, resolver, syntax};
 
 use crate::analyzer::usages::common::language_for_target;
-use crate::analyzer::usages::inverted_edges::{UsageEdgeWeights, UsageEdges};
+use crate::analyzer::usages::inverted_edges::{UsageEdgeBuildResult, UsageEdgeWeights, UsageEdges};
 use crate::analyzer::usages::model::FuzzyResult;
 use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
 use crate::analyzer::usages::scala_graph::shared::{ScalaEdgeResolver, ScalaQueryResolver};
@@ -21,7 +21,6 @@ use crate::analyzer::{
 };
 use crate::hash::HashSet;
 use resolver::{TargetKind, TargetSpec};
-use std::sync::Arc;
 
 pub(crate) use inverted::{NameResolver as ScalaNameResolver, ProjectTypes as ScalaProjectTypes};
 pub(in crate::analyzer::usages) use resolver::{
@@ -58,33 +57,13 @@ where
     Some(resolver.build_rooted_edges(analyzer, token, callers, keep_file))
 }
 
-pub(crate) fn build_inbound_scala_usage_edges(
+pub(crate) fn build_inbound_scala_usage_edges_with_completeness(
     analyzer: &dyn IAnalyzer,
     token: QueryToken<'_>,
     callees: &HashSet<String>,
-) -> Option<Arc<UsageEdges>> {
+) -> Option<UsageEdgeBuildResult<UsageEdges>> {
     let resolver = ScalaEdgeResolver::try_new(analyzer)?;
-    Some(Arc::new(resolver.build_inbound_edges(
-        analyzer,
-        token,
-        callees,
-        |_| true,
-    )))
-}
-
-#[cfg(test)]
-pub(crate) fn build_full_scala_usage_edges(
-    analyzer: &dyn IAnalyzer,
-    token: QueryToken<'_>,
-    nodes: &HashSet<String>,
-) -> Option<Arc<UsageEdges>> {
-    let scala = resolve_analyzer::<ScalaAnalyzer>(analyzer)?;
-    let edges = scala.full_usage_edges(nodes, || {
-        let resolver = ScalaEdgeResolver::try_new(analyzer)
-            .expect("resolved Scala analyzer must construct a Scala edge resolver");
-        resolver.build_edges(analyzer, token, nodes, |_| true)
-    });
-    Some(edges)
+    Some(resolver.build_inbound_edges_with_completeness(analyzer, token, callees, |_| true))
 }
 
 pub(crate) fn build_scala_usage_edge_weights<F>(
@@ -527,6 +506,7 @@ object Use {
         ));
     }
 
+    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
     #[test]
     fn scala_usage_graph_bulk_fetch_bypasses_lru_and_preserves_point_entry() {
         const FILE_COUNT: usize = 132;
@@ -586,44 +566,28 @@ object Use {
     }
 
     #[test]
-    fn scala_full_usage_edge_cache_reuses_node_sets_and_resets_after_update() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-
+    fn complete_inbound_graph_is_reused_by_the_dead_code_cache() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
         let file = ProjectFile::new(root.clone(), "Target.scala");
         file.write("package app\nclass Target\n").unwrap();
         let analyzer = ScalaAnalyzer::new(Arc::new(TestProject::new(root, Language::Scala)));
-        let first_nodes = HashSet::from_iter(["app.Target".to_string(), "app.Other".to_string()]);
-        let second_nodes = HashSet::from_iter(["app.Other".to_string(), "app.Target".to_string()]);
-        let builds = AtomicUsize::new(0);
+        let callees = HashSet::from_iter(["app.Target".to_string()]);
 
-        let build = || {
-            builds.fetch_add(1, Ordering::Relaxed);
-            UsageEdges::default()
-        };
-        analyzer.full_usage_edges(&first_nodes, build);
-        analyzer.full_usage_edges(&second_nodes, build);
-        assert_eq!(builds.load(Ordering::Relaxed), 1);
-
-        let updated = analyzer.update(&std::collections::BTreeSet::from([file]));
-        updated.full_usage_edges(&first_nodes, build);
-        assert_eq!(builds.load(Ordering::Relaxed), 2);
-    }
-
-    #[test]
-    fn full_usage_edge_builder_returns_the_cached_graph_handle() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().canonicalize().unwrap();
-        let file = ProjectFile::new(root.clone(), "Target.scala");
-        file.write("package app\nclass Target\n").unwrap();
-        let analyzer = ScalaAnalyzer::new(Arc::new(TestProject::new(root, Language::Scala)));
-        let nodes = HashSet::from_iter(["app.Target".to_string()]);
-
-        let scope = AnalyzerQueryScope::new(&analyzer);
-        let token = scope.token();
-        let first = build_full_scala_usage_edges(&analyzer, token, &nodes).unwrap();
-        let second = build_full_scala_usage_edges(&analyzer, token, &nodes).unwrap();
+        let first = crate::analyzer::usages::inverted_edges::cached_dead_code_usage_edges(
+            &analyzer,
+            &analyzer.dead_code_usage_edges,
+            &callees,
+            |token| build_inbound_scala_usage_edges_with_completeness(&analyzer, token, &callees),
+        )
+        .expect("complete Scala graph should be cached");
+        let second = crate::analyzer::usages::inverted_edges::cached_dead_code_usage_edges(
+            &analyzer,
+            &analyzer.dead_code_usage_edges,
+            &callees,
+            |_| panic!("canonical target set should hit the Scala dead-code cache"),
+        )
+        .expect("cached Scala graph should be returned");
 
         assert!(Arc::ptr_eq(&first, &second));
     }

@@ -1,0 +1,14 @@
+{
+  "kind": "configuration",
+  "edition": "2021",
+  "compiler": { "release": "1.85.0" },
+  "cargoResolver": "2",
+  "target": {
+    "triple": "x86_64-unknown-linux-gnu",
+    "customName": "acme-board",
+    "customSpecSha256": "e95eea02441c619e6cd0e660dd75a41ba9ac696c98139e88d0ca3ce22733d46b"
+  },
+  "compilationRole": "target",
+  "enabledFeatures": [],
+  "cfgAtoms": []
+}

@@ -168,7 +168,11 @@ pub fn lower_row_selector_plan(
             return None;
         }
         let model_id = filter.predicates.iter().find_map(|predicate| {
-            if predicate.field.field != "model_id" || !matches!(predicate.op, RowPredicateOp::Eq) {
+            if !matches!(
+                predicate.field.field.as_str(),
+                "model_callable_id" | "model_id"
+            ) || !matches!(predicate.op, RowPredicateOp::Eq)
+            {
                 return None;
             }
             let RowPredicateOperand::Literal(RowLiteral::String(model_id)) = &predicate.operand
@@ -525,6 +529,7 @@ fn lower_field(
     }
     if chain_schema.field(&column).is_none() {
         return Err(RelationalAssertionPlanError::UnknownField {
+            known_fields: chain_schema.field_names_of(&column.qualifier),
             binding: column.qualifier,
             field: column.name,
         });

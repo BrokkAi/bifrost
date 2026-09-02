@@ -11,8 +11,9 @@ use tree_sitter::{Node, Parser, Tree};
 use crate::CancellationToken;
 use crate::analyzer::semantic_model::{
     ArtifactProducerLimits, BoundedProducerDiagnostics, HierarchyFact, HierarchyKind, Locator,
-    MemberFact, MemberIdentity, MemberKind, Parameter, ProducerDiagnostic, Signature, TypeFact,
-    TypeIdentity, TypeKind, TypeRef, Visibility, member_declaration_id, type_declaration_id,
+    MemberFact, MemberIdentity, MemberKind, Parameter, ProducerDiagnostic, Signature,
+    SuppressedDiagnostics, TypeFact, TypeIdentity, TypeKind, TypeRef, Visibility,
+    member_declaration_id, type_declaration_id,
 };
 use brokk_bifrost_core::analyzer::semantic_diagnostics::node_text;
 use brokk_bifrost_php::aliases::{PhpFileContext, php_namespace_to_fq, resolve_php_type};
@@ -53,7 +54,7 @@ pub(crate) struct PhpSourceProjection {
     pub types: Vec<TypeFact>,
     pub members: Vec<MemberFact>,
     pub diagnostics: Vec<ProducerDiagnostic>,
-    pub suppressed_diagnostics: usize,
+    pub suppressed_diagnostics: SuppressedDiagnostics,
     pub complete: bool,
 }
 
@@ -368,6 +369,7 @@ fn project_type<'tree>(
         type_parameters: Vec::new(),
         type_parameter_constraints: Vec::new(),
         underlying_type: None,
+        value_semantics: None,
         embedded_types: Vec::new(),
         hierarchy: hierarchy_of(work.node, source, ctx),
         aliases: Vec::new(),
@@ -499,6 +501,7 @@ fn project_callable(
         is_static,
         is_abstract: has_modifier(node, source, "abstract"),
         is_virtual: false,
+        implicit_operation: None,
         callable_family_complete: false,
         signature: Some(signature),
         receiver: None,
@@ -535,6 +538,7 @@ fn callable_signature(node: Node<'_>, source: &str, ctx: &PhpFileContext) -> Sig
                     .unwrap_or_else(unknown_type),
                 optional: child.child_by_field_name("default_value").is_some(),
                 variadic: child.kind() == "variadic_parameter",
+                passing_mode: Default::default(),
             });
         }
     }
@@ -602,6 +606,7 @@ fn project_properties(
             is_static,
             is_abstract: false,
             is_virtual: false,
+            implicit_operation: None,
             callable_family_complete: false,
             signature: Some(signature),
             receiver: None,
@@ -679,6 +684,7 @@ fn constant_member(
         is_static: true,
         is_abstract: false,
         is_virtual: false,
+        implicit_operation: None,
         callable_family_complete: false,
         signature: None,
         receiver: None,
@@ -712,6 +718,7 @@ fn namespace_fact(namespace: &str, artifact_sha256: &str, entry_path: &str) -> T
         type_parameters: Vec::new(),
         type_parameter_constraints: Vec::new(),
         underlying_type: None,
+        value_semantics: None,
         embedded_types: Vec::new(),
         hierarchy: Vec::new(),
         aliases: Vec::new(),

@@ -310,3 +310,30 @@ pub fn weight_include_routes(
         + size_of::<Vec<crate::usage_includes::RustIncludeRoute>>();
     size.min(u32::MAX as usize) as u32
 }
+
+/// Byte weight of one module short name's declaring files, grouped by the
+/// module package each declaration names.
+///
+/// The key is one identifier and the value is the whole workspace answer for
+/// it, so the group strings and their file paths carry the cost.
+// The signature is moka's: a weigher is `Fn(&K, &V)`, and the key type is
+// `String`.
+#[allow(clippy::ptr_arg)]
+pub fn weight_module_declarations(
+    key: &String,
+    value: &Arc<HashMap<String, Vec<ProjectFile>>>,
+) -> u32 {
+    let groups = value
+        .iter()
+        .map(|(package, files)| {
+            package.len()
+                + files
+                    .iter()
+                    .map(|file| file.rel_path().to_string_lossy().len() + size_of::<ProjectFile>())
+                    .sum::<usize>()
+                + size_of::<Vec<ProjectFile>>()
+        })
+        .sum::<usize>();
+    (key.len() + groups + size_of::<HashMap<String, Vec<ProjectFile>>>()).min(u32::MAX as usize)
+        as u32
+}

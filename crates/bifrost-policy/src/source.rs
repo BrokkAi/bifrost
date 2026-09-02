@@ -32,9 +32,9 @@ use super::schema::{
     AtomDomain, CollectionOrder, CvssBaseMetricSchema, CvssMetricScopeSchema, FieldPlacement,
     PolicyAnalysisKind, PolicyAtomValue, PolicyField, PolicyRecord, PolicyRecordContext,
     PolicyValueShape, RqlpDocumentKind, ValueMultiplicity, applicable_fields_for_record,
-    lookup_applicable_field, lookup_atom, lookup_cvss_base_metric, lookup_field, positional_field,
-    records_from_label, required_fields_for_record, resolve_policy_schema_version,
-    variadic_positional_field,
+    atom_values, lookup_applicable_field, lookup_atom, lookup_cvss_base_metric, lookup_field,
+    positional_field, records_from_label, required_fields_for_record,
+    resolve_policy_schema_version, variadic_positional_field,
 };
 
 pub const MAX_RQLP_SOURCE_BYTES: usize = 256 * 1024;
@@ -511,6 +511,16 @@ fn help_in_expr(expr: &Expr, byte_offset: usize) -> Option<PolicySourceHelp> {
     if !(expr.range.start <= byte_offset && byte_offset < expr.range.end) {
         return None;
     }
+    // A vector is an ordered collection of values, not a record: it has no
+    // head symbol and no keyword fields of its own. Descend into its elements
+    // the way `completion_in_expr` does, or every record authored inside one
+    // -- every `:asserts` entry, every taint source and sink -- would be
+    // invisible to hover (#2647).
+    if let ExprKind::Vector(items) = &expr.kind {
+        return items
+            .iter()
+            .find_map(|item| help_in_expr(item, byte_offset));
+    }
     let items = expr.as_list()?;
     let head = items.first()?.as_symbol()?;
     let records = records_from_label(head).collect::<Vec<_>>();
@@ -769,6 +779,16 @@ struct Decoder {
     selector_paths: HashSet<String>,
 }
 
+/// One decoded `(analysis ...)` record.
+///
+/// `:on-unknown` is authored inside the analysis record but applies to every
+/// analysis kind, so it leaves the analysis decoder beside the kind-specific
+/// model rather than being pushed into each kind's own spec.
+struct DecodedAnalysis {
+    analysis: PolicyAnalysis,
+    on_unknown: OnUnknownSpec,
+}
+
 impl Decoder {
     fn new(identity: PolicySourceIdentity) -> Self {
         Self {
@@ -854,7 +874,10 @@ impl Decoder {
             fields.get("schema-version").unwrap_or(expr),
         );
 
-        let analysis = self.decode_analysis(fields.required("analysis"), "/analysis")?;
+        let DecodedAnalysis {
+            analysis,
+            on_unknown,
+        } = self.decode_analysis(fields.required("analysis"), "/analysis")?;
         let analysis_kind = analysis.analysis_type();
         let message = self.decode_message(fields.required("message"), analysis_kind)?;
         let severity = self.decode_severity(fields.required("severity"))?;
@@ -930,6 +953,7 @@ impl Decoder {
             schema_version,
             metadata,
             analysis,
+            on_unknown,
             classification,
             report,
         })
@@ -1079,7 +1103,7 @@ impl Decoder {
         &mut self,
         expr: &Expr,
         path: &str,
-    ) -> Result<PolicyAnalysis, PolicySourceError> {
+    ) -> Result<DecodedAnalysis, PolicySourceError> {
         expect_record_head(expr, PolicyRecord::Analysis)?;
         let type_expr = raw_keyword_value(expr, "type")?.ok_or_else(|| {
             source_error(
@@ -1092,8 +1116,15 @@ impl Decoder {
         let fields =
             RecordCursor::parse(expr, PolicyRecord::Analysis, DecodeContext::policy(kind))?;
         self.map(format!("{path}/type"), fields.required("type"));
-        match kind {
-            PolicyAnalysisKind::Match => Ok(PolicyAnalysis::Match {
+        // Every analysis kind may declare it, so it is decoded once here
+        // rather than in each kind's own decoder.
+        let on_unknown = fields
+            .get("on-unknown")
+            .map(|value| self.decode_on_unknown(value, kind))
+            .transpose()?
+            .unwrap_or_default();
+        let analysis = match kind {
+            PolicyAnalysisKind::Match => PolicyAnalysis::Match {
                 spec: MatchPolicySpec {
                     selector: self.decode_selector(
                         fields.required("selector"),
@@ -1101,20 +1132,24 @@ impl Decoder {
                         &format!("{path}/selector"),
                     )?,
                 },
-            }),
-            PolicyAnalysisKind::Taint => Ok(PolicyAnalysis::Taint {
+            },
+            PolicyAnalysisKind::Taint => PolicyAnalysis::Taint {
                 spec: self.decode_taint_analysis(&fields, path)?,
-            }),
-            PolicyAnalysisKind::Typestate => Ok(PolicyAnalysis::Typestate {
+            },
+            PolicyAnalysisKind::Typestate => PolicyAnalysis::Typestate {
                 spec: self.decode_typestate_analysis(&fields, path)?,
-            }),
-            PolicyAnalysisKind::Assertion => Ok(PolicyAnalysis::Assertion {
+            },
+            PolicyAnalysisKind::Assertion => PolicyAnalysis::Assertion {
                 spec: self.decode_assertion_analysis(&fields, path)?,
-            }),
-            PolicyAnalysisKind::Flow => Ok(PolicyAnalysis::Flow {
+            },
+            PolicyAnalysisKind::Flow => PolicyAnalysis::Flow {
                 spec: self.decode_flow_analysis(&fields, path)?,
-            }),
-        }
+            },
+        };
+        Ok(DecodedAnalysis {
+            analysis,
+            on_unknown,
+        })
     }
 
     fn decode_assertion_analysis(
@@ -1251,9 +1286,11 @@ impl Decoder {
             limits: RelationalAssertionLimits::default(),
         };
         crate::assertion_policy::validate_relational_assertion_plan(&plan).map_err(|error| {
+            let range = relational_error_range(&plan, &error)
+                .unwrap_or_else(|| fields.required("type").range.clone());
             source_error(
                 "invalid-relational-assertion-plan",
-                fields.required("type").range.clone(),
+                range,
                 error.to_string(),
             )
         })?;
@@ -1297,7 +1334,11 @@ impl Decoder {
                 ));
             }
         };
-        Ok(RowBinding { name, source })
+        Ok(RowBinding {
+            name,
+            source,
+            source_range: Some(expr.range.clone()),
+        })
     }
 
     /// Decode `(analysis :type flow ...)` into the shared taint-shaped model.
@@ -2523,6 +2564,26 @@ impl Decoder {
             atom => unreachable!("UnmodeledCallBehavior registry returned {atom:?}"),
         };
         Ok(CallModelingSpec { unmodeled })
+    }
+
+    fn decode_on_unknown(
+        &mut self,
+        expr: &Expr,
+        analysis: PolicyAnalysisKind,
+    ) -> Result<OnUnknownSpec, PolicySourceError> {
+        let context = DecodeContext::policy(analysis);
+        let fields = RecordCursor::parse(expr, PolicyRecord::OnUnknown, context)?;
+        let verdict = match expect_atom(
+            fields.required("verdict"),
+            AtomDomain::UnknownVerdict,
+            "unknown-result verdict",
+        )? {
+            PolicyAtomValue::UnknownVerdictAbstain => UnknownVerdict::Abstain,
+            PolicyAtomValue::UnknownVerdictWarnUnreliable => UnknownVerdict::WarnUnreliable,
+            PolicyAtomValue::UnknownVerdictFailClosed => UnknownVerdict::FailClosed,
+            atom => unreachable!("UnknownVerdict registry returned {atom:?}"),
+        };
+        Ok(OnUnknownSpec { verdict })
     }
 
     fn decode_automaton(
@@ -3927,6 +3988,252 @@ impl Decoder {
     }
 }
 
+/// Select the authored expression that owns one structured relational
+/// lowering failure.
+///
+/// The validator reports typed binding, group, aggregate, and field names.
+/// Decoding retains the exact parser ranges beside those same typed values, so
+/// this projection never inspects diagnostic prose or reparses policy text.
+fn relational_error_range(
+    plan: &RelationalAssertionPlan,
+    error: &crate::relational::RelationalAssertionPlanError,
+) -> Option<Range<usize>> {
+    use crate::relational::RelationalAssertionPlanError as Error;
+
+    let binding_definition = |name: &str| {
+        plan.bindings
+            .iter()
+            .rev()
+            .find(|binding| binding.name.as_str() == name)
+            .and_then(|binding| binding.source_range.clone())
+    };
+    let group_definition = |name: &str| {
+        plan.groups
+            .iter()
+            .rev()
+            .find(|group| group.name.as_str() == name)
+            .and_then(|group| group.source_range.clone())
+    };
+    let aggregate_definition = |group_name: &str, aggregate_name: &str| {
+        plan.groups
+            .iter()
+            .rev()
+            .filter(|group| group.name.as_str() == group_name)
+            .flat_map(|group| group.aggregates.iter().rev())
+            .find(|aggregate| aggregate.name.as_str() == aggregate_name)
+            .and_then(|aggregate| aggregate.source_range.clone())
+    };
+    let assertion = |id: Option<&str>, group_name: Option<&str>, aggregate_name: Option<&str>| {
+        plan.assertions
+            .iter()
+            .rev()
+            .find(|assertion| {
+                id.is_none_or(|id| assertion.id.as_str() == id)
+                    && group_name.is_none_or(|group| assertion.group.as_str() == group)
+                    && aggregate_name
+                        .is_none_or(|aggregate| assertion.aggregate.as_str() == aggregate)
+            })
+            .and_then(|assertion| assertion.source_range.clone())
+    };
+    let qualified = |field: &RowFieldRef| format!("{}.{}", field.binding, field.field);
+    let mut authored_fields = Vec::new();
+    let mut authored_predicates = Vec::new();
+    for derivation in &plan.derivations {
+        match derivation {
+            RowDerivation::Filter(filter) => {
+                for predicate in &filter.predicates {
+                    authored_predicates.push(predicate);
+                    authored_fields.push(&predicate.field);
+                    if let RowPredicateOperand::Field(field) = &predicate.operand {
+                        authored_fields.push(field);
+                    }
+                }
+            }
+            RowDerivation::Project(projection) => {
+                authored_fields.extend(projection.columns.iter().map(|column| &column.source));
+            }
+        }
+    }
+    for group in &plan.groups {
+        authored_fields.extend(&group.by);
+        for aggregate in &group.aggregates {
+            authored_fields.extend(aggregate.value.iter());
+            if let Some(sequences) = &aggregate.sequences {
+                authored_fields.extend([
+                    &sequences.left.position,
+                    &sequences.left.value,
+                    &sequences.right.position,
+                    &sequences.right.value,
+                ]);
+            }
+            for predicate in &aggregate.predicate {
+                authored_predicates.push(predicate);
+                authored_fields.push(&predicate.field);
+                if let RowPredicateOperand::Field(field) = &predicate.operand {
+                    authored_fields.push(field);
+                }
+            }
+        }
+    }
+    let binding_reference = |name: &str| {
+        authored_fields
+            .iter()
+            .rev()
+            .find(|field| field.binding.as_str() == name)
+            .and_then(|field| field.source_range.clone())
+            .or_else(|| {
+                plan.joins
+                    .iter()
+                    .rev()
+                    .find(|join| join.left.as_str() == name || join.right.as_str() == name)
+                    .and_then(|join| join.source_range.clone())
+            })
+            .or_else(|| {
+                plan.derivations
+                    .iter()
+                    .rev()
+                    .find(|derivation| match derivation {
+                        RowDerivation::Filter(filter) => filter.over.as_str() == name,
+                        RowDerivation::Project(projection) => projection.from.as_str() == name,
+                    })
+                    .and_then(|derivation| match derivation {
+                        RowDerivation::Filter(filter) => filter.source_range.clone(),
+                        RowDerivation::Project(projection) => projection.source_range.clone(),
+                    })
+            })
+    };
+    let predicate = |rendered_field: &str| {
+        authored_predicates
+            .iter()
+            .rev()
+            .find(|predicate| {
+                qualified(&predicate.field) == rendered_field
+                    || matches!(
+                        &predicate.operand,
+                        RowPredicateOperand::Field(field) if qualified(field) == rendered_field
+                    )
+            })
+            .and_then(|predicate| predicate.source_range.clone())
+    };
+    let field = |rendered: &str| {
+        authored_fields
+            .iter()
+            .rev()
+            .find(|candidate| qualified(candidate) == rendered)
+            .and_then(|field| field.source_range.clone())
+    };
+
+    match error {
+        Error::DuplicateBinding { name }
+        | Error::ForwardBinding { binding: name, .. }
+        | Error::NestedRowSelector { binding: name }
+        | Error::DeferredSelectorDomain { binding: name }
+        | Error::ExpansionDomainUnavailable { binding: name, .. }
+        | Error::InvalidQuery { binding: name, .. }
+        | Error::DisconnectedBinding { binding: name } => binding_definition(name),
+        Error::UnknownBinding { name } => {
+            binding_reference(name).or_else(|| binding_definition(name))
+        }
+        Error::DuplicateGroup { name } | Error::EmptyGroupKey { group: name } => {
+            group_definition(name)
+        }
+        Error::DuplicateAggregate { group, name }
+        | Error::AggregateValueRequired {
+            group,
+            aggregate: name,
+        }
+        | Error::AggregateValueForbidden {
+            group,
+            aggregate: name,
+        }
+        | Error::InvalidMinType {
+            group,
+            aggregate: name,
+            ..
+        }
+        | Error::InvalidAggregateValueType {
+            group,
+            aggregate: name,
+            ..
+        }
+        | Error::OrderedSequencesRequired {
+            group,
+            aggregate: name,
+        }
+        | Error::OrderedSequencesForbidden {
+            group,
+            aggregate: name,
+        }
+        | Error::OrderedValueTypeMismatch {
+            group,
+            aggregate: name,
+            ..
+        } => aggregate_definition(group, name),
+        Error::InvalidOrderedPositionType { field: name, .. } => field(name),
+        Error::DuplicateAssertion { id } => assertion(Some(id), None, None),
+        Error::UnknownGroup { name } => assertion(None, Some(name), None),
+        Error::UnknownAggregate { group, name } => assertion(None, Some(group), Some(name)),
+        Error::UnknownField {
+            binding,
+            field: name,
+            ..
+        } => field(&format!("{binding}.{name}")),
+        Error::JoinTypeMismatch { left, right, .. } => plan.joins.iter().rev().find_map(|join| {
+            join.on.iter().rev().find_map(|condition| {
+                (format!("{}.{}", join.left, condition.left_field) == *left
+                    && format!("{}.{}", join.right, condition.right_field) == *right)
+                    .then(|| condition.source_range.clone())
+                    .flatten()
+            })
+        }),
+        Error::EmptyJoin { left, right } => plan
+            .joins
+            .iter()
+            .rev()
+            .find(|join| join.left.as_str() == left && join.right.as_str() == right)
+            .and_then(|join| join.source_range.clone()),
+        Error::PredicateTypeMismatch { field: name, .. }
+        | Error::ComparisonTypeMismatch { left: name, .. }
+        | Error::UnorderedComparison { field: name, .. }
+        | Error::NullTestOnRequiredField { field: name }
+        | Error::UnknownEnumLabel { field: name, .. }
+        | Error::InvalidSetMembership { field: name, .. }
+        | Error::MalformedPredicate { field: name, .. } => predicate(name),
+        Error::DuplicateProjectionColumn { relation, column } => plan
+            .derivations
+            .iter()
+            .rev()
+            .filter_map(|derivation| match derivation {
+                RowDerivation::Project(projection) if projection.name.as_str() == relation => {
+                    Some(projection)
+                }
+                _ => None,
+            })
+            .flat_map(|projection| projection.columns.iter().rev())
+            .find(|candidate| candidate.name == *column)
+            .and_then(|candidate| candidate.source_range.clone()),
+        Error::RepeatedJoinBinding { binding } => plan
+            .joins
+            .iter()
+            .rev()
+            .find(|join| join.right.as_str() == binding)
+            .and_then(|join| join.source_range.clone()),
+        Error::RelationCycle { relation } => plan
+            .derivations
+            .iter()
+            .rev()
+            .find(|derivation| match derivation {
+                RowDerivation::Filter(filter) => filter.over.as_str() == relation,
+                RowDerivation::Project(projection) => projection.name.as_str() == relation,
+            })
+            .and_then(|derivation| match derivation {
+                RowDerivation::Filter(filter) => filter.source_range.clone(),
+                RowDerivation::Project(projection) => projection.source_range.clone(),
+            }),
+        Error::InvalidRowSelectorOutput { .. } | Error::ZeroLimit { .. } | Error::EmptyPlan => None,
+    }
+}
+
 #[derive(Clone, Copy)]
 struct DecodeContext {
     document: RqlpDocumentKind,
@@ -4310,10 +4617,17 @@ fn expect_atom(
     lookup_atom(domain, token)
         .map(|descriptor| descriptor.value)
         .ok_or_else(|| {
+            // The registry already holds the closed domain, so the message
+            // lists every accepted spelling rather than leaving the author to
+            // guess which ones exist.
+            let accepted = atom_values(domain)
+                .flat_map(|descriptor| descriptor.spellings.iter().copied())
+                .collect::<Vec<_>>()
+                .join(", ");
             source_error(
                 "invalid-enum-value",
                 expr.range.clone(),
-                format!("invalid {what} `{token}`"),
+                format!("invalid {what} `{token}`; accepted values are {accepted}"),
             )
         })
 }
@@ -4864,6 +5178,7 @@ fn decode_row_join(expr: &Expr) -> Result<RowJoin, PolicySourceError> {
         on.push(RowJoinCondition {
             left_field: decode_row_field_name(&values[0], "left join field")?,
             right_field: decode_row_field_name(&values[1], "right join field")?,
+            source_range: Some(pair.range.clone()),
         });
     }
     Ok(RowJoin {
@@ -4871,6 +5186,7 @@ fn decode_row_join(expr: &Expr) -> Result<RowJoin, PolicySourceError> {
         right,
         kind,
         on,
+        source_range: Some(expr.range.clone()),
     })
 }
 
@@ -4894,6 +5210,7 @@ fn decode_row_group(expr: &Expr) -> Result<RowGroup, PolicySourceError> {
         name,
         by,
         aggregates,
+        source_range: Some(expr.range.clone()),
     })
 }
 
@@ -4949,6 +5266,7 @@ fn decode_row_aggregate(expr: &Expr) -> Result<RowAggregate, PolicySourceError> 
         value,
         sequences,
         predicate,
+        source_range: Some(expr.range.clone()),
     })
 }
 
@@ -4986,6 +5304,7 @@ fn decode_row_filter(expr: &Expr) -> Result<RowFilter, PolicySourceError> {
         evidence: None,
         call_locator: None,
         resolved_locators: Vec::new(),
+        source_range: Some(expr.range.clone()),
     })
 }
 
@@ -5006,6 +5325,7 @@ fn decode_call_argument(expr: &Expr) -> Result<RowFilter, PolicySourceError> {
             field: RowFieldRef {
                 binding: over.clone(),
                 field: "formal_name".to_string(),
+                source_range: Some(name.range.clone()),
             },
             op: RowPredicateOp::Eq,
             operand: RowPredicateOperand::Literal(RowLiteral::String(expect_string(
@@ -5013,16 +5333,19 @@ fn decode_call_argument(expr: &Expr) -> Result<RowFilter, PolicySourceError> {
                 "formal name",
                 MAX_HUMAN_NAME_BYTES,
             )?)),
+            source_range: Some(expr.range.clone()),
         },
         (None, Some(index)) => RowPredicate {
             field: RowFieldRef {
                 binding: over.clone(),
                 field: "formal_index".to_string(),
+                source_range: Some(index.range.clone()),
             },
             op: RowPredicateOp::Eq,
             operand: RowPredicateOperand::Literal(RowLiteral::Integer(
                 expect_u32(index, "formal index", true)?.into(),
             )),
+            source_range: Some(expr.range.clone()),
         },
         (None, None) => {
             return Err(source_error(
@@ -5042,6 +5365,7 @@ fn decode_call_argument(expr: &Expr) -> Result<RowFilter, PolicySourceError> {
     let field = |name: &str| RowFieldRef {
         binding: over.clone(),
         field: name.to_string(),
+        source_range: Some(expr.range.clone()),
     };
     Ok(RowFilter {
         over: over.clone(),
@@ -5053,6 +5377,7 @@ fn decode_call_argument(expr: &Expr) -> Result<RowFilter, PolicySourceError> {
                 operand: RowPredicateOperand::Literal(RowLiteral::ConstrainedEnum(
                     "exact".to_string(),
                 )),
+                source_range: Some(expr.range.clone()),
             },
             RowPredicate {
                 field: field("coverage"),
@@ -5060,21 +5385,25 @@ fn decode_call_argument(expr: &Expr) -> Result<RowFilter, PolicySourceError> {
                 operand: RowPredicateOperand::Literal(RowLiteral::ConstrainedEnum(
                     "exhaustive".to_string(),
                 )),
+                source_range: Some(expr.range.clone()),
             },
             RowPredicate {
                 field: field("terminal"),
                 op: RowPredicateOp::Eq,
                 operand: RowPredicateOperand::Literal(RowLiteral::Boolean(false)),
+                source_range: Some(expr.range.clone()),
             },
             RowPredicate {
                 field: field("argument_id"),
                 op: RowPredicateOp::IsNotNull,
                 operand: RowPredicateOperand::None,
+                source_range: Some(expr.range.clone()),
             },
         ],
         evidence: None,
         call_locator: None,
         resolved_locators: Vec::new(),
+        source_range: Some(expr.range.clone()),
     })
 }
 
@@ -5095,7 +5424,7 @@ fn decode_call(expr: &Expr) -> Result<RowFilter, PolicySourceError> {
     )?;
     let over: RowBindingName = parse_identifier(fields.required("over"), "call row binding name")?;
     let model_id_expr = fields.required("resolves-to");
-    let (model_id, target_locator) = match &model_id_expr.kind {
+    let (model_id, target_field, target_locator) = match &model_id_expr.kind {
         ExprKind::String(value) => {
             if value.is_empty() || value.len() > MAX_HUMAN_NAME_BYTES {
                 return Err(source_error(
@@ -5108,6 +5437,7 @@ fn decode_call(expr: &Expr) -> Result<RowFilter, PolicySourceError> {
             }
             (
                 value.clone(),
+                "model_callable_id",
                 Some(PolicyLocator {
                     value: value.clone(),
                     range: model_id_expr.range.clone(),
@@ -5115,7 +5445,7 @@ fn decode_call(expr: &Expr) -> Result<RowFilter, PolicySourceError> {
             )
         }
         ExprKind::Symbol(value) if !value.is_empty() && value.len() <= MAX_HUMAN_NAME_BYTES => {
-            (value.clone(), None)
+            (value.clone(), "model_id", None)
         }
         _ => {
             return Err(source_error(
@@ -5173,35 +5503,42 @@ fn decode_call(expr: &Expr) -> Result<RowFilter, PolicySourceError> {
     let field = |name: &str| RowFieldRef {
         binding: over.clone(),
         field: name.to_string(),
+        source_range: Some(expr.range.clone()),
     };
     let not_null = |name: &str| RowPredicate {
         field: field(name),
         op: RowPredicateOp::IsNotNull,
         operand: RowPredicateOperand::None,
+        source_range: Some(expr.range.clone()),
     };
     let constrained = |name: &str, value: &str| RowPredicate {
         field: field(name),
         op: RowPredicateOp::Eq,
         operand: RowPredicateOperand::Literal(RowLiteral::ConstrainedEnum(value.to_owned())),
+        source_range: Some(expr.range.clone()),
     };
     let mut predicates = vec![
         RowPredicate {
-            field: field("model_id"),
+            field: field(target_field),
             op: RowPredicateOp::Eq,
             operand: RowPredicateOperand::Literal(RowLiteral::String(model_id)),
+            source_range: Some(expr.range.clone()),
         },
         not_null("semantic_target_id"),
-        not_null("signature_id"),
+        not_null("formal_layout_id"),
     ];
     let evidence = if proof == "exact" {
         predicates.push(RowPredicate {
             field: field("selector_exact"),
             op: RowPredicateOp::Eq,
             operand: RowPredicateOperand::Literal(RowLiteral::Boolean(true)),
+            source_range: Some(expr.range.clone()),
         });
         None
     } else {
         predicates.extend([
+            not_null("model_id"),
+            not_null("signature_id"),
             not_null("pack_id"),
             not_null("model_record_id"),
             not_null("model_proof"),
@@ -5210,6 +5547,7 @@ fn decode_call(expr: &Expr) -> Result<RowFilter, PolicySourceError> {
                 field: field("model_ambiguous"),
                 op: RowPredicateOp::Eq,
                 operand: RowPredicateOperand::Literal(RowLiteral::Boolean(false)),
+                source_range: Some(expr.range.clone()),
             },
             constrained("mapping", "exact"),
             constrained("coverage", "exhaustive"),
@@ -5217,6 +5555,7 @@ fn decode_call(expr: &Expr) -> Result<RowFilter, PolicySourceError> {
                 field: field("terminal"),
                 op: RowPredicateOp::Eq,
                 operand: RowPredicateOperand::Literal(RowLiteral::Boolean(false)),
+                source_range: Some(expr.range.clone()),
             },
             not_null("argument_id"),
         ]);
@@ -5227,6 +5566,7 @@ fn decode_call(expr: &Expr) -> Result<RowFilter, PolicySourceError> {
             field: field("receiver_type_id"),
             op: RowPredicateOp::Eq,
             operand: RowPredicateOperand::Literal(RowLiteral::String(receiver_type_id)),
+            source_range: Some(expr.range.clone()),
         });
         predicates.push(not_null("receiver_type_id"));
     }
@@ -5241,6 +5581,7 @@ fn decode_call(expr: &Expr) -> Result<RowFilter, PolicySourceError> {
             }
         }),
         resolved_locators: Vec::new(),
+        source_range: Some(expr.range.clone()),
     })
 }
 
@@ -5265,6 +5606,7 @@ fn decode_row_projection(expr: &Expr) -> Result<RowProjection, PolicySourceError
                 RowProjectionColumn {
                     source: decode_row_field_ref(&pair[0], "row projection source field")?,
                     name: decode_row_field_name(&pair[1], "row projection column name")?,
+                    source_range: Some(entry.range.clone()),
                 }
             }
             _ => {
@@ -5272,6 +5614,7 @@ fn decode_row_projection(expr: &Expr) -> Result<RowProjection, PolicySourceError
                 RowProjectionColumn {
                     name: source.field.clone(),
                     source,
+                    source_range: Some(entry.range.clone()),
                 }
             }
         };
@@ -5281,6 +5624,7 @@ fn decode_row_projection(expr: &Expr) -> Result<RowProjection, PolicySourceError
         name,
         from,
         columns,
+        source_range: Some(expr.range.clone()),
     })
 }
 
@@ -5362,7 +5706,12 @@ fn decode_row_predicates(expr: &Expr) -> Result<Vec<RowPredicate>, PolicySourceE
                 }
             }
         };
-        predicates.push(RowPredicate { field, op, operand });
+        predicates.push(RowPredicate {
+            field,
+            op,
+            operand,
+            source_range: Some(entry.range.clone()),
+        });
     }
     Ok(predicates)
 }
@@ -5410,6 +5759,7 @@ fn decode_row_assertion(expr: &Expr) -> Result<RowAssertion, PolicySourceError> 
         group,
         aggregate,
         cardinality: decode_assert_cardinality(fields.required("cardinality"))?,
+        source_range: Some(expr.range.clone()),
     })
 }
 
@@ -5469,13 +5819,16 @@ fn lower_selected_in_winning_tier(
         on: vec![RowJoinCondition {
             left_field: "site_ast_id".to_string(),
             right_field: "site_ast_id".to_string(),
+            source_range: Some(expr.range.clone()),
         }],
+        source_range: Some(expr.range.clone()),
     });
     groups.push(RowGroup {
         name: group.clone(),
         by: vec![RowFieldRef {
             binding: site,
             field: "site_ast_id".to_string(),
+            source_range: Some(expr.range.clone()),
         }],
         aggregates: vec![RowAggregate {
             name: aggregate.clone(),
@@ -5487,28 +5840,35 @@ fn lower_selected_in_winning_tier(
                     field: RowFieldRef {
                         binding: candidates.clone(),
                         field: "selected".to_string(),
+                        source_range: Some(expr.range.clone()),
                     },
                     op: RowPredicateOp::Eq,
                     operand: RowPredicateOperand::Literal(RowLiteral::Boolean(true)),
+                    source_range: Some(expr.range.clone()),
                 },
                 RowPredicate {
                     field: RowFieldRef {
                         binding: candidates,
                         field: "verdict".to_string(),
+                        source_range: Some(expr.range.clone()),
                     },
                     op: RowPredicateOp::Eq,
                     operand: RowPredicateOperand::Literal(RowLiteral::ConstrainedEnum(
                         "applicable".to_string(),
                     )),
+                    source_range: Some(expr.range.clone()),
                 },
             ],
+            source_range: Some(expr.range.clone()),
         }],
+        source_range: Some(expr.range.clone()),
     });
     assertions.push(RowAssertion {
         id,
         group,
         aggregate,
         cardinality,
+        source_range: Some(expr.range.clone()),
     });
     Ok(())
 }
@@ -5539,6 +5899,7 @@ fn decode_row_field_ref(expr: &Expr, what: &str) -> Result<RowFieldRef, PolicySo
     Ok(RowFieldRef {
         binding,
         field: field.to_string(),
+        source_range: Some(expr.range.clone()),
     })
 }
 
@@ -6802,6 +7163,10 @@ mod tests {
              the accepted values are function, method, constructor, extractor, infix, \
              operator, method_value"
         );
+        assert_eq!(
+            &policy("shape.call_kind eq zzz_totally_bogus_value_xyz")[error.range],
+            "(shape.call_kind eq zzz_totally_bogus_value_xyz)"
+        );
 
         // The same rule holds for every member of a set membership test: one
         // bad member would silently shrink the set.
@@ -7089,7 +7454,7 @@ mod tests {
             ordered_equal_policy("arg.name arg.name", "param.parameter_index param.label");
         let error = parse(&unordered).unwrap_err().diagnostic;
         assert_eq!(error.code, "invalid-relational-assertion-plan");
-        assert_eq!(&unordered[error.range], "assertion");
+        assert_eq!(&unordered[error.range], "arg.name");
         assert!(
             error.message.contains("position field `arg.name`"),
             "{}",
@@ -7253,7 +7618,7 @@ mod tests {
             r#"(filter :over calls :where
               ((calls.model_id eq "member.widget.create")
                (calls.semantic_target_id is-not-null)
-               (calls.signature_id is-not-null)
+               (calls.formal_layout_id is-not-null)
                (calls.selector_exact eq true)))"#,
         ))
         .unwrap();
@@ -7301,7 +7666,7 @@ mod tests {
             vec![
                 "model_id",
                 "semantic_target_id",
-                "signature_id",
+                "formal_layout_id",
                 "selector_exact",
             ]
         );
@@ -7323,7 +7688,7 @@ mod tests {
             r#"(filter :over calls :where
               ((calls.model_id eq "member.widget.create")
                (calls.semantic_target_id is-not-null)
-               (calls.signature_id is-not-null)
+               (calls.formal_layout_id is-not-null)
                (calls.selector_exact eq true)
                (calls.receiver_type_id eq "type.widget")
                (calls.receiver_type_id is-not-null)))"#,
@@ -7430,7 +7795,7 @@ mod tests {
             panic!("call must lower to a filter")
         };
         assert_eq!(filter.evidence, Some(RowFilterEvidence::DeclaredCall));
-        assert_eq!(filter.predicates.len(), 12);
+        assert_eq!(filter.predicates.len(), 14);
         assert_eq!(
             filter
                 .predicates
@@ -7440,6 +7805,8 @@ mod tests {
             vec![
                 "model_id",
                 "semantic_target_id",
+                "formal_layout_id",
+                "model_id",
                 "signature_id",
                 "pack_id",
                 "model_record_id",
@@ -7507,7 +7874,7 @@ mod tests {
             r#"(filter :over calls :where
                  ((calls.model_id eq "java.sql.Statement.execute")
                   (calls.semantic_target_id is-not-null)
-                  (calls.signature_id is-not-null)
+                  (calls.formal_layout_id is-not-null)
                   (calls.selector_exact eq true)
                   (calls.receiver_type_id eq "type.java-sql-statement")
                   (calls.receiver_type_id is-not-null)))
@@ -7602,7 +7969,7 @@ mod tests {
             r#"(filter :over calls :where
                  ((calls.model_id eq "java.sql.Statement.execute")
                   (calls.semantic_target_id is-not-null)
-                  (calls.signature_id is-not-null)
+                  (calls.formal_layout_id is-not-null)
                   (calls.selector_exact eq true)))
                (filter :over calls :where
                  ((calls.formal_index eq 0)
@@ -7834,9 +8201,17 @@ mod tests {
               :site site :candidates cand)))"#;
         let error = parse(source).unwrap_err().diagnostic;
         assert_eq!(error.code, "invalid-relational-assertion-plan");
-        assert_eq!(
-            error.message, "unknown field `site.site_ast_id`",
-            "the occurrence row states `ast_id`, not the call site's `site_ast_id`"
+        assert!(
+            error
+                .message
+                .starts_with("unknown field `site.site_ast_id`; `site` has fields: "),
+            "the occurrence row states `ast_id`, not the call site's `site_ast_id`: {}",
+            error.message
+        );
+        assert!(
+            error.message.ends_with("see `bifrost --list-row-schemas`"),
+            "{}",
+            error.message
         );
     }
 
@@ -7916,6 +8291,78 @@ mod tests {
         assert!(
             help.description
                 .contains("without adding flows through the unseen body")
+        );
+    }
+
+    #[test]
+    fn on_unknown_verdicts_are_typed_and_default_to_abstain() {
+        for (authored, expected) in [
+            (None, UnknownVerdict::Abstain),
+            (Some("abstain"), UnknownVerdict::Abstain),
+            (Some("warn-unreliable"), UnknownVerdict::WarnUnreliable),
+            (Some("fail-closed"), UnknownVerdict::FailClosed),
+        ] {
+            let extra = authored
+                .map(|verdict| format!(":on-unknown (on-unknown :verdict {verdict})"))
+                .unwrap_or_default();
+            let parsed = parse(&taint_policy(&extra)).unwrap();
+            let RqlpDocument::Policy { definition } = parsed.document else {
+                panic!("expected policy")
+            };
+            assert_eq!(definition.on_unknown.verdict, expected);
+        }
+
+        // The record belongs to every analysis kind, not only the ones that
+        // model calls.
+        let match_policy = r#"(policy :id "test.on-unknown-match" :name "Match" :message "M"
+          :severity warning
+          :analysis (analysis :type match
+            :on-unknown (on-unknown :verdict fail-closed)
+            :selector (rql (language python (call :callee (name "eval"))))))"#;
+        let parsed = parse(match_policy).unwrap();
+        let RqlpDocument::Policy { definition } = parsed.document else {
+            panic!("expected policy")
+        };
+        assert_eq!(definition.on_unknown.verdict, UnknownVerdict::FailClosed);
+    }
+
+    #[test]
+    fn an_unknown_verdict_spelling_names_every_accepted_value() {
+        let invalid = taint_policy(":on-unknown (on-unknown :verdict shrug)");
+        let error = parse(&invalid).unwrap_err().diagnostic;
+        assert_eq!(error.code, "invalid-enum-value");
+        assert_eq!(&invalid[error.range], "shrug");
+        assert_eq!(
+            error.message,
+            "invalid unknown-result verdict `shrug`; accepted values are abstain, \
+             warn-unreliable, fail-closed"
+        );
+    }
+
+    #[test]
+    fn on_unknown_records_and_verdicts_carry_hover_help() {
+        let source = taint_policy(":on-unknown (on-unknown :verdict warn-unreliable)");
+        let record = rqlp_source_help_at(&source, source.find("(on-unknown").unwrap() + 2)
+            .expect("registered record has hover help");
+        assert_eq!(
+            record.signature,
+            "(on-unknown :verdict abstain|warn-unreliable|fail-closed)"
+        );
+        assert!(
+            record
+                .description
+                .contains("unknown or incomplete evidence"),
+            "{}",
+            record.description
+        );
+
+        let atom = rqlp_source_help_at(&source, source.find("warn-unreliable").unwrap() + 2)
+            .expect("registered atom has hover help");
+        assert_eq!(atom.signature, "warn-unreliable");
+        assert!(
+            atom.description.contains("exit on the findings alone"),
+            "{}",
+            atom.description
         );
     }
 

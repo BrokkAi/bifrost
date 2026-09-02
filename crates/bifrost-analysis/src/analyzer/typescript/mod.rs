@@ -560,6 +560,10 @@ impl CodeUnitIndex for TypescriptAnalyzer {
         self.inner.all_declarations()
     }
 
+    fn declarations_sharing_name(&self, unit: &CodeUnit) -> Vec<CodeUnit> {
+        self.inner.declarations_sharing_name(unit)
+    }
+
     fn declarations(&self, file: &ProjectFile) -> BTreeSet<CodeUnit> {
         self.inner.declarations(file)
     }
@@ -681,9 +685,7 @@ impl CodeUnitIndex for TypescriptAnalyzer {
 impl IAnalyzer for TypescriptAnalyzer {
     crate::analyzer::i_analyzer::forward_relational_definition_batch!();
 
-    fn invalidate_cached_file_identities(&self) {
-        self.inner.invalidate_cached_file_identities();
-    }
+    crate::analyzer::i_analyzer::forward_file_identity_invalidation!();
 
     fn working_tree_identity(&self) -> Option<std::sync::Arc<crate::gitblob::WorkingTreeIdentity>> {
         self.inner.working_tree_identity()
@@ -708,6 +710,12 @@ impl IAnalyzer for TypescriptAnalyzer {
 
     fn workspace_file_index_cell(&self) -> Option<crate::analyzer::WorkspaceFileIndexCell> {
         self.inner.workspace_file_index_cell()
+    }
+
+    fn definition_lookup_memo(
+        &self,
+    ) -> Option<std::sync::Arc<crate::analyzer::DefinitionLookupMemo>> {
+        self.inner.definition_lookup_memo()
     }
 
     fn import_statements(&self, file: &ProjectFile) -> Vec<String> {
@@ -812,6 +820,12 @@ impl IAnalyzer for TypescriptAnalyzer {
         self.inner.workspace_content_identities()
     }
 
+    fn workspace_fact_indexes(
+        &self,
+    ) -> Vec<&dyn crate::analyzer::read_verification::WorkspaceFactIndex> {
+        self.inner.workspace_fact_indexes()
+    }
+
     fn contains_tests(&self, file: &ProjectFile) -> bool {
         self.inner.contains_tests(file)
     }
@@ -861,17 +875,17 @@ impl IAnalyzer for TypescriptAnalyzer {
             return Vec::new();
         }
 
-        let all_candidates: Vec<CloneCandidateProfile> = self
-            .get_all_declarations()
-            .into_iter()
-            .filter(|code_unit| {
-                code_unit.is_function()
-                    && matches!(file_language(code_unit.source()), Language::TypeScript)
-            })
+        let corpus_units = crate::analyzer::clone_detection::clone_corpus_function_units(
+            self,
+            Language::TypeScript,
+        );
+        let _query_scope = crate::analyzer::AnalyzerQueryScope::new(self);
+        let all_candidates: Vec<CloneCandidateProfile> = corpus_units
+            .iter()
             .filter_map(|code_unit| {
                 build_js_ts_clone_candidate_data(
                     self,
-                    &code_unit,
+                    code_unit,
                     weights,
                     tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
                 )
@@ -931,8 +945,10 @@ mod tests {
 
     #[test]
     fn hydration_uses_persisted_facts_and_path_conventions_only() {
-        let production = ProjectFile::new("/tmp/project", "src/runtime.ts");
-        let test_file = ProjectFile::new("/tmp/project", "test/parallel/test-runtime.ts");
+        let project_root =
+            std::env::current_dir().expect("test working directory must be available");
+        let production = ProjectFile::new(&project_root, "src/runtime.ts");
+        let test_file = ProjectFile::new(&project_root, "test/parallel/test-runtime.ts");
         let source = r#"test("runtime", () => {});"#;
 
         assert!(!TypescriptAdapter.hydrate_contains_tests(false, &production, source));

@@ -633,7 +633,17 @@ fn render_scan_usages_scope(
         "production analyzed source only (include_tests=false)"
     };
     let path_scope = if scope.whole_workspace {
-        "whole analyzed workspace".to_string()
+        // "whole analyzed workspace" is a false statement for a session built
+        // over a named subset, and this is the channel a model actually reads,
+        // so the rendered scope names the slice too (#2770).
+        match scope.session_subset {
+            Some(subset) => format!(
+                "whole analyzed workspace, which this session scopes to {} file{}",
+                subset.files,
+                if subset.files == 1 { "" } else { "s" }
+            ),
+            None => "whole analyzed workspace".to_string(),
+        }
     } else {
         let mut rendered = format!("effective paths: {}", scope.paths.join(", "));
         if let Some(omitted) = scope.paths_omitted {
@@ -1177,6 +1187,7 @@ mod tests {
         let result = SearchSymbolsResult {
             patterns: vec!["Foo".to_string()],
             truncated: true,
+            session_subset: None,
             total_files: 3,
             files: vec![SearchSymbolsFile {
                 path: "src/foo.rs".to_string(),
@@ -1370,10 +1381,44 @@ mod tests {
     }
 
     #[test]
+    fn whole_workspace_scope_names_the_session_slice_when_there_is_one() {
+        let whole = crate::searchtools::ScanUsagesScope {
+            include_tests: true,
+            whole_workspace: true,
+            session_subset: None,
+            paths: Vec::new(),
+            paths_omitted: None,
+            ignored_paths: None,
+        };
+        let scoped = crate::searchtools::ScanUsagesScope {
+            session_subset: Some(crate::analyzer::SubsetCoverage { files: 12 }),
+            ..whole.clone()
+        };
+        let one_file = crate::searchtools::ScanUsagesScope {
+            session_subset: Some(crate::analyzer::SubsetCoverage { files: 1 }),
+            ..whole.clone()
+        };
+
+        assert_eq!(
+            "Scope: analyzed source including test files; whole analyzed workspace.",
+            render_scan_usages_scope(&whole, false)
+        );
+        assert_eq!(
+            "Scope: analyzed source including test files; whole analyzed workspace, which this session scopes to 12 files.",
+            render_scan_usages_scope(&scoped, false)
+        );
+        assert_eq!(
+            "Scope: analyzed source including test files; whole analyzed workspace, which this session scopes to 1 file.",
+            render_scan_usages_scope(&one_file, false)
+        );
+    }
+
+    #[test]
     fn truncated_absence_scope_does_not_recommend_widening_paths() {
         let scope = crate::searchtools::ScanUsagesScope {
             include_tests: true,
             whole_workspace: false,
+            session_subset: None,
             paths: vec!["src/**/*.rs".to_string()],
             paths_omitted: None,
             ignored_paths: None,

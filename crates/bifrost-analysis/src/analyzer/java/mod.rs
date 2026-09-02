@@ -64,7 +64,7 @@ pub struct JavaAnalyzer {
     inner: TreeSitterAnalyzer<JavaAdapter>,
     memo_caches: Arc<JavaMemoCaches>,
     java_config: crate::analyzer::JvmAnalyzerConfig,
-    pub(crate) external_index: Arc<std::sync::OnceLock<JvmExternalDeclarationIndex>>,
+    pub(crate) external_index: Arc<std::sync::OnceLock<Arc<JvmExternalDeclarationIndex>>>,
 }
 
 crate::analyzer::impl_forward_query_provider!(JavaAnalyzer);
@@ -91,6 +91,12 @@ impl JavaAnalyzer {
         let mut clone = self.clone();
         clone.inner = clone.inner.clone_with_project(project);
         clone.external_index = Arc::new(std::sync::OnceLock::new());
+        clone
+    }
+
+    pub(crate) fn clone_for_index_warm(&self, project: Arc<dyn Project>) -> Self {
+        let mut clone = self.clone();
+        clone.inner = clone.inner.clone_with_project(project);
         clone
     }
 
@@ -302,9 +308,14 @@ impl JavaAnalyzer {
     }
 
     pub(crate) fn external_declaration_index(&self) -> &JvmExternalDeclarationIndex {
-        self.external_index.get_or_init(|| {
-            JvmExternalDeclarationIndex::build_for_project(&self.java_config, self.inner.project())
-        })
+        self.external_index
+            .get_or_init(|| {
+                JvmExternalDeclarationIndex::build_for_project(
+                    &self.java_config,
+                    self.inner.project(),
+                )
+            })
+            .as_ref()
     }
 
     /// The external declaration surface Java resolution reads: this analyzer's
@@ -439,7 +450,7 @@ impl JavaSource for JavaAnalyzer {
     }
 
     fn retained_external_index(&self) -> JvmRetainedExternalIndex {
-        retained_external_index_state(self.external_index.get())
+        retained_external_index_state(self.external_index.get().map(Arc::as_ref))
     }
 
     fn retained_external_holds_qualified_name(&self, fqn: &str, access_package: &str) -> bool {
@@ -536,6 +547,10 @@ impl CodeUnitIndex for JavaAnalyzer {
 
     fn all_declarations(&self) -> Box<dyn Iterator<Item = CodeUnit> + '_> {
         self.inner.all_declarations()
+    }
+
+    fn declarations_sharing_name(&self, unit: &CodeUnit) -> Vec<CodeUnit> {
+        self.inner.declarations_sharing_name(unit)
     }
 
     fn all_declarations_with_primary_ranges(
@@ -689,9 +704,7 @@ impl IAnalyzer for JavaAnalyzer {
         )
     }
 
-    fn invalidate_cached_file_identities(&self) {
-        self.inner.invalidate_cached_file_identities();
-    }
+    crate::analyzer::i_analyzer::forward_file_identity_invalidation!();
 
     fn working_tree_identity(&self) -> Option<std::sync::Arc<crate::gitblob::WorkingTreeIdentity>> {
         self.inner.working_tree_identity()
@@ -711,6 +724,12 @@ impl IAnalyzer for JavaAnalyzer {
 
     fn workspace_file_index_cell(&self) -> Option<crate::analyzer::WorkspaceFileIndexCell> {
         self.inner.workspace_file_index_cell()
+    }
+
+    fn definition_lookup_memo(
+        &self,
+    ) -> Option<std::sync::Arc<crate::analyzer::DefinitionLookupMemo>> {
+        self.inner.definition_lookup_memo()
     }
 
     fn declaration_syntax_kind(&self, code_unit: &CodeUnit) -> Option<&'static str> {
@@ -778,6 +797,12 @@ impl IAnalyzer for JavaAnalyzer {
         &self,
     ) -> Option<crate::analyzer::content_identity::WorkspaceContentIdentities> {
         self.inner.workspace_content_identities()
+    }
+
+    fn workspace_fact_indexes(
+        &self,
+    ) -> Vec<&dyn crate::analyzer::read_verification::WorkspaceFactIndex> {
+        self.inner.workspace_fact_indexes()
     }
 
     fn parse_errors(&self, file: &ProjectFile) -> Option<Vec<crate::analyzer::ParseError>> {
@@ -957,13 +982,12 @@ impl IAnalyzer for JavaAnalyzer {
             return Vec::new();
         }
 
-        let all_candidates: Vec<CloneCandidateProfile> = self
-            .get_all_declarations()
-            .into_iter()
-            .filter(|code_unit| {
-                code_unit.is_function() && file_language(code_unit.source()) == Language::Java
-            })
-            .filter_map(|code_unit| build_clone_candidate_data(self, &code_unit, weights))
+        let corpus_units =
+            crate::analyzer::clone_detection::clone_corpus_function_units(self, Language::Java);
+        let _query_scope = crate::analyzer::AnalyzerQueryScope::new(self);
+        let all_candidates: Vec<CloneCandidateProfile> = corpus_units
+            .iter()
+            .filter_map(|code_unit| build_clone_candidate_data(self, code_unit, weights))
             .map(|candidate| CloneCandidateProfile::create(candidate, weights))
             .collect();
         if all_candidates.is_empty() {

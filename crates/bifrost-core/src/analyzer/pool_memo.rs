@@ -50,10 +50,17 @@ thread_local! {
 /// A build here consumes no worker of the global pool, which is what lets a
 /// global-pool worker park on it instead of duplicating it serially. Built once
 /// per process; its workers sleep while no build is in flight.
+///
+/// Sized by the analyzer parallelism setting rather than by rayon's own default,
+/// the way `HEAVY_SCAN_POOL` in `searchtools/scan_usages.rs` is: a batch consumer
+/// running many analyzers in one process caps every pool with
+/// `BIFROST_PARALLELISM` to hold its process-wide thread budget, and a dedicated
+/// pool that ignored the setting would defeat that budget.
 fn dedicated_build_pool() -> &'static rayon::ThreadPool {
     static POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
     POOL.get_or_init(|| {
         rayon::ThreadPoolBuilder::new()
+            .num_threads(crate::analyzer::config::AnalyzerConfig::default().parallelism())
             .thread_name(|index| format!("bifrost-index-build-{index}"))
             .start_handler(|_| ON_DEDICATED_BUILD_POOL.with(|flag| flag.set(true)))
             .build()
@@ -77,6 +84,24 @@ pub fn spawn_on_dedicated_build_pool(task: impl FnOnce() + Send + 'static) {
         task();
     } else {
         dedicated_build_pool().spawn(task);
+    }
+}
+
+/// Run `task` on [`dedicated_build_pool`] and return its value.
+///
+/// The blocking counterpart of [`spawn_on_dedicated_build_pool`], for a caller
+/// that needs a bounded burst of parallelism and its result. Building a fresh
+/// `rayon::ThreadPool` per call instead spawns and joins that many OS threads
+/// every time, which is what `resolve_live_oids` did once per reconcile (#2115).
+///
+/// Same re-entrancy rule as [`spawn_on_dedicated_build_pool`]: a worker of this
+/// pool is already running a build's own parallelism, so it runs `task` inline
+/// instead of queueing the task behind itself.
+pub fn install_on_dedicated_build_pool<R: Send>(task: impl FnOnce() -> R + Send) -> R {
+    if ON_DEDICATED_BUILD_POOL.with(Cell::get) {
+        task()
+    } else {
+        dedicated_build_pool().install(task)
     }
 }
 
@@ -229,19 +254,14 @@ impl<T> PoolSafeMemo<T> {
 
     /// Build the value on [`dedicated_build_pool`], off the global rayon pool.
     ///
-    /// No production caller since the Rust usage index stopped being built
-    /// (ExecPlan Milestone 3, and Milestone 5 deleted the index itself).
-    /// Issue #1772 wants this for the type-hierarchy warm, which is the next
-    /// whole-workspace build to move off the request path, and deleting it
-    /// would also delete the pool-independent parking rule that is the
-    /// whole #1757 fix -- so the mechanism and its regression tests stay.
-    ///
-    /// Use from a background warm. While this build runs, a global-pool worker
-    /// that reaches the same memo waits for it instead of duplicating it
-    /// serially: the duplicate is a second whole-workspace build, billed to
-    /// whichever request's parallel fan-out touched the index first (#1757).
+    /// Use for a whole-workspace index whose build is long enough that a
+    /// request must not be billed for it: the C# compilation and
+    /// test-classification indexes, and the Rust and Go type hierarchies
+    /// (#1772). While this build runs, a global-pool worker that reaches the
+    /// same memo waits for it instead of duplicating it serially: the
+    /// duplicate is a second whole-workspace build, billed to whichever
+    /// request's parallel fan-out touched the index first (#1757).
     /// Returns an already-built or concurrently built value unchanged.
-    #[allow(dead_code)]
     pub fn get_or_build_on_dedicated_pool(&self, build: impl FnOnce() -> T + Send) -> Arc<T>
     where
         T: Send,

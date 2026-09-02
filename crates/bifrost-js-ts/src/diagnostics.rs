@@ -18,7 +18,7 @@
 //!   for those through [`JsTsExternalSurfaceEvidence`].
 
 use crate::imports::{
-    npm_package_of_module_specifier, require_call_module_specifier, resolve_js_ts_module_specifier,
+    js_ts_module_identity, require_call_module_specifier, resolve_js_ts_module_specifier,
 };
 use crate::parse::{
     FLOW_UNSUPPORTED_DETAIL, flow_dialect_blocks_extraction, js_ts_tree_sitter_language_for_file,
@@ -348,16 +348,20 @@ impl ExternalModuleClassifier<'_> {
         }
     }
 
-    /// The specifier as an external npm boundary, or `None` when this request
-    /// has no external question to ask about it.
+    /// The specifier as an external npm boundary in its canonical spelling, or
+    /// `None` when this request has no external question to ask about it.
+    ///
+    /// Every downstream judgement keys on what this returns, so the `node:`
+    /// scheme is folded here once: `node:fs` and `fs` ask one question about
+    /// one module (#2609).
     fn external_specifier<'s>(&self, specifier: &'s str) -> Option<&'s str> {
-        npm_package_of_module_specifier(specifier)?;
+        let module = js_ts_module_identity(specifier)?;
         if !resolve_js_ts_module_specifier(self.file, specifier, self.language, Some(self.aliases))
             .is_empty()
         {
             return None;
         }
-        Some(specifier)
+        Some(module.specifier)
     }
 
     fn push_exported_name(
@@ -421,7 +425,8 @@ impl ExternalModuleClassifier<'_> {
 }
 
 /// The bare module specifiers this file itself declares with
-/// `declare module 'name' { ... }`.
+/// `declare module 'name' { ... }`, in the canonical spelling
+/// `external_specifier` produces.
 ///
 /// An ambient module declaration is the workspace's own surface for that
 /// specifier, so an import from it resolves workspace-locally and no retained
@@ -440,7 +445,12 @@ fn locally_declared_modules(root: Node<'_>, source: &str) -> HashSet<String> {
             && let Some(name) = node.child_by_field_name("name")
             && let Some(text) = module_specifier_text(name, source)
         {
-            declared.insert(text.to_string());
+            // `declare module 'node:fs'` declares the same module `fs` does.
+            declared.insert(
+                js_ts_module_identity(text)
+                    .map_or(text, |module| module.specifier)
+                    .to_string(),
+            );
             continue;
         }
         // Ambient module declarations sit at the top level, directly or under

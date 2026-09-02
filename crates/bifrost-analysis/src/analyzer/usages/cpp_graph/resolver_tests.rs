@@ -431,6 +431,7 @@ mod tests {
         );
     }
 
+    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
     #[test]
     fn alternate_same_fqn_type_candidates_require_one_source_file() {
         let temp = tempfile::tempdir().expect("temp dir");
@@ -577,6 +578,7 @@ ABSL_NAMESPACE_END
         ));
     }
 
+    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
     #[test]
     fn const_global_with_extern_peer_remains_external_with_exact_fqn_peer_bound() {
         let temp = tempfile::tempdir().expect("temp dir");
@@ -765,6 +767,7 @@ ABSL_NAMESPACE_END
         );
     }
 
+    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
     #[test]
     fn bounded_visibility_does_not_hydrate_unreachable_same_name_donors() {
         let temp = tempfile::tempdir().expect("temp dir");
@@ -825,6 +828,7 @@ ABSL_NAMESPACE_END
         );
     }
 
+    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
     #[test]
     fn bounded_visibility_batches_many_names_from_one_donor_read() {
         let temp = tempfile::tempdir().expect("temp dir");
@@ -865,6 +869,7 @@ ABSL_NAMESPACE_END
         );
     }
 
+    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
     #[test]
     fn bounded_visibility_ignores_ordinary_identifiers_in_selected_function_bodies() {
         let temp = tempfile::tempdir().expect("temp dir");
@@ -1055,6 +1060,7 @@ ABSL_NAMESPACE_END
         );
     }
 
+    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
     #[test]
     fn compile_proven_include_guard_skips_reference_macro_environment() {
         fn run_case(
@@ -1221,6 +1227,7 @@ ABSL_NAMESPACE_END
         ));
     }
 
+    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
     #[test]
     fn raw_reference_guards_gate_macro_environment_hydration() {
         fn run_case(
@@ -1309,6 +1316,7 @@ ABSL_NAMESPACE_END
         );
     }
 
+    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
     #[test]
     fn shared_authoritative_batch_keeps_same_named_anonymous_namespace_globals_root_local() {
         let temp = tempfile::tempdir().expect("temp dir");
@@ -1854,6 +1862,7 @@ ABSL_NAMESPACE_END
         ));
     }
 
+    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
     #[test]
     fn class_strength_reuses_one_prepared_tree_for_qgis_sized_sibling_set() {
         const SIBLING_COUNT: usize = 113;
@@ -1956,6 +1965,7 @@ ABSL_NAMESPACE_END
         );
     }
 
+    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
     #[test]
     fn macro_environment_cache_scales_with_event_frontiers_not_call_sites() {
         const REPEATED_CALL_COUNT: usize = 1_000;
@@ -2197,6 +2207,7 @@ ABSL_NAMESPACE_END
         );
     }
 
+    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
     #[test]
     fn include_guard_cache_requires_one_outer_file_covering_guard() {
         let temp = tempfile::tempdir().expect("temp dir");
@@ -2289,6 +2300,7 @@ ABSL_NAMESPACE_END
         );
     }
 
+    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
     #[test]
     fn callable_targets_without_differing_redeclarations_skip_include_activation_work() {
         const TARGET_COUNT: usize = 128;
@@ -2417,6 +2429,7 @@ ABSL_NAMESPACE_END
         );
     }
 
+    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
     #[test]
     fn conditional_include_projection_index_walks_each_guard_state_once_for_all_donors() {
         let temp = tempfile::tempdir().expect("temp dir");
@@ -2586,6 +2599,7 @@ ABSL_NAMESPACE_END
         );
     }
 
+    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
     #[test]
     fn unconditional_include_reachability_keeps_c_and_cpp_contexts_separate() {
         let temp = tempfile::tempdir().expect("temp dir");
@@ -2688,6 +2702,7 @@ ABSL_NAMESPACE_END
         }
     }
 
+    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
     #[test]
     fn cpp_callable_arity_applies_defaulted_header_to_definition_target() {
         let temp = tempfile::tempdir().expect("temp dir");

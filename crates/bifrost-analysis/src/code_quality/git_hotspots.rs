@@ -661,6 +661,7 @@ mod tests {
         );
     }
 
+    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
     #[test]
     fn max_files_truncates_and_sets_flag() {
         let fixture = fixture_with_repo();
@@ -687,6 +688,7 @@ mod tests {
         );
     }
 
+    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
     #[test]
     fn until_excludes_later_commits() {
         let fixture = fixture_with_repo();
@@ -718,6 +720,7 @@ mod tests {
         }
     }
 
+    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
     #[test]
     fn no_matching_commits_returns_empty_state() {
         let fixture = fixture_with_repo();
@@ -734,6 +737,7 @@ mod tests {
         assert!(result.report.ends_with("No file hotspots in this window."));
     }
 
+    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
     #[test]
     fn accepts_offset_iso_and_formats_utc_timeframe() {
         let fixture = fixture_with_repo();
@@ -756,6 +760,7 @@ mod tests {
         );
     }
 
+    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
     #[test]
     fn invalid_clock_fields_are_rejected() {
         let fixture = fixture_with_repo();

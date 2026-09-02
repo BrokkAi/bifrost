@@ -1,0 +1,10 @@
+{
+  "kind": "import-bindings",
+  "bindings": [
+    {
+      "name": "PageElement",
+      "bindingKind": "re-export",
+      "target": "page-element"
+    }
+  ]
+}

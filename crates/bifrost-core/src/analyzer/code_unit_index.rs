@@ -154,6 +154,30 @@ pub trait CodeUnitIndex: Send + Sync {
         None
     }
 
+    /// Every declaration whose fully-qualified name equals `unit`'s, `unit`
+    /// itself included when the index still holds it.
+    ///
+    /// [`Self::definitions`] answers a different question -- which definition
+    /// a name resolves to -- and keeps at most one module out of the group,
+    /// because one definition is what a lookup wants. A module is declared
+    /// once per file that declares it (a Java or Go package, a C++ namespace),
+    /// so rendering a module target needs the whole group, not the
+    /// representative.
+    ///
+    /// Takes the declaration rather than a rendered name so an implementation
+    /// can seek on its structured identity: a persisted index overrides this
+    /// with a seek on `unit`'s terminal identifier and compares whole names.
+    /// The default scan is what an index holding its units in memory can do,
+    /// and it is what a persisted index must not do: hydrating every
+    /// declaration in the workspace to answer one name cost 1.7 s per module
+    /// selector on a 360k-declaration workspace (#2880).
+    fn declarations_sharing_name(&self, unit: &CodeUnit) -> Vec<CodeUnit> {
+        let fq_name = unit.fq_name();
+        self.all_declarations()
+            .filter(|candidate| candidate.fq_name() == fq_name)
+            .collect()
+    }
+
     fn definitions(&self, _fq_name: &str) -> Box<dyn Iterator<Item = CodeUnit> + '_> {
         Box::new(std::iter::empty())
     }

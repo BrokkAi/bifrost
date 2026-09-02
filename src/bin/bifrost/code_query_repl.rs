@@ -1,3 +1,4 @@
+use brokk_bifrost::policy::{RelationDomainSchema, relation_domain_schema};
 use brokk_bifrost::rql::kinds::{ALL_KINDS, ALL_ROLES, Role};
 use brokk_bifrost::rql::{
     CodeQuery, CodeQueryExecutionMode, CodeQueryMatch, CodeQueryPlan, CodeQueryPlanSource,
@@ -24,7 +25,7 @@ const COMMANDS: &[MetadataEntry] = &[
     MetadataEntry::new(":help", "Show commands and S-expression examples."),
     MetadataEntry::new(
         ":doc",
-        "Show documentation for a command, kind, role, wrapper, or example.",
+        "Show documentation for a command, kind, role, wrapper, example, or row domain.",
     ),
     MetadataEntry::new(":examples", "List named example queries."),
     MetadataEntry::new(":example", "Load a named example into the current query."),
@@ -1119,6 +1120,29 @@ fn render_code_query_repl_output(output: &CodeQueryResult, use_color: bool) -> S
                         value.certainty,
                     ));
                 }
+                CodeQueryResultValue::ConcurrentAccessConflict { value } => {
+                    let path = sanitize_terminal_text(&value.path);
+                    let id = sanitize_terminal_text(&value.id);
+                    out.push_str(&format!(
+                        "{}:{}:{}\n  {} {} ({} / {}; {}; {}; {}; {}/{})\n",
+                        paint(Style::new().fg(Color::Cyan).bold(), &path, use_color),
+                        value.range.start_line,
+                        value.range.start_column,
+                        paint(
+                            Style::new().fg(Color::Blue),
+                            "concurrent access conflict:",
+                            use_color
+                        ),
+                        paint(Style::new().bold(), &id, use_color),
+                        value.first_access,
+                        value.second_access,
+                        value.task_relation,
+                        value.ordering,
+                        value.protection,
+                        value.proof,
+                        value.coverage,
+                    ));
+                }
                 CodeQueryResultValue::TypestateWitness { value } => {
                     let path = sanitize_terminal_text(&value.path);
                     let id = sanitize_terminal_text(&value.id);
@@ -1259,6 +1283,26 @@ fn render_code_query_repl_output(output: &CodeQueryResult, use_color: bool) -> S
                         value.coverage
                     ));
                 }
+                CodeQueryResultValue::FieldWriteValue { value } => {
+                    let path = sanitize_terminal_text(&value.path);
+                    let text = sanitize_terminal_text(&value.text);
+                    let member = sanitize_terminal_text(&value.member_target.fq_name);
+                    out.push_str(&format!(
+                        "{}:{}:{}\n  {} `{}` -> {} ({}; {})\n",
+                        paint(Style::new().fg(Color::Cyan).bold(), &path, use_color),
+                        value.range.start_line,
+                        value.range.start_column,
+                        paint(
+                            Style::new().fg(Color::Blue),
+                            "field write value:",
+                            use_color
+                        ),
+                        text,
+                        member,
+                        value.proof,
+                        value.coverage,
+                    ));
+                }
                 CodeQueryResultValue::ReceiverAnalysis { value } => {
                     let path = sanitize_terminal_text(&value.path);
                     let text = sanitize_terminal_text(&value.text);
@@ -1278,6 +1322,28 @@ fn render_code_query_repl_output(output: &CodeQueryResult, use_color: bool) -> S
                     for detail in value.render_detail_lines() {
                         out.push_str(&format!("  {}\n", sanitize_terminal_text(&detail)));
                     }
+                }
+                CodeQueryResultValue::MemberTargetAnalysis { value } => {
+                    let path = sanitize_terminal_text(&value.path);
+                    out.push_str(&format!(
+                        "{}:{}:{}\n  {} {} target{} ({}; {})\n",
+                        paint(Style::new().fg(Color::Cyan).bold(), &path, use_color),
+                        value.receiver_range.start_line,
+                        value.receiver_range.start_column,
+                        paint(
+                            Style::new().fg(Color::Blue),
+                            "member target analysis:",
+                            use_color
+                        ),
+                        value.member_targets.len(),
+                        if value.member_targets.len() == 1 {
+                            ""
+                        } else {
+                            "s"
+                        },
+                        value.outcome,
+                        value.coverage,
+                    ));
                 }
                 CodeQueryResultValue::MemberSelection { value } => {
                     let path = sanitize_terminal_text(&value.path);
@@ -1639,6 +1705,57 @@ fn render_code_query_repl_output(output: &CodeQueryResult, use_color: bool) -> S
                         value.proof,
                         value.coverage,
                         acquisition_id,
+                    ));
+                }
+                CodeQueryResultValue::NilnessOperation { value } => {
+                    let path = sanitize_terminal_text(&value.path);
+                    out.push_str(&format!(
+                        "{}:{}:{}\n  {} {} {} [{}; {}; {}]\n",
+                        paint(Style::new().fg(Color::Cyan).bold(), &path, use_color),
+                        value.range.start_line,
+                        value.range.start_column,
+                        paint(
+                            Style::new().fg(Color::Blue),
+                            "nilness operation:",
+                            use_color
+                        ),
+                        value.use_kind,
+                        value.fact,
+                        value.origin,
+                        value.proof,
+                        value.coverage,
+                    ));
+                }
+                CodeQueryResultValue::SwitchCoverage { value } => {
+                    let path = sanitize_terminal_text(&value.path);
+                    out.push_str(&format!(
+                        "{}:{}:{}\n  {} {} {} [{}; {}]\n",
+                        paint(Style::new().fg(Color::Cyan).bold(), &path, use_color),
+                        value.range.start_line,
+                        value.range.start_column,
+                        paint(Style::new().fg(Color::Blue), "switch coverage:", use_color),
+                        value.kind,
+                        value.verdict,
+                        value.proof,
+                        value.reason.unwrap_or(value.selector_domain),
+                    ));
+                }
+                CodeQueryResultValue::DetachedTaskTransfer { value } => {
+                    let path = sanitize_terminal_text(&value.path);
+                    out.push_str(&format!(
+                        "{}:{}:{}\n  {} {} {} [{}; {}]\n",
+                        paint(Style::new().fg(Color::Cyan).bold(), &path, use_color),
+                        value.range.start_line,
+                        value.range.start_column,
+                        paint(
+                            Style::new().fg(Color::Blue),
+                            "detached task transfer:",
+                            use_color
+                        ),
+                        value.role,
+                        value.proof,
+                        value.coverage,
+                        value.reason.unwrap_or(value.timing),
                     ));
                 }
                 CodeQueryResultValue::ProcedureEffect { value } => {
@@ -2297,7 +2414,8 @@ fn help_text() -> String {
     let mut lines = vec![
         "Commands:".to_string(),
         "  :help                  Show this help.".to_string(),
-        "  :doc <name>            Show docs for commands, kinds, roles, wrappers, or examples."
+        "  :doc <name>            Show docs for commands, kinds, roles, wrappers, examples, or \
+row domains."
             .to_string(),
         "  :examples              List named examples.".to_string(),
         "  :example <name>        Load a named example.".to_string(),
@@ -2357,56 +2475,115 @@ fn doc_text(name: &str) -> String {
         return "usage: :doc <name>".to_string();
     }
     let normalized = name.trim_start_matches(':');
+    // A row domain shares its label with the query vocabulary that produces it
+    // (`occurrence` is an RQL form, `declaration` is also a structural kind),
+    // and the two answer different questions: the vocabulary is what a query
+    // writes, the domain is what a relational policy binds. Print both rather
+    // than letting either shadow the other.
+    let row_domain = relation_domain_schema(normalized).map(|domain| row_domain_text(&domain));
+    match (query_vocabulary_text(name, normalized), row_domain) {
+        (Some(vocabulary), Some(domain)) => format!("{vocabulary}\n\n{domain}"),
+        (Some(vocabulary), None) => vocabulary,
+        (None, Some(domain)) => domain,
+        (None, None) => format!("No docs for `{name}`."),
+    }
+}
+
+/// The command, topic, form, example, kind, role, or language label `name`
+/// addresses, in the order a shorter spelling defers to a more specific one.
+fn query_vocabulary_text(name: &str, normalized: &str) -> Option<String> {
     if let Some(command) = COMMANDS.iter().find(|entry| entry.name == name) {
-        return format!("{} — {}", command.name, command.doc);
+        return Some(format!("{} — {}", command.name, command.doc));
     }
     if let Some(topic) = LANGUAGE_TOPICS
         .iter()
         .find(|entry| entry.name == normalized)
     {
-        return format!("{} — {}", topic.name, topic.doc);
+        return Some(format!("{} — {}", topic.name, topic.doc));
     }
     if let Some(form) = ALL_RQL_FORMS
         .iter()
         .find(|form| form.labels().contains(&normalized))
     {
-        return format!(
+        return Some(format!(
             "{} — {}\n{}",
             form.label(),
             form.description(),
             form.signature()
-        );
+        ));
     }
     if let Some(example) = example_by_name(normalized) {
-        return format!("{} — {}\n{}", example.name, example.doc, example.query);
+        return Some(format!(
+            "{} — {}\n{}",
+            example.name, example.doc, example.query
+        ));
     }
     if let Some(kind) = ALL_KINDS.iter().find(|kind| kind.label() == normalized) {
-        return format!(
+        return Some(format!(
             "{} — {} Subtype parent: {}",
             kind.label(),
             kind.description(),
             kind.parent().map_or("none", |parent| parent.label())
-        );
+        ));
     }
     if let Some(role) = Role::from_label(normalized) {
-        return format!(
+        return Some(format!(
             ":{} — {}\n:{} {}",
             role.label(),
             role.description(),
             role.label(),
             role.signature()
-        );
+        ));
     }
     if normalized == "tsx" {
-        return "tsx — Rune IR parser label for TypeScript source containing JSX.".to_string();
+        return Some(
+            "tsx — Rune IR parser label for TypeScript source containing JSX.".to_string(),
+        );
     }
     if Language::ANALYZABLE
         .iter()
         .any(|language| language.config_label() == normalized)
     {
-        return format!("{normalized} — language filter label for query_code.");
+        return Some(format!(
+            "{normalized} — language filter label for query_code."
+        ));
     }
-    format!("No docs for `{name}`.")
+    None
+}
+
+/// Render one published row domain: the columns a relational policy may bind
+/// and the expansions admitted from it.
+///
+/// The projection comes from `bifrost_relation_schema/v1`, the same catalog
+/// `bifrost --list-row-schemas` prints and the same table the policy validator
+/// enforces, so this view cannot drift from the rule.
+fn row_domain_text(domain: &RelationDomainSchema) -> String {
+    let mut text = format!(
+        "{} — row domain for relational policy bindings",
+        domain.domain
+    );
+    for field in &domain.fields {
+        text.push_str(&format!("\n{}: {}", field.name, field.scalar_type));
+        if field.nullable {
+            text.push_str(" (nullable)");
+        }
+        if field.stable_join_key {
+            text.push_str(" (join key)");
+        }
+        if let Some(values) = field.values {
+            text.push_str(&format!("\n  values: {}", values.join(", ")));
+        }
+        if let Some(reason) = field.unenumerable_reason {
+            text.push_str(&format!("\n  values: not enumerable ({reason})"));
+        }
+    }
+    for expansion in &domain.expansions {
+        text.push_str(&format!(
+            "\nexpansions: {} -> {}",
+            expansion.step, expansion.result_domain
+        ));
+    }
+    text
 }
 
 fn example_by_name(name: &str) -> Option<&'static Example> {
@@ -2637,6 +2814,37 @@ mod tests {
         assert!(doc_text("comments").contains("no block comments"));
         assert!(doc_text("callee").contains("call target"));
         assert!(doc_text("calls").contains("eval"));
+    }
+
+    /// `:doc <row-domain>` reads the published relation catalog, so a policy
+    /// author can name a row domain's columns, its enum values, and the
+    /// expansions admitted from it without leaving the REPL (issue #2517).
+    #[test]
+    fn code_query_repl_documents_row_domains() {
+        let group = doc_text("call_argument_group");
+        assert!(group.contains("row domain"), "{group}");
+        assert!(group.contains("argument_count: integer"), "{group}");
+        assert!(group.contains("site_id: stable_id (join key)"), "{group}");
+        assert!(group.contains("values: "), "{group}");
+        let argument = doc_text("call_argument");
+        assert!(argument.contains("name: string (nullable)"), "{argument}");
+        let occurrence = doc_text("occurrence");
+        assert!(
+            occurrence.contains("expansions: member-selection -> member_selection"),
+            "{occurrence}"
+        );
+        // `occurrence` is an RQL form label and `declaration` a structural kind;
+        // both are also row domains, and neither answer may shadow the other.
+        assert!(
+            occurrence.contains("Seed classified identifier occurrences"),
+            "{occurrence}"
+        );
+        let declaration = doc_text("declaration");
+        assert!(
+            declaration.contains("Match any declaration"),
+            "{declaration}"
+        );
+        assert!(declaration.contains("fq_name: string"), "{declaration}");
     }
 
     #[test]
@@ -2909,6 +3117,7 @@ mod tests {
         };
         let output = render_code_query_repl_output(
             &CodeQueryResult {
+                session_subset: None,
                 results: vec![CodeQueryResultItem {
                     value: CodeQueryResultValue::StructuralMatch {
                         value: matched.clone(),
@@ -2943,6 +3152,7 @@ mod tests {
     fn code_query_repl_renders_decorated_parameter_identity_and_ranges() {
         let output = render_code_query_repl_output(
             &CodeQueryResult {
+                session_subset: None,
                 results: vec![CodeQueryResultItem {
                     value: CodeQueryResultValue::DecoratedParameter {
                         value: Box::new(CodeQueryDecoratedParameter {
@@ -3028,6 +3238,7 @@ mod tests {
         };
         let output = render_code_query_repl_output(
             &CodeQueryResult {
+                session_subset: None,
                 results: vec![CodeQueryResultItem {
                     value: CodeQueryResultValue::StructuralMatch {
                         value: matched.clone(),

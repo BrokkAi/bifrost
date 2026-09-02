@@ -769,7 +769,10 @@ public void Run() {}
     assert!(complete_ranges.complete);
 
     let analysis = ReceiverQueryAnalysis::MemberTargets(ReceiverAnalysisOutcome::Precise(vec![
-        target.clone(),
+        ReceiverMemberTarget::Workspace {
+            receiver: None,
+            member: target.clone(),
+        },
     ]));
     let mut dispatch_ledger = ReceiverWorkLedger::new(ReceiverAnalysisBudget::default());
     assert!(matches!(
@@ -1795,6 +1798,7 @@ fn java_allocation_projection_stops_at_target_cap_lookahead() {
         types: vec![TypeLookupType {
             fqn: service_type.fq_name(),
             definitions: vec![service_type],
+            semantic_model_id: None,
         }],
         diagnostics: Vec::new(),
         target_kind: TypeLookupTargetKind::ValueExpression,
@@ -1909,10 +1913,12 @@ void caller(boolean choice) {
             TypeLookupType {
                 fqn: service_type.fq_name(),
                 definitions: vec![service_type],
+                semantic_model_id: None,
             },
             TypeLookupType {
                 fqn: alternate_type.fq_name(),
                 definitions: vec![alternate_type],
+                semantic_model_id: None,
             },
         ],
         diagnostics: Vec::new(),
@@ -2225,8 +2231,12 @@ fn incomplete_semantic_evidence_downgrades_values_and_member_targets() {
     let mut values = ReceiverQueryAnalysis::Values(ReceiverAnalysisOutcome::Precise(vec![
         ReceiverValue::InstanceType(service.clone()),
     ]));
+    let member_target = ReceiverMemberTarget::Workspace {
+        receiver: None,
+        member: service.clone(),
+    };
     let mut members = ReceiverQueryAnalysis::MemberTargets(ReceiverAnalysisOutcome::Precise(vec![
-        service.clone(),
+        member_target.clone(),
     ]));
     neutral_incomplete(&mut values);
     neutral_incomplete(&mut members);
@@ -2239,7 +2249,7 @@ fn incomplete_semantic_evidence_downgrades_values_and_member_targets() {
     assert!(matches!(
         members,
         ReceiverQueryAnalysis::MemberTargets(ReceiverAnalysisOutcome::Ambiguous(ref targets))
-            if targets == &[service]
+            if targets == &[member_target]
     ));
 }
 

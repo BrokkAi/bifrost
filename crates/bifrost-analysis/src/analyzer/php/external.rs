@@ -11,7 +11,7 @@ use crate::analyzer::semantic_model::{
     Compatibility, Completeness, DependencyArtifactRole, DependencyPackAdapter,
     DependencyPackProduction, ExactArtifact, ExactDependencyArtifact, ExternalArtifactKind,
     MemberFact, NameSelector, Producer, ProducerDiagnostic, ProducerDiagnosticSeverity, Provenance,
-    ResolvedDependency, SEMANTIC_MODEL_SCHEMA_VERSION, Safety, TypeFact,
+    ResolvedDependency, SEMANTIC_MODEL_SCHEMA_VERSION, Safety, SuppressedDiagnostics, TypeFact,
 };
 use crate::hash::HashMap;
 
@@ -116,7 +116,7 @@ impl DependencyPackAdapter for PhpDependencyPackAdapter {
                     limits,
                     cancellation,
                 );
-                complete &= projection.complete && projection.suppressed_diagnostics == 0;
+                complete &= projection.complete && projection.suppressed_diagnostics.total() == 0;
                 append_diagnostics(&mut diagnostics, projection.diagnostics);
                 for fact in projection.types {
                     merge_type(&mut types, fact, &mut diagnostics, &mut complete);
@@ -288,6 +288,7 @@ impl ComposerPackagePackProducer {
             return ArtifactProduction::failed(
                 ProducerDiagnostic {
                     severity: ProducerDiagnosticSeverity::Error,
+                    source_entry: None,
                     code: "artifact.kind".to_owned(),
                     location: None,
                     declaration: None,
@@ -347,7 +348,7 @@ impl ComposerPackagePackProducer {
                     limits,
                     cancellation,
                 );
-                complete &= projection.complete && projection.suppressed_diagnostics == 0;
+                complete &= projection.complete && projection.suppressed_diagnostics.total() == 0;
                 append_diagnostics(&mut diagnostics, projection.diagnostics);
                 for fact in projection.types {
                     merge_type(&mut types, fact, &mut diagnostics, &mut complete);
@@ -490,12 +491,13 @@ fn failed(code: &str, message: &str) -> DependencyPackProduction {
         pack: None,
         diagnostics: vec![ProducerDiagnostic {
             severity: ProducerDiagnosticSeverity::Error,
+            source_entry: None,
             code: code.to_owned(),
             location: None,
             declaration: None,
             message: message.to_owned(),
         }],
-        suppressed_diagnostics: 0,
+        suppressed_diagnostics: SuppressedDiagnostics::default(),
     }
 }
 

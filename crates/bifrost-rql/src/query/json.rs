@@ -796,6 +796,10 @@ fn query_step_to_json(step: &QueryStep) -> Value {
         | QueryStep::CallResultContracts
         | QueryStep::ResultContractUses
         | QueryStep::ResultContractOperationUses
+        | QueryStep::NilnessOperations
+        | QueryStep::SwitchCoverage
+        | QueryStep::ConcurrentAccessConflicts
+        | QueryStep::DetachedTaskTransfers
         | QueryStep::ProcedureEffects
         | QueryStep::CallableSignature
         | QueryStep::SignatureParameters
@@ -945,6 +949,17 @@ fn query_step_to_json(step: &QueryStep) -> Value {
         | QueryStep::MemberTargets(filter) => {
             if let Some(capture) = &filter.capture {
                 object.insert("capture".to_string(), json!(capture));
+            }
+        }
+        QueryStep::FieldWriteValue(filter) => {
+            if let Some(receiver_identity_id) = &filter.receiver_identity_id {
+                object.insert(
+                    "receiver_identity_id".to_string(),
+                    json!(receiver_identity_id),
+                );
+            }
+            if let Some(member_target_id) = &filter.member_target_id {
+                object.insert("member_target_id".to_string(), json!(member_target_id));
             }
         }
     }

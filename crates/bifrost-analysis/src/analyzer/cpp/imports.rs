@@ -270,63 +270,76 @@ impl CppAnalyzer {
         resolved_targets
     }
 
-    /// For every file the direct reverse-include index reaches, the set of
-    /// workspace translation units whose include closure reaches it -- the
-    /// transitive answer over [`Self::reverse_include_index`]. Memoized
-    /// exactly like `reverse_include_index`, and reset at the same points
-    /// (`from_inner`, `with_updated_inner`) since it is invalidated only when
-    /// the whole analyzer generation turns over.
-    fn transitive_reverse_tu_index(
-        &self,
-        token: QueryToken<'_>,
-    ) -> Arc<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>> {
+    /// For every file the direct reverse-include index reaches, the workspace
+    /// translation units whose include closure reaches it -- the transitive
+    /// answer over [`Self::reverse_include_index`]. Memoized exactly like
+    /// `reverse_include_index`, and reset at the same points (`from_inner`,
+    /// `with_updated_inner`) since it is invalidated only when the whole
+    /// analyzer generation turns over.
+    fn transitive_reverse_tu_index(&self, token: QueryToken<'_>) -> Arc<TransitiveReverseTuIndex> {
         self.transitive_reverse_tu_index.get_or_build(
             || self.build_transitive_reverse_tu_index_data(token),
             || self.build_transitive_reverse_tu_index_data(token),
         )
     }
 
-    /// The inputs and worklist propagation behind
-    /// [`Self::transitive_reverse_tu_index`], gathered lazily so an
-    /// already-built memo never re-scans the workspace.
+    /// The inputs and propagation behind [`Self::transitive_reverse_tu_index`],
+    /// gathered lazily so an already-built memo never re-scans the workspace.
     fn build_transitive_reverse_tu_index_data(
         &self,
         token: QueryToken<'_>,
-    ) -> HashMap<ProjectFile, Arc<HashSet<ProjectFile>>> {
+    ) -> TransitiveReverseTuIndex {
         let _scope = crate::profiling::scope("cpp.build_transitive_reverse_tu_index");
         let direct_reverse = self.reverse_include_index(token);
-        let translation_units = self
+        let mut translation_units = self
             .inner
             .all_files()
             .into_iter()
             .filter(is_cpp_translation_unit)
             .collect::<Vec<_>>();
-        let index = build_transitive_reverse_tu_index(&direct_reverse, &translation_units);
-        // Total membership, not key count, is what this index costs: a header
-        // reachable from many translation units contributes one entry per unit,
-        // so the product can grow far faster than the workspace does. The note
-        // is the cheapest way to tell a slow build from a quadratic one.
+        // A unit's ordinal is its position here, so this order is the order
+        // every materialized answer comes out in. Sorting once at the source
+        // is what lets `reaching_translation_units` hand back a sorted list
+        // without a per-query sort.
+        translation_units.sort_unstable();
+        debug_assert!(
+            translation_units.windows(2).all(|pair| pair[0] != pair[1]),
+            "the workspace listing must not repeat a translation unit: {translation_units:?}"
+        );
+        let build = build_transitive_reverse_tu_index(&direct_reverse, &translation_units);
+        // Total membership, not key count, is what this index represents: a
+        // header reachable from many translation units contributes one entry
+        // per unit, so the product grows far faster than the workspace does.
+        // `edge_visits` is the number that says the build no longer pays for
+        // that product -- it is one visit per include edge whatever the
+        // memberships those edges carry (#2899).
         crate::profiling::note_with(|| {
-            let entries: usize = index.values().map(|set| set.len()).sum();
             format!(
-                "transitive_reverse_tu_index keys={} total_membership={entries}",
-                index.len()
+                "transitive_reverse_tu_index keys={} total_membership={} edge_visits={}",
+                build.index.keys(),
+                build.index.total_membership(),
+                build.edge_visits
             )
         });
-        index
+        build.index
     }
 
     /// Every workspace translation unit whose `#include` closure transitively
-    /// reaches `file`, empty when none does.
+    /// reaches `file`, ascending by path and empty when none does.
+    ///
+    /// This materializes one `ProjectFile` per reaching unit, which is why the
+    /// index stores ordinals and hands them out only here: a caller that just
+    /// reads the units (like [`Self::header_language_attribution`]) iterates
+    /// the index directly and clones nothing.
     pub(crate) fn transitive_reaching_translation_units(
         &self,
         token: QueryToken<'_>,
         file: &ProjectFile,
-    ) -> Arc<HashSet<ProjectFile>> {
+    ) -> Vec<ProjectFile> {
         self.transitive_reverse_tu_index(token)
-            .get(file)
+            .reaching_translation_units(file)
             .cloned()
-            .unwrap_or_default()
+            .collect()
     }
 
     /// Every file of `files` that some workspace translation unit provably
@@ -338,12 +351,15 @@ impl CppAnalyzer {
     ///
     /// This is the workspace mount's question, and the mount asks it of every
     /// analyzed file. Asking it through the attribution function materializes
-    /// [`Self::transitive_reverse_tu_index`], which holds one
-    /// `HashSet<ProjectFile>` of reaching translation units per file: on Godot
-    /// that is 1,887,205 memberships built in 10.2 seconds to produce 8,356
-    /// booleans. Only three monotone bits of each of those sets are ever read
-    /// (see [`ReachingCompilationEvidence`]), so propagating the bits instead
-    /// of the sets answers the same question in the size of the include graph.
+    /// [`Self::transitive_reverse_tu_index`], which holds the reaching
+    /// translation units of every file: on Godot that is 1,887,205 memberships
+    /// to produce 8,356 booleans. #2899 turned those per-file sets into
+    /// bitsets over the include graph's SCC condensation, so holding them is
+    /// no longer the cost it was; reading them still is, because the
+    /// attribution materializes one `ProjectFile` per membership. Only three
+    /// monotone bits of each set are ever read (see
+    /// [`ReachingCompilationEvidence`]), so propagating the bits instead
+    /// answers the same question in the size of the include graph.
     ///
     /// The full index is not replaced: the resolution-time attribution surface
     /// still needs the sets, and this function must agree with it file for
@@ -490,10 +506,14 @@ impl CppAnalyzer {
             );
         }
 
-        let reaching_translation_units = self.transitive_reaching_translation_units(token, file);
+        // Read straight off the index rather than through
+        // `transitive_reaching_translation_units`: this is a per-file question
+        // the resolver asks of every header it enumerates, and nothing here
+        // outlives the borrow, so none of the reaching units need cloning.
+        let index = self.transitive_reverse_tu_index(token);
 
-        let database_languages = reaching_translation_units
-            .iter()
+        let database_languages = index
+            .reaching_translation_units(file)
             .flat_map(|translation_unit| {
                 self.compile_contexts_for(translation_unit)
                     .iter()
@@ -504,10 +524,11 @@ impl CppAnalyzer {
             return attribution_from_languages(database_languages.into_iter());
         }
 
-        if reaching_translation_units.is_empty() {
+        let mut reaching_translation_units = index.reaching_translation_units(file).peekable();
+        if reaching_translation_units.peek().is_none() {
             return HeaderLanguageAttribution::Unknown;
         }
-        attribution_from_languages(reaching_translation_units.iter().map(|translation_unit| {
+        attribution_from_languages(reaching_translation_units.map(|translation_unit| {
             if translation_unit
                 .rel_path()
                 .extension()
@@ -578,56 +599,300 @@ impl ReachingCompilationEvidence {
     }
 }
 
-/// One iterative fixed point over the direct reverse-include index: starting
-/// from every translation unit, propagate "reached by this TU" forward along
-/// `#include` edges until nothing changes. `direct_reverse` is keyed the
-/// other way around (`header -> its direct includers`, the shape
-/// `referencing_files_of` reads), so the first step inverts it into forward
-/// adjacency (`includer -> what it directly includes`) -- the direction
-/// propagation must run in, since a TU's identity has to flow out through
-/// what it includes, not through who includes the TU. A worklist, not
-/// recursion, per repository convention for graph walks.
-fn build_transitive_reverse_tu_index(
-    direct_reverse: &HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>,
-    translation_units: &[ProjectFile],
-) -> HashMap<ProjectFile, Arc<HashSet<ProjectFile>>> {
-    let mut forward: HashMap<ProjectFile, Vec<ProjectFile>> = HashMap::default();
-    for (target, includers) in direct_reverse {
-        for includer in includers.iter() {
-            forward
-                .entry(includer.clone())
-                .or_default()
-                .push(target.clone());
+/// A set of translation units, one bit per ordinal.
+///
+/// An ordinal is a position in the `translation_units` slice
+/// [`build_transitive_reverse_tu_index`] was given: bit `i` set means
+/// `translation_units[i]` reaches whatever this set describes. That slice is
+/// sorted, so [`Self::iter`] yields ordinals in ascending path order and a
+/// materialized answer comes out sorted for free.
+#[derive(Clone, Debug, Default)]
+struct TranslationUnitSet {
+    words: Vec<u64>,
+}
+
+/// How many ordinals one [`TranslationUnitSet`] word holds.
+const UNITS_PER_WORD: usize = u64::BITS as usize;
+
+impl TranslationUnitSet {
+    /// The empty set over `units` ordinals.
+    fn with_capacity(units: usize) -> Self {
+        Self {
+            words: vec![0; units.div_ceil(UNITS_PER_WORD)],
         }
     }
 
-    let mut closure: HashMap<ProjectFile, HashSet<ProjectFile>> = HashMap::default();
-    let mut worklist: VecDeque<ProjectFile> = VecDeque::new();
-    for translation_unit in translation_units {
-        closure
-            .entry(translation_unit.clone())
-            .or_default()
-            .insert(translation_unit.clone());
-        worklist.push_back(translation_unit.clone());
+    fn insert(&mut self, ordinal: usize) {
+        self.words[ordinal / UNITS_PER_WORD] |= 1 << (ordinal % UNITS_PER_WORD);
     }
-    while let Some(current) = worklist.pop_front() {
-        let Some(targets) = forward.get(&current) else {
+
+    /// Union `other` into `self`. Both index the same slice of translation
+    /// units, so both hold the same number of words.
+    fn union_from(&mut self, other: &Self) {
+        debug_assert_eq!(
+            self.words.len(),
+            other.words.len(),
+            "translation-unit sets of one index share their ordinal space"
+        );
+        for (word, source) in self.words.iter_mut().zip(&other.words) {
+            *word |= *source;
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.words.iter().all(|word| *word == 0)
+    }
+
+    fn len(&self) -> usize {
+        self.words
+            .iter()
+            .map(|word| word.count_ones() as usize)
+            .sum()
+    }
+
+    fn iter(&self) -> impl Iterator<Item = usize> + '_ {
+        self.words.iter().enumerate().flat_map(|(index, word)| {
+            let word = *word;
+            (0..UNITS_PER_WORD)
+                .filter(move |bit| word & (1 << bit) != 0)
+                .map(move |bit| index * UNITS_PER_WORD + bit)
+        })
+    }
+}
+
+/// Which workspace translation units reach each file, over the whole include
+/// graph.
+///
+/// Files that include one another are reached by exactly the same units, so
+/// the index holds one [`TranslationUnitSet`] per strongly connected component
+/// of the forward include graph and maps each file to its component. Only a
+/// file that some unit actually reaches is keyed: an unreached file and an
+/// absent file are the same answer.
+pub(super) struct TransitiveReverseTuIndex {
+    /// Ordinal -> translation unit, ascending; the ordinal space every
+    /// [`TranslationUnitSet`] here indexes.
+    translation_units: Vec<ProjectFile>,
+    /// The component each reached file belongs to, indexing `component_units`.
+    component_of_file: HashMap<ProjectFile, u32>,
+    component_units: Vec<TranslationUnitSet>,
+}
+
+impl TransitiveReverseTuIndex {
+    /// Every translation unit whose `#include` closure reaches `file`,
+    /// ascending by path and empty when none does.
+    ///
+    /// Borrowed, not cloned: the index holds ordinals, and the only caller
+    /// that needs owned files is the one whose signature demands them.
+    pub(super) fn reaching_translation_units(
+        &self,
+        file: &ProjectFile,
+    ) -> impl Iterator<Item = &ProjectFile> + '_ {
+        self.component_of_file
+            .get(file)
+            .into_iter()
+            .flat_map(|component| {
+                self.component_units[*component as usize]
+                    .iter()
+                    .map(|ordinal| &self.translation_units[ordinal])
+            })
+    }
+
+    /// How many files some translation unit reaches.
+    fn keys(&self) -> usize {
+        self.component_of_file.len()
+    }
+
+    /// The size of the reachability relation: over every keyed file, how many
+    /// translation units reach it.
+    pub(super) fn total_membership(&self) -> usize {
+        self.component_of_file
+            .values()
+            .map(|component| self.component_units[*component as usize].len())
+            .sum()
+    }
+}
+
+/// What one [`build_transitive_reverse_tu_index`] run produced.
+pub(super) struct TransitiveReverseTuIndexBuild {
+    pub(super) index: TransitiveReverseTuIndex,
+    /// How many include edges the propagation looked at. Collapsing cycles and
+    /// ordering the components is what holds this at one visit per edge; the
+    /// worklist this replaced re-walked an edge once per translation unit that
+    /// arrived late at its source, which is why envoy's 5.05M memberships took
+    /// 1,362 s to build (#2899).
+    pub(super) edge_visits: usize,
+}
+
+/// Which workspace translation units reach each file, in the size of the
+/// include graph.
+///
+/// `direct_reverse` is keyed the other way around (`header -> its direct
+/// includers`, the shape `referencing_files_of` reads), so the first step
+/// inverts it into forward adjacency (`includer -> what it directly
+/// includes`) -- the direction propagation must run in, since a translation
+/// unit's identity has to flow out through what it includes, not through who
+/// includes the unit.
+///
+/// Then: collapse the strongly connected components of that graph (iterative
+/// Tarjan, an explicit stack per repository convention), seed each unit's
+/// ordinal into its own component's [`TranslationUnitSet`], and OR each
+/// component's set into its successors'. Tarjan closes a component only after
+/// every component reachable from it, so walking the components by descending
+/// id is a topological order and one pass over the edges reaches the fixed
+/// point. Guard-protected mutual includes are answered by the collapse, not by
+/// re-queuing them until their sets agree.
+pub(super) fn build_transitive_reverse_tu_index(
+    direct_reverse: &HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>,
+    translation_units: &[ProjectFile],
+) -> TransitiveReverseTuIndexBuild {
+    /// The node id of `file`, assigning the next one on first sight.
+    fn node_id(
+        file: &ProjectFile,
+        node_ids: &mut HashMap<ProjectFile, u32>,
+        node_files: &mut Vec<ProjectFile>,
+        forward: &mut Vec<Vec<u32>>,
+    ) -> u32 {
+        if let Some(id) = node_ids.get(file) {
+            return *id;
+        }
+        let id =
+            u32::try_from(node_files.len()).expect("an include graph has fewer than 2^32 files");
+        node_ids.insert(file.clone(), id);
+        node_files.push(file.clone());
+        forward.push(Vec::new());
+        id
+    }
+
+    let mut node_ids: HashMap<ProjectFile, u32> = HashMap::default();
+    let mut node_files: Vec<ProjectFile> = Vec::new();
+    let mut forward: Vec<Vec<u32>> = Vec::new();
+    for (target, includers) in direct_reverse {
+        let target_id = node_id(target, &mut node_ids, &mut node_files, &mut forward);
+        for includer in includers.iter() {
+            let includer_id = node_id(includer, &mut node_ids, &mut node_files, &mut forward);
+            forward[includer_id as usize].push(target_id);
+        }
+    }
+    // A translation unit that includes nothing still reaches itself.
+    for translation_unit in translation_units {
+        node_id(
+            translation_unit,
+            &mut node_ids,
+            &mut node_files,
+            &mut forward,
+        );
+    }
+
+    let node_count = node_files.len();
+    let mut discovery = vec![u32::MAX; node_count];
+    let mut lowlink = vec![0u32; node_count];
+    let mut on_component_stack = vec![false; node_count];
+    let mut component_of = vec![u32::MAX; node_count];
+    let mut component_stack: Vec<u32> = Vec::new();
+    // (node, how many of its out-edges the walk has taken) -- the explicit
+    // stack that replaces Tarjan's recursion.
+    let mut walk: Vec<(u32, usize)> = Vec::new();
+    let mut next_discovery = 0u32;
+    let mut component_count = 0usize;
+    for root in 0..node_count {
+        if discovery[root] != u32::MAX {
             continue;
-        };
-        let Some(current_tus) = closure.get(&current).cloned() else {
-            continue;
-        };
-        for target in targets {
-            let entry = closure.entry(target.clone()).or_default();
-            let before = entry.len();
-            entry.extend(current_tus.iter().cloned());
-            if entry.len() != before {
-                worklist.push_back(target.clone());
+        }
+        discovery[root] = next_discovery;
+        lowlink[root] = next_discovery;
+        next_discovery += 1;
+        component_stack.push(root as u32);
+        on_component_stack[root] = true;
+        walk.push((root as u32, 0));
+        while let Some((node, edge)) = walk.last_mut() {
+            let node = *node as usize;
+            if let Some(target) = forward[node].get(*edge).copied() {
+                *edge += 1;
+                let target = target as usize;
+                if discovery[target] == u32::MAX {
+                    discovery[target] = next_discovery;
+                    lowlink[target] = next_discovery;
+                    next_discovery += 1;
+                    component_stack.push(target as u32);
+                    on_component_stack[target] = true;
+                    walk.push((target as u32, 0));
+                } else if on_component_stack[target] {
+                    lowlink[node] = lowlink[node].min(discovery[target]);
+                }
+                continue;
+            }
+            walk.pop();
+            if lowlink[node] == discovery[node] {
+                let component = u32::try_from(component_count)
+                    .expect("an include graph has fewer than 2^32 components");
+                loop {
+                    let member = component_stack
+                        .pop()
+                        .expect("a closed component's members are on the component stack");
+                    on_component_stack[member as usize] = false;
+                    component_of[member as usize] = component;
+                    if member as usize == node {
+                        break;
+                    }
+                }
+                component_count += 1;
+            }
+            if let Some((parent, _)) = walk.last() {
+                let parent = *parent as usize;
+                lowlink[parent] = lowlink[parent].min(lowlink[node]);
             }
         }
     }
-    closure
+
+    let mut members: Vec<Vec<u32>> = vec![Vec::new(); component_count];
+    for (node, component) in component_of.iter().enumerate() {
+        members[*component as usize].push(node as u32);
+    }
+    let mut component_units =
+        vec![TranslationUnitSet::with_capacity(translation_units.len()); component_count];
+    for (ordinal, translation_unit) in translation_units.iter().enumerate() {
+        let node = *node_ids
+            .get(translation_unit)
+            .expect("every translation unit was interned as a node");
+        component_units[component_of[node as usize] as usize].insert(ordinal);
+    }
+
+    let mut edge_visits = 0usize;
+    // Descending component id is topological order: Tarjan closes a component
+    // only after every component reachable from it, so a component's
+    // successors all have smaller ids and are still waiting for this union.
+    for component in (0..component_count).rev() {
+        let (earlier, current) = component_units.split_at_mut(component);
+        let current_units = &current[0];
+        for node in &members[component] {
+            for target in &forward[*node as usize] {
+                edge_visits += 1;
+                let target_component = component_of[*target as usize] as usize;
+                if target_component == component {
+                    continue;
+                }
+                debug_assert!(
+                    target_component < component,
+                    "Tarjan closes a component only after the components it reaches"
+                );
+                earlier[target_component].union_from(current_units);
+            }
+        }
+    }
+
+    let component_of_file = node_files
         .into_iter()
-        .map(|(file, tus)| (file, Arc::new(tus)))
-        .collect()
+        .enumerate()
+        .filter(|(node, _)| !component_units[component_of[*node] as usize].is_empty())
+        .map(|(node, file)| (file, component_of[node]))
+        .collect();
+
+    TransitiveReverseTuIndexBuild {
+        index: TransitiveReverseTuIndex {
+            translation_units: translation_units.to_vec(),
+            component_of_file,
+            component_units,
+        },
+        edge_visits,
+    }
 }

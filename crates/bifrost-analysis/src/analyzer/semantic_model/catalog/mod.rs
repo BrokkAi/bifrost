@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use tempfile::TempDir;
 use uuid::Uuid;
 
+use super::validate::is_canonical_relative_path;
 use super::{
     ActivationSelector, ArtifactEncoding, CompiledPackManifest, CompiledSemanticModelPack,
     CompiledShard, CompiledShardDescriptor, Completeness, DecodeLimits, NameSelector, PayloadKind,
@@ -34,7 +35,7 @@ pub const CATALOG_SCHEMA_VERSION: i64 = db::CURRENT_CATALOG_VERSION;
 ///
 /// Increment this whenever producer or compiler behavior can change the bytes
 /// or meaning of a generated pack without changing its other exact inputs.
-pub const GENERATED_PRODUCTION_CACHE_VERSION: u32 = 3;
+pub const GENERATED_PRODUCTION_CACHE_VERSION: u32 = 5;
 pub const SEMANTIC_PACK_CACHE_ROOT_ENV: &str = "BIFROST_SEMANTIC_PACK_CACHE_ROOT";
 
 /// Resolve the generated catalog used when no explicit catalog is configured.
@@ -283,6 +284,18 @@ pub struct PackExtractionGap {
     pub reason: String,
 }
 
+/// One artifact-relative source entry that a pack producer could not parse.
+///
+/// A source entry provides accountability for a file-level reject. Unlike
+/// [`PackExtractionGap`], it is not a declaration and must not participate in
+/// declaration-gap lookup.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PackExtractionSourceEntry {
+    pub source_entry: String,
+    pub reason: String,
+}
+
 /// Complete reject accounting installed from a verified release bundle.
 ///
 /// Ordinary authored and workspace-generated packs have no row of this kind.
@@ -295,13 +308,15 @@ pub struct PackExtractionAccounting {
     pub suppressed_reject_count: u64,
     pub error_reject_count: u64,
     pub gaps: Vec<PackExtractionGap>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub source_entries: Vec<PackExtractionSourceEntry>,
 }
 
 impl PackExtractionAccounting {
     pub fn warning_only_and_fully_accounted(&self) -> bool {
         self.suppressed_reject_count == 0
             && self.error_reject_count == 0
-            && self.gaps.len() as u64 == self.reject_count
+            && (self.gaps.len() + self.source_entries.len()) as u64 == self.reject_count
     }
 }
 
@@ -1143,11 +1158,33 @@ impl SemanticPackCatalog {
         let gaps = rows
             .collect::<Result<Vec<_>, _>>()
             .map_err(|error| CatalogError::sqlite("read pack extraction gap", error))?;
+        let mut statement = connection
+            .prepare(
+                "SELECT source_entry, reason
+                 FROM catalog_pack_extraction_source_entries
+                 WHERE manifest_digest = ?1
+                 ORDER BY ordinal",
+            )
+            .map_err(|error| {
+                CatalogError::sqlite("prepare pack extraction source entries", error)
+            })?;
+        let rows = statement
+            .query_map([manifest_digest], |row| {
+                Ok(PackExtractionSourceEntry {
+                    source_entry: row.get(0)?,
+                    reason: row.get(1)?,
+                })
+            })
+            .map_err(|error| CatalogError::sqlite("query pack extraction source entries", error))?;
+        let source_entries = rows
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| CatalogError::sqlite("read pack extraction source entry", error))?;
         Ok(Some(PackExtractionAccounting {
             reject_count,
             suppressed_reject_count,
             error_reject_count,
             gaps,
+            source_entries,
         }))
     }
 
@@ -1963,13 +2000,37 @@ impl SemanticPackCatalog {
         &self,
         query: &SemanticPackSelectorQuery,
     ) -> Result<Vec<CatalogCandidate>, CatalogError> {
-        self.candidates_bounded(query, usize::MAX)
+        self.candidates_bounded_inner(query, usize::MAX, false)
+    }
+
+    /// Select candidates that explicitly bind at least one exact dependency
+    /// coordinate carried by `query`.
+    ///
+    /// An unconstrained selector is useful for intrinsic, explicitly enabled
+    /// language models, but it does not prove that the pack models a specific
+    /// discovered package, module, or toolchain version. Dependency
+    /// preparation must keep those two activation routes separate.
+    pub(crate) fn dependency_candidates(
+        &self,
+        query: &SemanticPackSelectorQuery,
+    ) -> Result<Vec<CatalogCandidate>, CatalogError> {
+        debug_assert!(query_has_exact_coordinate(query));
+        self.candidates_bounded_inner(query, usize::MAX, true)
     }
 
     pub fn candidates_bounded(
         &self,
         query: &SemanticPackSelectorQuery,
         max_rows: usize,
+    ) -> Result<Vec<CatalogCandidate>, CatalogError> {
+        self.candidates_bounded_inner(query, max_rows, false)
+    }
+
+    fn candidates_bounded_inner(
+        &self,
+        query: &SemanticPackSelectorQuery,
+        max_rows: usize,
+        require_exact_coordinate: bool,
     ) -> Result<Vec<CatalogCandidate>, CatalogError> {
         let durable_rows = self.durable_selector_rows(query, max_rows)?;
 
@@ -2009,6 +2070,9 @@ impl SemanticPackCatalog {
                 let selector: ActivationSelector = serde_json::from_slice(&selector_json)
                     .map_err(|error| CatalogError::Integrity(error.to_string()))?;
                 if !selector_matches(&selector, query)? {
+                    return Ok(None);
+                }
+                if require_exact_coordinate && !selector_binds_exact_coordinate(&selector, query) {
                     return Ok(None);
                 }
                 let descriptor: CompiledShardDescriptor = serde_json::from_slice(&descriptor_json)
@@ -2076,7 +2140,10 @@ impl SemanticPackCatalog {
                 }
                 let mut matches = false;
                 for selector in &shard.selectors {
-                    if selector_matches(selector, query)? {
+                    if selector_matches(selector, query)?
+                        && (!require_exact_coordinate
+                            || selector_binds_exact_coordinate(selector, query))
+                    {
                         matches = true;
                         break;
                     }
@@ -2969,11 +3036,31 @@ fn validate_extraction_accounting(
     }
     if extraction
         .gaps
+        .len()
+        .saturating_add(extraction.source_entries.len()) as u64
+        > extraction.reject_count
+    {
+        return Err(CatalogError::Integrity(
+            "accounted extraction rejects exceed total reject count".to_owned(),
+        ));
+    }
+    if extraction
+        .gaps
         .iter()
         .any(|gap| gap.declaration.is_empty() || gap.reason.is_empty())
     {
         return Err(CatalogError::Integrity(
             "pack extraction gaps require a declaration and reason".to_owned(),
+        ));
+    }
+    if extraction.source_entries.iter().any(|entry| {
+        entry.source_entry.is_empty()
+            || !is_canonical_relative_path(&entry.source_entry)
+            || entry.reason.is_empty()
+    }) {
+        return Err(CatalogError::Integrity(
+            "pack extraction source entries require a canonical relative source entry and reason"
+                .to_owned(),
         ));
     }
     Ok(())
@@ -3140,6 +3227,22 @@ fn insert_extraction_accounting(
                 params![manifest_digest, ordinal, &gap.declaration, &gap.reason],
             )
             .map_err(|error| CatalogError::sqlite("insert pack extraction gap", error))?;
+    }
+    transaction
+        .execute(
+            "DELETE FROM catalog_pack_extraction_source_entries WHERE manifest_digest = ?1",
+            [manifest_digest],
+        )
+        .map_err(|error| CatalogError::sqlite("replace pack extraction source entries", error))?;
+    for (ordinal, entry) in extraction.source_entries.iter().enumerate() {
+        transaction
+            .execute(
+                "INSERT INTO catalog_pack_extraction_source_entries(
+                   manifest_digest, ordinal, source_entry, reason
+                 ) VALUES(?1, ?2, ?3, ?4)",
+                params![manifest_digest, ordinal, &entry.source_entry, &entry.reason],
+            )
+            .map_err(|error| CatalogError::sqlite("insert pack extraction source entry", error))?;
     }
     Ok(())
 }
@@ -3443,6 +3546,34 @@ fn selector_matches(
         return Ok(false);
     }
     Ok(true)
+}
+
+fn query_has_exact_coordinate(query: &SemanticPackSelectorQuery) -> bool {
+    [&query.package, &query.module, &query.toolchain]
+        .into_iter()
+        .flatten()
+        .any(|coordinate| coordinate.version.is_some())
+}
+
+fn selector_binds_exact_coordinate(
+    selector: &ActivationSelector,
+    query: &SemanticPackSelectorQuery,
+) -> bool {
+    [
+        (&selector.package, &query.package),
+        (&selector.module, &query.module),
+        (&selector.toolchain, &query.toolchain),
+    ]
+    .into_iter()
+    .any(|(selector, query)| {
+        matches!(
+            (selector, query),
+            (Some(selector), Some(query))
+                if selector.name == query.name
+                    && selector.version.is_some()
+                    && query.version.is_some()
+        )
+    })
 }
 
 fn coordinate_matches(

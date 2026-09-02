@@ -31,6 +31,10 @@ impl KotlinHierarchyFact for HierarchyDeclarationFacts {
         &self.declaration
     }
 
+    fn primary_range(&self) -> Option<crate::analyzer::Range> {
+        self.primary_range
+    }
+
     fn imports(&self) -> &[ImportInfo] {
         &self.imports
     }

@@ -94,6 +94,17 @@ tasks.register("printGreeting") {
     }
 
     #[test]
+    fn newline_separated_primary_constructor_modifiers_parse_without_recovery() {
+        let source = r#"package sample
+
+actual class Endpoint<T>
+actual @Deprecated("legacy") public constructor(val value: T)
+"#;
+
+        assert_clean("newline-separated primary constructor modifiers", source);
+    }
+
+    #[test]
     fn malformed_source_recovers_trailing_declaration() {
         let source = r#"package sample
 

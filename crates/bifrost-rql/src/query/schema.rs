@@ -307,6 +307,7 @@ impl CodeQueryExecutionMode {
 
 macro_rules! query_step_ops {
     ($($variant:ident {
+        shape: $shape:ident,
         label: $label:literal,
         signature: $signature:literal,
         description: $description:literal
@@ -354,6 +355,20 @@ macro_rules! query_step_ops {
                 }
             }
 
+            /// How this step's driver reaches the rows it emits, which is what
+            /// decides whether an execution over one seed file can produce the
+            /// same rows as the whole execution restricted to that file.
+            ///
+            /// Assigned once here from the driver survey
+            /// (`.agents/docs/rql-seed-partition-map-2026-09.md`, section 2),
+            /// so a new step declares its shape beside its signature instead
+            /// of leaving a partition rule to infer one.
+            pub const fn shape(self) -> QueryStepShape {
+                match self {
+                    $(Self::$variant => QueryStepShape::$shape,)+
+                }
+            }
+
             pub fn allows_hierarchy_options(self) -> bool {
                 matches!(self, Self::Supertypes | Self::Subtypes)
             }
@@ -375,6 +390,10 @@ macro_rules! query_step_ops {
                     self,
                     Self::ReceiverTargets | Self::PointsTo | Self::MemberTargets
                 )
+            }
+
+            pub fn allows_field_write_value_options(self) -> bool {
+                matches!(self, Self::FieldWriteValue)
             }
 
             pub fn allows_typestate_options(self) -> bool {
@@ -440,105 +459,135 @@ macro_rules! query_step_ops {
     };
 }
 
+/// How one step's driver reaches the rows it emits.
+///
+/// This is a statement about the step's inputs, not about its cost: a
+/// derived-value step is one whose answer is a whole-workspace relation (the
+/// import topology, the usage or call scan, the type hierarchy, dispatch, the
+/// build topology, or a prepared analysis context), which is exactly the shape
+/// that lets a query seeded in one file report a row about another.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum QueryStepShape {
+    /// The driver reads only the input row's own file, facts, and handles.
+    RowLocal,
+    /// The driver sorts its whole input row vector by artifact file and opens
+    /// one per-file semantic window (the #2586 per-file enclosure batching).
+    /// The sort is stable over seed-major input, so every within-file order
+    /// the row ordinals depend on is still seed order.
+    Batched,
+    /// The driver's answer is a whole-workspace derived value. Seed-partitioned
+    /// execution keeps such a step whole-workspace: the unit's recorded reads
+    /// carry the derived value, so any change that rotates it invalidates the
+    /// unit.
+    DerivedValue,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum QuerySemanticFacet {
     Procedures,
     Dispatch,
     ProgramPoints,
     ControlEdges,
+    SwitchFacts,
     Typestate,
+    Concurrency,
     ValueFlow,
     Taint,
 }
 
 query_step_ops! {
-    EnclosingDecl { label: "enclosing_decl", signature: "structural_match -> declaration", description: "Map structural matches to their smallest real enclosing declarations." }
-    ProcedureOf { label: "procedure_of", signature: "structural_match|declaration -> procedure", description: "Resolve each source-backed input to its smallest enclosing executable procedure.", semantic: [Procedures] }
-    CfgEntry { label: "cfg_entry", signature: "procedure -> program_point", description: "Return the validated entry program point of each procedure.", semantic: [Procedures, ProgramPoints] }
-    CfgExits { label: "cfg_exits", signature: "procedure -> program_point", description: "Return the validated normal and exceptional exit program points of each procedure.", semantic: [Procedures, ProgramPoints] }
-    CfgSuccessorEdges { label: "cfg_successor_edges", signature: "program_point -> control_edge", description: "Return one-hop outgoing control edges from each program point.", semantic: [Procedures, ProgramPoints, ControlEdges] }
-    CfgPredecessorEdges { label: "cfg_predecessor_edges", signature: "program_point -> control_edge", description: "Return one-hop incoming control edges to each program point.", semantic: [Procedures, ProgramPoints, ControlEdges] }
-    CfgEdgeSource { label: "cfg_edge_source", signature: "control_edge -> program_point", description: "Project each control edge to its source program point.", semantic: [Procedures, ProgramPoints, ControlEdges] }
-    CfgEdgeTarget { label: "cfg_edge_target", signature: "control_edge -> program_point", description: "Project each control edge to its target program point.", semantic: [Procedures, ProgramPoints, ControlEdges] }
-    Typestate { label: "typestate", signature: "procedure -> typestate_finding", description: "Run one registered diagnostic-neutral typestate analysis for the exact procedure root.", semantic: [Procedures, Typestate] }
-    ValueFlow { label: "value_flow", signature: "procedure -> flow_endpoint", description: "Run one registered diagnostic-neutral value-flow plan for the exact procedure root.", semantic: [Procedures, ValueFlow] }
-    Taint { label: "taint", signature: "procedure -> taint_finding", description: "Project findings retained by one host-registered production taint result for the exact procedure root.", semantic: [Procedures, Taint] }
-    Witness { label: "witness", signature: "typestate_finding|flow_endpoint -> typestate_witness|flow_witness", description: "Project bounded retained evidence from each typestate finding or reached flow endpoint without rerunning analysis." }
-    FileOf { label: "file_of", signature: "structural_match|declaration|procedure|program_point|control_edge|typestate_finding|typestate_witness|flow_endpoint|flow_witness|taint_finding|reference_site|call_site|expression_site|jsx_attribute_value|receiver_analysis|receiver_outcome|receiver_evidence|call_shape|call_argument_group|call_argument|call_binding|call_effect|call_result_contract|result_contract_use|result_contract_failure_use|procedure_effect|callable_signature|signature_parameter|decorated_parameter|callable_applicability|overload_selection|dispatch_outcome|dispatch_target|member_family|member_family_edge|state_event -> file", description: "Map structural matches, declarations, procedures, program points, control edges, typestate findings, typestate witnesses, flow endpoints, flow witnesses, taint findings, reference sites, call sites, expression sites, exact JSX attribute operands, receiver analyses, receiver outcomes, receiver evidence, call-shape rows, call-result-contract rows, typed result-contract operation and failure-use rows, callable-signature rows, decorated-parameter rows, callable-applicability rows, overload-selection rows, dispatch rows, method-family rows, or state-event rows to their workspace files." }
-    ImportsOf { label: "imports_of", signature: "file -> file", description: "Traverse one direct project-local import edge forward." }
-    ImportersOf { label: "importers_of", signature: "file -> file", description: "Traverse one direct project-local import edge backward." }
-    Supertypes { label: "supertypes", signature: "declaration -> declaration", description: "Traverse indexed supertypes from supported type declarations." }
-    Subtypes { label: "subtypes", signature: "declaration -> declaration", description: "Traverse indexed subtypes from supported type declarations." }
-    Members { label: "members", signature: "declaration -> declaration", description: "Return direct indexed members of type declarations." }
-    Owner { label: "owner", signature: "declaration -> declaration", description: "Return the exact indexed declaring type of member declarations." }
-    ReferencesOf { label: "references_of", signature: "declaration -> reference_site", description: "Return resolved source reference sites for exact indexed declarations." }
-    UsedBy { label: "used_by", signature: "declaration -> declaration", description: "Return exact declarations containing references to each input declaration." }
-    Uses { label: "uses", signature: "declaration -> declaration", description: "Return exact declarations referenced by each input declaration." }
-    Callers { label: "callers", signature: "declaration -> declaration", description: "Traverse resolved incoming call edges to caller declarations, optionally to a bounded depth." }
-    Callees { label: "callees", signature: "declaration -> declaration", description: "Traverse resolved outgoing call edges to callee declarations, optionally to a bounded depth." }
-    CallSitesTo { label: "call_sites_to", signature: "declaration -> call_site", description: "Return structured call sites whose resolved callee is each input declaration." }
-    CallSitesFrom { label: "call_sites_from", signature: "declaration -> call_site", description: "Return structured call sites lexically owned by each input declaration." }
-    CallInput { label: "call_input", signature: "call_site -> expression_site", description: "Project one direct receiver or formal-parameter input from each call site." }
-    JsxAttributeValue { label: "jsx_attribute_value", signature: "structural_match -> jsx_attribute_value", description: "Project the exact normalized expression operand of JSX attributes, with intrinsic/component/unknown element identity and explicit incompleteness for unresolved semantic cases." }
-    ReceiverTargets { label: "receiver_targets", signature: "structural_match|reference_site|call_site|expression_site|occurrence -> receiver_analysis", description: "Analyze a bounded receiver value using adapter-provided structured facts." }
-    PointsTo { label: "points_to", signature: "structural_match|reference_site|expression_site|occurrence -> receiver_analysis", description: "Analyze bounded value provenance using adapter-provided structured facts." }
-    MemberTargets { label: "member_targets", signature: "structural_match|reference_site|occurrence -> receiver_analysis", description: "Resolve exact member declarations through bounded structured receiver facts." }
-    ReceiverOutcome { label: "receiver_outcome", signature: "receiver_analysis -> receiver_outcome", description: "Project the mandatory terminal outcome row for each receiver analysis." }
-    ReceiverEvidence { label: "receiver_evidence", signature: "receiver_analysis -> receiver_evidence", description: "Project zero or more parent-linked typed receiver evidence rows." }
-    CallShape { label: "call_shape", signature: "structural_match|call_site|occurrence -> call_shape", description: "Project the mandatory structured call-shape outcome row for each exact call site, including its structurally decoded callee token and written argument count when available." }
-    CallResults { label: "call_results", signature: "call_shape -> call_result", description: "Project the ordered normal result ports of each exact semantic call represented by a call-shape row. Each row carries the structural site identity, semantic call and procedure identities, zero-based result ordinal, procedure-local value identity, result point, and evidence quality so it can join assignments and guards without inferring source order.", semantic: [Procedures, ProgramPoints] }
-    CallArgumentGroups { label: "call_argument_groups", signature: "call_shape -> call_argument_group", description: "Project the ordered argument-list group rows of each call shape." }
-    CallArguments { label: "call_arguments", signature: "call_argument_group -> call_argument", description: "Project the ordered argument rows of each argument-list group." }
-    CallEffects { label: "call_effects", signature: "call_shape -> call_effect", description: "Project the direct effect rows of each call shape: one row per (dispatch arm, declared effect) for every callee an active semantic-model pack declares effects for, carrying the effect id, its execution timing, the certainty meet of the declaration and the dispatch proof, and the pack provenance. At least one row per call shape, so an unresolved, unmodeled or unsupported dispatch states that instead of answering empty. The callee set and its proof are the dispatch oracle's own answer; nothing is re-derived here.", semantic: [Procedures] }
-    ResultContractCalls { label: "result_contract_calls", signature: "call_shape -> call_shape", description: "Retain call shapes whose exhaustively resolved canonical dispatch arms unanimously select an activated semantic-model summary with at least one reviewed result contract. This lightweight positive candidate discovery uses structural call shapes, exact definition resolution (including Go package, bound-receiver, and conservative method-expression applicability), and activated model keys without materializing procedure semantics: conclusively unmodeled calls are omitted, while conflicts or interrupted dispatch make the query incomplete." }
-    CallResultContracts { label: "call_result_contracts", signature: "call_shape -> call_result_contract", description: "Project reviewed validity contracts for a call's normal results from the unique activated semantic-model summary for every possible dispatch arm. A positive row identifies the protected result ordinal and either a predicate over a separate condition result or a direct result-success predicate, derives only the exact normalized success-guard edges needed to instantiate that contract, counts reviewed member contracts, and reports whether every modeled arm declares a fresh allocation at that indexed result. It does not inspect resource-sensitive uses. At least one row per call shape; unresolved dispatch or conflicting models produce an explicit terminal row and incomplete query rather than an empty answer.", semantic: [Procedures, Dispatch, ProgramPoints, ControlEdges] }
-    ResultContractUses { label: "result_contract_uses", signature: "call_result_contract -> call_result_contract", description: "Summarize operation-sensitive uses of each positive call-result-contract row while preserving acquisition identity. This optional enrichment counts every exact structured operation, reports the lower bound of reviewed required operations proved unguarded, and carries aggregate use-validation coverage. Terminal rows pass through unchanged; incomplete structured use evidence makes only this relation incomplete.", semantic: [Procedures, Dispatch, ProgramPoints, ControlEdges] }
-    ResultContractOperationUses { label: "result_contract_operation_uses", signature: "call_result_contract -> result_contract_use", description: "Project one typed row per structured operation on a protected result. Intrinsic dereference, field, and index operations are required uses. Receiver calls use exact complete member operation contracts. Exact positional call arguments use complete possible-target procedure-entry preconditions and carry parameter_ordinal. Missing, conflicting, expanded, or ambiguous operation evidence stays open. Each row is anchored at the operation and carries its acquisition identity, exact applicability, timing, required predicate, and guarded, unguarded, not_applicable, or unknown verdict.", semantic: [Procedures, Dispatch, ProgramPoints, ControlEdges] }
-    ResultContractFailureUses { label: "result_contract_failure_uses", signature: "call_result_contract -> result_contract_failure_use", description: "Project structured values returned or passed to calls inside the exact failure arm of a reviewed conditional result contract. Each row compares the operand's exact reaching binding/value provenance with the paired condition result and classifies condition_result, distinct_zero_binding, distinct_binding, independent, or unknown. Exact normalized failure-edge confinement and complete structured identity are required for closed proof; ambiguity remains an open unknown row.", semantic: [Procedures, Dispatch, ProgramPoints, ControlEdges] }
-    ProcedureEffects { label: "procedure_effects", signature: "declaration -> procedure_effect", description: "Summarize the effects of each procedure over its reachable call graph: one row per (procedure, effect id), classified direct or transitive, with the hop count, the certainty and timing carried along the attributing chain, a bounded witness chain of call-site identities, and the coverage that says whether an absent effect is proven absent or merely unseen. At least one row per declaration. The walk is a bounded deterministic fixpoint over the same dispatch answers call_effects publishes.", semantic: [Procedures] }
-    CallBindings { label: "call_bindings", signature: "call_shape -> call_binding", description: "Project the normalized actual-to-formal binding rows of each call shape: one row per written actual, carrying the call-shape argument identity it binds, the formal ordinal and name it was bound to, the binding kind, this row's mapping status, and the whole call's partition coverage. Beside them, a row for each fact no written actual accounts for: the receiver the call is made against, an argument the language supplies with no syntax, and a formal that no actual passed but whose declaration carries a default. Coverage describes the written actuals alone. Exact receiver rows carry a stable declaring-type identity. Selector proof is separate from runtime dispatch: it is derived for exact dispatch or for a resolver-proven receiverless external static target whose unique complete model supplies exact formals. It can also be authored-summary proof when a unique complete exact-member summary explicitly covers the sole unresolved override residual; full activated provenance is retained. Workspace arms, ambiguous overloads, partial or conflicting models, unproven owner identity, instance boundaries without a contract, other boundary kinds, and truncation remain inexact. The semantic dispatch identity, proof, completeness, and candidate coverage are still carried unchanged from the bounded dispatch answer. A source declaration is only an optional materialized view. At least one row per call shape, so an unreadable shape, an unresolved or ambiguous callee, unrecorded formals, or a call that binds nothing each state that instead of answering empty. The callee is the one the production definition resolver binds; no overload is re-decided here.", semantic: [Procedures, Dispatch] }
-    CallableSignature { label: "callable_signature", signature: "declaration -> callable_signature", description: "Project the mandatory callable-signature rows of each declaration from the persisted signature contract: one row per persisted signature entry, so an overload set separates into one row per overload." }
-    SignatureParameters { label: "signature_parameters", signature: "callable_signature -> signature_parameter", description: "Project the ordered declared parameter rows of each callable signature." }
-    DecoratorBindings { label: "decorator_bindings", signature: "structural_match -> decorated_parameter", description: "Project one typed decorator-binding row for each decorator applied to a parameter match. Semantic parameter identity is used only when an exact structural source identity selects one Parameter value; otherwise the row retains only a syntax explanation and explicitly incomplete coverage.", semantic: [Procedures] }
-    CallableApplicability { label: "callable_applicability", signature: "occurrence -> callable_applicability", description: "Project one applicability row per candidate callable the production resolver considered for each reference occurrence: the verdict, the typed callable rejection reason when inapplicable, the precedence tier, and whether the resolver bound it. A candidate the resolver refused stays visible with its reason, so a losing overload is evidence rather than an absence." }
-    OverloadSelection { label: "overload_selection", signature: "occurrence -> overload_selection", description: "Project the mandatory overload-selection summary row for each reference occurrence: resolved_unique, ambiguous, unresolved, or unknown_shape, with the verdict counts it was computed from. Exactly one row per occurrence, and candidate order can never influence it -- zero applicable candidates stay unresolved and several equal winners stay ambiguous." }
-    MemberSelection { label: "member_selection", signature: "occurrence -> member_selection", description: "Project the mandatory member-selection summary row for each reference occurrence, from the production resolver's own candidate trace." }
-    DispatchOutcome { label: "dispatch_outcome", signature: "structural_match|call_site|reference_site|occurrence -> dispatch_outcome", description: "Project the mandatory bounded-dispatch outcome row for each input site: the semantic outcome, the candidate coverage, and the retained target count. Exactly one row per input site, so an unknown, unsupported, over-budget, or cancelled dispatch is stated rather than silently empty.", semantic: [Procedures, Dispatch] }
-    DispatchTargets { label: "dispatch_targets", signature: "structural_match|call_site|reference_site|occurrence -> dispatch_target", description: "Project zero or more bounded dispatch target rows for each input site, one per retained dispatch candidate plus one per boundary arm that names a target. Each row keeps the oracle's own proof, completeness, and candidate coverage, so a proven target in an exhaustive set stays distinguishable from an open may-dispatch arm.", semantic: [Procedures, Dispatch] }
-    MemberFamily { label: "member_family", signature: "declaration -> member_family", description: "Project the mandatory canonical method-family outcome row for each member declaration: the family id when the analyzer proves the family, the typed reason when it cannot, the per-relation edge counts, and the coverage. Exactly one row per input declaration, so an unsupported language or an unprovable overload identity is stated rather than silently empty." }
-    FamilyEdges { label: "family_edges", signature: "declaration -> member_family_edge", description: "Project the typed method-family edges of each member declaration: the forward overrides/implements edges the analyzer proves, plus the bounded inversion of those same edges as overridden_by/implemented_by. Emitted only from a proven family, so an unproven or unsupported member yields no edge row and its outcome row says why." }
-    OccurrencesOf { label: "occurrences_of", signature: "declaration -> occurrence", description: "Return the declaration-name occurrence of each declaration plus every reference-class occurrence resolving to it." }
-    OccurrencesIn { label: "occurrences_in", signature: "structural_match|file -> occurrence", description: "Return classified identifier occurrences lexically inside each structural match or file." }
-    OccurrenceTarget { label: "occurrence_target", signature: "occurrence -> declaration", description: "Project the resolved semantic targets of reference-class occurrences." }
-    ScopeOf { label: "scope_of", signature: "binding|occurrence|structural_match -> lexical_scope", description: "Return the innermost lexical scope that owns each binding, occurrence, or structural match." }
-    ScopeAncestors { label: "scope_ancestors", signature: "lexical_scope -> lexical_scope", description: "Return the enclosing lexical scopes of each scope, innermost first, excluding the scope itself." }
-    BindingsIn { label: "bindings_in", signature: "lexical_scope|structural_match -> binding", description: "Return the bindings declared in each lexical scope, or in the scopes inside each structural match." }
-    BindingOf { label: "binding_of", signature: "occurrence -> binding", description: "Return the binding of the occurrence's name that is in effect at its exact position." }
-    BindingOccurrence { label: "binding_occurrence", signature: "binding -> occurrence", description: "Return the binder-class occurrence row of each binding's declaring token." }
-    CandidatesOf { label: "candidates_of", signature: "occurrence -> resolution_candidate", description: "Return the candidates the resolver considered for each reference-class occurrence, with tier, outcome, and boundary." }
-    CandidateHierarchy { label: "candidate_hierarchy", signature: "occurrence -> candidate_hop", description: "Return the exact hierarchy hops each traced member candidate of a reference occurrence was found through. A depth-zero candidate contributes no hop, and a candidate the resolver recorded without member attribution contributes none either -- absence here is unattributed, never a claim that no hierarchy was walked; the mandatory outcome story is member_selection's." }
-    CandidateTarget { label: "candidate_target", signature: "resolution_candidate -> declaration", description: "Project the workspace declarations of unit-backed resolution candidates." }
-    EdgesOf { label: "edges_of", signature: "declaration -> reference_edge", description: "Return the canonical inverse reference edges of each declaration: every usage site the usage index enumerates, with kind, proof, usage kind, and owner relation." }
-    EdgesFrom { label: "edges_from", signature: "occurrence -> reference_edge", description: "Return the canonical forward reference edges of each occurrence: the resolver's own resolved targets for that exact token, with kind, proof, usage kind, and owner relation." }
-    EdgeTarget { label: "edge_target", signature: "reference_edge -> declaration", description: "Project each reference edge to its exact indexed target declaration." }
-    StateEventsOf { label: "state_events_of", signature: "procedure|declaration -> state_event", description: "Derive the flow-sensitive state events of each procedure from the production semantic IR: every establishment, kill, and read of a binding or of a property of a canonical binding base, anchored to a program point of that procedure's control-flow graph. Source order and containment are never evidence; an axis the lowering does not model is reported incomplete rather than approximated.", semantic: [Procedures, ProgramPoints] }
-    FlowRelationsOf { label: "flow_relations_of", signature: "state_event|procedure -> flow_relation", description: "Derive the flow relations between the state events of each procedure: reaching-definition, dominance, and same-evaluation, each with exact or may certainty. Seeded from a state event, only the relations incident to that event are returned. Budget exhaustion emits no rows and an explicit incomplete diagnostic; it is never reported as an absent relation.", semantic: [Procedures, ProgramPoints, ControlEdges] }
-    FlowSource { label: "flow_source", signature: "flow_relation -> state_event", description: "Project each flow relation to its source state event: the establishment or kill end." }
-    FlowTarget { label: "flow_target", signature: "flow_relation -> state_event", description: "Project each flow relation to its target state event: the read end." }
-    ControlRelations { label: "control_relations", signature: "procedure -> control_relation", description: "Derive the control relations of each procedure from the shared control-flow algorithms over the production semantic IR: dominance, postdominance, control dependence, entry reachability, and loop membership between the procedure's own program points, joined by the same stable ids the program_point and control_edge rows publish. Every row states the exit partition its claim was computed against, so a backward claim can never be read as a claim about a partition that was not computed. Budget exhaustion or cancellation emits no row for the affected relation and an explicit incomplete diagnostic; it is never reported as an absent relation.", semantic: [Procedures, ProgramPoints, ControlEdges] }
-    GuardsOf { label: "guards_of", signature: "procedure -> guard", description: "Return the normalized branch conditions the language adapter recorded for each procedure: which decision point each guard sits on, what its condition was normalized to -- a compile-time constant, a null comparison, a comparison against a constant, or an explicitly opaque condition -- and the stable ids of the true and false successor edges and target points. A constant condition is published even when lowering folded its dead arm away, which is the only place that evidence survives. An empty answer means the adapter records no guard facts for this language, which its own guard_facts capability states.", semantic: [Procedures, ProgramPoints, ControlEdges] }
-    TargetOf { label: "target_of", signature: "file -> build_target", description: "Return the build target each file compiles into, as the workspace's own build files declare it. Ownership comes from build evidence alone: a file no read build file claims produces no row, and a build model this workspace cannot read produces an explicit incomplete diagnostic rather than an empty answer that reads as \"no target\"." }
-    SourceSetOf { label: "source_set_of", signature: "file -> source_set", description: "Return the declared compilation input set each file belongs to, with the build file that fixes the layout. A file two declared source sets both claim is reported ambiguous rather than assigned to whichever was read first." }
-    TopologyEdgesOf { label: "topology_edges_of", signature: "build_target -> topology_edge", description: "Return the dependencies each build target declares on other targets of the same workspace, each carrying its build-declared scope and the build file that declares it. The absence of an edge is only publishable when the topology it was read from is complete, which the row's own completeness column states." }
-    RewritePathsOf { label: "rewrite_paths_of", signature: "file -> rewrite_path", description: "Enumerate the bounded rewrite chases each file engages in a declared finite rewrite domain: the ordered steps a production analysis took, the bound the domain declared for itself, and the terminal outcome -- converged with its fixed point, cycle with the ordered repeated-state witness, or exceeded-budget with the work performed. Budget exhaustion is absence of evidence, never a proven cycle and never a clean convergence." }
-    SegmentsOf { label: "segments_of", signature: "qualified_path -> path_segment", description: "Return each path's ordered segment rows with decoded text, spelled generic arity, and (with :resolved true) each segment's own prefix resolution." }
-    SegmentTarget { label: "segment_target", signature: "path_segment -> declaration", description: "Project the workspace declarations each path segment's own position resolves to." }
-    Generates { label: "generates", signature: "generation_site -> declaration_state", description: "Return the declaration-state rows of the declarations each generation site materializes." }
-    GeneratedBy { label: "generated_by", signature: "declaration|declaration_state -> generation_site", description: "Return the generation site that materialized each generated declaration." }
-    DeclarationStateOf { label: "declaration_state_of", signature: "declaration -> declaration_state", description: "Return each declaration's state row: origin, declaration-only flag, and configuration gate." }
-    ImplementationOf { label: "implementation_of", signature: "declaration_state|declaration -> declaration", description: "Return the runnable implementation a declaration-only signature links to." }
-    StubsOf { label: "stubs_of", signature: "declaration -> declaration_state", description: "Return the declaration-only stub state rows whose implementation link resolves to each declaration; composed with except, this lists the stubs no implementation answers." }
-    ExportTarget { label: "export_target", signature: "export -> declaration", description: "Project the declaration an export row materialized, where the analyzer models one." }
+    EnclosingDecl { shape: RowLocal, label: "enclosing_decl", signature: "structural_match -> declaration", description: "Map structural matches to their smallest real enclosing declarations." }
+    ProcedureOf { shape: RowLocal, label: "procedure_of", signature: "structural_match|declaration -> procedure", description: "Resolve each source-backed input to its smallest enclosing executable procedure.", semantic: [Procedures] }
+    CfgEntry { shape: RowLocal, label: "cfg_entry", signature: "procedure -> program_point", description: "Return the validated entry program point of each procedure.", semantic: [Procedures, ProgramPoints] }
+    CfgExits { shape: RowLocal, label: "cfg_exits", signature: "procedure -> program_point", description: "Return the validated normal and exceptional exit program points of each procedure.", semantic: [Procedures, ProgramPoints] }
+    CfgSuccessorEdges { shape: RowLocal, label: "cfg_successor_edges", signature: "program_point -> control_edge", description: "Return one-hop outgoing control edges from each program point.", semantic: [Procedures, ProgramPoints, ControlEdges] }
+    CfgPredecessorEdges { shape: RowLocal, label: "cfg_predecessor_edges", signature: "program_point -> control_edge", description: "Return one-hop incoming control edges to each program point.", semantic: [Procedures, ProgramPoints, ControlEdges] }
+    CfgEdgeSource { shape: RowLocal, label: "cfg_edge_source", signature: "control_edge -> program_point", description: "Project each control edge to its source program point.", semantic: [Procedures, ProgramPoints, ControlEdges] }
+    CfgEdgeTarget { shape: RowLocal, label: "cfg_edge_target", signature: "control_edge -> program_point", description: "Project each control edge to its target program point.", semantic: [Procedures, ProgramPoints, ControlEdges] }
+    Typestate { shape: DerivedValue, label: "typestate", signature: "procedure -> typestate_finding", description: "Run one registered diagnostic-neutral typestate analysis for the exact procedure root.", semantic: [Procedures, Typestate] }
+    ConcurrentAccessConflicts { shape: DerivedValue, label: "concurrent_access_conflicts", signature: "procedure -> concurrent_access_conflict", description: "Build a bounded spawn-rooted task slice and project exact ordinary accesses to the same location that may execute concurrently, including explicit ordering, protection, proof, and coverage.", semantic: [Procedures, Dispatch, ProgramPoints, ControlEdges, Concurrency] }
+    ValueFlow { shape: DerivedValue, label: "value_flow", signature: "procedure -> flow_endpoint", description: "Run one registered diagnostic-neutral value-flow plan for the exact procedure root.", semantic: [Procedures, ValueFlow] }
+    Taint { shape: DerivedValue, label: "taint", signature: "procedure -> taint_finding", description: "Project findings retained by one host-registered production taint result for the exact procedure root.", semantic: [Procedures, Taint] }
+    Witness { shape: DerivedValue, label: "witness", signature: "typestate_finding|flow_endpoint -> typestate_witness|flow_witness", description: "Project bounded retained evidence from each typestate finding or reached flow endpoint without rerunning analysis." }
+    FileOf { shape: RowLocal, label: "file_of", signature: "structural_match|declaration|procedure|program_point|control_edge|typestate_finding|typestate_witness|flow_endpoint|flow_witness|taint_finding|reference_site|call_site|expression_site|jsx_attribute_value|receiver_analysis|member_target_analysis|receiver_outcome|receiver_evidence|field_write_value|call_shape|call_argument_group|call_argument|call_binding|call_effect|call_result_contract|result_contract_use|result_contract_failure_use|procedure_effect|callable_signature|signature_parameter|decorated_parameter|callable_applicability|overload_selection|dispatch_outcome|dispatch_target|member_family|member_family_edge|state_event -> file", description: "Map structural matches, declarations, procedures, program points, control edges, typestate findings, typestate witnesses, flow endpoints, flow witnesses, taint findings, reference sites, call sites, expression sites, exact JSX attribute operands, receiver analyses, member-target analyses, receiver outcomes, receiver evidence, exact field-write operands, call-shape rows, call-result-contract rows, typed result-contract operation and failure-use rows, callable-signature rows, decorated-parameter rows, callable-applicability rows, overload-selection rows, dispatch rows, method-family rows, or state-event rows to their workspace files." }
+    ImportsOf { shape: RowLocal, label: "imports_of", signature: "file -> file", description: "Traverse one direct project-local import edge forward." }
+    ImportersOf { shape: DerivedValue, label: "importers_of", signature: "file -> file", description: "Traverse one direct project-local import edge backward." }
+    Supertypes { shape: DerivedValue, label: "supertypes", signature: "declaration -> declaration", description: "Traverse indexed supertypes from supported type declarations." }
+    Subtypes { shape: DerivedValue, label: "subtypes", signature: "declaration -> declaration", description: "Traverse indexed subtypes from supported type declarations." }
+    Members { shape: RowLocal, label: "members", signature: "declaration -> declaration", description: "Return direct indexed members of type declarations." }
+    Owner { shape: RowLocal, label: "owner", signature: "declaration -> declaration", description: "Return the exact indexed declaring type of member declarations." }
+    ReferencesOf { shape: DerivedValue, label: "references_of", signature: "declaration -> reference_site", description: "Return resolved source reference sites for exact indexed declarations." }
+    UsedBy { shape: DerivedValue, label: "used_by", signature: "declaration -> declaration", description: "Return exact declarations containing references to each input declaration." }
+    Uses { shape: RowLocal, label: "uses", signature: "declaration -> declaration", description: "Return exact declarations referenced by each input declaration." }
+    Callers { shape: DerivedValue, label: "callers", signature: "declaration -> declaration", description: "Traverse resolved incoming call edges to caller declarations, optionally to a bounded depth." }
+    Callees { shape: RowLocal, label: "callees", signature: "declaration -> declaration", description: "Traverse resolved outgoing call edges to callee declarations, optionally to a bounded depth." }
+    CallSitesTo { shape: DerivedValue, label: "call_sites_to", signature: "declaration -> call_site", description: "Return structured call sites whose resolved callee is each input declaration." }
+    CallSitesFrom { shape: RowLocal, label: "call_sites_from", signature: "declaration -> call_site", description: "Return structured call sites lexically owned by each input declaration." }
+    CallInput { shape: RowLocal, label: "call_input", signature: "call_site -> expression_site", description: "Project one direct receiver or formal-parameter input from each call site." }
+    JsxAttributeValue { shape: RowLocal, label: "jsx_attribute_value", signature: "structural_match -> jsx_attribute_value", description: "Project the exact normalized expression operand of JSX attributes, with intrinsic/component/unknown element identity and explicit incompleteness for unresolved semantic cases." }
+    ReceiverTargets { shape: DerivedValue, label: "receiver_targets", signature: "structural_match|reference_site|call_site|expression_site|occurrence -> receiver_analysis", description: "Analyze a bounded receiver value using adapter-provided structured facts." }
+    PointsTo { shape: DerivedValue, label: "points_to", signature: "structural_match|reference_site|expression_site|occurrence -> receiver_analysis", description: "Analyze bounded value provenance using adapter-provided structured facts." }
+    MemberTargets { shape: DerivedValue, label: "member_targets", signature: "structural_match|reference_site|occurrence -> member_target_analysis", description: "Resolve exact static member identities together with the receiver owner and model provenance used by bounded structured receiver analysis." }
+    FieldWriteValue { shape: RowLocal, label: "field_write_value", signature: "member_target_analysis -> field_write_value", description: "Project the exact right-hand expression of a simple assignment whose static member and receiver identities were proven by member_targets, optionally retaining only exact receiver/member identities." }
+    ReceiverOutcome { shape: RowLocal, label: "receiver_outcome", signature: "receiver_analysis|member_target_analysis -> receiver_outcome", description: "Project the mandatory terminal outcome row for each receiver or member-target analysis." }
+    ReceiverEvidence { shape: RowLocal, label: "receiver_evidence", signature: "receiver_analysis -> receiver_evidence", description: "Project zero or more parent-linked typed receiver evidence rows." }
+    CallShape { shape: RowLocal, label: "call_shape", signature: "structural_match|call_site|occurrence -> call_shape", description: "Project the mandatory structured call-shape outcome row for each exact call site, including its structurally decoded callee token and written argument count when available." }
+    CallResults { shape: RowLocal, label: "call_results", signature: "call_shape -> call_result", description: "Project the ordered normal result ports of each exact semantic call represented by a call-shape row. Each row carries the structural site identity, semantic call and procedure identities, zero-based result ordinal, procedure-local value identity, result point, and evidence quality so it can join assignments and guards without inferring source order.", semantic: [Procedures, ProgramPoints] }
+    CallArgumentGroups { shape: RowLocal, label: "call_argument_groups", signature: "call_shape -> call_argument_group", description: "Project the ordered argument-list group rows of each call shape." }
+    CallArguments { shape: RowLocal, label: "call_arguments", signature: "call_argument_group -> call_argument", description: "Project the ordered argument rows of each argument-list group." }
+    CallEffects { shape: RowLocal, label: "call_effects", signature: "call_shape -> call_effect", description: "Project the direct effect rows of each call shape: one row per (dispatch arm, declared effect) for every callee an active semantic-model pack declares effects for, carrying the effect id, the pack-authored timing, additive canonical execution timing, the certainty meet of the declaration and the dispatch proof, and the pack provenance. At least one row per call shape, so an unresolved, unmodeled or unsupported dispatch states that instead of answering empty. The callee set and its proof are the dispatch oracle's own answer; nothing is re-derived here.", semantic: [Procedures] }
+    ResultContractCalls { shape: Batched, label: "result_contract_calls", signature: "call_shape -> call_shape", description: "Retain call shapes whose exhaustively resolved canonical dispatch arms unanimously select an activated semantic-model summary with at least one reviewed result contract. This lightweight positive candidate discovery uses structural call shapes, exact definition resolution (including Go package, bound-receiver, and conservative method-expression applicability), and activated model keys without materializing procedure semantics: conclusively unmodeled calls are omitted, while conflicts or interrupted dispatch make the query incomplete." }
+    CallResultContracts { shape: Batched, label: "call_result_contracts", signature: "call_shape -> call_result_contract", description: "Project reviewed validity contracts for a call's normal results from the unique activated semantic-model summary for every possible dispatch arm. A positive row identifies the protected result ordinal and either a predicate over a separate condition result or a direct result-success predicate, derives only the exact normalized success-guard edges needed to instantiate that contract, counts reviewed member contracts, and reports whether every modeled arm declares a fresh allocation at that indexed result. It does not inspect resource-sensitive uses. At least one row per call shape; unresolved dispatch or conflicting models produce an explicit terminal row and incomplete query rather than an empty answer.", semantic: [Procedures, Dispatch, ProgramPoints, ControlEdges] }
+    ResultContractUses { shape: Batched, label: "result_contract_uses", signature: "call_result_contract -> call_result_contract", description: "Summarize operation-sensitive uses of each positive call-result-contract row while preserving acquisition identity. This optional enrichment counts every exact structured operation, reports the lower bound of reviewed required operations proved unguarded, and carries aggregate use-validation coverage. Terminal rows pass through unchanged; incomplete structured use evidence makes only this relation incomplete.", semantic: [Procedures, Dispatch, ProgramPoints, ControlEdges] }
+    ResultContractOperationUses { shape: Batched, label: "result_contract_operation_uses", signature: "call_result_contract -> result_contract_use", description: "Project one typed row per structured operation on a protected result. Intrinsic dereference, field, and index operations are required uses. Receiver calls use exact complete member operation contracts. Exact positional call arguments use complete possible-target procedure-entry preconditions and carry parameter_ordinal. Missing, conflicting, expanded, or ambiguous operation evidence stays open. Each row is anchored at the operation and carries its acquisition identity, exact applicability, timing, required predicate, and guarded, unguarded, not_applicable, or unknown verdict.", semantic: [Procedures, Dispatch, ProgramPoints, ControlEdges] }
+    ResultContractFailureUses { shape: Batched, label: "result_contract_failure_uses", signature: "call_result_contract -> result_contract_failure_use", description: "Project structured values returned or passed to calls inside the exact failure arm of a reviewed conditional result contract. Each row compares the operand's exact reaching binding/value provenance with the paired condition result and classifies condition_result, distinct_zero_binding, distinct_binding, independent, or unknown. Exact normalized failure-edge confinement and complete structured identity are required for closed proof; ambiguity remains an open unknown row.", semantic: [Procedures, Dispatch, ProgramPoints, ControlEdges] }
+    NilnessOperations { shape: RowLocal, label: "nilness_operations", signature: "procedure -> nilness_operation", description: "Project source-backed pointer operations with their procedure-local scalar nilness fact. Explicit dereferences and implicit pointer field loads or stores are intrinsic operations; receiver calls are included only when exhaustive reviewed models require a non-null receiver. Unsupported identity or scalar evidence stays explicit and open rather than becoming a finding.", semantic: [Procedures, Dispatch, ProgramPoints, ControlEdges] }
+    SwitchCoverage { shape: RowLocal, label: "switch_coverage", signature: "procedure -> switch_coverage", description: "Project one source-backed coverage verdict for each switch. An explicit default is exhaustive; an exact Boolean expression selector is exhaustive only with both literal cases and non-exhaustive when a complete literal case set omits either value. Expressionless switches without default, type switches, open selector domains, and nonliteral case sets remain unknown.", semantic: [Procedures, ProgramPoints, ControlEdges, SwitchFacts] }
+    DetachedTaskTransfers { shape: RowLocal, label: "detached_task_transfers", signature: "procedure -> detached_task_transfer", description: "Project receiver, argument, and exact local closure-capture values copied into calls whose semantic invocation mode is detached and whose execution timing is different_task. Each row carries stable value identity and an exact abstract-object identity when the heap oracle proves one closed candidate; absent, ambiguous, open, or unproven object sets remain explicit open terminal rows.", semantic: [Procedures, ProgramPoints] }
+    ProcedureEffects { shape: RowLocal, label: "procedure_effects", signature: "declaration -> procedure_effect", description: "Summarize the effects of each procedure over its reachable call graph: one row per (procedure, effect id), classified direct or transitive, with the hop count, the certainty and timing carried along the attributing chain, a bounded witness chain of call-site identities, and the coverage that says whether an absent effect is proven absent or merely unseen. At least one row per declaration. The walk is a bounded deterministic fixpoint over the same dispatch answers call_effects publishes.", semantic: [Procedures] }
+    CallBindings { shape: RowLocal, label: "call_bindings", signature: "call_shape -> call_binding", description: "Project the normalized actual-to-formal binding rows of each call shape: one row per written actual, carrying the call-shape argument identity it binds, the formal ordinal and name it was bound to, the binding kind, this row's mapping status, and the whole call's partition coverage. Beside them, a row for each fact no written actual accounts for: the receiver the call is made against, an argument the language supplies with no syntax, and a formal that no actual passed but whose declaration carries a default. Coverage describes the written actuals alone. Exact receiver rows carry a stable declaring-type identity. Selector proof is separate from runtime dispatch: it is derived for exact dispatch or for a resolver-proven receiverless external static target whose unique complete model supplies exact formals. It can also be authored-summary proof when a unique complete exact-member summary explicitly covers the sole unresolved override residual; full activated provenance is retained. Workspace arms, ambiguous overloads, partial or conflicting models, unproven owner identity, instance boundaries without a contract, other boundary kinds, and truncation remain inexact. The semantic dispatch identity, proof, completeness, and candidate coverage are still carried unchanged from the bounded dispatch answer. A source declaration is only an optional materialized view. At least one row per call shape, so an unreadable shape, an unresolved or ambiguous callee, unrecorded formals, or a call that binds nothing each state that instead of answering empty. The callee is the one the production definition resolver binds; no overload is re-decided here.", semantic: [Procedures, Dispatch] }
+    CallableSignature { shape: RowLocal, label: "callable_signature", signature: "declaration -> callable_signature", description: "Project the mandatory callable-signature rows of each declaration from the persisted signature contract: one row per persisted signature entry, so an overload set separates into one row per overload." }
+    SignatureParameters { shape: RowLocal, label: "signature_parameters", signature: "callable_signature -> signature_parameter", description: "Project the ordered declared parameter rows of each callable signature." }
+    DecoratorBindings { shape: Batched, label: "decorator_bindings", signature: "structural_match -> decorated_parameter", description: "Project one typed decorator-binding row for each decorator applied to a parameter match. Semantic parameter identity is used only when an exact structural source identity selects one Parameter value; otherwise the row retains only a syntax explanation and explicitly incomplete coverage.", semantic: [Procedures] }
+    CallableApplicability { shape: DerivedValue, label: "callable_applicability", signature: "occurrence -> callable_applicability", description: "Project one applicability row per candidate callable the production resolver considered for each reference occurrence: the verdict, the typed callable rejection reason when inapplicable, the precedence tier, and whether the resolver bound it. A candidate the resolver refused stays visible with its reason, so a losing overload is evidence rather than an absence." }
+    OverloadSelection { shape: DerivedValue, label: "overload_selection", signature: "occurrence -> overload_selection", description: "Project the mandatory overload-selection summary row for each reference occurrence: resolved_unique, ambiguous, unresolved, or unknown_shape, with the verdict counts it was computed from. Exactly one row per occurrence, and candidate order can never influence it -- zero applicable candidates stay unresolved and several equal winners stay ambiguous." }
+    MemberSelection { shape: DerivedValue, label: "member_selection", signature: "occurrence -> member_selection", description: "Project the mandatory member-selection summary row for each reference occurrence, from the production resolver's own candidate trace." }
+    DispatchOutcome { shape: DerivedValue, label: "dispatch_outcome", signature: "structural_match|call_site|reference_site|occurrence -> dispatch_outcome", description: "Project the mandatory bounded-dispatch outcome row for each input site: the semantic outcome, the candidate coverage, and the retained target count. Exactly one row per input site, so an unknown, unsupported, over-budget, or cancelled dispatch is stated rather than silently empty.", semantic: [Procedures, Dispatch] }
+    DispatchTargets { shape: DerivedValue, label: "dispatch_targets", signature: "structural_match|call_site|reference_site|occurrence -> dispatch_target", description: "Project zero or more bounded dispatch target rows for each input site, one per retained dispatch candidate plus one per boundary arm that names a target. Each row keeps the oracle's own proof, completeness, and candidate coverage, so a proven target in an exhaustive set stays distinguishable from an open may-dispatch arm.", semantic: [Procedures, Dispatch] }
+    MemberFamily { shape: DerivedValue, label: "member_family", signature: "declaration -> member_family", description: "Project the mandatory canonical method-family outcome row for each member declaration: the family id when the analyzer proves the family, the typed reason when it cannot, the per-relation edge counts, and the coverage. Exactly one row per input declaration, so an unsupported language or an unprovable overload identity is stated rather than silently empty." }
+    FamilyEdges { shape: DerivedValue, label: "family_edges", signature: "declaration -> member_family_edge", description: "Project the typed method-family edges of each member declaration: the forward overrides/implements edges the analyzer proves, plus the bounded inversion of those same edges as overridden_by/implemented_by. Emitted only from a proven family, so an unproven or unsupported member yields no edge row and its outcome row says why." }
+    OccurrencesOf { shape: DerivedValue, label: "occurrences_of", signature: "declaration -> occurrence", description: "Return the declaration-name occurrence of each declaration plus every reference-class occurrence resolving to it." }
+    OccurrencesIn { shape: RowLocal, label: "occurrences_in", signature: "structural_match|file -> occurrence", description: "Return classified identifier occurrences lexically inside each structural match or file." }
+    OccurrenceTarget { shape: DerivedValue, label: "occurrence_target", signature: "occurrence -> declaration", description: "Project the resolved semantic targets of reference-class occurrences." }
+    ScopeOf { shape: RowLocal, label: "scope_of", signature: "binding|occurrence|structural_match -> lexical_scope", description: "Return the innermost lexical scope that owns each binding, occurrence, or structural match." }
+    ScopeAncestors { shape: RowLocal, label: "scope_ancestors", signature: "lexical_scope -> lexical_scope", description: "Return the enclosing lexical scopes of each scope, innermost first, excluding the scope itself." }
+    BindingsIn { shape: RowLocal, label: "bindings_in", signature: "lexical_scope|structural_match -> binding", description: "Return the bindings declared in each lexical scope, or in the scopes inside each structural match." }
+    BindingOf { shape: RowLocal, label: "binding_of", signature: "occurrence -> binding", description: "Return the binding of the occurrence's name that is in effect at its exact position." }
+    BindingOccurrence { shape: RowLocal, label: "binding_occurrence", signature: "binding -> occurrence", description: "Return the binder-class occurrence row of each binding's declaring token." }
+    CandidatesOf { shape: DerivedValue, label: "candidates_of", signature: "occurrence -> resolution_candidate", description: "Return the candidates the resolver considered for each reference-class occurrence, with tier, outcome, and boundary." }
+    CandidateHierarchy { shape: DerivedValue, label: "candidate_hierarchy", signature: "occurrence -> candidate_hop", description: "Return the exact hierarchy hops each traced member candidate of a reference occurrence was found through. A depth-zero candidate contributes no hop, and a candidate the resolver recorded without member attribution contributes none either -- absence here is unattributed, never a claim that no hierarchy was walked; the mandatory outcome story is member_selection's." }
+    CandidateTarget { shape: DerivedValue, label: "candidate_target", signature: "resolution_candidate -> declaration", description: "Project the workspace declarations of unit-backed resolution candidates." }
+    EdgesOf { shape: DerivedValue, label: "edges_of", signature: "declaration -> reference_edge", description: "Return the canonical inverse reference edges of each declaration: every usage site the usage index enumerates, with kind, proof, usage kind, and owner relation." }
+    EdgesFrom { shape: RowLocal, label: "edges_from", signature: "occurrence -> reference_edge", description: "Return the canonical forward reference edges of each occurrence: the resolver's own resolved targets for that exact token, with kind, proof, usage kind, and owner relation." }
+    EdgeTarget { shape: DerivedValue, label: "edge_target", signature: "reference_edge -> declaration", description: "Project each reference edge to its exact indexed target declaration." }
+    StateEventsOf { shape: RowLocal, label: "state_events_of", signature: "procedure|declaration -> state_event", description: "Derive the flow-sensitive state events of each procedure from the production semantic IR: every establishment, kill, and read of a binding or of a property of a canonical binding base, anchored to a program point of that procedure's control-flow graph. Source order and containment are never evidence; an axis the lowering does not model is reported incomplete rather than approximated.", semantic: [Procedures, ProgramPoints] }
+    FlowRelationsOf { shape: RowLocal, label: "flow_relations_of", signature: "state_event|procedure -> flow_relation", description: "Derive the flow relations between the state events of each procedure: reaching-definition, dominance, and same-evaluation, each with exact or may certainty. Seeded from a state event, only the relations incident to that event are returned. Budget exhaustion emits no rows and an explicit incomplete diagnostic; it is never reported as an absent relation.", semantic: [Procedures, ProgramPoints, ControlEdges] }
+    FlowSource { shape: RowLocal, label: "flow_source", signature: "flow_relation -> state_event", description: "Project each flow relation to its source state event: the establishment or kill end." }
+    FlowTarget { shape: RowLocal, label: "flow_target", signature: "flow_relation -> state_event", description: "Project each flow relation to its target state event: the read end." }
+    ControlRelations { shape: RowLocal, label: "control_relations", signature: "procedure -> control_relation", description: "Derive the control relations of each procedure from the shared control-flow algorithms over the production semantic IR: dominance, postdominance, control dependence, entry reachability, and loop membership between the procedure's own program points, joined by the same stable ids the program_point and control_edge rows publish. Every row states the exit partition its claim was computed against, so a backward claim can never be read as a claim about a partition that was not computed. Budget exhaustion or cancellation emits no row for the affected relation and an explicit incomplete diagnostic; it is never reported as an absent relation.", semantic: [Procedures, ProgramPoints, ControlEdges] }
+    GuardsOf { shape: RowLocal, label: "guards_of", signature: "procedure -> guard", description: "Return the normalized branch conditions the language adapter recorded for each procedure: which decision point each guard sits on, what its condition was normalized to -- a compile-time constant, a null comparison, a comparison against a constant, or an explicitly opaque condition -- and the stable ids of the true and false successor edges and target points. A constant condition is published even when lowering folded its dead arm away, which is the only place that evidence survives. An empty answer means the adapter records no guard facts for this language, which its own guard_facts capability states.", semantic: [Procedures, ProgramPoints, ControlEdges] }
+    TargetOf { shape: DerivedValue, label: "target_of", signature: "file -> build_target", description: "Return the build target each file compiles into, as the workspace's own build files declare it. Ownership comes from build evidence alone: a file no read build file claims produces no row, and a build model this workspace cannot read produces an explicit incomplete diagnostic rather than an empty answer that reads as \"no target\"." }
+    SourceSetOf { shape: DerivedValue, label: "source_set_of", signature: "file -> source_set", description: "Return the declared compilation input set each file belongs to, with the build file that fixes the layout. A file two declared source sets both claim is reported ambiguous rather than assigned to whichever was read first." }
+    TopologyEdgesOf { shape: DerivedValue, label: "topology_edges_of", signature: "build_target -> topology_edge", description: "Return the dependencies each build target declares on other targets of the same workspace, each carrying its build-declared scope and the build file that declares it. The absence of an edge is only publishable when the topology it was read from is complete, which the row's own completeness column states." }
+    RewritePathsOf { shape: RowLocal, label: "rewrite_paths_of", signature: "file -> rewrite_path", description: "Enumerate the bounded rewrite chases each file engages in a declared finite rewrite domain: the ordered steps a production analysis took, the bound the domain declared for itself, and the terminal outcome -- converged with its fixed point, cycle with the ordered repeated-state witness, or exceeded-budget with the work performed. Budget exhaustion is absence of evidence, never a proven cycle and never a clean convergence." }
+    SegmentsOf { shape: RowLocal, label: "segments_of", signature: "qualified_path -> path_segment", description: "Return each path's ordered segment rows with decoded text, spelled generic arity, and (with :resolved true) each segment's own prefix resolution." }
+    SegmentTarget { shape: DerivedValue, label: "segment_target", signature: "path_segment -> declaration", description: "Project the workspace declarations each path segment's own position resolves to." }
+    Generates { shape: RowLocal, label: "generates", signature: "generation_site -> declaration_state", description: "Return the declaration-state rows of the declarations each generation site materializes." }
+    GeneratedBy { shape: RowLocal, label: "generated_by", signature: "declaration|declaration_state -> generation_site", description: "Return the generation site that materialized each generated declaration." }
+    DeclarationStateOf { shape: RowLocal, label: "declaration_state_of", signature: "declaration -> declaration_state", description: "Return each declaration's state row: origin, declaration-only flag, and configuration gate." }
+    ImplementationOf { shape: RowLocal, label: "implementation_of", signature: "declaration_state|declaration -> declaration", description: "Return the runnable implementation a declaration-only signature links to." }
+    StubsOf { shape: RowLocal, label: "stubs_of", signature: "declaration -> declaration_state", description: "Return the declaration-only stub state rows whose implementation link resolves to each declaration; composed with except, this lists the stubs no implementation answers." }
+    ExportTarget { shape: DerivedValue, label: "export_target", signature: "export -> declaration", description: "Project the declaration an export row materialized, where the analyzer models one." }
 }
 
 /// The generated step reference: one line per registry step, in
@@ -679,6 +728,7 @@ macro_rules! rql_forms {
                     | Self::CfgEdgeSource
                     | Self::CfgEdgeTarget
                     | Self::Typestate
+                    | Self::ConcurrentAccessConflicts
                     | Self::ValueFlow
                     | Self::Taint
                     | Self::Witness
@@ -701,6 +751,7 @@ macro_rules! rql_forms {
                     | Self::ReceiverTargets
                     | Self::PointsTo
                     | Self::MemberTargets
+                    | Self::FieldWriteValue
                     | Self::ReceiverOutcome
                     | Self::ReceiverEvidence
                     | Self::CallShape
@@ -714,6 +765,9 @@ macro_rules! rql_forms {
                     | Self::ResultContractUses
                     | Self::ResultContractOperationUses
                     | Self::ResultContractFailureUses
+                    | Self::NilnessOperations
+                    | Self::SwitchCoverage
+                    | Self::DetachedTaskTransfers
                     | Self::ProcedureEffects
                     | Self::CallableSignature
                     | Self::SignatureParameters
@@ -938,6 +992,14 @@ rql_forms! {
         description: (QueryStepOp::Typestate),
         step: Typestate,
     }
+    ConcurrentAccessConflicts {
+        labels: ["concurrent-access-conflicts", "concurrent_access_conflicts"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(concurrent-access-conflicts query)",
+        description: (QueryStepOp::ConcurrentAccessConflicts),
+        step: ConcurrentAccessConflicts,
+    }
     ValueFlow {
         labels: ["value-flow", "value_flow"],
         class: Wrapper,
@@ -1114,6 +1176,14 @@ rql_forms! {
         description: (QueryStepOp::MemberTargets),
         step: MemberTargets,
     }
+    FieldWriteValue {
+        labels: ["field-write-value", "field_write_value"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(field-write-value [:receiver-identity-id id] [:member-target-id id] query)",
+        description: (QueryStepOp::FieldWriteValue),
+        step: FieldWriteValue,
+    }
     ReceiverOutcome {
         labels: ["receiver-outcome", "receiver_outcome"],
         class: Wrapper,
@@ -1217,6 +1287,30 @@ rql_forms! {
         signature: "(result-contract-failure-uses [:provenance [condition-result ...]] [:consumer [return ...]] query)",
         description: (QueryStepOp::ResultContractFailureUses),
         step: ResultContractFailureUses,
+    }
+    NilnessOperations {
+        labels: ["nilness-operations", "nilness_operations"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(nilness-operations query)",
+        description: (QueryStepOp::NilnessOperations),
+        step: NilnessOperations,
+    }
+    SwitchCoverage {
+        labels: ["switch-coverage", "switch_coverage"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(switch-coverage query)",
+        description: (QueryStepOp::SwitchCoverage),
+        step: SwitchCoverage,
+    }
+    DetachedTaskTransfers {
+        labels: ["detached-task-transfers", "detached_task_transfers"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(detached-task-transfers query)",
+        description: (QueryStepOp::DetachedTaskTransfers),
+        step: DetachedTaskTransfers,
     }
     ProcedureEffects {
         labels: ["procedure-effects", "procedure_effects"],
@@ -1915,6 +2009,8 @@ json_fields! {
     ElementName { label: "element_name", shape: String, signature: "\"element_name\": \"name\"", description: "Restrict JSX value rows to one exact unqualified element tag name." }
     PropertyName { label: "property_name", shape: String, signature: "\"property_name\": \"name\"", description: "Restrict JSX value rows to one exact JSX attribute or object-property name." }
     Capture { label: "capture", shape: CaptureName, signature: "\"capture\": \"declared_name\"", description: "Analyze every unique range bound to a declared positive structural capture." }
+    ReceiverIdentityId { label: "receiver_identity_id", shape: String, signature: "\"receiver_identity_id\": \"stable-id\"", description: "Retain field-write rows whose already-proven receiver identity equals this exact analyzer or semantic-model identity." }
+    MemberTargetId { label: "member_target_id", shape: String, signature: "\"member_target_id\": \"stable-id\"", description: "Retain field-write rows whose already-proven static member identity equals this exact analyzer or semantic-model identity." }
     ProtocolRef { label: "protocol_ref", shape: ProtocolRef, signature: "\"protocol_ref\": \"namespace:name\"", description: "Select one host-registered compiled protocol and binding plan." }
     PlanRef { label: "plan_ref", shape: ValueFlowPlanRef, signature: "\"plan_ref\": \"namespace:name\"", description: "Select one host-registered immutable value-flow plan." }
     TaintRef { label: "taint_ref", shape: TaintResultRef, signature: "\"taint_ref\": \"namespace:name\"", description: "Select one host-registered immutable retained production taint result." }
@@ -2044,6 +2140,16 @@ const JSX_ATTRIBUTE_VALUE_STEP_OPTIONS: &[QueryStepOption] = &[
     QueryStepOption::optional(
         QueryStepField::PropertyName,
         &[":property-name", ":property_name"],
+    ),
+];
+const FIELD_WRITE_VALUE_STEP_OPTIONS: &[QueryStepOption] = &[
+    QueryStepOption::optional(
+        QueryStepField::ReceiverIdentityId,
+        &[":receiver-identity-id", ":receiver_identity_id"],
+    ),
+    QueryStepOption::optional(
+        QueryStepField::MemberTargetId,
+        &[":member-target-id", ":member_target_id"],
     ),
 ];
 const WITNESS_STEP_OPTIONS: &[QueryStepOption] = &[
@@ -2222,6 +2328,7 @@ impl QueryStepOp {
             Self::ValueFlow => VALUE_FLOW_STEP_OPTIONS,
             Self::Taint => TAINT_STEP_OPTIONS,
             Self::JsxAttributeValue => JSX_ATTRIBUTE_VALUE_STEP_OPTIONS,
+            Self::FieldWriteValue => FIELD_WRITE_VALUE_STEP_OPTIONS,
             Self::Witness => WITNESS_STEP_OPTIONS,
             Self::OccurrencesOf | Self::OccurrencesIn => OCCURRENCE_STEP_OPTIONS,
             Self::BindingsIn => BINDING_STEP_OPTIONS,

@@ -1,14 +1,15 @@
 use super::artifact::{
-    ArtifactEncoding, ArtifactError, CompiledConditionalResultRefinement, CompiledDeclaredEffect,
-    CompiledDeclaredEffectCertainty, CompiledDeclaredEffectTiming, CompiledNormalReturnRefinement,
-    CompiledOperationPrecondition, CompiledPackManifest, CompiledPayload,
-    CompiledPredicateProofEffect, CompiledProcedureSummary, CompiledProcedureTarget,
-    CompiledResultContract, CompiledResultMemberContract, CompiledResultPredicate,
-    CompiledSemanticModelPack, CompiledShard, CompiledShardArtifact, CompiledShardDescriptor,
-    CompiledSummaryEffect, CompiledSummaryExitKind, CompiledSummaryInput, CompiledSummaryLocation,
-    CompiledSummaryLocationKind, CompiledSummaryOutput, CompiledSummaryTransfer, DecodeLimits,
-    canonical_json, content_digest, manifest_content_digest, manifest_semantic_digest,
-    payload_inventory, routing_keys, semantic_digest, stored_digest,
+    ArtifactEncoding, ArtifactError, CompiledAtomicOperation, CompiledConcurrencyEffect,
+    CompiledConditionalIndirectWrite, CompiledConditionalResultRefinement, CompiledDeclaredEffect,
+    CompiledDeclaredEffectCertainty, CompiledDeclaredEffectTiming, CompiledIndirectWriteTarget,
+    CompiledLockMode, CompiledNormalReturnRefinement, CompiledOperationPrecondition,
+    CompiledPackManifest, CompiledPayload, CompiledPredicateProofEffect, CompiledProcedureSummary,
+    CompiledProcedureTarget, CompiledResultContract, CompiledResultMemberContract,
+    CompiledResultPredicate, CompiledSemanticModelPack, CompiledShard, CompiledShardArtifact,
+    CompiledShardDescriptor, CompiledSummaryEffect, CompiledSummaryExitKind, CompiledSummaryInput,
+    CompiledSummaryLocation, CompiledSummaryLocationKind, CompiledSummaryOutput,
+    CompiledSummaryTransfer, DecodeLimits, canonical_json, content_digest, manifest_content_digest,
+    manifest_semantic_digest, payload_inventory, routing_keys, semantic_digest, stored_digest,
 };
 use super::model::*;
 use super::source::{SourceFormat, parse_source};
@@ -298,6 +299,10 @@ pub(crate) fn normalize(mut pack: AuthoredSemanticModelPack) -> AuthoredSemantic
                     }
                     summary.effects.sort_by_cached_key(canonical_sort_key);
                     summary.effects.dedup();
+                    summary
+                        .concurrency_effects
+                        .sort_by_cached_key(canonical_sort_key);
+                    summary.concurrency_effects.dedup();
                     // Declared effects (#2437) are a set keyed by id; validation
                     // already rejected two entries sharing one id, so sorting by
                     // id is a total order over what survives.
@@ -319,6 +324,8 @@ pub(crate) fn normalize(mut pack: AuthoredSemanticModelPack) -> AuthoredSemantic
                     summary.result_contracts.dedup();
                     summary.conditional_result_refinements.sort();
                     summary.conditional_result_refinements.dedup();
+                    summary.conditional_indirect_writes.sort();
+                    summary.conditional_indirect_writes.dedup();
                     summary.normal_return_refinements.sort();
                     summary.normal_return_refinements.dedup();
                 }
@@ -441,6 +448,11 @@ fn compile_procedure_summary(
             })
             .collect(),
         effects: summary.effects.iter().map(compile_summary_effect).collect(),
+        concurrency_effects: summary
+            .concurrency_effects
+            .iter()
+            .map(compile_concurrency_effect)
+            .collect(),
         declared_effects: summary
             .declared_effects
             .iter()
@@ -508,6 +520,18 @@ fn compile_procedure_summary(
                 },
             })
             .collect(),
+        conditional_indirect_writes: summary
+            .conditional_indirect_writes
+            .iter()
+            .map(|write| CompiledConditionalIndirectWrite {
+                result_ordinal: write.result_ordinal,
+                outcome: write.outcome,
+                parameter_ordinal: write.parameter_ordinal,
+                target: match write.target {
+                    AuthoredIndirectWriteTarget::Pointee => CompiledIndirectWriteTarget::Pointee,
+                },
+            })
+            .collect(),
         normal_return_refinements: summary
             .normal_return_refinements
             .iter()
@@ -523,6 +547,8 @@ fn compile_result_predicate(predicate: AuthoredResultPredicate) -> CompiledResul
     match predicate {
         AuthoredResultPredicate::Null => CompiledResultPredicate::Null,
         AuthoredResultPredicate::NonNull => CompiledResultPredicate::NonNull,
+        AuthoredResultPredicate::True => CompiledResultPredicate::True,
+        AuthoredResultPredicate::False => CompiledResultPredicate::False,
     }
 }
 
@@ -547,6 +573,72 @@ fn compile_summary_input(input: &AuthoredSummaryInput) -> CompiledSummaryInput {
         AuthoredSummaryInput::Parameter { ordinal } => {
             CompiledSummaryInput::Parameter { ordinal: *ordinal }
         }
+    }
+}
+
+fn compile_concurrency_effect(effect: &AuthoredConcurrencyEffect) -> CompiledConcurrencyEffect {
+    match effect {
+        AuthoredConcurrencyEffect::Unsupported { protocol } => {
+            CompiledConcurrencyEffect::Unsupported {
+                protocol: protocol.clone(),
+            }
+        }
+        AuthoredConcurrencyEffect::TaskSpawn { callable, group } => {
+            CompiledConcurrencyEffect::TaskSpawn {
+                callable: compile_summary_input(callable),
+                group: group.as_ref().map(compile_summary_input),
+            }
+        }
+        AuthoredConcurrencyEffect::TaskJoin { group } => CompiledConcurrencyEffect::TaskJoin {
+            group: compile_summary_input(group),
+        },
+        AuthoredConcurrencyEffect::LockAcquire { lock, mode } => {
+            CompiledConcurrencyEffect::LockAcquire {
+                lock: compile_summary_input(lock),
+                mode: match mode {
+                    AuthoredLockMode::Shared => CompiledLockMode::Shared,
+                    AuthoredLockMode::Exclusive => CompiledLockMode::Exclusive,
+                },
+            }
+        }
+        AuthoredConcurrencyEffect::LockRelease { lock, mode } => {
+            CompiledConcurrencyEffect::LockRelease {
+                lock: compile_summary_input(lock),
+                mode: match mode {
+                    AuthoredLockMode::Shared => CompiledLockMode::Shared,
+                    AuthoredLockMode::Exclusive => CompiledLockMode::Exclusive,
+                },
+            }
+        }
+        AuthoredConcurrencyEffect::WaitGroupAdd { group, delta } => {
+            CompiledConcurrencyEffect::WaitGroupAdd {
+                group: compile_summary_input(group),
+                delta: compile_summary_input(delta),
+            }
+        }
+        AuthoredConcurrencyEffect::WaitGroupDone { group } => {
+            CompiledConcurrencyEffect::WaitGroupDone {
+                group: compile_summary_input(group),
+            }
+        }
+        AuthoredConcurrencyEffect::WaitGroupWait { group } => {
+            CompiledConcurrencyEffect::WaitGroupWait {
+                group: compile_summary_input(group),
+            }
+        }
+        AuthoredConcurrencyEffect::Atomic {
+            location,
+            operation,
+        } => CompiledConcurrencyEffect::Atomic {
+            location: compile_summary_input(location),
+            operation: match operation {
+                AuthoredAtomicOperation::Load => CompiledAtomicOperation::Load,
+                AuthoredAtomicOperation::Store => CompiledAtomicOperation::Store,
+                AuthoredAtomicOperation::ReadModifyWrite => {
+                    CompiledAtomicOperation::ReadModifyWrite
+                }
+            },
+        },
     }
 }
 

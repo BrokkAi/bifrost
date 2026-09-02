@@ -50,11 +50,11 @@ use crate::analyzer::usages::get_definition::{
     resolve_definition_batch_with_source_and_cancellation,
 };
 use crate::analyzer::usages::receiver_analysis::{
-    ReceiverAnalysisBudget, ReceiverAnalysisOutcome, ReceiverValue,
+    ReceiverAnalysisBudget, ReceiverAnalysisOutcome, ReceiverIdentityProof, ReceiverValue,
 };
 use crate::analyzer::usages::receiver_query::{
-    ReceiverQueryAnalysis, ReceiverQueryError, ReceiverQueryInput, ReceiverQueryOperation,
-    ReceiverQueryReport, ReceiverQueryService,
+    ReceiverMemberTarget, ReceiverQueryAnalysis, ReceiverQueryError, ReceiverQueryInput,
+    ReceiverQueryOperation, ReceiverQueryReport, ReceiverQueryService,
 };
 use crate::analyzer::usages::{
     CallBindingCache, CallBindingStatus, CallRelationDiagnostic, CallRelationDiagnosticCode,
@@ -62,7 +62,9 @@ use crate::analyzer::usages::{
     ExplicitCandidateProvider, FuzzyResult, ReferenceHit, ReferenceKind, UsageFinder, UsageHitKind,
     UsageProof, bind_call_site_arguments,
 };
-use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile, Range, WorkspaceAnalyzer};
+use crate::analyzer::{
+    CodeUnit, IAnalyzer, Language, ProjectFile, Range, SubsetCoverage, WorkspaceAnalyzer,
+};
 use crate::cancellation::CancellationToken;
 use crate::hash::{HashMap, HashSet};
 use crate::path_utils::rel_path_string;
@@ -73,15 +75,16 @@ use crate::structural::analysis_context::{
 };
 use crate::structural::capabilities::QueryFeature;
 use crate::text_utils::{compute_line_starts, line_column_for_offset};
+use brokk_bifrost_analysis::searchtools::session_subset;
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_rql::schema::{reference_kind_label, usage_proof_label};
 use brokk_bifrost_rql::{
     CallInputSelector, CallSiteTraversalFilter, CallTraversalFilter, CodeQuery,
     CodeQueryExecutionMode, CodeQueryPlan, CodeQueryPlanSource, CodeQueryResultDetail,
-    CodeQuerySeed, HierarchyTraversal, PathFilter, Pattern, QueryError, QueryStep,
-    ReferenceTraversalFilter, SetOperator,
+    CodeQuerySeed, FieldWriteValueTraversal, HierarchyTraversal, PathFilter, Pattern, QueryError,
+    QueryStep, ReferenceTraversalFilter, SetOperator,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -92,6 +95,7 @@ mod applicability;
 mod call_binding;
 mod call_shape;
 mod callable_signature;
+mod concurrency;
 mod control_relations;
 mod decorator_binding;
 mod dispatch;
@@ -100,6 +104,7 @@ mod effects;
 mod environment;
 mod execution;
 pub(crate) mod expansions;
+mod field_write;
 mod flow_state;
 mod guards;
 mod imports;
@@ -118,12 +123,14 @@ use crate::analyzer::{AnalyzerQueryScope, QueryScope};
 use applicability::{CallableApplicabilityValue, OverloadSelectionValue};
 use call_binding::CallBindingValue;
 use callable_signature::{CallableSignatureValue, SignatureParameterValue};
+use concurrency::ConcurrentAccessConflictValue;
 use control_relations::{ControlRelationKey, ControlRelationTraversalCache, ControlRelationValue};
 use decorator_binding::DecoratedParameterValue;
 use dispatch::{DispatchSiteValue, DispatchTargetValue};
 use effects::{
-    CallEffectValue, CallResultContractValue, EffectTraversalCache, ProcedureEffectValue,
-    ResultContractFailureUseValue, ResultContractUseValue,
+    CallEffectValue, CallResultContractValue, DetachedTaskTransferValue, EffectTraversalCache,
+    NilnessOperationValue, ProcedureEffectValue, ResultContractFailureUseValue,
+    ResultContractUseValue, SwitchCoverageValue,
 };
 use environment::{
     BindingKey, BindingValue, CandidateHopKey, CandidateHopValue, CandidateKey, CandidateValue,
@@ -154,6 +161,7 @@ mod taint;
 mod tests;
 mod topology_rows;
 mod typestate;
+mod units;
 mod value_flow;
 mod witness_projection;
 
@@ -176,6 +184,15 @@ use semantic::{
 };
 use taint::SemanticTaintFindingValue;
 use typestate::{SemanticTypestateFindingValue, SemanticTypestateWitnessValue};
+use units::unit_row_key;
+pub use units::{
+    CodeQueryExecutionScope, MergedLimit, MergedUnitRows, UnitExecutionResult, UnitRow,
+    UnitRowEvidence, UnitRowIdentities, UnitRowIdentityCandidate, UnitRowItem,
+    UnitRowItemProvenance, UnitRowItemProvenanceStep, UnitRowItemRef, UnitRowItemRefValue,
+    UnitRowItemTerminal, UnitRowItemValue, UnitRowKey, UnitRowProvenance, UnitRowProvenanceRef,
+    UnitRowProvenanceStep, execute_code_query_unit, merge_unit_rows, plan_seed_files,
+    seed_file_order, structural_seed_file_order,
+};
 pub(crate) use value_flow::public_witness_step;
 use value_flow::{SemanticFlowEndpointValue, SemanticFlowWitnessValue};
 pub(crate) use witness_projection::project_taint_finding_report_bounded;
@@ -208,6 +225,7 @@ use brokk_bifrost_rql::{
 };
 pub use results::ALL_DETAILED_CODE_QUERY_DOMAINS;
 pub use results::CodeQueryBinding;
+pub use results::CodeQueryBudgetedWork;
 pub use results::CodeQueryCallArgument;
 pub use results::CodeQueryCallArgumentGroup;
 pub use results::CodeQueryCallBinding;
@@ -223,10 +241,12 @@ pub use results::CodeQueryCandidateHop;
 pub use results::CodeQueryCandidateRef;
 pub use results::CodeQueryCapture;
 pub use results::CodeQueryCompletion;
+pub use results::CodeQueryConcurrentAccessConflict;
 pub use results::CodeQueryControlEdge;
 pub use results::CodeQueryDeclaration;
 pub use results::CodeQueryDeclarationState;
 pub use results::CodeQueryDecoratedParameter;
+pub use results::CodeQueryDetachedTaskTransfer;
 pub use results::CodeQueryDiagnostic;
 pub use results::CodeQueryDiagnosticCode;
 pub use results::CodeQueryDiagnosticImpact;
@@ -237,6 +257,7 @@ pub use results::CodeQueryExecutionLimits;
 pub use results::CodeQueryExecutionWork;
 pub use results::CodeQueryExport;
 pub use results::CodeQueryExpressionSite;
+pub use results::CodeQueryFieldWriteValue;
 pub use results::CodeQueryFile;
 pub use results::CodeQueryFlowCarrierSymbol;
 pub use results::CodeQueryFlowCertainty;
@@ -262,6 +283,9 @@ pub use results::CodeQueryMatch;
 pub use results::CodeQueryMemberFamily;
 pub use results::CodeQueryMemberFamilyEdge;
 pub use results::CodeQueryMemberSelection;
+pub use results::CodeQueryMemberTarget;
+pub use results::CodeQueryMemberTargetAnalysis;
+pub use results::CodeQueryNilnessOperation;
 pub use results::CodeQueryOccurrence;
 pub use results::CodeQueryOccurrenceTarget;
 pub use results::CodeQueryOverloadSelection;
@@ -305,6 +329,7 @@ pub use results::CodeQuerySignatureParameter;
 pub use results::CodeQuerySourceSite;
 pub use results::CodeQueryStableOwnerCandidate;
 pub use results::CodeQueryStableOwnerDerivation;
+pub use results::CodeQuerySwitchCoverage;
 pub use results::CodeQueryTaintFinding;
 pub use results::CodeQueryTaintLimits;
 pub use results::CodeQueryTaintOrigin;
@@ -333,6 +358,7 @@ pub use results::DetailedCodeQueryProvenanceRefEvidence;
 pub(crate) use results::DetailedCodeQueryProvenanceStepEvidence;
 pub(crate) use results::DetailedCodeQueryResult;
 pub(crate) use results::UnionExecutionStrategy;
+pub use results::code_query_completion;
 pub use results::{CodeQueryFlowRelation, CodeQueryStateEvent, CodeQueryStateEventRef};
 pub use results::{CodeQueryRewritePath, CodeQueryRewriteStep};
 
@@ -600,6 +626,51 @@ struct ReceiverEvidenceValue {
     factory: Option<CodeUnit>,
 }
 
+/// Exact right-hand operand of one proven static member assignment.
+#[derive(Debug, Clone)]
+struct FieldWriteValue {
+    seed: Arc<SeedMatch>,
+    analysis: ReceiverAnalysisValue,
+    target: ReceiverMemberTarget,
+    assignment_node: u32,
+    left_node: u32,
+    receiver_node: u32,
+    member_node: u32,
+    rhs_node: u32,
+}
+
+impl FieldWriteValue {
+    fn ast_id(&self, node: u32) -> String {
+        crate::analyzer::structural::occurrence_rows::ast_id(
+            self.seed.facts.source_identity(),
+            node,
+        )
+    }
+
+    fn assignment_ast_id(&self) -> String {
+        self.ast_id(self.assignment_node)
+    }
+
+    fn rhs_ast_id(&self) -> String {
+        self.ast_id(self.rhs_node)
+    }
+
+    fn id(&self) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(b"bifrost.field_write_value.v1");
+        hasher.update(self.assignment_ast_id().as_bytes());
+        hasher.update(self.rhs_ast_id().as_bytes());
+        hasher.update(
+            self.target
+                .receiver_identity_id()
+                .expect("field-write targets retain an exact receiver identity")
+                .as_bytes(),
+        );
+        hasher.update(self.target.member_identity_id().as_bytes());
+        format!("{:x}", hasher.finalize())
+    }
+}
+
 /// One derived call-shape report shared by its outcome, group, and argument
 /// pipeline rows. Group and argument values index into the shared report
 /// instead of cloning row data per pipeline expansion.
@@ -734,8 +805,10 @@ enum PipelineValue {
     ExpressionSite(ExpressionSiteValue),
     JsxAttributeValue(Box<JsxAttributeValue>),
     ReceiverAnalysis(ReceiverAnalysisValue),
+    MemberTargetAnalysis(ReceiverAnalysisValue),
     ReceiverOutcome(ReceiverAnalysisValue),
     ReceiverEvidence(ReceiverEvidenceValue),
+    FieldWriteValue(Box<FieldWriteValue>),
     CallShape(CallShapeValue),
     CallArgumentGroup(CallArgumentGroupValue),
     CallArgument(CallArgumentValue),
@@ -744,6 +817,10 @@ enum PipelineValue {
     CallResultContract(Box<CallResultContractValue>),
     ResultContractUse(Box<ResultContractUseValue>),
     ResultContractFailureUse(Box<ResultContractFailureUseValue>),
+    NilnessOperation(Box<NilnessOperationValue>),
+    SwitchCoverage(Box<SwitchCoverageValue>),
+    ConcurrentAccessConflict(Box<ConcurrentAccessConflictValue>),
+    DetachedTaskTransfer(Box<DetachedTaskTransferValue>),
     ProcedureEffect(Box<ProcedureEffectValue>),
     CallableSignature(Box<CallableSignatureValue>),
     SignatureParameter(Box<SignatureParameterValue>),
@@ -831,8 +908,10 @@ enum PipelineKey {
     ExpressionSite(ExpressionSiteValue),
     JsxAttributeValue(String),
     ReceiverAnalysis(ReceiverQueryOperation, ProjectFile, Range),
+    MemberTargetAnalysis(ReceiverQueryOperation, ProjectFile, Range),
     ReceiverOutcome(String),
     ReceiverEvidence(String),
+    FieldWriteValue(String),
     CallShape(String),
     CallArgumentGroup(String),
     CallArgument(String),
@@ -841,6 +920,10 @@ enum PipelineKey {
     CallResultContract(String),
     ResultContractUse(String),
     ResultContractFailureUse(String),
+    NilnessOperation(String),
+    SwitchCoverage(String),
+    ConcurrentAccessConflict(String),
+    DetachedTaskTransfer(String),
     ProcedureEffect(String),
     CallableSignature(String),
     SignatureParameter(String),
@@ -904,8 +987,14 @@ impl PipelineValue {
                 value.report.site.file.clone(),
                 value.report.site.range,
             ),
+            Self::MemberTargetAnalysis(value) => PipelineKey::MemberTargetAnalysis(
+                value.report.operation,
+                value.report.site.file.clone(),
+                value.report.site.range,
+            ),
             Self::ReceiverOutcome(value) => PipelineKey::ReceiverOutcome(value.site_id.clone()),
             Self::ReceiverEvidence(value) => PipelineKey::ReceiverEvidence(value.id.clone()),
+            Self::FieldWriteValue(value) => PipelineKey::FieldWriteValue(value.id()),
             Self::CallShape(value) => PipelineKey::CallShape(value.report.outcome.site_id.clone()),
             Self::CallArgumentGroup(value) => PipelineKey::CallArgumentGroup(
                 value.shape.report.groups[value.group_index].id.clone(),
@@ -921,6 +1010,14 @@ impl PipelineValue {
             Self::ResultContractUse(value) => PipelineKey::ResultContractUse(value.id.clone()),
             Self::ResultContractFailureUse(value) => {
                 PipelineKey::ResultContractFailureUse(value.id.clone())
+            }
+            Self::NilnessOperation(value) => PipelineKey::NilnessOperation(value.id.clone()),
+            Self::SwitchCoverage(value) => PipelineKey::SwitchCoverage(value.id.clone()),
+            Self::ConcurrentAccessConflict(value) => {
+                PipelineKey::ConcurrentAccessConflict(value.id.clone())
+            }
+            Self::DetachedTaskTransfer(value) => {
+                PipelineKey::DetachedTaskTransfer(value.id.clone())
             }
             Self::ProcedureEffect(value) => PipelineKey::ProcedureEffect(value.row().id.clone()),
             Self::CallableSignature(value) => {
@@ -1197,8 +1294,10 @@ enum PipelineTraceValue {
     ExpressionSite(ExpressionSiteValue),
     JsxAttributeValue(Box<JsxAttributeValue>),
     ReceiverAnalysis(ReceiverAnalysisValue),
+    MemberTargetAnalysis(ReceiverAnalysisValue),
     ReceiverOutcome(ReceiverAnalysisValue),
     ReceiverEvidence(ReceiverEvidenceValue),
+    FieldWriteValue(Box<FieldWriteValue>),
     CallShape(CallShapeValue),
     CallArgumentGroup(CallArgumentGroupValue),
     CallArgument(CallArgumentValue),
@@ -1207,6 +1306,10 @@ enum PipelineTraceValue {
     CallResultContract(Box<CallResultContractValue>),
     ResultContractUse(Box<ResultContractUseValue>),
     ResultContractFailureUse(Box<ResultContractFailureUseValue>),
+    NilnessOperation(Box<NilnessOperationValue>),
+    SwitchCoverage(Box<SwitchCoverageValue>),
+    ConcurrentAccessConflict(Box<ConcurrentAccessConflictValue>),
+    DetachedTaskTransfer(Box<DetachedTaskTransferValue>),
     ProcedureEffect(Box<ProcedureEffectValue>),
     CallableSignature(Box<CallableSignatureValue>),
     SignatureParameter(Box<SignatureParameterValue>),
@@ -1342,7 +1445,16 @@ impl PipelineRenderCache {
         F: FnOnce() -> Option<String>,
     {
         if self.source_loads_sealed && !self.sources.contains_key(file) {
-            self.sources.insert(file.clone(), None);
+            // Sealed means "load no new source for this row", not "this file
+            // has no source". Recording the refusal as a negative entry made
+            // the budgeted retention of that same file later in the render
+            // pass a no-op -- `retain_budgeted_source_snapshot` returns early
+            // for any file the cache already holds an entry for -- so every
+            // row of a file some earlier row's nested rendering happened to
+            // probe rendered the fallback coordinates (column 1) instead of
+            // its own. The refusal is about this probe, so it stays local to
+            // it.
+            return None;
         }
         self.sources
             .entry(file.clone())
@@ -1991,6 +2103,12 @@ struct QueryExecutionState<'a> {
     analyzer: &'a dyn IAnalyzer,
     workspace: Option<&'a WorkspaceAnalyzer>,
     cancellation: Option<&'a CancellationToken>,
+    /// Which files the seed scanners enumerate. Narrowed only by a unit
+    /// execution; every derived-value expansion still sees the workspace.
+    scope: CodeQueryExecutionScope<'a>,
+    /// Rows each plan operator emitted, indexed by its physical plan node.
+    /// `max_step_outputs` is enforced per step and has no other counter.
+    step_outputs: Vec<u64>,
     receiver_budget_override: Option<ReceiverAnalysisBudget>,
     budget: CodeQueryExecutionBudget,
     seed_cache: HashMap<String, CachedSeedExecution>,
@@ -2323,16 +2441,19 @@ fn execute_request_internal(
     );
     if query_plan_requires_typestate(&query.plan) && !limits.typestate.is_valid() {
         return CodeQueryResponse::Results(invalid_plan_result(
+            session_subset(analyzer),
             "typestate execution limits must be positive and no greater than their hard maxima",
         ));
     }
     if query_plan_requires_value_flow(&query.plan) && !limits.value_flow.is_valid() {
         return CodeQueryResponse::Results(invalid_plan_result(
+            session_subset(analyzer),
             "value-flow execution limits must be positive and no greater than their hard maxima",
         ));
     }
     if query_plan_requires_taint(&query.plan) && !limits.taint.is_valid() {
         return CodeQueryResponse::Results(invalid_plan_result(
+            session_subset(analyzer),
             "taint projection limits must be positive and no greater than their hard maxima",
         ));
     }
@@ -2367,7 +2488,10 @@ fn execute_request_internal(
         ) {
             Ok(context) => Some(context),
             Err(error) => {
-                return CodeQueryResponse::Results(query_analysis_context_error_result(error));
+                return CodeQueryResponse::Results(query_analysis_context_error_result(
+                    session_subset(analyzer),
+                    error,
+                ));
             }
         }
     } else {
@@ -2405,7 +2529,9 @@ fn execute_request_internal(
                     physical_plan.public_explain(query, CODE_QUERY_SCHEDULER_WORKERS),
                 )
             }
-            Err(error) => CodeQueryResponse::Results(invalid_plan_result(error)),
+            Err(error) => {
+                CodeQueryResponse::Results(invalid_plan_result(session_subset(analyzer), error))
+            }
         },
         CodeQueryExecutionMode::Profile => {
             let detailed = execute_internal_with_analysis(
@@ -2495,6 +2621,8 @@ pub fn execute_code_query_detailed_eager_index(
         OccurrenceDerivationOptions::ROWS_ONLY,
         None,
         None,
+        CodeQueryExecutionScope::whole_workspace(),
+        None,
     )
 }
 
@@ -2537,6 +2665,8 @@ pub fn execute_code_query_detailed_eager_index_without_targets(
         OccurrenceDerivationOptions::IDENTITY_ONLY,
         None,
         None,
+        CodeQueryExecutionScope::whole_workspace(),
+        None,
     )
 }
 
@@ -2575,6 +2705,8 @@ pub fn execute_code_query_detailed_eager_index_workspace(
         access_mode,
         OccurrenceDerivationOptions::ROWS_ONLY,
         None,
+        None,
+        CodeQueryExecutionScope::whole_workspace(),
         None,
     )
 }
@@ -2637,6 +2769,8 @@ pub fn execute_code_query_detailed_eager_index_workspace_with_semantic_receipt(
             artifact_leases,
         }),
         None,
+        CodeQueryExecutionScope::whole_workspace(),
+        None,
     )
 }
 
@@ -2692,6 +2826,8 @@ pub(crate) fn execute_code_query_with_union_strategy(
         OccurrenceDerivationOptions::ROWS_ONLY,
         None,
         None,
+        CodeQueryExecutionScope::whole_workspace(),
+        None,
     )
 }
 
@@ -2723,6 +2859,8 @@ pub(crate) fn execute_code_query_with_access_mode(
         OccurrenceDerivationOptions::ROWS_ONLY,
         None,
         Some(&mut failure),
+        CodeQueryExecutionScope::whole_workspace(),
+        None,
     );
     match failure {
         Some(failure) => Err(failure),
@@ -2809,6 +2947,8 @@ fn execute_internal_with_analysis(
         OccurrenceDerivationOptions::ROWS_ONLY,
         None,
         None,
+        CodeQueryExecutionScope::whole_workspace(),
+        None,
     )
 }
 
@@ -2853,6 +2993,8 @@ fn execute_internal_with_strategy(
         OccurrenceDerivationOptions::ROWS_ONLY,
         None,
         access_failure_out,
+        CodeQueryExecutionScope::whole_workspace(),
+        None,
     )
 }
 
@@ -2874,6 +3016,8 @@ fn execute_internal_with_analysis_strategy(
     occurrence_options: OccurrenceDerivationOptions,
     semantic_continuation: Option<SemanticQueryContinuation>,
     access_failure_out: Option<&mut Option<String>>,
+    scope: CodeQueryExecutionScope<'_>,
+    mut row_keys_out: Option<&mut Vec<UnitRowKey>>,
 ) -> DetailedCodeQueryResult {
     let active_semantic_model_snapshot = analyzer.active_semantic_model_snapshot();
     // Keep every resolver read in this query on the same semantic-model
@@ -2887,7 +3031,7 @@ fn execute_internal_with_analysis_strategy(
     let planning_started = capture_profile.then(Instant::now);
     if !capture_profile && cancellation.is_some_and(CancellationToken::is_cancelled) {
         return detailed_result_without_evidence(
-            cancelled_query_result(),
+            cancelled_query_result(session_subset(analyzer)),
             CodeQueryExecutionBudget::default(),
         );
     }
@@ -2895,7 +3039,7 @@ fn execute_internal_with_analysis_strategy(
         Ok(plan) => plan,
         Err(error) => {
             return detailed_result_without_evidence(
-                invalid_plan_result(error),
+                invalid_plan_result(session_subset(analyzer), error),
                 CodeQueryExecutionBudget::default(),
             );
         }
@@ -2904,6 +3048,7 @@ fn execute_internal_with_analysis_strategy(
     if requires_semantic && semantic_continuation.is_none() && !limits.semantic.all_positive() {
         return detailed_result_without_evidence(
             invalid_plan_result(
+                session_subset(analyzer),
                 "semantic execution limits must all be positive for a semantic query",
             ),
             CodeQueryExecutionBudget::default(),
@@ -2912,6 +3057,7 @@ fn execute_internal_with_analysis_strategy(
     if query_plan_requires_typestate(&query.plan) && !limits.typestate.is_valid() {
         return detailed_result_without_evidence(
             invalid_plan_result(
+                session_subset(analyzer),
                 "typestate execution limits must be positive and no greater than their hard maxima",
             ),
             CodeQueryExecutionBudget::default(),
@@ -2920,6 +3066,7 @@ fn execute_internal_with_analysis_strategy(
     if query_plan_requires_value_flow(&query.plan) && !limits.value_flow.is_valid() {
         return detailed_result_without_evidence(
             invalid_plan_result(
+                session_subset(analyzer),
                 "value-flow execution limits must be positive and no greater than their hard maxima",
             ),
             CodeQueryExecutionBudget::default(),
@@ -2934,6 +3081,8 @@ fn execute_internal_with_analysis_strategy(
         analyzer,
         workspace,
         cancellation,
+        scope,
+        step_outputs: vec![0; physical_plan.node_count()],
         receiver_budget_override,
         budget: CodeQueryExecutionBudget::default(),
         seed_cache: HashMap::default(),
@@ -3097,6 +3246,9 @@ fn execute_internal_with_analysis_strategy(
             truncated = true;
         }
         render_cache.seal_source_loads();
+        if let Some(row_keys) = row_keys_out.as_deref_mut() {
+            row_keys.push(unit_row_key(&row.value.key()));
+        }
         let terminal_source_file = terminal_source_file(&row.value);
         let retained_source =
             terminal_source_file.and_then(|file| render_cache.source_snapshot(file));
@@ -3139,6 +3291,8 @@ fn execute_internal_with_analysis_strategy(
     }
     let total_work = execution_work_snapshot(state.budget, semantic_work);
     let work = public_execution_work(total_work);
+    let budgeted_work =
+        budgeted_execution_work(state.budget, std::mem::take(&mut state.step_outputs));
     if let Some(profile) = &mut state.profile {
         let execution_work = execution_work_profile.unwrap_or_default();
         profile.rendering_ns = rendering_started.map(elapsed_ns).unwrap_or(0);
@@ -3159,12 +3313,14 @@ fn execute_internal_with_analysis_strategy(
     let mut result = CodeQueryResult {
         results,
         truncated: truncated || cancelled,
+        session_subset: session_subset(analyzer),
         diagnostics,
     };
     result.cap_flow_completion_by_run();
     let detailed = DetailedCodeQueryResult {
         result,
         work,
+        budgeted_work,
         evidence,
         profile,
         semantic_receipt,
@@ -3277,12 +3433,28 @@ fn detailed_result_without_evidence(
             budget,
             CodeQuerySemanticWork::default(),
         )),
+        budgeted_work: budgeted_execution_work(budget, Vec::new()),
         evidence: Vec::new(),
         profile: None,
         semantic_receipt: None,
     };
     detailed.assert_invariants();
     detailed
+}
+
+/// The budgeted lanes `CodeQueryExecutionWork` drops, plus the per-step output
+/// counts, for a caller that merges several executions of one query.
+fn budgeted_execution_work(
+    budget: CodeQueryExecutionBudget,
+    step_outputs: Vec<u64>,
+) -> CodeQueryBudgetedWork {
+    let as_u64 = |value: usize| u64::try_from(value).unwrap_or(u64::MAX);
+    CodeQueryBudgetedWork {
+        provenance_steps: as_u64(budget.provenance_steps),
+        import_files_resolved: as_u64(budget.import_files_resolved),
+        import_edges_resolved: as_u64(budget.import_edges_resolved),
+        step_outputs,
+    }
 }
 
 fn public_execution_work(work: QueryOperatorWorkProfile) -> CodeQueryExecutionWork {
@@ -3546,6 +3718,24 @@ fn detailed_evidence_for_pipeline_value(
                 decorated_parameter: None,
             }
         }
+        PipelineValue::MemberTargetAnalysis(value) => {
+            let site = &value.report.site;
+            let byte_span = range_byte_span(site.range);
+            DetailedCodeQueryEvidence {
+                result_index,
+                domain: DetailedCodeQueryDomain::MemberTargetAnalysis,
+                key: DetailedCodeQueryKey::MemberTargetAnalysis {
+                    site_id: value.site_id.clone(),
+                },
+                file: site.file.clone(),
+                source_slice_sha256: None,
+                byte_span: Some(byte_span),
+                identities: DetailedCodeQueryProvenanceIdentities::None,
+                stable_owner_candidate: None,
+                provenance: Vec::new(),
+                decorated_parameter: None,
+            }
+        }
         PipelineValue::ReceiverOutcome(value) => {
             let site = &value.report.site;
             DetailedCodeQueryEvidence {
@@ -3578,6 +3768,39 @@ fn detailed_evidence_for_pipeline_value(
                 byte_span: Some(range_byte_span(site.range)),
                 identities: DetailedCodeQueryProvenanceIdentities::None,
                 stable_owner_candidate: None,
+                provenance: Vec::new(),
+                decorated_parameter: None,
+            }
+        }
+        PipelineValue::FieldWriteValue(value) => {
+            let node = value.seed.facts.node(value.rhs_node);
+            let byte_span = range_byte_span(node.range);
+            let rhs_ast_id = value.rhs_ast_id();
+            let candidate = canonical_ast_candidate_for_node(&value.seed, value.rhs_node);
+            DetailedCodeQueryEvidence {
+                result_index,
+                domain: DetailedCodeQueryDomain::FieldWriteValue,
+                key: DetailedCodeQueryKey::FieldWriteValue {
+                    id: value.id(),
+                    assignment_ast_id: value.assignment_ast_id(),
+                    rhs_ast_id,
+                    receiver_identity_id: value
+                        .target
+                        .receiver_identity_id()
+                        .expect("field-write targets retain an exact receiver identity"),
+                    member_target_id: value.target.member_identity_id(),
+                },
+                file: value.seed.file.clone(),
+                source_slice_sha256: retained_source
+                    .and_then(|source| source_slice_sha256(source, &byte_span)),
+                byte_span: Some(byte_span),
+                identities: DetailedCodeQueryProvenanceIdentities::Primary(candidate.as_ref().map(
+                    |candidate| DetailedCodeQueryIdentityCandidate {
+                        file: value.seed.file.clone(),
+                        candidate: candidate.clone(),
+                    },
+                )),
+                stable_owner_candidate: candidate,
                 provenance: Vec::new(),
                 decorated_parameter: None,
             }
@@ -3710,6 +3933,66 @@ fn detailed_evidence_for_pipeline_value(
             key: DetailedCodeQueryKey::ResultContractFailureUse {
                 id: value.id.clone(),
                 acquisition_id: value.acquisition_id.clone(),
+            },
+            file: value.file.clone(),
+            source_slice_sha256: None,
+            byte_span: Some(range_byte_span(value.range)),
+            identities: DetailedCodeQueryProvenanceIdentities::None,
+            stable_owner_candidate: None,
+            provenance: Vec::new(),
+            decorated_parameter: None,
+        },
+        PipelineValue::NilnessOperation(value) => DetailedCodeQueryEvidence {
+            result_index,
+            domain: DetailedCodeQueryDomain::NilnessOperation,
+            key: DetailedCodeQueryKey::NilnessOperation {
+                id: value.id.clone(),
+                procedure_id: value.procedure_id.clone(),
+            },
+            file: value.file.clone(),
+            source_slice_sha256: None,
+            byte_span: Some(range_byte_span(value.range)),
+            identities: DetailedCodeQueryProvenanceIdentities::None,
+            stable_owner_candidate: None,
+            provenance: Vec::new(),
+            decorated_parameter: None,
+        },
+        PipelineValue::SwitchCoverage(value) => DetailedCodeQueryEvidence {
+            result_index,
+            domain: DetailedCodeQueryDomain::SwitchCoverage,
+            key: DetailedCodeQueryKey::SwitchCoverage {
+                id: value.id.clone(),
+                procedure_id: value.procedure_id.clone(),
+            },
+            file: value.file.clone(),
+            source_slice_sha256: None,
+            byte_span: Some(range_byte_span(value.range)),
+            identities: DetailedCodeQueryProvenanceIdentities::None,
+            stable_owner_candidate: None,
+            provenance: Vec::new(),
+            decorated_parameter: None,
+        },
+        PipelineValue::ConcurrentAccessConflict(value) => DetailedCodeQueryEvidence {
+            result_index,
+            domain: DetailedCodeQueryDomain::ConcurrentAccessConflict,
+            key: DetailedCodeQueryKey::ConcurrentAccessConflict {
+                id: value.id.clone(),
+                root_procedure_id: value.root_procedure_id.clone(),
+            },
+            file: value.file.clone(),
+            source_slice_sha256: None,
+            byte_span: Some(range_byte_span(value.range)),
+            identities: DetailedCodeQueryProvenanceIdentities::None,
+            stable_owner_candidate: None,
+            provenance: Vec::new(),
+            decorated_parameter: None,
+        },
+        PipelineValue::DetachedTaskTransfer(value) => DetailedCodeQueryEvidence {
+            result_index,
+            domain: DetailedCodeQueryDomain::DetachedTaskTransfer,
+            key: DetailedCodeQueryKey::DetachedTaskTransfer {
+                id: value.id.clone(),
+                procedure_id: value.procedure_id.clone(),
             },
             file: value.file.clone(),
             source_slice_sha256: None,
@@ -4339,6 +4622,7 @@ fn terminal_source_file(value: &PipelineValue) -> Option<&ProjectFile> {
         PipelineValue::CallSite(site) => Some(&site.0.file),
         PipelineValue::ExpressionSite(site) => Some(&site.call_site.0.file),
         PipelineValue::JsxAttributeValue(value) => Some(&value.seed.file),
+        PipelineValue::FieldWriteValue(value) => Some(&value.seed.file),
         PipelineValue::CallableSignature(value) => Some(value.file()),
         PipelineValue::SignatureParameter(value) => Some(value.file()),
         PipelineValue::DecoratedParameter(value) => Some(&value.file),
@@ -4352,6 +4636,10 @@ fn terminal_source_file(value: &PipelineValue) -> Option<&ProjectFile> {
         PipelineValue::CallResultContract(value) => Some(value.file()),
         PipelineValue::ResultContractUse(value) => Some(value.file()),
         PipelineValue::ResultContractFailureUse(value) => Some(value.file()),
+        PipelineValue::NilnessOperation(value) => Some(value.file()),
+        PipelineValue::SwitchCoverage(value) => Some(value.file()),
+        PipelineValue::ConcurrentAccessConflict(value) => Some(value.file()),
+        PipelineValue::DetachedTaskTransfer(value) => Some(value.file()),
         PipelineValue::ProcedureEffect(value) => Some(value.file()),
         PipelineValue::Occurrence(value) => Some(value.file()),
         PipelineValue::MemberSelection(value) => Some(&value.occurrence.file),
@@ -4378,7 +4666,9 @@ fn terminal_source_file(value: &PipelineValue) -> Option<&ProjectFile> {
         PipelineValue::RewritePath(value) => Some(value.file()),
         PipelineValue::ReceiverOutcome(value) => Some(&value.report.site.file),
         PipelineValue::ReceiverEvidence(value) => Some(&value.receiver.report.site.file),
-        PipelineValue::File(_) | PipelineValue::ReceiverAnalysis(_) => None,
+        PipelineValue::File(_)
+        | PipelineValue::ReceiverAnalysis(_)
+        | PipelineValue::MemberTargetAnalysis(_) => None,
     }
 }
 
@@ -4475,9 +4765,15 @@ fn collect_pipeline_value_source_files(value: &PipelineValue, files: &mut BTreeS
             files.insert(value.seed.file.clone());
         }
         PipelineValue::ReceiverAnalysis(value) => collect_receiver_source_files(value, files),
+        PipelineValue::MemberTargetAnalysis(value) => collect_receiver_source_files(value, files),
         PipelineValue::ReceiverOutcome(value) => collect_receiver_source_files(value, files),
         PipelineValue::ReceiverEvidence(value) => {
             collect_receiver_source_files(&value.receiver, files)
+        }
+        PipelineValue::FieldWriteValue(value) => {
+            files.insert(value.seed.file.clone());
+            collect_receiver_source_files(&value.analysis, files);
+            collect_member_target_source_files(&value.target, files);
         }
         PipelineValue::CallShape(value) => {
             files.insert(value.report.outcome.file.clone());
@@ -4504,6 +4800,18 @@ fn collect_pipeline_value_source_files(value: &PipelineValue, files: &mut BTreeS
             files.insert(value.file().clone());
         }
         PipelineValue::ResultContractFailureUse(value) => {
+            files.insert(value.file().clone());
+        }
+        PipelineValue::NilnessOperation(value) => {
+            files.insert(value.file().clone());
+        }
+        PipelineValue::SwitchCoverage(value) => {
+            files.insert(value.file().clone());
+        }
+        PipelineValue::ConcurrentAccessConflict(value) => {
+            files.insert(value.file().clone());
+        }
+        PipelineValue::DetachedTaskTransfer(value) => {
             files.insert(value.file().clone());
         }
         PipelineValue::ProcedureEffect(value) => {
@@ -4613,9 +4921,17 @@ fn collect_trace_value_source_files(value: &PipelineTraceValue, files: &mut BTre
             files.insert(value.seed.file.clone());
         }
         PipelineTraceValue::ReceiverAnalysis(value) => collect_receiver_source_files(value, files),
+        PipelineTraceValue::MemberTargetAnalysis(value) => {
+            collect_receiver_source_files(value, files)
+        }
         PipelineTraceValue::ReceiverOutcome(value) => collect_receiver_source_files(value, files),
         PipelineTraceValue::ReceiverEvidence(value) => {
             collect_receiver_source_files(&value.receiver, files)
+        }
+        PipelineTraceValue::FieldWriteValue(value) => {
+            files.insert(value.seed.file.clone());
+            collect_receiver_source_files(&value.analysis, files);
+            collect_member_target_source_files(&value.target, files);
         }
         PipelineTraceValue::CallShape(value) => {
             files.insert(value.report.outcome.file.clone());
@@ -4642,6 +4958,18 @@ fn collect_trace_value_source_files(value: &PipelineTraceValue, files: &mut BTre
             files.insert(value.file().clone());
         }
         PipelineTraceValue::ResultContractFailureUse(value) => {
+            files.insert(value.file().clone());
+        }
+        PipelineTraceValue::NilnessOperation(value) => {
+            files.insert(value.file().clone());
+        }
+        PipelineTraceValue::SwitchCoverage(value) => {
+            files.insert(value.file().clone());
+        }
+        PipelineTraceValue::ConcurrentAccessConflict(value) => {
+            files.insert(value.file().clone());
+        }
+        PipelineTraceValue::DetachedTaskTransfer(value) => {
             files.insert(value.file().clone());
         }
         PipelineTraceValue::ProcedureEffect(value) => {
@@ -4787,10 +5115,22 @@ fn collect_receiver_source_files(value: &ReceiverAnalysisValue, files: &mut BTre
             }
         }
         ReceiverQueryAnalysis::MemberTargets(outcome) => {
-            for unit in outcome.values().into_iter().flatten() {
-                files.insert(unit.source().clone());
+            for target in outcome.values().into_iter().flatten() {
+                collect_member_target_source_files(target, files);
             }
         }
+    }
+}
+
+fn collect_member_target_source_files(
+    target: &ReceiverMemberTarget,
+    files: &mut BTreeSet<ProjectFile>,
+) {
+    if let ReceiverMemberTarget::Workspace { receiver, member } = target {
+        if let Some(receiver) = receiver {
+            files.insert(receiver.source().clone());
+        }
+        files.insert(member.source().clone());
     }
 }
 
@@ -4923,11 +5263,17 @@ fn detailed_trace_provenance_ref(
         PipelineTraceValue::ReceiverAnalysis(value) => {
             detailed_receiver_provenance_ref(value, cache)
         }
+        PipelineTraceValue::MemberTargetAnalysis(value) => {
+            detailed_member_target_provenance_ref(value, cache)
+        }
         PipelineTraceValue::ReceiverOutcome(value) => {
             detailed_receiver_outcome_provenance_ref(value, cache)
         }
         PipelineTraceValue::ReceiverEvidence(value) => {
             detailed_receiver_evidence_provenance_ref(value, cache)
+        }
+        PipelineTraceValue::FieldWriteValue(value) => {
+            detailed_field_write_provenance_ref(value, cache)
         }
         PipelineTraceValue::CallShape(value) => detailed_call_shape_provenance_ref(
             DetailedCodeQueryDomain::CallShape,
@@ -5016,6 +5362,46 @@ fn detailed_trace_provenance_ref(
             DetailedCodeQueryKey::ResultContractFailureUse {
                 id: value.id.clone(),
                 acquisition_id: value.acquisition_id.clone(),
+            },
+            value.file(),
+            value.range,
+            cache,
+        ),
+        PipelineTraceValue::NilnessOperation(value) => detailed_call_shape_provenance_ref(
+            DetailedCodeQueryDomain::NilnessOperation,
+            DetailedCodeQueryKey::NilnessOperation {
+                id: value.id.clone(),
+                procedure_id: value.procedure_id.clone(),
+            },
+            value.file(),
+            value.range,
+            cache,
+        ),
+        PipelineTraceValue::SwitchCoverage(value) => detailed_call_shape_provenance_ref(
+            DetailedCodeQueryDomain::SwitchCoverage,
+            DetailedCodeQueryKey::SwitchCoverage {
+                id: value.id.clone(),
+                procedure_id: value.procedure_id.clone(),
+            },
+            value.file(),
+            value.range,
+            cache,
+        ),
+        PipelineTraceValue::ConcurrentAccessConflict(value) => detailed_call_shape_provenance_ref(
+            DetailedCodeQueryDomain::ConcurrentAccessConflict,
+            DetailedCodeQueryKey::ConcurrentAccessConflict {
+                id: value.id.clone(),
+                root_procedure_id: value.root_procedure_id.clone(),
+            },
+            value.file(),
+            value.range,
+            cache,
+        ),
+        PipelineTraceValue::DetachedTaskTransfer(value) => detailed_call_shape_provenance_ref(
+            DetailedCodeQueryDomain::DetachedTaskTransfer,
+            DetailedCodeQueryKey::DetachedTaskTransfer {
+                id: value.id.clone(),
+                procedure_id: value.procedure_id.clone(),
             },
             value.file(),
             value.range,
@@ -5567,6 +5953,59 @@ fn detailed_receiver_provenance_ref(
     }
 }
 
+fn detailed_member_target_provenance_ref(
+    value: &ReceiverAnalysisValue,
+    cache: &PipelineRenderCache,
+) -> DetailedCodeQueryProvenanceRefEvidence {
+    let site = &value.report.site;
+    let byte_span = range_byte_span(site.range);
+    DetailedCodeQueryProvenanceRefEvidence {
+        domain: DetailedCodeQueryDomain::MemberTargetAnalysis,
+        key: DetailedCodeQueryKey::MemberTargetAnalysis {
+            site_id: value.site_id.clone(),
+        },
+        file: site.file.clone(),
+        source_slice_sha256: cached_source_slice_sha256(cache, &site.file, &byte_span),
+        byte_span: Some(byte_span),
+        display_range: cached_display_range(cache, &site.file, site.range),
+        identities: DetailedCodeQueryProvenanceIdentities::None,
+    }
+}
+
+fn detailed_field_write_provenance_ref(
+    value: &FieldWriteValue,
+    cache: &PipelineRenderCache,
+) -> DetailedCodeQueryProvenanceRefEvidence {
+    let range = value.seed.facts.node(value.rhs_node).range;
+    let byte_span = range_byte_span(range);
+    let rhs_ast_id = value.rhs_ast_id();
+    DetailedCodeQueryProvenanceRefEvidence {
+        domain: DetailedCodeQueryDomain::FieldWriteValue,
+        key: DetailedCodeQueryKey::FieldWriteValue {
+            id: value.id(),
+            assignment_ast_id: value.assignment_ast_id(),
+            rhs_ast_id,
+            receiver_identity_id: value
+                .target
+                .receiver_identity_id()
+                .expect("field-write targets retain an exact receiver identity"),
+            member_target_id: value.target.member_identity_id(),
+        },
+        file: value.seed.file.clone(),
+        source_slice_sha256: cached_source_slice_sha256(cache, &value.seed.file, &byte_span),
+        byte_span: Some(byte_span),
+        display_range: cached_display_range(cache, &value.seed.file, range),
+        identities: DetailedCodeQueryProvenanceIdentities::Primary(
+            canonical_ast_candidate_for_node(&value.seed, value.rhs_node).map(|candidate| {
+                DetailedCodeQueryIdentityCandidate {
+                    file: value.seed.file.clone(),
+                    candidate,
+                }
+            }),
+        ),
+    }
+}
+
 fn detailed_receiver_outcome_provenance_ref(
     value: &ReceiverAnalysisValue,
     cache: &PipelineRenderCache,
@@ -5852,11 +6291,17 @@ fn pipeline_trace_value(value: &PipelineValue) -> Option<PipelineTraceValue> {
         PipelineValue::ReceiverAnalysis(value) => {
             Some(PipelineTraceValue::ReceiverAnalysis(value.clone()))
         }
+        PipelineValue::MemberTargetAnalysis(value) => {
+            Some(PipelineTraceValue::MemberTargetAnalysis(value.clone()))
+        }
         PipelineValue::ReceiverOutcome(value) => {
             Some(PipelineTraceValue::ReceiverOutcome(value.clone()))
         }
         PipelineValue::ReceiverEvidence(value) => {
             Some(PipelineTraceValue::ReceiverEvidence(value.clone()))
+        }
+        PipelineValue::FieldWriteValue(value) => {
+            Some(PipelineTraceValue::FieldWriteValue(value.clone()))
         }
         PipelineValue::CallShape(value) => Some(PipelineTraceValue::CallShape(value.clone())),
         PipelineValue::CallArgumentGroup(value) => {
@@ -5873,6 +6318,18 @@ fn pipeline_trace_value(value: &PipelineValue) -> Option<PipelineTraceValue> {
         }
         PipelineValue::ResultContractFailureUse(value) => {
             Some(PipelineTraceValue::ResultContractFailureUse(value.clone()))
+        }
+        PipelineValue::NilnessOperation(value) => {
+            Some(PipelineTraceValue::NilnessOperation(value.clone()))
+        }
+        PipelineValue::SwitchCoverage(value) => {
+            Some(PipelineTraceValue::SwitchCoverage(value.clone()))
+        }
+        PipelineValue::ConcurrentAccessConflict(value) => {
+            Some(PipelineTraceValue::ConcurrentAccessConflict(value.clone()))
+        }
+        PipelineValue::DetachedTaskTransfer(value) => {
+            Some(PipelineTraceValue::DetachedTaskTransfer(value.clone()))
         }
         PipelineValue::ProcedureEffect(value) => {
             Some(PipelineTraceValue::ProcedureEffect(value.clone()))

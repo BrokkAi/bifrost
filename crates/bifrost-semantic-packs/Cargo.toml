@@ -2,14 +2,11 @@
 name = "brokk-bifrost-semantic-packs"
 version.workspace = true
 edition.workspace = true
-rust-version.workspace = true
 description = "Optional prebuilt semantic-pack distribution for brokk-bifrost"
 readme = "README.md"
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
-keywords.workspace = true
-categories.workspace = true
 publish = true
 autobins = false
 # The JDK source slices under testdata/summary-sources are GPL-2.0 WITH
@@ -50,8 +47,8 @@ path = "src/bin/bifrost-semantic-pack.rs"
 required-features = ["release-tooling"]
 
 [dependencies]
-brokk-bifrost-analysis = { path = "../bifrost-analysis", version = "=0.10.8" }
-brokk-bifrost-flow = { path = "../bifrost-flow", version = "=0.10.8" }
+brokk-bifrost-analysis = { path = "../bifrost-analysis", version = "=0.10.9" }
+brokk-bifrost-flow = { path = "../bifrost-flow", version = "=0.10.9" }
 semver = { version = "1.0.28", optional = true }
 serde = { version = "1.0.228", features = ["derive"], optional = true }
 serde_json = { version = "1.0.145", optional = true }
@@ -67,3 +64,6 @@ ureq = { version = "3.4.0", default-features = false, features = ["rustls"], opt
 [dev-dependencies]
 tempfile = "3.23.0"
 zip = { version = "2.4.2", default-features = false, features = ["deflate"] }
+
+[lints]
+workspace = true

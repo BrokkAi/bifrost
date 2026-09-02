@@ -23,10 +23,10 @@ use crate::kotlin::graph::resolver::{
 };
 use crate::kotlin::syntax::{
     kotlin_binding_type_components, kotlin_call_arity, kotlin_call_with_callee, kotlin_callee,
-    kotlin_class_literal_type, kotlin_dotted_navigation_segments, kotlin_import_header_segments,
-    kotlin_is_declaration_name, kotlin_is_expression_kind, kotlin_is_navigation_kind,
-    kotlin_named_argument_label, kotlin_navigation_member, kotlin_navigation_receiver,
-    kotlin_user_type_segments,
+    kotlin_class_literal_type, kotlin_declared_type_parameter_names,
+    kotlin_dotted_navigation_segments, kotlin_import_header_segments, kotlin_is_declaration_name,
+    kotlin_is_expression_kind, kotlin_is_navigation_kind, kotlin_named_argument_label,
+    kotlin_navigation_member, kotlin_navigation_receiver, kotlin_user_type_segments,
 };
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_core::analyzer::tree_walk::{
@@ -39,9 +39,8 @@ use brokk_bifrost_core::analyzer::usages::local_inference::{
 use brokk_bifrost_core::analyzer::usages::model::UsageHit;
 use brokk_bifrost_core::analyzer::{CodeUnit, ProjectFile};
 use brokk_bifrost_core::hash::HashMap;
-use brokk_bifrost_core::text_utils::compute_line_starts;
 use std::collections::BTreeSet;
-use tree_sitter::{Node, Parser};
+use tree_sitter::Node;
 
 /// Node kinds that open a Kotlin binding scope.
 ///
@@ -155,46 +154,33 @@ impl KotlinResolutionCtx for ScanCtx<'_> {
     }
 }
 
-pub fn scan_file(
+/// The parse-free scan body behind the query path.
+///
+/// The caller prepares source, line starts, and the parsed tree once per file
+/// and replays only this resolution pass when its relational frontier
+/// discovers a new dependency layer, so a replay costs resolution work rather
+/// than a reparse.
+#[allow(clippy::too_many_arguments)]
+pub fn scan_parsed_file(
     graph: &KotlinGraphSource<'_>,
     token: QueryToken<'_>,
     file: &ProjectFile,
+    source: &str,
+    line_starts: &[usize],
+    root: Node<'_>,
     spec: &TargetSpec,
     state: &mut ScanState<'_>,
 ) {
     if *state.limit_exceeded {
         return;
     }
-    let Some(source) = graph
-        .index
-        .indexed_source(file)
-        .or_else(|| graph.index.project().read_source(file).ok())
-    else {
-        return;
-    };
-    if source.is_empty() {
-        return;
-    }
-
-    let mut parser = Parser::new();
-    if parser
-        .set_language(&crate::kotlin::language::LANGUAGE.into())
-        .is_err()
-    {
-        return;
-    }
-    let Some(tree) = parser.parse(source.as_str(), None) else {
-        return;
-    };
-
-    let line_starts = compute_line_starts(&source);
-    let names = KotlinNameResolver::new(graph, token, file, tree.root_node(), &source);
+    let names = KotlinNameResolver::new(graph, token, file, root, source);
     let mut type_parameters: TypeParameterScopes = Vec::new();
     let mut ctx = ScanCtx {
         graph,
         file,
-        source: &source,
-        line_starts: &line_starts,
+        source,
+        line_starts,
         spec,
         names: &names,
         hits: state.hits,
@@ -209,7 +195,7 @@ pub fn scan_file(
         class_scope_depths: Vec::new(),
         pending_exits: Vec::new(),
     };
-    walk(tree.root_node(), token, &mut ctx, &mut type_parameters);
+    walk(root, token, &mut ctx, &mut type_parameters);
 }
 
 /// Type-parameter names in scope, innermost frame last.
@@ -245,7 +231,7 @@ fn walk(
             }
             let enters_value_scope = SCOPE_NODES.contains(&node.kind());
             let enters_class_scope = enters_value_scope && node.kind() == "class_body";
-            let declared_type_parameters = type_parameter_names(node, ctx.source);
+            let declared_type_parameters = kotlin_declared_type_parameter_names(node, ctx.source);
             let enters_type_scope = !declared_type_parameters.is_empty();
             if enters_value_scope {
                 ctx.bindings.enter_scope();
@@ -289,24 +275,6 @@ fn walk(
             }
         },
     );
-}
-
-/// The type parameters `node` declares, if it declares any.
-///
-/// Read from the `type_parameters` child rather than from a field, because the
-/// grammar names no field for it. Both `class Box<T>` and `fun <T> f()` carry it.
-fn type_parameter_names(node: Node<'_>, source: &str) -> Vec<String> {
-    let Some(parameters) = first_named_child_of_kind(node, "type_parameters") else {
-        return Vec::new();
-    };
-    named_children(parameters)
-        .into_iter()
-        .filter(|child| child.kind() == "type_parameter")
-        .filter_map(|parameter| first_named_child_of_kind(parameter, "type_identifier"))
-        .map(|name| node_text(name, source))
-        .filter(|name| !name.is_empty())
-        .map(str::to_string)
-        .collect()
 }
 
 /// Record what each value declaration introduces: its type when the scan can

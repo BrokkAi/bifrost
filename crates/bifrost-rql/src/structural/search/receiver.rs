@@ -67,13 +67,20 @@ pub(super) fn receiver_evidence_expansions(
 
 pub(super) fn correlate_receiver_expansions(expansions: &mut [PipelineExpansion], ast_id: String) {
     for expansion in expansions {
-        let PipelineValue::ReceiverAnalysis(value) = &mut expansion.value else {
-            unreachable!("receiver analysis expansion has its declared terminal domain")
+        let value = match &mut expansion.value {
+            PipelineValue::ReceiverAnalysis(value) | PipelineValue::MemberTargetAnalysis(value) => {
+                value
+            }
+            _ => unreachable!("receiver analysis expansion has its declared terminal domain"),
         };
         value.site_ast_id = Some(ast_id.clone());
         for (trace, _) in &mut expansion.trace {
-            let PipelineTraceValue::ReceiverAnalysis(value) = trace else {
-                unreachable!("receiver analysis expansion trace has its declared terminal domain")
+            let value = match trace {
+                PipelineTraceValue::ReceiverAnalysis(value)
+                | PipelineTraceValue::MemberTargetAnalysis(value) => value,
+                _ => unreachable!(
+                    "receiver analysis expansion trace has its declared terminal domain"
+                ),
             };
             value.site_ast_id = Some(ast_id.clone());
         }
@@ -575,9 +582,20 @@ pub(super) fn receiver_analysis_expansions(
             site_id,
             site_ast_id,
         };
+        let (value, trace) = if operation == ReceiverQueryOperation::MemberTargets {
+            (
+                PipelineValue::MemberTargetAnalysis(value.clone()),
+                PipelineTraceValue::MemberTargetAnalysis(value),
+            )
+        } else {
+            (
+                PipelineValue::ReceiverAnalysis(value.clone()),
+                PipelineTraceValue::ReceiverAnalysis(value),
+            )
+        };
         expansions.push(PipelineExpansion {
-            value: PipelineValue::ReceiverAnalysis(value.clone()),
-            trace: vec![(PipelineTraceValue::ReceiverAnalysis(value), None)],
+            value,
+            trace: vec![(trace, None)],
             budgeted: true,
         });
     }

@@ -1746,6 +1746,7 @@ fn evaluate_relational_assertion_policy(
             );
         }
     };
+    let work = relational_work_report(total_work, evaluation.work, 0, 0);
 
     let capability = assertion_capabilities(&query_diagnostics);
     let adapted = adapt_query_diagnostics(&query_diagnostics, budget.max_diagnostics());
@@ -1841,6 +1842,48 @@ fn evaluate_relational_assertion_policy(
             _ => Some(PolicySourceLocation::artifact(path)),
         }
     };
+    let row_endpoint_locations =
+        |row: &RelationalViolationRow| -> Option<Vec<PolicySourceLocation>> {
+            let index = *binding_index_by_name.get(&row.binding)?;
+            let item = executed[index].result.results.get(row.row)?;
+            let CodeQueryResultValue::ConcurrentAccessConflict { value } = &item.value else {
+                return Some(Vec::new());
+            };
+            let endpoint = |path: &str,
+                            range: CodeQueryRange,
+                            start_byte: usize,
+                            end_byte: usize|
+             -> Option<PolicySourceLocation> {
+                let path = WorkspaceRelativePath::new(path).ok()?;
+                let byte_span = PolicyByteSpan::new(
+                    u64::try_from(start_byte).ok()?,
+                    u64::try_from(end_byte).ok()?,
+                )
+                .ok()?;
+                let region = PolicyDisplayRegion::new(
+                    u64::try_from(range.start_line).ok()?,
+                    u64::try_from(range.start_column).ok()?,
+                    u64::try_from(range.end_line).ok()?,
+                    u64::try_from(range.end_column).ok()?,
+                )
+                .ok()?;
+                Some(PolicySourceLocation::span(path, byte_span, region))
+            };
+            Some(vec![
+                endpoint(
+                    &value.first_path,
+                    value.first_range,
+                    value.first_start_byte,
+                    value.first_end_byte,
+                )?,
+                endpoint(
+                    &value.second_path,
+                    value.second_range,
+                    value.second_start_byte,
+                    value.second_end_byte,
+                )?,
+            ])
+        };
 
     let mut findings = Vec::new();
     for violation in &evaluation.violations {
@@ -1916,6 +1959,43 @@ fn evaluate_relational_assertion_policy(
                     );
                 };
                 related.push(entry);
+                let Some(endpoint_locations) = row_endpoint_locations(row) else {
+                    return failed_policy_run_with_reason(
+                        policy,
+                        PolicyAnalysisType::Assertion,
+                        findings,
+                        PolicyFailureReason::InternalInvariant,
+                        "a concurrent access row could not project its endpoint locations",
+                        work,
+                        budget,
+                    );
+                };
+                for location in endpoint_locations {
+                    if related.iter().any(|entry| entry.location() == &location) {
+                        continue;
+                    }
+                    if related.len() == budget.max_related_locations_per_finding() {
+                        related_truncated = true;
+                        omitted_related = omitted_related.saturating_add(1);
+                        continue;
+                    }
+                    let Ok(entry) = RelatedPolicyLocation::try_new(
+                        PolicyLocationRelationship::Evidence,
+                        location,
+                        Vec::new(),
+                    ) else {
+                        return failed_policy_run_with_reason(
+                            policy,
+                            PolicyAnalysisType::Assertion,
+                            findings,
+                            PolicyFailureReason::InternalInvariant,
+                            "a concurrent access endpoint could not be retained as finding evidence",
+                            work,
+                            budget,
+                        );
+                    };
+                    related.push(entry);
+                }
             }
         }
 
@@ -2016,7 +2096,7 @@ fn evaluate_relational_assertion_policy(
         }
     }
 
-    let work = work_report(total_work, findings.len(), 0);
+    let work = relational_work_report(total_work, evaluation.work, findings.len(), 0);
     let mut run = finish_assembled_run(
         policy,
         PolicyAnalysisType::Assertion,

@@ -24,7 +24,9 @@ use crate::{CvssMetricValueToken, EvidenceRef};
 use brokk_bifrost_analysis::analyzer::Language;
 use brokk_bifrost_analysis::analyzer::{ProjectFile, TestProject, TypescriptAnalyzer};
 use brokk_bifrost_rql::structural::search::{
-    CodeQueryStableOwnerCandidate, execute_code_query_detailed,
+    CodeQueryStableOwnerCandidate, DetailedCodeQueryIdentityCandidate,
+    DetailedCodeQueryProvenanceEvidence, DetailedCodeQueryProvenanceIdentities,
+    DetailedCodeQueryProvenanceRefEvidence, execute_code_query_detailed,
 };
 use brokk_bifrost_rql::structural::{CodeQuery, CodeQueryCallSite, CodeQueryDeclaration};
 use serde_json::json;
@@ -72,6 +74,7 @@ fn classified_match_run(source: &str, budget: PolicyBudget) -> PolicyRun {
         cancellation: None,
         cvss_overlays: &[],
         organizational_risk: &[],
+        incremental: None,
     };
     let mut budget = budget;
     DefaultPolicyEvaluator::new()
@@ -489,6 +492,7 @@ fn typestate_compilation_incompleteness_remains_typed_and_non_clean() {
                 cancellation: None,
                 cvss_overlays: &[],
                 organizational_risk: &[],
+                incremental: None,
             },
             &mut PolicyBudget::default(),
         )
@@ -525,6 +529,7 @@ fn default_evaluator_dispatches_valid_taint_and_typestate_adapters() {
         cancellation: None,
         cvss_overlays: &[],
         organizational_risk: &[],
+        incremental: None,
     };
 
     let taint_registry = policy_registry("test:taint-assembly", taint_policy_source());
@@ -618,6 +623,7 @@ fn duplicate_taint_projection_fails_but_preserves_unrelated_strong_positive() {
             cancellation: None,
             cvss_overlays: &[],
             organizational_risk: &[],
+            incremental: None,
         },
         &PolicyBudget::default(),
     )
@@ -652,6 +658,7 @@ fn taint_assembly_keeps_cvss_scenario_display_joined_after_byte_truncation() {
         cancellation: None,
         cvss_overlays: &[],
         organizational_risk: &[],
+        incremental: None,
     };
     let mut baseline_budget = PolicyBudget::default();
     let baseline = evaluator
@@ -736,6 +743,7 @@ fn terminal_adapter_completion_survives_secondary_overlay_budget() {
             cancellation: None,
             cvss_overlays: &[],
             organizational_risk: &overlays,
+            incremental: None,
         },
         &budget,
     )
@@ -1067,8 +1075,16 @@ fn broad_advisory_stays_complete_and_untruncated_capability_gap_is_inconclusive(
         language: "workspace",
         message: "broad query".to_string(),
     };
-    assert!(certainty_reasons(&[broad], &[]).is_empty());
+    assert!(certainty_reasons(std::slice::from_ref(&broad), &[]).is_empty());
     assert!(incomplete_reasons(&CodeQueryCompletion::Complete, false).is_empty());
+    // A policy run drops the advisory entirely: it measures the execution that
+    // raised it, and only a whole execution can raise it, so forwarding it
+    // would make a sliced run and a full run differ in report bytes and at the
+    // retention boundary.
+    let adapted = adapt_query_diagnostics(&[broad], 8);
+    assert!(adapted.diagnostics.is_empty());
+    assert!(!adapted.truncated);
+    assert!(!adapted.adaptation_failed);
 
     let completion = CodeQueryCompletion::Incomplete {
         codes: vec![CodeQueryDiagnosticCode::UnsupportedStructuralFeature],
@@ -1107,8 +1123,10 @@ fn secondary_incomplete_cause_does_not_corrupt_terminal_completion() {
 
 #[test]
 fn rejected_query_diagnostic_marks_truncation_without_hiding_later_valid_diagnostics() {
+    // Any forwarded code will do; deliberately not `broad_query`, which a
+    // policy run drops before it can be rejected for its length.
     let rejected = CodeQueryDiagnostic {
-        code: CodeQueryDiagnosticCode::BroadQuery,
+        code: CodeQueryDiagnosticCode::UsesTargetsAmbiguous,
         impact: CodeQueryDiagnosticImpact::Advisory,
         branch: Vec::new(),
         language: "workspace",
@@ -1161,8 +1179,8 @@ fn rejected_detailed_row_does_not_hide_later_positive_candidates() {
 
     let adapted = adapt_match_candidates(
         &PolicyId::new("test.partial-row-conversion").expect("policy id"),
-        results,
-        evidence,
+        results.iter().map(UnitRowItem::project).collect(),
+        evidence.iter().map(UnitRowEvidence::project).collect(),
         &query_diagnostics,
     );
 
@@ -1455,8 +1473,14 @@ fn direct_call_terminal_downgrades_proven_proof_when_caller_identity_is_unavaila
         provenance: Vec::new(),
         decorated_parameter: None,
     };
-    let candidate = adapt_match_candidate(&policy_id, item, evidence, &[], &mut HashMap::new())
-        .expect("synthetic detailed/public terminal pair adapts");
+    let candidate = adapt_match_candidate(
+        &policy_id,
+        UnitRowItem::project(&item),
+        UnitRowEvidence::project(&evidence),
+        &[],
+        &mut HashMap::new(),
+    )
+    .expect("synthetic detailed/public terminal pair adapts");
 
     assert!(
         matches!(
@@ -1615,8 +1639,8 @@ fn proven_call_without_a_stable_caller_identity_is_name_based_but_keeps_strong_a
     let mut ordinals = HashMap::new();
     let candidate = adapt_match_candidate(
         &policy_id,
-        item,
-        evidence,
+        UnitRowItem::project(&item),
+        UnitRowEvidence::project(&evidence),
         &detailed.result.diagnostics,
         &mut ordinals,
     )
@@ -1671,11 +1695,12 @@ fn advisory_ambiguity_only_lowers_findings_from_the_affected_set_branch() {
         message: "branch-local ambiguity".to_string(),
     };
 
+    let projected = |branch| UnitRowProvenance::project(&provenance(branch));
     assert_eq!(
-        certainty_reasons(std::slice::from_ref(&diagnostic), &[provenance(0)]).len(),
+        certainty_reasons(std::slice::from_ref(&diagnostic), &[projected(0)]).len(),
         1
     );
-    assert!(certainty_reasons(&[diagnostic], &[provenance(1)]).is_empty());
+    assert!(certainty_reasons(&[diagnostic], &[projected(1)]).is_empty());
 }
 
 #[test]
@@ -1703,7 +1728,9 @@ fn invalid_owner_candidate_forces_weak_anchor() {
         decorated_parameter: None,
     };
     assert!(matches!(OwnerCandidate::Rejected, OwnerCandidate::Rejected));
-    let key = weak_finding_key(&evidence);
+    let projected = UnitRowEvidence::project(&evidence);
+    let path = workspace_relative_path(&projected.rel_path).expect("workspace-relative path");
+    let key = weak_finding_key(&projected, &path);
     assert!(key.as_str().starts_with("code-query:"));
 }
 
@@ -1745,10 +1772,9 @@ fn weak_key_is_domain_and_span_separated() {
         provenance: Vec::new(),
         decorated_parameter: None,
     };
-    assert_ne!(
-        weak_finding_key(&evidence(0..4)),
-        weak_finding_key(&evidence(5..9))
-    );
+    let path = WorkspaceRelativePath::new("src/app.ts").expect("path");
+    let key = |span| weak_finding_key(&UnitRowEvidence::project(&evidence(span)), &path);
+    assert_ne!(key(0..4), key(5..9));
 }
 
 #[test]

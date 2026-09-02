@@ -755,6 +755,16 @@ fn acquire_usage_ranking_graph_with_cancellation(
                     .scope(|language| selected_ecosystems.contains(&UsageEcosystem::of(language)))
             })
     };
+    if analyzer.read_ledger_attached() {
+        // The graph spans whole languages; nothing narrower than the ecosystem
+        // scope's content identity bounds what it answered.
+        let languages = analyzer
+            .languages()
+            .into_iter()
+            .filter(|language| selected_ecosystems.contains(&UsageEcosystem::of(*language)))
+            .collect::<Vec<_>>();
+        analyzer.record_read(analyzer.workspace_scope_read_key(&languages));
+    }
     let Some(workspace_content) = ecosystem_content(analyzer) else {
         cache.record_missing_content_identity(graph_kind, selected_ecosystems.iter().copied());
         return build_usage_ranking_graph_uncached(
@@ -1630,6 +1640,13 @@ fn referencing_files_for(
         .import_analysis_provider()
         .map(|provider| provider.referencing_files_of(file).into_iter().collect())
         .unwrap_or_default();
+    if analyzer.read_ledger_attached() {
+        analyzer.record_read(crate::analyzer::read_ledger::ReadKey::lookup(
+            crate::analyzer::read_ledger::LookupKind::Importers,
+            crate::analyzer::read_ledger::LookupQuestion::file(file),
+            crate::analyzer::read_ledger::file_set_digest(&resolved),
+        ));
+    }
     cache.insert(file.clone(), resolved.clone());
     resolved
 }
@@ -3857,6 +3874,7 @@ mod tests {
     /// fetches from it are filesystem reads, not the unbounded network work
     /// the #1373 guard exists for. This is exactly the clone the benchmark
     /// harness produces when it blobless-clones a local fixture repository.
+    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
     #[test]
     fn local_promisor_partial_clone_still_ranks_by_commit_history() {
         let temp = TempDir::new().unwrap();
@@ -3889,6 +3907,7 @@ mod tests {
 
     /// The partial-clone rule keys off the clone, so an ordinary repository keeps
     /// filling its history and ranking at full quality.
+    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
     #[test]
     fn issue_1373_ordinary_clone_still_ranks_by_commit_history() {
         let temp = TempDir::new().unwrap();
@@ -4681,6 +4700,7 @@ mod tests {
     /// M5 invalidation proof: a new commit moves HEAD to a new OID, which must miss the cached
     /// key and force a refill, so the next call reflects the new commit rather than serving a
     /// stale cached commit-OID list.
+    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
     #[test]
     fn most_important_files_reflect_commit_added_after_first_call() {
         let temp = TempDir::new().unwrap();

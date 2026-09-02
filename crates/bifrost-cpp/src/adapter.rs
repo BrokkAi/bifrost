@@ -232,7 +232,6 @@ pub fn cpp_extract_call_receiver(reference: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
     use tree_sitter::Parser;
 
     fn cpp_tree(source: &str) -> tree_sitter::Tree {
@@ -409,7 +408,10 @@ class SIMPLECPP_LIB Token {
         ];
 
         for (name, source) in fixtures {
-            let file = ProjectFile::new(PathBuf::from("/workspace"), "src/widget.h");
+            let file = ProjectFile::new(
+                std::env::current_dir().expect("test working directory must be available"),
+                "src/widget.h",
+            );
             let tree = cpp_tree(source);
             let root = tree.root_node();
 
@@ -440,7 +442,10 @@ class SIMPLECPP_LIB Token {
     #[test]
     fn the_nested_tag_fixture_really_has_two_readings() {
         let source = "struct outer { struct inner { int v; } i; };\nstruct inner *p;\n";
-        let file = ProjectFile::new(PathBuf::from("/workspace"), "src/widget.h");
+        let file = ProjectFile::new(
+            std::env::current_dir().expect("test working directory must be available"),
+            "src/widget.h",
+        );
         let tree = cpp_tree(source);
         let root = tree.root_node();
         let ancestry = ParentIndex::new(root);
@@ -481,7 +486,10 @@ int run() {
     }
 }
 "#;
-        let file = ProjectFile::new(PathBuf::from("/workspace"), "src/widget.cpp");
+        let file = ProjectFile::new(
+            std::env::current_dir().expect("test working directory must be available"),
+            "src/widget.cpp",
+        );
         let mut parser = Parser::new();
         parser
             .set_language(&tree_sitter_cpp::LANGUAGE.into())

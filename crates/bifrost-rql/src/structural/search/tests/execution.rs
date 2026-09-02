@@ -123,6 +123,7 @@ fn conflicting_held_snapshots_are_negative_cached_and_typed_incomplete() {
     assert!(diagnostics[0].branch == vec![1]);
 }
 
+#[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
 #[test]
 fn sequential_profile_replays_a_shared_seed_for_each_union_branch() {
     let temp = tempfile::tempdir().expect("temp dir");
@@ -209,6 +210,7 @@ fn sequential_profile_replays_a_shared_seed_for_each_union_branch() {
     assert!(union.temporary_capacity_bytes_lower_bound > 0);
 }
 
+#[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
 #[test]
 fn parallel_seed_union_matches_serial_fair_budget_roll_forward() {
     let temp = tempfile::tempdir().expect("temp dir");
@@ -354,6 +356,7 @@ fn parallel_seed_union_matches_serial_budget_exhaustion() {
     assert_eq!(parallel.result.results.len(), 3);
 }
 
+#[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
 #[test]
 fn sequential_union_charges_shared_scan_file_extraction_once() {
     let temp = tempfile::tempdir().expect("temp dir");
@@ -414,6 +417,7 @@ fn sequential_union_charges_shared_scan_file_extraction_once() {
     );
 }
 
+#[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
 #[test]
 fn sequential_union_still_charges_distinct_files_fully() {
     let temp = tempfile::tempdir().expect("temp dir");
@@ -796,6 +800,7 @@ fn profile_marks_truncated_seed_materialization_and_replay_incomplete() {
     }));
 }
 
+#[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
 #[test]
 fn profile_does_not_call_a_terminal_cap_seed_cache_complete() {
     let temp = tempfile::tempdir().expect("temp dir");
@@ -856,6 +861,7 @@ fn profile_does_not_call_a_terminal_cap_seed_cache_complete() {
     );
 }
 
+#[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
 #[test]
 fn profile_marks_unsupported_seed_materialization_and_replay_incomplete() {
     let temp = tempfile::tempdir().expect("temp dir");
@@ -966,6 +972,7 @@ fn profile_marks_unsupported_import_builds_and_replays_incomplete() {
     );
 }
 
+#[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
 #[test]
 fn profile_distinguishes_seed_reuse_from_structural_facts_reuse() {
     let temp = tempfile::tempdir().expect("temp dir");
@@ -1035,6 +1042,7 @@ fn profile_distinguishes_seed_reuse_from_structural_facts_reuse() {
     assert!(union.temporary_capacity_bytes_lower_bound > 0);
 }
 
+#[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
 #[test]
 fn profile_records_request_local_import_graph_reuse_without_snapshot_retention() {
     let temp = tempfile::tempdir().expect("temp dir");
@@ -1228,6 +1236,7 @@ fn profile_preserves_incomplete_reference_cache_state_for_a_sibling() {
     );
 }
 
+#[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
 #[test]
 fn profile_attributes_root_limit_probe_to_the_limit_operator() {
     let temp = tempfile::tempdir().expect("temp dir");
@@ -1293,6 +1302,7 @@ fn profile_attributes_root_limit_probe_to_the_limit_operator() {
     );
 }
 
+#[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
 #[test]
 fn skipped_set_profile_forwards_cancellation_safe_partial_cardinality() {
     let temp = tempfile::tempdir().expect("temp dir");
@@ -1452,6 +1462,7 @@ fn scan_only_run(
     .expect("scan access is always available")
 }
 
+#[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
 #[test]
 fn sequential_union_retries_a_starved_first_branch() {
     let temp = tempfile::tempdir().expect("temp dir");
@@ -1510,6 +1521,7 @@ fn sequential_union_retries_a_starved_first_branch() {
     assert_eq!(result_identities(&detailed.result), expected);
 }
 
+#[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
 #[test]
 fn sequential_union_retry_keeps_reporting_genuine_exhaustion() {
     let temp = tempfile::tempdir().expect("temp dir");
@@ -1658,6 +1670,7 @@ func localMisuse() string {
     assert_eq!(matches, vec!["os.Open(\"local.xlsx\")"]);
 }
 
+#[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
 #[test]
 fn flow_state_replays_the_exact_artifact_behind_result_handles() {
     use brokk_bifrost_core::analyzer::structural::flow_state::{FlowStateAxis, StateEventClass};
@@ -1861,7 +1874,7 @@ fn execute_conditional_result_contract_files_with_operation(
     let project = project.build();
     let workspace = project.workspace_analyzer(AnalyzerConfig::default());
     let pack_source = br#"{
-        "schema_version": 1,
+        "schema_version": 2,
         "pack_id": "test.rql.go-conditional-result-contract",
         "version": "1.0.0",
         "producer": { "name": "bifrost-rql-test", "version": "1.0.0" },
@@ -1950,6 +1963,42 @@ fn execute_conditional_result_contract_files_with_operation(
                             "parameter_ordinal": 0,
                             "predicate": "null",
                             "proof_effect": "does_not_establish"
+                        }]
+                    },
+                    {
+                        "id": "errors.as",
+                        "target": {
+                            "path": "src/errors/wrap.go",
+                            "symbol": "errors.As(err error, target any)",
+                            "has_receiver": false,
+                            "parameter_count": 2
+                        },
+                        "completeness": "complete",
+                        "normal_result_count": 1,
+                        "transfers": [],
+                        "effects": [],
+                        "conditional_indirect_writes": [{
+                            "result_ordinal": 0,
+                            "outcome": true,
+                            "parameter_ordinal": 1,
+                            "target": "pointee"
+                        }]
+                    },
+                    {
+                        "id": "os-exec.exit-error-exit-code",
+                        "target": {
+                            "path": "src/os/exec/exec.go",
+                            "symbol": "os/exec.ExitError.ExitCode()",
+                            "has_receiver": true,
+                            "parameter_count": 0
+                        },
+                        "completeness": "complete",
+                        "normal_result_count": 1,
+                        "transfers": [],
+                        "effects": [],
+                        "preconditions": [{
+                            "input": { "kind": "receiver" },
+                            "predicate": "non_null"
                         }]
                     },
                     {
@@ -2103,7 +2152,7 @@ fn execute_conditional_result_contract_files_with_operation(
         }]
     }"#;
     let declaration_pack_source = br#"{
-        "schema_version": 1,
+        "schema_version": 2,
         "pack_id": "test.rql.go-conditional-result-contract-declarations",
         "version": "1.0.0",
         "producer": { "name": "bifrost-rql-test", "version": "1.0.0" },
@@ -2205,6 +2254,50 @@ fn execute_conditional_result_contract_files_with_operation(
                             "kind": "artifact",
                             "path": "testify/require/require.go",
                             "symbol": "github.com/stretchr/testify/require"
+                        }
+                    },
+                    {
+                        "id": "type.test.rql.os-exec.module",
+                        "name": "os/exec",
+                        "type_kind": "module",
+                        "visibility": "package",
+                        "is_abstract": false,
+                        "is_sealed": false,
+                        "has_explicit_type_terms": false,
+                        "type_parameters": [],
+                        "type_parameter_constraints": [],
+                        "embedded_types": [],
+                        "hierarchy": [],
+                        "aliases": ["exec"],
+                        "extension_surfaces": [],
+                        "locator": {
+                            "kind": "artifact",
+                            "path": "os/exec/exec.go",
+                            "symbol": "os/exec"
+                        }
+                    },
+                    {
+                        "id": "type.test.rql.os-exec.exit-error",
+                        "name": "os/exec.ExitError",
+                        "type_kind": "struct",
+                        "visibility": "public",
+                        "is_abstract": false,
+                        "is_sealed": false,
+                        "has_explicit_type_terms": false,
+                        "type_parameters": [],
+                        "type_parameter_constraints": [],
+                        "underlying_type": {
+                            "display": "struct{}",
+                            "referenced_types": []
+                        },
+                        "embedded_types": [],
+                        "hierarchy": [],
+                        "aliases": [],
+                        "extension_surfaces": [],
+                        "locator": {
+                            "kind": "artifact",
+                            "path": "os/exec/exec.go",
+                            "symbol": "os/exec.ExitError"
                         }
                     },
                     {
@@ -2553,6 +2646,55 @@ fn execute_conditional_result_contract_files_with_operation(
                         }
                     },
                     {
+                        "id": "member.9fd565756088ca91d69be236b28ee436db05c9fa5b505d121a26fcf7d151992d",
+                        "owner": "type.1eef3afbc23b6c534c6d054fc877197155006d5fdbdce518890a99d07a1f85d8",
+                        "name": "As",
+                        "member_kind": "function",
+                        "visibility": "public",
+                        "is_static": true,
+                        "is_abstract": false,
+                        "is_virtual": false,
+                        "signature": {
+                            "type_parameters": [],
+                            "parameters": [
+                                {
+                                    "name": "err",
+                                    "type": {
+                                        "kind": "named",
+                                        "name": "error",
+                                        "arguments": [],
+                                        "nullable": false
+                                    },
+                                    "optional": false,
+                                    "variadic": false
+                                },
+                                {
+                                    "name": "target",
+                                    "type": {
+                                        "kind": "named",
+                                        "name": "any",
+                                        "arguments": [],
+                                        "nullable": false
+                                    },
+                                    "optional": false,
+                                    "variadic": false
+                                }
+                            ],
+                            "returns": {
+                                "kind": "named",
+                                "name": "bool",
+                                "arguments": [],
+                                "nullable": false
+                            }
+                        },
+                        "aliases": [],
+                        "locator": {
+                            "kind": "artifact",
+                            "path": "errors/errors.go",
+                            "symbol": "errors.As"
+                        }
+                    },
+                    {
                         "id": "member.3de3ee8d4154a940e5cf65b19f308ef5e6ba51eb72c419b7fc1294389ba3bdfb",
                         "owner": "type.66dc4abf1c89685d48c53a4f98f69a160a61abbfad9f955c25a70a2bab3b79f8",
                         "name": "NoError",
@@ -2604,6 +2746,33 @@ fn execute_conditional_result_contract_files_with_operation(
                             "kind": "artifact",
                             "path": "testify/require/require.go",
                             "symbol": "github.com/stretchr/testify/require.NoError"
+                        }
+                    },
+                    {
+                        "id": "member.test.rql.os-exec.exit-error.exit-code",
+                        "owner": "type.test.rql.os-exec.exit-error",
+                        "name": "ExitCode",
+                        "member_kind": "method",
+                        "visibility": "public",
+                        "is_static": false,
+                        "is_abstract": false,
+                        "is_virtual": false,
+                        "signature": {
+                            "type_parameters": [],
+                            "parameters": [],
+                            "returns": {
+                                "kind": "named",
+                                "name": "int",
+                                "arguments": [],
+                                "nullable": false
+                            }
+                        },
+                        "receiver": { "pointer": true },
+                        "aliases": [],
+                        "locator": {
+                            "kind": "artifact",
+                            "path": "os/exec/exec.go",
+                            "symbol": "os/exec.ExitError.ExitCode"
                         }
                     },
                     {
@@ -2959,16 +3128,28 @@ fn execute_conditional_result_contract_files_with_operation(
         "test conditional result-contract pack activates: {activation:#?}"
     );
 
-    let query = CodeQuery::from_json(&json!({
-        "languages": ["go"],
-        "match": { "kind": "call", "callee": { "name": "Open" } },
-        "steps": [
-            { "op": "call_shape" },
-            { "op": "call_result_contracts" },
-            { "op": operation }
-        ],
-        "result_detail": "full"
-    }))
+    let query = CodeQuery::from_json(&if operation == "nilness_operations" {
+        json!({
+            "languages": ["go"],
+            "match": { "kind": "function", "name": "exitCode" },
+            "steps": [
+                { "op": "procedure_of" },
+                { "op": operation }
+            ],
+            "result_detail": "full"
+        })
+    } else {
+        json!({
+            "languages": ["go"],
+            "match": { "kind": "call", "callee": { "name": "Open" } },
+            "steps": [
+                { "op": "call_shape" },
+                { "op": "call_result_contracts" },
+                { "op": operation }
+            ],
+            "result_detail": "full"
+        })
+    })
     .expect("conditional result-contract use query");
     execute_workspace(
         &workspace,
@@ -2977,6 +3158,7 @@ fn execute_conditional_result_contract_files_with_operation(
     )
 }
 
+#[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
 #[test]
 fn direct_result_contracts_preserve_raw_shape_and_prove_result_guards() {
     let project = InlineTestProject::with_language(Language::Go)
@@ -3001,7 +3183,7 @@ func checked(path string) os.File {
         .build();
     let workspace = project.workspace_analyzer(AnalyzerConfig::default());
     let pack_source = br#"{
-        "schema_version": 1,
+        "schema_version": 2,
         "pack_id": "test.rql.go-direct-result-contract",
         "version": "1.0.0",
         "producer": { "name": "bifrost-rql-test", "version": "1.0.0" },
@@ -3037,7 +3219,7 @@ func checked(path string) os.File {
         }]
     }"#;
     let declaration_pack_source = br#"{
-        "schema_version": 1,
+        "schema_version": 2,
         "pack_id": "test.rql.go-direct-result-contract-declarations",
         "version": "1.0.0",
         "producer": { "name": "bifrost-rql-test", "version": "1.0.0" },
@@ -3431,6 +3613,7 @@ fn assert_open_unknown_result_contract_uses(
     }
 }
 
+#[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
 #[test]
 fn go_exact_assignment_converted_result_and_condition_bindings_are_proven() {
     let result = execute_conditional_result_contract_fixture(
@@ -3485,6 +3668,7 @@ func reusedResultAndCondition(path string) string {
     }
 }
 
+#[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
 #[test]
 fn go_assignment_converted_field_and_index_results_stay_open() {
     let result = execute_conditional_result_contract_fixture(
@@ -3578,6 +3762,2221 @@ func deferred(path string) {
     assert!(
         !super::super::effects::is_go_assignment_conversion_target(procedure, defer_capture),
         "a defer capture must not be mistaken for a Go assignment conversion"
+    );
+}
+
+#[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
+#[test]
+fn go_nilness_operations_project_scalar_pointer_facts() {
+    let project = InlineTestProject::with_language(Language::Go)
+        .file(
+            "main.go",
+            r#"package main
+
+type item struct { field int }
+
+func run(flag bool) int {
+    var maybe *item
+    var guarded *item
+    if flag { maybe = &item{} }
+    if guarded == nil { guarded = &item{} }
+    return maybe.field + guarded.field
+}
+"#,
+        )
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let query = CodeQuery::from_json(&json!({
+        "languages": ["go"],
+        "match": { "kind": "function", "name": "run" },
+        "steps": [
+            { "op": "procedure_of" },
+            { "op": "nilness_operations" }
+        ],
+        "result_detail": "full"
+    }))
+    .expect("nilness operation query");
+    let result = execute_workspace(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &query,
+    );
+    assert_eq!(
+        result.completion(),
+        CodeQueryCompletion::Complete,
+        "{result:#?}"
+    );
+    let mut facts = result
+        .results
+        .iter()
+        .map(|item| {
+            let CodeQueryResultValue::NilnessOperation { value } = &item.value else {
+                panic!("nilness_operations returns its typed row: {item:#?}");
+            };
+            assert_eq!(value.use_kind, "field");
+            assert_eq!(value.proof, "exact");
+            (value.range.start_line, value.fact)
+        })
+        .collect::<Vec<_>>();
+    facts.sort_unstable();
+    assert_eq!(facts, [(10, "maybe_nil"), (10, "non_nil")], "{result:#?}");
+}
+
+#[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
+#[test]
+fn go_nilness_operations_apply_errors_as_write_only_on_true() {
+    let result = execute_conditional_result_contract_files_with_operation(
+        &[(
+            "main.go",
+            r#"package main
+
+import (
+    "errors"
+    "os/exec"
+)
+
+func exitCode(err error) int {
+    var exitError *exec.ExitError
+    if errors.As(err, &exitError) {
+        return exitError.ExitCode()
+    }
+    return exitError.ExitCode()
+}
+
+"#,
+        )],
+        "nilness_operations",
+    );
+    let mut operations = result
+        .results
+        .iter()
+        .map(|item| {
+            let CodeQueryResultValue::NilnessOperation { value } = &item.value else {
+                panic!("nilness_operations returns its typed row: {item:#?}");
+            };
+            (
+                value.range.start_line,
+                value.use_kind,
+                value.fact,
+                value.proof,
+            )
+        })
+        .collect::<Vec<_>>();
+    operations.sort_unstable();
+    assert_eq!(
+        operations,
+        [
+            (11, "receiver_call", "unknown", "unknown"),
+            (13, "receiver_call", "nil", "exact")
+        ],
+        "the modeled true write invalidates only the true arm: {result:#?}"
+    );
+}
+
+#[test]
+fn go_switch_coverage_projects_closed_and_open_domains() {
+    let project = InlineTestProject::with_language(Language::Go)
+        .file(
+            "main.go",
+            r#"package main
+
+func coverage(flag bool, n int, x any) {
+    switch flag {
+    case true: n++
+    case false: n--
+    }
+    switch flag {
+    case true: n++
+    }
+    switch n {
+    case 1: n++
+    default: n--
+    }
+    switch n {
+    case 1: n++
+    }
+    switch {
+    case flag: n++
+    }
+    switch {
+    default: n--
+    }
+    switch v := x.(type) {
+    case int: n += v
+    default: n--
+    }
+}
+"#,
+        )
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let query = CodeQuery::from_json(&json!({
+        "languages": ["go"],
+        "match": { "kind": "function", "name": "coverage" },
+        "steps": [
+            { "op": "procedure_of" },
+            { "op": "switch_coverage" }
+        ],
+        "result_detail": "full"
+    }))
+    .expect("switch coverage query");
+    assert_eq!(
+        query.validate_steps().unwrap(),
+        crate::QueryValueKind::SwitchCoverage
+    );
+    let result = execute_workspace(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &query,
+    );
+    assert_eq!(
+        result.completion(),
+        CodeQueryCompletion::Complete,
+        "{result:#?}"
+    );
+    let rows = result
+        .results
+        .iter()
+        .map(|item| {
+            let CodeQueryResultValue::SwitchCoverage { value } = &item.value else {
+                panic!("switch_coverage returns its typed row: {item:#?}");
+            };
+            assert!(
+                !item.provenance.is_empty(),
+                "switch row retains its procedure derivation"
+            );
+            (
+                value.range.start_line,
+                value.kind,
+                value.selector_domain,
+                value.verdict,
+                value.proof,
+                value.reason,
+                value.has_true_case,
+                value.has_false_case,
+                value.default_present,
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        rows,
+        [
+            (
+                4,
+                "expression",
+                "boolean",
+                "exhaustive",
+                "exact",
+                None,
+                true,
+                true,
+                false,
+            ),
+            (
+                8,
+                "expression",
+                "boolean",
+                "non_exhaustive",
+                "exact",
+                Some("boolean_case_missing"),
+                true,
+                false,
+                false,
+            ),
+            (
+                11,
+                "expression",
+                "open",
+                "exhaustive",
+                "exact",
+                None,
+                false,
+                false,
+                true,
+            ),
+            (
+                15,
+                "expression",
+                "open",
+                "unknown",
+                "unknown",
+                Some("selector_domain_open"),
+                false,
+                false,
+                false,
+            ),
+            (
+                18,
+                "expressionless",
+                "open",
+                "unknown",
+                "unknown",
+                Some("expressionless_without_default"),
+                false,
+                false,
+                false,
+            ),
+            (
+                21,
+                "expressionless",
+                "open",
+                "exhaustive",
+                "exact",
+                None,
+                false,
+                false,
+                true,
+            ),
+            (
+                24,
+                "type",
+                "open",
+                "unknown",
+                "unknown",
+                Some("type_switch"),
+                false,
+                false,
+                true,
+            ),
+        ],
+        "{result:#?}"
+    );
+}
+
+#[test]
+fn go_detached_task_transfers_project_arguments_receivers_and_captures() {
+    let project = InlineTestProject::with_language(Language::Go)
+        .file(
+            "main.go",
+            r#"package main
+
+type worker struct{}
+func (w *worker) run(value int) {}
+func consume(values ...any) {}
+
+func spawn(w *worker, value int, flag bool) {
+    go w.run(value)
+    capturedWorker := w
+    capturedValue := value
+    go func() { consume(capturedWorker, capturedValue) }()
+    consume(w)
+    defer consume(value)
+
+    var selected *worker
+    if flag { selected = &worker{} } else { selected = &worker{} }
+    go consume(selected)
+}
+"#,
+        )
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let query = CodeQuery::from_json(&json!({
+        "languages": ["go"],
+        "match": { "kind": "function", "name": "spawn" },
+        "steps": [
+            { "op": "procedure_of" },
+            { "op": "detached_task_transfers" }
+        ],
+        "result_detail": "full"
+    }))
+    .expect("detached task transfer query");
+    let result = execute_workspace(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &query,
+    );
+    assert_eq!(
+        result.completion(),
+        CodeQueryCompletion::Complete,
+        "{result:#?}"
+    );
+    let rows = result
+        .results
+        .iter()
+        .map(|item| {
+            let CodeQueryResultValue::DetachedTaskTransfer { value } = &item.value else {
+                panic!("detached_task_transfers returns its typed row: {item:#?}");
+            };
+            assert_eq!(value.timing, "different_task");
+            assert!(!item.provenance.is_empty());
+            (
+                value.range.start_line,
+                value.role,
+                value.ordinal,
+                value.proof,
+                value.coverage,
+                value.reason,
+                value.object_id.is_some(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        rows.len(),
+        5,
+        "ordinary and deferred calls are omitted: {result:#?}"
+    );
+    assert_eq!(
+        rows.iter().map(|row| (row.1, row.2)).collect::<Vec<_>>(),
+        [
+            ("receiver", None),
+            ("argument", Some(0)),
+            ("capture", Some(0)),
+            ("capture", Some(1)),
+            ("argument", Some(0)),
+        ],
+        "{result:#?}"
+    );
+    assert!(
+        rows[..2].iter().all(|row| row.3 == "exact" && row.6),
+        "{result:#?}"
+    );
+    assert!(
+        rows[2..4].iter().all(|row| {
+            row.3 == "unknown" && row.4 == "open" && row.5 == Some("object_set_open") && !row.6
+        }),
+        "scalar immutable captures retain explicit open object identity: {result:#?}"
+    );
+    assert_eq!(
+        (rows[4].3, rows[4].4, rows[4].5, rows[4].6),
+        ("unknown", "open", Some("object_identity_ambiguous"), false),
+        "{result:#?}"
+    );
+}
+
+#[test]
+fn go_concurrent_access_conflicts_project_exact_capture_races() {
+    let project = InlineTestProject::with_language(Language::Go)
+        .file(
+            "main.go",
+            r#"package main
+
+func race() int {
+    value := 0
+    go func() { value = 1 }()
+    return value
+}
+
+func joinedByChannel() int {
+    value := 0
+    done := make(chan struct{})
+    go func() {
+        value = 1
+        close(done)
+    }()
+    <-done
+    return value
+}
+
+func channel() chan struct{} { return nil }
+
+func ambiguouslyJoined() int {
+    value := 0
+    sent := channel()
+    received := channel()
+    go func() {
+        value = 1
+        close(sent)
+    }()
+    <-received
+    return value
+}
+
+func joinedByAllSelectArms() int {
+    value := 0
+    done := make(chan struct{})
+    go func() {
+        value = 1
+        close(done)
+    }()
+    select {
+    case <-done:
+    case _, ok := <-done:
+        _ = ok
+    }
+    return value
+}
+
+func selectWithDefaultIsUnjoined() int {
+    value := 0
+    done := make(chan struct{})
+    go func() {
+        value = 1
+        close(done)
+    }()
+    select {
+    case <-done:
+    default:
+    }
+    return value
+}
+
+func selectCancellationShadowsResult(cancelled <-chan struct{}) error {
+    var err error
+    done := make(chan struct{})
+    go func() {
+        defer close(done)
+        err = nil
+    }()
+    select {
+    case <-cancelled:
+        err := error(nil)
+        _ = err
+        return nil
+    case <-done:
+    }
+    return err
+}
+
+func namedResultCancellationRace(cancelled <-chan struct{}, stop bool) (err error) {
+    done := make(chan struct{})
+    go func() {
+        defer close(done)
+        if stop {
+            return
+        }
+        err = nil
+    }()
+    select {
+    case <-cancelled:
+        return nil
+    case <-done:
+    }
+    return err
+}
+
+type cell struct { value int }
+
+func writeCell(value *cell) { value.value = 1 }
+func readCell(value *cell) int { return value.value }
+
+func namedHelpers() int {
+    value := &cell{}
+    go writeCell(value)
+    return readCell(value)
+}
+
+func distinctHelperObjects() int {
+    written := &cell{}
+    read := &cell{}
+    go writeCell(written)
+    return readCell(read)
+}
+
+func mutateFreshCell() {
+    value := &cell{}
+    value.value = 1
+}
+
+func perTaskAllocationsAreDistinct() {
+    go mutateFreshCell()
+    go mutateFreshCell()
+}
+
+func mapBackingRace() int {
+    values := make(map[int]int)
+    go func() { values[0] = 1 }()
+    return values[1]
+}
+
+func arrayElementsAreDistinct() int {
+    values := [2]int{}
+    go func() { values[0] = 1 }()
+    return values[1]
+}
+
+func arrayElementRace() int {
+    values := [2]int{}
+    go func() { values[0] = 1 }()
+    return values[0]
+}
+
+func sliceAliasRace() int {
+    values := make([]int, 2)
+    alias := values
+    go func() { alias[0] = 1 }()
+    return values[0]
+}
+
+func distinctSliceElements() int {
+    values := make([]int, 2)
+    alias := values
+    go func() { alias[0] = 1 }()
+    return values[1]
+}
+
+var sharedGlobal int
+
+func globalRace() int {
+    go func() { sharedGlobal = 1 }()
+    return sharedGlobal
+}
+
+func copiedScalarArgument() int {
+    value := 0
+    go func(copy int) { copy = 1 }(value)
+    return value
+}
+
+type copiedOptions struct { term int }
+
+func writeCopiedOptions(opts copiedOptions) { opts.term = 1 }
+
+func copiedStructArguments() {
+    var opts copiedOptions
+    go writeCopiedOptions(opts)
+    writeCopiedOptions(opts)
+}
+
+func childOnlyWrite() {
+    value := 0
+    go func() { value = 1 }()
+}
+
+func accessBeforeSpawn() {
+    value := &cell{}
+    value.value = 1
+    go func() { _ = value.value }()
+}
+
+type fieldPair struct { left, right int }
+
+func distinctFields() int {
+    value := &fieldPair{}
+    go func() { value.left = 1 }()
+    return value.right
+}
+
+func siblingRace() {
+    value := 0
+    go func() { value = 1 }()
+    go func() { value = 2 }()
+}
+
+func nestedRace() {
+    value := 0
+    go func() {
+        go func() { value = 1 }()
+        value = 2
+    }()
+}
+
+func repeatedRace() {
+    value := 0
+    for index := 0; index < 2; index++ {
+        go func() { value++ }()
+    }
+}
+
+func unknownSliceIndex(first, second int) int {
+    values := make([]int, 2)
+    alias := values
+    go func() { alias[first] = 1 }()
+    return values[second]
+}
+
+func unknownIndicesOnDistinctSlices(first, second int) int {
+    written := make([]int, 2)
+    read := make([]int, 2)
+    go func() { written[first] = 1 }()
+    return read[second]
+}
+
+func unknownCell() *cell { return nil }
+
+func unknownObjectAlias() int {
+    written := unknownCell()
+    read := unknownCell()
+    go writeCell(written)
+    return readCell(read)
+}
+
+func writeLeft(value *fieldPair) { value.left = 1 }
+func readRight(value *fieldPair) int { return value.right }
+
+func unknownObjectsDistinctFields() int {
+    written := (*fieldPair)(nil)
+    read := (*fieldPair)(nil)
+    go writeLeft(written)
+    return readRight(read)
+}
+"#,
+        )
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let query = CodeQuery::from_json(&json!({
+        "languages": ["go"],
+        "match": { "kind": "function", "name": "race" },
+        "steps": [
+            { "op": "procedure_of" },
+            { "op": "concurrent_access_conflicts" }
+        ],
+        "result_detail": "full"
+    }))
+    .expect("concurrent access conflict query");
+    let result = execute_workspace(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &query,
+    );
+    assert_eq!(
+        result.completion(),
+        CodeQueryCompletion::Complete,
+        "{result:#?}"
+    );
+    let rows = result
+        .results
+        .iter()
+        .map(|item| {
+            let CodeQueryResultValue::ConcurrentAccessConflict { value } = &item.value else {
+                panic!("concurrent_access_conflicts returns its typed row: {item:#?}");
+            };
+            assert!(!item.provenance.is_empty());
+            (
+                value.task_relation,
+                value.ordering,
+                value.protection,
+                value.proof,
+                value.coverage,
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        rows,
+        [(
+            "parent_child",
+            "unordered",
+            "unprotected",
+            "proven",
+            "exhaustive"
+        )],
+        "{result:#?}"
+    );
+
+    let joined_query = CodeQuery::from_json(&json!({
+        "languages": ["go"],
+        "match": { "kind": "function", "name": "joinedByChannel" },
+        "steps": [
+            { "op": "procedure_of" },
+            { "op": "concurrent_access_conflicts" }
+        ],
+        "result_detail": "full"
+    }))
+    .expect("channel-joined concurrent access query");
+    let joined = execute_workspace(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &joined_query,
+    );
+    assert_eq!(
+        joined.completion(),
+        CodeQueryCompletion::Complete,
+        "{joined:#?}"
+    );
+    assert!(joined.results.is_empty(), "{joined:#?}");
+
+    let ambiguous_query = CodeQuery::from_json(&json!({
+        "languages": ["go"],
+        "match": { "kind": "function", "name": "ambiguouslyJoined" },
+        "steps": [
+            { "op": "procedure_of" },
+            { "op": "concurrent_access_conflicts" }
+        ],
+        "result_detail": "full"
+    }))
+    .expect("ambiguously joined concurrent access query");
+    let ambiguous = execute_workspace(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &ambiguous_query,
+    );
+    assert_eq!(
+        ambiguous.completion(),
+        CodeQueryCompletion::Complete,
+        "{ambiguous:#?}"
+    );
+    let [item] = ambiguous.results.as_slice() else {
+        panic!("one open ambiguous synchronization row: {ambiguous:#?}");
+    };
+    let CodeQueryResultValue::ConcurrentAccessConflict { value } = &item.value else {
+        panic!("ambiguous synchronization retains its typed row: {item:#?}");
+    };
+    assert_eq!(
+        (value.ordering, value.proof, value.coverage),
+        ("open", "open", "open"),
+        "{ambiguous:#?}"
+    );
+    assert_eq!(value.reasons, ["unknown_location"], "{ambiguous:#?}");
+
+    let named_query = CodeQuery::from_json(&json!({
+        "languages": ["go"],
+        "match": { "kind": "function", "name": "namedHelpers" },
+        "steps": [
+            { "op": "procedure_of" },
+            { "op": "concurrent_access_conflicts" }
+        ],
+        "result_detail": "full"
+    }))
+    .expect("named helper concurrent access query");
+    let named = execute_workspace(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &named_query,
+    );
+    assert_eq!(
+        named.completion(),
+        CodeQueryCompletion::Complete,
+        "{named:#?}"
+    );
+    let [item] = named.results.as_slice() else {
+        panic!("one named cross-procedure conflict: {named:#?}");
+    };
+    let CodeQueryResultValue::ConcurrentAccessConflict { value } = &item.value else {
+        panic!("named helper query returns its typed row: {item:#?}");
+    };
+    assert_eq!(
+        (
+            value.task_relation,
+            value.ordering,
+            value.protection,
+            value.proof,
+            value.coverage
+        ),
+        (
+            "parent_child",
+            "unordered",
+            "unprotected",
+            "proven",
+            "exhaustive"
+        ),
+        "{named:#?}"
+    );
+
+    let distinct_query = CodeQuery::from_json(&json!({
+        "languages": ["go"],
+        "match": { "kind": "function", "name": "distinctHelperObjects" },
+        "steps": [
+            { "op": "procedure_of" },
+            { "op": "concurrent_access_conflicts" }
+        ],
+        "result_detail": "full"
+    }))
+    .expect("distinct helper object concurrent access query");
+    let distinct = execute_workspace(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &distinct_query,
+    );
+    assert_eq!(
+        distinct.completion(),
+        CodeQueryCompletion::Complete,
+        "{distinct:#?}"
+    );
+    assert!(distinct.results.is_empty(), "{distinct:#?}");
+
+    let conflicts_for = |name: &str| {
+        let query = CodeQuery::from_json(&json!({
+            "languages": ["go"],
+            "match": { "kind": "function", "name": name },
+            "steps": [
+                { "op": "procedure_of" },
+                { "op": "concurrent_access_conflicts" }
+            ],
+            "result_detail": "full"
+        }))
+        .expect("collection concurrent access query");
+        execute_workspace(
+            &workspace,
+            &brokk_bifrost_flow::FlowWorkspaceState::new(),
+            &query,
+        )
+    };
+    for name in [
+        "mapBackingRace",
+        "arrayElementRace",
+        "sliceAliasRace",
+        "globalRace",
+        "siblingRace",
+        "nestedRace",
+        "repeatedRace",
+    ] {
+        let result = conflicts_for(name);
+        assert_eq!(
+            result.completion(),
+            CodeQueryCompletion::Complete,
+            "{name}: {result:#?}"
+        );
+        let [item] = result.results.as_slice() else {
+            panic!("{name} has one exact collection conflict: {result:#?}");
+        };
+        let CodeQueryResultValue::ConcurrentAccessConflict { value } = &item.value else {
+            panic!("{name} returns its typed conflict: {item:#?}");
+        };
+        assert_eq!(
+            (value.proof, value.coverage),
+            ("proven", "exhaustive"),
+            "{name}: {result:#?}"
+        );
+    }
+    for name in [
+        "arrayElementsAreDistinct",
+        "distinctSliceElements",
+        "copiedScalarArgument",
+        "childOnlyWrite",
+        "accessBeforeSpawn",
+        "distinctFields",
+        "joinedByAllSelectArms",
+        "selectCancellationShadowsResult",
+        "unknownIndicesOnDistinctSlices",
+        "unknownObjectsDistinctFields",
+        "perTaskAllocationsAreDistinct",
+    ] {
+        let result = conflicts_for(name);
+        assert_eq!(
+            result.completion(),
+            CodeQueryCompletion::Complete,
+            "{name}: {result:#?}"
+        );
+        assert!(result.results.is_empty(), "{name}: {result:#?}");
+    }
+    let cancellation_race = conflicts_for("namedResultCancellationRace");
+    assert_eq!(
+        cancellation_race.completion(),
+        CodeQueryCompletion::Complete,
+        "{cancellation_race:#?}"
+    );
+    let [item] = cancellation_race.results.as_slice() else {
+        panic!(
+            "the cancellation return races with the named result capture: {cancellation_race:#?}"
+        );
+    };
+    let CodeQueryResultValue::ConcurrentAccessConflict { value } = &item.value else {
+        panic!("named result cancellation returns its typed conflict: {item:#?}");
+    };
+    assert_eq!(
+        (
+            value.first_access,
+            value.second_access,
+            value.task_relation,
+            value.ordering,
+            value.protection,
+            value.proof,
+            value.coverage,
+        ),
+        (
+            "write",
+            "write",
+            "parent_child",
+            "unordered",
+            "unprotected",
+            "proven",
+            "exhaustive",
+        ),
+        "{cancellation_race:#?}"
+    );
+    let mut endpoint_lines = [value.first_range.start_line, value.second_range.start_line];
+    endpoint_lines.sort_unstable();
+    assert_eq!(
+        endpoint_lines,
+        [87, 91],
+        "the exact pair is the child assignment and cancellation return: {cancellation_race:#?}"
+    );
+    let unknown_index = conflicts_for("unknownSliceIndex");
+    assert_eq!(
+        unknown_index.completion(),
+        CodeQueryCompletion::Complete,
+        "{unknown_index:#?}"
+    );
+    let [item] = unknown_index.results.as_slice() else {
+        panic!("one open dynamic-index candidate: {unknown_index:#?}");
+    };
+    let CodeQueryResultValue::ConcurrentAccessConflict { value } = &item.value else {
+        panic!("dynamic-index query returns its typed row: {item:#?}");
+    };
+    assert_eq!(
+        (value.ordering, value.proof, value.coverage),
+        ("unordered", "open", "open"),
+        "{unknown_index:#?}"
+    );
+    assert_eq!(value.reasons, ["unknown_location"], "{unknown_index:#?}");
+
+    let unknown_alias = conflicts_for("unknownObjectAlias");
+    assert_eq!(
+        unknown_alias.completion(),
+        CodeQueryCompletion::Complete,
+        "{unknown_alias:#?}"
+    );
+    let [item] = unknown_alias.results.as_slice() else {
+        panic!("one open unknown-object alias candidate: {unknown_alias:#?}");
+    };
+    let CodeQueryResultValue::ConcurrentAccessConflict { value } = &item.value else {
+        panic!("unknown-object query returns its typed row: {item:#?}");
+    };
+    assert_eq!(
+        (value.ordering, value.proof, value.coverage),
+        ("unordered", "open", "open"),
+        "{unknown_alias:#?}"
+    );
+    assert_eq!(value.reasons, ["unknown_location"], "{unknown_alias:#?}");
+
+    let copied_struct = conflicts_for("copiedStructArguments");
+    assert_eq!(
+        copied_struct.completion(),
+        CodeQueryCompletion::Complete,
+        "{copied_struct:#?}"
+    );
+    let [item] = copied_struct.results.as_slice() else {
+        panic!("one open copied-aggregate candidate: {copied_struct:#?}");
+    };
+    let CodeQueryResultValue::ConcurrentAccessConflict { value } = &item.value else {
+        panic!("copied-aggregate query returns its typed row: {item:#?}");
+    };
+    assert_eq!(
+        (value.ordering, value.proof, value.coverage),
+        ("unordered", "open", "open"),
+        "{copied_struct:#?}"
+    );
+    assert_eq!(value.reasons, ["unknown_location"], "{copied_struct:#?}");
+
+    let select_default = conflicts_for("selectWithDefaultIsUnjoined");
+    assert_eq!(
+        select_default.completion(),
+        CodeQueryCompletion::Complete,
+        "{select_default:#?}"
+    );
+    let [item] = select_default.results.as_slice() else {
+        panic!("one conflict through a select default arm: {select_default:#?}");
+    };
+    let CodeQueryResultValue::ConcurrentAccessConflict { value } = &item.value else {
+        panic!("select-default query returns its typed row: {item:#?}");
+    };
+    assert_eq!(
+        (value.ordering, value.proof, value.coverage),
+        ("unordered", "proven", "exhaustive"),
+        "{select_default:#?}"
+    );
+}
+
+#[test]
+fn go_concurrent_access_conflicts_report_incomplete_recursive_slices() {
+    let project = InlineTestProject::with_language(Language::Go)
+        .file(
+            "main.go",
+            r#"package main
+
+func recursive() {
+    recursive()
+}
+"#,
+        )
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let query = CodeQuery::from_json(&json!({
+        "languages": ["go"],
+        "match": { "kind": "function", "name": "recursive" },
+        "steps": [
+            { "op": "procedure_of" },
+            { "op": "concurrent_access_conflicts" }
+        ],
+        "result_detail": "full"
+    }))
+    .expect("recursive concurrent access query");
+    let result = execute_workspace(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &query,
+    );
+    assert_eq!(
+        result.completion(),
+        CodeQueryCompletion::Incomplete {
+            codes: vec![CodeQueryDiagnosticCode::SemanticAnalysisPartial]
+        },
+        "{result:#?}"
+    );
+    assert!(result.results.is_empty(), "{result:#?}");
+    assert!(result.diagnostics.iter().any(|diagnostic| {
+        diagnostic.code == CodeQueryDiagnosticCode::SemanticAnalysisPartial
+            && diagnostic.message.contains("RecursiveExpansion")
+    }));
+}
+
+#[test]
+fn go_concurrent_access_conflicts_report_unsafe_and_cgo_boundaries_without_poisoning() {
+    let project = InlineTestProject::with_language(Language::Go)
+        .file(
+            "unsafe.go",
+            r#"package main
+
+import "unsafe"
+
+func unsafeBoundary() int {
+    value := 0
+    pointer := unsafe.Pointer(&value)
+    _ = pointer
+    go func() { value = 1 }()
+    return value
+}
+"#,
+        )
+        .file(
+            "cgo.go",
+            r#"package main
+
+/* void noop(void) {} */
+import "C"
+
+func cgoBoundary() int {
+    value := 0
+    go func() {
+        value = 1
+        C.noop()
+    }()
+    C.noop()
+    return value
+}
+"#,
+        )
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+
+    for name in ["unsafeBoundary", "cgoBoundary"] {
+        let query = CodeQuery::from_json(&json!({
+            "languages": ["go"],
+            "match": { "kind": "function", "name": name },
+            "steps": [
+                { "op": "procedure_of" },
+                { "op": "concurrent_access_conflicts" }
+            ],
+            "result_detail": "full"
+        }))
+        .expect("unsupported boundary concurrent access query");
+        let result = execute_workspace(
+            &workspace,
+            &brokk_bifrost_flow::FlowWorkspaceState::new(),
+            &query,
+        );
+        let [item] = result.results.as_slice() else {
+            panic!("{name} retains one binding-scoped open row: {result:#?}");
+        };
+        let CodeQueryResultValue::ConcurrentAccessConflict { value } = &item.value else {
+            panic!("{name} returns its typed conflict row: {item:#?}");
+        };
+        assert_eq!(
+            result.completion(),
+            CodeQueryCompletion::Incomplete {
+                codes: vec![CodeQueryDiagnosticCode::SemanticAnalysisPartial]
+            },
+            "{name}: {result:#?}"
+        );
+        assert!(result.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == CodeQueryDiagnosticCode::SemanticAnalysisPartial
+                && diagnostic.message.contains("UnresolvedTarget")
+        }));
+        assert_eq!(
+            (value.proof, value.coverage),
+            ("proven", "exhaustive"),
+            "an unrelated {name} boundary must not poison the exact ordinary race: {result:#?}"
+        );
+        assert!(value.reasons.is_empty(), "{result:#?}");
+    }
+}
+
+#[test]
+fn go_concurrent_access_conflicts_apply_exact_sync_models() {
+    let project = InlineTestProject::with_language(Language::Go)
+        .file(
+            "main.go",
+            r#"package main
+
+import (
+    "sync"
+    "sync/atomic"
+)
+
+func locked() int {
+    mutex := &sync.Mutex{}
+    value := 0
+    go func() {
+        mutex.Lock()
+        value = 1
+        mutex.Unlock()
+    }()
+    mutex.Lock()
+    result := value
+    mutex.Unlock()
+    return result
+}
+
+func grouped() int {
+    group := &sync.WaitGroup{}
+    value := 0
+    group.Go(func() { value = 1 })
+    group.Wait()
+    return value
+}
+
+func classicGroup() int {
+    group := &sync.WaitGroup{}
+    value := 0
+    group.Add(1)
+    go func() {
+        defer group.Done()
+        value = 1
+    }()
+    group.Wait()
+    return value
+}
+
+func repeatedClassicGroup() int {
+    total := 0
+    for index := 0; index < 2; index++ {
+        group := sync.WaitGroup{}
+        first, second := 0, 0
+        group.Add(2)
+        go func() {
+            defer func() { group.Done() }()
+            first = 1
+        }()
+        go func() {
+            defer group.Done()
+            second = 2
+        }()
+        group.Wait()
+        total += first + second
+    }
+    return total
+}
+
+func nestedRepeatedClassicGroup() {
+    go func() { _ = repeatedClassicGroup() }()
+}
+
+func unknownGroupCount(delta int) int {
+    group := &sync.WaitGroup{}
+    value := 0
+    group.Add(delta)
+    go func() {
+        defer group.Done()
+        value = 1
+    }()
+    group.Wait()
+    return value
+}
+
+func atomicOnly() int64 {
+    var value int64
+    go func() { atomic.StoreInt64(&value, 1) }()
+    return atomic.LoadInt64(&value)
+}
+
+func mixedAtomic() int64 {
+    var value int64
+    go func() { atomic.StoreInt64(&value, 1) }()
+    return value
+}
+
+func mutex() *sync.Mutex { return nil }
+
+func ambiguousLock() int {
+    first := mutex()
+    second := mutex()
+    value := 0
+    go func() {
+        first.Lock()
+        value = 1
+        first.Unlock()
+    }()
+    second.Lock()
+    result := value
+    second.Unlock()
+    return result
+}
+
+func oneSidedLock() int {
+    mutex := &sync.Mutex{}
+    value := 0
+    go func() {
+        mutex.Lock()
+        value = 1
+        mutex.Unlock()
+    }()
+    return value
+}
+
+func unsupportedOnce() int {
+    once := &sync.Once{}
+    value := 0
+    go func() {
+        value = 1
+        once.Do(func() {})
+    }()
+    once.Do(func() {})
+    return value
+}
+"#,
+        )
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let pack = compile_source(
+        SourceFormat::Json,
+        br#"{
+          "schema_version": 2,
+          "pack_id": "test.go.concurrency",
+          "version": "1.0.0",
+          "producer": { "name": "test", "version": "1.0.0" },
+          "language": "go",
+          "ecosystem": "go",
+          "compatibility": { "bifrost": ">=0.10.7, <1.0.0", "toolchains": [] },
+          "provenance": { "source": "test", "revision": "1" },
+          "license": "MIT",
+          "completeness": "complete",
+          "safety": { "generated_code_only": false, "review_required": false },
+          "shards": [{
+            "id": "sync.declarations",
+            "activation": [{}],
+            "payload": {
+              "kind": "declaration_facts",
+              "types": [
+                {
+                  "id": "type.1111111111111111111111111111111111111111111111111111111111111111",
+                  "name": "sync",
+                  "type_kind": "module",
+                  "visibility": "package",
+                  "is_abstract": false,
+                  "is_sealed": false,
+                  "has_explicit_type_terms": false,
+                  "type_parameters": [],
+                  "type_parameter_constraints": [],
+                  "embedded_types": [],
+                  "hierarchy": [],
+                  "aliases": ["sync"],
+                  "extension_surfaces": [],
+                  "locator": { "kind": "artifact", "path": "src/sync/mutex.go", "symbol": "sync" }
+                },
+                {
+                  "id": "type.2222222222222222222222222222222222222222222222222222222222222222",
+                  "name": "sync.Mutex",
+                  "type_kind": "struct",
+                  "visibility": "public",
+                  "is_abstract": false,
+                  "is_sealed": false,
+                  "has_explicit_type_terms": false,
+                  "type_parameters": [],
+                  "type_parameter_constraints": [],
+                  "embedded_types": [],
+                  "hierarchy": [],
+                  "aliases": [],
+                  "extension_surfaces": [],
+                  "locator": { "kind": "artifact", "path": "src/sync/mutex.go", "symbol": "sync.Mutex" }
+                },
+                {
+                  "id": "type.5555555555555555555555555555555555555555555555555555555555555555",
+                  "name": "sync.WaitGroup",
+                  "type_kind": "struct",
+                  "visibility": "public",
+                  "is_abstract": false,
+                  "is_sealed": false,
+                  "has_explicit_type_terms": false,
+                  "type_parameters": [],
+                  "type_parameter_constraints": [],
+                  "embedded_types": [],
+                  "hierarchy": [],
+                  "aliases": [],
+                  "extension_surfaces": [],
+                  "locator": { "kind": "artifact", "path": "src/sync/waitgroup.go", "symbol": "sync.WaitGroup" }
+                },
+                {
+                  "id": "type.dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+                  "name": "sync.Once",
+                  "type_kind": "struct",
+                  "visibility": "public",
+                  "is_abstract": false,
+                  "is_sealed": false,
+                  "has_explicit_type_terms": false,
+                  "type_parameters": [],
+                  "type_parameter_constraints": [],
+                  "embedded_types": [],
+                  "hierarchy": [],
+                  "aliases": [],
+                  "extension_surfaces": [],
+                  "locator": { "kind": "artifact", "path": "src/sync/once.go", "symbol": "sync.Once" }
+                },
+                {
+                  "id": "type.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                  "name": "sync/atomic",
+                  "type_kind": "module",
+                  "visibility": "package",
+                  "is_abstract": false,
+                  "is_sealed": false,
+                  "has_explicit_type_terms": false,
+                  "type_parameters": [],
+                  "type_parameter_constraints": [],
+                  "embedded_types": [],
+                  "hierarchy": [],
+                  "aliases": ["atomic"],
+                  "extension_surfaces": [],
+                  "locator": { "kind": "artifact", "path": "src/sync/atomic/doc.go", "symbol": "sync/atomic" }
+                }
+              ],
+              "members": [
+                {
+                  "id": "member.3333333333333333333333333333333333333333333333333333333333333333",
+                  "owner": "type.2222222222222222222222222222222222222222222222222222222222222222",
+                  "name": "Lock",
+                  "member_kind": "method",
+                  "visibility": "public",
+                  "is_static": false,
+                  "is_abstract": false,
+                  "is_virtual": false,
+                  "signature": { "type_parameters": [], "parameters": [] },
+                  "receiver": { "pointer": true },
+                  "aliases": [],
+                  "locator": { "kind": "artifact", "path": "src/sync/mutex.go", "symbol": "sync.Mutex.Lock" }
+                },
+                {
+                  "id": "member.4444444444444444444444444444444444444444444444444444444444444444",
+                  "owner": "type.2222222222222222222222222222222222222222222222222222222222222222",
+                  "name": "Unlock",
+                  "member_kind": "method",
+                  "visibility": "public",
+                  "is_static": false,
+                  "is_abstract": false,
+                  "is_virtual": false,
+                  "signature": { "type_parameters": [], "parameters": [] },
+                  "receiver": { "pointer": true },
+                  "aliases": [],
+                  "locator": { "kind": "artifact", "path": "src/sync/mutex.go", "symbol": "sync.Mutex.Unlock" }
+                },
+                {
+                  "id": "member.dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+                  "owner": "type.dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+                  "name": "Do",
+                  "member_kind": "method",
+                  "visibility": "public",
+                  "is_static": false,
+                  "is_abstract": false,
+                  "is_virtual": false,
+                  "signature": { "type_parameters": [], "parameters": [{ "name": "f", "type": { "kind": "named", "name": "func()", "arguments": [], "nullable": false }, "optional": false, "variadic": false }] },
+                  "receiver": { "pointer": true },
+                  "aliases": [],
+                  "locator": { "kind": "artifact", "path": "src/sync/once.go", "symbol": "sync.Once.Do" }
+                },
+                {
+                  "id": "member.6666666666666666666666666666666666666666666666666666666666666666",
+                  "owner": "type.5555555555555555555555555555555555555555555555555555555555555555",
+                  "name": "Go",
+                  "member_kind": "method",
+                  "visibility": "public",
+                  "is_static": false,
+                  "is_abstract": false,
+                  "is_virtual": false,
+                  "signature": { "type_parameters": [], "parameters": [{ "name": "f", "type": { "kind": "named", "name": "func()", "arguments": [], "nullable": false }, "optional": false, "variadic": false }] },
+                  "receiver": { "pointer": true },
+                  "aliases": [],
+                  "locator": { "kind": "artifact", "path": "src/sync/waitgroup.go", "symbol": "sync.WaitGroup.Go" }
+                },
+                {
+                  "id": "member.7777777777777777777777777777777777777777777777777777777777777777",
+                  "owner": "type.5555555555555555555555555555555555555555555555555555555555555555",
+                  "name": "Wait",
+                  "member_kind": "method",
+                  "visibility": "public",
+                  "is_static": false,
+                  "is_abstract": false,
+                  "is_virtual": false,
+                  "signature": { "type_parameters": [], "parameters": [] },
+                  "receiver": { "pointer": true },
+                  "aliases": [],
+                  "locator": { "kind": "artifact", "path": "src/sync/waitgroup.go", "symbol": "sync.WaitGroup.Wait" }
+                },
+                {
+                  "id": "member.8888888888888888888888888888888888888888888888888888888888888888",
+                  "owner": "type.5555555555555555555555555555555555555555555555555555555555555555",
+                  "name": "Add",
+                  "member_kind": "method",
+                  "visibility": "public",
+                  "is_static": false,
+                  "is_abstract": false,
+                  "is_virtual": false,
+                  "signature": { "type_parameters": [], "parameters": [{ "name": "delta", "type": { "kind": "named", "name": "int", "arguments": [], "nullable": false }, "optional": false, "variadic": false }] },
+                  "receiver": { "pointer": true },
+                  "aliases": [],
+                  "locator": { "kind": "artifact", "path": "src/sync/waitgroup.go", "symbol": "sync.WaitGroup.Add" }
+                },
+                {
+                  "id": "member.9999999999999999999999999999999999999999999999999999999999999999",
+                  "owner": "type.5555555555555555555555555555555555555555555555555555555555555555",
+                  "name": "Done",
+                  "member_kind": "method",
+                  "visibility": "public",
+                  "is_static": false,
+                  "is_abstract": false,
+                  "is_virtual": false,
+                  "signature": { "type_parameters": [], "parameters": [] },
+                  "receiver": { "pointer": true },
+                  "aliases": [],
+                  "locator": { "kind": "artifact", "path": "src/sync/waitgroup.go", "symbol": "sync.WaitGroup.Done" }
+                },
+                {
+                  "id": "member.bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                  "owner": "type.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                  "name": "StoreInt64",
+                  "member_kind": "function",
+                  "visibility": "public",
+                  "is_static": true,
+                  "is_abstract": false,
+                  "is_virtual": false,
+                  "signature": { "type_parameters": [], "parameters": [{ "name": "addr", "type": { "kind": "named", "name": "*int64", "arguments": [], "nullable": false }, "optional": false, "variadic": false }, { "name": "val", "type": { "kind": "named", "name": "int64", "arguments": [], "nullable": false }, "optional": false, "variadic": false }] },
+                  "aliases": [],
+                  "locator": { "kind": "artifact", "path": "src/sync/atomic/doc_64.go", "symbol": "sync/atomic.StoreInt64" }
+                },
+                {
+                  "id": "member.cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                  "owner": "type.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                  "name": "LoadInt64",
+                  "member_kind": "function",
+                  "visibility": "public",
+                  "is_static": true,
+                  "is_abstract": false,
+                  "is_virtual": false,
+                  "signature": { "type_parameters": [], "parameters": [{ "name": "addr", "type": { "kind": "named", "name": "*int64", "arguments": [], "nullable": false }, "optional": false, "variadic": false }], "returns": { "kind": "named", "name": "int64", "arguments": [], "nullable": false } },
+                  "aliases": [],
+                  "locator": { "kind": "artifact", "path": "src/sync/atomic/doc_64.go", "symbol": "sync/atomic.LoadInt64" }
+                }
+              ],
+              "relations": []
+            }
+          }, {
+            "id": "sync",
+            "activation": [{}],
+            "payload": {
+              "kind": "procedure_summaries",
+              "summaries": [
+                {
+                  "id": "mutex.lock",
+                  "target": { "path": "src/sync/mutex.go", "symbol": "sync.Mutex.Lock()", "has_receiver": true, "parameter_count": 0 },
+                  "completeness": "complete",
+                  "transfers": [],
+                  "concurrency_effects": [{ "kind": "lock_acquire", "lock": { "kind": "receiver" }, "mode": "exclusive" }]
+                },
+                {
+                  "id": "mutex.unlock",
+                  "target": { "path": "src/sync/mutex.go", "symbol": "sync.Mutex.Unlock()", "has_receiver": true, "parameter_count": 0 },
+                  "completeness": "complete",
+                  "transfers": [],
+                  "concurrency_effects": [{ "kind": "lock_release", "lock": { "kind": "receiver" }, "mode": "exclusive" }]
+                },
+                {
+                  "id": "once.do",
+                  "target": { "path": "src/sync/once.go", "symbol": "sync.Once.Do(func())", "has_receiver": true, "parameter_count": 1 },
+                  "completeness": "complete",
+                  "transfers": [],
+                  "concurrency_effects": [{ "kind": "unsupported", "protocol": "sync.Once" }]
+                },
+                {
+                  "id": "waitgroup.go",
+                  "target": { "path": "src/sync/waitgroup.go", "symbol": "sync.WaitGroup.Go(func())", "has_receiver": true, "parameter_count": 1 },
+                  "completeness": "complete",
+                  "transfers": [],
+                  "concurrency_effects": [{ "kind": "task_spawn", "callable": { "kind": "parameter", "ordinal": 0 }, "group": { "kind": "receiver" } }]
+                },
+                {
+                  "id": "waitgroup.wait",
+                  "target": { "path": "src/sync/waitgroup.go", "symbol": "sync.WaitGroup.Wait()", "has_receiver": true, "parameter_count": 0 },
+                  "completeness": "complete",
+                  "transfers": [],
+                  "concurrency_effects": [{ "kind": "wait_group_wait", "group": { "kind": "receiver" } }]
+                },
+                {
+                  "id": "waitgroup.add",
+                  "target": { "path": "src/sync/waitgroup.go", "symbol": "sync.WaitGroup.Add(delta int)", "has_receiver": true, "parameter_count": 1 },
+                  "completeness": "complete",
+                  "transfers": [],
+                  "concurrency_effects": [{ "kind": "wait_group_add", "group": { "kind": "receiver" }, "delta": { "kind": "parameter", "ordinal": 0 } }]
+                },
+                {
+                  "id": "waitgroup.done",
+                  "target": { "path": "src/sync/waitgroup.go", "symbol": "sync.WaitGroup.Done()", "has_receiver": true, "parameter_count": 0 },
+                  "completeness": "complete",
+                  "transfers": [],
+                  "concurrency_effects": [{ "kind": "wait_group_done", "group": { "kind": "receiver" } }]
+                },
+                {
+                  "id": "atomic.store-int64",
+                  "target": { "path": "src/sync/atomic/doc_64.go", "symbol": "sync/atomic.StoreInt64(addr *int64, val int64)", "has_receiver": false, "parameter_count": 2 },
+                  "completeness": "complete",
+                  "transfers": [],
+                  "concurrency_effects": [{ "kind": "atomic", "location": { "kind": "parameter", "ordinal": 0 }, "operation": "store" }]
+                },
+                {
+                  "id": "atomic.load-int64",
+                  "target": { "path": "src/sync/atomic/doc_64.go", "symbol": "sync/atomic.LoadInt64(addr *int64)", "has_receiver": false, "parameter_count": 1 },
+                  "completeness": "complete",
+                  "transfers": [],
+                  "concurrency_effects": [{ "kind": "atomic", "location": { "kind": "parameter", "ordinal": 0 }, "operation": "load" }]
+                }
+              ]
+            }
+          }]
+        }"#,
+        &CompilerOptions::default(),
+    )
+    .unwrap_or_else(|diagnostics| panic!("sync model pack compiles: {diagnostics:#?}"));
+    let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default())
+        .expect("ephemeral semantic-pack catalog");
+    catalog
+        .register_session_pack(
+            &pack,
+            &SessionPackSource {
+                kind: SessionPackSourceKind::Embedded,
+                source_id: "test:go-concurrency-sync".to_owned(),
+            },
+        )
+        .expect("register mutex model pack");
+    let activation = acquire_active_semantic_models(
+        workspace.analyzer(),
+        &catalog,
+        None,
+        &SemanticModelActivationRequest {
+            bifrost_version: Version::parse(env!("CARGO_PKG_VERSION")).expect("crate version"),
+            evidence: vec![SemanticModelActivationEvidence {
+                language: "go".to_owned(),
+                ecosystem: "go".to_owned(),
+                package: None,
+                module: None,
+                toolchain: None,
+                target: None,
+                configuration: None,
+                artifact_sha256: None,
+            }],
+            controls: Vec::new(),
+            limits: SemanticModelRuntimeLimits::default(),
+        },
+        &CancellationToken::default(),
+    );
+    assert!(
+        matches!(activation, SemanticModelRuntimeOutcome::Ready { .. }),
+        "sync models activate: {activation:#?}"
+    );
+
+    let query = CodeQuery::from_json(&json!({
+        "languages": ["go"],
+        "match": { "kind": "function", "name": "locked" },
+        "steps": [
+            { "op": "procedure_of" },
+            { "op": "concurrent_access_conflicts" }
+        ],
+        "result_detail": "full"
+    }))
+    .expect("mutex-protected concurrent access query");
+    let result = execute_workspace(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &query,
+    );
+    assert_eq!(
+        result.completion(),
+        CodeQueryCompletion::Complete,
+        "{result:#?}"
+    );
+    assert!(result.results.is_empty(), "{result:#?}");
+
+    let query = CodeQuery::from_json(&json!({
+        "languages": ["go"],
+        "match": { "kind": "function", "name": "nestedRepeatedClassicGroup" },
+        "steps": [
+            { "op": "procedure_of" },
+            { "op": "concurrent_access_conflicts" }
+        ],
+        "result_detail": "full"
+    }))
+    .expect("nested repeated classic WaitGroup-joined concurrent access query");
+    let result = execute_workspace(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &query,
+    );
+    assert_eq!(
+        result.completion(),
+        CodeQueryCompletion::Complete,
+        "{result:#?}"
+    );
+    assert!(result.results.is_empty(), "{result:#?}");
+
+    let query = CodeQuery::from_json(&json!({
+        "languages": ["go"],
+        "match": { "kind": "function", "name": "repeatedClassicGroup" },
+        "steps": [
+            { "op": "procedure_of" },
+            { "op": "concurrent_access_conflicts" }
+        ],
+        "result_detail": "full"
+    }))
+    .expect("repeated classic WaitGroup-joined concurrent access query");
+    let result = execute_workspace(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &query,
+    );
+    assert_eq!(
+        result.completion(),
+        CodeQueryCompletion::Complete,
+        "{result:#?}"
+    );
+    assert!(result.results.is_empty(), "{result:#?}");
+
+    let query = CodeQuery::from_json(&json!({
+        "languages": ["go"],
+        "match": { "kind": "function", "name": "atomicOnly" },
+        "steps": [
+            { "op": "procedure_of" },
+            { "op": "concurrent_access_conflicts" }
+        ],
+        "result_detail": "full"
+    }))
+    .expect("atomic-only concurrent access query");
+    let result = execute_workspace(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &query,
+    );
+    assert_eq!(
+        result.completion(),
+        CodeQueryCompletion::Complete,
+        "{result:#?}"
+    );
+    assert!(result.results.is_empty(), "{result:#?}");
+
+    let query = CodeQuery::from_json(&json!({
+        "languages": ["go"],
+        "match": { "kind": "function", "name": "mixedAtomic" },
+        "steps": [
+            { "op": "procedure_of" },
+            { "op": "concurrent_access_conflicts" }
+        ],
+        "result_detail": "full"
+    }))
+    .expect("mixed atomic and ordinary concurrent access query");
+    let result = execute_workspace(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &query,
+    );
+    assert_eq!(
+        result.completion(),
+        CodeQueryCompletion::Complete,
+        "{result:#?}"
+    );
+    let [item] = result.results.as_slice() else {
+        panic!("one mixed atomic/ordinary conflict: {result:#?}");
+    };
+    let CodeQueryResultValue::ConcurrentAccessConflict { value } = &item.value else {
+        panic!("mixed atomic/ordinary access returns its typed row: {item:#?}");
+    };
+    assert_eq!(
+        (
+            value.ordering,
+            value.protection,
+            value.proof,
+            value.coverage
+        ),
+        ("unordered", "unprotected", "proven", "exhaustive"),
+        "{result:#?}"
+    );
+
+    let query = CodeQuery::from_json(&json!({
+        "languages": ["go"],
+        "match": { "kind": "function", "name": "unsupportedOnce" },
+        "steps": [
+            { "op": "procedure_of" },
+            { "op": "concurrent_access_conflicts" }
+        ],
+        "result_detail": "full"
+    }))
+    .expect("unsupported Once synchronization query");
+    let result = execute_workspace(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &query,
+    );
+    assert_eq!(
+        result.completion(),
+        CodeQueryCompletion::Incomplete {
+            codes: vec![CodeQueryDiagnosticCode::SemanticAnalysisPartial]
+        },
+        "{result:#?}"
+    );
+    let [item] = result.results.as_slice() else {
+        panic!("one binding-scoped unsupported Once row: {result:#?}");
+    };
+    let CodeQueryResultValue::ConcurrentAccessConflict { value } = &item.value else {
+        panic!("unsupported Once retains its typed row: {item:#?}");
+    };
+    assert_eq!(
+        (value.ordering, value.proof, value.coverage),
+        ("unordered", "open", "open"),
+        "{result:#?}"
+    );
+    assert_eq!(
+        value.reasons,
+        ["unsupported_synchronization:sync.Once"],
+        "{result:#?}"
+    );
+
+    let query = CodeQuery::from_json(&json!({
+        "languages": ["go"],
+        "match": { "kind": "function", "name": "ambiguousLock" },
+        "steps": [
+            { "op": "procedure_of" },
+            { "op": "concurrent_access_conflicts" }
+        ],
+        "result_detail": "full"
+    }))
+    .expect("ambiguous mutex identity concurrent access query");
+    let result = execute_workspace(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &query,
+    );
+    assert_eq!(
+        result.completion(),
+        CodeQueryCompletion::Complete,
+        "{result:#?}"
+    );
+    let [item] = result.results.as_slice() else {
+        panic!("one open mutex identity conflict: {result:#?}");
+    };
+    let CodeQueryResultValue::ConcurrentAccessConflict { value } = &item.value else {
+        panic!("ambiguous mutex identity returns its typed row: {item:#?}");
+    };
+    assert_eq!(
+        (
+            value.ordering,
+            value.protection,
+            value.proof,
+            value.coverage
+        ),
+        ("unordered", "open", "open", "open"),
+        "{result:#?}"
+    );
+    assert_eq!(value.reasons, ["ambiguous_synchronization"], "{result:#?}");
+
+    let query = CodeQuery::from_json(&json!({
+        "languages": ["go"],
+        "match": { "kind": "function", "name": "oneSidedLock" },
+        "steps": [
+            { "op": "procedure_of" },
+            { "op": "concurrent_access_conflicts" }
+        ],
+        "result_detail": "full"
+    }))
+    .expect("one-sided mutex concurrent access query");
+    let result = execute_workspace(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &query,
+    );
+    assert_eq!(
+        result.completion(),
+        CodeQueryCompletion::Complete,
+        "{result:#?}"
+    );
+    let [item] = result.results.as_slice() else {
+        panic!("one one-sided mutex conflict: {result:#?}");
+    };
+    let CodeQueryResultValue::ConcurrentAccessConflict { value } = &item.value else {
+        panic!("one-sided mutex returns its typed row: {item:#?}");
+    };
+    assert_eq!(
+        (
+            value.ordering,
+            value.protection,
+            value.proof,
+            value.coverage
+        ),
+        ("unordered", "unprotected", "proven", "exhaustive"),
+        "{result:#?}"
+    );
+
+    let query = CodeQuery::from_json(&json!({
+        "languages": ["go"],
+        "match": { "kind": "function", "name": "unknownGroupCount" },
+        "steps": [
+            { "op": "procedure_of" },
+            { "op": "concurrent_access_conflicts" }
+        ],
+        "result_detail": "full"
+    }))
+    .expect("unknown WaitGroup count concurrent access query");
+    let result = execute_workspace(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &query,
+    );
+    assert_eq!(
+        result.completion(),
+        CodeQueryCompletion::Complete,
+        "{result:#?}"
+    );
+    let [item] = result.results.as_slice() else {
+        panic!("one open WaitGroup count row: {result:#?}");
+    };
+    let CodeQueryResultValue::ConcurrentAccessConflict { value } = &item.value else {
+        panic!("unknown WaitGroup count retains its typed row: {item:#?}");
+    };
+    assert_eq!(
+        (value.ordering, value.proof, value.coverage),
+        ("open", "open", "open"),
+        "{result:#?}"
+    );
+    assert_eq!(value.reasons, ["ambiguous_synchronization"], "{result:#?}");
+
+    let query = CodeQuery::from_json(&json!({
+        "languages": ["go"],
+        "match": { "kind": "function", "name": "classicGroup" },
+        "steps": [
+            { "op": "procedure_of" },
+            { "op": "concurrent_access_conflicts" }
+        ],
+        "result_detail": "full"
+    }))
+    .expect("classic WaitGroup-joined concurrent access query");
+    let result = execute_workspace(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &query,
+    );
+    assert_eq!(
+        result.completion(),
+        CodeQueryCompletion::Complete,
+        "{result:#?}"
+    );
+    assert!(result.results.is_empty(), "{result:#?}");
+
+    let query = CodeQuery::from_json(&json!({
+        "languages": ["go"],
+        "match": { "kind": "function", "name": "grouped" },
+        "steps": [
+            { "op": "procedure_of" },
+            { "op": "concurrent_access_conflicts" }
+        ],
+        "result_detail": "full"
+    }))
+    .expect("WaitGroup.Go-joined concurrent access query");
+    let result = execute_workspace(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &query,
+    );
+    assert_eq!(
+        result.completion(),
+        CodeQueryCompletion::Complete,
+        "{result:#?}"
+    );
+    assert!(result.results.is_empty(), "{result:#?}");
+}
+
+#[test]
+fn go_concurrent_access_conflicts_apply_rwmutex_and_errgroup_models() {
+    let project = InlineTestProject::with_language(Language::Go)
+        .file(
+            "main.go",
+            r#"package main
+
+import (
+    "sync"
+    "golang.org/x/sync/errgroup"
+)
+
+func rwExclusive() int {
+    mutex := &sync.RWMutex{}
+    value := 0
+    go func() {
+        mutex.Lock()
+        value = 1
+        mutex.Unlock()
+    }()
+    mutex.RLock()
+    result := value
+    mutex.RUnlock()
+    return result
+}
+
+func rwSharedWrite() int {
+    mutex := &sync.RWMutex{}
+    value := 0
+    go func() {
+        mutex.RLock()
+        value = 1
+        mutex.RUnlock()
+    }()
+    mutex.RLock()
+    result := value
+    mutex.RUnlock()
+    return result
+}
+
+func errgroupJoined() int {
+    group, _ := errgroup.WithContext(nil)
+    value := 0
+    group.Go(func() error { value = 1; return nil })
+    _ = group.Wait()
+    return value
+}
+"#,
+        )
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let pack = compile_source(
+        SourceFormat::Json,
+        br#"{
+          "schema_version": 2,
+          "pack_id": "test.go.rwmutex-errgroup",
+          "version": "1.0.0",
+          "producer": { "name": "test", "version": "1.0.0" },
+          "language": "go",
+          "ecosystem": "go",
+          "compatibility": { "bifrost": ">=0.10.7, <1.0.0", "toolchains": [] },
+          "provenance": { "source": "test", "revision": "1" },
+          "license": "MIT",
+          "completeness": "complete",
+          "safety": { "generated_code_only": false, "review_required": false },
+          "shards": [{
+            "id": "declarations",
+            "activation": [{}],
+            "payload": {
+              "kind": "declaration_facts",
+              "types": [
+                {
+                  "id": "type.1111111111111111111111111111111111111111111111111111111111111111",
+                  "name": "sync", "type_kind": "module", "visibility": "package",
+                  "is_abstract": false, "is_sealed": false, "has_explicit_type_terms": false,
+                  "type_parameters": [], "type_parameter_constraints": [], "embedded_types": [],
+                  "hierarchy": [], "aliases": ["sync"], "extension_surfaces": [],
+                  "locator": { "kind": "artifact", "path": "src/sync/rwmutex.go", "symbol": "sync" }
+                },
+                {
+                  "id": "type.2222222222222222222222222222222222222222222222222222222222222222",
+                  "name": "sync.RWMutex", "type_kind": "struct", "visibility": "public",
+                  "is_abstract": false, "is_sealed": false, "has_explicit_type_terms": false,
+                  "type_parameters": [], "type_parameter_constraints": [], "embedded_types": [],
+                  "hierarchy": [], "aliases": [], "extension_surfaces": [],
+                  "locator": { "kind": "artifact", "path": "src/sync/rwmutex.go", "symbol": "sync.RWMutex" }
+                },
+                {
+                  "id": "type.d9a13c3593128df16b560fd8293a702e20b1a36f381b6d54f82a6ccbcd2737cd",
+                  "name": "golang.org/x/sync/errgroup", "type_kind": "module", "visibility": "package",
+                  "is_abstract": false, "is_sealed": false, "has_explicit_type_terms": false,
+                  "type_parameters": [], "type_parameter_constraints": [], "embedded_types": [],
+                  "hierarchy": [], "aliases": ["errgroup"], "extension_surfaces": [],
+                  "locator": { "kind": "artifact", "path": "errgroup/errgroup.go", "symbol": "golang.org/x/sync/errgroup" }
+                },
+                {
+                  "id": "type.0c4f21e4d6d55855f8189f63d90adcce32a1cd675cd25058d1416fba1c0a2927",
+                  "name": "golang.org/x/sync/errgroup.Group", "type_kind": "struct", "visibility": "public",
+                  "is_abstract": false, "is_sealed": false, "has_explicit_type_terms": false,
+                  "type_parameters": [], "type_parameter_constraints": [], "embedded_types": [],
+                  "hierarchy": [], "aliases": [], "extension_surfaces": [],
+                  "locator": { "kind": "artifact", "path": "errgroup/errgroup.go", "symbol": "golang.org/x/sync/errgroup.Group" }
+                }
+              ],
+              "members": [
+                {
+                  "id": "member.1111111111111111111111111111111111111111111111111111111111111111",
+                  "owner": "type.2222222222222222222222222222222222222222222222222222222222222222",
+                  "name": "Lock", "member_kind": "method", "visibility": "public", "is_static": false,
+                  "is_abstract": false, "is_virtual": false, "signature": { "type_parameters": [], "parameters": [] },
+                  "receiver": { "pointer": true }, "aliases": [],
+                  "locator": { "kind": "artifact", "path": "src/sync/rwmutex.go", "symbol": "sync.RWMutex.Lock" }
+                },
+                {
+                  "id": "member.2222222222222222222222222222222222222222222222222222222222222222",
+                  "owner": "type.2222222222222222222222222222222222222222222222222222222222222222",
+                  "name": "Unlock", "member_kind": "method", "visibility": "public", "is_static": false,
+                  "is_abstract": false, "is_virtual": false, "signature": { "type_parameters": [], "parameters": [] },
+                  "receiver": { "pointer": true }, "aliases": [],
+                  "locator": { "kind": "artifact", "path": "src/sync/rwmutex.go", "symbol": "sync.RWMutex.Unlock" }
+                },
+                {
+                  "id": "member.3333333333333333333333333333333333333333333333333333333333333333",
+                  "owner": "type.2222222222222222222222222222222222222222222222222222222222222222",
+                  "name": "RLock", "member_kind": "method", "visibility": "public", "is_static": false,
+                  "is_abstract": false, "is_virtual": false, "signature": { "type_parameters": [], "parameters": [] },
+                  "receiver": { "pointer": true }, "aliases": [],
+                  "locator": { "kind": "artifact", "path": "src/sync/rwmutex.go", "symbol": "sync.RWMutex.RLock" }
+                },
+                {
+                  "id": "member.4444444444444444444444444444444444444444444444444444444444444444",
+                  "owner": "type.2222222222222222222222222222222222222222222222222222222222222222",
+                  "name": "RUnlock", "member_kind": "method", "visibility": "public", "is_static": false,
+                  "is_abstract": false, "is_virtual": false, "signature": { "type_parameters": [], "parameters": [] },
+                  "receiver": { "pointer": true }, "aliases": [],
+                  "locator": { "kind": "artifact", "path": "src/sync/rwmutex.go", "symbol": "sync.RWMutex.RUnlock" }
+                },
+                {
+                  "id": "member.8eba5e7e0d44e9a914e81eb4c18dadad146753487819400bd7f686a30da5c9cb",
+                  "owner": "type.d9a13c3593128df16b560fd8293a702e20b1a36f381b6d54f82a6ccbcd2737cd",
+                  "name": "WithContext", "member_kind": "function", "visibility": "public", "is_static": true,
+                  "is_abstract": false, "is_virtual": false,
+                  "signature": { "type_parameters": [], "parameters": [{ "name": "ctx", "type": { "kind": "named", "name": "context.Context", "arguments": [], "nullable": false }, "optional": false, "variadic": false }], "returns": { "kind": "tuple", "elements": [{ "kind": "pointer", "element": { "kind": "declared", "id": "type.0c4f21e4d6d55855f8189f63d90adcce32a1cd675cd25058d1416fba1c0a2927", "arguments": [], "nullable": false } }, { "kind": "named", "name": "context.Context", "arguments": [], "nullable": false }] } },
+                  "aliases": [],
+                  "locator": { "kind": "artifact", "path": "errgroup/errgroup.go", "symbol": "golang.org/x/sync/errgroup.WithContext" }
+                },
+                {
+                  "id": "member.4d0432d587858f542855f7836d30c4e8e41ef7cc530c5d10e2adf7297cee2227",
+                  "owner": "type.0c4f21e4d6d55855f8189f63d90adcce32a1cd675cd25058d1416fba1c0a2927",
+                  "name": "Go", "member_kind": "method", "visibility": "public", "is_static": false,
+                  "is_abstract": false, "is_virtual": false,
+                  "signature": { "type_parameters": [], "parameters": [{ "name": "f", "type": { "kind": "named", "name": "func", "arguments": [], "nullable": false }, "optional": false, "variadic": false }] },
+                  "receiver": { "pointer": true }, "aliases": [],
+                  "locator": { "kind": "artifact", "path": "errgroup/errgroup.go", "symbol": "golang.org/x/sync/errgroup.Group.Go" }
+                },
+                {
+                  "id": "member.f4ccffe4aee7246f71dafc1d38211225e0c689dfa0068c64def4713ff8e989cd",
+                  "owner": "type.0c4f21e4d6d55855f8189f63d90adcce32a1cd675cd25058d1416fba1c0a2927",
+                  "name": "Wait", "member_kind": "method", "visibility": "public", "is_static": false,
+                  "is_abstract": false, "is_virtual": false,
+                  "signature": { "type_parameters": [], "parameters": [], "returns": { "kind": "named", "name": "error", "arguments": [], "nullable": false } },
+                  "receiver": { "pointer": true }, "aliases": [],
+                  "locator": { "kind": "artifact", "path": "errgroup/errgroup.go", "symbol": "golang.org/x/sync/errgroup.Group.Wait" }
+                }
+              ],
+              "relations": []
+            }
+          }, {
+            "id": "behavior",
+            "activation": [{}],
+            "payload": {
+              "kind": "procedure_summaries",
+              "summaries": [
+                {
+                  "id": "rw.lock", "target": { "path": "src/sync/rwmutex.go", "symbol": "sync.RWMutex.Lock()", "has_receiver": true, "parameter_count": 0 },
+                  "completeness": "complete", "transfers": [],
+                  "concurrency_effects": [{ "kind": "lock_acquire", "lock": { "kind": "receiver" }, "mode": "exclusive" }]
+                },
+                {
+                  "id": "rw.unlock", "target": { "path": "src/sync/rwmutex.go", "symbol": "sync.RWMutex.Unlock()", "has_receiver": true, "parameter_count": 0 },
+                  "completeness": "complete", "transfers": [],
+                  "concurrency_effects": [{ "kind": "lock_release", "lock": { "kind": "receiver" }, "mode": "exclusive" }]
+                },
+                {
+                  "id": "rw.rlock", "target": { "path": "src/sync/rwmutex.go", "symbol": "sync.RWMutex.RLock()", "has_receiver": true, "parameter_count": 0 },
+                  "completeness": "complete", "transfers": [],
+                  "concurrency_effects": [{ "kind": "lock_acquire", "lock": { "kind": "receiver" }, "mode": "shared" }]
+                },
+                {
+                  "id": "rw.runlock", "target": { "path": "src/sync/rwmutex.go", "symbol": "sync.RWMutex.RUnlock()", "has_receiver": true, "parameter_count": 0 },
+                  "completeness": "complete", "transfers": [],
+                  "concurrency_effects": [{ "kind": "lock_release", "lock": { "kind": "receiver" }, "mode": "shared" }]
+                },
+                {
+                  "id": "errgroup.with-context",
+                  "target": { "path": "errgroup/errgroup.go", "symbol": "golang.org/x/sync/errgroup.WithContext(ctx context.Context)", "has_receiver": false, "parameter_count": 1 },
+                  "completeness": "complete", "normal_result_count": 2,
+                  "locations": [{ "id": "group", "location_kind": "heap" }],
+                  "transfers": [{ "input": { "kind": "parameter", "ordinal": 0 }, "exit_kind": "normal", "output": { "kind": "indexed_normal_return", "ordinal": 1 } }],
+                  "effects": [{ "kind": "allocation", "event": "group-allocation", "output": { "kind": "indexed_normal_return", "ordinal": 0 } }]
+                },
+                {
+                  "id": "errgroup.go", "target": { "path": "errgroup/errgroup.go", "symbol": "golang.org/x/sync/errgroup.Group.Go(f func() error)", "has_receiver": true, "parameter_count": 1 },
+                  "completeness": "complete", "transfers": [],
+                  "concurrency_effects": [{ "kind": "task_spawn", "callable": { "kind": "parameter", "ordinal": 0 }, "group": { "kind": "receiver" } }]
+                },
+                {
+                  "id": "errgroup.wait", "target": { "path": "errgroup/errgroup.go", "symbol": "golang.org/x/sync/errgroup.Group.Wait()", "has_receiver": true, "parameter_count": 0 },
+                  "completeness": "complete", "transfers": [],
+                  "concurrency_effects": [{ "kind": "task_join", "group": { "kind": "receiver" } }]
+                }
+              ]
+            }
+          }]
+        }"#,
+        &CompilerOptions::default(),
+    )
+    .unwrap_or_else(|diagnostics| panic!("RWMutex/errgroup pack compiles: {diagnostics:#?}"));
+    let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default())
+        .expect("ephemeral semantic-pack catalog");
+    catalog
+        .register_session_pack(
+            &pack,
+            &SessionPackSource {
+                kind: SessionPackSourceKind::Embedded,
+                source_id: "test:go-rwmutex-errgroup".to_owned(),
+            },
+        )
+        .expect("register RWMutex/errgroup model pack");
+    let activation = acquire_active_semantic_models(
+        workspace.analyzer(),
+        &catalog,
+        None,
+        &SemanticModelActivationRequest {
+            bifrost_version: Version::parse(env!("CARGO_PKG_VERSION")).expect("crate version"),
+            evidence: vec![SemanticModelActivationEvidence {
+                language: "go".to_owned(),
+                ecosystem: "go".to_owned(),
+                package: None,
+                module: None,
+                toolchain: None,
+                target: None,
+                configuration: None,
+                artifact_sha256: None,
+            }],
+            controls: Vec::new(),
+            limits: SemanticModelRuntimeLimits::default(),
+        },
+        &CancellationToken::default(),
+    );
+    assert!(
+        matches!(activation, SemanticModelRuntimeOutcome::Ready { .. }),
+        "RWMutex/errgroup models activate: {activation:#?}"
+    );
+
+    let conflicts_for = |name: &str| {
+        let query = CodeQuery::from_json(&json!({
+            "languages": ["go"],
+            "match": { "kind": "function", "name": name },
+            "steps": [
+                { "op": "procedure_of" },
+                { "op": "concurrent_access_conflicts" }
+            ],
+            "result_detail": "full"
+        }))
+        .expect("RWMutex/errgroup concurrent access query");
+        execute_workspace(
+            &workspace,
+            &brokk_bifrost_flow::FlowWorkspaceState::new(),
+            &query,
+        )
+    };
+    for name in ["rwExclusive", "errgroupJoined"] {
+        let result = conflicts_for(name);
+        assert_eq!(
+            result.completion(),
+            CodeQueryCompletion::Complete,
+            "{name}: {result:#?}"
+        );
+        assert!(result.results.is_empty(), "{name}: {result:#?}");
+    }
+    let shared = conflicts_for("rwSharedWrite");
+    assert_eq!(
+        shared.completion(),
+        CodeQueryCompletion::Complete,
+        "{shared:#?}"
+    );
+    let [item] = shared.results.as_slice() else {
+        panic!("shared read locks do not protect a write: {shared:#?}");
+    };
+    let CodeQueryResultValue::ConcurrentAccessConflict { value } = &item.value else {
+        panic!("RWMutex query returns its typed row: {item:#?}");
+    };
+    assert_eq!(
+        (
+            value.ordering,
+            value.protection,
+            value.proof,
+            value.coverage
+        ),
+        ("unordered", "unprotected", "proven", "exhaustive"),
+        "{shared:#?}"
     );
 }
 
@@ -3678,6 +6077,7 @@ import stderrors "errors"
 func Is(x, y error) bool { return stderrors.Is(x, y) }
 "#;
 
+#[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
 #[test]
 fn exact_call_arguments_use_reviewed_procedure_preconditions() {
     let result = execute_conditional_result_contract_files_with_operation(
@@ -3815,6 +6215,7 @@ func unreviewed(path string) {
     );
 }
 
+#[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
 #[test]
 fn parenthesized_call_argument_keeps_its_exact_reviewed_precondition() {
     let result = execute_conditional_result_contract_files_with_operation(
@@ -3866,6 +6267,7 @@ func parenthesized(path string) {
     assert_eq!(value.coverage, "exhaustive", "{value:#?}");
 }
 
+#[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
 #[test]
 fn method_expression_receiver_is_not_a_formal_parameter() {
     let result = execute_conditional_result_contract_files_with_operation(
@@ -3940,6 +6342,7 @@ func methodExpression(path string) {
     );
 }
 
+#[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
 #[test]
 fn spread_call_arguments_do_not_claim_a_formal_parameter() {
     let result = execute_conditional_result_contract_files_with_operation(
@@ -3989,6 +6392,7 @@ func spread(path string, rest []*os.File) {
     assert_eq!(row.coverage, "open", "{row:#?}");
 }
 
+#[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
 #[test]
 fn pre_origin_gaps_do_not_hide_exact_failure_and_success_arm_uses() {
     let result = execute_conditional_result_contract_files_with_operation(
@@ -4068,6 +6472,7 @@ func unrelatedEarlierConsumer(path string, h *holder) error {
     );
 }
 
+#[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
 #[test]
 fn modeled_negative_arm_closes_a_use_despite_a_nonrejoining_sibling_call() {
     let result = execute_conditional_result_contract_files_with_operation(
@@ -4128,6 +6533,7 @@ func useOnFalseOutcome(path string, printer Printer) string {
     );
 }
 
+#[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
 #[test]
 fn later_scalar_call_reassignment_does_not_poison_a_prior_wrapper_violation() {
     let result = execute_conditional_result_contract_files(&[
@@ -4157,6 +6563,7 @@ func useBeforeLaterGuard(path string) string {
     assert_single_exhaustive_violated_result_contract(&result);
 }
 
+#[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
 #[test]
 fn later_scalar_call_guard_does_not_validate_the_old_result_definition() {
     let result = execute_conditional_result_contract_files(&[
@@ -4185,6 +6592,7 @@ func useAfterLaterGuard(path string) string {
     assert_single_exhaustive_violated_result_contract(&result);
 }
 
+#[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
 #[test]
 fn unmodeled_void_condition_consumer_stays_open() {
     let result = execute_conditional_result_contract_fixture(
@@ -4205,6 +6613,7 @@ func unmodeledVoidConsumer(path string) string {
     assert_single_open_unknown_result_contract(&result);
 }
 
+#[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
 #[test]
 fn discarded_testify_assert_no_error_does_not_guard_a_later_result_use() {
     let result = execute_conditional_result_contract_fixture(
@@ -4227,6 +6636,7 @@ func ignoredAssertion(t *testing.T, path string) string {
     assert_single_exhaustive_violated_result_contract(&result);
 }
 
+#[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
 #[test]
 fn discarded_testify_assert_with_nested_argument_evaluation_does_not_guard() {
     let result = execute_conditional_result_contract_fixture(
@@ -4252,6 +6662,7 @@ func ignoredAssertion(s *suite, path string) string {
     assert_single_exhaustive_violated_result_contract(&result);
 }
 
+#[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
 #[test]
 fn direct_testify_assert_no_error_true_arm_guards_the_result_use() {
     let result = execute_conditional_result_contract_fixture(
@@ -4276,6 +6687,7 @@ func checkedAssertion(t *testing.T, path string) string {
     assert_single_exhaustive_satisfied_result_contract(&result);
 }
 
+#[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
 #[test]
 fn consumed_testify_assert_no_error_results_stay_open() {
     let result = execute_conditional_result_contract_fixture(
@@ -4309,6 +6721,7 @@ func argumentAssertion(t *testing.T, path string) string {
     assert_open_unknown_result_contract_uses(&result, &[1, 1]);
 }
 
+#[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
 #[test]
 fn unmodeled_condition_consumer_on_failure_arm_preserves_the_violation() {
     let result = execute_conditional_result_contract_fixture(
@@ -4349,6 +6762,7 @@ func failureArmConsumer(path string) string {
     );
 }
 
+#[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
 #[test]
 fn failure_arm_modeled_normal_return_validator_stays_open() {
     let result = execute_conditional_result_contract_fixture(
@@ -4371,6 +6785,7 @@ func modeledFailureArmValidator(t *testing.T, path string) string {
     assert_single_guarded_open_unknown_result_contract(&result);
 }
 
+#[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
 #[test]
 fn failure_arm_modeled_conditional_positive_stays_open_without_a_collective_proof() {
     let result = execute_conditional_result_contract_fixture(
@@ -4397,6 +6812,7 @@ func modeledConditionalOnFailureArm(path string) string {
     assert_single_guarded_open_unknown_result_contract(&result);
 }
 
+#[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
 #[test]
 fn unmodeled_condition_consumer_on_success_arm_preserves_the_joined_violation() {
     let result = execute_conditional_result_contract_fixture(
@@ -4437,6 +6853,7 @@ func successArmConsumer(path string) string {
     );
 }
 
+#[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
 #[test]
 fn parenthesized_unmodeled_predicate_argument_stays_open() {
     let result = execute_conditional_result_contract_fixture(
@@ -4457,6 +6874,7 @@ func parenthesizedPredicate(path string) string {
     assert_single_open_unknown_result_contract(&result);
 }
 
+#[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
 #[test]
 fn address_mutation_before_modeled_predicate_keeps_condition_identity_open() {
     let result = execute_conditional_result_contract_fixture(
@@ -4481,6 +6899,7 @@ func mutatedBeforePredicate(path string) string {
     assert_single_open_unknown_result_contract(&result);
 }
 
+#[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
 #[test]
 fn channel_send_address_escape_keeps_condition_identity_open() {
     let result = execute_conditional_result_contract_fixture(
@@ -4520,6 +6939,29 @@ func guardedInArgument(path string) {
     assert_single_exhaustive_satisfied_result_contract(&result);
 }
 
+#[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
+#[test]
+fn detached_normal_return_refinement_does_not_guard_parent_continuation() {
+    let result = execute_conditional_result_contract_fixture(
+        r#"package main
+
+import (
+    "os"
+    predicate "example.com/predicate"
+)
+
+func detachedValidation(path string) string {
+    file, err := os.Open(path)
+    go predicate.Checked(err)
+    return file.Name()
+}
+"#,
+    );
+
+    assert_single_exhaustive_violated_result_contract(&result);
+}
+
+#[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
 #[test]
 fn later_member_argument_mutation_does_not_preserve_modeled_validation() {
     let result = execute_conditional_result_contract_fixture(
@@ -4546,6 +6988,7 @@ func invalidatedInLaterArgument(path string) {
     assert_single_open_unknown_result_contract(&result);
 }
 
+#[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
 #[test]
 fn earlier_member_argument_escape_does_not_preserve_modeled_validation() {
     let result = execute_conditional_result_contract_fixture(
@@ -4575,7 +7018,7 @@ func escapedInEarlierArgument(path string) {
 }
 
 #[test]
-fn captured_member_argument_mutation_does_not_preserve_modeled_validation() {
+fn captured_member_argument_mutation_after_validation_preserves_the_modeled_result() {
     let result = execute_conditional_result_contract_fixture(
         r#"package main
 
@@ -4598,9 +7041,10 @@ func mutatedThroughCapture(path string) {
 "#,
     );
 
-    assert_single_open_unknown_result_contract(&result);
+    assert_single_exhaustive_satisfied_result_contract(&result);
 }
 
+#[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
 #[test]
 fn unmodeled_member_argument_validator_stays_open() {
     let result = execute_conditional_result_contract_fixture(
@@ -4623,6 +7067,7 @@ func maybeGuardedInArgument(path string) {
     assert_single_open_unknown_result_contract(&result);
 }
 
+#[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
 #[test]
 fn parenthesized_direct_receiver_retains_exact_unguarded_use() {
     let result = execute_conditional_result_contract_fixture(
@@ -4640,6 +7085,7 @@ func parenthesizedReceiver(path string) string {
     assert_single_exhaustive_violated_result_contract(&result);
 }
 
+#[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
 #[test]
 fn channel_receive_retains_exact_unguarded_result_use() {
     let result = execute_conditional_result_contract_fixture(
@@ -4695,7 +7141,7 @@ func captured(path string) string {
 }
 
 #[test]
-fn later_capture_does_not_hide_an_earlier_direct_result_use() {
+fn later_capture_retains_both_the_earlier_direct_and_captured_result_uses() {
     let result = execute_conditional_result_contract_fixture(
         r#"package main
 
@@ -4731,12 +7177,13 @@ func useBeforeCapture(t *testing.T, path string) string {
     let CodeQueryResultValue::CallResultContract { value } = &item.value else {
         panic!("result-contract wrapper returns its typed row: {item:#?}")
     };
-    assert_eq!(value.result_use_count, Some(1), "{value:#?}");
+    assert_eq!(value.result_use_count, Some(2), "{value:#?}");
     assert_eq!(value.unguarded_result_use_count, Some(1), "{value:#?}");
     assert_eq!(value.use_validation, Some("violated"), "{value:#?}");
     assert_eq!(value.use_validation_coverage, Some("open"), "{value:#?}");
 }
 
+#[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
 #[test]
 fn spawned_assertion_result_does_not_guard_later_result_use() {
     let result = execute_conditional_result_contract_fixture(
@@ -4761,6 +7208,117 @@ func spawnedAssertionConsumer(t *testing.T, path string) string {
     assert_single_exhaustive_violated_result_contract(&result);
 }
 
+#[test]
+fn detached_assertion_result_sent_back_to_parent_keeps_the_use_open() {
+    let result = execute_conditional_result_contract_fixture(
+        r#"package main
+
+import (
+    check "github.com/stretchr/testify/assert"
+    "os"
+    "testing"
+)
+
+func send(result bool, results chan bool) { results <- result }
+
+func spawnedAssertionFeedback(t *testing.T, path string, results chan bool) string {
+    file, err := os.Open(path)
+    go send(check.NoError(t, err), results)
+    if <-results {
+        return file.Name()
+    }
+    return ""
+}
+"#,
+    );
+
+    assert_single_open_unknown_result_contract(&result);
+}
+
+#[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
+#[test]
+fn detached_assertion_feedback_across_a_blocking_receive_stays_open() {
+    let result = execute_conditional_result_contract_fixture(
+        r#"package main
+
+import (
+    check "github.com/stretchr/testify/assert"
+    "os"
+    "testing"
+)
+
+func sendSuccess(result bool, results chan bool) {
+    if result {
+        results <- result
+    }
+}
+
+func spawnedAssertionFeedback(t *testing.T, path string, results chan bool) string {
+    file, err := os.Open(path)
+    go sendSuccess(check.NoError(t, err), results)
+    <-results
+    return file.Name()
+}
+"#,
+    );
+
+    assert_single_open_unknown_result_contract(&result);
+}
+
+#[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
+#[test]
+fn detached_assertion_feedback_across_an_ordinary_call_stays_open() {
+    let result = execute_conditional_result_contract_fixture(
+        r#"package main
+
+import (
+    check "github.com/stretchr/testify/assert"
+    "os"
+    "testing"
+)
+
+func send(result bool, results chan bool) { results <- result }
+func waitForSuccess(results chan bool) { <-results }
+
+func spawnedAssertionFeedback(t *testing.T, path string, results chan bool) string {
+    file, err := os.Open(path)
+    go send(check.NoError(t, err), results)
+    waitForSuccess(results)
+    return file.Name()
+}
+"#,
+    );
+
+    assert_single_open_unknown_result_contract(&result);
+}
+
+#[test]
+fn detached_assertion_feedback_across_unspecified_operand_order_stays_open() {
+    let result = execute_conditional_result_contract_fixture(
+        r#"package main
+
+import (
+    check "github.com/stretchr/testify/assert"
+    "os"
+    "testing"
+)
+
+func send(result bool, results chan bool) { results <- result }
+func waitForSuccess(results chan bool) string { <-results; return "" }
+func combine(left os.File, right string) string { return left.Name() + right }
+
+func spawnedAssertionFeedback(t *testing.T, path string, results chan bool) string {
+    file, err := os.Open(path)
+    go send(check.NoError(t, err), results)
+    return combine(*file, waitForSuccess(results))
+}
+"#,
+    );
+
+    assert_single_open_unknown_result_contract(&result);
+}
+
+#[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
 #[test]
 fn result_contract_uses_executes_the_projected_contract_wrapper() {
     let source = r#"package main
@@ -4787,7 +7345,7 @@ func earlyUse() string {
         .build();
     let workspace = project.workspace_analyzer(AnalyzerConfig::default());
     let pack_source = br#"{
-        "schema_version": 1,
+        "schema_version": 2,
         "pack_id": "test.rql.go-result-contract",
         "version": "1.0.0",
         "producer": { "name": "bifrost-rql-test", "version": "1.0.0" },
@@ -4845,7 +7403,7 @@ func earlyUse() string {
         }]
     }"#;
     let declaration_pack_source = br#"{
-        "schema_version": 1,
+        "schema_version": 2,
         "pack_id": "test.rql.go-result-contract-declarations",
         "version": "1.0.0",
         "producer": { "name": "bifrost-rql-test", "version": "1.0.0" },
@@ -5239,5 +7797,54 @@ fn union_query_over_root_limit_reports_exactly_one_truncation_diagnostic() {
         1,
         "exactly one truncation diagnostic, no double report: {:?}",
         detailed.result.diagnostics
+    );
+}
+
+#[test]
+fn a_truncated_query_reports_identical_diagnostics_on_every_run() {
+    // Regression for issue #2897: `result_limit_reached` interpolated the live
+    // budget counters (`scanned_files`, `fact_nodes`, ...), which depend on
+    // worker scheduling and on how far the scan got before the limit tripped.
+    // Two executions of one query over an unchanged workspace reported
+    // different messages (5178 facts on one run, 4927 on the next), so a
+    // truncated result could not be documented, diffed, or snapshotted; the
+    // #1132 cookbook had to drop its `limit: 2` example for that reason. The
+    // second run below reuses the warm analyzer, which is the state that made
+    // the counters diverge.
+    let temp = tempfile::tempdir().expect("temp dir");
+    let root = temp.path().canonicalize().expect("canonical root");
+    for i in 0..8 {
+        ProjectFile::new(root.clone(), PathBuf::from(format!("f{i}.ts")))
+            .write("function first() {}\nfunction second() {}\nfunction third() {}\n")
+            .expect("write source");
+    }
+    let analyzer = TypescriptAnalyzer::from_project(TestProject::new(root, Language::TypeScript));
+    let query = CodeQuery::from_json(&json!({
+        "languages": ["typescript"],
+        "match": { "kind": "function" },
+        "limit": 2
+    }))
+    .expect("query");
+
+    let first = execute(&analyzer, &query);
+    let second = execute(&analyzer, &query);
+
+    assert!(first.truncated, "{:?}", first.diagnostics);
+    assert_eq!(first.results.len(), 2);
+    assert_eq!(
+        first
+            .diagnostics
+            .iter()
+            .map(|diagnostic| (diagnostic.code, diagnostic.message.as_str()))
+            .collect::<Vec<_>>(),
+        vec![(
+            CodeQueryDiagnosticCode::ResultLimitReached,
+            "query_code reached the query limit of 2 and returned the first 2 results; results are ordered by project-relative path; refine the query with where, languages, exact names, or a narrower pattern",
+        )],
+    );
+    assert_eq!(
+        serde_json::to_value(&first).expect("serialize first run"),
+        serde_json::to_value(&second).expect("serialize second run"),
+        "two runs of one truncating query over an unchanged workspace must agree",
     );
 }

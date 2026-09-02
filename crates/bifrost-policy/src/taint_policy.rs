@@ -46,13 +46,16 @@ use crate::{ProductionTaintAnalysisResult, ProductionTaintPhaseMetrics};
 use brokk_bifrost_analysis::CancellationToken;
 use brokk_bifrost_analysis::analyzer::common::language_for_file;
 use brokk_bifrost_analysis::analyzer::lexical_definitions::formal_parameter_slots;
+use brokk_bifrost_analysis::analyzer::semantic::workspace_oracle::{
+    ProcedureRangeLookupStatus, procedures_in_artifact,
+};
 use brokk_bifrost_analysis::analyzer::semantic::{
     CallArgumentMapping, CallArgumentMember, CallBinding, CallSiteHandle, CandidateCoverage,
     DurablePortIdentity, EvidenceCompleteness, ExactExternalProcedureTarget, ObservationPhase,
     OracleCallContext, ProcedureHandle, ProcedurePortHandle, ProcedurePortKind, ProgramPointHandle,
     ProofStatus, SemanticArtifactKey, SemanticBudget, SemanticOutcome, SemanticValueKind,
     UnmaterializedExternalTarget, ValueHandle, WorkspaceIcfgProvider, WorkspaceRelativePath,
-    split_qualified_member,
+    authored_procedure_target_identity,
 };
 use brokk_bifrost_analysis::analyzer::semantic::{DispatchOracle, ValueFlowOracle};
 use brokk_bifrost_analysis::analyzer::semantic_model::{
@@ -65,9 +68,9 @@ use brokk_bifrost_analysis::analyzer::usages::get_definition::parse_tree_for_lan
 use brokk_bifrost_analysis::analyzer::{ProjectFile, Range, WorkspaceAnalyzer};
 use brokk_bifrost_flow::dataflow::{
     DataflowRequest, ExternalSemanticSummarySet, ExternalSummaryCompatibilityKey,
-    ExternalSummaryTarget, SemanticInputStatus, SolverBudget, SummaryBehaviorKey,
-    SummaryContextKey, SummarySchemaVersion, SummarySemanticsVersion, SummaryWitness,
-    SummaryWitnessStepKind, WitnessReconstructionLimits, WitnessRetentionLimits,
+    ExternalSummaryTarget, SemanticInputStatus, SolverBudget, SolverTermination,
+    SummaryBehaviorKey, SummaryContextKey, SummarySchemaVersion, SummarySemanticsVersion,
+    SummaryWitness, SummaryWitnessStepKind, WitnessReconstructionLimits, WitnessRetentionLimits,
 };
 use brokk_bifrost_flow::taint::{
     SourceClassId, SourceEventKey, TaintAnalysisPlan, TaintBatch, TaintBatchCompatibilityKey,
@@ -1123,7 +1126,7 @@ impl<'a> TaintPolicyCompiler<'a> {
         // report distinguishes a proven verdict from one taken over an empty
         // relation without re-running the policy (#2659).
         let mut work = self.selectors.work_report("taint");
-        record_endpoint_metrics(&mut work, self.bound_endpoints);
+        record_compile_metrics(&mut work, self.bound_endpoints);
         match compiled {
             Ok(compiled) => Ok(TaintPolicyCompilation::Plans {
                 roots: compiled,
@@ -1394,19 +1397,56 @@ impl<'a> TaintPolicyCompiler<'a> {
             .iter()
             .map(|kill| kill.input.point.procedure().durable_key())
             .collect::<Vec<_>>();
-        discoveries.retain(|discovery| {
-            source_procedures
-                .iter()
-                .any(|procedure| discovery.procedures.contains(procedure))
-                && sink_procedures
+        let (mut covering_discoveries, mut disconnected_discoveries): (Vec<_>, Vec<_>) =
+            discoveries.into_iter().partition(|discovery| {
+                source_procedures
                     .iter()
                     .any(|procedure| discovery.procedures.contains(procedure))
-        });
-        let covered = discoveries
+                    && sink_procedures
+                        .iter()
+                        .any(|procedure| discovery.procedures.contains(procedure))
+            });
+        if covering_discoveries.is_empty()
+            && let Some(mut discovery) = disconnected_discoveries
+                .iter()
+                .position(|discovery| {
+                    discovery.procedures.contains(
+                        source_procedures
+                            .first()
+                            .expect("the source set is non-empty"),
+                    )
+                })
+                .map(|index| disconnected_discoveries.swap_remove(index))
+        {
+            // The selectors bound real endpoints, but no discovered call region
+            // connects them. This is an unresolved-dispatch boundary, not a
+            // policy-evaluation failure: mount the disconnected endpoint
+            // procedures in one bounded plan so `ValueFlowPlan` can name each
+            // unreachable procedure and keep the result typed incomplete
+            // (#2834). We add no call binding between them, so this cannot
+            // manufacture a path or finding. In particular, a negative sibling
+            // stays finding-free, while neither sibling can be read as clean.
+            for endpoint in source_procedures.iter().chain(&sink_procedures) {
+                if discovery.procedures.insert(endpoint.clone()) {
+                    let Some(snapshot) = materialization.procedures.get(endpoint) else {
+                        // A skipped budget-exhausted root has no finished
+                        // snapshot. Do not turn that absence into a fabricated
+                        // mounted procedure; preserve the existing compile
+                        // refusal instead.
+                        return Err(TaintPolicyCompileError::SemanticUnavailable(
+                            "no analysis root contains both a selected source and sink".to_owned(),
+                        ));
+                    };
+                    discovery.snapshots.push(snapshot.clone());
+                }
+            }
+            covering_discoveries.push(discovery);
+        }
+        let covered = covering_discoveries
             .iter()
             .map(|discovery| discovery.procedures.clone())
             .collect::<Vec<_>>();
-        discoveries = discoveries
+        let discoveries = covering_discoveries
             .into_iter()
             .enumerate()
             .filter_map(|(index, discovery)| {
@@ -1417,7 +1457,7 @@ impl<'a> TaintPolicyCompiler<'a> {
                 }))
                 .then_some(discovery)
             })
-            .collect();
+            .collect::<Vec<_>>();
         let mut compiled = Vec::new();
         for (root_index, discovery) in discoveries.into_iter().enumerate() {
             let root = discovery.root.clone();
@@ -1537,44 +1577,44 @@ impl<'a> TaintPolicyCompiler<'a> {
             .selectors
             .materialize(&selection.file)
             .map_err(taint_selector_error)?;
-        // Bind against every procedure in the file artifact. Narrowing by
-        // procedure-anchor containment loses calls in languages whose
-        // procedure anchors cover only the declaration header (Ruby anchors
-        // `def name`, not the body, #1953); the call site's own source anchor
-        // in select_call is the identity that decides the binding.
-        let max_steps = self
-            .selectors
-            .remaining_semantic_traversal_steps()
-            .map_err(taint_selector_error)?;
-        let cancellation = self.selectors.cancellation();
-        let mut handles = Vec::with_capacity(artifact.procedures().len());
-        let mut examined = 0_usize;
-        for procedure in artifact.procedures() {
-            if cancellation.is_cancelled() {
+        let lookup = procedures_in_artifact(
+            &artifact,
+            self.selectors
+                .remaining_semantic_traversal_steps()
+                .map_err(taint_selector_error)?,
+            self.selectors.cancellation(),
+        );
+        match lookup.status {
+            ProcedureRangeLookupStatus::Complete => {}
+            ProcedureRangeLookupStatus::Cancelled => {
                 return Err(TaintPolicyCompileError::QueryIncomplete {
                     completion: CodeQueryCompletion::Cancelled,
                     detail: "taint semantic call binding was cancelled".to_owned(),
                 });
             }
-            examined = examined.saturating_add(1 + procedure.call_sites().len());
-            if examined > max_steps {
+            ProcedureRangeLookupStatus::BudgetExhausted => {
                 return Err(query_budget_error(
                     CodeQueryDiagnosticCode::SemanticBudgetExhausted,
                     "taint semantic call binding exhausted the shared traversal budget",
                 ));
             }
-            let handle = artifact
-                .procedure_handle(procedure.id())
-                .expect("validated artifact procedure has a scoped handle");
-            handles.push(handle);
+            ProcedureRangeLookupStatus::SourceChanged => {
+                return Err(TaintPolicyCompileError::SemanticUnavailable(
+                    "taint semantic call binding observed a changed source snapshot".to_owned(),
+                ));
+            }
         }
-        if !self.selectors.execution_budget().charge_traversal(examined) {
+        if !self
+            .selectors
+            .execution_budget()
+            .charge_traversal(lookup.examined)
+        {
             return Err(query_budget_error(
                 CodeQueryDiagnosticCode::SemanticBudgetExhausted,
                 "taint semantic call binding exhausted the shared traversal budget",
             ));
         }
-        let sites = match select_call(&handles, &selection)? {
+        let sites = match select_call(&lookup.handles, &selection)? {
             SelectedCallSites::One(sites) => sites,
             SelectedCallSites::Ambiguous { ranges, procedures } => {
                 // The row names more than one distinct call. Refuse this row
@@ -2894,7 +2934,10 @@ impl<'a> TaintPolicyCompiler<'a> {
                         summary.id
                     ))
                 };
-                let Some((owner, member)) = split_qualified_member(&summary.target.symbol) else {
+                let Some((owner, member)) = authored_procedure_target_identity(
+                    &summary.target.path,
+                    &summary.target.symbol,
+                ) else {
                     return Err(binding_error());
                 };
                 let candidates = unmaterialized.iter().filter(|target| {
@@ -3226,6 +3269,9 @@ fn solve_and_project_batch(
             .get_mut(&plan.policy_id)
             .ok_or_else(|| "compiled taint policy has no prepared payload".to_owned())?;
         payload.projections.extend(projected);
+        // Both counters were already published at zero by
+        // `record_compile_metrics`, so this raises existing metrics and never
+        // adds a name. See that function for why the name set has to be fixed.
         increment_work_metric(
             &mut payload.work,
             "taint.propagation_solves",
@@ -3283,11 +3329,16 @@ fn solve_and_project_batch(
                 // the diagnostic names the input that opened the run instead of
                 // collapsing everything into a bare partial-discovery verdict.
                 let cause = batch.analysis().value_flow().first_incomplete_cause();
-                let reason = match cause.and_then(ValueFlowIncompleteCause::status) {
-                    Some(SemanticInputStatus::Unsupported { .. }) => {
-                        PolicyIncompleteReason::CapabilityIncomplete
+                let reason = match retained.report().result().termination() {
+                    SolverTermination::Cancelled => PolicyIncompleteReason::Cancelled,
+                    SolverTermination::FixedPoint | SolverTermination::ExceededBudget(_) => {
+                        match cause.and_then(ValueFlowIncompleteCause::status) {
+                            Some(SemanticInputStatus::Unsupported { .. }) => {
+                                PolicyIncompleteReason::CapabilityIncomplete
+                            }
+                            _ => PolicyIncompleteReason::PartialDiscovery,
+                        }
                     }
-                    _ => PolicyIncompleteReason::PartialDiscovery,
                 };
                 payload.completion = PolicyRunCompletion::inconclusive(vec![reason])
                     .map_err(|error| error.to_string())?;
@@ -3335,6 +3386,7 @@ fn solve_and_project_batch(
                         payload.diagnostics.push(diagnostic);
                     }
                 }
+                ensure_taint_incomplete_diagnostic(payload, retained.report());
             }
         }
     }
@@ -3365,24 +3417,111 @@ fn solve_and_project_batch(
     Ok(())
 }
 
-/// Publish the compile's bound endpoint counts on the run's work report.
+/// Preserve a machine-readable reason when solver-derived incompleteness has no
+/// plan-time [`ValueFlowIncompleteCause`]. Recursive calls are the important
+/// example: the plan can be structurally complete while the fixed-point result
+/// retains an open coverage boundary. Before #2838 those runs carried only
+/// `completion.reasons = [partial_discovery]`, with no diagnostic family at all.
+fn ensure_taint_incomplete_diagnostic(
+    payload: &mut TaintProjectionPayload,
+    report: &TaintFindingReport,
+) {
+    if payload
+        .diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.impact() == PolicyDiagnosticImpact::RunIncomplete)
+    {
+        return;
+    }
+    let PolicyRunCompletion::Inconclusive { reasons } = &payload.completion else {
+        return;
+    };
+    let reason = reasons
+        .first()
+        .copied()
+        .expect("validated inconclusive completion has a reason");
+    let diagnostic = taint_incomplete_diagnostic(
+        report.result().termination(),
+        reason,
+        report.result().coverage().unproven_edges().len(),
+        report.result().coverage().partial_edges().len(),
+        report.result().coverage().boundaries().len(),
+    );
+    payload.diagnostics.push(diagnostic);
+}
+
+fn taint_incomplete_diagnostic(
+    termination: SolverTermination,
+    reason: PolicyIncompleteReason,
+    unproven_edges: usize,
+    partial_edges: usize,
+    boundaries: usize,
+) -> PolicyDiagnostic {
+    let (family, message) = match termination {
+        SolverTermination::FixedPoint => (
+            format!("taint_analysis/{}", reason.label()),
+            format!(
+                "taint analysis is incomplete after reaching a fixed point: {} unproven edge(s), {} partial edge(s), and {} open boundary row(s)",
+                unproven_edges, partial_edges, boundaries,
+            ),
+        ),
+        SolverTermination::Cancelled => (
+            "taint_analysis/cancelled".to_owned(),
+            "taint analysis was cancelled before reaching a fixed point".to_owned(),
+        ),
+        SolverTermination::ExceededBudget(exceeded) => (
+            format!(
+                "taint_analysis/solver_budget/{}",
+                exceeded.dimension().label()
+            ),
+            exceeded.to_string(),
+        ),
+    };
+    PolicyDiagnostic::try_new_in_family(
+        PolicyDiagnosticCode::EvaluationFailure,
+        PolicyDiagnosticSeverity::Warning,
+        PolicyDiagnosticImpact::RunIncomplete,
+        family,
+        message,
+        None,
+        Vec::new(),
+    )
+    .expect("static taint incompleteness diagnostic is valid")
+}
+
+/// Publish every metric name a compiled taint run reports: the compile's bound
+/// endpoint counts, and the propagation counters seeded at zero for the solve
+/// to raise.
 ///
 /// Reported unconditionally, including the zeros: a permanent zero is exactly
 /// the signal a reader of a raw benchmark artifact needs, because it says the
 /// policy's selectors bound nothing here rather than that the analysis found
 /// nothing (#2659).
-fn record_endpoint_metrics(work: &mut PolicyWorkReport, counts: BoundEndpointCounts) {
+///
+/// Seeding the propagation counters here, rather than letting the solve
+/// introduce their names, keeps the metric *name* set a function of the policy
+/// family alone. Retention accounting sums metric name capacities
+/// (`PolicyWorkReport::retained_size` feeds `PolicyRun`'s), and the evaluator's
+/// retention search decides how many findings a run keeps from that size, so a
+/// name set that depended on whether a batch was solved would make the retained
+/// finding set depend on it too. The incremental diff-base work
+/// (`.agents/plans/impact-sliced-diff-base.md`) cannot tolerate that: it has to
+/// prove a reused-result report is byte-identical to a full one.
+fn record_compile_metrics(work: &mut PolicyWorkReport, counts: BoundEndpointCounts) {
     for (name, value) in [
-        ("taint.compiled_source_endpoints", counts.sources),
-        ("taint.compiled_sink_endpoints", counts.sinks),
+        (
+            "taint.compiled_source_endpoints",
+            u64::try_from(counts.sources).unwrap_or(u64::MAX),
+        ),
+        (
+            "taint.compiled_sink_endpoints",
+            u64::try_from(counts.sinks).unwrap_or(u64::MAX),
+        ),
+        ("taint.propagation_solves", 0),
+        ("taint.propagation_shared_memberships", 0),
     ] {
-        increment_work_metric(
-            work,
-            name,
-            PolicyWorkUnit::Count,
-            u64::try_from(value).unwrap_or(u64::MAX),
-        )
-        .expect("two endpoint-count metrics fit the taint work report");
+        increment_work_metric(work, name, PolicyWorkUnit::Count, value)
+            .expect("four compile-time metrics fit the taint work report");
     }
 }
 
@@ -4878,6 +5017,7 @@ mod tests {
     use crate::catalog::{CatalogRegistryLimits, TaintCatalogRegistry};
     use crate::coordinator::{PolicyEvaluationOptions, evaluate_policy_source};
     use crate::definition::PolicyId;
+    use crate::evaluator::{DefaultPolicyEvaluator, PolicyEvaluationContext, PolicyEvaluator};
     use crate::finding::{
         PolicyIncompleteReason, PolicyRunCompletion, PolicyWorkMetric, PolicyWorkReport,
     };
@@ -4893,6 +5033,62 @@ mod tests {
     };
     use brokk_bifrost_flow::dataflow::SolverWork;
     use brokk_bifrost_rql::structural::{CodeQueryExecutionLimits, CodeQuerySemanticLimits};
+
+    #[test]
+    fn solver_incompleteness_diagnostics_have_stable_typed_families() {
+        let fixed_point = super::taint_incomplete_diagnostic(
+            super::SolverTermination::FixedPoint,
+            PolicyIncompleteReason::PartialDiscovery,
+            1,
+            2,
+            3,
+        );
+        assert_eq!(fixed_point.family(), "taint_analysis/partial_discovery");
+        assert_eq!(
+            fixed_point.impact(),
+            super::PolicyDiagnosticImpact::RunIncomplete
+        );
+        assert!(fixed_point.message().contains("1 unproven edge(s)"));
+        assert!(fixed_point.message().contains("2 partial edge(s)"));
+        assert!(fixed_point.message().contains("3 open boundary row(s)"));
+
+        let cancelled = super::taint_incomplete_diagnostic(
+            super::SolverTermination::Cancelled,
+            PolicyIncompleteReason::Cancelled,
+            0,
+            0,
+            0,
+        );
+        assert_eq!(cancelled.family(), "taint_analysis/cancelled");
+        assert_eq!(
+            cancelled.impact(),
+            super::PolicyDiagnosticImpact::RunIncomplete
+        );
+
+        let cancellation = CancellationToken::default();
+        let mut budget = super::SolverBudget::uniform(0);
+        let exceeded = super::DataflowRequest::new(&mut budget, &cancellation)
+            .reserve(SolverWork {
+                summary_applications: 1,
+                ..SolverWork::default()
+            })
+            .expect("the zero summary-application budget is exhausted");
+        let budgeted = super::taint_incomplete_diagnostic(
+            exceeded,
+            PolicyIncompleteReason::PartialDiscovery,
+            0,
+            0,
+            0,
+        );
+        assert_eq!(
+            budgeted.family(),
+            "taint_analysis/solver_budget/summary_applications"
+        );
+        assert_eq!(
+            budgeted.impact(),
+            super::PolicyDiagnosticImpact::RunIncomplete
+        );
+    }
 
     #[test]
     fn an_oversized_compile_failure_detail_still_names_the_refusal() {
@@ -4979,6 +5175,23 @@ def run_two():
     sink_one(source_one())
 ";
 
+    /// The same per-file region shape with two written sink sites. This is the
+    /// focused form of the #2481 XSS assembly failure: before #2544 assigned a
+    /// source-ordered ordinal to each sink site, both projections claimed one
+    /// strong finding identity and assembly failed with `InternalInvariant`.
+    const FANOUT_FLOW_SOURCE: &str = "\
+def source_one():
+    return \"fanout\"
+
+def sink_one(value):
+    pass
+
+def run_fanout():
+    value = source_one()
+    sink_one(value)
+    sink_one(value)
+";
+
     /// A taint policy over the two fixtures above. `report` is the authored
     /// report-option block; passing an empty string keeps the defaults.
     fn two_flow_policy(report: &str) -> String {
@@ -5025,6 +5238,25 @@ def run_two():
             },
         )
         .expect("an analyzer over the fixture");
+        (workspace, analyzer)
+    }
+
+    fn three_fanout_workspace() -> (tempfile::TempDir, WorkspaceAnalyzer) {
+        let workspace = tempfile::tempdir().expect("temporary workspace");
+        for name in ["first.py", "second.py", "third.py"] {
+            std::fs::write(workspace.path().join(name), FANOUT_FLOW_SOURCE)
+                .expect("fanout fixture source");
+        }
+        let project: Arc<dyn Project> =
+            Arc::new(FilesystemProject::new(workspace.path()).expect("fixture project"));
+        let analyzer = WorkspaceAnalyzer::build_ephemeral_footgun(
+            project,
+            AnalyzerConfig {
+                parallelism: Some(1),
+                ..AnalyzerConfig::default()
+            },
+        )
+        .expect("an analyzer over the fanout fixture");
         (workspace, analyzer)
     }
 
@@ -5102,6 +5334,79 @@ def run_two():
         assert!(
             !payload.projections.is_empty(),
             "the findings the earlier batch already projected must survive"
+        );
+    }
+
+    /// #2481 end-to-end regression: the historical XSS failure after #2356
+    /// was not another kind of budget exhaustion. One source reached several
+    /// written sink sites in a procedure, and those sites collided on one
+    /// finding identity during assembly. The #2544 site-ordinal repair makes
+    /// both findings valid. Once that first region genuinely spends the
+    /// request-wide cap, the next region must still take #2356's typed budget
+    /// path and preserve the already assembled findings.
+    #[test]
+    fn xss_style_fanout_assembles_before_the_findings_lane_exhausts() {
+        let (_workspace, analyzer) = three_fanout_workspace();
+        let registry = registry_for(&two_flow_policy(""));
+        let budget = PolicyBudget::builder()
+            .with_max_findings(4)
+            .expect("four analysis findings are inside the host cap")
+            .build()
+            .expect("a four-finding budget is valid");
+        let taint = ProductionTaintPolicyEvaluator::prepare(
+            registry.policies(),
+            &analyzer,
+            Ok(None),
+            None,
+            &budget,
+        );
+        let policy = registry.policies().next().expect("one policy");
+        let flow_state = brokk_bifrost_flow::FlowWorkspaceState::default();
+        let context = PolicyEvaluationContext {
+            analyzer: analyzer.analyzer(),
+            workspace: Some(&analyzer),
+            flow_state: &flow_state,
+            cancellation: None,
+            cvss_overlays: &[],
+            organizational_risk: &[],
+            incremental: None,
+        };
+        let mut evaluation_budget = budget;
+        let run = DefaultPolicyEvaluator::new()
+            .with_taint(&taint)
+            .evaluate(policy, &context, &mut evaluation_budget)
+            .expect("the prepared fanout payload assembles");
+
+        assert!(
+            matches!(
+                run.completion(),
+                PolicyRunCompletion::Inconclusive { reasons }
+                    if reasons.contains(&PolicyIncompleteReason::BatchFindingLimit)
+            ),
+            "a spent findings lane is typed rather than an invariant: completion={:?} diagnostics={:?}",
+            run.completion(),
+            run.diagnostics()
+        );
+        assert_eq!(
+            run.findings().len(),
+            2,
+            "both sink sites assembled before the request-wide cap was spent; findings={:?} diagnostics={:?} work={:?}",
+            run.findings(),
+            run.diagnostics(),
+            run.work()
+        );
+        assert_ne!(
+            run.findings()[0].id(),
+            run.findings()[1].id(),
+            "written sink sites need distinct stable identities"
+        );
+        assert!(
+            run.diagnostics()
+                .iter()
+                .any(|diagnostic| diagnostic.message()
+                    == "taint request-wide budget is exhausted: findings"),
+            "the exhausted lane must remain named: {:?}",
+            run.diagnostics()
         );
     }
 
@@ -5616,9 +5921,12 @@ def direct():
     }
 
     fn flow_workspace() -> (tempfile::TempDir, WorkspaceAnalyzer) {
+        python_workspace(FLOW_FIXTURE_SOURCE)
+    }
+
+    fn python_workspace(source: &str) -> (tempfile::TempDir, WorkspaceAnalyzer) {
         let workspace = tempfile::tempdir().expect("temporary workspace");
-        std::fs::write(workspace.path().join("flow.py"), FLOW_FIXTURE_SOURCE)
-            .expect("fixture source");
+        std::fs::write(workspace.path().join("flow.py"), source).expect("fixture source");
         let project: Arc<dyn Project> =
             Arc::new(FilesystemProject::new(workspace.path()).expect("fixture project"));
         let analyzer = WorkspaceAnalyzer::build_ephemeral_footgun(
@@ -5651,6 +5959,80 @@ def direct():
             .iter()
             .find(|metric| metric.name() == "taint.propagation_shared_memberships")
             .map_or(0, PolicyWorkMetric::value)
+    }
+
+    /// The metric *name* set one policy publishes must be a function of the
+    /// policy family, never of the workspace it ran over.
+    ///
+    /// `PolicyWorkReport::retained_size` sums metric name capacities and feeds
+    /// `PolicyRun`'s, and the evaluator's retention search picks how many
+    /// findings a run keeps from that size. A name that appeared only once its
+    /// counter moved would therefore let the input data decide which findings
+    /// a run at the retention boundary keeps, which the incremental diff-base
+    /// work (`.agents/plans/impact-sliced-diff-base.md`) cannot tolerate: it
+    /// has to prove a reused-result report is byte-identical to a full one.
+    #[test]
+    fn one_flow_policy_publishes_the_same_metric_names_over_every_workspace() {
+        let work_for = |source: &str| {
+            let (_workspace, analyzer) = python_workspace(source);
+            let registry =
+                registry_for_sources(&[("test:flow.rqlp", &flow_policy("test.flow", "validate"))]);
+            let evaluator = ProductionTaintPolicyEvaluator::prepare(
+                registry.policies(),
+                &analyzer,
+                Ok(None),
+                None,
+                &PolicyBudget::default(),
+            );
+            let payloads = evaluator.prepared.borrow();
+            let [(_, payload)] = payloads.iter().collect::<Vec<_>>()[..] else {
+                panic!(
+                    "one flow policy produces one payload, got {}",
+                    payloads.len()
+                );
+            };
+            payload.work.clone()
+        };
+
+        // The fixture binds both endpoints and reaches the observation, so the
+        // batch is solved and the semantic counters move. The second workspace
+        // declares neither endpoint, so nothing is bound and nothing is solved.
+        let solved = work_for(FLOW_FIXTURE_SOURCE);
+        let unbound = work_for("def unrelated(value):\n    return value\n");
+
+        let names = |work: &PolicyWorkReport| {
+            let mut names = work
+                .metrics()
+                .iter()
+                .map(|metric| metric.name().to_owned())
+                .collect::<Vec<_>>();
+            names.sort();
+            names
+        };
+        assert_eq!(names(&solved), names(&unbound), "{solved:#?}\n{unbound:#?}");
+
+        // The two runs really did different work, so the equality above is not
+        // two identically empty reports agreeing with each other.
+        let value = |work: &PolicyWorkReport, name: &str| {
+            work.metrics()
+                .iter()
+                .find(|metric| metric.name() == name)
+                .unwrap_or_else(|| panic!("{name} is published: {work:#?}"))
+                .value()
+        };
+        assert_eq!(value(&solved, "taint.propagation_solves"), 1);
+        assert_eq!(value(&unbound, "taint.propagation_solves"), 0);
+        assert!(value(&solved, "taint.compiled_source_endpoints") > 0);
+        assert_eq!(value(&unbound, "taint.compiled_source_endpoints"), 0);
+        // Previously conditional (#2284, #2289): published now even at zero.
+        for name in [
+            "taint.semantic_snapshot_materializations",
+            "taint.semantic_handle_identity_reuses",
+            "taint.semantic_result_contract_artifact_leases",
+            "taint.propagation_shared_memberships",
+        ] {
+            assert_eq!(value(&unbound, name), 0, "{unbound:#?}");
+        }
     }
 
     /// #2436: two flow policies whose propagation semantics agree must share

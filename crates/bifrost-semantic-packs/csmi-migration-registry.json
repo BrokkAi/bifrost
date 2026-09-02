@@ -1,0 +1,2069 @@
+{
+  "entries": [
+    {
+      "asset_role": "compiled_manifest",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_generation_vocabulary"
+      ],
+      "classification": "blocked_missing_vocabulary",
+      "generation_strategy": "retain_until_vocabulary_support",
+      "native_source_kind": "compiled_semantic_model",
+      "path": "crates/bifrost-semantic-packs/embedded/getset-0.1.7/manifest.json",
+      "profiles": [
+        "rust"
+      ],
+      "reason": "The generator-rule model is not representable by pinned CSMI 0.1 generator vocabulary.",
+      "source_model": "crates/bifrost-semantic-packs/models/getset-0.1.7.json"
+    },
+    {
+      "asset_role": "compiled_shard",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_generation_vocabulary"
+      ],
+      "classification": "blocked_missing_vocabulary",
+      "generation_strategy": "retain_until_vocabulary_support",
+      "native_source_kind": "compiled_semantic_model",
+      "path": "crates/bifrost-semantic-packs/embedded/getset-0.1.7/shards/rust.getset.generated-getter.deflate",
+      "profiles": [
+        "rust"
+      ],
+      "reason": "The generator-rule model is not representable by pinned CSMI 0.1 generator vocabulary.",
+      "source_model": "crates/bifrost-semantic-packs/models/getset-0.1.7.json"
+    },
+    {
+      "asset_role": "compiled_manifest",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "compiled_semantic_model",
+      "path": "crates/bifrost-semantic-packs/embedded/go-concurrency-declarations/manifest.json",
+      "profiles": [],
+      "reason": "No supported standard CSMI Go profile adapter provides exact declaration identity and applicability evidence.",
+      "source_model": "crates/bifrost-semantic-packs/models/go-concurrency-declarations.json"
+    },
+    {
+      "asset_role": "compiled_shard",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "compiled_semantic_model",
+      "path": "crates/bifrost-semantic-packs/embedded/go-concurrency-declarations/shards/go.concurrency.errgroup.declarations.deflate",
+      "profiles": [],
+      "reason": "No supported standard CSMI Go profile adapter provides exact declaration identity and applicability evidence.",
+      "source_model": "crates/bifrost-semantic-packs/models/go-concurrency-declarations.json"
+    },
+    {
+      "asset_role": "compiled_shard",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "compiled_semantic_model",
+      "path": "crates/bifrost-semantic-packs/embedded/go-concurrency-declarations/shards/go.concurrency.sync.declarations.deflate",
+      "profiles": [],
+      "reason": "No supported standard CSMI Go profile adapter provides exact declaration identity and applicability evidence.",
+      "source_model": "crates/bifrost-semantic-packs/models/go-concurrency-declarations.json"
+    },
+    {
+      "asset_role": "compiled_manifest",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "compiled_semantic_model",
+      "path": "crates/bifrost-semantic-packs/embedded/go-concurrency/manifest.json",
+      "profiles": [],
+      "reason": "No supported standard CSMI Go profile adapter provides exact declaration identity and applicability evidence.",
+      "source_model": "crates/bifrost-semantic-packs/models/go-concurrency.json"
+    },
+    {
+      "asset_role": "compiled_shard",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "compiled_semantic_model",
+      "path": "crates/bifrost-semantic-packs/embedded/go-concurrency/shards/go.concurrency.errgroup.deflate",
+      "profiles": [],
+      "reason": "No supported standard CSMI Go profile adapter provides exact declaration identity and applicability evidence.",
+      "source_model": "crates/bifrost-semantic-packs/models/go-concurrency.json"
+    },
+    {
+      "asset_role": "compiled_shard",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "compiled_semantic_model",
+      "path": "crates/bifrost-semantic-packs/embedded/go-concurrency/shards/go.concurrency.sync.deflate",
+      "profiles": [],
+      "reason": "No supported standard CSMI Go profile adapter provides exact declaration identity and applicability evidence.",
+      "source_model": "crates/bifrost-semantic-packs/models/go-concurrency.json"
+    },
+    {
+      "asset_role": "compiled_manifest",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "compiled_semantic_model",
+      "path": "crates/bifrost-semantic-packs/embedded/go-stdlib-bytes-declarations/manifest.json",
+      "profiles": [],
+      "reason": "No supported standard CSMI Go profile adapter provides exact declaration identity and applicability evidence.",
+      "source_model": "crates/bifrost-semantic-packs/models/go-stdlib-bytes-declarations.json"
+    },
+    {
+      "asset_role": "compiled_shard",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "compiled_semantic_model",
+      "path": "crates/bifrost-semantic-packs/embedded/go-stdlib-bytes-declarations/shards/go.stdlib.bytes.declarations.json",
+      "profiles": [],
+      "reason": "No supported standard CSMI Go profile adapter provides exact declaration identity and applicability evidence.",
+      "source_model": "crates/bifrost-semantic-packs/models/go-stdlib-bytes-declarations.json"
+    },
+    {
+      "asset_role": "compiled_manifest",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "compiled_semantic_model",
+      "path": "crates/bifrost-semantic-packs/embedded/go-stdlib-crypto-x509-declarations/manifest.json",
+      "profiles": [],
+      "reason": "No supported standard CSMI Go profile adapter provides exact declaration identity and applicability evidence.",
+      "source_model": "crates/bifrost-semantic-packs/models/go-stdlib-crypto-x509-declarations.json"
+    },
+    {
+      "asset_role": "compiled_shard",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "compiled_semantic_model",
+      "path": "crates/bifrost-semantic-packs/embedded/go-stdlib-crypto-x509-declarations/shards/go.stdlib.crypto-x509.declarations.json",
+      "profiles": [],
+      "reason": "No supported standard CSMI Go profile adapter provides exact declaration identity and applicability evidence.",
+      "source_model": "crates/bifrost-semantic-packs/models/go-stdlib-crypto-x509-declarations.json"
+    },
+    {
+      "asset_role": "compiled_manifest",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "compiled_semantic_model",
+      "path": "crates/bifrost-semantic-packs/embedded/go-stdlib-crypto-x509/manifest.json",
+      "profiles": [],
+      "reason": "No supported standard CSMI Go profile adapter provides exact declaration identity and applicability evidence.",
+      "source_model": "crates/bifrost-semantic-packs/models/go-stdlib-crypto-x509.json"
+    },
+    {
+      "asset_role": "compiled_shard",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "compiled_semantic_model",
+      "path": "crates/bifrost-semantic-packs/embedded/go-stdlib-crypto-x509/shards/go.stdlib.crypto-x509.parameter-preconditions.json",
+      "profiles": [],
+      "reason": "No supported standard CSMI Go profile adapter provides exact declaration identity and applicability evidence.",
+      "source_model": "crates/bifrost-semantic-packs/models/go-stdlib-crypto-x509.json"
+    },
+    {
+      "asset_role": "compiled_manifest",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "compiled_semantic_model",
+      "path": "crates/bifrost-semantic-packs/embedded/go-stdlib-encoding-pem-declarations/manifest.json",
+      "profiles": [],
+      "reason": "No supported standard CSMI Go profile adapter provides exact declaration identity and applicability evidence.",
+      "source_model": "crates/bifrost-semantic-packs/models/go-stdlib-encoding-pem-declarations.json"
+    },
+    {
+      "asset_role": "compiled_shard",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "compiled_semantic_model",
+      "path": "crates/bifrost-semantic-packs/embedded/go-stdlib-encoding-pem-declarations/shards/go.stdlib.encoding-pem.declarations.deflate",
+      "profiles": [],
+      "reason": "No supported standard CSMI Go profile adapter provides exact declaration identity and applicability evidence.",
+      "source_model": "crates/bifrost-semantic-packs/models/go-stdlib-encoding-pem-declarations.json"
+    },
+    {
+      "asset_role": "compiled_manifest",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "compiled_semantic_model",
+      "path": "crates/bifrost-semantic-packs/embedded/go-stdlib-encoding-pem/manifest.json",
+      "profiles": [],
+      "reason": "No supported standard CSMI Go profile adapter provides exact declaration identity and applicability evidence.",
+      "source_model": "crates/bifrost-semantic-packs/models/go-stdlib-encoding-pem.json"
+    },
+    {
+      "asset_role": "compiled_shard",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "compiled_semantic_model",
+      "path": "crates/bifrost-semantic-packs/embedded/go-stdlib-encoding-pem/shards/go.stdlib.encoding-pem.result-contracts.json",
+      "profiles": [],
+      "reason": "No supported standard CSMI Go profile adapter provides exact declaration identity and applicability evidence.",
+      "source_model": "crates/bifrost-semantic-packs/models/go-stdlib-encoding-pem.json"
+    },
+    {
+      "asset_role": "compiled_manifest",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "compiled_semantic_model",
+      "path": "crates/bifrost-semantic-packs/embedded/go-stdlib-errors-declarations/manifest.json",
+      "profiles": [],
+      "reason": "No supported standard CSMI Go profile adapter provides exact declaration identity and applicability evidence.",
+      "source_model": "crates/bifrost-semantic-packs/models/go-stdlib-errors-declarations.json"
+    },
+    {
+      "asset_role": "compiled_shard",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "compiled_semantic_model",
+      "path": "crates/bifrost-semantic-packs/embedded/go-stdlib-errors-declarations/shards/go.stdlib.errors.declarations.deflate",
+      "profiles": [],
+      "reason": "No supported standard CSMI Go profile adapter provides exact declaration identity and applicability evidence.",
+      "source_model": "crates/bifrost-semantic-packs/models/go-stdlib-errors-declarations.json"
+    },
+    {
+      "asset_role": "compiled_manifest",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "compiled_semantic_model",
+      "path": "crates/bifrost-semantic-packs/embedded/go-stdlib-errors/manifest.json",
+      "profiles": [],
+      "reason": "No supported standard CSMI Go profile adapter provides exact declaration identity and applicability evidence.",
+      "source_model": "crates/bifrost-semantic-packs/models/go-stdlib-errors.json"
+    },
+    {
+      "asset_role": "compiled_shard",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "compiled_semantic_model",
+      "path": "crates/bifrost-semantic-packs/embedded/go-stdlib-errors/shards/go.stdlib.errors.conditional-result-refinements.json",
+      "profiles": [],
+      "reason": "No supported standard CSMI Go profile adapter provides exact declaration identity and applicability evidence.",
+      "source_model": "crates/bifrost-semantic-packs/models/go-stdlib-errors.json"
+    },
+    {
+      "asset_role": "compiled_manifest",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "compiled_semantic_model",
+      "path": "crates/bifrost-semantic-packs/embedded/go-stdlib-log-declarations/manifest.json",
+      "profiles": [],
+      "reason": "No supported standard CSMI Go profile adapter provides exact declaration identity and applicability evidence.",
+      "source_model": "crates/bifrost-semantic-packs/models/go-stdlib-log-declarations.json"
+    },
+    {
+      "asset_role": "compiled_shard",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "compiled_semantic_model",
+      "path": "crates/bifrost-semantic-packs/embedded/go-stdlib-log-declarations/shards/go.stdlib.log.declarations.deflate",
+      "profiles": [],
+      "reason": "No supported standard CSMI Go profile adapter provides exact declaration identity and applicability evidence.",
+      "source_model": "crates/bifrost-semantic-packs/models/go-stdlib-log-declarations.json"
+    },
+    {
+      "asset_role": "compiled_manifest",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "compiled_semantic_model",
+      "path": "crates/bifrost-semantic-packs/embedded/go-stdlib-log/manifest.json",
+      "profiles": [],
+      "reason": "No supported standard CSMI Go profile adapter provides exact declaration identity and applicability evidence.",
+      "source_model": "crates/bifrost-semantic-packs/models/go-stdlib-log.json"
+    },
+    {
+      "asset_role": "compiled_shard",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "compiled_semantic_model",
+      "path": "crates/bifrost-semantic-packs/embedded/go-stdlib-log/shards/go.stdlib.log.normal-continuation.deflate",
+      "profiles": [],
+      "reason": "No supported standard CSMI Go profile adapter provides exact declaration identity and applicability evidence.",
+      "source_model": "crates/bifrost-semantic-packs/models/go-stdlib-log.json"
+    },
+    {
+      "asset_role": "compiled_manifest",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "compiled_semantic_model",
+      "path": "crates/bifrost-semantic-packs/embedded/go-stdlib-net-declarations/manifest.json",
+      "profiles": [],
+      "reason": "No supported standard CSMI Go profile adapter provides exact declaration identity and applicability evidence.",
+      "source_model": "crates/bifrost-semantic-packs/models/go-stdlib-net-declarations.json"
+    },
+    {
+      "asset_role": "compiled_shard",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "compiled_semantic_model",
+      "path": "crates/bifrost-semantic-packs/embedded/go-stdlib-net-declarations/shards/go.stdlib.net.declarations.deflate",
+      "profiles": [],
+      "reason": "No supported standard CSMI Go profile adapter provides exact declaration identity and applicability evidence.",
+      "source_model": "crates/bifrost-semantic-packs/models/go-stdlib-net-declarations.json"
+    },
+    {
+      "asset_role": "compiled_manifest",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "compiled_semantic_model",
+      "path": "crates/bifrost-semantic-packs/embedded/go-stdlib-net-url-declarations/manifest.json",
+      "profiles": [],
+      "reason": "No supported standard CSMI Go profile adapter provides exact declaration identity and applicability evidence.",
+      "source_model": "crates/bifrost-semantic-packs/models/go-stdlib-net-url-declarations.json"
+    },
+    {
+      "asset_role": "compiled_shard",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "compiled_semantic_model",
+      "path": "crates/bifrost-semantic-packs/embedded/go-stdlib-net-url-declarations/shards/go.stdlib.net-url.declarations.deflate",
+      "profiles": [],
+      "reason": "No supported standard CSMI Go profile adapter provides exact declaration identity and applicability evidence.",
+      "source_model": "crates/bifrost-semantic-packs/models/go-stdlib-net-url-declarations.json"
+    },
+    {
+      "asset_role": "compiled_manifest",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "compiled_semantic_model",
+      "path": "crates/bifrost-semantic-packs/embedded/go-stdlib-net-url/manifest.json",
+      "profiles": [],
+      "reason": "No supported standard CSMI Go profile adapter provides exact declaration identity and applicability evidence.",
+      "source_model": "crates/bifrost-semantic-packs/models/go-stdlib-net-url.json"
+    },
+    {
+      "asset_role": "compiled_shard",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "compiled_semantic_model",
+      "path": "crates/bifrost-semantic-packs/embedded/go-stdlib-net-url/shards/go.stdlib.net-url.result-contracts.json",
+      "profiles": [],
+      "reason": "No supported standard CSMI Go profile adapter provides exact declaration identity and applicability evidence.",
+      "source_model": "crates/bifrost-semantic-packs/models/go-stdlib-net-url.json"
+    },
+    {
+      "asset_role": "compiled_manifest",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "compiled_semantic_model",
+      "path": "crates/bifrost-semantic-packs/embedded/go-stdlib-net/manifest.json",
+      "profiles": [],
+      "reason": "No supported standard CSMI Go profile adapter provides exact declaration identity and applicability evidence.",
+      "source_model": "crates/bifrost-semantic-packs/models/go-stdlib-net.json"
+    },
+    {
+      "asset_role": "compiled_shard",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "compiled_semantic_model",
+      "path": "crates/bifrost-semantic-packs/embedded/go-stdlib-net/shards/go.stdlib.net.result-contracts.deflate",
+      "profiles": [],
+      "reason": "No supported standard CSMI Go profile adapter provides exact declaration identity and applicability evidence.",
+      "source_model": "crates/bifrost-semantic-packs/models/go-stdlib-net.json"
+    },
+    {
+      "asset_role": "compiled_manifest",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "compiled_semantic_model",
+      "path": "crates/bifrost-semantic-packs/embedded/go-stdlib-os-declarations/manifest.json",
+      "profiles": [],
+      "reason": "No supported standard CSMI Go profile adapter provides exact declaration identity and applicability evidence.",
+      "source_model": "crates/bifrost-semantic-packs/models/go-stdlib-os-declarations.json"
+    },
+    {
+      "asset_role": "compiled_shard",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "compiled_semantic_model",
+      "path": "crates/bifrost-semantic-packs/embedded/go-stdlib-os-declarations/shards/go.stdlib.os.declarations.deflate",
+      "profiles": [],
+      "reason": "No supported standard CSMI Go profile adapter provides exact declaration identity and applicability evidence.",
+      "source_model": "crates/bifrost-semantic-packs/models/go-stdlib-os-declarations.json"
+    },
+    {
+      "asset_role": "compiled_manifest",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "compiled_semantic_model",
+      "path": "crates/bifrost-semantic-packs/embedded/go-stdlib-os/manifest.json",
+      "profiles": [],
+      "reason": "No supported standard CSMI Go profile adapter provides exact declaration identity and applicability evidence.",
+      "source_model": "crates/bifrost-semantic-packs/models/go-stdlib-os.json"
+    },
+    {
+      "asset_role": "compiled_shard",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "compiled_semantic_model",
+      "path": "crates/bifrost-semantic-packs/embedded/go-stdlib-os/shards/go.stdlib.os.result-contracts.deflate",
+      "profiles": [],
+      "reason": "No supported standard CSMI Go profile adapter provides exact declaration identity and applicability evidence.",
+      "source_model": "crates/bifrost-semantic-packs/models/go-stdlib-os.json"
+    },
+    {
+      "asset_role": "compiled_manifest",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "compiled_semantic_model",
+      "path": "crates/bifrost-semantic-packs/embedded/go-stdlib-path-filepath/manifest.json",
+      "profiles": [],
+      "reason": "No supported standard CSMI Go profile adapter provides exact declaration identity and applicability evidence.",
+      "source_model": "crates/bifrost-semantic-packs/models/go-stdlib-path-filepath.json"
+    },
+    {
+      "asset_role": "compiled_shard",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "compiled_semantic_model",
+      "path": "crates/bifrost-semantic-packs/embedded/go-stdlib-path-filepath/shards/go.stdlib.path-filepath.declarations.json",
+      "profiles": [],
+      "reason": "No supported standard CSMI Go profile adapter provides exact declaration identity and applicability evidence.",
+      "source_model": "crates/bifrost-semantic-packs/models/go-stdlib-path-filepath.json"
+    },
+    {
+      "asset_role": "compiled_manifest",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "compiled_semantic_model",
+      "path": "crates/bifrost-semantic-packs/embedded/go-stdlib-sync-atomic-declarations/manifest.json",
+      "profiles": [],
+      "reason": "No supported standard CSMI Go profile adapter provides exact declaration identity and applicability evidence.",
+      "source_model": "crates/bifrost-semantic-packs/models/go-stdlib-sync-atomic-declarations.json"
+    },
+    {
+      "asset_role": "compiled_shard",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "compiled_semantic_model",
+      "path": "crates/bifrost-semantic-packs/embedded/go-stdlib-sync-atomic-declarations/shards/go.stdlib.sync-atomic.declarations.deflate",
+      "profiles": [],
+      "reason": "No supported standard CSMI Go profile adapter provides exact declaration identity and applicability evidence.",
+      "source_model": "crates/bifrost-semantic-packs/models/go-stdlib-sync-atomic-declarations.json"
+    },
+    {
+      "asset_role": "compiled_manifest",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "compiled_semantic_model",
+      "path": "crates/bifrost-semantic-packs/embedded/go-stdlib-sync-atomic/manifest.json",
+      "profiles": [],
+      "reason": "No supported standard CSMI Go profile adapter provides exact declaration identity and applicability evidence.",
+      "source_model": "crates/bifrost-semantic-packs/models/go-stdlib-sync-atomic.json"
+    },
+    {
+      "asset_role": "compiled_shard",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "compiled_semantic_model",
+      "path": "crates/bifrost-semantic-packs/embedded/go-stdlib-sync-atomic/shards/go.stdlib.sync-atomic.concurrency.deflate",
+      "profiles": [],
+      "reason": "No supported standard CSMI Go profile adapter provides exact declaration identity and applicability evidence.",
+      "source_model": "crates/bifrost-semantic-packs/models/go-stdlib-sync-atomic.json"
+    },
+    {
+      "asset_role": "compiled_manifest",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "compiled_semantic_model",
+      "path": "crates/bifrost-semantic-packs/embedded/go-stdlib-testing/manifest.json",
+      "profiles": [],
+      "reason": "No supported standard CSMI Go profile adapter provides exact declaration identity and applicability evidence.",
+      "source_model": "crates/bifrost-semantic-packs/models/go-stdlib-testing.json"
+    },
+    {
+      "asset_role": "compiled_shard",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "compiled_semantic_model",
+      "path": "crates/bifrost-semantic-packs/embedded/go-stdlib-testing/shards/go.stdlib.testing.concrete-receivers.deflate",
+      "profiles": [],
+      "reason": "No supported standard CSMI Go profile adapter provides exact declaration identity and applicability evidence.",
+      "source_model": "crates/bifrost-semantic-packs/models/go-stdlib-testing.json"
+    },
+    {
+      "asset_role": "compiled_shard",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "compiled_semantic_model",
+      "path": "crates/bifrost-semantic-packs/embedded/go-stdlib-testing/shards/go.stdlib.testing.normal-continuation.deflate",
+      "profiles": [],
+      "reason": "No supported standard CSMI Go profile adapter provides exact declaration identity and applicability evidence.",
+      "source_model": "crates/bifrost-semantic-packs/models/go-stdlib-testing.json"
+    },
+    {
+      "asset_role": "compiled_manifest",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "compiled_semantic_model",
+      "path": "crates/bifrost-semantic-packs/embedded/go-testify-assert-declarations/manifest.json",
+      "profiles": [],
+      "reason": "No supported standard CSMI Go profile adapter provides exact declaration identity and applicability evidence.",
+      "source_model": "crates/bifrost-semantic-packs/models/go-testify-assert-declarations.json"
+    },
+    {
+      "asset_role": "compiled_shard",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "compiled_semantic_model",
+      "path": "crates/bifrost-semantic-packs/embedded/go-testify-assert-declarations/shards/go.testify.assert.declarations.deflate",
+      "profiles": [],
+      "reason": "No supported standard CSMI Go profile adapter provides exact declaration identity and applicability evidence.",
+      "source_model": "crates/bifrost-semantic-packs/models/go-testify-assert-declarations.json"
+    },
+    {
+      "asset_role": "compiled_manifest",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "compiled_semantic_model",
+      "path": "crates/bifrost-semantic-packs/embedded/go-testify-assert/manifest.json",
+      "profiles": [],
+      "reason": "No supported standard CSMI Go profile adapter provides exact declaration identity and applicability evidence.",
+      "source_model": "crates/bifrost-semantic-packs/models/go-testify-assert.json"
+    },
+    {
+      "asset_role": "compiled_shard",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "compiled_semantic_model",
+      "path": "crates/bifrost-semantic-packs/embedded/go-testify-assert/shards/go.testify.assert.conditional-result-refinements.json",
+      "profiles": [],
+      "reason": "No supported standard CSMI Go profile adapter provides exact declaration identity and applicability evidence.",
+      "source_model": "crates/bifrost-semantic-packs/models/go-testify-assert.json"
+    },
+    {
+      "asset_role": "compiled_manifest",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "compiled_semantic_model",
+      "path": "crates/bifrost-semantic-packs/embedded/go-testify-require-declarations/manifest.json",
+      "profiles": [],
+      "reason": "No supported standard CSMI Go profile adapter provides exact declaration identity and applicability evidence.",
+      "source_model": "crates/bifrost-semantic-packs/models/go-testify-require-declarations.json"
+    },
+    {
+      "asset_role": "compiled_shard",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "compiled_semantic_model",
+      "path": "crates/bifrost-semantic-packs/embedded/go-testify-require-declarations/shards/go.testify.require.declarations.deflate",
+      "profiles": [],
+      "reason": "No supported standard CSMI Go profile adapter provides exact declaration identity and applicability evidence.",
+      "source_model": "crates/bifrost-semantic-packs/models/go-testify-require-declarations.json"
+    },
+    {
+      "asset_role": "compiled_manifest",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "compiled_semantic_model",
+      "path": "crates/bifrost-semantic-packs/embedded/go-testify-require/manifest.json",
+      "profiles": [],
+      "reason": "No supported standard CSMI Go profile adapter provides exact declaration identity and applicability evidence.",
+      "source_model": "crates/bifrost-semantic-packs/models/go-testify-require.json"
+    },
+    {
+      "asset_role": "compiled_shard",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "compiled_semantic_model",
+      "path": "crates/bifrost-semantic-packs/embedded/go-testify-require/shards/go.testify.require.normal-return-refinements.json",
+      "profiles": [],
+      "reason": "No supported standard CSMI Go profile adapter provides exact declaration identity and applicability evidence.",
+      "source_model": "crates/bifrost-semantic-packs/models/go-testify-require.json"
+    },
+    {
+      "asset_role": "compiled_manifest",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_generation_vocabulary"
+      ],
+      "classification": "blocked_missing_vocabulary",
+      "generation_strategy": "retain_until_vocabulary_support",
+      "native_source_kind": "compiled_semantic_model",
+      "path": "crates/bifrost-semantic-packs/embedded/lombok-1.18.42/manifest.json",
+      "profiles": [
+        "java-jvm"
+      ],
+      "reason": "The generator-rule model is not representable by pinned CSMI 0.1 generator vocabulary.",
+      "source_model": "crates/bifrost-semantic-packs/models/lombok-1.18.42.json"
+    },
+    {
+      "asset_role": "compiled_shard",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_generation_vocabulary"
+      ],
+      "classification": "blocked_missing_vocabulary",
+      "generation_strategy": "retain_until_vocabulary_support",
+      "native_source_kind": "compiled_semantic_model",
+      "path": "crates/bifrost-semantic-packs/embedded/lombok-1.18.42/shards/java.lombok.generated-accessors.deflate",
+      "profiles": [
+        "java-jvm"
+      ],
+      "reason": "The generator-rule model is not representable by pinned CSMI 0.1 generator vocabulary.",
+      "source_model": "crates/bifrost-semantic-packs/models/lombok-1.18.42.json"
+    },
+    {
+      "asset_role": "compiled_manifest",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "compiled_semantic_model",
+      "path": "crates/bifrost-semantic-packs/embedded/node-child-process-javascript-declarations/manifest.json",
+      "profiles": [
+        "javascript-typescript",
+        "node-compatibility"
+      ],
+      "reason": "First-wave migration candidate; exportability remains pending lossless field and applicability audit.",
+      "source_model": "semantic-packs/node/child-process/javascript/bifrost.node-child-process-declarations.json"
+    },
+    {
+      "asset_role": "compiled_shard",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "compiled_semantic_model",
+      "path": "crates/bifrost-semantic-packs/embedded/node-child-process-javascript-declarations/shards/declarations.child-process-exec-sync.json",
+      "profiles": [
+        "javascript-typescript",
+        "node-compatibility"
+      ],
+      "reason": "First-wave migration candidate; exportability remains pending lossless field and applicability audit.",
+      "source_model": "semantic-packs/node/child-process/javascript/bifrost.node-child-process-declarations.json"
+    },
+    {
+      "asset_role": "compiled_manifest",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "compiled_semantic_model",
+      "path": "crates/bifrost-semantic-packs/embedded/node-child-process-typescript-declarations/manifest.json",
+      "profiles": [
+        "javascript-typescript",
+        "node-compatibility"
+      ],
+      "reason": "First-wave migration candidate; exportability remains pending lossless field and applicability audit.",
+      "source_model": "semantic-packs/node/child-process/typescript/bifrost.node-child-process-declarations.json"
+    },
+    {
+      "asset_role": "compiled_shard",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "compiled_semantic_model",
+      "path": "crates/bifrost-semantic-packs/embedded/node-child-process-typescript-declarations/shards/declarations.child-process-exec-sync.json",
+      "profiles": [
+        "javascript-typescript",
+        "node-compatibility"
+      ],
+      "reason": "First-wave migration candidate; exportability remains pending lossless field and applicability audit.",
+      "source_model": "semantic-packs/node/child-process/typescript/bifrost.node-child-process-declarations.json"
+    },
+    {
+      "asset_role": "compiled_manifest",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "compiled_semantic_model",
+      "path": "crates/bifrost-semantic-packs/embedded/scala-case-class/manifest.json",
+      "profiles": [],
+      "reason": "Scala source and JVM identities have no supported standard profile adapter.",
+      "source_model": "crates/bifrost-semantic-packs/models/scala-case-class.json"
+    },
+    {
+      "asset_role": "compiled_shard",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "compiled_semantic_model",
+      "path": "crates/bifrost-semantic-packs/embedded/scala-case-class/shards/scala.case-class.generated-members.deflate",
+      "profiles": [],
+      "reason": "Scala source and JVM identities have no supported standard profile adapter.",
+      "source_model": "crates/bifrost-semantic-packs/models/scala-case-class.json"
+    },
+    {
+      "asset_role": "generated_semantic_model",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_generation_vocabulary"
+      ],
+      "classification": "blocked_missing_vocabulary",
+      "embedded_paths": [
+        "crates/bifrost-semantic-packs/embedded/getset-0.1.7/manifest.json",
+        "crates/bifrost-semantic-packs/embedded/getset-0.1.7/shards/rust.getset.generated-getter.deflate"
+      ],
+      "generation_strategy": "retain_until_vocabulary_support",
+      "native_source_kind": "generated_semantic_model",
+      "path": "crates/bifrost-semantic-packs/models/getset-0.1.7.json",
+      "profiles": [
+        "rust"
+      ],
+      "reason": "The generator-rule model is not representable by pinned CSMI 0.1 generator vocabulary."
+    },
+    {
+      "asset_role": "generated_semantic_model",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "embedded_paths": [
+        "crates/bifrost-semantic-packs/embedded/go-concurrency-declarations/manifest.json",
+        "crates/bifrost-semantic-packs/embedded/go-concurrency-declarations/shards/go.concurrency.errgroup.declarations.deflate",
+        "crates/bifrost-semantic-packs/embedded/go-concurrency-declarations/shards/go.concurrency.sync.declarations.deflate"
+      ],
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "generated_semantic_model",
+      "path": "crates/bifrost-semantic-packs/models/go-concurrency-declarations.json",
+      "profiles": [],
+      "reason": "No supported standard CSMI Go profile adapter provides exact declaration identity and applicability evidence."
+    },
+    {
+      "asset_role": "generated_semantic_model",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "embedded_paths": [
+        "crates/bifrost-semantic-packs/embedded/go-concurrency/manifest.json",
+        "crates/bifrost-semantic-packs/embedded/go-concurrency/shards/go.concurrency.errgroup.deflate",
+        "crates/bifrost-semantic-packs/embedded/go-concurrency/shards/go.concurrency.sync.deflate"
+      ],
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "generated_semantic_model",
+      "path": "crates/bifrost-semantic-packs/models/go-concurrency.json",
+      "profiles": [],
+      "reason": "No supported standard CSMI Go profile adapter provides exact declaration identity and applicability evidence."
+    },
+    {
+      "asset_role": "generated_semantic_model",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "embedded_paths": [
+        "crates/bifrost-semantic-packs/embedded/go-stdlib-bytes-declarations/manifest.json",
+        "crates/bifrost-semantic-packs/embedded/go-stdlib-bytes-declarations/shards/go.stdlib.bytes.declarations.json"
+      ],
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "generated_semantic_model",
+      "path": "crates/bifrost-semantic-packs/models/go-stdlib-bytes-declarations.json",
+      "profiles": [],
+      "reason": "No supported standard CSMI Go profile adapter provides exact declaration identity and applicability evidence."
+    },
+    {
+      "asset_role": "generated_semantic_model",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "embedded_paths": [
+        "crates/bifrost-semantic-packs/embedded/go-stdlib-crypto-x509-declarations/manifest.json",
+        "crates/bifrost-semantic-packs/embedded/go-stdlib-crypto-x509-declarations/shards/go.stdlib.crypto-x509.declarations.json"
+      ],
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "generated_semantic_model",
+      "path": "crates/bifrost-semantic-packs/models/go-stdlib-crypto-x509-declarations.json",
+      "profiles": [],
+      "reason": "No supported standard CSMI Go profile adapter provides exact declaration identity and applicability evidence."
+    },
+    {
+      "asset_role": "generated_semantic_model",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "embedded_paths": [
+        "crates/bifrost-semantic-packs/embedded/go-stdlib-crypto-x509/manifest.json",
+        "crates/bifrost-semantic-packs/embedded/go-stdlib-crypto-x509/shards/go.stdlib.crypto-x509.parameter-preconditions.json"
+      ],
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "generated_semantic_model",
+      "path": "crates/bifrost-semantic-packs/models/go-stdlib-crypto-x509.json",
+      "profiles": [],
+      "reason": "No supported standard CSMI Go profile adapter provides exact declaration identity and applicability evidence."
+    },
+    {
+      "asset_role": "generated_semantic_model",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "embedded_paths": [
+        "crates/bifrost-semantic-packs/embedded/go-stdlib-encoding-pem-declarations/manifest.json",
+        "crates/bifrost-semantic-packs/embedded/go-stdlib-encoding-pem-declarations/shards/go.stdlib.encoding-pem.declarations.deflate"
+      ],
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "generated_semantic_model",
+      "path": "crates/bifrost-semantic-packs/models/go-stdlib-encoding-pem-declarations.json",
+      "profiles": [],
+      "reason": "No supported standard CSMI Go profile adapter provides exact declaration identity and applicability evidence."
+    },
+    {
+      "asset_role": "generated_semantic_model",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "embedded_paths": [
+        "crates/bifrost-semantic-packs/embedded/go-stdlib-encoding-pem/manifest.json",
+        "crates/bifrost-semantic-packs/embedded/go-stdlib-encoding-pem/shards/go.stdlib.encoding-pem.result-contracts.json"
+      ],
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "generated_semantic_model",
+      "path": "crates/bifrost-semantic-packs/models/go-stdlib-encoding-pem.json",
+      "profiles": [],
+      "reason": "No supported standard CSMI Go profile adapter provides exact declaration identity and applicability evidence."
+    },
+    {
+      "asset_role": "generated_semantic_model",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "embedded_paths": [
+        "crates/bifrost-semantic-packs/embedded/go-stdlib-errors-declarations/manifest.json",
+        "crates/bifrost-semantic-packs/embedded/go-stdlib-errors-declarations/shards/go.stdlib.errors.declarations.deflate"
+      ],
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "generated_semantic_model",
+      "path": "crates/bifrost-semantic-packs/models/go-stdlib-errors-declarations.json",
+      "profiles": [],
+      "reason": "No supported standard CSMI Go profile adapter provides exact declaration identity and applicability evidence."
+    },
+    {
+      "asset_role": "generated_semantic_model",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "embedded_paths": [
+        "crates/bifrost-semantic-packs/embedded/go-stdlib-errors/manifest.json",
+        "crates/bifrost-semantic-packs/embedded/go-stdlib-errors/shards/go.stdlib.errors.conditional-result-refinements.json"
+      ],
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "generated_semantic_model",
+      "path": "crates/bifrost-semantic-packs/models/go-stdlib-errors.json",
+      "profiles": [],
+      "reason": "No supported standard CSMI Go profile adapter provides exact declaration identity and applicability evidence."
+    },
+    {
+      "asset_role": "generated_semantic_model",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "embedded_paths": [
+        "crates/bifrost-semantic-packs/embedded/go-stdlib-log-declarations/manifest.json",
+        "crates/bifrost-semantic-packs/embedded/go-stdlib-log-declarations/shards/go.stdlib.log.declarations.deflate"
+      ],
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "generated_semantic_model",
+      "path": "crates/bifrost-semantic-packs/models/go-stdlib-log-declarations.json",
+      "profiles": [],
+      "reason": "No supported standard CSMI Go profile adapter provides exact declaration identity and applicability evidence."
+    },
+    {
+      "asset_role": "generated_semantic_model",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "embedded_paths": [
+        "crates/bifrost-semantic-packs/embedded/go-stdlib-log/manifest.json",
+        "crates/bifrost-semantic-packs/embedded/go-stdlib-log/shards/go.stdlib.log.normal-continuation.deflate"
+      ],
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "generated_semantic_model",
+      "path": "crates/bifrost-semantic-packs/models/go-stdlib-log.json",
+      "profiles": [],
+      "reason": "No supported standard CSMI Go profile adapter provides exact declaration identity and applicability evidence."
+    },
+    {
+      "asset_role": "generated_semantic_model",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "embedded_paths": [
+        "crates/bifrost-semantic-packs/embedded/go-stdlib-net-declarations/manifest.json",
+        "crates/bifrost-semantic-packs/embedded/go-stdlib-net-declarations/shards/go.stdlib.net.declarations.deflate"
+      ],
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "generated_semantic_model",
+      "path": "crates/bifrost-semantic-packs/models/go-stdlib-net-declarations.json",
+      "profiles": [],
+      "reason": "No supported standard CSMI Go profile adapter provides exact declaration identity and applicability evidence."
+    },
+    {
+      "asset_role": "generated_semantic_model",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "embedded_paths": [
+        "crates/bifrost-semantic-packs/embedded/go-stdlib-net-url-declarations/manifest.json",
+        "crates/bifrost-semantic-packs/embedded/go-stdlib-net-url-declarations/shards/go.stdlib.net-url.declarations.deflate"
+      ],
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "generated_semantic_model",
+      "path": "crates/bifrost-semantic-packs/models/go-stdlib-net-url-declarations.json",
+      "profiles": [],
+      "reason": "No supported standard CSMI Go profile adapter provides exact declaration identity and applicability evidence."
+    },
+    {
+      "asset_role": "generated_semantic_model",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "embedded_paths": [
+        "crates/bifrost-semantic-packs/embedded/go-stdlib-net-url/manifest.json",
+        "crates/bifrost-semantic-packs/embedded/go-stdlib-net-url/shards/go.stdlib.net-url.result-contracts.json"
+      ],
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "generated_semantic_model",
+      "path": "crates/bifrost-semantic-packs/models/go-stdlib-net-url.json",
+      "profiles": [],
+      "reason": "No supported standard CSMI Go profile adapter provides exact declaration identity and applicability evidence."
+    },
+    {
+      "asset_role": "generated_semantic_model",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "embedded_paths": [
+        "crates/bifrost-semantic-packs/embedded/go-stdlib-net/manifest.json",
+        "crates/bifrost-semantic-packs/embedded/go-stdlib-net/shards/go.stdlib.net.result-contracts.deflate"
+      ],
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "generated_semantic_model",
+      "path": "crates/bifrost-semantic-packs/models/go-stdlib-net.json",
+      "profiles": [],
+      "reason": "No supported standard CSMI Go profile adapter provides exact declaration identity and applicability evidence."
+    },
+    {
+      "asset_role": "generated_semantic_model",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "embedded_paths": [
+        "crates/bifrost-semantic-packs/embedded/go-stdlib-os-declarations/manifest.json",
+        "crates/bifrost-semantic-packs/embedded/go-stdlib-os-declarations/shards/go.stdlib.os.declarations.deflate"
+      ],
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "generated_semantic_model",
+      "path": "crates/bifrost-semantic-packs/models/go-stdlib-os-declarations.json",
+      "profiles": [],
+      "reason": "No supported standard CSMI Go profile adapter provides exact declaration identity and applicability evidence."
+    },
+    {
+      "asset_role": "generated_semantic_model",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "embedded_paths": [
+        "crates/bifrost-semantic-packs/embedded/go-stdlib-os/manifest.json",
+        "crates/bifrost-semantic-packs/embedded/go-stdlib-os/shards/go.stdlib.os.result-contracts.deflate"
+      ],
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "generated_semantic_model",
+      "path": "crates/bifrost-semantic-packs/models/go-stdlib-os.json",
+      "profiles": [],
+      "reason": "No supported standard CSMI Go profile adapter provides exact declaration identity and applicability evidence."
+    },
+    {
+      "asset_role": "generated_semantic_model",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "embedded_paths": [
+        "crates/bifrost-semantic-packs/embedded/go-stdlib-path-filepath/manifest.json",
+        "crates/bifrost-semantic-packs/embedded/go-stdlib-path-filepath/shards/go.stdlib.path-filepath.declarations.json"
+      ],
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "generated_semantic_model",
+      "path": "crates/bifrost-semantic-packs/models/go-stdlib-path-filepath.json",
+      "profiles": [],
+      "reason": "No supported standard CSMI Go profile adapter provides exact declaration identity and applicability evidence."
+    },
+    {
+      "asset_role": "generated_semantic_model",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "embedded_paths": [
+        "crates/bifrost-semantic-packs/embedded/go-stdlib-sync-atomic-declarations/manifest.json",
+        "crates/bifrost-semantic-packs/embedded/go-stdlib-sync-atomic-declarations/shards/go.stdlib.sync-atomic.declarations.deflate"
+      ],
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "generated_semantic_model",
+      "path": "crates/bifrost-semantic-packs/models/go-stdlib-sync-atomic-declarations.json",
+      "profiles": [],
+      "reason": "No supported standard CSMI Go profile adapter provides exact declaration identity and applicability evidence."
+    },
+    {
+      "asset_role": "generated_semantic_model",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "embedded_paths": [
+        "crates/bifrost-semantic-packs/embedded/go-stdlib-sync-atomic/manifest.json",
+        "crates/bifrost-semantic-packs/embedded/go-stdlib-sync-atomic/shards/go.stdlib.sync-atomic.concurrency.deflate"
+      ],
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "generated_semantic_model",
+      "path": "crates/bifrost-semantic-packs/models/go-stdlib-sync-atomic.json",
+      "profiles": [],
+      "reason": "No supported standard CSMI Go profile adapter provides exact declaration identity and applicability evidence."
+    },
+    {
+      "asset_role": "generated_semantic_model",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "embedded_paths": [
+        "crates/bifrost-semantic-packs/embedded/go-stdlib-testing/manifest.json",
+        "crates/bifrost-semantic-packs/embedded/go-stdlib-testing/shards/go.stdlib.testing.concrete-receivers.deflate",
+        "crates/bifrost-semantic-packs/embedded/go-stdlib-testing/shards/go.stdlib.testing.normal-continuation.deflate"
+      ],
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "generated_semantic_model",
+      "path": "crates/bifrost-semantic-packs/models/go-stdlib-testing.json",
+      "profiles": [],
+      "reason": "No supported standard CSMI Go profile adapter provides exact declaration identity and applicability evidence."
+    },
+    {
+      "asset_role": "generated_semantic_model",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "embedded_paths": [
+        "crates/bifrost-semantic-packs/embedded/go-testify-assert-declarations/manifest.json",
+        "crates/bifrost-semantic-packs/embedded/go-testify-assert-declarations/shards/go.testify.assert.declarations.deflate"
+      ],
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "generated_semantic_model",
+      "path": "crates/bifrost-semantic-packs/models/go-testify-assert-declarations.json",
+      "profiles": [],
+      "reason": "No supported standard CSMI Go profile adapter provides exact declaration identity and applicability evidence."
+    },
+    {
+      "asset_role": "generated_semantic_model",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "embedded_paths": [
+        "crates/bifrost-semantic-packs/embedded/go-testify-assert/manifest.json",
+        "crates/bifrost-semantic-packs/embedded/go-testify-assert/shards/go.testify.assert.conditional-result-refinements.json"
+      ],
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "generated_semantic_model",
+      "path": "crates/bifrost-semantic-packs/models/go-testify-assert.json",
+      "profiles": [],
+      "reason": "No supported standard CSMI Go profile adapter provides exact declaration identity and applicability evidence."
+    },
+    {
+      "asset_role": "generated_semantic_model",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "embedded_paths": [
+        "crates/bifrost-semantic-packs/embedded/go-testify-require-declarations/manifest.json",
+        "crates/bifrost-semantic-packs/embedded/go-testify-require-declarations/shards/go.testify.require.declarations.deflate"
+      ],
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "generated_semantic_model",
+      "path": "crates/bifrost-semantic-packs/models/go-testify-require-declarations.json",
+      "profiles": [],
+      "reason": "No supported standard CSMI Go profile adapter provides exact declaration identity and applicability evidence."
+    },
+    {
+      "asset_role": "generated_semantic_model",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "embedded_paths": [
+        "crates/bifrost-semantic-packs/embedded/go-testify-require/manifest.json",
+        "crates/bifrost-semantic-packs/embedded/go-testify-require/shards/go.testify.require.normal-return-refinements.json"
+      ],
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "generated_semantic_model",
+      "path": "crates/bifrost-semantic-packs/models/go-testify-require.json",
+      "profiles": [],
+      "reason": "No supported standard CSMI Go profile adapter provides exact declaration identity and applicability evidence."
+    },
+    {
+      "asset_role": "generated_semantic_model",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_generation_vocabulary"
+      ],
+      "classification": "blocked_missing_vocabulary",
+      "embedded_paths": [
+        "crates/bifrost-semantic-packs/embedded/lombok-1.18.42/manifest.json",
+        "crates/bifrost-semantic-packs/embedded/lombok-1.18.42/shards/java.lombok.generated-accessors.deflate"
+      ],
+      "generation_strategy": "retain_until_vocabulary_support",
+      "native_source_kind": "generated_semantic_model",
+      "path": "crates/bifrost-semantic-packs/models/lombok-1.18.42.json",
+      "profiles": [
+        "java-jvm"
+      ],
+      "reason": "The generator-rule model is not representable by pinned CSMI 0.1 generator vocabulary."
+    },
+    {
+      "asset_role": "generated_semantic_model",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "embedded_paths": [
+        "crates/bifrost-semantic-packs/embedded/scala-case-class/manifest.json",
+        "crates/bifrost-semantic-packs/embedded/scala-case-class/shards/scala.case-class.generated-members.deflate"
+      ],
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "generated_semantic_model",
+      "path": "crates/bifrost-semantic-packs/models/scala-case-class.json",
+      "profiles": [],
+      "reason": "Scala source and JVM identities have no supported standard profile adapter."
+    },
+    {
+      "asset_role": "benchmark_report",
+      "audit_status": "not_applicable",
+      "blockers": [],
+      "classification": "not_a_semantic_model",
+      "generation_strategy": "retain_native_artifact",
+      "native_source_kind": "derived_report",
+      "path": "semantic-packs/benchmarks/owasp-benchmark-java-v0.10.7-timeout.json",
+      "profiles": [],
+      "reason": "Benchmark result data records evaluation evidence, not semantic model facts."
+    },
+    {
+      "asset_role": "benchmark_report",
+      "audit_status": "not_applicable",
+      "blockers": [],
+      "classification": "not_a_semantic_model",
+      "generation_strategy": "retain_native_artifact",
+      "native_source_kind": "derived_report",
+      "path": "semantic-packs/benchmarks/owasp-benchmark-java-v2.json",
+      "profiles": [],
+      "reason": "Benchmark result data records evaluation evidence, not semantic model facts."
+    },
+    {
+      "asset_role": "benchmark_report",
+      "audit_status": "not_applicable",
+      "blockers": [],
+      "classification": "not_a_semantic_model",
+      "generation_strategy": "retain_native_artifact",
+      "native_source_kind": "derived_report",
+      "path": "semantic-packs/benchmarks/owasp-benchmark-java.json",
+      "profiles": [],
+      "reason": "Benchmark result data records evaluation evidence, not semantic model facts."
+    },
+    {
+      "asset_role": "authored_semantic_model",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_artifact_evidence",
+        "missing_identity_evidence"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "authored_semantic_model",
+      "path": "semantic-packs/framework-decls/bifrost.jdk-framework-decls.json",
+      "profiles": [
+        "java-jvm"
+      ],
+      "reason": "Framework declaration identities do not yet carry exact standard Java/JVM source and artifact correspondence."
+    },
+    {
+      "asset_role": "rejection_report",
+      "audit_status": "not_applicable",
+      "blockers": [],
+      "classification": "not_a_semantic_model",
+      "generation_strategy": "retain_native_artifact",
+      "native_source_kind": "derived_report",
+      "path": "semantic-packs/framework-decls/rejects.json",
+      "profiles": [],
+      "reason": "Reject accounting records candidates excluded by authoring gates, not a semantic model."
+    },
+    {
+      "asset_role": "authored_semantic_model",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_artifact_evidence",
+        "missing_identity_evidence"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "authored_semantic_model",
+      "path": "semantic-packs/framework-decls/staged/bifrost.javax.servlet-api-framework-decls.json",
+      "profiles": [
+        "java-jvm"
+      ],
+      "reason": "Framework declaration identities do not yet carry exact standard Java/JVM source and artifact correspondence."
+    },
+    {
+      "asset_role": "authored_semantic_model",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_effect_vocabulary"
+      ],
+      "classification": "blocked_missing_vocabulary",
+      "generation_strategy": "retain_until_vocabulary_support",
+      "native_source_kind": "authored_semantic_model",
+      "path": "semantic-packs/framework-decls/staged/bifrost.javax.servlet-api-summaries.json",
+      "profiles": [
+        "java-jvm"
+      ],
+      "reason": "Summary effects and callable refinements are not represented by the pinned CSMI core/JVM vocabulary."
+    },
+    {
+      "asset_role": "authored_semantic_model",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_effect_vocabulary"
+      ],
+      "classification": "blocked_missing_vocabulary",
+      "generation_strategy": "retain_until_vocabulary_support",
+      "native_source_kind": "authored_semantic_model",
+      "path": "semantic-packs/framework-decls/staged/bifrost.jdk-framework-summaries.json",
+      "profiles": [
+        "java-jvm"
+      ],
+      "reason": "Summary effects and callable refinements are not represented by the pinned CSMI core/JVM vocabulary."
+    },
+    {
+      "asset_role": "authored_semantic_model",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "authored_semantic_model",
+      "path": "semantic-packs/golden-core/bifrost.jdk-golden-summaries.json",
+      "profiles": [
+        "java-jvm"
+      ],
+      "reason": "First-wave migration candidate; exportability remains pending lossless field and applicability audit."
+    },
+    {
+      "asset_role": "authored_semantic_model",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "authored_semantic_model",
+      "path": "semantic-packs/golden-core/cpython/bifrost.cpython-golden-summaries.json",
+      "profiles": [
+        "python"
+      ],
+      "reason": "First-wave migration candidate; exportability remains pending lossless field and applicability audit."
+    },
+    {
+      "asset_role": "rejection_report",
+      "audit_status": "not_applicable",
+      "blockers": [],
+      "classification": "not_a_semantic_model",
+      "generation_strategy": "retain_native_artifact",
+      "native_source_kind": "derived_report",
+      "path": "semantic-packs/golden-core/cpython/rejects.json",
+      "profiles": [],
+      "reason": "Reject accounting records candidates excluded by authoring gates, not a semantic model."
+    },
+    {
+      "asset_role": "authored_semantic_model",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "authored_semantic_model",
+      "path": "semantic-packs/golden-core/js-ts/javascript/bifrost.javascript-golden-summaries.json",
+      "profiles": [
+        "javascript-typescript"
+      ],
+      "reason": "First-wave migration candidate; exportability remains pending lossless field and applicability audit."
+    },
+    {
+      "asset_role": "rejection_report",
+      "audit_status": "not_applicable",
+      "blockers": [],
+      "classification": "not_a_semantic_model",
+      "generation_strategy": "retain_native_artifact",
+      "native_source_kind": "derived_report",
+      "path": "semantic-packs/golden-core/js-ts/javascript/rejects.json",
+      "profiles": [],
+      "reason": "Reject accounting records candidates excluded by authoring gates, not a semantic model."
+    },
+    {
+      "asset_role": "authored_semantic_model",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "authored_semantic_model",
+      "path": "semantic-packs/golden-core/js-ts/typescript/bifrost.typescript-golden-summaries.json",
+      "profiles": [
+        "javascript-typescript"
+      ],
+      "reason": "First-wave migration candidate; exportability remains pending lossless field and applicability audit."
+    },
+    {
+      "asset_role": "rejection_report",
+      "audit_status": "not_applicable",
+      "blockers": [],
+      "classification": "not_a_semantic_model",
+      "generation_strategy": "retain_native_artifact",
+      "native_source_kind": "derived_report",
+      "path": "semantic-packs/golden-core/js-ts/typescript/rejects.json",
+      "profiles": [],
+      "reason": "Reject accounting records candidates excluded by authoring gates, not a semantic model."
+    },
+    {
+      "asset_role": "rejection_report",
+      "audit_status": "not_applicable",
+      "blockers": [],
+      "classification": "not_a_semantic_model",
+      "generation_strategy": "retain_native_artifact",
+      "native_source_kind": "derived_report",
+      "path": "semantic-packs/golden-core/rejects.json",
+      "profiles": [],
+      "reason": "Reject accounting records candidates excluded by authoring gates, not a semantic model."
+    },
+    {
+      "asset_role": "authored_semantic_model",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "authored_semantic_model",
+      "path": "semantic-packs/golden-core/rust/bifrost.rust-std-golden-summaries.json",
+      "profiles": [
+        "rust"
+      ],
+      "reason": "First-wave migration candidate; exportability remains pending lossless field and applicability audit."
+    },
+    {
+      "asset_role": "rejection_report",
+      "audit_status": "not_applicable",
+      "blockers": [],
+      "classification": "not_a_semantic_model",
+      "generation_strategy": "retain_native_artifact",
+      "native_source_kind": "derived_report",
+      "path": "semantic-packs/golden-core/rust/rejects.json",
+      "profiles": [],
+      "reason": "Reject accounting records candidates excluded by authoring gates, not a semantic model."
+    },
+    {
+      "asset_role": "documentation",
+      "audit_status": "not_applicable",
+      "blockers": [],
+      "classification": "not_a_semantic_model",
+      "generation_strategy": "retain_native_artifact",
+      "native_source_kind": "documentation",
+      "path": "semantic-packs/jvm/README.md",
+      "profiles": [],
+      "reason": "Documentation describes or governs native pack authoring; it is not a semantic model."
+    },
+    {
+      "asset_role": "artifact_descriptor",
+      "audit_status": "not_applicable",
+      "blockers": [],
+      "classification": "not_a_semantic_model",
+      "generation_strategy": "retain_native_artifact",
+      "native_source_kind": "artifact_descriptor",
+      "path": "semantic-packs/jvm/kotlin-stdlib-2.2.20.json",
+      "profiles": [],
+      "reason": "Artifact acquisition and extraction instructions are inputs to model generation, not semantic model facts."
+    },
+    {
+      "asset_role": "license_notice",
+      "audit_status": "not_applicable",
+      "blockers": [],
+      "classification": "not_a_semantic_model",
+      "generation_strategy": "retain_native_artifact",
+      "native_source_kind": "license_notice",
+      "path": "semantic-packs/jvm/notices/kotlin-stdlib-2.2.20.txt",
+      "profiles": [],
+      "reason": "License or notice text is provenance material, not a semantic model."
+    },
+    {
+      "asset_role": "license_notice",
+      "audit_status": "not_applicable",
+      "blockers": [],
+      "classification": "not_a_semantic_model",
+      "generation_strategy": "retain_native_artifact",
+      "native_source_kind": "license_notice",
+      "path": "semantic-packs/jvm/notices/scala-library-2.13.16.txt",
+      "profiles": [],
+      "reason": "License or notice text is provenance material, not a semantic model."
+    },
+    {
+      "asset_role": "license_notice",
+      "audit_status": "not_applicable",
+      "blockers": [],
+      "classification": "not_a_semantic_model",
+      "generation_strategy": "retain_native_artifact",
+      "native_source_kind": "license_notice",
+      "path": "semantic-packs/jvm/notices/temurin-jdk-21.0.8+9.txt",
+      "profiles": [],
+      "reason": "License or notice text is provenance material, not a semantic model."
+    },
+    {
+      "asset_role": "artifact_descriptor",
+      "audit_status": "not_applicable",
+      "blockers": [],
+      "classification": "not_a_semantic_model",
+      "generation_strategy": "retain_native_artifact",
+      "native_source_kind": "artifact_descriptor",
+      "path": "semantic-packs/jvm/scala-library-2.13.16.json",
+      "profiles": [],
+      "reason": "Artifact acquisition and extraction instructions are inputs to model generation, not semantic model facts."
+    },
+    {
+      "asset_role": "artifact_descriptor",
+      "audit_status": "not_applicable",
+      "blockers": [],
+      "classification": "not_a_semantic_model",
+      "generation_strategy": "retain_native_artifact",
+      "native_source_kind": "artifact_descriptor",
+      "path": "semantic-packs/jvm/temurin-jdk-21.0.8+9.json",
+      "profiles": [],
+      "reason": "Artifact acquisition and extraction instructions are inputs to model generation, not semantic model facts."
+    },
+    {
+      "asset_role": "authored_semantic_model",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "embedded_paths": [
+        "crates/bifrost-semantic-packs/embedded/node-child-process-javascript-declarations/manifest.json",
+        "crates/bifrost-semantic-packs/embedded/node-child-process-javascript-declarations/shards/declarations.child-process-exec-sync.json"
+      ],
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "authored_semantic_model",
+      "path": "semantic-packs/node/child-process/javascript/bifrost.node-child-process-declarations.json",
+      "profiles": [
+        "javascript-typescript",
+        "node-compatibility"
+      ],
+      "reason": "First-wave migration candidate; exportability remains pending lossless field and applicability audit."
+    },
+    {
+      "asset_role": "authored_semantic_model",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "embedded_paths": [
+        "crates/bifrost-semantic-packs/embedded/node-child-process-typescript-declarations/manifest.json",
+        "crates/bifrost-semantic-packs/embedded/node-child-process-typescript-declarations/shards/declarations.child-process-exec-sync.json"
+      ],
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "authored_semantic_model",
+      "path": "semantic-packs/node/child-process/typescript/bifrost.node-child-process-declarations.json",
+      "profiles": [
+        "javascript-typescript",
+        "node-compatibility"
+      ],
+      "reason": "First-wave migration candidate; exportability remains pending lossless field and applicability audit."
+    },
+    {
+      "asset_role": "documentation",
+      "audit_status": "not_applicable",
+      "blockers": [],
+      "classification": "not_a_semantic_model",
+      "generation_strategy": "retain_native_artifact",
+      "native_source_kind": "documentation",
+      "path": "semantic-packs/python/README.md",
+      "profiles": [],
+      "reason": "Documentation describes or governs native pack authoring; it is not a semantic model."
+    },
+    {
+      "asset_role": "license_notice",
+      "audit_status": "not_applicable",
+      "blockers": [],
+      "classification": "not_a_semantic_model",
+      "generation_strategy": "retain_native_artifact",
+      "native_source_kind": "license_notice",
+      "path": "semantic-packs/python/notices/typeshed-stdlib-2026.8.31.txt",
+      "profiles": [],
+      "reason": "License or notice text is provenance material, not a semantic model."
+    },
+    {
+      "asset_role": "artifact_descriptor",
+      "audit_status": "not_applicable",
+      "blockers": [],
+      "classification": "not_a_semantic_model",
+      "generation_strategy": "retain_native_artifact",
+      "native_source_kind": "artifact_descriptor",
+      "path": "semantic-packs/python/typeshed-stdlib-2026.8.31.json",
+      "profiles": [],
+      "reason": "Artifact acquisition and extraction instructions are inputs to model generation, not semantic model facts."
+    },
+    {
+      "asset_role": "documentation",
+      "audit_status": "not_applicable",
+      "blockers": [],
+      "classification": "not_a_semantic_model",
+      "generation_strategy": "retain_native_artifact",
+      "native_source_kind": "documentation",
+      "path": "semantic-packs/rust/README.md",
+      "profiles": [],
+      "reason": "Documentation describes or governs native pack authoring; it is not a semantic model."
+    },
+    {
+      "asset_role": "license_notice",
+      "audit_status": "not_applicable",
+      "blockers": [],
+      "classification": "not_a_semantic_model",
+      "generation_strategy": "retain_native_artifact",
+      "native_source_kind": "license_notice",
+      "path": "semantic-packs/rust/notices/rust-stdlib-nightly-2026-08-24.txt",
+      "profiles": [],
+      "reason": "License or notice text is provenance material, not a semantic model."
+    },
+    {
+      "asset_role": "artifact_descriptor",
+      "audit_status": "not_applicable",
+      "blockers": [],
+      "classification": "not_a_semantic_model",
+      "generation_strategy": "retain_native_artifact",
+      "native_source_kind": "artifact_descriptor",
+      "path": "semantic-packs/rust/rust-stdlib-nightly-2026-08-24.json",
+      "profiles": [],
+      "reason": "Artifact acquisition and extraction instructions are inputs to model generation, not semantic model facts."
+    },
+    {
+      "asset_role": "documentation",
+      "audit_status": "not_applicable",
+      "blockers": [],
+      "classification": "not_a_semantic_model",
+      "generation_strategy": "retain_native_artifact",
+      "native_source_kind": "documentation",
+      "path": "semantic-packs/sanitizers/README.md",
+      "profiles": [],
+      "reason": "Documentation describes or governs native pack authoring; it is not a semantic model."
+    },
+    {
+      "asset_role": "authored_semantic_model",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_effect_vocabulary"
+      ],
+      "classification": "blocked_missing_vocabulary",
+      "generation_strategy": "retain_until_vocabulary_support",
+      "native_source_kind": "authored_semantic_model",
+      "path": "semantic-packs/sanitizers/bifrost.esapi-sanitizers.json",
+      "profiles": [
+        "java-jvm"
+      ],
+      "reason": "Sanitizer behavior requires a vocabulary for effects and value transitions not present in pinned CSMI 0.1."
+    },
+    {
+      "asset_role": "authored_semantic_model",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_effect_vocabulary"
+      ],
+      "classification": "blocked_missing_vocabulary",
+      "generation_strategy": "retain_until_vocabulary_support",
+      "native_source_kind": "authored_semantic_model",
+      "path": "semantic-packs/sanitizers/bifrost.java-sanitizers.json",
+      "profiles": [
+        "java-jvm"
+      ],
+      "reason": "Sanitizer behavior requires a vocabulary for effects and value transitions not present in pinned CSMI 0.1."
+    },
+    {
+      "asset_role": "rejection_report",
+      "audit_status": "not_applicable",
+      "blockers": [],
+      "classification": "not_a_semantic_model",
+      "generation_strategy": "retain_native_artifact",
+      "native_source_kind": "derived_report",
+      "path": "semantic-packs/sanitizers/rejects.json",
+      "profiles": [],
+      "reason": "Reject accounting records candidates excluded by authoring gates, not a semantic model."
+    },
+    {
+      "asset_role": "authored_semantic_model",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_effect_vocabulary"
+      ],
+      "classification": "blocked_missing_vocabulary",
+      "generation_strategy": "retain_until_vocabulary_support",
+      "native_source_kind": "authored_semantic_model",
+      "path": "semantic-packs/sanitizers/staged/bifrost.commons-text-sanitizers.json",
+      "profiles": [
+        "java-jvm"
+      ],
+      "reason": "Sanitizer behavior requires a vocabulary for effects and value transitions not present in pinned CSMI 0.1."
+    },
+    {
+      "asset_role": "authored_semantic_model",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_effect_vocabulary"
+      ],
+      "classification": "blocked_missing_vocabulary",
+      "generation_strategy": "retain_until_vocabulary_support",
+      "native_source_kind": "authored_semantic_model",
+      "path": "semantic-packs/sanitizers/staged/bifrost.encoder-sanitizers.json",
+      "profiles": [
+        "java-jvm"
+      ],
+      "reason": "Sanitizer behavior requires a vocabulary for effects and value transitions not present in pinned CSMI 0.1."
+    },
+    {
+      "asset_role": "authored_semantic_model",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_effect_vocabulary"
+      ],
+      "classification": "blocked_missing_vocabulary",
+      "generation_strategy": "retain_until_vocabulary_support",
+      "native_source_kind": "authored_semantic_model",
+      "path": "semantic-packs/sanitizers/staged/bifrost.esapi-sanitizers.json",
+      "profiles": [
+        "java-jvm"
+      ],
+      "reason": "Sanitizer behavior requires a vocabulary for effects and value transitions not present in pinned CSMI 0.1."
+    },
+    {
+      "asset_role": "authored_semantic_model",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_effect_vocabulary"
+      ],
+      "classification": "blocked_missing_vocabulary",
+      "generation_strategy": "retain_until_vocabulary_support",
+      "native_source_kind": "authored_semantic_model",
+      "path": "semantic-packs/sanitizers/staged/bifrost.guava-sanitizers.json",
+      "profiles": [
+        "java-jvm"
+      ],
+      "reason": "Sanitizer behavior requires a vocabulary for effects and value transitions not present in pinned CSMI 0.1."
+    },
+    {
+      "asset_role": "authored_semantic_model",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_effect_vocabulary"
+      ],
+      "classification": "blocked_missing_vocabulary",
+      "generation_strategy": "retain_until_vocabulary_support",
+      "native_source_kind": "authored_semantic_model",
+      "path": "semantic-packs/sanitizers/staged/bifrost.spring-web-sanitizers.json",
+      "profiles": [
+        "java-jvm"
+      ],
+      "reason": "Sanitizer behavior requires a vocabulary for effects and value transitions not present in pinned CSMI 0.1."
+    },
+    {
+      "asset_role": "corpus_pin",
+      "audit_status": "not_applicable",
+      "blockers": [],
+      "classification": "not_a_semantic_model",
+      "generation_strategy": "retain_native_artifact",
+      "native_source_kind": "configuration",
+      "path": "semantic-packs/summary-corpora/pins.json",
+      "profiles": [],
+      "reason": "Corpus revisions and pins configure a foundry run, not a semantic model."
+    },
+    {
+      "asset_role": "policy",
+      "audit_status": "not_applicable",
+      "blockers": [],
+      "classification": "not_a_semantic_model",
+      "generation_strategy": "retain_native_artifact",
+      "native_source_kind": "policy_source",
+      "path": "semantic-packs/summary-foundry/attacker-controlled-injection.require-model.rqlp",
+      "profiles": [],
+      "reason": "RQL policy source is an analyzer policy, not a semantic model."
+    },
+    {
+      "asset_role": "documentation",
+      "audit_status": "not_applicable",
+      "blockers": [],
+      "classification": "not_a_semantic_model",
+      "generation_strategy": "retain_native_artifact",
+      "native_source_kind": "documentation",
+      "path": "semantic-packs/summary-foundry/codeql-java-injection-models/PROVENANCE.md",
+      "profiles": [],
+      "reason": "Documentation describes or governs native pack authoring; it is not a semantic model."
+    },
+    {
+      "asset_role": "extraction_source",
+      "audit_status": "not_applicable",
+      "blockers": [],
+      "classification": "not_a_semantic_model",
+      "generation_strategy": "retain_native_artifact",
+      "native_source_kind": "source_model",
+      "path": "semantic-packs/summary-foundry/codeql-java-injection-models/java.lang.model.yml",
+      "profiles": [],
+      "reason": "CodeQL extraction input is a native source description, not a CSMI semantic model."
+    },
+    {
+      "asset_role": "extraction_source",
+      "audit_status": "not_applicable",
+      "blockers": [],
+      "classification": "not_a_semantic_model",
+      "generation_strategy": "retain_native_artifact",
+      "native_source_kind": "source_model",
+      "path": "semantic-packs/summary-foundry/codeql-java-injection-models/java.sql.model.yml",
+      "profiles": [],
+      "reason": "CodeQL extraction input is a native source description, not a CSMI semantic model."
+    },
+    {
+      "asset_role": "extraction_source",
+      "audit_status": "not_applicable",
+      "blockers": [],
+      "classification": "not_a_semantic_model",
+      "generation_strategy": "retain_native_artifact",
+      "native_source_kind": "source_model",
+      "path": "semantic-packs/summary-foundry/codeql-java-injection-models/javax.servlet.http.model.yml",
+      "profiles": [],
+      "reason": "CodeQL extraction input is a native source description, not a CSMI semantic model."
+    },
+    {
+      "asset_role": "foundry_report",
+      "audit_status": "not_applicable",
+      "blockers": [],
+      "classification": "not_a_semantic_model",
+      "generation_strategy": "retain_native_artifact",
+      "native_source_kind": "derived_report",
+      "path": "semantic-packs/summary-foundry/demand-sweep-java-realistic.json",
+      "profiles": [],
+      "reason": "Summary-foundry sweep output records evaluation evidence, not semantic model facts."
+    },
+    {
+      "asset_role": "foundry_report",
+      "audit_status": "not_applicable",
+      "blockers": [],
+      "classification": "not_a_semantic_model",
+      "generation_strategy": "retain_native_artifact",
+      "native_source_kind": "derived_report",
+      "path": "semantic-packs/summary-foundry/demand-sweep-java.json",
+      "profiles": [],
+      "reason": "Summary-foundry sweep output records evaluation evidence, not semantic model facts."
+    },
+    {
+      "asset_role": "documentation",
+      "audit_status": "not_applicable",
+      "blockers": [],
+      "classification": "not_a_semantic_model",
+      "generation_strategy": "retain_native_artifact",
+      "native_source_kind": "documentation",
+      "path": "semantic-packs/typescript/README.md",
+      "profiles": [],
+      "reason": "Documentation describes or governs native pack authoring; it is not a semantic model."
+    },
+    {
+      "asset_role": "license_notice",
+      "audit_status": "not_applicable",
+      "blockers": [],
+      "classification": "not_a_semantic_model",
+      "generation_strategy": "retain_native_artifact",
+      "native_source_kind": "license_notice",
+      "path": "semantic-packs/typescript/notices/typescript-7.0.2.txt",
+      "profiles": [],
+      "reason": "License or notice text is provenance material, not a semantic model."
+    },
+    {
+      "asset_role": "artifact_descriptor",
+      "audit_status": "not_applicable",
+      "blockers": [],
+      "classification": "not_a_semantic_model",
+      "generation_strategy": "retain_native_artifact",
+      "native_source_kind": "artifact_descriptor",
+      "path": "semantic-packs/typescript/typescript-7.0.2.json",
+      "profiles": [],
+      "reason": "Artifact acquisition and extraction instructions are inputs to model generation, not semantic model facts."
+    }
+  ],
+  "format": "bifrost_csmi_migration_registry/v1",
+  "profiles": [
+    "java-jvm",
+    "javascript-typescript",
+    "node-compatibility",
+    "python",
+    "rust"
+  ],
+  "scope": [
+    "crates/bifrost-semantic-packs/embedded/**",
+    "crates/bifrost-semantic-packs/models/**",
+    "semantic-packs/**"
+  ]
+}

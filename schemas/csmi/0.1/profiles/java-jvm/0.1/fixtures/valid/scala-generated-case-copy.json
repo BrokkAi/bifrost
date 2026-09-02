@@ -1,0 +1,23 @@
+{
+  "$profileSchema": "java-source-identity",
+  "profileVersion": "0.1",
+  "language": "scala",
+  "package": ["org", "example"],
+  "ownerPath": [
+    { "kind": "class", "name": "User", "genericArity": 0 }
+  ],
+  "declaration": {
+    "kind": "method",
+    "name": "copy",
+    "signature": {
+      "parameterTypes": [
+        { "canonicalName": "scala.Predef.String", "nullability": "unspecified", "parameterMode": "value" }
+      ]
+    }
+  },
+  "origin": "generated",
+  "generation": {
+    "kind": "compiler-synthesis",
+    "stableKey": "scala.case-class.copy"
+  }
+}

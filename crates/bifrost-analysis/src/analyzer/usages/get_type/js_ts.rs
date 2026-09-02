@@ -424,21 +424,32 @@ fn model_type_outcome(
         && records.len() == 1
         && !records[0].provenance.ambiguous
         && records[0].provenance.completeness == SemanticModelCompleteness::Complete;
-    let definitions = records
+    let types = records
         .into_iter()
-        .map(|symbol| {
-            CodeUnit::with_signature(
+        .map(|symbol| TypeLookupType {
+            fqn: symbol.qualified_name.clone(),
+            definitions: vec![CodeUnit::with_signature(
                 file.clone(),
                 CodeUnitType::Class,
                 "",
                 symbol.qualified_name.clone(),
                 symbol.signature.clone(),
                 true,
-            )
+            )],
+            semantic_model_id: Some(symbol.id.clone()),
         })
         .collect::<Vec<_>>();
-    let mut outcome =
-        candidates_outcome_with_target_kind(type_name.to_string(), definitions, target_kind);
+    let mut outcome = TypeLookupOutcome {
+        status: if types.len() == 1 {
+            TypeLookupStatus::Resolved
+        } else {
+            TypeLookupStatus::Ambiguous
+        },
+        reference: None,
+        types,
+        diagnostics: Vec::new(),
+        target_kind,
+    };
     if !complete {
         outcome.status = TypeLookupStatus::Ambiguous;
         outcome.diagnostics.push(TypeLookupDiagnostic {
@@ -881,7 +892,11 @@ fn multi_arm_annotation_outcome(
         {
             continue;
         }
-        types.push(TypeLookupType { fqn, definitions });
+        types.push(TypeLookupType {
+            fqn,
+            definitions,
+            semantic_model_id: None,
+        });
     }
 
     if types.is_empty() {

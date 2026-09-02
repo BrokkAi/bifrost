@@ -175,6 +175,8 @@ pub struct CompiledProcedureSummary {
     pub locations: Vec<CompiledSummaryLocation>,
     pub transfers: Vec<CompiledSummaryTransfer>,
     pub effects: Vec<CompiledSummaryEffect>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub concurrency_effects: Vec<CompiledConcurrencyEffect>,
     /// Namespaced effect identifiers declared for this exact procedure (#2437).
     /// Serialized only when non-empty, so a summary that declares none keeps the
     /// compiled bytes -- and therefore the shard digests -- it had before the
@@ -190,6 +192,8 @@ pub struct CompiledProcedureSummary {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub conditional_result_refinements: Vec<CompiledConditionalResultRefinement>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub conditional_indirect_writes: Vec<CompiledConditionalIndirectWrite>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub normal_return_refinements: Vec<CompiledNormalReturnRefinement>,
 }
 
@@ -201,6 +205,21 @@ pub struct CompiledConditionalResultRefinement {
     pub parameter_ordinal: u32,
     pub predicate: CompiledResultPredicate,
     pub proof_effect: CompiledPredicateProofEffect,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompiledConditionalIndirectWrite {
+    pub result_ordinal: u32,
+    pub outcome: bool,
+    pub parameter_ordinal: u32,
+    pub target: CompiledIndirectWriteTarget,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompiledIndirectWriteTarget {
+    Pointee,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -260,6 +279,8 @@ pub struct CompiledOperationPrecondition {
 pub enum CompiledResultPredicate {
     Null,
     NonNull,
+    True,
+    False,
 }
 
 /// Compiled mirror of `AuthoredDeclaredEffect` (#2437).
@@ -408,6 +429,59 @@ pub enum CompiledSummaryEffect {
         output: CompiledSummaryOutput,
         removes: Vec<String>,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum CompiledConcurrencyEffect {
+    Unsupported {
+        protocol: String,
+    },
+    TaskSpawn {
+        callable: CompiledSummaryInput,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        group: Option<CompiledSummaryInput>,
+    },
+    TaskJoin {
+        group: CompiledSummaryInput,
+    },
+    LockAcquire {
+        lock: CompiledSummaryInput,
+        mode: CompiledLockMode,
+    },
+    LockRelease {
+        lock: CompiledSummaryInput,
+        mode: CompiledLockMode,
+    },
+    WaitGroupAdd {
+        group: CompiledSummaryInput,
+        delta: CompiledSummaryInput,
+    },
+    WaitGroupDone {
+        group: CompiledSummaryInput,
+    },
+    WaitGroupWait {
+        group: CompiledSummaryInput,
+    },
+    Atomic {
+        location: CompiledSummaryInput,
+        operation: CompiledAtomicOperation,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompiledLockMode {
+    Shared,
+    Exclusive,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompiledAtomicOperation {
+    Load,
+    Store,
+    ReadModifyWrite,
 }
 
 impl CompiledPayload {
@@ -1169,6 +1243,13 @@ pub(crate) fn payload_inventory(payload: &CompiledPayload) -> (Vec<String>, Vec<
                         collect_declared_type_refs(type_ref, &mut referenced);
                     }
                 }
+                if let Some(TypeValueSemantics {
+                    copy: Some(TypeCopySemantics::ViaMember { member }),
+                    ..
+                }) = &fact.value_semantics
+                {
+                    referenced.insert(member.clone());
+                }
                 for embedded in &fact.embedded_types {
                     collect_declared_type_refs(&embedded.target, &mut referenced);
                 }
@@ -1183,6 +1264,11 @@ pub(crate) fn payload_inventory(payload: &CompiledPayload) -> (Vec<String>, Vec<
                     if let Some(returns) = &signature.returns {
                         collect_declared_type_refs(returns, &mut referenced);
                     }
+                }
+                if let Some(ImplicitOperation::ConversionOperator { target }) =
+                    &fact.implicit_operation
+                {
+                    collect_declared_type_refs(target, &mut referenced);
                 }
             }
             for relation in relations {
@@ -1361,6 +1447,11 @@ fn authored_procedure_summary_from_compiled(
             .iter()
             .map(authored_summary_effect_from_compiled)
             .collect(),
+        concurrency_effects: summary
+            .concurrency_effects
+            .iter()
+            .map(authored_concurrency_effect_from_compiled)
+            .collect(),
         declared_effects: summary
             .declared_effects
             .iter()
@@ -1434,6 +1525,18 @@ fn authored_procedure_summary_from_compiled(
                 },
             })
             .collect(),
+        conditional_indirect_writes: summary
+            .conditional_indirect_writes
+            .iter()
+            .map(|write| AuthoredConditionalIndirectWrite {
+                result_ordinal: write.result_ordinal,
+                outcome: write.outcome,
+                parameter_ordinal: write.parameter_ordinal,
+                target: match write.target {
+                    CompiledIndirectWriteTarget::Pointee => AuthoredIndirectWriteTarget::Pointee,
+                },
+            })
+            .collect(),
         normal_return_refinements: summary
             .normal_return_refinements
             .iter()
@@ -1451,6 +1554,8 @@ fn authored_result_predicate_from_compiled(
     match predicate {
         CompiledResultPredicate::Null => AuthoredResultPredicate::Null,
         CompiledResultPredicate::NonNull => AuthoredResultPredicate::NonNull,
+        CompiledResultPredicate::True => AuthoredResultPredicate::True,
+        CompiledResultPredicate::False => AuthoredResultPredicate::False,
     }
 }
 
@@ -1477,6 +1582,74 @@ fn authored_summary_input_from_compiled(input: &CompiledSummaryInput) -> Authore
         CompiledSummaryInput::Parameter { ordinal } => {
             AuthoredSummaryInput::Parameter { ordinal: *ordinal }
         }
+    }
+}
+
+fn authored_concurrency_effect_from_compiled(
+    effect: &CompiledConcurrencyEffect,
+) -> AuthoredConcurrencyEffect {
+    match effect {
+        CompiledConcurrencyEffect::Unsupported { protocol } => {
+            AuthoredConcurrencyEffect::Unsupported {
+                protocol: protocol.clone(),
+            }
+        }
+        CompiledConcurrencyEffect::TaskSpawn { callable, group } => {
+            AuthoredConcurrencyEffect::TaskSpawn {
+                callable: authored_summary_input_from_compiled(callable),
+                group: group.as_ref().map(authored_summary_input_from_compiled),
+            }
+        }
+        CompiledConcurrencyEffect::TaskJoin { group } => AuthoredConcurrencyEffect::TaskJoin {
+            group: authored_summary_input_from_compiled(group),
+        },
+        CompiledConcurrencyEffect::LockAcquire { lock, mode } => {
+            AuthoredConcurrencyEffect::LockAcquire {
+                lock: authored_summary_input_from_compiled(lock),
+                mode: match mode {
+                    CompiledLockMode::Shared => AuthoredLockMode::Shared,
+                    CompiledLockMode::Exclusive => AuthoredLockMode::Exclusive,
+                },
+            }
+        }
+        CompiledConcurrencyEffect::LockRelease { lock, mode } => {
+            AuthoredConcurrencyEffect::LockRelease {
+                lock: authored_summary_input_from_compiled(lock),
+                mode: match mode {
+                    CompiledLockMode::Shared => AuthoredLockMode::Shared,
+                    CompiledLockMode::Exclusive => AuthoredLockMode::Exclusive,
+                },
+            }
+        }
+        CompiledConcurrencyEffect::WaitGroupAdd { group, delta } => {
+            AuthoredConcurrencyEffect::WaitGroupAdd {
+                group: authored_summary_input_from_compiled(group),
+                delta: authored_summary_input_from_compiled(delta),
+            }
+        }
+        CompiledConcurrencyEffect::WaitGroupDone { group } => {
+            AuthoredConcurrencyEffect::WaitGroupDone {
+                group: authored_summary_input_from_compiled(group),
+            }
+        }
+        CompiledConcurrencyEffect::WaitGroupWait { group } => {
+            AuthoredConcurrencyEffect::WaitGroupWait {
+                group: authored_summary_input_from_compiled(group),
+            }
+        }
+        CompiledConcurrencyEffect::Atomic {
+            location,
+            operation,
+        } => AuthoredConcurrencyEffect::Atomic {
+            location: authored_summary_input_from_compiled(location),
+            operation: match operation {
+                CompiledAtomicOperation::Load => AuthoredAtomicOperation::Load,
+                CompiledAtomicOperation::Store => AuthoredAtomicOperation::Store,
+                CompiledAtomicOperation::ReadModifyWrite => {
+                    AuthoredAtomicOperation::ReadModifyWrite
+                }
+            },
+        },
     }
 }
 
@@ -1675,25 +1848,26 @@ mod tests {
                 .contains("\"preconditions\"")
         }));
 
-        // Captured before procedure-level preconditions existed. An omitted
-        // optional claim must leave the authored content, compiled shard, and
-        // manifest identities byte-for-byte compatible.
+        // Captured for schema v2 before procedure-level preconditions existed.
+        // An omitted optional claim must leave the authored content, compiled
+        // shard, and manifest identities byte-for-byte compatible within the
+        // same schema version.
         let compiled = compile_pack(&authored, &CompilerOptions::default()).unwrap();
         assert_eq!(
             compiled.manifest.semantic_sha256,
-            "287323ecf762582b6398ad06e893d1465921b3e8789877f2f72fc7be45b0fad2"
+            "c95c929e580da66b273670232922084f7bf76495fdd609e0338e1cb832538932"
         );
         assert_eq!(
             compiled.manifest.content_sha256,
-            "aa7cc37d6c45ed038dfe0c92a0c9f604f52bf7bcdc027225c5b37b9eb62020bd"
+            "bbddac2ff793463700951d9a2b5377facb90741a779e029468b50df07e985b53"
         );
         assert_eq!(
             compiled.shards[0].descriptor.semantic_sha256,
-            "0fa2cafdde42718988144143a86dd526337acab6c1e767e158d0df51f4abae30"
+            "9db53e8ae41538e727785153a35935b000fae2efd916b0dfa85a226aafbe00a2"
         );
         assert_eq!(
             compiled.shards[0].descriptor.content_sha256,
-            "c412472b25e4d097dd56d5e0538b29855fb79377ec9bcadf6f896808bf302f06"
+            "5db9b5f2535724a7c173425fe1b6b07ceeccdb7e09c45736ab2f73a85328eec9"
         );
 
         let decoded = decode_shard_for_manifest(
@@ -1915,6 +2089,166 @@ mod tests {
             diagnostic.code == "summary.unsupported_variadic_tail_reference"
                 && diagnostic.path.ends_with(".preconditions[0].input.ordinal")
         }));
+    }
+
+    #[test]
+    fn concurrency_effects_validate_and_round_trip_canonically() {
+        fn with_effects(effects: Vec<AuthoredConcurrencyEffect>) -> AuthoredSemanticModelPack {
+            let mut authored: AuthoredSemanticModelPack =
+                serde_json::from_slice(PROCEDURE_SUMMARIES).unwrap();
+            let AuthoredPayload::ProcedureSummaries { summaries } = &mut authored.shards[0].payload
+            else {
+                unreachable!()
+            };
+            summaries[0].concurrency_effects = effects;
+            authored
+        }
+
+        let spawn = AuthoredConcurrencyEffect::TaskSpawn {
+            callable: AuthoredSummaryInput::Parameter { ordinal: 0 },
+            group: Some(AuthoredSummaryInput::Receiver {}),
+        };
+        let lock = AuthoredConcurrencyEffect::LockAcquire {
+            lock: AuthoredSummaryInput::Receiver {},
+            mode: AuthoredLockMode::Exclusive,
+        };
+        let atomic = AuthoredConcurrencyEffect::Atomic {
+            location: AuthoredSummaryInput::Parameter { ordinal: 0 },
+            operation: AuthoredAtomicOperation::ReadModifyWrite,
+        };
+        let unsupported = AuthoredConcurrencyEffect::Unsupported {
+            protocol: "sync.Once.Do".to_owned(),
+        };
+        let mut expected = vec![spawn.clone(), lock, atomic, unsupported];
+        expected.sort_by_cached_key(|effect| canonical_json(effect).unwrap());
+        let compiled =
+            compile_pack(&with_effects(expected.clone()), &CompilerOptions::default()).unwrap();
+        let decoded = decode_shard_for_manifest(
+            &compiled.manifest,
+            &compiled.shards[0].descriptor,
+            &compiled.shards[0].bytes,
+            &DecodeLimits::default(),
+        )
+        .unwrap();
+        let summary = &decoded.payload().procedure_summaries().unwrap()[0];
+        assert_eq!(
+            authored_procedure_summary_from_compiled(summary).concurrency_effects,
+            expected
+        );
+
+        for (effects, expected_code) in [
+            (
+                vec![spawn.clone(), spawn],
+                "summary.duplicate_concurrency_effect",
+            ),
+            (
+                vec![AuthoredConcurrencyEffect::TaskSpawn {
+                    callable: AuthoredSummaryInput::Receiver {},
+                    group: None,
+                }],
+                "summary.invalid_task_callable",
+            ),
+            (
+                vec![AuthoredConcurrencyEffect::WaitGroupAdd {
+                    group: AuthoredSummaryInput::Parameter { ordinal: 0 },
+                    delta: AuthoredSummaryInput::Parameter { ordinal: 0 },
+                }],
+                "summary.conflicting_concurrency_effect",
+            ),
+            (
+                vec![AuthoredConcurrencyEffect::Unsupported {
+                    protocol: " ".to_owned(),
+                }],
+                "summary.invalid_unsupported_concurrency_protocol",
+            ),
+        ] {
+            let diagnostics =
+                compile_pack(&with_effects(effects), &CompilerOptions::default()).unwrap_err();
+            assert!(
+                diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.code == expected_code),
+                "missing {expected_code} in {diagnostics:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn conditional_indirect_writes_validate_and_round_trip_canonically() {
+        fn with_writes(writes: Vec<AuthoredConditionalIndirectWrite>) -> AuthoredSemanticModelPack {
+            let mut authored: AuthoredSemanticModelPack =
+                serde_json::from_slice(PROCEDURE_SUMMARIES).unwrap();
+            let AuthoredPayload::ProcedureSummaries { summaries } = &mut authored.shards[0].payload
+            else {
+                unreachable!()
+            };
+            summaries[1].normal_result_count = Some(1);
+            summaries[1].conditional_indirect_writes = writes;
+            authored
+        }
+
+        let write = AuthoredConditionalIndirectWrite {
+            result_ordinal: 0,
+            outcome: true,
+            parameter_ordinal: 0,
+            target: AuthoredIndirectWriteTarget::Pointee,
+        };
+        let compiled = compile_pack(
+            &with_writes(vec![write.clone()]),
+            &CompilerOptions::default(),
+        )
+        .expect("one in-range pointee write compiles");
+        let decoded = decode_shard_for_manifest(
+            &compiled.manifest,
+            &compiled.shards[0].descriptor,
+            &compiled.shards[0].bytes,
+            &DecodeLimits::default(),
+        )
+        .expect("compiled indirect write decodes");
+        let summary = &decoded.payload().procedure_summaries().unwrap()[1];
+        assert_eq!(
+            authored_procedure_summary_from_compiled(summary).conditional_indirect_writes,
+            vec![write.clone()]
+        );
+        assert!(
+            String::from_utf8(canonical_json(summary).unwrap())
+                .unwrap()
+                .contains("\"conditional_indirect_writes\":[{\"result_ordinal\":0,\"outcome\":true,\"parameter_ordinal\":0,\"target\":\"pointee\"}]")
+        );
+
+        for (writes, expected_code) in [
+            (
+                vec![write.clone(), write],
+                "summary.duplicate_conditional_indirect_write",
+            ),
+            (
+                vec![AuthoredConditionalIndirectWrite {
+                    result_ordinal: 1,
+                    outcome: true,
+                    parameter_ordinal: 0,
+                    target: AuthoredIndirectWriteTarget::Pointee,
+                }],
+                "summary.result_ordinal_out_of_range",
+            ),
+            (
+                vec![AuthoredConditionalIndirectWrite {
+                    result_ordinal: 0,
+                    outcome: true,
+                    parameter_ordinal: 1,
+                    target: AuthoredIndirectWriteTarget::Pointee,
+                }],
+                "summary.parameter_ordinal_out_of_range",
+            ),
+        ] {
+            let diagnostics =
+                compile_pack(&with_writes(writes), &CompilerOptions::default()).unwrap_err();
+            assert!(
+                diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.code == expected_code),
+                "missing `{expected_code}` in {diagnostics:#?}"
+            );
+        }
     }
 
     #[test]

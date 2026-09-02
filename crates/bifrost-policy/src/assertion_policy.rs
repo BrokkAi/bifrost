@@ -172,10 +172,12 @@ mod tests {
                 RowBinding {
                     name: site.clone(),
                     source: RowBindingSource::Query(occurrence_selector()),
+                    source_range: None,
                 },
                 RowBinding {
                     name: candidate.clone(),
                     source: RowBindingSource::Query(occurrence_selector()),
+                    source_range: None,
                 },
             ],
             derivations: Vec::new(),
@@ -186,13 +188,16 @@ mod tests {
                 on: vec![RowJoinCondition {
                     left_field: "ast_id".to_string(),
                     right_field: "ast_id".to_string(),
+                    source_range: None,
                 }],
+                source_range: None,
             }],
             groups: vec![RowGroup {
                 name: group.clone(),
                 by: vec![RowFieldRef {
                     binding: site,
                     field: "ast_id".to_string(),
+                    source_range: None,
                 }],
                 aggregates: vec![RowAggregate {
                     name: count.clone(),
@@ -200,13 +205,16 @@ mod tests {
                     value: None,
                     sequences: None,
                     predicate: Vec::new(),
+                    source_range: None,
                 }],
+                source_range: None,
             }],
             assertions: vec![RowAssertion {
                 id: name::<PolicyAssertId>("one-candidate"),
                 group,
                 aggregate: count,
                 cardinality: AssertCardinality::Exactly(1),
+                source_range: None,
             }],
             limits: RelationalAssertionLimits::default(),
         }
@@ -230,16 +238,40 @@ mod tests {
             .expect("member occurrences expand into receiver evidence rows");
     }
 
+    /// The diagnostic must carry the complete alternative set and the flag that
+    /// prints the whole catalog (issue #2517): a misspelled column is an
+    /// authoring mistake the message can resolve on its own.
     #[test]
     fn rejects_unknown_row_field_before_execution() {
         let mut plan = valid_plan();
         plan.joins[0].on[0].right_field = "source_range".to_string();
-        assert_eq!(
-            validate_relational_assertion_plan(&plan),
-            Err(RelationalAssertionPlanError::UnknownField {
-                binding: "candidate".to_string(),
-                field: "source_range".to_string(),
-            })
+        let error = validate_relational_assertion_plan(&plan)
+            .expect_err("`source_range` is not a resolution-candidate column");
+        let RelationalAssertionPlanError::UnknownField {
+            binding,
+            field,
+            known_fields,
+        } = &error
+        else {
+            panic!("expected an unknown-field error, got {error:?}");
+        };
+        assert_eq!(binding, "candidate");
+        assert_eq!(field, "source_range");
+        assert!(
+            known_fields.contains(&"target_id".to_string()),
+            "{known_fields:?}"
+        );
+        let message = error.to_string();
+        assert!(
+            message.contains("unknown field `candidate.source_range`"),
+            "{message}"
+        );
+        for known in known_fields {
+            assert!(message.contains(known.as_str()), "{message}");
+        }
+        assert!(
+            message.ends_with("see `bifrost --list-row-schemas`"),
+            "{message}"
         );
     }
 
@@ -263,6 +295,7 @@ mod tests {
         plan.groups[0].by[0] = RowFieldRef {
             binding: name("candidate"),
             field: "ast_id".to_string(),
+            source_range: None,
         };
         assert_eq!(
             validate_relational_assertion_plan(&plan),
@@ -296,6 +329,7 @@ mod tests {
                     from: name("site"),
                     step: crate::definition::RowExpansionStep::ReceiverEvidence,
                 },
+                source_range: None,
             }],
             derivations: Vec::new(),
             joins: Vec::new(),
@@ -319,6 +353,7 @@ mod tests {
         plan.groups[0].aggregates[0].value = Some(RowFieldRef {
             binding: name("candidate"),
             field: "role".to_string(),
+            source_range: None,
         });
         assert_eq!(
             validate_relational_assertion_plan(&plan),
@@ -544,10 +579,12 @@ mod tests {
                 RowBinding {
                     name: arg.clone(),
                     source: RowBindingSource::Query(call_argument_selector()),
+                    source_range: None,
                 },
                 RowBinding {
                     name: param.clone(),
                     source: RowBindingSource::Query(signature_parameter_selector()),
+                    source_range: None,
                 },
             ],
             derivations: Vec::new(),
@@ -558,13 +595,16 @@ mod tests {
                 on: vec![RowJoinCondition {
                     left_field: "site_id".to_string(),
                     right_field: "signature_id".to_string(),
+                    source_range: None,
                 }],
+                source_range: None,
             }],
             groups: vec![RowGroup {
                 name: group.clone(),
                 by: vec![RowFieldRef {
                     binding: arg.clone(),
                     field: "site_id".to_string(),
+                    source_range: None,
                 }],
                 aggregates: vec![RowAggregate {
                     name: parity.clone(),
@@ -575,31 +615,38 @@ mod tests {
                             position: RowFieldRef {
                                 binding: arg,
                                 field: "argument_index".to_string(),
+                                source_range: None,
                             },
                             value: RowFieldRef {
                                 binding: name("arg"),
                                 field: "name".to_string(),
+                                source_range: None,
                             },
                         },
                         right: crate::definition::RowOrderedSequence {
                             position: RowFieldRef {
                                 binding: param.clone(),
                                 field: "parameter_index".to_string(),
+                                source_range: None,
                             },
                             value: RowFieldRef {
                                 binding: param,
                                 field: "label".to_string(),
+                                source_range: None,
                             },
                         },
                     }),
                     predicate: Vec::new(),
+                    source_range: None,
                 }],
+                source_range: None,
             }],
             assertions: vec![RowAssertion {
                 id: name::<PolicyAssertId>("argument-order"),
                 group,
                 aggregate: parity,
                 cardinality: AssertCardinality::Exactly(1),
+                source_range: None,
             }],
             limits: RelationalAssertionLimits::default(),
         }

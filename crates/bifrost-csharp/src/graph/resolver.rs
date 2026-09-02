@@ -2684,6 +2684,407 @@ pub(super) fn extension_visibility_site_key(site: Node<'_>) -> (usize, usize) {
         })
 }
 
+/// The canonical identity of a C# builtin *value* type.
+///
+/// [`canonical_builtin_type_identity`] also answers for `string` and `object`,
+/// which are builtin but are reference types. The argument refutation below is
+/// only sound for value types, so it asks this narrower question.
+fn canonical_builtin_value_type_identity(reference: &str) -> Option<&'static str> {
+    canonical_builtin_type_identity(reference)
+        .filter(|identity| !matches!(*identity, "System.String" | "System.Object"))
+}
+
+/// Which of a call's positional arguments are proven to be of a builtin value
+/// type.
+///
+/// This is the call-site half of the extension-argument refutation. It is a
+/// pure function of the site node and the file source, so the callers that
+/// cache an extension scan can put it in their cache key and get the same
+/// answer the scan itself derives.
+///
+/// Positions past the 64th are never recorded. A longer argument list simply
+/// proves nothing about its tail, which is the safe direction for a refutation.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct CSharpBuiltinValueArguments {
+    positions: u64,
+}
+
+impl CSharpBuiltinValueArguments {
+    /// Reads the argument list of the invocation whose callee name is `site`.
+    ///
+    /// Proves nothing for a site that is not an invocation's callee, and
+    /// nothing for a call that writes a named argument: a named argument binds
+    /// by parameter name, so position stops deciding which parameter an
+    /// argument fills.
+    pub(super) fn at_site(site: Node<'_>, source: &str) -> Self {
+        let Some(arguments) = invocation_arguments_for_callee_name(site) else {
+            return Self::default();
+        };
+        let mut positions = 0u64;
+        let mut cursor = arguments.walk();
+        for (index, argument) in arguments
+            .named_children(&mut cursor)
+            .filter(|child| child.kind() == "argument")
+            .enumerate()
+        {
+            if argument.child_by_field_name("name").is_some() {
+                return Self::default();
+            }
+            if index >= u64::BITS as usize {
+                break;
+            }
+            if argument
+                .named_child(0)
+                .is_some_and(|value| argument_is_builtin_value_type(value, source))
+            {
+                positions |= 1 << index;
+            }
+        }
+        Self { positions }
+    }
+
+    fn is_empty(self) -> bool {
+        self.positions == 0
+    }
+
+    fn contains(self, index: usize) -> bool {
+        index < u64::BITS as usize && self.positions & (1 << index) != 0
+    }
+}
+
+/// The argument list of the invocation that `site` names as its callee.
+///
+/// `site` is the member name the extension scan was asked about, which the
+/// grammar wraps in a `generic_name` for an explicit type-argument list and in
+/// a member access or member binding for a qualified call.
+fn invocation_arguments_for_callee_name(site: Node<'_>) -> Option<Node<'_>> {
+    let mut callee = site;
+    loop {
+        let parent = callee.parent()?;
+        let name = parent
+            .child_by_field_name("name")
+            .or_else(|| parent.named_child(0));
+        match parent.kind() {
+            "generic_name" | "member_access_expression" | "member_binding_expression"
+                if name == Some(callee) =>
+            {
+                callee = parent;
+            }
+            "invocation_expression" if parent.child_by_field_name("function") == Some(callee) => {
+                return parent.child_by_field_name("arguments");
+            }
+            _ => return None,
+        }
+    }
+}
+
+/// Whether an argument expression is proven to evaluate to a builtin value
+/// type.
+///
+/// Three shapes prove it without resolving anything: a numeric, character or
+/// boolean literal; an explicit cast to a value-type keyword; and an identifier
+/// whose visible declaration writes a value-type keyword. C# reserves those
+/// keywords and no declaration can rebind them, so a `predefined_type` spelling
+/// is an identity rather than a name still waiting for a scope.
+///
+/// Every other shape answers false and so proves nothing: a call, a `default`
+/// expression, `null`, a lambda, a string or interpolated string, a `var` local,
+/// and any name this file does not declare.
+fn argument_is_builtin_value_type(argument: Node<'_>, source: &str) -> bool {
+    let mut value = argument;
+    loop {
+        match value.kind() {
+            "integer_literal" | "real_literal" | "character_literal" | "boolean_literal" => {
+                return true;
+            }
+            "parenthesized_expression" => {
+                let Some(inner) = value.named_child(0) else {
+                    return false;
+                };
+                value = inner;
+            }
+            "cast_expression" => {
+                return value
+                    .child_by_field_name("type")
+                    .is_some_and(|type_node| predefined_value_type(type_node, source));
+            }
+            "identifier" => {
+                let name = node_text(value, source);
+                return visible_declared_type_node(value, source, name)
+                    .is_some_and(|type_node| predefined_value_type(type_node, source));
+            }
+            _ => return false,
+        }
+    }
+}
+
+/// Whether a written type node is one of C#'s builtin value-type keywords.
+///
+/// The node kind carries the answer: only the reserved keywords parse as
+/// `predefined_type`, so a workspace type named `Int32` cannot reach here and a
+/// `ulong[]` or `Nullable<ulong>` spelling, which is a different type, is a
+/// different node.
+fn predefined_value_type(type_node: Node<'_>, source: &str) -> bool {
+    type_node.kind() == "predefined_type"
+        && canonical_builtin_value_type_identity(node_text(type_node, source)).is_some()
+}
+
+/// The written type of the nearest declaration of `name` visible at `node`: a
+/// parameter of an enclosing callable or lambda, a local variable declared
+/// earlier in an enclosing block, or a field or property of an enclosing type
+/// declaration in this file.
+///
+/// Answers `None` for a `var` local, whose type comes from an initializer this
+/// walk does not evaluate, and for every name this file does not declare, which
+/// includes an inherited field.
+fn visible_declared_type_node<'tree>(
+    node: Node<'tree>,
+    source: &str,
+    name: &str,
+) -> Option<Node<'tree>> {
+    let mut current = node;
+    while let Some(parent) = current.parent() {
+        if let Some(type_node) = declared_type_in_scope(parent, current, source, name) {
+            return Some(type_node);
+        }
+        current = parent;
+    }
+    None
+}
+
+/// The written type `scope` gives `name`, searching only the declarations that
+/// precede `before` when `scope` is a statement scope.
+fn declared_type_in_scope<'tree>(
+    scope: Node<'tree>,
+    before: Node<'tree>,
+    source: &str,
+    name: &str,
+) -> Option<Node<'tree>> {
+    if let Some(parameters) = scope.child_by_field_name("parameters") {
+        let mut cursor = parameters.walk();
+        let declared = parameters
+            .named_children(&mut cursor)
+            .filter(|parameter| parameter.kind() == "parameter")
+            .find(|parameter| {
+                parameter
+                    .child_by_field_name("name")
+                    .is_some_and(|declared| node_text(declared, source) == name)
+            })
+            .and_then(|parameter| parameter.child_by_field_name("type"));
+        if declared.is_some() {
+            return declared;
+        }
+    }
+    match scope.kind() {
+        "block" | "switch_section" => {
+            declared_variable_type(scope, Some(before.start_byte()), source, name)
+        }
+        "class_declaration"
+        | "struct_declaration"
+        | "record_declaration"
+        | "record_struct_declaration"
+        | "interface_declaration" => scope
+            .child_by_field_name("body")
+            .and_then(|body| declared_variable_type(body, None, source, name)),
+        _ => None,
+    }
+}
+
+/// The written type a container's own local, field or property declarations
+/// give `name`. `limit`, when set, stops the scan at the first declaration that
+/// does not precede that byte, which is what makes a statement scope's search
+/// respect declaration order.
+fn declared_variable_type<'tree>(
+    container: Node<'tree>,
+    limit: Option<usize>,
+    source: &str,
+    name: &str,
+) -> Option<Node<'tree>> {
+    let mut cursor = container.walk();
+    for child in container.named_children(&mut cursor) {
+        if limit.is_some_and(|limit| child.start_byte() >= limit) {
+            break;
+        }
+        if child.kind() == "property_declaration" {
+            if child
+                .child_by_field_name("name")
+                .is_some_and(|declared| node_text(declared, source) == name)
+            {
+                return child.child_by_field_name("type");
+            }
+            continue;
+        }
+        if !matches!(
+            child.kind(),
+            "local_declaration_statement" | "field_declaration"
+        ) {
+            continue;
+        }
+        let Some(declaration) = first_named_child_of_kind(child, "variable_declaration") else {
+            continue;
+        };
+        let Some(type_node) = declaration.child_by_field_name("type") else {
+            continue;
+        };
+        let mut declarator_cursor = declaration.walk();
+        if declaration
+            .named_children(&mut declarator_cursor)
+            .any(|declarator| {
+                declarator.kind() == "variable_declarator"
+                    && declarator
+                        .child_by_field_name("name")
+                        .is_some_and(|declared| node_text(declared, source) == name)
+            })
+        {
+            return Some(type_node);
+        }
+    }
+    None
+}
+
+/// Whether an actual argument's proven type refutes this extension candidate.
+///
+/// The rule is one-directional. A candidate is dropped only when an argument is
+/// *proven* to be of a builtin value type and the candidate's parameter in that
+/// position is a workspace-declared interface. No workspace declaration can add
+/// an interface to `System.UInt64`, so that pair is structurally impossible
+/// however the names line up. This is never a positive applicability check: a
+/// candidate the rule cannot refute stays, and the caller decides the site as it
+/// did before.
+///
+/// These must not refute, and none of them does:
+/// - an argument whose type the AST does not prove, which is every shape
+///   [`argument_is_builtin_value_type`] answers false for;
+/// - a `string` or `object` argument, which are reference types the rule says
+///   nothing about;
+/// - a parameter whose type is one of the candidate's own type parameters, or
+///   any spelling that does not resolve to a workspace declaration;
+/// - a parameter whose workspace declaration is a class, struct or record: a
+///   user-defined implicit conversion operator can make a builtin value convert
+///   to one, and C# conversion operators are not indexed declarations, so their
+///   absence cannot be proven;
+/// - a `params` candidate, whose trailing parameter's written type is the array,
+///   not the element type each extra argument binds to;
+/// - a call with a named argument, which unbinds position from parameter order
+///   before this function is reached;
+/// - a candidate whose adapter recorded no parameter types, which a warm row
+///   written before #2225 has.
+#[allow(clippy::too_many_arguments)]
+fn extension_argument_types_refute_candidate(
+    csharp: &dyn CSharpSource,
+    token: QueryToken<'_>,
+    graph: &CSharpGraphSource<'_>,
+    unit: &CodeUnit,
+    builtin_value_arguments: CSharpBuiltinValueArguments,
+    usage: bool,
+    session: Option<&ResolutionSession>,
+) -> bool {
+    if builtin_value_arguments.is_empty() {
+        return false;
+    }
+    let Some(owner) = resolution_query(session, || graph.index.parent_of(unit)).flatten() else {
+        return false;
+    };
+    let metadata = resolution_query_limited_rows(
+        session,
+        |limit| csharp.signature_metadata_limited(unit, limit),
+        || csharp.signature_metadata(unit),
+    );
+    // A declaration can carry more than one recorded signature -- a C# partial
+    // method records its declaring and implementing halves -- and refuting on
+    // one of them would disclaim the whole declaration. Every recorded
+    // signature has to agree.
+    !metadata.is_empty()
+        && metadata.iter().all(|metadata| {
+            if metadata
+                .callable_arity()
+                .is_some_and(CallableArity::is_repeated)
+            {
+                return false;
+            }
+            let Some(parameter_types) = metadata.callable_parameter_types() else {
+                return false;
+            };
+            // Parameter zero is the extension receiver, which
+            // `compatible_receiver_type_names` has already decided.
+            let Some((_, value_parameters)) = parameter_types.split_first() else {
+                return false;
+            };
+            value_parameters
+                .iter()
+                .enumerate()
+                .any(|(index, parameter_type)| {
+                    builtin_value_arguments.contains(index)
+                        && parameter_type_is_workspace_interface(
+                            csharp,
+                            token,
+                            unit,
+                            &owner,
+                            metadata,
+                            parameter_type,
+                            usage,
+                            session,
+                        )
+                })
+        })
+}
+
+/// Whether a candidate's written parameter type names an interface this
+/// workspace declares.
+///
+/// Resolved in the declaring file's scope through the same ladder the extension
+/// receiver type uses, so a spelling that names an external or unindexed type
+/// answers false. Interface-ness is read from the declaration's published
+/// signature metadata rather than by reparsing the declaring file.
+#[allow(clippy::too_many_arguments)]
+fn parameter_type_is_workspace_interface(
+    csharp: &dyn CSharpSource,
+    token: QueryToken<'_>,
+    unit: &CodeUnit,
+    owner: &CodeUnit,
+    metadata: &SignatureMetadata,
+    parameter_type: &str,
+    usage: bool,
+    session: Option<&ResolutionSession>,
+) -> bool {
+    if parameter_type.is_empty()
+        || canonical_builtin_type_identity(parameter_type).is_some()
+        || metadata
+            .type_parameters()
+            .iter()
+            .any(|type_parameter| type_parameter == parameter_type)
+    {
+        return false;
+    }
+    // The whole resolution is charged as one session step. It is reached only
+    // for a candidate that already passed the receiver and generic-arity gates
+    // and that has a builtin-typed argument in this position, so it runs at
+    // most once per surviving candidate per site.
+    resolution_query(session, || {
+        let fq_name = resolve_member_type_fq_name(
+            csharp,
+            token,
+            unit.source(),
+            owner,
+            parameter_type,
+            usage,
+        )?;
+        let declaration = if usage {
+            class_unit_for_fq_name(csharp, token, &fq_name)
+        } else {
+            forward_class_unit_for_fq_name(csharp, &fq_name)
+        }?;
+        Some(
+            csharp
+                .signature_metadata(&declaration)
+                .iter()
+                .any(SignatureMetadata::class_like_is_interface),
+        )
+    })
+    .flatten()
+    .unwrap_or(false)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn visible_extension_method_candidates(
     csharp: &dyn CSharpSource,
@@ -2787,6 +3188,7 @@ fn visible_extension_method_candidates_inner(
     if !usage && compatible_receiver_types.is_empty() {
         return Vec::new();
     }
+    let builtin_value_arguments = CSharpBuiltinValueArguments::at_site(site, source);
     let scopes = extension_visibility_scopes(csharp, token, source, site, usage, session);
     let mut named_candidates = Vec::new();
     let named = if usage {
@@ -2922,9 +3324,28 @@ fn visible_extension_method_candidates_inner(
                     (usage && compatible_receiver_types.is_empty()) || matches_receiver(&receiver)
                 }
             };
-            if compatible {
-                filtered.push(unit);
+            if !compatible {
+                continue;
             }
+            // An argument whose type the AST proves can refute a candidate the
+            // receiver and arity gates both accept: neo's
+            // `writer.Write(_value1)` passes a `ulong`, which no workspace
+            // declaration can make implement `ISerializable` (#2225).
+            if extension_argument_types_refute_candidate(
+                csharp,
+                token,
+                graph,
+                &unit,
+                builtin_value_arguments,
+                usage,
+                session,
+            ) {
+                continue;
+            }
+            if session.is_some_and(|session| !session.observe_cancellation()) {
+                return Vec::new();
+            }
+            filtered.push(unit);
         }
         let candidates = filtered;
         let Some(call_arity) = call_arity else {
@@ -4218,6 +4639,162 @@ pub fn object_creation_collection_target(initializer: Node<'_>) -> Option<Node<'
         return None;
     }
     assignment.child_by_field_name("left")
+}
+
+/// Where the owner type of a C# object initializer comes from.
+///
+/// The forward definition lookup and the inverse usage scan used to decide this
+/// separately, and drifted: forward answered an assignment target that inverse
+/// did not, and neither read `new A { B = new() { .. } }` as anything but a
+/// plain assignment to a variable named `B` (#2173). The decision is made once,
+/// here, so the two directions cannot disagree about which construct they are
+/// looking at.
+pub enum CSharpInitializerOwnerSource<'tree> {
+    /// The tree writes the constructed type, either directly (`new Foo { .. }`)
+    /// or on the target a `new()` takes its type from.
+    WrittenType(Node<'tree>),
+    /// A `new()` whose target is an element of the collection value this node
+    /// names.
+    CollectionTarget(Node<'tree>),
+    /// A `new()` assigned to an expression whose type only the index proves.
+    AssignmentTarget(Node<'tree>),
+    /// A `new()` written into an enclosing initializer's member, as the inner
+    /// creation of `new A { B = new() { .. } }`. Its type is the declared type
+    /// of the member `label` names on the owner of `enclosing`, so this arm is
+    /// the one that depends on resolving another initializer first.
+    EnclosingInitializerMember {
+        label: Node<'tree>,
+        enclosing: Node<'tree>,
+    },
+}
+
+pub fn object_initializer_owner_source(
+    initializer: Node<'_>,
+) -> Option<CSharpInitializerOwnerSource<'_>> {
+    if let Some(type_node) = object_initializer_owner_type_node(initializer) {
+        return Some(CSharpInitializerOwnerSource::WrittenType(type_node));
+    }
+    if let Some(target) = object_creation_collection_target(initializer) {
+        return Some(CSharpInitializerOwnerSource::CollectionTarget(target));
+    }
+    let target = object_creation_assignment_target(initializer)?;
+    // An assignment whose left side is itself an initializer label writes a
+    // member of the enclosing constructed type, not a variable: the grammar
+    // gives both the same `assignment_expression`, and only the parent tells
+    // them apart. An indexer element (`{ ["k"] = new() { .. } }`) sits in the
+    // same position but names no member, so only an identifier qualifies.
+    if target.kind() == "identifier"
+        && let Some(enclosing) = object_initializer_for_label(target)
+    {
+        return Some(CSharpInitializerOwnerSource::EnclosingInitializerMember {
+            label: target,
+            enclosing,
+        });
+    }
+    Some(CSharpInitializerOwnerSource::AssignmentTarget(target))
+}
+
+/// The index lookups [`object_initializer_owners`] needs.
+///
+/// The ladder is one function; only these four probes differ between the
+/// forward definition provider and the inverse usage scan, because the two
+/// reach different index facades.
+pub trait CSharpInitializerOwnerLookups {
+    /// Every declaration the written type spelling `reference` at `type_node`
+    /// can name, in C# lookup order.
+    fn written_type_owners(&mut self, reference: &str, type_node: Node<'_>) -> Vec<CodeUnit>;
+    /// The element type of the collection value `target` names.
+    fn collection_target_owners(&mut self, target: Node<'_>) -> Vec<CodeUnit>;
+    /// Every type the expression `target` can have.
+    fn expression_owners(&mut self, target: Node<'_>) -> Vec<CodeUnit>;
+    /// The declared type of `member` on `owner`, including inherited members.
+    fn member_type_owners(&mut self, owner: &CodeUnit, member: &str) -> Vec<CodeUnit>;
+}
+
+/// The owner declarations an object initializer's target proved.
+pub struct CSharpInitializerOwners {
+    /// Zero declarations is a refusal, one is the answer, several is an
+    /// ambiguity the caller must report with its candidates named.
+    pub owners: Vec<CodeUnit>,
+    /// What the owners were derived from, for the caller's refusal message.
+    pub target: CSharpInitializerOwnerTarget,
+}
+
+/// The target text a refusal must name, tagged with the kind of target it was.
+/// A written type that resolved to nothing is a different fact from a target
+/// whose type could not be inferred at all.
+pub enum CSharpInitializerOwnerTarget {
+    WrittenType(String),
+    CollectionTarget(String),
+    AssignmentTarget(String),
+    InitializerMember(String),
+}
+
+impl CSharpInitializerOwnerTarget {
+    pub fn text(&self) -> &str {
+        match self {
+            Self::WrittenType(text)
+            | Self::CollectionTarget(text)
+            | Self::AssignmentTarget(text)
+            | Self::InitializerMember(text) => text,
+        }
+    }
+}
+
+/// The owner ladder for an object initializer, shared by forward definition
+/// lookup and the inverse usage scan.
+///
+/// `None` means no arm of [`CSharpInitializerOwnerSource`] applies: the tree
+/// writes no type and names no target at all.
+pub fn object_initializer_owners(
+    initializer: Node<'_>,
+    source: &str,
+    lookups: &mut dyn CSharpInitializerOwnerLookups,
+) -> Option<CSharpInitializerOwners> {
+    // Nested target-typed initializers chain outward an unbounded number of
+    // levels, so collect the labels to descend through and then descend, rather
+    // than recursing once per level.
+    let mut labels = Vec::new();
+    let mut current = initializer;
+    let base = loop {
+        match object_initializer_owner_source(current)? {
+            CSharpInitializerOwnerSource::EnclosingInitializerMember { label, enclosing } => {
+                labels.push(label);
+                current = enclosing;
+            }
+            base => break base,
+        }
+    };
+    let (mut owners, mut target) = match base {
+        CSharpInitializerOwnerSource::WrittenType(type_node) => {
+            let reference = reference_type_text(type_node, source);
+            let owners = lookups.written_type_owners(&reference, type_node);
+            (owners, CSharpInitializerOwnerTarget::WrittenType(reference))
+        }
+        CSharpInitializerOwnerSource::CollectionTarget(node) => (
+            lookups.collection_target_owners(node),
+            CSharpInitializerOwnerTarget::CollectionTarget(node_text(node, source).to_string()),
+        ),
+        CSharpInitializerOwnerSource::AssignmentTarget(node) => (
+            lookups.expression_owners(node),
+            CSharpInitializerOwnerTarget::AssignmentTarget(node_text(node, source).to_string()),
+        ),
+        CSharpInitializerOwnerSource::EnclosingInitializerMember { .. } => {
+            unreachable!("the walk above breaks only on a source that needs no enclosing owner")
+        }
+    };
+    // Outermost label first: the chain was collected inside out.
+    for label in labels.into_iter().rev() {
+        let [owner] = owners.as_slice() else {
+            // Nothing to descend from, or an ambiguity the caller reports with
+            // the candidates it already has.
+            return Some(CSharpInitializerOwners { owners, target });
+        };
+        let member = node_text(label, source);
+        owners = lookups.member_type_owners(owner, member);
+        target = CSharpInitializerOwnerTarget::InitializerMember(member.to_string());
+    }
+    Some(CSharpInitializerOwners { owners, target })
 }
 
 /// The written type a target-typed `new()` takes its type from.

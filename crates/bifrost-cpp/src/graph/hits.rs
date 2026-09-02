@@ -1,6 +1,7 @@
 use crate::graph::extractor::{EnclosingContext, ScanCtx};
 use crate::graph::resolver::{
-    TargetKind, precise_parent_of, same_logical_symbol, visible_owner_from_member_name,
+    TargetKind, declarator_name_node, precise_parent_of, same_logical_symbol,
+    visible_owner_from_member_name,
 };
 use brokk_bifrost_core::analyzer::usages::common::{SNIPPET_CONTEXT_LINES, usage_hit};
 use brokk_bifrost_core::analyzer::usages::model::{UsageHitKind, UsageHitSurface};
@@ -34,6 +35,34 @@ pub fn push_type_hit_range(anchor: Node<'_>, start: usize, end: usize, ctx: &mut
     } else {
         push_unproven_hit_range(anchor, start, end, ctx, UsageHitKind::Reference);
     }
+}
+
+/// Record a reference occupying `start..end` while judging enclosure from
+/// `anchor`.
+///
+/// A reference recovered from a macro replacement has no node of its own in
+/// the scanned file: the whole replacement is one `preproc_arg`. That token is
+/// the anchor for enclosure and declaration-range questions, while the range
+/// names the exact bytes the member spells.
+pub fn push_reference_hit_range(anchor: Node<'_>, start: usize, end: usize, ctx: &mut ScanCtx<'_>) {
+    push_hit_range_with_options(
+        anchor,
+        start,
+        end,
+        ctx,
+        false,
+        UsageHitKind::Reference,
+        false,
+    );
+}
+
+pub fn push_unproven_reference_hit_range(
+    anchor: Node<'_>,
+    start: usize,
+    end: usize,
+    ctx: &mut ScanCtx<'_>,
+) {
+    push_unproven_hit_range(anchor, start, end, ctx, UsageHitKind::Reference);
 }
 
 pub fn push_self_receiver_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
@@ -132,6 +161,7 @@ fn push_unproven_hit_range(
         UsageHitKind::Import
         | UsageHitKind::Reexport
         | UsageHitKind::SelfReceiver
+        | UsageHitKind::DeclaredReference
         | UsageHitKind::OverrideDeclaration => {
             unreachable!("unsupported unproven C++ hit emission kind: {kind:?}")
         }
@@ -253,7 +283,10 @@ fn insert_hit_range(
         UsageHitKind::Reference => hit,
         UsageHitKind::SelfReceiver => hit.into_self_receiver(),
         UsageHitKind::Definition => hit.into_definition(),
-        UsageHitKind::Import | UsageHitKind::Reexport | UsageHitKind::OverrideDeclaration => {
+        UsageHitKind::Import
+        | UsageHitKind::Reexport
+        | UsageHitKind::DeclaredReference
+        | UsageHitKind::OverrideDeclaration => {
             unreachable!("unsupported C++ hit emission kind: {kind:?}")
         }
     };
@@ -308,19 +341,18 @@ pub fn enclosing_context(node: Node<'_>, ctx: &ScanCtx<'_>) -> EnclosingContext 
 /// identifier`), while parameters, default arguments, and the body hang off
 /// sibling fields. Containment in that terminal therefore covers a qualified
 /// out-of-line name (`void Foo::target()`) without also covering a call written
-/// in a default argument.
+/// in a default argument. `declarator_name_node` walks that chain through the
+/// wrappers the grammar leaves unlabelled, such as `reference_declarator`.
 fn is_target_declaration_name(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
     let mut current = Some(node);
     while let Some(candidate) = current {
         if ctx.target_declaration_ranges.iter().any(|range| {
             candidate.start_byte() == range.start_byte && candidate.end_byte() == range.end_byte
         }) {
-            let mut declarator = candidate;
-            while let Some(inner) = declarator.child_by_field_name("declarator") {
-                declarator = inner;
-            }
-            return node.start_byte() >= declarator.start_byte()
-                && node.end_byte() <= declarator.end_byte();
+            return declarator_name_node(candidate).is_some_and(|declarator| {
+                node.start_byte() >= declarator.start_byte()
+                    && node.end_byte() <= declarator.end_byte()
+            });
         }
         current = candidate.parent();
     }
@@ -338,6 +370,12 @@ fn is_inside_target_declaration(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
 /// A `field_declaration` also owns default member initializers and, for method
 /// declarations, parameter default values. Those subtrees contain genuine
 /// references and must not be discarded with the declaration's own name.
+///
+/// The declared name is the leaf of the declarator chain, and the grammar
+/// leaves some links in that chain unlabelled: `reference_declarator` holds its
+/// inner declarator as a plain named child, so `XmlWriter& write(Fmt f = A::B)`
+/// folds the whole parameter list into the outermost declarator's range.
+/// `declarator_name_node` follows the unlabelled links as well (#2196).
 pub fn is_member_field_own_declarator(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
     if !matches!(ctx.spec.kind, TargetKind::MemberField) {
         return false;
@@ -348,10 +386,8 @@ pub fn is_member_field_own_declarator(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool
             let mut cursor = parent.walk();
             return parent
                 .children_by_field_name("declarator", &mut cursor)
-                .any(|mut declarator| {
-                    while let Some(inner) = declarator.child_by_field_name("declarator") {
-                        declarator = inner;
-                    }
+                .filter_map(declarator_name_node)
+                .any(|declarator| {
                     node.start_byte() >= declarator.start_byte()
                         && node.end_byte() <= declarator.end_byte()
                 });

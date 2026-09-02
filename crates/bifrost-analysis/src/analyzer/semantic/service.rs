@@ -444,6 +444,31 @@ pub(crate) fn materialize_with_lowerer<A: LanguageAdapter>(
     file: &ProjectFile,
     request: &mut SemanticRequest<'_>,
 ) -> Result<SemanticOutcome<Arc<SemanticArtifact>>, SemanticProviderError> {
+    let outcome = materialize_with_lowerer_inner(analyzer, cache, lowerer, file, request)?;
+    // The artifact is the unit of consumption, and its public fingerprint is
+    // the one identity that names it without the workspace mount. Recorded on
+    // the cache-hit path as well as the fresh path: a hit in a later request is
+    // still a read of that artifact.
+    if let Some(artifact) = outcome.available_value() {
+        analyzer.record_reads(|sink| {
+            sink.push(crate::analyzer::read_ledger::ReadKey::artifact(
+                crate::analyzer::invalidation::DerivedArtifactId::semantic_artifact(
+                    artifact.key().public_fingerprint(),
+                ),
+                Some(artifact.key().path().as_str()),
+            ));
+        });
+    }
+    Ok(outcome)
+}
+
+fn materialize_with_lowerer_inner<A: LanguageAdapter>(
+    analyzer: &TreeSitterAnalyzer<A>,
+    cache: &CompleteSemanticArtifactCache,
+    lowerer: &dyn ProgramSemanticsLowerer,
+    file: &ProjectFile,
+    request: &mut SemanticRequest<'_>,
+) -> Result<SemanticOutcome<Arc<SemanticArtifact>>, SemanticProviderError> {
     let started_work = request.budget.used();
     if request.cancellation.is_cancelled() {
         return Ok(SemanticOutcome::Cancelled {

@@ -95,6 +95,7 @@ export function caller() {
         assert!(!report.candidates_truncated);
     }
 
+    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
     #[test]
     fn scope_node_budget_is_per_receiver_query() {
         let source = r#"
@@ -195,6 +196,7 @@ export function caller(which: number) {
         assert!(report.work.summary_expansions > 0);
     }
 
+    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
     #[test]
     fn receiver_history_does_not_false_prove_after_an_unknown_write() {
         let cases = [
@@ -260,6 +262,82 @@ function run() {
         }
     }
 
+    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
+    #[test]
+    fn annotated_initializers_do_not_override_value_evidence() {
+        let cases = [
+            (
+                "compatible",
+                r#"
+class Store { put() {} }
+function run() {
+  const store: Store = new Store();
+  store.put();
+}
+"#,
+                Some("Store.put"),
+            ),
+            (
+                "conflicting",
+                r#"
+class Store { put() {} }
+class Cache { put() {} static make() { return new Cache(); } }
+function run() {
+  const store: Store = Cache.make();
+  store.put();
+}
+"#,
+                Some("Cache.put"),
+            ),
+            (
+                "dynamic",
+                r#"
+class Store { put() {} }
+declare function dynamicValue(): unknown;
+function run() {
+  const store: Store = dynamicValue() as Store;
+  store.put();
+}
+"#,
+                None,
+            ),
+        ];
+
+        for (label, source, exact_target) in cases {
+            let (_temp, file, analyzer) = test_project(source);
+            let tree = parse(source);
+            let definitions = AnalyzerDefinitionLookup::new(&analyzer, Language::TypeScript);
+            let provider = JsTsReceiverFactProvider::new(
+                &analyzer,
+                &definitions,
+                Language::TypeScript,
+                &file,
+                source,
+                tree.root_node(),
+                JsTsImportBinder::empty(),
+            );
+            let receiver = receiver_node(tree.root_node(), source, "store.put", "store");
+            let report = provider.resolve_member_targets_report(
+                receiver,
+                "put",
+                receiver.start_byte(),
+                ReceiverAnalysisBudget::default(),
+            );
+
+            match exact_target {
+                Some(expected) => assert!(
+                    matches!(&report.outcome, ReceiverAnalysisOutcome::Precise(targets)
+                        if matches!(targets.as_slice(), [target] if target.fq_name() == expected)),
+                    "{label}: a resolved initializer owns the exact target: {report:#?}"
+                ),
+                None => assert!(
+                    !matches!(report.outcome, ReceiverAnalysisOutcome::Precise(_)),
+                    "{label}: an unresolved initializer stays explicit: {report:#?}"
+                ),
+            }
+        }
+    }
+
     #[test]
     fn nested_same_name_factory_does_not_reuse_the_enclosing_declaration() {
         let source = r#"
@@ -292,6 +370,7 @@ function make() {
         assert_eq!(provider.function_unit_for_node("make", inner), None);
     }
 
+    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
     #[test]
     fn unique_package_imports_are_complete_module_receiver_identities() {
         let source = r#"
@@ -318,11 +397,13 @@ crypto.randomUUID();
             compute_import_binder(source, &tree),
         );
 
+        // Node's `node:` scheme is spelling, not identity, so every module
+        // receiver resolves to the bare builtin name (#2609).
         for (marker, receiver, expected) in [
-            ("path.basename", "path", "node:path"),
-            ("os.platform", "os", "node:os"),
+            ("path.basename", "path", "path"),
+            ("os.platform", "os", "os"),
             ("Buffer.from", "Buffer", "Buffer"),
-            ("crypto.randomUUID", "crypto", "node:crypto"),
+            ("crypto.randomUUID", "crypto", "crypto"),
         ] {
             let receiver = receiver_node(tree.root_node(), source, marker, receiver);
             let report =

@@ -1102,6 +1102,7 @@ mod tests {
     /// directories, once in a single file. Every geometry feature that claims
     /// to measure dispersion must separate the two, or it measures nothing --
     /// a patch's difficulty is supposed to be the thing these numbers track.
+    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
     #[test]
     fn dispersed_edit_reports_more_clusters_and_distance_than_a_single_file_edit() {
         fn seed(root: &Path, repo: &git2::Repository) {
@@ -1327,6 +1328,7 @@ mod tests {
     /// absent. The second case is why the three lists must be merged rather
     /// than concatenated: a relocated symbol whose body also changed is in two
     /// of them and must still be judged once.
+    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
     #[test]
     fn a_relocated_symbol_is_judged_by_verification_exactly_once() {
         fn seed(root: &Path, repo: &git2::Repository) {
@@ -1419,6 +1421,7 @@ mod tests {
     /// relationship to the source file, so counting them as changed production
     /// files would report a one-file edit as three unrelated clusters spread
     /// across the tree. They must be reported as excluded instead.
+    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
     #[test]
     fn binary_and_unparseable_changes_are_excluded_from_the_shape_features() {
         let score = score_two_commits(|root, repo| {
@@ -1479,6 +1482,7 @@ mod tests {
     /// A body that gains nested branching must move the baseline metric, and
     /// must move it upward. The delta is what a consumer compares the geometry
     /// features against, so a flat zero here would make the comparison vacuous.
+    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
     #[test]
     fn added_branching_raises_the_cognitive_baseline() {
         let score = score_two_commits(|root, repo| {

@@ -23,6 +23,7 @@ use crate::analyzer::tree_sitter_analyzer::{
 use crate::analyzer::{CodeUnit, Language, ProjectFile, Range};
 use crate::cancellation::CancellationToken;
 use moka::sync::Cache;
+use rayon::prelude::*;
 use std::hash::Hasher;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -37,9 +38,9 @@ pub struct StructuralFactSnapshotCache {
 }
 
 impl StructuralFactSnapshotCache {
-    pub(crate) fn new(max_retained_bytes: u64) -> Self {
+    pub(crate) fn new(memo_budget_bytes: u64) -> Self {
         Self {
-            inner: super::index::SnapshotStructuralIndexCache::new(max_retained_bytes),
+            inner: super::index::SnapshotStructuralIndexCache::new(memo_budget_bytes),
         }
     }
 
@@ -48,12 +49,48 @@ impl StructuralFactSnapshotCache {
     }
 }
 
+/// What one provider's posting index would cover, measured before any fact is
+/// acquired.
+///
+/// The posting index is roughly proportional to the source it indexes, so this
+/// census is what lets the cache predict a build's retained size and its share
+/// of the shared memo budget before spending the build.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StructuralIndexCensus {
+    /// Files this provider would index.
+    pub files: u64,
+    /// Their total source bytes.
+    pub source_bytes: u64,
+    /// Source bytes of every analyzable file in the workspace, across every
+    /// analyzer language. A provider's share of this total is its share of the
+    /// memo budget the providers apportion between them, so the apportioned
+    /// parts sum to one budget however many providers there are.
+    pub workspace_source_bytes: u64,
+}
+
+/// One file's length on disk, or zero when it cannot be measured.
+fn source_bytes(file: &ProjectFile) -> u64 {
+    std::fs::metadata(file.abs_path())
+        .map(|metadata| metadata.len())
+        .unwrap_or(0)
+}
+
 pub trait StructuralFactProvider: Send + Sync {
     fn structural_language(&self) -> Language;
 
     /// Every analyzed file of this provider's language, unsorted; callers
     /// order for determinism.
     fn structural_files(&self) -> Vec<ProjectFile>;
+
+    /// Measure `files` without hydrating any source or acquiring any fact.
+    ///
+    /// `None` means this provider cannot answer, which leaves the build
+    /// governed by its own construction limits exactly as before. Third-party
+    /// providers keep that default; a provider that answers lets the index
+    /// cache reject a build it could never retain before paying for it.
+    fn structural_index_census(&self, _files: &[ProjectFile]) -> Option<StructuralIndexCensus> {
+        None
+    }
 
     /// Source for an analyzed file. Store-backed analyzers may hydrate this on
     /// demand instead of retaining every file's source in aggregate state.
@@ -375,6 +412,36 @@ impl<A: LanguageAdapter> StructuralFactProvider for TreeSitterAnalyzer<A> {
         self.all_files()
     }
 
+    /// Measure the files from their own on-disk lengths, and the workspace
+    /// they share with the other providers the same way.
+    ///
+    /// This is a prediction, not the analyzed text: hydrating every source to
+    /// measure it exactly would cost as much as the build the prediction
+    /// exists to avoid. A file whose length cannot be read (an overlay-only
+    /// buffer, a race with a delete) contributes nothing, which can only
+    /// shrink the estimate and therefore can only admit a build, never reject
+    /// one that would have fitted.
+    ///
+    /// The workspace total walks the project's own shared listing, so it costs
+    /// one `stat` per analyzable file and no source read. Without a listing
+    /// there is no denominator to apportion the shared memo budget with, so the
+    /// whole census is unavailable and the cache falls back to its fixed share.
+    fn structural_index_census(&self, files: &[ProjectFile]) -> Option<StructuralIndexCensus> {
+        let listing = self.project().all_files_shared().ok()?;
+        let analyzer_languages = self.project().analyzer_languages();
+        let analyzable: Vec<&ProjectFile> = listing
+            .iter()
+            .filter(|file| analyzer_languages.contains(&file.language()))
+            .collect();
+        let workspace_source_bytes = analyzable.par_iter().map(|file| source_bytes(file)).sum();
+        let source_bytes = files.par_iter().map(source_bytes).sum();
+        Some(StructuralIndexCensus {
+            files: files.len() as u64,
+            source_bytes,
+            workspace_source_bytes,
+        })
+    }
+
     fn structural_source(&self, file: &ProjectFile) -> Option<String> {
         self.file_source(file)
     }
@@ -446,6 +513,14 @@ impl<A: LanguageAdapter> StructuralFactProvider for TreeSitterAnalyzer<A> {
         let Some(source) = self.file_source(file) else {
             return (None, StructuralFactsCacheOutcome::Unavailable);
         };
+        // The structural facts of one file are a per-file read of exactly these
+        // bytes, recorded whether the cache, the store, or a fresh extraction
+        // answers: all three are the same input.
+        self.record_reads(|sink| {
+            if let Some(key) = self.source_file_read_key(file, &source) {
+                sink.push(key);
+            }
+        });
         let snapshot_key = self.structural_snapshot_key(file, &source);
         self.structural_cache().get_or_materialize(
             file,

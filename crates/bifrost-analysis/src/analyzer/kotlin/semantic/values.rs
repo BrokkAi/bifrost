@@ -2,20 +2,57 @@ use super::syntax::*;
 use super::*;
 
 impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
-    pub(super) fn emit_captured_receiver(
+    pub(super) fn emit_capture_inputs(
         &mut self,
         builder: &mut ProcedureCfgBuilder,
         entry: ProgramPointId,
         spec: &ProcedureSpec<'tree>,
     ) -> Result<(), KotlinLoweringError> {
-        let Some(lexical_parent) = spec.lexical_parent.filter(|_| spec.captures_receiver) else {
+        let Some(lexical_parent) = spec.lexical_parent else {
             return Ok(());
         };
-        let metadata = self.value_mapping(builder, spec.callable)?;
-        let (value, _) =
-            self.session
-                .add_receiver_capture_input(builder, entry, metadata, lexical_parent)?;
-        self.captured_receiver = Some(value);
+        if spec.captures_receiver {
+            let metadata = self.value_mapping(builder, spec.callable)?;
+            let (value, _) = self.session.add_receiver_capture_input(
+                builder,
+                entry,
+                metadata,
+                lexical_parent,
+            )?;
+            self.captured_receiver = Some(value);
+        }
+        for (index, capture) in spec.captures.iter().enumerate() {
+            let metadata = self.value_mapping(builder, capture.reference)?;
+            let value = self.session.add_value_with_metadata(
+                builder,
+                metadata,
+                SemanticValueKind::Local,
+            )?;
+            let location = self.session.add_memory_location(
+                builder,
+                entry,
+                MemoryLocationKind::Capture {
+                    lexical_parent,
+                    binding: Some(value),
+                },
+            )?;
+            let expected = lexical_capture_destination(spec.captures_receiver, index)?;
+            if location != expected {
+                return Err(KotlinLoweringError::Invalid(format!(
+                    "Kotlin capture destination must be {expected}, allocated {location}"
+                )));
+            }
+            self.append_effect(
+                builder,
+                entry,
+                SemanticEffect::MemoryLoad {
+                    kind: MemoryAccessKind::Capture,
+                    location,
+                    result: value,
+                },
+            )?;
+            self.captured_bindings.insert(capture.name.into(), value);
+        }
         Ok(())
     }
 
@@ -40,7 +77,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 )));
             }
             if node.id() != body.id() && is_kotlin_nested_execution_boundary(node) {
-                if let Some(target) = self.procedure_targets.get(&node.id()).copied()
+                if let Some(target) = self.procedure_targets.get(&node.id()).cloned()
                     && node.kind() == "function_declaration"
                     && let Some(name) = child_of_kind(node, "simple_identifier")
                         .and_then(|name| node_text(self.prepared.source(), name))
@@ -65,8 +102,11 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     }
                 }
                 "property_declaration" => {
-                    if let Some(value) = property_initializer(node)
-                        && let Some(target) = self.procedure_targets.get(&value.id()).copied()
+                    if child_of_kind(node, "binding_pattern_kind")
+                        .and_then(|kind| node_text(self.prepared.source(), kind))
+                        == Some("val")
+                        && let Some(value) = property_initializer(node)
+                        && let Some(target) = self.procedure_targets.get(&value.id()).cloned()
                         && let Some(name) = binding_node(node)
                             .and_then(|binding| binding_names(binding).first().copied())
                             .and_then(|name| node_text(self.prepared.source(), name))
@@ -261,7 +301,9 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             let Some(name) = node_text(self.prepared.source(), node) else {
                 return Ok(());
             };
-            if let Some(local) = self.local_at(name, node.start_byte()) {
+            if let Some(captured) = self.captured_bindings.get(name).copied() {
+                (Some(captured), ValueFlowKind::Local)
+            } else if let Some(local) = self.local_at(name, node.start_byte()) {
                 (Some(local), ValueFlowKind::Local)
             } else {
                 (self.parameters.get(name).copied(), ValueFlowKind::Parameter)

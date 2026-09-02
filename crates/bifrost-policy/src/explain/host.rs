@@ -266,6 +266,9 @@ fn with_one_policy<T>(
         cancellation,
         cvss_overlays: &[],
         organizational_risk: &[],
+        // An explanation re-executes one policy to describe what it did, so
+        // it has nothing to reuse and nothing to publish.
+        incremental: None,
     };
     // The same per-policy budget an ordinary run would use, scaled the same
     // way, so a re-executed prefix is bounded exactly as the original was.

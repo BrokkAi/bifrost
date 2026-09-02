@@ -112,7 +112,7 @@ JSON is not a separate query language. It is the stable serialization of the `Co
 
 See [JSON CodeQuery](/code-query-json/) for the complete schema, validation rules, result model, and copy-paste examples. See [Rune Query Language](/rune-query-language/) for interactive authoring and canonical JSON inspection. Use [Explain and Profile CodeQuery](/code-query-explain-profile/) to inspect logical sharing and physical selection before execution or collect opt-in operator, cache, budget, wait, and concurrency observations from one execution.
 
-For source-first walkthroughs, see the [per-language `query_code` tutorials](/code-query-tutorials/). Their fixtures, RQL and JSON forms, and exact results are exercised against the real structural adapters.
+For source-first walkthroughs, see the [per-language `query_code` tutorials](/code-query-tutorials/). Their fixtures, RQL and JSON forms, and exact results are exercised against the real structural adapters. To call `query_code` from an embedding application rather than from MCP or the REPL, see [Library Integration](/code-query-tutorials/library-integration/): it runs one canonical query through both `SearchToolsService::query_code_result(...)` and `SearchToolsClient.query_code(...)` and shows how each caller reads diagnostics, `truncated`, provenance completeness, and receiver `outcome` before making a completeness-sensitive claim.
 
 ## CLI Mini Tutorial
 

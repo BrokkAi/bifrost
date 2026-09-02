@@ -4,29 +4,35 @@
   :name "Network request inside a loop"
   :message "Review whether this lexically nested network request repeats per iteration"
   :severity note
-  :description "A network call lexically nested under a loop may amplify latency and remote load. This structural prompt also includes deferred nested bodies; verify execution before batching or adding bounded concurrency."
+  :description "A network call lexically nested under a loop may amplify latency and remote load. This structural prompt also includes deferred nested bodies; verify execution before batching or adding bounded concurrency. A for-each loop whose iterated expression provably resolves to a collection literal with at most eight elements is excluded; the proof covers declarator-established bindings (JS/TS const/let/var, Rust let, Java locals), so field-, assignment-, or call-produced iterables still report."
   :help-uri "https://bifrost.brokk.ai/static-analysis-policies/#built-in-code-smell-pack"
   :tags ["performance" "network" "loop" "code-smell"]
   :analysis
     (analysis
-      :type match
-      :selector
+      :type assertion
+      :subject
         (rql
           :schema-version 1
           (union
             (language python
-              (inside-decl (loop) (call :receiver (name "requests") :callee (name "get"))))
+              (inside-decl (loop :capture "region") (call :receiver (name "requests") :callee (name "get") :capture "smell")))
             (language python
-              (inside-decl (loop) (call :receiver (name "requests") :callee (name "post"))))
+              (inside-decl (loop :capture "region") (call :receiver (name "requests") :callee (name "post") :capture "smell")))
             (language java
-              (inside-decl (loop) (call :receiver (name "client") :callee (name "send"))))
-            (language javascript (inside-decl (loop) (call :callee (name "fetch"))))
-            (language typescript (inside-decl (loop) (call :callee (name "fetch"))))
+              (inside-decl (loop :capture "region") (call :receiver (name "client") :callee (name "send") :capture "smell")))
+            (language javascript
+              (inside-decl (loop :capture "region") (call :callee (name "fetch") :capture "smell")))
+            (language typescript
+              (inside-decl (loop :capture "region") (call :callee (name "fetch") :capture "smell")))
             (language rust
-              (inside-decl (loop) (call :receiver (name "reqwest") :callee (name "get"))))
+              (inside-decl (loop :capture "region") (call :receiver (name "reqwest") :callee (name "get") :capture "smell")))
             (language rust
               (inside-decl
-                (loop)
+                (loop :capture "region")
                 (call
                   :receiver (name "ureq")
-                  :callee (name/regex "^(get|post)$"))))))))
+                  :callee (name/regex "^(get|post)$") :capture "smell")))))
+      :asserts [
+        (assert-origin-shape :id small-literal-iterable :at "region" :anchor "smell"
+                             :role value_reference :shape collection-literal :max-elements 8)
+      ]))

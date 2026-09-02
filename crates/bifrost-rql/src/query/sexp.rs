@@ -805,6 +805,10 @@ fn wrapper_query_to_json(expr: &Expr) -> LowerResult<Option<Value>> {
         | RqlForm::CallResultContracts
         | RqlForm::ResultContractUses
         | RqlForm::ResultContractOperationUses
+        | RqlForm::NilnessOperations
+        | RqlForm::SwitchCoverage
+        | RqlForm::ConcurrentAccessConflicts
+        | RqlForm::DetachedTaskTransfers
         | RqlForm::ProcedureEffects
         | RqlForm::CallableSignature
         | RqlForm::SignatureParameters
@@ -825,6 +829,10 @@ fn wrapper_query_to_json(expr: &Expr) -> LowerResult<Option<Value>> {
                 RqlForm::CallResultContracts => "call_result_contracts",
                 RqlForm::ResultContractUses => "result_contract_uses",
                 RqlForm::ResultContractOperationUses => "result_contract_operation_uses",
+                RqlForm::NilnessOperations => "nilness_operations",
+                RqlForm::SwitchCoverage => "switch_coverage",
+                RqlForm::ConcurrentAccessConflicts => "concurrent_access_conflicts",
+                RqlForm::DetachedTaskTransfers => "detached_task_transfers",
                 RqlForm::ProcedureEffects => "procedure_effects",
                 RqlForm::CallableSignature => "callable_signature",
                 RqlForm::SignatureParameters => "signature_parameters",
@@ -845,6 +853,43 @@ fn wrapper_query_to_json(expr: &Expr) -> LowerResult<Option<Value>> {
                 .ok_or_else(|| lower_error(expr, "internal error: steps must be an array"))?
                 .push(json!({ "op": op }));
             Ok(Some(Value::Object(query)))
+        }
+        RqlForm::FieldWriteValue => {
+            if items.len() < 2 || !(items.len() - 2).is_multiple_of(2) {
+                return Err(lower_error(
+                    expr,
+                    format!("({head} ...) expects option/value pairs followed by a query"),
+                ));
+            }
+            let mut step = Map::new();
+            step.insert(
+                "op".to_string(),
+                Value::String(QueryStepOp::FieldWriteValue.label().to_string()),
+            );
+            for pair in items[1..items.len() - 1].chunks_exact(2) {
+                let key = pair[0]
+                    .as_symbol()
+                    .ok_or_else(|| lower_error(&pair[0], "expected an option name"))?;
+                let field = QueryStepOp::FieldWriteValue
+                    .option_for_rql_label(key)
+                    .ok_or_else(|| lower_error(&pair[0], format!("unknown {head} option {key}")))?
+                    .field()
+                    .label();
+                let value = symbol_or_string(&pair[1])?;
+                if value.is_empty() {
+                    return Err(lower_error(&pair[1], "identity must not be empty"));
+                }
+                if step
+                    .insert(field.to_string(), Value::String(value))
+                    .is_some()
+                {
+                    return Err(lower_error(
+                        &pair[0],
+                        format!("({head} ...) repeats option {key}"),
+                    ));
+                }
+            }
+            append_step(expr, &items[items.len() - 1], step)
         }
         RqlForm::DecoratorBindings => {
             if items.len() < 2 || !(items.len() - 2).is_multiple_of(2) {
@@ -1744,6 +1789,7 @@ fn pattern_to_json(expr: &Expr) -> LowerResult<Value> {
         | RqlForm::ReceiverTargets
         | RqlForm::PointsTo
         | RqlForm::MemberTargets
+        | RqlForm::FieldWriteValue
         | RqlForm::ReceiverOutcome
         | RqlForm::ReceiverEvidence
         | RqlForm::CallShape
@@ -1757,6 +1803,9 @@ fn pattern_to_json(expr: &Expr) -> LowerResult<Value> {
         | RqlForm::ResultContractUses
         | RqlForm::ResultContractOperationUses
         | RqlForm::ResultContractFailureUses
+        | RqlForm::NilnessOperations
+        | RqlForm::SwitchCoverage
+        | RqlForm::DetachedTaskTransfers
         | RqlForm::ProcedureEffects
         | RqlForm::CallableSignature
         | RqlForm::SignatureParameters
@@ -1803,6 +1852,7 @@ fn pattern_to_json(expr: &Expr) -> LowerResult<Value> {
         | RqlForm::FlowTarget
         | RqlForm::ControlRelations
         | RqlForm::RewritePathsOf => unreachable!("wrapper filtered above"),
+        RqlForm::ConcurrentAccessConflicts => unreachable!("wrapper filtered above"),
         RqlForm::Paths | RqlForm::SegmentsOf | RqlForm::SegmentTarget => {
             unreachable!("wrapper filtered above")
         }

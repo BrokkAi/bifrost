@@ -1,0 +1,83 @@
+{
+  "schema_version": 2,
+  "pack_id": "bifrost.node-child-process-javascript-declarations",
+  "version": "0.2.0",
+  "producer": {
+    "name": "bifrost-reviewed-node-models",
+    "version": "0.1.0"
+  },
+  "language": "javascript",
+  "ecosystem": "npm",
+  "compatibility": {
+    "bifrost": ">=0.8.0, <1.0.0",
+    "toolchains": []
+  },
+  "provenance": {
+    "source": "Node.js child_process API",
+    "revision": "v26.8.1"
+  },
+  "license": "Apache-2.0",
+  "completeness": "partial",
+  "safety": {
+    "generated_code_only": false,
+    "review_required": true
+  },
+  "shards": [
+    {
+      "id": "declarations.child-process-exec-sync",
+      "activation": [
+        {
+          "targets": [],
+          "configurations": []
+        }
+      ],
+      "payload": {
+        "kind": "declaration_facts",
+        "types": [
+          {
+            "id": "type.node.child-process.javascript",
+            "name": "child_process",
+            "type_kind": "module",
+            "visibility": "public",
+            "locator": {
+              "kind": "artifact",
+              "path": "node/lib/child_process.js",
+              "symbol": "child_process"
+            }
+          }
+        ],
+        "members": [
+          {
+            "id": "member.node.child-process.javascript.exec-sync-1",
+            "owner": "type.node.child-process.javascript",
+            "name": "execSync",
+            "member_kind": "method",
+            "visibility": "public",
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [
+                {
+                  "name": "command",
+                  "type": {
+                    "kind": "named",
+                    "name": "string"
+                  }
+                }
+              ],
+              "returns": {
+                "kind": "named",
+                "name": "Buffer"
+              }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "node/lib/child_process.js",
+              "symbol": "child_process.execSync(command)"
+            }
+          }
+        ],
+        "relations": []
+      }
+    }
+  ]
+}

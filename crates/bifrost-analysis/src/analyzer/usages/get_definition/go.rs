@@ -5010,7 +5010,7 @@ mod bounded_tests {
         };
 
         let source = serde_json::to_vec(&serde_json::json!({
-            "schema_version": 1,
+            "schema_version": 2,
             "pack_id": "fixture.go.selector-navigation",
             "version": "1.0.0",
             "producer": { "name": "go-selector-fixture", "version": "1.0.0" },

@@ -15,8 +15,9 @@ use crate::analyzer::semantic_model::{
     ExactArtifact, ExternalArtifactKind, ExternalArtifactPackProducer, HierarchyFact,
     HierarchyKind, Locator, MemberFact, MemberIdentity, MemberKind, Parameter, Producer,
     ProducerDiagnostic, ProducerDiagnosticSeverity, RelationFact, RelationKind, Signature,
-    TypeFact, TypeIdentity, TypeKind, TypeRef, Visibility, WildcardVariance, member_declaration_id,
-    read_exact_artifact_while, type_declaration_id,
+    SuppressedDiagnostics, TypeFact, TypeIdentity, TypeKind, TypeRef, Visibility, WildcardVariance,
+    admit_into_full_diagnostics, member_declaration_id, read_exact_artifact_while,
+    type_declaration_id,
 };
 use crate::hash::{HashMap, HashSet};
 
@@ -339,15 +340,21 @@ fn limit_production_records(
     production.completeness = Completeness::Partial;
     let diagnostic = ProducerDiagnostic {
         severity: ProducerDiagnosticSeverity::Warning,
+        source_entry: None,
         code: "limit.records".to_owned(),
         location: None,
         declaration: None,
         message: format!("source set stopped after {max_records} aggregate records"),
     };
-    if production.diagnostics.len() < limits.max_diagnostics {
+    if production.diagnostics.len() < limits.max_diagnostics
+        || admit_into_full_diagnostics(
+            &mut production.diagnostics,
+            &mut production.suppressed_diagnostics,
+            diagnostic.severity == ProducerDiagnosticSeverity::Warning,
+            |retained| retained.severity == ProducerDiagnosticSeverity::Warning,
+        )
+    {
         production.diagnostics.push(diagnostic);
-    } else {
-        production.suppressed_diagnostics = production.suppressed_diagnostics.saturating_add(1);
     }
 }
 
@@ -374,7 +381,7 @@ fn merge_source_set_productions(
     productions: Vec<ArtifactProduction>,
 ) -> ArtifactProduction {
     let mut diagnostics = Vec::new();
-    let mut suppressed_diagnostics = 0_usize;
+    let mut suppressed_diagnostics = SuppressedDiagnostics::default();
     let mut types = Vec::new();
     let mut members = Vec::new();
     let mut relations = Vec::new();
@@ -386,14 +393,20 @@ fn merge_source_set_productions(
             Completeness::Partial
         };
         for diagnostic in production.diagnostics {
-            if diagnostics.len() < limits.max_diagnostics {
+            if diagnostics.len() < limits.max_diagnostics
+                || admit_into_full_diagnostics(
+                    &mut diagnostics,
+                    &mut suppressed_diagnostics,
+                    diagnostic.severity == ProducerDiagnosticSeverity::Warning,
+                    |retained: &ProducerDiagnostic| {
+                        retained.severity == ProducerDiagnosticSeverity::Warning
+                    },
+                )
+            {
                 diagnostics.push(diagnostic);
-            } else {
-                suppressed_diagnostics = suppressed_diagnostics.saturating_add(1);
             }
         }
-        suppressed_diagnostics =
-            suppressed_diagnostics.saturating_add(production.suppressed_diagnostics);
+        suppressed_diagnostics += production.suppressed_diagnostics;
         let Some(pack) = production.pack else {
             continue;
         };
@@ -415,17 +428,25 @@ fn merge_source_set_productions(
         relations.extend(shard_relations);
     }
     if types.is_empty() {
-        if diagnostics.len() < limits.max_diagnostics {
+        if diagnostics.len() < limits.max_diagnostics
+            || admit_into_full_diagnostics(
+                &mut diagnostics,
+                &mut suppressed_diagnostics,
+                false,
+                |retained: &ProducerDiagnostic| {
+                    retained.severity == ProducerDiagnosticSeverity::Warning
+                },
+            )
+        {
             diagnostics.push(ProducerDiagnostic {
                 severity: ProducerDiagnosticSeverity::Error,
+                source_entry: None,
                 code: "rust.rustdoc.no_external_declarations".to_owned(),
                 location: None,
                 declaration: None,
                 message: "rustdoc source set contains no externally visible Rust declarations"
                     .to_owned(),
             });
-        } else {
-            suppressed_diagnostics = suppressed_diagnostics.saturating_add(1);
         }
         completeness = Completeness::Partial;
     }
@@ -451,7 +472,7 @@ fn merge_source_set_productions(
         ))
     });
     if diagnostics.is_empty()
-        && suppressed_diagnostics == 0
+        && suppressed_diagnostics.total() == 0
         && completeness == Completeness::Complete
     {
         completeness = Completeness::Complete;
@@ -761,6 +782,7 @@ fn produce_document(
             type_parameters: generic_names(generics),
             type_parameter_constraints: Vec::new(),
             underlying_type: None,
+            value_semantics: None,
             embedded_types: Vec::new(),
             hierarchy,
             aliases: Vec::new(),
@@ -941,6 +963,7 @@ fn produce_document(
             is_static,
             is_abstract: matches!(&item.inner, ItemEnum::Function(function) if !function.has_body),
             is_virtual: false,
+            implicit_operation: None,
             callable_family_complete: false,
             signature,
             receiver: None,
@@ -1321,6 +1344,7 @@ fn member_signature(
                     r#type: rust_type_ref(ty, document, type_ids, limits, diagnostics, 0),
                     optional: false,
                     variadic: false,
+                    passing_mode: Default::default(),
                 })
                 .collect(),
             function
@@ -1372,6 +1396,7 @@ fn member_signature(
                         r#type: rust_type_ref(ty, document, type_ids, limits, diagnostics, 0),
                         optional: false,
                         variadic: false,
+                        passing_mode: Default::default(),
                     }),
                     _ => None,
                 })
@@ -1513,6 +1538,7 @@ fn rust_type_ref(
                     r#type: rust_type_ref(ty, document, type_ids, limits, diagnostics, next),
                     optional: false,
                     variadic: false,
+                    passing_mode: Default::default(),
                 })
                 .collect(),
             result: pointer.sig.output.as_ref().map(|ty| {
@@ -2083,7 +2109,7 @@ fn finish(
         selector.artifact_sha256 = Some(artifact_sha256.to_owned());
     }
     let (diagnostics, suppressed_diagnostics) = diagnostics.finish();
-    let completeness = if diagnostics.is_empty() && suppressed_diagnostics == 0 {
+    let completeness = if diagnostics.is_empty() && suppressed_diagnostics.total() == 0 {
         Completeness::Complete
     } else {
         Completeness::Partial
@@ -2130,6 +2156,7 @@ fn failed(
     ArtifactProduction::failed(
         ProducerDiagnostic {
             severity: ProducerDiagnosticSeverity::Error,
+            source_entry: None,
             code: code.to_owned(),
             location: None,
             declaration: None,

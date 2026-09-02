@@ -31,15 +31,16 @@ use crate::analyzer::semantic::cfg_algorithms::{
     Dominators, GenKillFacts, ReachingSets, dominators, forward_reachability, reaching_definitions,
 };
 use crate::analyzer::semantic::{
-    CallSiteHandle, CallSiteId, CallToReturnModel, CallTransferSet, CandidateCoverage,
-    CapabilitySupport, ContentIdentity, ControlContinuation, ControlEdgeHandle, ControlEdgeId,
-    ControlEdgeKind, IcfgProvider, LengthDelimitedDigest, MemoryAccessKind, MemoryLocationId,
-    MemoryLocationKind, ProcedureHandle, ProcedureId, ProcedureSemantics, ProgramPointHandle,
-    ProgramPointId, ProofStatus, SemanticArtifact, SemanticArtifactKey, SemanticBudget,
-    SemanticCallSite, SemanticCapabilities, SemanticCapability, SemanticEffect, SemanticGap,
-    SemanticGapDischarge, SemanticGapId, SemanticGapImpact, SemanticGapKind, SemanticGapSubject,
-    SemanticLocator, SemanticOutcome, SemanticRequest, SemanticValueKind, SemanticWork,
-    SourceMappingId, SourceMappingKind, SourceSpan, ValueFlowKind, ValueId, WorkspaceIcfgProvider,
+    CallContinuationKind, CallInvocationMode, CallSiteHandle, CallSiteId, CallToReturnModel,
+    CallTransferSet, CandidateCoverage, CapabilitySupport, ContentIdentity, ControlContinuation,
+    ControlEdgeHandle, ControlEdgeId, ControlEdgeKind, IcfgProvider, LengthDelimitedDigest,
+    MemoryAccessKind, MemoryLocationId, MemoryLocationKind, ProcedureHandle, ProcedureId,
+    ProcedureSemantics, ProgramPointHandle, ProgramPointId, ProofStatus, SemanticArtifact,
+    SemanticArtifactKey, SemanticBudget, SemanticCallSite, SemanticCapabilities,
+    SemanticCapability, SemanticEffect, SemanticGap, SemanticGapDischarge, SemanticGapId,
+    SemanticGapImpact, SemanticGapKind, SemanticGapSubject, SemanticLocator, SemanticOutcome,
+    SemanticRequest, SemanticValueKind, SemanticWork, SourceMappingId, SourceMappingKind,
+    SourceSpan, ValueFlowKind, ValueId, WorkspaceIcfgProvider,
 };
 use crate::analyzer::semantic_model::{
     ActiveSemanticModelSnapshot, ProcedureSummaryMemberKey, ResolvedActiveSemanticModels,
@@ -347,6 +348,7 @@ fn axes_blocked_by(capability: SemanticCapability) -> &'static [FlowStateAxis] {
     // control-flow capabilities do.
     match capability {
         GuardFacts
+        | SwitchFacts
         | Procedures
         | BasicBlocks
         | ProgramPoints
@@ -367,7 +369,7 @@ fn axes_blocked_by(capability: SemanticCapability) -> &'static [FlowStateAxis] {
         Assignments | Values | LocalFlow | ParameterFlow | ReceiverFlow | ReturnFlow
         | Allocations => BINDINGS,
         FieldMemory | StaticMemory | IndexMemory => PROPERTIES,
-        Calls | DynamicDispatch | CallableReferences | Captures => EVALUATION,
+        Calls | DynamicDispatch | CallableReferences | Captures | Synchronization => EVALUATION,
     }
 }
 
@@ -491,7 +493,9 @@ impl FlowStateDerivation {
     /// The returned closure is bounded by this derivation's event count and
     /// the procedure's value count. A `May` reaching row or a direct copy into
     /// a parameter, receiver, or property is recorded explicitly instead of
-    /// being promoted to an alias.
+    /// being promoted to an alias. An `AggregateCopy` likewise remains visible
+    /// as ordinary data dependence, but its independent aggregate storage is
+    /// retained as an unclosed identity transfer rather than an exact alias.
     pub fn exact_local_value_alias_closure(
         &self,
         procedure: &ProcedureHandle,
@@ -637,6 +641,13 @@ impl FlowStateDerivation {
         // two reads of one binding have distinct ValueIds and only the read
         // occurrence that actually feeds this conversion enters the set.
         let mut assignment_conversion_sources = HashSet::<ValueId>::default();
+        // An identity-separating transfer remains ordinary data dependence,
+        // but its validated adjacent Assignment does not preserve aggregate
+        // storage identity. Retain the exact source read as an open transfer
+        // rather than promoting the copied local into this resource-identity
+        // closure.
+        let mut identity_separating_assignments =
+            HashSet::<(ProgramPointId, ValueId, ValueId)>::default();
         for point in semantics.points() {
             for event in &point.events {
                 match event.effect {
@@ -663,6 +674,13 @@ impl FlowStateDerivation {
                     }) =>
                     {
                         assignment_conversion_sources.insert(source);
+                    }
+                    SemanticEffect::ValueFlow {
+                        kind: ValueFlowKind::Transfer(_),
+                        source,
+                        target,
+                    } => {
+                        identity_separating_assignments.insert((point.id, target, source));
                     }
                     _ => {}
                 }
@@ -730,6 +748,14 @@ impl FlowStateDerivation {
                                         value.kind == SemanticValueKind::Local
                                     }) =>
                                 {
+                                    if identity_separating_assignments.contains(&(
+                                        alias.point,
+                                        value,
+                                        alias.value,
+                                    )) {
+                                        closure.unclosed_transfers.insert(read.event);
+                                        continue;
+                                    }
                                     debug_assert!(
                                         semantics.point(alias.point).is_some_and(|point| {
                                             point.events.iter().any(|event| {
@@ -1517,6 +1543,139 @@ impl FlowStateDerivation {
                     .collect::<Vec<_>>()
                     .into_boxed_slice(),
             )
+        })
+    }
+
+    /// Whether every detached result consumer is unable to gate each use.
+    ///
+    /// This is deliberately narrower than postdominance. A detached callee's
+    /// return cannot gate its caller, but the child can still communicate back
+    /// through shared state or a channel. A target is therefore closed only
+    /// when that exact consumer is unavoidable for the result use and the
+    /// parent reaches the use through a unique normal continuation before any
+    /// represented control, invocation, suspension, or undisclosed boundary.
+    /// Branches, loops, calls, and gaps keep the target open. In particular,
+    /// retained evaluation order may move a later synchronizing sibling before
+    /// the target even when the retained CFG happens to visit the target first.
+    /// The walk starts after registration, so the spawn's own retained-
+    /// topology marker is not part of the traversed parent continuation.
+    pub fn detached_consumers_cannot_gate_result_uses(
+        &self,
+        procedure: &ProcedureHandle,
+        result_establishments: &[ProgramPointId],
+        candidates: &[CallSiteHandle],
+        targets: &[ProgramPointId],
+    ) -> Option<Box<[bool]>> {
+        let procedure_artifact = Arc::downgrade(procedure.artifact());
+        if self.procedure != procedure.id()
+            || !Weak::ptr_eq(&self.procedure_artifact, &procedure_artifact)
+            || candidates.is_empty()
+            || targets
+                .iter()
+                .any(|target| procedure.semantics().point(*target).is_none())
+            || self.completeness.reasons().iter().any(|reason| {
+                reason.blocks(FlowStateAxis::DominanceRelation)
+                    && !matches!(reason, FlowStateIncompleteReason::LoweringGap { .. })
+            })
+        {
+            return None;
+        }
+
+        let semantics = procedure.semantics();
+        if semantics
+            .gaps()
+            .iter()
+            .any(|gap| gap.subject == SemanticGapSubject::Procedure)
+        {
+            return None;
+        }
+        let barrier_gap_points = semantics
+            .gaps()
+            .iter()
+            .map(|gap| gap.point)
+            .collect::<HashSet<_>>();
+        let mut starts = Vec::with_capacity(candidates.len());
+        for candidate in candidates {
+            if candidate.procedure() != procedure {
+                return None;
+            }
+            let call = semantics.call_site(candidate.id())?;
+            if call.invocation_mode != CallInvocationMode::Detached {
+                return None;
+            }
+            let unavoidable = self.any_candidate_dominates_result_uses(
+                procedure,
+                result_establishments,
+                std::slice::from_ref(&call.point),
+                targets,
+            )?;
+            starts.push((call.id, call.normal_continuation.target()?, unavoidable));
+        }
+
+        with_control_graph!(semantics, &self.control_edge_mask, |graph| {
+            let mut answers = vec![true; targets.len()];
+            for (candidate, start, unavoidable) in starts {
+                let mut reached = vec![false; targets.len()];
+                let mut visited = HashSet::default();
+                let mut current = start;
+                loop {
+                    if !visited.insert(current) {
+                        break;
+                    }
+                    for (index, target) in targets.iter().enumerate() {
+                        reached[index] |= current == *target;
+                    }
+                    if reached.iter().all(|answer| *answer) {
+                        break;
+                    }
+                    let point = semantics.point(current)?;
+                    let event_is_barrier = point.events.iter().any(|event| match event.effect {
+                        SemanticEffect::Invoke { .. }
+                        | SemanticEffect::AsyncSuspend { .. }
+                        | SemanticEffect::AsyncResume { .. } => true,
+                        SemanticEffect::CallContinuation { call_site, kind } => {
+                            current != start
+                                || call_site != candidate
+                                || kind != CallContinuationKind::Normal
+                        }
+                        SemanticEffect::Entry
+                        | SemanticEffect::NormalExit
+                        | SemanticEffect::ExceptionalExit
+                        | SemanticEffect::Assignment { .. }
+                        | SemanticEffect::ValueFlow { .. }
+                        | SemanticEffect::ValueUse { .. }
+                        | SemanticEffect::Allocation { .. }
+                        | SemanticEffect::MemoryLoad { .. }
+                        | SemanticEffect::MemoryStore { .. }
+                        | SemanticEffect::CallableCreation { .. }
+                        | SemanticEffect::CallableReference { .. }
+                        | SemanticEffect::CaptureBind { .. }
+                        | SemanticEffect::Synchronization { .. }
+                        | SemanticEffect::ProcedureReturn { .. }
+                        | SemanticEffect::Throw { .. }
+                        | SemanticEffect::Gap { .. } => false,
+                    });
+                    if event_is_barrier || barrier_gap_points.contains(&current) {
+                        break;
+                    }
+                    let mut successors = graph.successors(current);
+                    let Some((edge, successor)) = successors.next() else {
+                        break;
+                    };
+                    if successors.next().is_some()
+                        || semantics.control_edge(edge)?.kind != ControlEdgeKind::Normal
+                    {
+                        break;
+                    }
+                    current = successor;
+                }
+                for ((answer, reached), unavoidable) in
+                    answers.iter_mut().zip(reached).zip(unavoidable.iter())
+                {
+                    *answer &= reached && *unavoidable;
+                }
+            }
+            Some(answers.into_boxed_slice())
         })
     }
 
@@ -3344,7 +3503,11 @@ impl SemanticCallSpanIndex {
         for procedure in artifact.procedures().iter().filter(|procedure| {
             requested_procedure.is_none_or(|requested| procedure.id() == requested)
         }) {
-            for call in procedure.call_sites() {
+            for call in procedure
+                .call_sites()
+                .iter()
+                .filter(|call| call.invocation_mode == CallInvocationMode::Ordinary)
+            {
                 let Some(mapping) = procedure.source_mapping(call.source) else {
                     continue;
                 };
@@ -3426,6 +3589,9 @@ fn modeled_normal_control_edge(
     let call = procedure
         .call_site(call_id)
         .expect("the exact call-span index names a procedure call");
+    if call.invocation_mode != CallInvocationMode::Ordinary {
+        return Ok(None);
+    }
     let target = match call.normal_continuation {
         ControlContinuation::Absent => return Ok(None),
         ControlContinuation::Target(target) => target,
@@ -3480,10 +3646,11 @@ fn derive_modeled_control_projection(
     let candidate_shapes = shapes
         .iter()
         .filter(|shape| normal_continuation_absence_may_name(models, shape))
-        // `go` and unsupported `defer` intentionally retain their outer
-        // structural call shape but emit no synchronous semantic call site.
-        // There is no caller edge to project, so they are an inapplicable
-        // shape rather than file-wide modeled-control incompleteness.
+        // Unsupported `defer` retains its outer structural call shape but
+        // emits no semantic call site. Detached calls are excluded from the
+        // span index above. Neither has a synchronous caller edge that a
+        // non-return model may remove, so both are inapplicable rather than
+        // file-wide modeled-control incompleteness.
         .filter(|shape| !call_spans.matches(shape).is_empty())
         .collect::<Vec<_>>();
     if candidate_shapes.is_empty() {
@@ -3659,7 +3826,10 @@ fn discover_workspace_nonreturn_procedure(
     let reachable_calls = semantics
         .call_sites()
         .iter()
-        .filter(|call| reachable.contains(semantics, call.point))
+        .filter(|call| {
+            call.invocation_mode == CallInvocationMode::Ordinary
+                && reachable.contains(semantics, call.point)
+        })
         .map(|call| call.id)
         .collect::<Vec<_>>();
 
@@ -4776,6 +4946,63 @@ impl EventBuilder<'_> {
                         };
                         (StateEventClass::Read, subject, *result)
                     }
+                    SemanticEffect::MemoryStore {
+                        kind: MemoryAccessKind::LexicalCell | MemoryAccessKind::Capture,
+                        location,
+                        value,
+                    } => {
+                        let Some(binding) = procedure.memory_location(*location).and_then(
+                            |location| match location.kind {
+                                MemoryLocationKind::LexicalCell { binding } => Some(binding),
+                                MemoryLocationKind::Capture {
+                                    binding: Some(binding),
+                                    ..
+                                } => Some(binding),
+                                _ => None,
+                            },
+                        ) else {
+                            continue;
+                        };
+                        if point.events.iter().any(|event| {
+                            matches!(
+                                event.effect,
+                                SemanticEffect::Assignment {
+                                    target,
+                                    value: assigned,
+                                } if target == binding && assigned == *value
+                            )
+                        }) {
+                            continue;
+                        }
+                        (
+                            StateEventClass::Establish,
+                            FlowSubject::Binding { value: binding },
+                            *value,
+                        )
+                    }
+                    SemanticEffect::MemoryLoad {
+                        kind: MemoryAccessKind::LexicalCell | MemoryAccessKind::Capture,
+                        location,
+                        result,
+                    } => {
+                        let Some(binding) = procedure.memory_location(*location).and_then(
+                            |location| match location.kind {
+                                MemoryLocationKind::LexicalCell { binding } => Some(binding),
+                                MemoryLocationKind::Capture {
+                                    binding: Some(binding),
+                                    ..
+                                } => Some(binding),
+                                _ => None,
+                            },
+                        ) else {
+                            continue;
+                        };
+                        (
+                            StateEventClass::Read,
+                            FlowSubject::Binding { value: binding },
+                            *result,
+                        )
+                    }
                     _ => continue,
                 };
                 let Some(site) = self.site(procedure, event.source) else {
@@ -5427,7 +5654,7 @@ impl EvaluationDependence {
                         if let Some(location) = procedure.memory_location(*location) {
                             match &location.kind {
                                 MemoryLocationKind::Field { base, .. } => record(*result, *base),
-                                MemoryLocationKind::Index { base, index } => {
+                                MemoryLocationKind::Index { base, index, .. } => {
                                     record(*result, *base);
                                     if let Some(index) = index {
                                         record(*result, *index);
@@ -5483,12 +5710,9 @@ impl EvaluationDependence {
 }
 
 #[cfg(test)]
-#[path = "../../../test-support/inline_project.rs"]
-mod inline_project;
-
-#[cfg(test)]
 mod tests {
     use super::*;
+    use crate::analyzer::semantic::ExecutionTiming;
     use crate::analyzer::semantic::cfg_algorithms::CfgAlgorithmBudget;
     use crate::analyzer::semantic_model::{
         CatalogOptions, CompilerOptions, SemanticModelActivationEvidence,
@@ -5498,7 +5722,7 @@ mod tests {
     };
     use crate::analyzer::{AnalyzerConfig, Language};
 
-    use super::inline_project::{BuiltInlineTestProject, InlineTestProject};
+    use crate::inline_project::{BuiltInlineTestProject, InlineTestProject};
 
     struct Fixture {
         _project: BuiltInlineTestProject,
@@ -5940,6 +6164,203 @@ func choose(flag bool) int {
             "a normal call continuation has one exact source edge: {edges:?}"
         );
         edges[0]
+    }
+
+    const GO_DETACHED_CONSUMER_PARENT_CONTINUATIONS: &str = r#"
+package sample
+
+type item struct { value int }
+
+func observe(bool) {}
+func pause() {}
+
+func linear(result *item, condition bool) int {
+    linearResult := result
+    go observe(condition)
+    return linearResult.value
+}
+
+func interposedCall(result *item, condition bool) int {
+    callResult := result
+    go observe(condition)
+    pause()
+    return callResult.value
+}
+
+func branched(result *item, condition bool, branch bool) int {
+    branchResult := result
+    go observe(condition)
+    if branch {
+        branch = false
+    }
+    return branchResult.value
+}
+
+func looped(result *item, condition bool, count int) int {
+    loopResult := result
+    go observe(condition)
+    for index := 0; index < count; index++ {}
+    return loopResult.value
+}
+
+func received(result *item, condition bool, ready chan bool) int {
+    gapResult := result
+    go observe(condition)
+    <-ready
+    return gapResult.value
+}
+
+func optional(result *item, condition bool, spawn bool) int {
+    optionalResult := result
+    if spawn {
+        go observe(condition)
+    }
+    return optionalResult.value
+}
+
+func captured(result *item, condition bool) int {
+    return func() int {
+        capturedResult := result
+        go observe(condition)
+        return capturedResult.value
+    }()
+}
+"#;
+
+    #[test]
+    fn detached_consumer_irrelevance_requires_an_uninterrupted_parent_continuation() {
+        let fixture = Fixture::new(
+            Language::Go,
+            &[("main.go", GO_DETACHED_CONSUMER_PARENT_CONTINUATIONS)],
+        );
+        let state = fixture.state(0);
+
+        for (binding, expected) in [
+            ("linearResult", true),
+            ("callResult", false),
+            ("branchResult", false),
+            ("loopResult", false),
+            ("gapResult", false),
+            ("optionalResult", false),
+        ] {
+            let assignment = format!("{binding} := result");
+            let read = format!("{binding}.value");
+            let derivation = procedure_containing(&state, |event| {
+                event.event_class == StateEventClass::Read
+                    && spelling(GO_DETACHED_CONSUMER_PARENT_CONTINUATIONS, event) == read
+            });
+            let procedure = fixture.procedure(0, derivation.procedure);
+            let establishment = derivation
+                .events
+                .iter()
+                .find(|event| {
+                    event.event_class == StateEventClass::Establish
+                        && spelling(GO_DETACHED_CONSUMER_PARENT_CONTINUATIONS, event) == assignment
+                })
+                .expect("the copied result has one exact establishment");
+            let target = derivation
+                .events
+                .iter()
+                .find(|event| {
+                    event.event_class == StateEventClass::Read
+                        && spelling(GO_DETACHED_CONSUMER_PARENT_CONTINUATIONS, event) == read
+                })
+                .expect("the copied result has one exact property read");
+            let candidate = call_handle_spelled(
+                &procedure,
+                GO_DETACHED_CONSUMER_PARENT_CONTINUATIONS,
+                "observe(condition)",
+            );
+
+            assert_eq!(
+                derivation
+                    .detached_consumers_cannot_gate_result_uses(
+                        &procedure,
+                        &[establishment.point],
+                        std::slice::from_ref(&candidate),
+                        &[target.point],
+                    )
+                    .as_deref(),
+                Some([expected].as_slice()),
+                "{binding} has the expected parent-continuation proof"
+            );
+
+            if expected {
+                let call = procedure
+                    .semantics()
+                    .call_site(candidate.id())
+                    .expect("the procedure owns the detached call");
+                let start = call
+                    .normal_continuation
+                    .target()
+                    .expect("the detached registration continues normally");
+                let [event] = procedure
+                    .semantics()
+                    .point(start)
+                    .expect("the continuation point exists")
+                    .events
+                    .as_ref()
+                else {
+                    panic!("the straight-line start has one event");
+                };
+                assert!(matches!(
+                    event.effect,
+                    SemanticEffect::CallContinuation {
+                        call_site,
+                        kind: CallContinuationKind::Normal,
+                    } if call_site == candidate.id()
+                ));
+            }
+        }
+
+        let derivation = procedure_containing(&state, |event| {
+            event.event_class == StateEventClass::Read
+                && spelling(GO_DETACHED_CONSUMER_PARENT_CONTINUATIONS, event)
+                    == "capturedResult.value"
+        });
+        let procedure = fixture.procedure(0, derivation.procedure);
+        assert!(
+            procedure.semantics().gaps().iter().all(|gap| {
+                gap.subject != SemanticGapSubject::Procedure
+                    || gap.capability != SemanticCapability::Captures
+            }),
+            "the exact captured child has no procedure-scoped capture uncertainty"
+        );
+        let establishment = derivation
+            .events
+            .iter()
+            .find(|event| {
+                event.event_class == StateEventClass::Establish
+                    && spelling(GO_DETACHED_CONSUMER_PARENT_CONTINUATIONS, event)
+                        == "capturedResult := result"
+            })
+            .expect("the captured result has one exact establishment");
+        let target = derivation
+            .events
+            .iter()
+            .find(|event| {
+                event.event_class == StateEventClass::Read
+                    && spelling(GO_DETACHED_CONSUMER_PARENT_CONTINUATIONS, event)
+                        == "capturedResult.value"
+            })
+            .expect("the captured result has one exact property read");
+        let candidate = call_handle_spelled(
+            &procedure,
+            GO_DETACHED_CONSUMER_PARENT_CONTINUATIONS,
+            "observe(condition)",
+        );
+        assert_eq!(
+            derivation
+                .detached_consumers_cannot_gate_result_uses(
+                    &procedure,
+                    &[establishment.point],
+                    &[candidate],
+                    &[target.point],
+                )
+                .as_deref(),
+            Some([true].as_slice()),
+            "an exact capture preserves the uninterrupted child-local continuation"
+        );
     }
 
     const GO_CHILD_LOCAL_RESULT_WITH_CAPTURE_GAP: &str = r#"
@@ -6417,7 +6838,7 @@ func first() int {
             .expect("the gap names a retained memory location")
             .kind
         {
-            MemoryLocationKind::Index { base, index } => {
+            MemoryLocationKind::Index { base, index, .. } => {
                 assert!(
                     index.is_some(),
                     "a literal index keeps exact IR identity while flow-state projection remains open"
@@ -6488,7 +6909,7 @@ func first() int {
     }
 
     #[test]
-    fn procedure_capture_gap_does_not_hide_child_local_result_observations() {
+    fn exact_procedure_capture_preserves_child_local_result_observations() {
         let fixture = Fixture::new(
             Language::Go,
             &[("main.go", GO_CHILD_LOCAL_RESULT_WITH_CAPTURE_GAP)],
@@ -6500,20 +6921,13 @@ func first() int {
         });
         let procedure = fixture.procedure(0, derivation.procedure);
         let semantics = procedure.semantics();
-        let capture_gap = semantics
-            .gaps()
-            .iter()
-            .find(|gap| {
-                gap.subject == SemanticGapSubject::Procedure
-                    && gap.capability == SemanticCapability::Captures
-            })
-            .expect("the omitted outer parameter publishes a child procedure capture gap");
-        assert_eq!(capture_gap.point, semantics.entry_point());
         assert!(
-            !derivation.completeness.is_complete(),
-            "generic flow completeness must retain the capture gap"
+            semantics.gaps().iter().all(|gap| {
+                !(gap.subject == SemanticGapSubject::Procedure
+                    && gap.capability == SemanticCapability::Captures)
+            }),
+            "the resolved outer parameter must not publish a capture gap"
         );
-
         let establishment = derivation
             .events
             .iter()
@@ -6545,12 +6959,12 @@ func first() int {
             "an outer capture cannot hide a static observation of a result established inside the child"
         );
         assert!(
-            !derivation.result_observation_enumeration_is_complete(
+            derivation.result_observation_enumeration_is_complete(
                 &procedure,
                 &[semantics.entry_point()],
                 &relevant_values,
             ),
-            "an entry-origin result may itself cross the unsupported capture boundary"
+            "an entry-origin result can cross the exact capture boundary"
         );
     }
 
@@ -7211,14 +7625,14 @@ func cleanupOnly(preInput *item, postInput *item, value *item, err error) int {
     return 0
 }
 
-func mixed(value *item, err error) int {
+func mixed(value *item, err error, ch chan int) int {
     defer cleanup()
     exactMixed := value
     if err != nil {
         reportMixed(err)
         return 1
     }
-    select {}
+    ch <- 1
 }
 "#;
 
@@ -7373,7 +7787,7 @@ func mixed(value *item, err error) int {
                 let span = mapping.locator.anchor().span();
                 &GO_ACTIVE_CLEANUP_COMPLETION_RELATIVE_TO_TARGET
                     [span.start_byte() as usize..span.end_byte() as usize]
-                    == "select {}"
+                    == "ch <- 1"
             })
             .collect::<Vec<_>>();
         let select_completion = select_gaps
@@ -7959,7 +8373,7 @@ func captured(value error) {
             ("invalidated", None),
             ("afterReceive", Some(true)),
             ("escaped", None),
-            ("captured", None),
+            ("captured", Some(true)),
         ] {
             let semantics = artifact
                 .procedures()
@@ -9488,7 +9902,7 @@ func inspect(result *item, err error) int {
 "#;
 
     const GO_NONRETURN_DECLARATIONS: &str = r#"{
-  "schema_version": 1,
+  "schema_version": 2,
   "pack_id": "test.flow.go-os-exit-declarations",
   "version": "1.0.0",
   "producer": { "name": "bifrost-flow-test", "version": "1.0.0" },
@@ -9560,7 +9974,7 @@ func inspect(result *item, err error) int {
 }"#;
 
     const GO_NONRETURN_MODEL: &str = r#"{
-  "schema_version": 1,
+  "schema_version": 2,
   "pack_id": "test.flow.go-nonreturn",
   "version": "1.0.0",
   "producer": { "name": "bifrost-flow-test", "version": "1.0.0" },
@@ -9758,21 +10172,45 @@ func multiCleanup(result *item) int {
                 && spelling(GO_AUTOMATIC_NONRETURN, event) == "spawnedResult.value"
         });
         let spawned_procedure = fixture.procedure(0, spawned.procedure);
-        assert!(
-            call_handles_spelled(&spawned_procedure, GO_AUTOMATIC_NONRETURN, "os.Exit(1)",)
-                .is_empty(),
-            "the spawned outer call must not lower as a synchronous semantic call"
+        let spawned_calls =
+            call_handles_spelled(&spawned_procedure, GO_AUTOMATIC_NONRETURN, "os.Exit(1)");
+        let [spawned_call] = spawned_calls.as_slice() else {
+            panic!("the spawned outer call must lower exactly once: {spawned_calls:#?}");
+        };
+        let semantic_call = spawned_procedure
+            .semantics()
+            .call_site(spawned_call.id())
+            .expect("the spawned procedure owns its call");
+        assert_eq!(semantic_call.invocation_mode, CallInvocationMode::Detached);
+        assert_eq!(
+            semantic_call.execution_timing,
+            ExecutionTiming::DifferentTask
         );
+        assert!(semantic_call.normal_results.is_empty());
+        assert!(semantic_call.result.is_none());
+        assert!(semantic_call.thrown.is_none());
+        assert!(semantic_call.normal_continuation.target().is_some());
+        assert_eq!(
+            semantic_call.exceptional_continuation,
+            ControlContinuation::Absent
+        );
+        let spawned_normal_edge = normal_edge_for_call(&spawned_procedure, spawned_call);
         assert!(
             spawned.control_edge_mask.is_empty(),
-            "a spawned target has no caller normal edge for the model to omit"
+            "a spawned target cannot make its parent's registration edge non-returning"
+        );
+        assert!(
+            !spawned
+                .control_edge_mask
+                .omitted
+                .contains(&spawned_normal_edge)
         );
         assert!(
             !spawned.completeness.reasons().iter().any(|reason| matches!(
                 reason,
                 FlowStateIncompleteReason::ModeledControlProjectionIncomplete { .. }
             )),
-            "a spawned outer call has no synchronous semantic edge and must not poison the file"
+            "a detached call is inapplicable to synchronous control projection and must not poison the file"
         );
     }
 
@@ -11435,6 +11873,78 @@ func nonLocal(target *os.File, value holder) {
         );
     }
 
+    const GO_AGGREGATE_COPY_VALUE_ALIAS: &str = r#"package app
+
+type resource struct{}
+
+func copyValue() {
+    original := [1]*resource{}
+    copied := original
+    _ = copied[0]
+}
+"#;
+
+    #[test]
+    fn exact_local_value_alias_closure_keeps_go_aggregate_copy_open() {
+        let fixture = Fixture::new(
+            Language::Go,
+            &[
+                ("go.mod", GO_MOD),
+                ("app.go", GO_AGGREGATE_COPY_VALUE_ALIAS),
+            ],
+        );
+        let state = fixture.state(1);
+        let derivation = procedure_containing(&state, |event| {
+            event.event_class == StateEventClass::Establish
+                && spelling(GO_AGGREGATE_COPY_VALUE_ALIAS, event) == "original := [1]*resource{}"
+        });
+        let procedure = fixture.procedure(1, derivation.procedure);
+        let root = derivation
+            .events
+            .iter()
+            .find(|event| {
+                event.event_class == StateEventClass::Establish
+                    && spelling(GO_AGGREGATE_COPY_VALUE_ALIAS, event)
+                        == "original := [1]*resource{}"
+            })
+            .expect("the fresh array value establishes original");
+        let copied = derivation
+            .events
+            .iter()
+            .find(|event| {
+                event.event_class == StateEventClass::Establish
+                    && spelling(GO_AGGREGATE_COPY_VALUE_ALIAS, event) == "copied := original"
+            })
+            .expect("the array copy establishes its independent local");
+        let source_read = derivation
+            .events
+            .iter()
+            .find(|event| {
+                event.event_class == StateEventClass::Read
+                    && spelling(GO_AGGREGATE_COPY_VALUE_ALIAS, event) == "original"
+            })
+            .expect("the aggregate copy retains its ordinary source read");
+
+        let closure = derivation
+            .exact_local_value_alias_closure(&procedure, std::slice::from_ref(&root.event));
+        assert!(
+            closure.reads.contains(&source_read.event),
+            "AggregateCopy remains ordinary exact data dependence"
+        );
+        assert!(
+            !closure.establishments.contains(&copied.event),
+            "independent array storage is not promoted as exact resource identity"
+        );
+        assert!(
+            closure.unclosed_transfers.contains(&source_read.event),
+            "the copied array remains a candidate-scoped identity frontier"
+        );
+        assert!(
+            !closure.proof_open,
+            "the structured closure itself remains available"
+        );
+    }
+
     const GO_ASSIGNMENT_CONVERSION_ALIAS: &str = r#"package app
 
 type resource struct{}
@@ -11877,12 +12387,10 @@ def local_binder(x)
 end
 "#;
 
-    /// A language whose adapter declares no field-memory capability reports
-    /// the property axis unsupported rather than silently empty. (Go carried
-    /// this pin until #2662 gave it field memory, Rust until #2667, and the
-    /// C family until #2666.)
+    /// Ruby's structured field-memory subset makes the property axis available
+    /// without pretending the language's remaining heap shapes are complete.
     #[test]
-    fn a_language_without_field_memory_reports_the_property_axis_unsupported() {
+    fn ruby_partial_field_memory_does_not_report_the_property_axis_unsupported() {
         let fixture = Fixture::new(Language::Ruby, &[("src/main.rb", RUBY_LOCAL_BINDER)]);
         let state = fixture.state(0);
         let derivation = procedure_containing(&state, |event| {
@@ -11894,18 +12402,18 @@ end
                 .artifact()
                 .capabilities()
                 .support(SemanticCapability::FieldMemory),
-            CapabilitySupport::Unsupported,
-            "the fixture language must substantiate the unsupported-axis contract"
+            CapabilitySupport::Partial,
+            "Ruby must advertise the structured field-memory subset"
         );
         assert!(
-            derivation.completeness.reasons().contains(
+            !derivation.completeness.reasons().contains(
                 &FlowStateIncompleteReason::AxisUnsupported(FlowStateAxis::PropertyEvents)
             ),
             "got {:?}",
             derivation.completeness
         );
         assert!(
-            !derivation
+            derivation
                 .completeness
                 .covers(FlowStateAxis::PropertyEvents)
         );

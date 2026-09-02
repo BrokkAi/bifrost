@@ -1,0 +1,265 @@
+{
+  "schema_version": 2,
+  "pack_id": "bifrost.go.concurrency",
+  "version": "1.0.0",
+  "producer": { "name": "bifrost", "version": "0.10.7" },
+  "language": "go",
+  "ecosystem": "go",
+  "compatibility": { "bifrost": ">=0.10.7, <1.0.0", "toolchains": [] },
+  "provenance": {
+    "source": "https://go.dev/src/context/, https://go.dev/src/sync/, and https://pkg.go.dev/golang.org/x/sync/errgroup",
+    "revision": "go1.26.0;x-sync-v0.15.0"
+  },
+  "license": "BSD-3-Clause",
+  "completeness": "complete",
+  "safety": { "generated_code_only": false, "review_required": false },
+  "shards": [
+    {
+      "id": "go.concurrency.sync",
+      "activation": [{}],
+      "payload": {
+        "kind": "procedure_summaries",
+        "summaries": [
+          {
+            "id": "context.context.done",
+            "target": { "path": "src/context/context.go", "symbol": "context.Context.Done()", "has_receiver": true, "parameter_count": 0 },
+            "completeness": "complete",
+            "normal_result_count": 1,
+            "transfers": [{ "input": { "kind": "receiver" }, "exit_kind": "normal", "output": { "kind": "normal_return" } }]
+          },
+          {
+            "id": "sync.mutex.lock",
+            "target": { "path": "src/sync/mutex.go", "symbol": "sync.Mutex.Lock()", "has_receiver": true, "parameter_count": 0 },
+            "completeness": "complete",
+            "transfers": [],
+            "concurrency_effects": [{ "kind": "lock_acquire", "lock": { "kind": "receiver" }, "mode": "exclusive" }]
+          },
+          {
+            "id": "sync.mutex.unlock",
+            "target": { "path": "src/sync/mutex.go", "symbol": "sync.Mutex.Unlock()", "has_receiver": true, "parameter_count": 0 },
+            "completeness": "complete",
+            "transfers": [],
+            "concurrency_effects": [{ "kind": "lock_release", "lock": { "kind": "receiver" }, "mode": "exclusive" }]
+          },
+          {
+            "id": "sync.rwmutex.lock",
+            "target": { "path": "src/sync/rwmutex.go", "symbol": "sync.RWMutex.Lock()", "has_receiver": true, "parameter_count": 0 },
+            "completeness": "complete",
+            "transfers": [],
+            "concurrency_effects": [{ "kind": "lock_acquire", "lock": { "kind": "receiver" }, "mode": "exclusive" }]
+          },
+          {
+            "id": "sync.rwmutex.unlock",
+            "target": { "path": "src/sync/rwmutex.go", "symbol": "sync.RWMutex.Unlock()", "has_receiver": true, "parameter_count": 0 },
+            "completeness": "complete",
+            "transfers": [],
+            "concurrency_effects": [{ "kind": "lock_release", "lock": { "kind": "receiver" }, "mode": "exclusive" }]
+          },
+          {
+            "id": "sync.rwmutex.rlock",
+            "target": { "path": "src/sync/rwmutex.go", "symbol": "sync.RWMutex.RLock()", "has_receiver": true, "parameter_count": 0 },
+            "completeness": "complete",
+            "transfers": [],
+            "concurrency_effects": [{ "kind": "lock_acquire", "lock": { "kind": "receiver" }, "mode": "shared" }]
+          },
+          {
+            "id": "sync.rwmutex.runlock",
+            "target": { "path": "src/sync/rwmutex.go", "symbol": "sync.RWMutex.RUnlock()", "has_receiver": true, "parameter_count": 0 },
+            "completeness": "complete",
+            "transfers": [],
+            "concurrency_effects": [{ "kind": "lock_release", "lock": { "kind": "receiver" }, "mode": "shared" }]
+          },
+          {
+            "id": "sync.mutex.try-lock",
+            "target": { "path": "src/sync/mutex.go", "symbol": "sync.Mutex.TryLock()", "has_receiver": true, "parameter_count": 0 },
+            "completeness": "complete",
+            "transfers": [],
+            "concurrency_effects": [{ "kind": "unsupported", "protocol": "sync.Mutex.TryLock" }]
+          },
+          {
+            "id": "sync.rwmutex.try-lock",
+            "target": { "path": "src/sync/rwmutex.go", "symbol": "sync.RWMutex.TryLock()", "has_receiver": true, "parameter_count": 0 },
+            "completeness": "complete",
+            "transfers": [],
+            "concurrency_effects": [{ "kind": "unsupported", "protocol": "sync.RWMutex.TryLock" }]
+          },
+          {
+            "id": "sync.rwmutex.try-rlock",
+            "target": { "path": "src/sync/rwmutex.go", "symbol": "sync.RWMutex.TryRLock()", "has_receiver": true, "parameter_count": 0 },
+            "completeness": "complete",
+            "transfers": [],
+            "concurrency_effects": [{ "kind": "unsupported", "protocol": "sync.RWMutex.TryRLock" }]
+          },
+          {
+            "id": "sync.cond.wait",
+            "target": { "path": "src/sync/cond.go", "symbol": "sync.Cond.Wait()", "has_receiver": true, "parameter_count": 0 },
+            "completeness": "complete",
+            "transfers": [],
+            "concurrency_effects": [{ "kind": "unsupported", "protocol": "sync.Cond" }]
+          },
+          {
+            "id": "sync.cond.signal",
+            "target": { "path": "src/sync/cond.go", "symbol": "sync.Cond.Signal()", "has_receiver": true, "parameter_count": 0 },
+            "completeness": "complete",
+            "transfers": [],
+            "concurrency_effects": [{ "kind": "unsupported", "protocol": "sync.Cond" }]
+          },
+          {
+            "id": "sync.cond.broadcast",
+            "target": { "path": "src/sync/cond.go", "symbol": "sync.Cond.Broadcast()", "has_receiver": true, "parameter_count": 0 },
+            "completeness": "complete",
+            "transfers": [],
+            "concurrency_effects": [{ "kind": "unsupported", "protocol": "sync.Cond" }]
+          },
+          {
+            "id": "sync.once.do",
+            "target": { "path": "src/sync/once.go", "symbol": "sync.Once.Do(f func())", "has_receiver": true, "parameter_count": 1 },
+            "completeness": "complete",
+            "transfers": [],
+            "concurrency_effects": [{ "kind": "unsupported", "protocol": "sync.Once" }]
+          },
+          {
+            "id": "sync.map.load",
+            "target": { "path": "src/sync/hashtriemap.go", "symbol": "sync.Map.Load(key any)", "has_receiver": true, "parameter_count": 1 },
+            "completeness": "complete",
+            "transfers": [],
+            "concurrency_effects": [{ "kind": "unsupported", "protocol": "sync.Map" }]
+          },
+          {
+            "id": "sync.map.store",
+            "target": { "path": "src/sync/hashtriemap.go", "symbol": "sync.Map.Store(key any, value any)", "has_receiver": true, "parameter_count": 2 },
+            "completeness": "complete",
+            "transfers": [],
+            "concurrency_effects": [{ "kind": "unsupported", "protocol": "sync.Map" }]
+          },
+          {
+            "id": "sync.map.load-or-store",
+            "target": { "path": "src/sync/hashtriemap.go", "symbol": "sync.Map.LoadOrStore(key any, value any)", "has_receiver": true, "parameter_count": 2 },
+            "completeness": "complete",
+            "transfers": [],
+            "concurrency_effects": [{ "kind": "unsupported", "protocol": "sync.Map" }]
+          },
+          {
+            "id": "sync.map.load-and-delete",
+            "target": { "path": "src/sync/hashtriemap.go", "symbol": "sync.Map.LoadAndDelete(key any)", "has_receiver": true, "parameter_count": 1 },
+            "completeness": "complete",
+            "transfers": [],
+            "concurrency_effects": [{ "kind": "unsupported", "protocol": "sync.Map" }]
+          },
+          {
+            "id": "sync.map.delete",
+            "target": { "path": "src/sync/hashtriemap.go", "symbol": "sync.Map.Delete(key any)", "has_receiver": true, "parameter_count": 1 },
+            "completeness": "complete",
+            "transfers": [],
+            "concurrency_effects": [{ "kind": "unsupported", "protocol": "sync.Map" }]
+          },
+          {
+            "id": "sync.map.swap",
+            "target": { "path": "src/sync/hashtriemap.go", "symbol": "sync.Map.Swap(key any, value any)", "has_receiver": true, "parameter_count": 2 },
+            "completeness": "complete",
+            "transfers": [],
+            "concurrency_effects": [{ "kind": "unsupported", "protocol": "sync.Map" }]
+          },
+          {
+            "id": "sync.map.compare-and-swap",
+            "target": { "path": "src/sync/hashtriemap.go", "symbol": "sync.Map.CompareAndSwap(key any, old any, new any)", "has_receiver": true, "parameter_count": 3 },
+            "completeness": "complete",
+            "transfers": [],
+            "concurrency_effects": [{ "kind": "unsupported", "protocol": "sync.Map" }]
+          },
+          {
+            "id": "sync.map.compare-and-delete",
+            "target": { "path": "src/sync/hashtriemap.go", "symbol": "sync.Map.CompareAndDelete(key any, old any)", "has_receiver": true, "parameter_count": 2 },
+            "completeness": "complete",
+            "transfers": [],
+            "concurrency_effects": [{ "kind": "unsupported", "protocol": "sync.Map" }]
+          },
+          {
+            "id": "sync.map.range",
+            "target": { "path": "src/sync/hashtriemap.go", "symbol": "sync.Map.Range(f func(key any, value any) bool)", "has_receiver": true, "parameter_count": 1 },
+            "completeness": "complete",
+            "transfers": [],
+            "concurrency_effects": [{ "kind": "unsupported", "protocol": "sync.Map" }]
+          },
+          {
+            "id": "sync.map.clear",
+            "target": { "path": "src/sync/hashtriemap.go", "symbol": "sync.Map.Clear()", "has_receiver": true, "parameter_count": 0 },
+            "completeness": "complete",
+            "transfers": [],
+            "concurrency_effects": [{ "kind": "unsupported", "protocol": "sync.Map" }]
+          },
+          {
+            "id": "sync.waitgroup.add",
+            "target": { "path": "src/sync/waitgroup.go", "symbol": "sync.WaitGroup.Add(delta int)", "has_receiver": true, "parameter_count": 1 },
+            "completeness": "complete",
+            "transfers": [],
+            "concurrency_effects": [{ "kind": "wait_group_add", "group": { "kind": "receiver" }, "delta": { "kind": "parameter", "ordinal": 0 } }]
+          },
+          {
+            "id": "sync.waitgroup.done",
+            "target": { "path": "src/sync/waitgroup.go", "symbol": "sync.WaitGroup.Done()", "has_receiver": true, "parameter_count": 0 },
+            "completeness": "complete",
+            "transfers": [],
+            "concurrency_effects": [{ "kind": "wait_group_done", "group": { "kind": "receiver" } }]
+          },
+          {
+            "id": "sync.waitgroup.go",
+            "target": { "path": "src/sync/waitgroup.go", "symbol": "sync.WaitGroup.Go(f func())", "has_receiver": true, "parameter_count": 1 },
+            "completeness": "complete",
+            "transfers": [],
+            "concurrency_effects": [{ "kind": "task_spawn", "callable": { "kind": "parameter", "ordinal": 0 }, "group": { "kind": "receiver" } }]
+          },
+          {
+            "id": "sync.waitgroup.wait",
+            "target": { "path": "src/sync/waitgroup.go", "symbol": "sync.WaitGroup.Wait()", "has_receiver": true, "parameter_count": 0 },
+            "completeness": "complete",
+            "transfers": [],
+            "concurrency_effects": [{ "kind": "wait_group_wait", "group": { "kind": "receiver" } }]
+          }
+        ]
+      }
+    },
+    {
+      "id": "go.concurrency.errgroup",
+      "activation": [{ "module": { "name": "golang.org/x/sync", "version": ">=0.1.0, <1.0.0" } }],
+      "payload": {
+        "kind": "procedure_summaries",
+        "summaries": [
+          {
+            "id": "errgroup.with-context",
+            "target": { "path": "errgroup/errgroup.go", "symbol": "golang.org/x/sync/errgroup.WithContext(ctx context.Context)", "has_receiver": false, "parameter_count": 1 },
+            "completeness": "complete",
+            "normal_result_count": 2,
+            "locations": [{ "id": "errgroup.with-context.group", "location_kind": "heap" }],
+            "transfers": [{ "input": { "kind": "parameter", "ordinal": 0 }, "exit_kind": "normal", "output": { "kind": "indexed_normal_return", "ordinal": 1 } }],
+            "effects": [{ "kind": "allocation", "event": "errgroup.with-context.group-allocation", "output": { "kind": "indexed_normal_return", "ordinal": 0 } }]
+          },
+          {
+            "id": "errgroup.group.go",
+            "target": { "path": "errgroup/errgroup.go", "symbol": "golang.org/x/sync/errgroup.Group.Go(f func() error)", "has_receiver": true, "parameter_count": 1 },
+            "completeness": "complete",
+            "transfers": [],
+            "concurrency_effects": [{ "kind": "task_spawn", "callable": { "kind": "parameter", "ordinal": 0 }, "group": { "kind": "receiver" } }]
+          },
+          {
+            "id": "errgroup.group.wait",
+            "target": { "path": "errgroup/errgroup.go", "symbol": "golang.org/x/sync/errgroup.Group.Wait()", "has_receiver": true, "parameter_count": 0 },
+            "completeness": "complete",
+            "transfers": [],
+            "concurrency_effects": [{ "kind": "task_join", "group": { "kind": "receiver" } }]
+          },
+          {
+            "id": "errgroup.group.try-go",
+            "target": { "path": "errgroup/errgroup.go", "symbol": "golang.org/x/sync/errgroup.Group.TryGo(f func() error)", "has_receiver": true, "parameter_count": 1 },
+            "completeness": "complete",
+            "transfers": [],
+            "concurrency_effects": [
+              { "kind": "task_spawn", "callable": { "kind": "parameter", "ordinal": 0 }, "group": { "kind": "receiver" } },
+              { "kind": "unsupported", "protocol": "errgroup.Group.TryGo" }
+            ]
+          }
+        ]
+      }
+    }
+  ]
+}

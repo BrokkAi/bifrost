@@ -10,6 +10,7 @@ use brokk_bifrost_core::analyzer::{CodeUnit, ProjectFile};
 use brokk_bifrost_core::hash::HashSet;
 use tree_sitter::{Node, Parser, Tree};
 
+use crate::java::graph_support::{java_declared_type_parameters, java_type_parameter_name};
 use crate::java::imports::parse_import_info;
 
 /// Intern one qualified-name segment in the process-global interner.
@@ -408,7 +409,18 @@ pub fn visit_class_like<'tree>(
             code_unit.clone(),
             SignatureMetadata::new(facts.signature, Vec::new())
                 .with_class_like_interface(facts.is_interface)
-                .with_class_like_static(facts.is_static),
+                .with_class_like_static(facts.is_static)
+                // The arity of the written parameter list, so a class that
+                // writes none is a recorded zero rather than an unread list.
+                // An anonymous body and an enum-constant body write no list at
+                // all, which is the same recorded zero.
+                .with_recorded_type_parameters(
+                    java_declared_type_parameters(facts.anchor)
+                        .into_iter()
+                        .filter_map(|parameter| java_type_parameter_name(parameter, source))
+                        .map(str::to_string)
+                        .collect(),
+                ),
         );
 
         if facts.anchor.kind() == "record_declaration" {
@@ -1918,7 +1930,10 @@ class Outer {
     }
 }
 "#;
-        let file = ProjectFile::new("/tmp/project", "src/Outer.java");
+        let file = ProjectFile::new(
+            std::env::current_dir().expect("test working directory must be available"),
+            "src/Outer.java",
+        );
         let tree = parse(source);
         let parsed = parse_java_file(&file, source, &tree);
 
@@ -1929,6 +1944,60 @@ class Outer {
             !parsed.type_identifiers.contains("Outer"),
             "a declaration's own name is a definition, not a reference: {:?}",
             parsed.type_identifiers
+        );
+    }
+}
+
+#[cfg(test)]
+mod type_parameter_metadata_tests {
+    use super::*;
+    use tree_sitter::Parser;
+
+    /// A Java class-like declaration records its own type-parameter list, so a
+    /// nongeneric class is a proven zero rather than the unread list an empty
+    /// `type_parameters` used to mean (#1651).
+    #[test]
+    fn java_class_like_declarations_record_their_type_parameters() {
+        let source = r#"package example;
+
+public class Foo {
+    public interface Inner<T> {}
+    public record Pair<K, V>(K key, V value) {}
+    public enum Colour { RED }
+    public <T> T identity(T value) { return value; }
+}
+"#;
+        let file = ProjectFile::new(
+            std::env::current_dir().expect("test working directory must be available"),
+            "src/example/Foo.java",
+        );
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_java::LANGUAGE.into())
+            .expect("Java grammar");
+        let tree = parser.parse(source, None).expect("Java tree");
+        let parsed = parse_java_file(&file, source, &tree);
+
+        let mut recorded = parsed
+            .signature_metadata
+            .iter()
+            .flat_map(|(unit, metadata)| {
+                metadata
+                    .iter()
+                    .filter(|entry| entry.type_parameters_recorded())
+                    .map(|entry| (unit.short_name().to_string(), entry.type_parameters().len()))
+            })
+            .collect::<Vec<_>>();
+        recorded.sort();
+        assert_eq!(
+            recorded,
+            vec![
+                ("Foo".to_string(), 0),
+                ("Foo.Colour".to_string(), 0),
+                ("Foo.Inner".to_string(), 1),
+                ("Foo.Pair".to_string(), 2),
+            ],
+            "a generic method's own parameters stay a callable fact, unrecorded here"
         );
     }
 }

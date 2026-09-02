@@ -120,9 +120,32 @@ fn tool_descriptors_json(toolset: &str, render_line_numbers: bool) -> PyResult<S
         .map_err(|err| PyRuntimeError::new_err(err.to_string()))
 }
 
+/// The complete `query_code` vocabulary this build can emit, as JSON.
+///
+/// Every list comes from the producing registry itself, not from a copy: the
+/// row domains are the one declaration site behind `result_type`, and the
+/// three diagnostic vocabularies publish their own labels. A client mirrors
+/// these lists, so reading them live is what makes a missing client member a
+/// failing test instead of a `ValueError` in a user's call (#2898).
+#[pyfunction]
+fn code_query_variant_inventory_json() -> PyResult<String> {
+    let result_types = crate::rql::search::ALL_DETAILED_CODE_QUERY_DOMAINS
+        .iter()
+        .map(|domain| domain.label())
+        .collect::<Vec<_>>();
+    let inventory = serde_json::json!({
+        "result_types": result_types,
+        "diagnostic_codes": crate::rql::CodeQueryDiagnosticCode::LABELS,
+        "diagnostic_impacts": crate::rql::CodeQueryDiagnosticImpact::LABELS,
+        "completion_kinds": crate::rql::CodeQueryCompletion::KIND_LABELS,
+    });
+    serde_json::to_string(&inventory).map_err(|err| PyRuntimeError::new_err(err.to_string()))
+}
+
 #[pymodule]
 fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<SearchToolsNativeSession>()?;
     module.add_function(wrap_pyfunction!(tool_descriptors_json, module)?)?;
+    module.add_function(wrap_pyfunction!(code_query_variant_inventory_json, module)?)?;
     Ok(())
 }

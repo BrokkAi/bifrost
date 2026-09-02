@@ -1,0 +1,19 @@
+{
+  "$profileSchema": "java-source-identity",
+  "profileVersion": "0.1",
+  "language": "java",
+  "package": ["org", "example", "text"],
+  "ownerPath": [
+    { "kind": "class", "name": "Strings" }
+  ],
+  "declaration": {
+    "kind": "method",
+    "name": "normalize",
+    "signature": {
+      "parameterTypes": [
+        { "canonicalName": "java.lang.String", "nullability": "unspecified", "parameterMode": "value" }
+      ]
+    }
+  },
+  "origin": "named"
+}

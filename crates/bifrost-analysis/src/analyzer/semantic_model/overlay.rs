@@ -8,12 +8,13 @@ use url::Url;
 use super::{
     ActivePackExtractionGap, ActiveSemanticModelShard, AsciiTransform, CaptureBinding,
     CaptureProjection, CaptureSource, CatalogPackSourceKind, Completeness, EmbeddedTypeFact,
-    EmittedDeclaration, GeneratorRule, HierarchyFact, HierarchyKind, Locator, MemberFact,
-    MemberKind, ReceiverFact, RelationFact, RelationKind, ResolvedActiveSemanticModels,
+    EmittedDeclaration, GeneratorRule, HierarchyFact, HierarchyKind, ImplicitOperation, Locator,
+    MemberFact, MemberKind, ReceiverFact, RelationFact, RelationKind, ResolvedActiveSemanticModels,
     RuleEmission, RuleTrigger, SemanticModelActivationStatus, SemanticModelMatchDisposition,
     Signature, StructuredTypeExpression, TemplateExpression, TemplateSignature, TemplateTypeRef,
-    TypeFact, TypeKind, TypeParameterConstraint, TypeRef, Visibility,
+    TypeFact, TypeKind, TypeParameterConstraint, TypeRef, TypeValueSemantics, Visibility,
 };
+use crate::analyzer::semantic::LengthDelimitedDigest;
 use crate::analyzer::structural::{FileFacts, NormalizedKind, Role};
 use crate::analyzer::{AnalyzerQueryScope, QueryScope};
 use crate::analyzer::{CodeUnit, IAnalyzer, ProjectFile, Range};
@@ -206,10 +207,14 @@ pub struct SemanticModelSymbol {
     pub type_parameter_constraints: Vec<TypeParameterConstraint>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub underlying_type: Option<StructuredTypeExpression>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value_semantics: Option<TypeValueSemantics>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub embedded_types: Vec<EmbeddedTypeFact>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub receiver: Option<ReceiverFact>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub implicit_operation: Option<ImplicitOperation>,
     #[serde(skip)]
     pub(crate) extension_receiver: Option<TypeRef>,
     #[serde(skip)]
@@ -253,6 +258,61 @@ impl<'a> SemanticModelCallableKey<'a> {
     }
 }
 
+/// The structured application facts for one call to a modeled callable.
+///
+/// These facts come from the shared call-shape relation, not from a reparsed
+/// call expression. They are necessary because written-argument count is not
+/// callable applicability: named actuals, defaults, and unexpanded spreads all
+/// change which declaration can accept the call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SemanticModelCallApplication {
+    Unknown,
+    Written {
+        positional_count: u32,
+        named_labels: Vec<String>,
+        has_spread: bool,
+    },
+}
+
+impl SemanticModelCallApplication {
+    pub fn positional(parameter_count: u32) -> Self {
+        Self::Written {
+            positional_count: parameter_count,
+            named_labels: Vec::new(),
+            has_spread: false,
+        }
+    }
+
+    pub fn structured(
+        positional_count: usize,
+        named_labels: Vec<String>,
+        has_spread: bool,
+    ) -> Self {
+        let positional_count =
+            u32::try_from(positional_count).expect("structured argument counts fit u32");
+        Self::Written {
+            positional_count,
+            named_labels,
+            has_spread,
+        }
+    }
+
+    fn written(&self) -> Option<(usize, &[String], bool)> {
+        match self {
+            Self::Unknown => None,
+            Self::Written {
+                positional_count,
+                named_labels,
+                has_spread,
+            } => Some((
+                usize::try_from(*positional_count).expect("u32 argument count fits usize"),
+                named_labels,
+                *has_spread,
+            )),
+        }
+    }
+}
+
 /// Why a model record cannot provide an exact formal layout for one external
 /// call target.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -265,9 +325,12 @@ pub enum SemanticModelCallableIncompleteReason {
     MissingSignature,
     /// The model published a signature but omitted one formal name.
     MissingFormalName { ordinal: usize },
-    /// A callable with this owner/member/receiver exists, but its structured
-    /// arity cannot answer the requested target identity.
-    ArityMismatch,
+    /// The call shape did not enumerate an exact application.
+    ApplicationUnavailable,
+    /// The written positional and named actuals match no declaration.
+    ApplicationMismatch,
+    /// A spread or splat prevents exact application and formal mapping.
+    UnexpandedSpread,
 }
 
 /// Typed result of resolving an unmaterialized external target against the
@@ -276,6 +339,9 @@ pub enum SemanticModelCallableIncompleteReason {
 pub enum SemanticModelCallableDisposition {
     Empty,
     Unique,
+    /// Multiple overloads remain applicable but share one exact binding
+    /// layout. Their overload identity remains unresolved.
+    CompatibleLayout,
     Conflict,
     Incomplete(SemanticModelCallableIncompleteReason),
 }
@@ -292,6 +358,68 @@ impl<'a> SemanticModelCallableMatch<'a> {
             .then(|| self.records.first().copied())
             .flatten()
     }
+
+    /// Stable identity of the exact declared callable family represented by
+    /// this match. A unique declaration keeps its authored record identity;
+    /// a complete overload family receives a domain-separated identity over
+    /// its exact record identities. The latter names the callable without
+    /// pretending that one overload record was selected.
+    pub fn callable_family_id(&self) -> Option<String> {
+        semantic_model_callable_family_id(&self.records)
+    }
+}
+
+/// Derive one exact callable-family identity from active model records.
+///
+/// Every overload must belong to a complete model or explicitly certify
+/// complete family coverage, and share one structured owner/name/call shape
+/// plus one activation provenance. This is deliberately unavailable for
+/// partial, ambiguous, cross-pack, or merely same-named records.
+pub fn semantic_model_callable_family_id(records: &[&SemanticModelSymbol]) -> Option<String> {
+    let first = *records.first()?;
+    if records.len() == 1 {
+        return (!first.provenance.ambiguous
+            && (first.provenance.completeness == SemanticModelCompleteness::Complete
+                || first.callable_family_complete))
+            .then(|| first.id.clone());
+    }
+    let first_provenance = &first.provenance;
+    let same_family = records.iter().all(|record| {
+        !record.provenance.ambiguous
+            && (record.provenance.completeness == SemanticModelCompleteness::Complete
+                || record.callable_family_complete)
+            && record.owner_id == first.owner_id
+            && record.name == first.name
+            && record.language == first.language
+            && record.kind == first.kind
+            && record.has_receiver() == first.has_receiver()
+            && record.provenance.active_model_set_hash == first_provenance.active_model_set_hash
+            && record.provenance.pack_digest == first_provenance.pack_digest
+            && record.provenance.pack_id == first_provenance.pack_id
+            && record.provenance.pack_version == first_provenance.pack_version
+            && record.provenance.producer == first_provenance.producer
+            && record.provenance.producer_version == first_provenance.producer_version
+            && record.provenance.origin == first_provenance.origin
+            && record.provenance.activation == first_provenance.activation
+            && record.provenance.proof == first_provenance.proof
+    });
+    if !same_family {
+        return None;
+    }
+    let mut record_ids = records
+        .iter()
+        .map(|record| record.id.as_str())
+        .collect::<Vec<_>>();
+    record_ids.sort_unstable();
+    record_ids.dedup();
+    if record_ids.len() != records.len() {
+        return None;
+    }
+    let mut digest = LengthDelimitedDigest::new(b"bifrost.semantic_model.callable_family.v1");
+    for record_id in record_ids {
+        digest.push(record_id.as_bytes());
+    }
+    Some(digest.finish().to_string())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -323,6 +451,26 @@ pub(crate) enum SemanticModelOverlayBuildError {
 pub struct SemanticModelOverlayMatch<'a, T> {
     pub records: Vec<&'a T>,
     pub disposition: SemanticModelOverlayDisposition,
+}
+
+/// Result of resolving one static member from one exact modeled owner.
+///
+/// `Unique` is the only disposition that proves an exact target. `Absent`
+/// means the active model proves the complete owner surface and the member is
+/// not on it. `Incomplete` preserves a missing/partial owner or hierarchy;
+/// `Conflict` preserves competing owner or member records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SemanticModelMemberTargetDisposition {
+    Unique,
+    Absent,
+    Incomplete,
+    Conflict,
+}
+
+#[derive(Debug)]
+pub struct SemanticModelMemberTargetMatch<'a> {
+    pub records: Vec<&'a SemanticModelSymbol>,
+    pub disposition: SemanticModelMemberTargetDisposition,
 }
 
 /// Why one hierarchy edge does not reach exactly one published declaration.
@@ -729,6 +877,94 @@ impl SemanticModelOverlay {
         self.symbol_match(self.symbols_by_owner.get(owner_id))
     }
 
+    /// Resolve a static member through one exact modeled owner identity.
+    ///
+    /// This deliberately does not use the name index for `Owner.member`: that
+    /// index also admits aliases and simple-name postings. The exact owner ID,
+    /// its typed inherited surface, and each member's exact `owner_id` keep the
+    /// result tied to the active model record that justified the receiver.
+    pub fn member_target_on_owner(
+        &self,
+        owner_id: &str,
+        member_name: &str,
+    ) -> SemanticModelMemberTargetMatch<'_> {
+        let owners = self.symbols_with_id(owner_id);
+        if owners.disposition == SemanticModelOverlayDisposition::Conflict
+            || owners.records.len() > 1
+        {
+            return SemanticModelMemberTargetMatch {
+                records: Vec::new(),
+                disposition: SemanticModelMemberTargetDisposition::Conflict,
+            };
+        }
+        let [owner] = owners.records.as_slice() else {
+            return SemanticModelMemberTargetMatch {
+                records: Vec::new(),
+                disposition: SemanticModelMemberTargetDisposition::Incomplete,
+            };
+        };
+        if owner.provenance.ambiguous
+            || owner.provenance.completeness != SemanticModelCompleteness::Complete
+        {
+            return SemanticModelMemberTargetMatch {
+                records: Vec::new(),
+                disposition: SemanticModelMemberTargetDisposition::Incomplete,
+            };
+        }
+
+        let surface = self.owner_surface(owner);
+        let surface_complete = surface.proves_absence()
+            && self
+                .gapped_member_surface(&owner.qualified_name, member_name)
+                .is_none();
+        for (ordinal, surface_owner) in surface.closure.into_iter().enumerate() {
+            let mut records = self
+                .members_of(&surface_owner.id)
+                .records
+                .into_iter()
+                .filter(|symbol| {
+                    symbol.owner_id.as_deref() == Some(surface_owner.id.as_str())
+                        && symbol.name == member_name
+                        && symbol.language == owner.language
+                })
+                .collect::<Vec<_>>();
+            records.sort_by(|left, right| left.id.cmp(&right.id));
+            records.dedup_by(|left, right| left.id == right.id);
+            if records.is_empty() {
+                continue;
+            }
+            if records.len() > 1 || records.iter().any(|symbol| symbol.provenance.ambiguous) {
+                return SemanticModelMemberTargetMatch {
+                    records,
+                    disposition: SemanticModelMemberTargetDisposition::Conflict,
+                };
+            }
+            let complete_record = records[0].provenance.completeness
+                == SemanticModelCompleteness::Complete
+                && self
+                    .gapped_member_surface(&surface_owner.qualified_name, member_name)
+                    .is_none();
+            let complete_path = ordinal == 0 || surface_complete;
+            return SemanticModelMemberTargetMatch {
+                records,
+                disposition: if complete_record && complete_path {
+                    SemanticModelMemberTargetDisposition::Unique
+                } else {
+                    SemanticModelMemberTargetDisposition::Incomplete
+                },
+            };
+        }
+
+        SemanticModelMemberTargetMatch {
+            records: Vec::new(),
+            disposition: if surface_complete {
+                SemanticModelMemberTargetDisposition::Absent
+            } else {
+                SemanticModelMemberTargetDisposition::Incomplete
+            },
+        }
+    }
+
     /// Resolve a TypeScript ambient global value's member through its
     /// structured declaration-model type.
     ///
@@ -830,18 +1066,109 @@ impl SemanticModelOverlay {
         }
     }
 
+    /// Resolve a target whose declared arity is already known.
+    ///
+    /// This compatibility entry point is used by source-declaration consumers.
+    /// External call sites should use [`Self::callable_for_application`] so
+    /// defaults and named actuals participate in selection.
+    pub fn callable_for_target(
+        &self,
+        key: SemanticModelCallableKey<'_>,
+    ) -> SemanticModelCallableMatch<'_> {
+        let application = SemanticModelCallApplication::positional(key.parameter_count);
+        self.callable_for_application(key, &application)
+    }
+
+    /// Resolve the stable identity of the whole declared callable family.
+    ///
+    /// Application filtering may select one overload or a compatible subset;
+    /// policy endpoint identity must still remain the same family identity in
+    /// either case. This lookup therefore uses the exact resolver-owned key but
+    /// deliberately does not apply written arguments.
+    pub fn callable_family_id_for_target(
+        &self,
+        key: SemanticModelCallableKey<'_>,
+    ) -> Option<String> {
+        let owners = self
+            .symbols_named(key.owner)
+            .records
+            .into_iter()
+            .filter(|symbol| {
+                symbol.owner_id.is_none()
+                    && symbol.qualified_name == key.owner
+                    && symbol.language == key.language
+            })
+            .collect::<Vec<_>>();
+        let [owner] = owners.as_slice() else {
+            return None;
+        };
+        self.callable_family_id_for_owner_member(
+            &owner.id,
+            key.language,
+            key.member,
+            key.has_receiver,
+        )
+    }
+
+    /// Resolve the stable family identity containing one exact model record.
+    ///
+    /// Stable record IDs remain valid authored locators, but exact call rows
+    /// publish family identity so overload selection cannot change endpoint
+    /// identity. Expand the record through its structured owner/member shape
+    /// before deriving that identity.
+    pub fn callable_family_id_for_symbol(&self, symbol: &SemanticModelSymbol) -> Option<String> {
+        let owner_id = symbol.owner_id.as_deref()?;
+        self.callable_family_id_for_owner_member(
+            owner_id,
+            &symbol.language,
+            &symbol.name,
+            symbol.has_receiver(),
+        )
+    }
+
+    fn callable_family_id_for_owner_member(
+        &self,
+        owner_id: &str,
+        language: &str,
+        member_name: &str,
+        has_receiver: bool,
+    ) -> Option<String> {
+        let records = self
+            .members_of(owner_id)
+            .records
+            .into_iter()
+            .filter(|member| {
+                member.language == language
+                    && member.name == member_name
+                    && member_is_callable(member)
+                    && member_has_receiver(member) == has_receiver
+            })
+            .collect::<Vec<_>>();
+        semantic_model_callable_family_id(&records)
+    }
+
     /// Resolve one oracle-owned external callable identity against the active
-    /// declaration model.
+    /// declaration model and one structured call application.
     ///
     /// Owner lookup is exact on the model's qualified declaration field and
     /// member lookup is exact on its owner identity and member field. The
     /// rendered signature is never consulted. A missing or partial record is
     /// retained as an explicit incomplete result so a model gap cannot become
-    /// an empty, clean answer; multiple same-arity records remain a conflict.
-    pub fn callable_for_target(
+    /// an empty, clean answer. Multiple applicable overloads may share one
+    /// exact binding layout, but they never become one selected overload.
+    pub fn callable_for_application(
         &self,
         key: SemanticModelCallableKey<'_>,
+        application: &SemanticModelCallApplication,
     ) -> SemanticModelCallableMatch<'_> {
+        let Some((_, _, has_spread)) = application.written() else {
+            return SemanticModelCallableMatch {
+                records: Vec::new(),
+                disposition: SemanticModelCallableDisposition::Incomplete(
+                    SemanticModelCallableIncompleteReason::ApplicationUnavailable,
+                ),
+            };
+        };
         let owners = self
             .symbols_named(key.owner)
             .records
@@ -868,9 +1195,10 @@ impl SemanticModelOverlay {
             .iter()
             .map(|owner| owner.id.as_str())
             .collect::<HashSet<_>>();
-        let mut exact_arity_candidates = Vec::new();
-        let mut variadic_candidates = Vec::new();
-        let mut arity_mismatches = false;
+        let mut exact_candidates = Vec::new();
+        let mut spread_candidates = Vec::new();
+        let mut application_mismatches = false;
+        let mut missing_signatures = Vec::new();
 
         for owner_id in owner_ids {
             for member in self.members_of(owner_id).records {
@@ -882,44 +1210,64 @@ impl SemanticModelOverlay {
                     continue;
                 }
                 let Some(signature) = member.structured_signature.as_ref() else {
-                    exact_arity_candidates.push(member);
+                    missing_signatures.push(member);
                     continue;
                 };
-                let declared_parameter_count = u32::try_from(signature.parameters.len()).ok();
-                let accepts_variadic_actuals =
-                    signature.parameters.last().is_some_and(|parameter| {
-                        parameter.variadic
-                            && declared_parameter_count
-                                .is_some_and(|count| key.parameter_count >= count)
-                    });
-                if declared_parameter_count == Some(key.parameter_count) {
-                    exact_arity_candidates.push(member);
-                } else if accepts_variadic_actuals {
-                    variadic_candidates.push(member);
-                } else {
-                    arity_mismatches = true;
+                match application_match(signature, application) {
+                    SemanticModelApplicationMatch::Exact => exact_candidates.push(member),
+                    SemanticModelApplicationMatch::PossibleSpread => spread_candidates.push(member),
+                    SemanticModelApplicationMatch::Mismatch => application_mismatches = true,
                 }
             }
         }
 
-        // A target that already carries the declaration's parameter count is
-        // stronger evidence than the fallback "this variadic declaration can
-        // accept that many written actuals". This matters when a fixed-prefix
-        // overload has the same declared count as another overload's expanded
-        // varargs call, as with PrintWriter.format(String, Object...) and
-        // format(Locale, String, Object...).
-        let candidates = if exact_arity_candidates.is_empty() {
-            variadic_candidates
+        // A signature-less member of the same callable family may accept this
+        // application. A modeled sibling cannot make that unknown overload
+        // disappear, so retain the family as incomplete before selecting any
+        // known candidate.
+        if !missing_signatures.is_empty() {
+            return SemanticModelCallableMatch {
+                records: missing_signatures,
+                disposition: SemanticModelCallableDisposition::Incomplete(
+                    SemanticModelCallableIncompleteReason::MissingSignature,
+                ),
+            };
+        }
+
+        if exact_candidates.iter().any(|candidate| {
+            candidate
+                .structured_signature
+                .as_ref()
+                .is_some_and(|signature| {
+                    u32::try_from(signature.parameters.len()).ok() == Some(key.parameter_count)
+                })
+        }) {
+            exact_candidates.retain(|candidate| {
+                candidate
+                    .structured_signature
+                    .as_ref()
+                    .is_some_and(|signature| {
+                        u32::try_from(signature.parameters.len()).ok() == Some(key.parameter_count)
+                    })
+            });
+        }
+
+        // A spread's actual cardinality is unknown, so even a compatible
+        // variadic declaration can produce formal rows only after expansion.
+        // Keep the candidate visible in the incomplete match rather than
+        // promoting its structured signature to exact binding rows.
+        let candidates = if exact_candidates.is_empty() {
+            spread_candidates
         } else {
-            exact_arity_candidates
+            exact_candidates
         };
 
         if candidates.is_empty() {
             return SemanticModelCallableMatch {
                 records: Vec::new(),
-                disposition: if arity_mismatches {
+                disposition: if application_mismatches {
                     SemanticModelCallableDisposition::Incomplete(
-                        SemanticModelCallableIncompleteReason::ArityMismatch,
+                        SemanticModelCallableIncompleteReason::ApplicationMismatch,
                     )
                 } else {
                     SemanticModelCallableDisposition::Empty
@@ -927,50 +1275,66 @@ impl SemanticModelOverlay {
             };
         }
 
-        if candidates.len() != 1 || owners.len() != 1 {
+        if owners.len() != 1 {
             return SemanticModelCallableMatch {
                 records: candidates,
                 disposition: SemanticModelCallableDisposition::Conflict,
             };
         }
 
-        let candidate = candidates[0];
-        let disposition = if owner_model_is_ambiguous || candidate.provenance.ambiguous {
+        let candidate_model_is_ambiguous = candidates
+            .iter()
+            .any(|candidate| candidate.provenance.ambiguous);
+        let candidate_model_is_partial = candidates.iter().any(|candidate| {
+            candidate.provenance.completeness == SemanticModelCompleteness::Partial
+                && !candidate.callable_family_complete
+        });
+        let callable_family_is_complete = candidates
+            .iter()
+            .all(|candidate| candidate.callable_family_complete);
+        let disposition = if owner_model_is_ambiguous || candidate_model_is_ambiguous {
             SemanticModelCallableDisposition::Incomplete(
                 SemanticModelCallableIncompleteReason::AmbiguousModel,
             )
-        } else if (owner_model_is_partial
-            || candidate.provenance.completeness == SemanticModelCompleteness::Partial)
-            && !candidate.callable_family_complete
+        } else if (owner_model_is_partial && !callable_family_is_complete)
+            || candidate_model_is_partial
         {
             SemanticModelCallableDisposition::Incomplete(
                 SemanticModelCallableIncompleteReason::PartialModel,
             )
+        } else if has_spread {
+            SemanticModelCallableDisposition::Incomplete(
+                SemanticModelCallableIncompleteReason::UnexpandedSpread,
+            )
         } else {
-            let Some(signature) = candidate.structured_signature.as_ref() else {
-                return SemanticModelCallableMatch {
-                    records: candidates,
-                    disposition: SemanticModelCallableDisposition::Incomplete(
-                        SemanticModelCallableIncompleteReason::MissingSignature,
-                    ),
-                };
-            };
-            if let Some((ordinal, _)) = signature
-                .parameters
+            let signatures = candidates
                 .iter()
-                .enumerate()
-                .find(|(_, parameter)| parameter.name.is_none())
-            {
+                .map(|candidate| {
+                    candidate
+                        .structured_signature
+                        .as_ref()
+                        .expect("candidate filtering requires a signature")
+                })
+                .collect::<Vec<_>>();
+            if let Some((ordinal, _)) = signatures.iter().find_map(|signature| {
+                signature
+                    .parameters
+                    .iter()
+                    .enumerate()
+                    .find(|(_, parameter)| parameter.name.is_none())
+            }) {
                 SemanticModelCallableDisposition::Incomplete(
                     SemanticModelCallableIncompleteReason::MissingFormalName { ordinal },
                 )
-            } else {
-                // Variadic metadata is part of the structured signature and
-                // is intentionally preserved for the shared binder. Whether
-                // a particular spread/array actual can be expanded is a
-                // call-site question, not a reason to discard the model
-                // callable here.
+            } else if candidates.len() == 1 {
                 SemanticModelCallableDisposition::Unique
+            } else if signatures[1..]
+                .iter()
+                .all(|signature| binding_layouts_match(signatures[0], signature))
+            {
+                SemanticModelCallableDisposition::CompatibleLayout
+            } else {
+                SemanticModelCallableDisposition::Conflict
             }
         };
 
@@ -1280,7 +1644,7 @@ impl SemanticModelOverlay {
         Ok(())
     }
 
-    fn retained_bytes_lower_bound(&self) -> u64 {
+    pub(crate) fn retained_bytes_lower_bound(&self) -> u64 {
         let symbol_bytes = self
             .symbols
             .iter()
@@ -1377,6 +1741,106 @@ impl SemanticModelOverlay {
             records,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SemanticModelApplicationMatch {
+    Exact,
+    PossibleSpread,
+    Mismatch,
+}
+
+fn application_match(
+    signature: &Signature,
+    application: &SemanticModelCallApplication,
+) -> SemanticModelApplicationMatch {
+    let Some((positional_count, named_labels, has_spread)) = application.written() else {
+        return SemanticModelApplicationMatch::Mismatch;
+    };
+    let mut bound = vec![false; signature.parameters.len()];
+
+    for position in 0..positional_count {
+        let matched = signature
+            .parameters
+            .iter()
+            .enumerate()
+            .filter(|(_, parameter)| parameter.passing_mode.accepts_positional())
+            .nth(position)
+            .map(|(ordinal, _)| ordinal)
+            .or_else(|| {
+                signature
+                    .parameters
+                    .iter()
+                    .enumerate()
+                    .rev()
+                    .find(|(_, parameter)| {
+                        parameter.variadic && parameter.passing_mode.accepts_positional()
+                    })
+                    .map(|(ordinal, _)| ordinal)
+            });
+        let Some(ordinal) = matched else {
+            return SemanticModelApplicationMatch::Mismatch;
+        };
+        bound[ordinal] = true;
+    }
+
+    for label in named_labels {
+        let declared = signature
+            .parameters
+            .iter()
+            .enumerate()
+            .find(|(_, parameter)| {
+                parameter.passing_mode.accepts_named()
+                    && parameter.name.as_deref() == Some(label.as_str())
+            })
+            .map(|(ordinal, _)| ordinal);
+        let matched = match declared {
+            Some(ordinal) if bound[ordinal] => return SemanticModelApplicationMatch::Mismatch,
+            Some(ordinal) => Some(ordinal),
+            None => signature
+                .parameters
+                .iter()
+                .enumerate()
+                .rev()
+                .find(|(_, parameter)| parameter.variadic && parameter.passing_mode.accepts_named())
+                .map(|(ordinal, _)| ordinal),
+        };
+        let Some(ordinal) = matched else {
+            return SemanticModelApplicationMatch::Mismatch;
+        };
+        if bound[ordinal] && !signature.parameters[ordinal].variadic {
+            return SemanticModelApplicationMatch::Mismatch;
+        }
+        bound[ordinal] = true;
+    }
+
+    if has_spread {
+        return SemanticModelApplicationMatch::PossibleSpread;
+    }
+    if signature
+        .parameters
+        .iter()
+        .zip(bound)
+        .all(|(parameter, bound)| parameter.optional || parameter.variadic || bound)
+    {
+        SemanticModelApplicationMatch::Exact
+    } else {
+        SemanticModelApplicationMatch::Mismatch
+    }
+}
+
+fn binding_layouts_match(left: &Signature, right: &Signature) -> bool {
+    left.parameters.len() == right.parameters.len()
+        && left
+            .parameters
+            .iter()
+            .zip(&right.parameters)
+            .all(|(left, right)| {
+                left.name == right.name
+                    && left.optional == right.optional
+                    && left.variadic == right.variadic
+                    && left.passing_mode == right.passing_mode
+            })
 }
 
 impl SemanticModelSymbol {
@@ -3380,8 +3844,10 @@ fn emit_rule_match(
                         aliases: Vec::new(),
                         type_parameter_constraints: Vec::new(),
                         underlying_type: None,
+                        value_semantics: None,
                         embedded_types: Vec::new(),
                         receiver: None,
+                        implicit_operation: None,
                         extension_receiver: None,
                         extension_receiver_constraints: Vec::new(),
                         locator_path: None,
@@ -3430,8 +3896,10 @@ fn emit_rule_match(
                             aliases: Vec::new(),
                             type_parameter_constraints: Vec::new(),
                             underlying_type: None,
+                            value_semantics: None,
                             embedded_types: Vec::new(),
                             receiver: None,
+                            implicit_operation: None,
                             extension_receiver: None,
                             extension_receiver_constraints: Vec::new(),
                             locator_path: None,
@@ -3621,6 +4089,7 @@ fn evaluate_template_signature(
                 r#type: evaluate_template_type(&parameter.r#type, captures)?,
                 optional: parameter.optional,
                 variadic: parameter.variadic,
+                passing_mode: Default::default(),
             })
         })
         .collect::<Option<Vec<_>>>()?;
@@ -3631,6 +4100,7 @@ fn evaluate_template_signature(
                 r#type: evaluate_template_type(&parameter.r#type, &row)?,
                 optional: parameter.optional,
                 variadic: parameter.variadic,
+                passing_mode: Default::default(),
             });
         }
     }
@@ -3831,8 +4301,10 @@ fn type_symbol(
         aliases: record.aliases.clone(),
         type_parameter_constraints: record.type_parameter_constraints.clone(),
         underlying_type: record.underlying_type.clone(),
+        value_semantics: record.value_semantics.clone(),
         embedded_types: record.embedded_types.clone(),
         receiver: None,
+        implicit_operation: None,
         extension_receiver: None,
         extension_receiver_constraints: Vec::new(),
         locator_path: Some(locator_path(&record.locator).to_owned()),
@@ -3889,8 +4361,10 @@ fn member_symbol(
         aliases: record.aliases.clone(),
         type_parameter_constraints: Vec::new(),
         underlying_type: None,
+        value_semantics: None,
         embedded_types: Vec::new(),
         receiver: record.receiver,
+        implicit_operation: record.implicit_operation.clone(),
         extension_receiver: record.extension_receiver.clone(),
         extension_receiver_constraints: record.extension_receiver_constraints.clone(),
         locator_path: Some(locator_path(&record.locator).to_owned()),
@@ -4348,6 +4822,7 @@ fn render_named_type(name: &str, arguments: &[TypeRef], nullable: bool) -> Strin
 mod tests {
     use super::*;
     use crate::analyzer::Language;
+    use crate::analyzer::semantic_model::ParameterPassingMode;
     use crate::test_support::AnalyzerFixture;
 
     #[test]
@@ -4485,8 +4960,10 @@ mod tests {
             aliases: Vec::new(),
             type_parameter_constraints: Vec::new(),
             underlying_type: None,
+            value_semantics: None,
             embedded_types: Vec::new(),
             receiver: None,
+            implicit_operation: None,
             extension_receiver: None,
             extension_receiver_constraints: Vec::new(),
             locator_path: None,
@@ -4559,8 +5036,10 @@ mod tests {
             aliases: Vec::new(),
             type_parameter_constraints: Vec::new(),
             underlying_type: None,
+            value_semantics: None,
             embedded_types: Vec::new(),
             receiver: None,
+            implicit_operation: None,
             extension_receiver: None,
             extension_receiver_constraints: Vec::new(),
             locator_path: None,
@@ -4580,6 +5059,13 @@ mod tests {
             .as_ref()
             .map(render_callable_shape);
         symbol
+    }
+
+    fn field(owner: &SemanticModelSymbol, id: &str, name: &str) -> SemanticModelSymbol {
+        let mut field = method(owner, id, name, None);
+        field.kind = SemanticModelSymbolKind::Field;
+        field.receiver = None;
+        field
     }
 
     fn global_value(
@@ -4624,6 +5110,7 @@ mod tests {
                         },
                         optional: false,
                         variadic: variadic && ordinal + 1 == names.len(),
+                        passing_mode: Default::default(),
                     },
                 )
                 .collect(),
@@ -4633,6 +5120,13 @@ mod tests {
 
     fn callable_key(parameter_count: u32) -> SemanticModelCallableKey<'static> {
         SemanticModelCallableKey::new("java", "pkg.Owner", "run", true, parameter_count)
+    }
+
+    fn lookup(
+        overlay: &SemanticModelOverlay,
+        parameter_count: u32,
+    ) -> SemanticModelCallableMatch<'_> {
+        overlay.callable_for_target(callable_key(parameter_count))
     }
 
     fn go_package_function(
@@ -4667,7 +5161,7 @@ mod tests {
         );
         let overlay = overlay(vec![owner, member], Vec::new());
 
-        let result = overlay.callable_for_target(callable_key(1));
+        let result = lookup(&overlay, 1);
 
         assert_eq!(result.disposition, SemanticModelCallableDisposition::Unique);
         let selected = result.unique().expect("one exact callable");
@@ -4700,7 +5194,7 @@ mod tests {
         second.callable_family_complete = true;
         let overlay = overlay(vec![owner, first, second], Vec::new());
 
-        let result = overlay.callable_for_target(callable_key(1));
+        let result = lookup(&overlay, 1);
 
         assert_eq!(
             result.disposition,
@@ -4708,6 +5202,185 @@ mod tests {
         );
         assert_eq!(result.records.len(), 2);
         assert!(result.unique().is_none());
+    }
+
+    #[test]
+    fn external_callable_lookup_keeps_an_unmodeled_sibling_signature_incomplete() {
+        let owner = class("pkg.Owner", "java");
+        let known = method(
+            &owner,
+            "member.run.known",
+            "run",
+            Some(signature(&[Some("value")], false)),
+        );
+        let missing = method(&owner, "member.run.missing", "run", None);
+        let overlay = overlay(vec![owner, known, missing], Vec::new());
+
+        let result = lookup(&overlay, 1);
+
+        assert_eq!(
+            result.disposition,
+            SemanticModelCallableDisposition::Incomplete(
+                SemanticModelCallableIncompleteReason::MissingSignature
+            )
+        );
+        assert!(result.unique().is_none());
+    }
+
+    #[test]
+    fn external_callable_application_honors_defaults_names_and_passing_modes() {
+        let owner = class("pkg.Owner", "java");
+        let mut modeled = signature(
+            &[Some("args"), Some("shell"), Some("capture_output")],
+            false,
+        );
+        modeled.parameters[0].passing_mode = ParameterPassingMode::PositionalOnly;
+        modeled.parameters[1].optional = true;
+        modeled.parameters[1].passing_mode = ParameterPassingMode::NamedOnly;
+        modeled.parameters[2].optional = true;
+        modeled.parameters[2].passing_mode = ParameterPassingMode::NamedOnly;
+        let member = method(&owner, "member.run", "run", Some(modeled));
+        let overlay = overlay(vec![owner, member], Vec::new());
+
+        let exact = SemanticModelCallApplication::structured(1, vec!["shell".to_owned()], false);
+        assert_eq!(
+            overlay
+                .callable_for_application(callable_key(2), &exact)
+                .disposition,
+            SemanticModelCallableDisposition::Unique
+        );
+
+        let positional_keyword_only =
+            SemanticModelCallApplication::structured(2, Vec::new(), false);
+        assert_eq!(
+            overlay
+                .callable_for_application(callable_key(2), &positional_keyword_only)
+                .disposition,
+            SemanticModelCallableDisposition::Incomplete(
+                SemanticModelCallableIncompleteReason::ApplicationMismatch
+            )
+        );
+
+        let named_positional_only =
+            SemanticModelCallApplication::structured(0, vec!["args".to_owned()], false);
+        assert_eq!(
+            overlay
+                .callable_for_application(callable_key(1), &named_positional_only)
+                .disposition,
+            SemanticModelCallableDisposition::Incomplete(
+                SemanticModelCallableIncompleteReason::ApplicationMismatch
+            )
+        );
+    }
+
+    #[test]
+    fn external_callable_application_rejects_duplicate_binding_before_keyword_variadic() {
+        let owner = class("pkg.Owner", "java");
+        let mut modeled = signature(&[Some("value"), Some("kwargs")], false);
+        modeled.parameters[1].variadic = true;
+        modeled.parameters[1].passing_mode = ParameterPassingMode::NamedOnly;
+        let member = method(&owner, "member.run", "run", Some(modeled));
+        let overlay = overlay(vec![owner, member], Vec::new());
+        let duplicate =
+            SemanticModelCallApplication::structured(1, vec!["value".to_owned()], false);
+
+        assert_eq!(
+            overlay
+                .callable_for_application(callable_key(2), &duplicate)
+                .disposition,
+            SemanticModelCallableDisposition::Incomplete(
+                SemanticModelCallableIncompleteReason::ApplicationMismatch
+            )
+        );
+    }
+
+    #[test]
+    fn external_callable_application_keeps_shared_layout_overloads_distinct() {
+        let owner = class("pkg.Owner", "java");
+        let first = method(
+            &owner,
+            "member.run.first",
+            "run",
+            Some(signature(&[Some("value")], false)),
+        );
+        let second = method(
+            &owner,
+            "member.run.second",
+            "run",
+            Some(signature(&[Some("value")], false)),
+        );
+        let overlay = overlay(vec![owner, first, second], Vec::new());
+        let application = SemanticModelCallApplication::positional(1);
+
+        let result = overlay.callable_for_application(callable_key(1), &application);
+
+        assert_eq!(
+            result.disposition,
+            SemanticModelCallableDisposition::CompatibleLayout
+        );
+        assert_eq!(result.records.len(), 2);
+        assert!(result.unique().is_none(), "no overload was selected");
+    }
+
+    #[test]
+    fn callable_family_identity_is_stable_when_application_selects_one_overload() {
+        let owner = class("pkg.Owner", "java");
+        let first = method(
+            &owner,
+            "member.run.first",
+            "run",
+            Some(signature(&[Some("value")], false)),
+        );
+        let mut wider = signature(&[Some("value"), Some("mode")], false);
+        wider.parameters[1].optional = true;
+        let second = method(&owner, "member.run.second", "run", Some(wider));
+        let overlay = overlay(vec![owner, first, second], Vec::new());
+        let key = callable_key(1);
+
+        let selected = overlay
+            .callable_for_application(key, &SemanticModelCallApplication::positional(1))
+            .unique()
+            .expect("the exact-arity preference selects one overload");
+        let family_id = overlay
+            .callable_family_id_for_target(key)
+            .expect("the complete overload family has one identity");
+
+        assert_eq!(selected.id, "member.run.first");
+        assert_ne!(family_id, selected.id);
+        assert_eq!(
+            family_id,
+            semantic_model_callable_family_id(
+                &overlay
+                    .symbols_named("pkg.Owner.run")
+                    .records
+                    .into_iter()
+                    .filter(|record| record.owner_id.is_some())
+                    .collect::<Vec<_>>()
+            )
+            .expect("the name index exposes the same structured family")
+        );
+    }
+
+    #[test]
+    fn external_callable_application_keeps_spread_incomplete() {
+        let owner = class("pkg.Owner", "java");
+        let member = method(
+            &owner,
+            "member.run",
+            "run",
+            Some(signature(&[Some("values")], true)),
+        );
+        let overlay = overlay(vec![owner, member], Vec::new());
+        let application = SemanticModelCallApplication::structured(0, Vec::new(), true);
+
+        assert_eq!(
+            overlay
+                .callable_for_application(callable_key(1), &application)
+                .disposition,
+            SemanticModelCallableDisposition::Incomplete(
+                SemanticModelCallableIncompleteReason::UnexpandedSpread
+            )
+        );
     }
 
     #[test]
@@ -4724,7 +5397,7 @@ mod tests {
         claimed.callable_family_complete = true;
 
         let claimed_overlay = overlay(vec![owner.clone(), claimed.clone()], Vec::new());
-        let claimed_result = claimed_overlay.callable_for_target(callable_key(1));
+        let claimed_result = lookup(&claimed_overlay, 1);
         assert_eq!(
             claimed_result.disposition,
             SemanticModelCallableDisposition::Unique
@@ -4739,7 +5412,7 @@ mod tests {
 
         claimed.callable_family_complete = false;
         let unclaimed_overlay = overlay(vec![owner, claimed], Vec::new());
-        let unclaimed_result = unclaimed_overlay.callable_for_target(callable_key(1));
+        let unclaimed_result = lookup(&unclaimed_overlay, 1);
         assert_eq!(
             unclaimed_result.disposition,
             SemanticModelCallableDisposition::Incomplete(
@@ -4759,7 +5432,7 @@ mod tests {
         );
         partial.provenance.completeness = SemanticModelCompleteness::Partial;
         let partial_overlay = overlay(vec![owner.clone(), partial], Vec::new());
-        let result = partial_overlay.callable_for_target(callable_key(1));
+        let result = lookup(&partial_overlay, 1);
         assert_eq!(
             result.disposition,
             SemanticModelCallableDisposition::Incomplete(
@@ -4775,7 +5448,7 @@ mod tests {
             Some(signature(&[None], false)),
         );
         let missing_overlay = overlay(vec![owner, missing], Vec::new());
-        let result = missing_overlay.callable_for_target(callable_key(1));
+        let result = lookup(&missing_overlay, 1);
         assert_eq!(
             result.disposition,
             SemanticModelCallableDisposition::Incomplete(
@@ -4795,7 +5468,7 @@ mod tests {
         );
         let overlay = overlay(vec![owner, member], Vec::new());
 
-        let result = overlay.callable_for_target(callable_key(1));
+        let result = lookup(&overlay, 1);
 
         assert_eq!(result.disposition, SemanticModelCallableDisposition::Unique);
         assert!(
@@ -4808,7 +5481,7 @@ mod tests {
                 .variadic
         );
 
-        let repeated = overlay.callable_for_target(callable_key(3));
+        let repeated = lookup(&overlay, 3);
         assert_eq!(
             repeated.disposition,
             SemanticModelCallableDisposition::Unique
@@ -4844,7 +5517,7 @@ mod tests {
         );
         let overlay = overlay(vec![owner, variadic, exact], Vec::new());
 
-        let result = overlay.callable_for_target(callable_key(3));
+        let result = lookup(&overlay, 3);
 
         assert_eq!(result.disposition, SemanticModelCallableDisposition::Unique);
         assert_eq!(result.unique().unwrap().id, "member.run.exact");
@@ -5537,6 +6210,81 @@ mod tests {
 
         assert!(surface.proves_absence(), "{surface:#?}");
         assert_eq!(vec!["pkg.Child", "pkg.Base"], closure_names(&surface));
+    }
+
+    #[test]
+    fn exact_owner_member_lookup_prefers_a_direct_member_then_a_complete_base() {
+        let child = class("pkg.Child", "typescript");
+        let base = class("pkg.Base", "typescript");
+        let base_member = field(&base, "member.base.value", "value");
+        let edge = extends(&child, "pkg.Base");
+        let inherited = overlay(
+            vec![child.clone(), base.clone(), base_member.clone()],
+            vec![edge.clone()],
+        );
+
+        let inherited_match = inherited.member_target_on_owner(&child.id, "value");
+        assert_eq!(
+            inherited_match.disposition,
+            SemanticModelMemberTargetDisposition::Unique
+        );
+        assert_eq!(
+            inherited_match.records[0].id, base_member.id,
+            "the exact inherited model record is retained"
+        );
+
+        let direct_member = field(&child, "member.child.value", "value");
+        let overridden = overlay(
+            vec![child.clone(), base, base_member, direct_member.clone()],
+            vec![edge],
+        );
+        let direct_match = overridden.member_target_on_owner(&child.id, "value");
+        assert_eq!(
+            direct_match.disposition,
+            SemanticModelMemberTargetDisposition::Unique
+        );
+        assert_eq!(
+            direct_match.records[0].id, direct_member.id,
+            "dispatch order must select the direct member before its base"
+        );
+
+        let absent = overridden.member_target_on_owner(&child.id, "missing");
+        assert_eq!(
+            absent.disposition,
+            SemanticModelMemberTargetDisposition::Absent,
+            "a complete owner surface may prove exact absence"
+        );
+    }
+
+    #[test]
+    fn exact_owner_member_lookup_preserves_conflict_and_incompleteness() {
+        let owner = class("pkg.Owner", "typescript");
+        let first = field(&owner, "member.owner.value.first", "value");
+        let second = field(&owner, "member.owner.value.second", "value");
+        let conflict = overlay(vec![owner.clone(), first, second], Vec::new());
+        assert_eq!(
+            conflict
+                .member_target_on_owner(&owner.id, "value")
+                .disposition,
+            SemanticModelMemberTargetDisposition::Conflict
+        );
+
+        let mut partial = field(&owner, "member.owner.value.partial", "value");
+        partial.provenance.completeness = SemanticModelCompleteness::Partial;
+        let partial_overlay = overlay(vec![owner.clone(), partial], Vec::new());
+        assert_eq!(
+            partial_overlay
+                .member_target_on_owner(&owner.id, "value")
+                .disposition,
+            SemanticModelMemberTargetDisposition::Incomplete
+        );
+        assert_eq!(
+            partial_overlay
+                .member_target_on_owner("type.missing", "value")
+                .disposition,
+            SemanticModelMemberTargetDisposition::Incomplete,
+            "an unpublished owner is not an absence proof"
+        );
     }
 
     #[test]

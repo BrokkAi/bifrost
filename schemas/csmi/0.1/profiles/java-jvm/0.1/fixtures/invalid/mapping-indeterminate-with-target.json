@@ -1,0 +1,8 @@
+{
+  "$profileSchema": "java-jvm-mapping",
+  "profileVersion": "0.1",
+  "resolution": "indeterminate",
+  "sourceSymbol": "java-normalize",
+  "binarySymbols": ["guessed-jvm-normalize"],
+  "reason": "missing-classfile"
+}

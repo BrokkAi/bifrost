@@ -1,0 +1,64 @@
+{
+  "documentType": "semantic-document",
+  "schema": "https://csmi.brokk.ai/schema/0.1/schema.json",
+  "semanticModelVersion": "0.1",
+  "serializationVersion": "0.1-json",
+  "defaultProvenance": "rustProfileAuthor",
+  "provenanceRecords": [
+    {
+      "id": "rustProfileAuthor",
+      "producer": {
+        "identifier": "https://csmi.brokk.ai/producers/rust-profile-fixture",
+        "version": "0.1.0"
+      },
+      "generationMethod": "manual-authoring"
+    }
+  ],
+  "semanticModels": [
+    {
+      "artifactSelectors": [
+        {
+          "purl": "pkg:generic/rust-sysroot@1.85.0",
+          "digests": [
+            {
+              "algorithm": "sha-256",
+              "coverage": "rustlib/x86_64-unknown-linux-gnu/lib/libcore.rlib",
+              "value": "bb4c8d8871d98d149567c29b1b2e16ccdb686f7e431e5408f282e0939aab4363"
+            }
+          ]
+        }
+      ],
+      "vocabularyUses": [
+        {
+          "identifier": "csmi.rust",
+          "version": "0.1.0",
+          "schema": "https://csmi.brokk.ai/schema/profiles/rust/0.1/schema.json",
+          "requirement": "required",
+          "affects": [
+            {
+              "kind": "fact-family",
+              "family": "crate-mappings",
+              "scope": { "model": "pkg:generic/rust-sysroot@1.85.0" }
+            }
+          ]
+        }
+      ],
+      "extensionFacts": [
+        {
+          "vocabulary": "csmi.rust",
+          "version": "0.1.0",
+          "family": "crate-mappings",
+          "scope": { "model": "pkg:generic/rust-sysroot@1.85.0" },
+          "payload": {
+            "kind": "sysroot-crate",
+            "crateName": "core",
+            "artifactPurl": "pkg:generic/rust-sysroot@1.85.0",
+            "compilerRelease": "1.85.0",
+            "targetTriple": "x86_64-unknown-linux-gnu",
+            "componentSha256": "bb4c8d8871d98d149567c29b1b2e16ccdb686f7e431e5408f282e0939aab4363"
+          }
+        }
+      ]
+    }
+  ]
+}

@@ -28,8 +28,8 @@ use brokk_bifrost_rql::structural::search::{
     execute_code_query_detailed_eager_index, execute_code_query_detailed_eager_index_workspace,
 };
 use brokk_bifrost_rql::structural::{
-    CodeQuery, CodeQueryCompletion, CodeQueryResultDetail, DetailedCodeQueryEvidence,
-    DetailedCodeQueryProvenanceEvidence,
+    CodeQuery, CodeQueryCompletion, CodeQueryResultDetail, CodeQueryResultValue,
+    DetailedCodeQueryEvidence, DetailedCodeQueryProvenanceEvidence,
 };
 use brokk_bifrost_rql::{CodeQueryPlanSource, SetOperator};
 
@@ -332,6 +332,49 @@ impl StageOutcome {
     }
 }
 
+/// What the deepest executed prefix -- the complete selector, which is a row
+/// binding's own relation -- returned for the candidate.
+///
+/// A caller that replays plan-level operators over the candidate's row needs
+/// the row itself, not a second query for it, and needs to know whether the
+/// query that produced it saw everything: a row absent from a non-exhaustive
+/// row set is undecided, so a negative replayed over one is `unknown`.
+#[derive(Debug, Default)]
+pub(super) struct LocatedRows {
+    rows: Vec<CodeQueryResultValue>,
+    exhaustive: bool,
+    reasons: Vec<PolicyIncompleteReason>,
+}
+
+impl LocatedRows {
+    /// The rows the query returned for the candidate, judged against what that
+    /// same query proved about its own row set.
+    fn new(
+        rows: Vec<CodeQueryResultValue>,
+        completion: &CodeQueryCompletion,
+        truncated: bool,
+    ) -> Self {
+        Self {
+            rows,
+            exhaustive: !truncated && matches!(completion, CodeQueryCompletion::Complete),
+            reasons: absence_reasons(completion, truncated),
+        }
+    }
+
+    pub(super) fn rows(&self) -> &[CodeQueryResultValue] {
+        &self.rows
+    }
+    /// Whether the query returned every row it could, which is what licenses a
+    /// `failed` verdict over the rows it did return.
+    pub(super) const fn exhaustive(&self) -> bool {
+        self.exhaustive
+    }
+    /// Why it did not, when it did not.
+    pub(super) fn reasons(&self) -> &[PolicyIncompleteReason] {
+        &self.reasons
+    }
+}
+
 /// Rendered authored-order stages, actual executions, and prefix-budget
 /// truncation for one walk.
 #[derive(Debug)]
@@ -340,9 +383,15 @@ pub(super) struct StageWalk {
     executed: usize,
     prefixes_truncated: bool,
     omitted_prefixes: u64,
+    located: LocatedRows,
 }
 
 impl StageWalk {
+    /// The rows the complete selector returned for the candidate, empty unless
+    /// every presented stage retained it.
+    pub(super) const fn located(&self) -> &LocatedRows {
+        &self.located
+    }
     pub(super) const fn prefixes_truncated(&self) -> bool {
         self.prefixes_truncated
     }
@@ -441,8 +490,11 @@ pub(super) fn run_prefixes(
     // candidate in rows that prefix omitted. Retain the completion state and
     // reasons of every strict suffix before consuming the results for
     // authored-order presentation.
+    // The reasons accumulate as an ordered set so every per-prefix snapshot is
+    // already sorted and deduplicated; the presentation order is part of the
+    // explanation contract, which is what earns the ordered structure here.
     let mut suffix_exhaustive = true;
-    let mut suffix_reasons = BTreeSet::new();
+    let mut suffix_reasons: BTreeSet<PolicyIncompleteReason> = BTreeSet::new();
     let mut later_prefix_state = Vec::with_capacity(executable);
     for (_, executed) in executed_prefixes.iter().rev() {
         later_prefix_state.push((
@@ -457,7 +509,8 @@ pub(super) fn run_prefixes(
     }
     later_prefix_state.reverse();
 
-    for ((prefix, executed), (later_prefixes_exhaustive, later_prefix_reasons)) in
+    let mut located = LocatedRows::default();
+    for ((prefix, mut executed), (later_prefixes_exhaustive, later_prefix_reasons)) in
         executed_prefixes.into_iter().zip(later_prefix_state)
     {
         let label = match prefix.checked_sub(1) {
@@ -550,6 +603,28 @@ pub(super) fn run_prefixes(
             }
         };
         let decided = stage.outcome != ExplanationOutcome::Satisfied;
+        if !decided && prefix == step_count {
+            // The complete selector is the relation a row binding stands for,
+            // so its rows -- and only its rows -- are the candidate's rows.
+            debug_assert!(
+                !prefixes_omitted,
+                "the complete selector runs only when the budget omitted no prefix"
+            );
+            let covering = executed
+                .evidence
+                .iter()
+                .filter(|evidence| evidence_covers_candidate(evidence, candidate))
+                .map(|evidence| evidence.result_index)
+                .collect::<Vec<_>>();
+            let truncated = executed.result.truncated;
+            let rows = std::mem::take(&mut executed.result.results)
+                .into_iter()
+                .enumerate()
+                .filter(|(index, _)| covering.contains(index))
+                .map(|(_, item)| item.value)
+                .collect();
+            located = LocatedRows::new(rows, &completion, truncated);
+        }
         stages.push(stage);
         if decided {
             break;
@@ -567,6 +642,7 @@ pub(super) fn run_prefixes(
         executed: executed_count,
         prefixes_truncated: omitted_prefixes > 0,
         omitted_prefixes,
+        located,
     }
 }
 

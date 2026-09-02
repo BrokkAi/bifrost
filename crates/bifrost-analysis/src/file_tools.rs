@@ -581,6 +581,7 @@ mod tests {
         assert_eq!(result.not_found, vec!["missing.rs"]);
     }
 
+    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
     #[test]
     fn get_file_contents_normalizes_backslashes() {
         let fix = Fixture::new(&[("src/a.rs", "x")]);

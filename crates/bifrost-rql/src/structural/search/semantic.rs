@@ -1,6 +1,7 @@
 use std::mem::{align_of, size_of};
 use std::sync::Arc;
 
+use super::concurrency::{ConcurrentAccessConflictValue, WorkspaceConcurrencyProvider};
 use super::taint::{SemanticTaintFindingValue, TaintQueryState};
 use super::typestate::{SemanticTypestateFindingValue, TypestateQueryState};
 use super::value_flow::{SemanticFlowEndpointValue, SemanticFlowWitnessValue, ValueFlowQueryState};
@@ -19,15 +20,16 @@ use crate::analyzer::semantic::workspace_oracle::{
 };
 use crate::analyzer::semantic::{
     AllocationSite, BasicBlock, CallSiteHandle, CapabilitySupport, CaptureBinding, ContentIdentity,
-    ControlEdge, ControlEdgeHandle, ControlEdgeId, Evidence, EvidenceCompleteness,
-    LengthDelimitedDigest, MemoryLocation, ProcedureHandle, ProcedureSemantics, ProgramPoint,
-    ProgramPointHandle, ProgramPointId, ProofStatus, SemanticArtifact, SemanticArtifactLeaseChild,
-    SemanticArtifactLeaseError, SemanticArtifactLeaseLiveReservation, SemanticArtifactLeaseSet,
-    SemanticArtifactLeaseSnapshot, SemanticArtifactLeaseWindow, SemanticBudget,
-    SemanticBudgetDimension, SemanticBudgetScopeSnapshot, SemanticCallSite, SemanticCapability,
-    SemanticEvent, SemanticExecutionBudget, SemanticExecutionBudgetSnapshot, SemanticGap,
-    SemanticLocator, SemanticOutcome, SemanticRequest, SemanticValue, SemanticWork, SourceMapping,
-    ValueId,
+    ControlEdge, ControlEdgeHandle, ControlEdgeId, DeclarationSegmentKind, DispatchBoundaryKind,
+    Evidence, EvidenceCompleteness, ExecutionTiming, HeapOracle, LengthDelimitedDigest,
+    MemoryLocation, ObservationPhase, OracleCallContext, ProcedureHandle, ProcedureSemantics,
+    ProgramPoint, ProgramPointHandle, ProgramPointId, ProofStatus, SemanticArtifact,
+    SemanticArtifactLeaseChild, SemanticArtifactLeaseError, SemanticArtifactLeaseLiveReservation,
+    SemanticArtifactLeaseSet, SemanticArtifactLeaseSnapshot, SemanticArtifactLeaseWindow,
+    SemanticBudget, SemanticBudgetDimension, SemanticBudgetScopeSnapshot, SemanticCallSite,
+    SemanticCapability, SemanticEvent, SemanticExecutionBudget, SemanticExecutionBudgetSnapshot,
+    SemanticGap, SemanticLocator, SemanticOutcome, SemanticRequest, SemanticValue, SemanticWork,
+    SourceMapping, ValueAtPoint, ValueHandle, ValueId,
 };
 use crate::analyzer::semantic_model::{ActiveSemanticModelSnapshot, SemanticModelOverlay};
 use crate::analyzer::{ProjectFile, WorkspaceAnalyzer};
@@ -141,6 +143,12 @@ pub(super) struct SemanticCallResultValue {
     file: ProjectFile,
     source: SemanticSourceSnapshot,
     quality: SemanticQueryQuality,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct ExactObjectIdentity {
+    pub(super) id: String,
+    pub(super) cardinality: &'static str,
 }
 
 #[derive(Debug, Clone)]
@@ -435,6 +443,60 @@ impl<'a> SemanticQueryContext<'a> {
             .cloned()
     }
 
+    pub(super) fn exact_object_identity(
+        &mut self,
+        value: ValueHandle,
+        point: ProgramPointHandle,
+    ) -> Result<ExactObjectIdentity, &'static str> {
+        let query = ValueAtPoint::new(
+            value,
+            point,
+            ObservationPhase::BeforeEffects,
+            OracleCallContext::empty(),
+        )
+        .expect("detached transfer value and call point share one procedure");
+        let cancellation = self.cancellation.unwrap_or(&self.uncancelled);
+        let artifact_collector = self
+            .artifact_window
+            .as_ref()
+            .map(SemanticArtifactLeaseWindow::collector);
+        let mut request = SemanticRequest::new(&mut self.budget, cancellation);
+        if let Some(collector) = &artifact_collector {
+            request = request.with_artifact_collector(collector);
+        }
+        let outcome = self
+            .workspace
+            .semantic_oracle_provider()
+            .pointees(&query, &mut request)
+            .map_err(|_| "heap_provider_failed")?;
+        let Some(result) = outcome.available_value() else {
+            return Err("heap_result_unavailable");
+        };
+        if !outcome.is_complete() || !result.objects().coverage().is_exhaustive() {
+            return Err("object_set_open");
+        }
+        let [candidate] = result.objects().candidates() else {
+            return Err(if result.objects().candidates().is_empty() {
+                "object_identity_absent"
+            } else {
+                "object_identity_ambiguous"
+            });
+        };
+        if !candidate.is_proven_complete() {
+            return Err("object_identity_unproven");
+        }
+        let object = candidate.value();
+        Ok(ExactObjectIdentity {
+            id: brokk_bifrost_flow::typestate::TypestateObjectKey::for_object(object)
+                .public_canonical_rendering(),
+            cardinality: match object.cardinality() {
+                crate::analyzer::semantic::ObjectCardinality::Singleton => "singleton",
+                crate::analyzer::semantic::ObjectCardinality::Summary => "summary",
+                crate::analyzer::semantic::ObjectCardinality::Unknown => "unknown",
+            },
+        })
+    }
+
     fn take_prepared_source_dispatch(&mut self) -> Option<PreparedSourceDispatchCache<'a>> {
         let prepared = self.prepared_source_dispatch.take()?;
         assert!(
@@ -685,18 +747,42 @@ impl<'a> SemanticQueryContext<'a> {
 
         let coverage = result.coverage();
         let mut arms = Vec::new();
+        let mut call_contexts = Vec::with_capacity(result.observations().len());
         let mut unnamed_boundaries = Vec::new();
         for observation in result.observations() {
+            let call = observation.call();
+            let semantic_call = call
+                .procedure()
+                .semantics()
+                .call_site(call.id())
+                .expect("source dispatch retains a valid semantic call-site handle");
+            let caller_locator = call.procedure().semantics().locator();
+            let caller = self.definition_for_locator(caller_locator);
+            let caller_is_exact = caller
+                .as_ref()
+                .is_some_and(|unit| self.locator_exactly_names_unit(caller_locator, unit));
+            let call_context = call_contexts.len();
+            call_contexts.push(super::dispatch::DispatchCallContext {
+                caller,
+                caller_is_exact,
+            });
             for candidate in observation.dispatch().candidates() {
                 let target = candidate.target();
                 let locator = target.semantics().locator();
                 arms.push(DispatchArm {
+                    call_context,
+                    execution_timing: dispatch_arm_execution_timing(
+                        semantic_call.execution_timing,
+                        None,
+                    ),
                     target_id: super::dispatch::target_identity(
                         Some(target.artifact().key().public_fingerprint().to_string()).as_deref(),
                         locator,
                     ),
                     target_path: locator.path().as_str().to_string(),
-                    target_unit: self.definition_for_locator(locator),
+                    target_unit: self
+                        .definition_for_locator(locator)
+                        .filter(|unit| self.locator_exactly_names_unit(locator, unit)),
                     exact_external_target: None,
                     // A dispatch candidate names a materialized procedure, so
                     // it never carries an unmaterialized identity.
@@ -720,9 +806,16 @@ impl<'a> SemanticQueryContext<'a> {
                     .exact_external_target()
                     .map(|target| target.artifact().public_fingerprint().to_string());
                 arms.push(DispatchArm {
+                    call_context,
+                    execution_timing: dispatch_arm_execution_timing(
+                        semantic_call.execution_timing,
+                        Some(&boundary.kind),
+                    ),
                     target_id: super::dispatch::target_identity(fingerprint.as_deref(), locator),
                     target_path: locator.path().as_str().to_string(),
-                    target_unit: self.definition_for_locator(locator),
+                    target_unit: self
+                        .definition_for_locator(locator)
+                        .filter(|unit| self.locator_exactly_names_unit(locator, unit)),
                     exact_external_target: boundary.exact_external_target().cloned(),
                     // #1978: a fully-qualified callee the workspace never
                     // materializes still has a canonical member identity. It
@@ -743,6 +836,7 @@ impl<'a> SemanticQueryContext<'a> {
             semantic_unsupported,
             exceeded_limit,
             arms,
+            call_contexts,
             unnamed_boundaries,
         }
     }
@@ -1106,6 +1200,55 @@ impl<'a> SemanticQueryContext<'a> {
         super::dispatch::declaration_at_locator(self.workspace.analyzer(), locator, &file)
     }
 
+    /// Whether a semantic procedure locator names this declaration itself,
+    /// rather than only a nested callable structurally contained by it.
+    ///
+    /// Exact source ranges are sufficient. Language extractors may instead
+    /// retain a declaration wrapper (for example, TypeScript's `export`
+    /// statement) around the callable node. In that case the locator's named
+    /// declaration path must match the declaration's structured FQ-name suffix.
+    /// An anonymous locator never borrows the enclosing named declaration.
+    fn locator_exactly_names_unit(
+        &self,
+        locator: &SemanticLocator,
+        unit: &crate::analyzer::CodeUnit,
+    ) -> bool {
+        let span = locator.anchor().span();
+        let ranges = self.workspace.analyzer().ranges_of(unit);
+        if ranges.iter().any(|range| {
+            range.start_byte == span.start_byte() as usize
+                && range.end_byte == span.end_byte() as usize
+        }) {
+            return true;
+        }
+        if !ranges.iter().any(|range| {
+            range.start_byte <= span.start_byte() as usize
+                && range.end_byte >= span.end_byte() as usize
+        }) {
+            return false;
+        }
+
+        let mut locator_names = Vec::new();
+        for segment in locator.declaration().segments() {
+            if segment.kind() == DeclarationSegmentKind::File {
+                continue;
+            }
+            let Some(name) = segment.name() else {
+                return false;
+            };
+            locator_names.push(name);
+        }
+        if locator_names.is_empty() {
+            return false;
+        }
+        let unit_names = unit.fq_segment_texts();
+        locator_names.len() <= unit_names.len()
+            && unit_names[unit_names.len() - locator_names.len()..]
+                .iter()
+                .zip(locator_names)
+                .all(|(unit_name, locator_name)| unit_name == locator_name)
+    }
+
     pub(super) fn procedure_of_match(&mut self, seed: &SeedMatch) -> Vec<SemanticProcedureValue> {
         let ranges = [seed_range(seed)];
         let Some((artifact, source, quality)) = self.materialize(&seed.file) else {
@@ -1408,6 +1551,69 @@ impl<'a> SemanticQueryContext<'a> {
             cancellation,
             self.active_semantic_model_snapshot.clone(),
         )
+    }
+
+    pub(super) fn concurrent_access_conflicts(
+        &mut self,
+        procedure: &SemanticProcedureValue,
+    ) -> Vec<ConcurrentAccessConflictValue> {
+        let cancellation = self.cancellation.unwrap_or(&self.uncancelled);
+        let artifact_collector = self
+            .artifact_window
+            .as_ref()
+            .map(SemanticArtifactLeaseWindow::collector);
+        let mut request = SemanticRequest::new(&mut self.budget, cancellation);
+        if let Some(collector) = &artifact_collector {
+            request = request.with_artifact_collector(collector);
+        }
+        let provider = WorkspaceConcurrencyProvider::new(
+            self.workspace,
+            self.active_semantic_model_snapshot.clone(),
+        );
+        match brokk_bifrost_flow::concurrency::concurrent_access_conflicts(
+            &provider,
+            &procedure.handle,
+            &mut request,
+        ) {
+            Ok(report) => {
+                if !report.reasons.is_empty() {
+                    let code = if report.reasons.contains(
+                        &brokk_bifrost_flow::concurrency::ConcurrencyOpenReason::BudgetExhausted,
+                    ) {
+                        CodeQueryDiagnosticCode::SemanticBudgetExhausted
+                    } else {
+                        CodeQueryDiagnosticCode::SemanticAnalysisPartial
+                    };
+                    self.diagnostics.push(CodeQueryDiagnostic {
+                        code,
+                        impact: CodeQueryDiagnosticImpact::Incomplete,
+                        branch: Vec::new(),
+                        language: "go",
+                        message: format!(
+                            "concurrent access analysis retained incomplete task slices: {:?}",
+                            report.reasons
+                        ),
+                    });
+                }
+                report
+                    .conflicts
+                    .into_iter()
+                    .map(|conflict| {
+                        super::concurrency::project_conflict(self.workspace, procedure, conflict)
+                    })
+                    .collect()
+            }
+            Err(error) => {
+                self.diagnostics.push(CodeQueryDiagnostic {
+                    code: CodeQueryDiagnosticCode::SemanticProviderFailed,
+                    impact: CodeQueryDiagnosticImpact::Incomplete,
+                    branch: Vec::new(),
+                    language: "workspace",
+                    message: format!("concurrent access analysis failed: {error}"),
+                });
+                Vec::new()
+            }
+        }
     }
 
     pub(super) fn typestate_witness_truncated(&mut self, count: usize) {
@@ -2273,6 +2479,25 @@ impl<'a> SemanticQueryContext<'a> {
     }
 }
 
+/// Refine source-call timing with facts that apply only to one dispatch arm.
+///
+/// A deferred target boundary says the target body does not execute as an
+/// ordinary invocation of this source call. Until async/generator resumption
+/// has an exact schedule model, that arm is unknown. An explicit Go spawn has
+/// already established that all work reached through the call is in a
+/// different task, so a deferred target cannot weaken that fact.
+fn dispatch_arm_execution_timing(
+    source: ExecutionTiming,
+    boundary: Option<&DispatchBoundaryKind>,
+) -> ExecutionTiming {
+    match boundary {
+        Some(DispatchBoundaryKind::Deferred { .. }) if source != ExecutionTiming::DifferentTask => {
+            ExecutionTiming::Unknown
+        }
+        _ => source,
+    }
+}
+
 /// CFG-specific projection over the reusable request-local semantic context.
 ///
 /// Later flow or typestate adapters can share the same coherent
@@ -2858,6 +3083,26 @@ pub(crate) fn program_point_wire_id(handle: &ProgramPointHandle) -> String {
     brokk_bifrost_flow::flow_state::program_point_wire_id(handle)
 }
 
+pub(crate) fn semantic_value_wire_id(value: &ValueHandle) -> String {
+    let identity = crate::analyzer::semantic::DurableValueIdentity::of(value)
+        .expect("validated semantic value has a durable source identity");
+    let mut digest = LengthDelimitedDigest::new(b"bifrost.code_query.semantic_value.v1");
+    digest.push(
+        value
+            .procedure()
+            .artifact()
+            .key()
+            .public_fingerprint()
+            .as_bytes(),
+    );
+    identity.locator.push_stable_identity(&mut digest);
+    digest.push(identity.role.as_bytes());
+    if let Some(ordinal) = identity.ordinal {
+        digest.push(&ordinal.to_le_bytes());
+    }
+    digest.finish().to_string()
+}
+
 pub(crate) fn control_edge_wire_id(handle: &ControlEdgeHandle) -> String {
     let procedure = handle.procedure();
     let edge = procedure
@@ -2975,11 +3220,11 @@ mod tests {
     use crate::analyzer::semantic::{
         AdapterSemanticsVersion, BasicBlock, BlockId, CandidateCoverage, ConfigurationFingerprint,
         ContentIdentity, ControlEdgeId, ControlEdgeKind, DeclarationLocator, DeclarationSegment,
-        DeclarationSegmentKind, DependencyFingerprint, EvidenceId, ProcedureId, ProcedureKind,
-        ProcedureSemanticsParts, ProgramPointId, SemanticArtifactKey, SemanticArtifactLeaseSet,
-        SemanticCapabilities, SemanticEvent, SemanticIrVersion, SemanticLanguage, SemanticRole,
-        SourceAnchor, SourceMappingId, SourceMappingKind, SourcePosition, SourceRevision,
-        SourceSpan, WorkspaceMountId, WorkspaceRelativePath,
+        DeclarationSegmentKind, DeferredInvocationKind, DependencyFingerprint, EvidenceId,
+        ProcedureId, ProcedureKind, ProcedureSemanticsParts, ProgramPointId, SemanticArtifactKey,
+        SemanticArtifactLeaseSet, SemanticCapabilities, SemanticEvent, SemanticIrVersion,
+        SemanticLanguage, SemanticRole, SourceAnchor, SourceMappingId, SourceMappingKind,
+        SourcePosition, SourceRevision, SourceSpan, WorkspaceMountId, WorkspaceRelativePath,
     };
 
     #[test]
@@ -4315,6 +4560,37 @@ mod tests {
             program_point_wire_id(&first),
             program_point_wire_id(&second),
             "valid ordinary points that share source and evidence rows must not collide"
+        );
+    }
+
+    #[test]
+    fn deferred_dispatch_boundary_weakens_only_unestablished_arm_timing() {
+        let artifact = parallel_edge_artifact(false);
+        let target = artifact
+            .procedure_handle(ProcedureId::new(0))
+            .expect("test procedure exists")
+            .semantics()
+            .locator()
+            .clone();
+        let deferred = DispatchBoundaryKind::Deferred {
+            target,
+            kind: DeferredInvocationKind::Async,
+        };
+
+        assert_eq!(
+            dispatch_arm_execution_timing(ExecutionTiming::SameEvaluation, Some(&deferred)),
+            ExecutionTiming::Unknown,
+            "an ordinary call does not establish when a deferred target body runs"
+        );
+        assert_eq!(
+            dispatch_arm_execution_timing(ExecutionTiming::DifferentTask, Some(&deferred)),
+            ExecutionTiming::DifferentTask,
+            "an explicit spawn independently establishes a different task"
+        );
+        assert_eq!(
+            dispatch_arm_execution_timing(ExecutionTiming::SameEvaluation, None),
+            ExecutionTiming::SameEvaluation,
+            "an ordinary materialized arm retains the source call timing"
         );
     }
 }

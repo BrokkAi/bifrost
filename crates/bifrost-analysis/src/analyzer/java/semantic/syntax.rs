@@ -443,15 +443,6 @@ pub(super) fn missing_field(node: Node<'_>, field: &str) -> JavaLoweringError {
     ))
 }
 
-pub(super) fn node_range(node: Node<'_>) -> Range {
-    Range {
-        start_byte: node.start_byte(),
-        end_byte: node.end_byte(),
-        start_line: node.start_position().row + 1,
-        end_line: node.end_position().row + 1,
-    }
-}
-
 pub(super) fn is_java_nested_execution_boundary(node: Node<'_>) -> bool {
     matches!(
         node.kind(),

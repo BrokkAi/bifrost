@@ -45,6 +45,7 @@ impl JdkSourceArchivePackProducer {
             return ArtifactProduction::failed(
                 ProducerDiagnostic {
                     severity: ProducerDiagnosticSeverity::Error,
+                    source_entry: None,
                     code: "artifact.kind".to_owned(),
                     location: None,
                     declaration: None,
@@ -57,6 +58,7 @@ impl JdkSourceArchivePackProducer {
             return ArtifactProduction::failed(
                 ProducerDiagnostic {
                     severity: ProducerDiagnosticSeverity::Error,
+                    source_entry: None,
                     code: "jdk.activation.missing".to_owned(),
                     location: None,
                     declaration: None,
@@ -91,6 +93,7 @@ impl JdkSourceArchivePackProducer {
             return ArtifactProduction::failed(
                 ProducerDiagnostic {
                     severity: ProducerDiagnosticSeverity::Error,
+                    source_entry: None,
                     code: "limit.archive_directory".to_owned(),
                     location: None,
                     declaration: None,
@@ -106,6 +109,7 @@ impl JdkSourceArchivePackProducer {
                 return ArtifactProduction::failed(
                     ProducerDiagnostic {
                         severity: ProducerDiagnosticSeverity::Error,
+                        source_entry: None,
                         code: "jdk.archive.invalid".to_owned(),
                         location: None,
                         declaration: None,
@@ -411,7 +415,7 @@ impl JdkSourceArchivePackProducer {
             return failed_with_diagnostics(artifact.sha256(), diagnostics);
         }
         let (diagnostics, suppressed_diagnostics) = diagnostics.finish();
-        let completeness = if diagnostics.is_empty() && suppressed_diagnostics == 0 {
+        let completeness = if diagnostics.is_empty() && suppressed_diagnostics.total() == 0 {
             Completeness::Complete
         } else {
             Completeness::Partial
@@ -456,6 +460,7 @@ pub fn detect_jdk_source_archive_layout(
     {
         return Err(ProducerDiagnostic {
             severity: ProducerDiagnosticSeverity::Error,
+            source_entry: None,
             code: "limit.archive_directory".to_owned(),
             location: Some(artifact.path().to_string_lossy().into_owned()),
             declaration: None,
@@ -465,6 +470,7 @@ pub fn detect_jdk_source_archive_layout(
     let mut archive =
         ZipArchive::new(Cursor::new(artifact.bytes())).map_err(|_| ProducerDiagnostic {
             severity: ProducerDiagnosticSeverity::Error,
+            source_entry: None,
             code: "jdk.archive.invalid".to_owned(),
             location: Some(artifact.path().to_string_lossy().into_owned()),
             declaration: None,
@@ -491,6 +497,7 @@ pub fn detect_jdk_source_archive_layout(
     if module_prefixed && flat {
         return Err(ProducerDiagnostic {
             severity: ProducerDiagnosticSeverity::Error,
+            source_entry: None,
             code: "jdk.layout.ambiguous".to_owned(),
             location: Some(artifact.path().to_string_lossy().into_owned()),
             declaration: None,
@@ -591,6 +598,7 @@ fn cancelled_production(limits: &ArtifactProducerLimits) -> ArtifactProduction {
     ArtifactProduction::failed(
         ProducerDiagnostic {
             severity: ProducerDiagnosticSeverity::Error,
+            source_entry: None,
             code: "artifact.cancelled".to_owned(),
             location: None,
             declaration: None,

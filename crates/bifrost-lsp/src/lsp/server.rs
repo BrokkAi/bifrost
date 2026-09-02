@@ -5,6 +5,7 @@ use std::io::{self, Read};
 use std::panic;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex, Once};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -22,8 +23,8 @@ use lsp_types::request::{
     CallHierarchyIncomingCalls, CallHierarchyOutgoingCalls, CallHierarchyPrepare,
     CodeActionRequest, Completion, DocumentDiagnosticRequest, DocumentHighlightRequest,
     DocumentSymbolRequest, FoldingRangeRequest, Formatting, GotoDeclaration, GotoDefinition,
-    GotoImplementation, GotoTypeDefinition, HoverRequest, PrepareRenameRequest, References,
-    RegisterCapability, Rename, Request as LspRequestTrait, SemanticTokensFullRequest,
+    GotoImplementation, GotoTypeDefinition, HoverRequest, OnTypeFormatting, PrepareRenameRequest,
+    References, RegisterCapability, Rename, Request as LspRequestTrait, SemanticTokensFullRequest,
     SignatureHelpRequest, TypeHierarchyPrepare, TypeHierarchySubtypes, TypeHierarchySupertypes,
     WorkDoneProgressCreate, WorkspaceConfiguration, WorkspaceSymbolRequest,
 };
@@ -46,8 +47,8 @@ use crate::analyzer::semantic::WorkspaceRelativePath;
 use crate::analyzer::{
     AnalyzerConfig, AnalyzerQueryScope, BIFROST_IGNORE_FILE_NAME, BuildProgressEvent,
     BuildProgressPhase, EmptyAnalyzer, FilesystemProject, IndexWarmer, MultiRootProject,
-    OverlayProject, Project, ProjectFile, PythonAnalyzerConfig, PythonEnvironmentConfig,
-    WorkspaceAnalyzer,
+    OverlayProject, Project, ProjectCoverage, ProjectFile, PythonAnalyzerConfig,
+    PythonEnvironmentConfig, WorkspaceAnalyzer,
     packs_document::{
         WORKSPACE_PACKS_DOCUMENT_PATH, WorkspacePacksConfig, load_workspace_packs_config_at,
         workspace_pack_ecosystems,
@@ -70,8 +71,8 @@ use crate::lsp::handlers::util::{
 };
 use crate::lsp::handlers::{
     call_hierarchy, completion, definition, diagnostic, document_highlight, document_symbol,
-    folding_range, formatting, hover, references, rename, rune_ir, semantic_tokens, signature_help,
-    type_definition, type_hierarchy, workspace_symbol,
+    folding_range, formatting, hover, on_type_formatting, references, rename, rune_ir,
+    semantic_tokens, signature_help, type_definition, type_hierarchy, workspace_symbol,
 };
 use crate::lsp::progress::work_done_progress_message;
 use crate::lsp::request_context::{RequestCancelled, RequestContext};
@@ -765,6 +766,9 @@ fn handle_request(
     }
     if req.method == Formatting::METHOD {
         return handle_formatting_request(connection, state, req);
+    }
+    if req.method == OnTypeFormatting::METHOD {
+        return handle_on_type_formatting_request(connection, state, req);
     }
     if req.method == References::METHOD {
         return handle_references_request(connection, state, req);
@@ -1771,6 +1775,7 @@ fn run_rql_query_result(
                     CodeQueryResultValue::ProgramPoint { value } => &value.path,
                     CodeQueryResultValue::ControlEdge { value } => &value.path,
                     CodeQueryResultValue::TypestateFinding { value } => &value.path,
+                    CodeQueryResultValue::ConcurrentAccessConflict { value } => &value.path,
                     CodeQueryResultValue::TypestateWitness { value } => &value.path,
                     CodeQueryResultValue::FlowEndpoint { value } => &value.path,
                     CodeQueryResultValue::FlowWitness { value } => &value.path,
@@ -1781,11 +1786,13 @@ fn run_rql_query_result(
                     CodeQueryResultValue::ExpressionSite { value } => &value.path,
                     CodeQueryResultValue::JsxAttributeValue { value } => &value.path,
                     CodeQueryResultValue::ReceiverAnalysis { value } => &value.path,
+                    CodeQueryResultValue::MemberTargetAnalysis { value } => &value.path,
                     CodeQueryResultValue::ReceiverOutcome { value } => &value.path,
                     CodeQueryResultValue::MemberSelection { value } => &value.path,
                     CodeQueryResultValue::MemberFamily { value } => &value.path,
                     CodeQueryResultValue::MemberFamilyEdge { value } => &value.path,
                     CodeQueryResultValue::ReceiverEvidence { value } => &value.path,
+                    CodeQueryResultValue::FieldWriteValue { value } => &value.path,
                     CodeQueryResultValue::CallShape { value } => &value.path,
                     CodeQueryResultValue::CallResult { value } => &value.path,
                     CodeQueryResultValue::CallArgumentGroup { value } => &value.path,
@@ -1795,6 +1802,9 @@ fn run_rql_query_result(
                     CodeQueryResultValue::CallResultContract { value } => &value.path,
                     CodeQueryResultValue::ResultContractUse { value } => &value.path,
                     CodeQueryResultValue::ResultContractFailureUse { value } => &value.path,
+                    CodeQueryResultValue::NilnessOperation { value } => &value.path,
+                    CodeQueryResultValue::SwitchCoverage { value } => &value.path,
+                    CodeQueryResultValue::DetachedTaskTransfer { value } => &value.path,
                     CodeQueryResultValue::ProcedureEffect { value } => &value.path,
                     CodeQueryResultValue::CallableSignature { value } => &value.path,
                     CodeQueryResultValue::SignatureParameter { value } => &value.path,
@@ -2091,50 +2101,211 @@ fn handle_formatting_request(
     let jobs = state.formatting_jobs.clone();
     thread::spawn(move || {
         let result = formatting::run_prepared_with_cancellation(prepared, &cancellation);
-        let current_generation = generations
-            .lock()
-            .expect("document generation lock poisoned")
-            .get(document_uri.as_str())
-            .copied()
-            .unwrap_or(0);
-        let response = if current_generation != document_generation && !cancellation.is_cancelled()
-        {
-            Response::new_ok(id.clone(), serde_json::Value::Array(Vec::new()))
-        } else {
-            match result {
-                Ok(edits) => match serde_json::to_value(edits) {
-                    Ok(value) => Response::new_ok(id.clone(), value),
-                    Err(err) => Response::new_err(
-                        id.clone(),
-                        ErrorCode::InternalError as i32,
-                        format!("Failed to serialize {method} result: {err}"),
-                    ),
-                },
-                Err(message) if cancellation.is_cancelled() => {
-                    Response::new_err(id.clone(), ErrorCode::RequestCanceled as i32, message)
-                }
-                Err(message) => {
-                    Response::new_err(id.clone(), ErrorCode::InternalError as i32, message)
-                }
-            }
-        };
-        if let Some(error) = response.error.as_ref() {
-            eprintln!(
-                "[bifrost-lsp] request error method={} id={:?} code={} message={}",
-                method, id, error.code, error.message
-            );
-        }
-        if let Err(err) = sender.send(Message::Response(response)) {
-            eprintln!(
-                "[bifrost-lsp] failed to send formatting response method={} id={:?}: {err}",
-                method, id
-            );
-        }
+        let response = formatting_edit_response(
+            &method,
+            id.clone(),
+            result,
+            &cancellation,
+            &generations,
+            &document_uri,
+            document_generation,
+        );
+        send_formatting_response(&sender, &method, &id, response);
         jobs.remove(&id);
         drop(active_request);
         drop(slot);
     });
     Ok(())
+}
+
+/// Answer one on-type formatting trigger.
+///
+/// The capability is global in LSP, so most triggers arrive for documents the
+/// in-process S-expression formatters do not cover. Those are answered with an
+/// empty edit list before any text is copied or parsed, and no formatter
+/// command is ever resolved or run on type.
+fn handle_on_type_formatting_request(
+    connection: &Connection,
+    state: &ServerState,
+    req: Request,
+) -> Result<(), String> {
+    let id = req.id.clone();
+    let method = req.method.clone();
+    let params =
+        match req.extract::<lsp_types::DocumentOnTypeFormattingParams>(OnTypeFormatting::METHOD) {
+            Ok((_, params)) => params,
+            Err(ExtractError::JsonError { error, .. }) => {
+                let response = Response::new_err(
+                    id,
+                    ErrorCode::InvalidParams as i32,
+                    format!("Failed to decode params for {method}: {error}"),
+                );
+                return connection
+                    .sender
+                    .send(Message::Response(response))
+                    .map_err(|err| format!("Failed to send LSP response: {err}"));
+            }
+            Err(ExtractError::MethodMismatch(_)) => {
+                let response = Response::new_err(
+                    id,
+                    ErrorCode::MethodNotFound as i32,
+                    format!("Method not implemented: {method}"),
+                );
+                return connection
+                    .sender
+                    .send(Message::Response(response))
+                    .map_err(|err| format!("Failed to send LSP response: {err}"));
+            }
+        };
+    let document_uri = params.text_document_position.text_document.uri.clone();
+    let Some((language_id, text)) = state
+        .open_documents
+        .get(document_uri.as_str())
+        .filter(|document| on_type_formatting::is_supported_language(&document.language_id))
+        .map(|document| (document.language_id.clone(), document.text.clone()))
+    else {
+        return send_no_edits(connection, id);
+    };
+    // Typing must not queue behind a whole-document format, and a trigger that
+    // cannot start now is not worth an error the editor would surface to the
+    // author. Answer with no edits and let the next keystroke try again.
+    let Some(slot) = state.formatting_jobs.try_acquire() else {
+        return send_no_edits(connection, id);
+    };
+    let Some(active_request) = state.active_request_ids.try_reserve(id.clone()) else {
+        let response = Response::new_err(
+            id,
+            ErrorCode::InvalidRequest as i32,
+            "request id is already active".to_string(),
+        );
+        return connection
+            .sender
+            .send(Message::Response(response))
+            .map_err(|err| format!("Failed to send LSP response: {err}"));
+    };
+    let position = params.text_document_position.position;
+    let document_generation = state.document_generation(&document_uri);
+    let cancellation = formatting::FormatterCancellation::new();
+    state
+        .formatting_jobs
+        .insert(id.clone(), cancellation.clone());
+    let sender = connection.sender.clone();
+    let generations = Arc::clone(&state.document_generations);
+    let jobs = state.formatting_jobs.clone();
+    let worker_cancellation = cancellation.clone();
+    let worker_id = id.clone();
+    let (result_sender, result_receiver) = mpsc::sync_channel(1);
+    thread::spawn(move || {
+        let result = on_type_formatting::format_on_type(
+            &language_id,
+            &text,
+            &position,
+            &worker_cancellation,
+        );
+        if result_sender.send(result).is_err() {
+            // The responder already answered with no edits once
+            // ON_TYPE_FORMATTING_BUDGET expired, so this late result has no
+            // consumer. Releasing the slot below is all that is left to do.
+        }
+        jobs.remove(&worker_id);
+        drop(active_request);
+        drop(slot);
+    });
+    thread::spawn(move || {
+        // The formatter is pure and in-process but cannot be preempted, so the
+        // budget bounds what the editor waits for rather than the work itself.
+        // A trigger that has produced nothing in time is answered with no
+        // edits, and the abandoned worker exits on its own.
+        let response = match result_receiver.recv_timeout(formatting::ON_TYPE_FORMATTING_BUDGET) {
+            Ok(result) => formatting_edit_response(
+                &method,
+                id.clone(),
+                result,
+                &cancellation,
+                &generations,
+                &document_uri,
+                document_generation,
+            ),
+            Err(RecvTimeoutError::Timeout) => {
+                Response::new_ok(id.clone(), serde_json::Value::Array(Vec::new()))
+            }
+            Err(RecvTimeoutError::Disconnected) => Response::new_err(
+                id.clone(),
+                ErrorCode::InternalError as i32,
+                format!("{method} stopped before it produced a result"),
+            ),
+        };
+        send_formatting_response(&sender, &method, &id, response);
+    });
+    Ok(())
+}
+
+/// Build the response for a finished formatting run.
+///
+/// A document that changed while the formatter ran gets an empty edit list:
+/// the edits describe text the client no longer holds. An explicitly cancelled
+/// run reports `RequestCanceled` so the client can tell the two apart.
+fn formatting_edit_response(
+    method: &str,
+    id: RequestId,
+    result: Result<Vec<TextEdit>, String>,
+    cancellation: &formatting::FormatterCancellation,
+    generations: &Mutex<HashMap<String, u64>>,
+    document_uri: &Uri,
+    document_generation: u64,
+) -> Response {
+    let current_generation = generations
+        .lock()
+        .expect("document generation lock poisoned")
+        .get(document_uri.as_str())
+        .copied()
+        .unwrap_or(0);
+    if current_generation != document_generation && !cancellation.is_cancelled() {
+        return Response::new_ok(id, serde_json::Value::Array(Vec::new()));
+    }
+    match result {
+        Ok(edits) => match serde_json::to_value(edits) {
+            Ok(value) => Response::new_ok(id, value),
+            Err(err) => Response::new_err(
+                id,
+                ErrorCode::InternalError as i32,
+                format!("Failed to serialize {method} result: {err}"),
+            ),
+        },
+        Err(message) if cancellation.is_cancelled() => {
+            Response::new_err(id, ErrorCode::RequestCanceled as i32, message)
+        }
+        Err(message) => Response::new_err(id, ErrorCode::InternalError as i32, message),
+    }
+}
+
+fn send_formatting_response(
+    sender: &crossbeam_channel::Sender<Message>,
+    method: &str,
+    id: &RequestId,
+    response: Response,
+) {
+    if let Some(error) = response.error.as_ref() {
+        eprintln!(
+            "[bifrost-lsp] request error method={} id={:?} code={} message={}",
+            method, id, error.code, error.message
+        );
+    }
+    if let Err(err) = sender.send(Message::Response(response)) {
+        eprintln!(
+            "[bifrost-lsp] failed to send formatting response method={} id={:?}: {err}",
+            method, id
+        );
+    }
+}
+
+/// Answer a request with an empty edit list.
+fn send_no_edits(connection: &Connection, id: RequestId) -> Result<(), String> {
+    let response = Response::new_ok(id, serde_json::Value::Array(Vec::new()));
+    connection
+        .sender
+        .send(Message::Response(response))
+        .map_err(|err| format!("Failed to send LSP response: {err}"))
 }
 
 /// Decode the typed params for an LSP request and run `handler`, mapping any
@@ -3423,7 +3594,21 @@ impl ServerState {
     /// indexes (#1582). Free when the snapshot is already warm; the clone
     /// shares the generation's lazy-index cells with `self.workspace`.
     fn schedule_index_warm(&self) {
-        self.index_warmer.schedule(Arc::new(self.workspace.clone()));
+        if self.workspace.query_indexes_warm() {
+            return;
+        }
+        self.index_warmer
+            .schedule(Arc::new(self.index_warm_snapshot()));
+    }
+
+    /// Freeze the editor overlay before handing a workspace to the index
+    /// warmer. A plain analyzer clone still points at the live mutable overlay;
+    /// if a later edit lands while that clone is warming, it can publish the
+    /// new source identity into the previous generation and make the
+    /// foreground update incorrectly look unchanged.
+    fn index_warm_snapshot(&self) -> WorkspaceAnalyzer {
+        let project: Arc<dyn Project> = Arc::new(self.overlay.snapshot());
+        self.workspace.clone_for_index_warm(project)
     }
 
     /// Queue a background dependency-pack activation for the current snapshot
@@ -3858,6 +4043,15 @@ impl ScopedProject {
 impl Project for ScopedProject {
     fn root(&self) -> &Path {
         self.inner.root()
+    }
+
+    /// Exclusions configure what this workspace *is*, the way `.gitignore` and
+    /// `.bifrostignore` do; they do not slice a workspace into a session-sized
+    /// subset the way an enumerated `FileSetProject` does. So this reports the
+    /// delegate's coverage unchanged rather than counting survivors: an answer
+    /// over the configured workspace is a whole-workspace answer (#2770).
+    fn coverage(&self) -> ProjectCoverage {
+        self.inner.coverage()
     }
 
     fn workspace_root_for_file(&self, file: &ProjectFile) -> PathBuf {
@@ -4682,6 +4876,142 @@ mod tests {
     }
 
     #[test]
+    fn index_warm_snapshot_cannot_advance_to_a_later_editor_overlay() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let valid = "trait Runnable {}\npub struct Worker;\nimpl Runnable for Worker {}\n";
+        let malformed =
+            "trait Runnable {}\npub struct Worker;\nimpl Runnable for Worker {}\nfn broken( {\n";
+        let path = root.join("src/lib.rs");
+        std::fs::write(&path, valid).unwrap();
+        let params: InitializeParams = serde_json::from_value(json!({
+            "processId": null,
+            "rootUri": path_to_uri_string(&root),
+            "capabilities": {}
+        }))
+        .unwrap();
+        let config = collect_workspace_config(&params, &root).unwrap();
+        let mut state = ServerState::new(config, None).unwrap();
+        let file = ProjectFile::new(root, "src/lib.rs");
+
+        assert!(state.overlay.set(path.clone(), valid.to_string()));
+        let changed = BTreeSet::from([file.clone()]);
+        state.workspace = state.workspace.update(&changed);
+        let warm_snapshot = state.index_warm_snapshot();
+
+        assert!(state.overlay.set(path, malformed.to_string()));
+        warm_snapshot.warm_query_indexes();
+
+        assert_eq!(
+            warm_snapshot
+                .analyzer()
+                .project()
+                .read_source(&file)
+                .unwrap(),
+            valid,
+            "a queued warm must retain the source generation it was scheduled for"
+        );
+        assert_eq!(state.project().read_source(&file).unwrap(), malformed);
+
+        state.workspace = state.workspace.update(&changed);
+        let errors = state
+            .workspace
+            .analyzer()
+            .parse_errors(&file)
+            .expect("the edited overlay was reparsed");
+        assert!(
+            !errors.is_empty(),
+            "the old warm must not make the malformed editor generation look unchanged"
+        );
+    }
+
+    #[test]
+    fn overlay_queries_cannot_advance_indexed_generation_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let valid = "trait Runnable {}\npub struct Worker;\nimpl Runnable for Worker {}\n";
+        let malformed =
+            "trait Runnable {}\npub struct Worker;\nimpl Runnable for Worker {}\nfn broken( {\n";
+        let path = root.join("src/lib.rs");
+        std::fs::write(&path, valid).unwrap();
+        let params: InitializeParams = serde_json::from_value(json!({
+            "processId": null,
+            "rootUri": path_to_uri_string(&root),
+            "capabilities": {}
+        }))
+        .unwrap();
+        let config = collect_workspace_config(&params, &root).unwrap();
+        let mut state = ServerState::new(config, None).unwrap();
+        let file = ProjectFile::new(root, "src/lib.rs");
+        let changed = BTreeSet::from([file.clone()]);
+
+        assert!(state.overlay.set(path.clone(), valid.to_string()));
+        state.workspace = state.workspace.update(&changed);
+        let stale_overlay_reader = state.workspace.clone();
+        assert!(state.overlay.set(path.clone(), malformed.to_string()));
+        stale_overlay_reader.warm_query_indexes();
+        assert!(
+            !state
+                .workspace
+                .analyzer()
+                .indexed_source_matches(&file, malformed),
+            "a query-refreshed live OID must not replace the indexed generation's identity"
+        );
+
+        state.workspace = state.workspace.update(&changed);
+        let uri: Uri = path_to_uri_string(&path).parse().unwrap();
+        let diagnostics = diagnostic::collect(&state.workspace, state.project(), &uri, false);
+        assert!(
+            !diagnostics.is_empty(),
+            "a mutable-project OID match must not retain clean diagnostics from the prior source"
+        );
+    }
+
+    #[test]
+    fn disk_queries_under_an_empty_overlay_cannot_advance_indexed_generation_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let valid = "trait Runnable {}\npub struct Worker;\nimpl Runnable for Worker {}\n";
+        let malformed =
+            "trait Runnable {}\npub struct Worker;\nimpl Runnable for Worker {}\nfn broken( {\n";
+        let path = root.join("src/lib.rs");
+        std::fs::write(&path, valid).unwrap();
+        let params: InitializeParams = serde_json::from_value(json!({
+            "processId": null,
+            "rootUri": path_to_uri_string(&root),
+            "capabilities": {}
+        }))
+        .unwrap();
+        let config = collect_workspace_config(&params, &root).unwrap();
+        let mut state = ServerState::new(config, None).unwrap();
+        let file = ProjectFile::new(root, "src/lib.rs");
+        let changed = BTreeSet::from([file.clone()]);
+
+        assert_eq!(state.project().analysis_generation(), 0);
+        let stale_disk_reader = state.workspace.clone();
+        std::fs::write(&path, malformed).unwrap();
+        stale_disk_reader.warm_query_indexes();
+        assert!(
+            !state
+                .workspace
+                .analyzer()
+                .indexed_source_matches(&file, malformed),
+            "a query-refreshed disk OID must not replace the indexed generation's identity"
+        );
+
+        state.workspace = state.workspace.update(&changed);
+        let uri: Uri = path_to_uri_string(&path).parse().unwrap();
+        let diagnostics = diagnostic::collect(&state.workspace, state.project(), &uri, false);
+        assert!(
+            !diagnostics.is_empty(),
+            "a generation-zero overlay project must diagnose the changed disk source"
+        );
+    }
+
+    #[test]
     fn workspace_config_captures_runtime_configuration_capabilities() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
@@ -4992,6 +5322,7 @@ mod tests {
             completeness_reason: None,
         };
         let response = CodeQueryResponse::Results(CodeQueryResult {
+            session_subset: None,
             results: vec![CodeQueryResultItem {
                 value: CodeQueryResultValue::TypestateWitness {
                     value: Box::new(CodeQueryTypestateWitness {
@@ -5092,6 +5423,7 @@ mod tests {
             end_column: 32,
         };
         let response = CodeQueryResponse::Results(CodeQueryResult {
+            session_subset: None,
             results: vec![CodeQueryResultItem {
                 value: CodeQueryResultValue::DecoratedParameter {
                     value: Box::new(CodeQueryDecoratedParameter {

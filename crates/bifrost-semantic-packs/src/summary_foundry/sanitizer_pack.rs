@@ -604,10 +604,12 @@ fn build_summary(
         locations: Vec::new(),
         transfers: vec![transfer],
         effects: vec![effect],
+        concurrency_effects: Vec::new(),
         declared_effects: Vec::new(),
         preconditions: None,
         result_contracts: Vec::new(),
         conditional_result_refinements: Vec::new(),
+        conditional_indirect_writes: Vec::new(),
         normal_return_refinements: Vec::new(),
     })
 }
@@ -736,7 +738,7 @@ impl PackIdentity {
         completeness: Completeness,
     ) -> AuthoredSemanticModelPack {
         AuthoredSemanticModelPack {
-            schema_version: 1,
+            schema_version: 2,
             pack_id: self.pack_id.clone(),
             version: PACK_CONTENT_VERSION.to_owned(),
             producer: Producer {

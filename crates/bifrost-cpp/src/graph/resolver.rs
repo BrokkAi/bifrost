@@ -5,12 +5,11 @@ use crate::compile_context::CppCompileContext;
 #[cfg(test)]
 use crate::declarations::cpp_displaced_preprocessor_terminator;
 use crate::declarations::{
-    CppComparableNode, CppComparableParameter, CppComparableSlot, cpp_callable_identity_suffix,
-    cpp_comparable_parameter_shapes, cpp_declarator_adds_indirection,
+    CppComparableNode, CppComparableParameter, CppComparableSlot, CppRecoveredExportClassIndex,
+    cpp_callable_identity_suffix, cpp_comparable_parameter_shapes, cpp_declarator_adds_indirection,
     cpp_displaced_preprocessor_boundary, cpp_export_macro_token, cpp_field_declaration_linkage,
     cpp_function_declarator_at, cpp_template_term, node_text, normalize_cpp_whitespace,
-    recovered_embedded_function_like_export_class_has_body, recovered_exported_class_has_body,
-    recovered_fragmented_plain_class_has_body, recovered_function_like_export_class_pair_has_body,
+    recovered_class_body_at,
 };
 use crate::graph::CppGraphSource;
 use crate::graph::extractor::ScanCtx;
@@ -639,6 +638,7 @@ pub type MacroEnvironmentCursorCell = Arc<Mutex<MacroEnvironmentCursor>>;
 type MacroReplacementCache = HashMap<(ProjectFile, usize), Arc<ParsedMacroReplacement>>;
 type MacroLocalBindingTemplateCache =
     HashMap<(ProjectFile, usize), Option<Arc<MacroLocalBindingTemplate>>>;
+type MacroReplacementBodyCache = HashMap<(ProjectFile, usize), Option<Arc<ParsedReplacementBody>>>;
 
 #[derive(Clone, Default)]
 pub struct MacroEnvironment {
@@ -908,6 +908,7 @@ pub struct VisibilityIndex<'a> {
         Mutex<HashMap<(ProjectFile, ThreadId), MacroEnvironmentCursorCell>>,
     macro_replacements: Mutex<MacroReplacementCache>,
     macro_local_binding_templates: Mutex<MacroLocalBindingTemplateCache>,
+    macro_replacement_bodies: Mutex<MacroReplacementBodyCache>,
     callable_parameter_macro_arities: Mutex<HashMap<(ProjectFile, String), Option<CallableArity>>>,
     #[cfg(any(test, feature = "test-support"))]
     pub macro_replacement_parse_count: AtomicUsize,
@@ -1042,6 +1043,22 @@ impl BooleanGuardExpression {
         }
     }
 
+    fn may_depend_on_macro(&self, macro_name: &str) -> bool {
+        match self {
+            Self::Defined(name)
+            | Self::Undefined(name)
+            | Self::Truthy(name)
+            | Self::Falsy(name) => name == macro_name,
+            // Opaque expressions have structured conditional ownership but no
+            // structured macro operands, so any mutation may change them.
+            Self::Opaque(_) | Self::NegatedOpaque(_) => true,
+            Self::All(expressions) | Self::Any(expressions) => expressions
+                .iter()
+                .any(|expression| expression.may_depend_on_macro(macro_name)),
+            Self::Constant(_) => false,
+        }
+    }
+
     pub fn heap_size(&self) -> usize {
         match self {
             Self::Defined(value)
@@ -1088,11 +1105,10 @@ impl PreprocessorGuard {
     fn may_depend_on_macro(&self, macro_name: &str) -> bool {
         match self {
             Self::Defined(name) | Self::Undefined(name) => name == macro_name,
-            // The expression has already been isolated structurally by
-            // tree-sitter, but its full preprocessor semantics are outside the
-            // analyzer's guard model. Any macro mutation can therefore change
-            // its truth value.
-            Self::Boolean(_) | Self::Expression(_) | Self::NegatedExpression(_) => true,
+            Self::Boolean(expression) => expression.may_depend_on_macro(macro_name),
+            // These expressions could not be lowered to a Boolean operand
+            // tree, so their dependencies remain unknown.
+            Self::Expression(_) | Self::NegatedExpression(_) => true,
             Self::Constant(_) => false,
         }
     }
@@ -1120,6 +1136,70 @@ pub enum MacroIncludeProtection {
 enum ParsedMacroReplacement {
     Parsed { source: String, tree: Tree },
     Unsupported,
+}
+
+/// The sentinel that gives a function-like macro replacement a parseable
+/// statement context. The replacement text is copied in verbatim, so the only
+/// bytes ahead of it are this prefix.
+const MACRO_BODY_SENTINEL_PREFIX: &str = "void __bifrost_macro_body() { ";
+
+/// A function-like macro replacement parsed inside a sentinel function body.
+///
+/// Tree-sitter keeps a `#define NAME(a) ...` replacement as one opaque
+/// `preproc_arg`. Wrapping that exact byte slice in a function body recovers
+/// its statements, declarations, and member calls as ordinary C++ structure.
+/// The slice is copied verbatim at [`Self::body_offset`], so a node range in
+/// [`Self::tree`] maps back onto the defining `preproc_arg` by subtracting
+/// that offset.
+pub struct ParsedReplacementBody {
+    pub source: String,
+    pub tree: Tree,
+    pub body_offset: usize,
+    pub parameters: Vec<String>,
+}
+
+impl ParsedReplacementBody {
+    /// The sentinel function body holding the replacement's statements.
+    pub fn statements(&self) -> Option<Node<'_>> {
+        first_descendant_of_kind(self.tree.root_node(), "function_definition")?
+            .child_by_field_name("body")
+    }
+
+    /// The byte range `node` occupies in the file that defines the macro.
+    ///
+    /// `replacement_start` is the defining `preproc_arg`'s start byte. The
+    /// replacement is copied into the sentinel verbatim, so subtracting the
+    /// body offset and adding that start is exact.
+    pub fn file_range(&self, node: Node<'_>, replacement_start: usize) -> std::ops::Range<usize> {
+        debug_assert!(node.start_byte() >= self.body_offset);
+        let start = replacement_start + (node.start_byte() - self.body_offset);
+        start..start + (node.end_byte() - node.start_byte())
+    }
+
+    /// Whether the replacement names the variadic argument pack.
+    ///
+    /// `__VA_ARGS__` parses as an ordinary identifier, so the sentinel tree
+    /// gives no error for it even though the expansion it stands for is
+    /// unknown at the definition. Reject it from the parsed tree rather than
+    /// by scanning the replacement text.
+    fn expands_variadic_arguments(&self) -> bool {
+        let mut stack = vec![self.tree.root_node()];
+        while let Some(node) = stack.pop() {
+            if matches!(
+                node.kind(),
+                "identifier" | "type_identifier" | "field_identifier" | "namespace_identifier"
+            ) && node_text(node, &self.source) == "__VA_ARGS__"
+            {
+                return true;
+            }
+            for index in (0..node.named_child_count()).rev() {
+                if let Some(child) = node.named_child(index) {
+                    stack.push(child);
+                }
+            }
+        }
+        false
+    }
 }
 
 fn parse_cpp_integer_literal(text: &str) -> Option<i128> {
@@ -1464,6 +1544,7 @@ impl<'a> VisibilityIndex<'a> {
             macro_environment_cursors: Mutex::new(HashMap::default()),
             macro_replacements: Mutex::new(HashMap::default()),
             macro_local_binding_templates: Mutex::new(HashMap::default()),
+            macro_replacement_bodies: Mutex::new(HashMap::default()),
             callable_parameter_macro_arities: Mutex::new(HashMap::default()),
             macro_replacement_parse_count: AtomicUsize::new(0),
             macro_event_application_count: AtomicUsize::new(0),
@@ -1728,6 +1809,7 @@ impl<'a> VisibilityIndex<'a> {
             macro_environment_cursors: Mutex::new(HashMap::default()),
             macro_replacements: Mutex::new(HashMap::default()),
             macro_local_binding_templates: Mutex::new(HashMap::default()),
+            macro_replacement_bodies: Mutex::new(HashMap::default()),
             callable_parameter_macro_arities: Mutex::new(HashMap::default()),
             #[cfg(any(test, feature = "test-support"))]
             macro_replacement_parse_count: AtomicUsize::new(0),
@@ -1774,6 +1856,23 @@ impl<'a> VisibilityIndex<'a> {
         call: Node<'_>,
         source: &str,
     ) -> CallArityEvidence {
+        self.call_arity_evidence_at(file, call, source, call.start_byte())
+    }
+
+    /// Argument-count evidence for a call whose macro environment is not the
+    /// one at its own byte offset.
+    ///
+    /// A call recovered from a macro replacement lives in a sentinel parse of
+    /// its own, so its node offsets say nothing about which macros are active.
+    /// `environment_byte` names the position in `file` whose macro environment
+    /// governs the call: the macro definition site for a replacement body.
+    pub fn call_arity_evidence_at(
+        &self,
+        file: &ProjectFile,
+        call: Node<'_>,
+        source: &str,
+        environment_byte: usize,
+    ) -> CallArityEvidence {
         let Some(arguments) = call
             .child_by_field_name("arguments")
             .or_else(|| call.child_by_field_name("parameters"))
@@ -1792,7 +1891,7 @@ impl<'a> VisibilityIndex<'a> {
         {
             return CallArityEvidence::Exact(arguments.len() + recovered_c_keyword_arguments);
         }
-        let environment = self.macro_environment(file, call.start_byte());
+        let environment = self.macro_environment(file, environment_byte);
         let mut stack = Vec::new();
         let mut total = recovered_c_keyword_arguments;
         for argument in arguments {
@@ -2062,29 +2161,22 @@ impl<'a> VisibilityIndex<'a> {
         replacement: &str,
     ) -> Option<Arc<MacroLocalBindingTemplate>> {
         let key = (binding.source.clone(), binding.declaration_byte);
-        let mut cache = self
+        if let Some(template) = self
             .macro_local_binding_templates
             .lock()
-            .expect("C++ macro local-binding cache poisoned");
-        if let Some(template) = cache.get(&key) {
+            .expect("C++ macro local-binding cache poisoned")
+            .get(&key)
+        {
             return template.clone();
         }
-        let sentinel = format!("void __bifrost_macro_local() {{ {replacement}; }}");
         let template = (|| {
-            let mut parser = Parser::new();
-            parser
-                .set_language(&tree_sitter_cpp::LANGUAGE.into())
-                .ok()?;
-            let tree = parser.parse(&sentinel, None)?;
-            if tree.root_node().has_error() {
+            let body = self.parsed_macro_replacement_body(&key, parameters, replacement)?;
+            let sentinel = body.source.as_str();
+            let statements = body.statements()?;
+            if statements.named_child_count() != 1 {
                 return None;
             }
-            let function = first_descendant_of_kind(tree.root_node(), "function_definition")?;
-            let body = function.child_by_field_name("body")?;
-            if body.named_child_count() != 1 {
-                return None;
-            }
-            let declaration = body.named_child(0)?;
+            let declaration = statements.named_child(0)?;
             if declaration.kind() != "declaration" {
                 return None;
             }
@@ -2101,10 +2193,9 @@ impl<'a> VisibilityIndex<'a> {
                     }
                 })
             })?;
-            let name = extract_variable_name(declarator, &sentinel)?;
-            let pointer_depth =
-                declared_name_indirection(declaration, type_node, &name, &sentinel)?;
-            let type_text = node_text(type_node, &sentinel).trim();
+            let name = extract_variable_name(declarator, sentinel)?;
+            let pointer_depth = declared_name_indirection(declaration, type_node, &name, sentinel)?;
+            let type_text = node_text(type_node, sentinel).trim();
             let declared_type = parameters
                 .iter()
                 .position(|parameter| parameter == type_text)
@@ -2116,8 +2207,91 @@ impl<'a> VisibilityIndex<'a> {
                 pointer_depth,
             }))
         })();
-        cache.insert(key, template.clone());
+        self.macro_local_binding_templates
+            .lock()
+            .expect("C++ macro local-binding cache poisoned")
+            .insert(key, template.clone());
         template
+    }
+
+    /// The parsed replacement body of the function-like macro `definition`
+    /// defines, or `None` when the replacement cannot be recovered exactly.
+    ///
+    /// `definition` is the defining `preproc_function_def` node in `file`, so
+    /// the result describes that definition rather than whichever same-named
+    /// macro a later reference resolves to.
+    pub fn function_macro_replacement_body(
+        &self,
+        file: &ProjectFile,
+        definition: Node<'_>,
+        source: &str,
+    ) -> Option<Arc<ParsedReplacementBody>> {
+        debug_assert_eq!(definition.kind(), "preproc_function_def");
+        let MacroDefinition::Function {
+            parameters,
+            replacement,
+        } = Self::decode_macro_definition(definition, source)
+        else {
+            return None;
+        };
+        self.parsed_macro_replacement_body(
+            &(file.clone(), definition.start_byte()),
+            &parameters,
+            &replacement,
+        )
+    }
+
+    /// Parse one function-like macro replacement inside the shared sentinel.
+    ///
+    /// The parse fails closed, and the failure is cached, whenever the
+    /// sentinel tree carries an error or the replacement uses preprocessor
+    /// syntax that has no C++ meaning. Token pasting and stringizing produce
+    /// `ERROR` nodes; `__VA_ARGS__` parses as an ordinary identifier and is
+    /// therefore rejected from the parsed tree instead of the source text.
+    fn parsed_macro_replacement_body(
+        &self,
+        key: &(ProjectFile, usize),
+        parameters: &[String],
+        replacement: &str,
+    ) -> Option<Arc<ParsedReplacementBody>> {
+        if let Some(body) = self
+            .macro_replacement_bodies
+            .lock()
+            .expect("C++ macro replacement body cache poisoned")
+            .get(key)
+        {
+            return body.clone();
+        }
+        let body = (|| {
+            if replacement.trim().is_empty() {
+                return None;
+            }
+            let source = format!("{MACRO_BODY_SENTINEL_PREFIX}{replacement}; }}");
+            let mut parser = Parser::new();
+            parser
+                .set_language(&tree_sitter_cpp::LANGUAGE.into())
+                .ok()?;
+            let tree = parser.parse(&source, None)?;
+            if tree.root_node().has_error() {
+                return None;
+            }
+            let body = ParsedReplacementBody {
+                source,
+                tree,
+                body_offset: MACRO_BODY_SENTINEL_PREFIX.len(),
+                parameters: parameters.to_vec(),
+            };
+            body.statements()?;
+            if body.expands_variadic_arguments() {
+                return None;
+            }
+            Some(Arc::new(body))
+        })();
+        self.macro_replacement_bodies
+            .lock()
+            .expect("C++ macro replacement body cache poisoned")
+            .insert(key.clone(), body.clone());
+        body
     }
 
     fn decode_macro_definition(node: Node<'_>, source: &str) -> MacroDefinition {
@@ -5170,6 +5344,20 @@ impl<'a> VisibilityIndex<'a> {
 
     /// Resolve a base class through its injected class name at the nearest
     /// inheritance tier. Distinct same-named bases at that tier are ambiguous.
+    ///
+    /// A base whose canonical full definition cannot be pinned from `file` -
+    /// a forward declaration the include closure completes with two different
+    /// full definitions, or an alias chain that leaves the index - stops the
+    /// walk only when that base is spelled `injected_name`. The mem-initializer
+    /// names a base by that base's own injected class name, so a base spelled
+    /// differently can never be the one it names, whichever definition it would
+    /// have turned out to be; aborting the level on its account instead loses
+    /// the sibling base that *is* named (#2543). A base that is spelled
+    /// `injected_name` still fails closed, because choosing a deeper same-named
+    /// ancestor over it would bind the initializer to the wrong constructor.
+    /// The skipped base carries its own ancestors out of the walk with it: with
+    /// no canonical unit, the repeated-base accounting below cannot tell one
+    /// inherited path through it from two.
     pub fn inherited_injected_class_owner(
         &self,
         analyzer: &CppGraphSource<'_>,
@@ -5184,7 +5372,13 @@ impl<'a> VisibilityIndex<'a> {
             let mut level_matches = Vec::new();
             let mut next_frontier = Vec::new();
             for raw_owner in frontier {
-                let owner = self.canonical_visible_full_type_unit(analyzer, file, &raw_owner)?;
+                let Some(owner) = self.canonical_visible_full_type_unit(analyzer, file, &raw_owner)
+                else {
+                    if raw_owner.identifier() == injected_name {
+                        return None;
+                    }
+                    continue;
+                };
                 let propagated = propagated_counts.entry(owner.clone()).or_default();
                 if *propagated == 2 {
                     continue;
@@ -8286,6 +8480,25 @@ pub fn infer_cpp_initializer_binding(
             ))
         }
         "call_expression" => node.child_by_field_name("function").and_then(|function| {
+            // `a().b()` and `p->b()` invoke a member on a receiver *value*. The
+            // callee's source text is an expression, not a name, and every name
+            // lookup below normalizes a reference by truncating at the first
+            // `(`: `first().second` would read as `first`, so the chained call
+            // would take the type of `first()` instead of the type of
+            // `first().second()` (#2178). Only the member path can answer for
+            // this shape, so route to it from the callee's node kind.
+            if function.kind() == "field_expression" {
+                let arity = visibility.call_arity_evidence(file, node, source).exact()?;
+                return resolve_field_method_call_return_binding(
+                    analyzer,
+                    visibility,
+                    file,
+                    source,
+                    function,
+                    arity,
+                    receiver_resolver,
+                );
+            }
             let function_text = node_text(function, source);
             let direct_type_binding = visibility
                 .resolve_type(file, function_text)
@@ -8325,39 +8538,36 @@ pub fn infer_cpp_initializer_binding(
                 }
                 return direct_type_binding;
             }
-            let arity = visibility.call_arity_evidence(file, node, source).exact()?;
-            let direct_type_binding_for_call = direct_type_binding.clone();
-            resolve_static_method_call_return_binding(
-                analyzer, visibility, file, source, function, arity,
-            )
-            .or_else(|| {
-                // An applicable free function supplies the receiver value
-                // before an unrelated visible type with the same terminal
-                // name. The direct type still excludes its own constructor
-                // declaration below and remains the construction fallback.
-                visibility.resolve_call_return_binding(
-                    analyzer,
-                    file,
-                    function_text,
-                    arity,
-                    enclosing_namespace_context(node, source).as_deref(),
-                    direct_type_binding_for_call
-                        .as_ref()
-                        .and_then(|binding| binding.unit.as_ref()),
+            // Only the return-typed branches need the argument count. An
+            // unknown arity leaves them out, exactly as in the template arm
+            // above, and still constructs the direct type: `File(getPath())`
+            // names `File` whether or not `getPath()`'s expansion is provable.
+            let arity = visibility.call_arity_evidence(file, node, source).exact();
+            if let Some(arity) = arity {
+                let direct_type_binding_for_call = direct_type_binding.clone();
+                if let Some(binding) = resolve_static_method_call_return_binding(
+                    analyzer, visibility, file, source, function, arity,
                 )
-            })
-            .or(direct_type_binding)
-            .or_else(|| {
-                resolve_field_method_call_return_binding(
-                    analyzer,
-                    visibility,
-                    file,
-                    source,
-                    function,
-                    arity,
-                    receiver_resolver,
-                )
-            })
+                .or_else(|| {
+                    // An applicable free function supplies the receiver value
+                    // before an unrelated visible type with the same terminal
+                    // name. The direct type still excludes its own constructor
+                    // declaration below and remains the construction fallback.
+                    visibility.resolve_call_return_binding(
+                        analyzer,
+                        file,
+                        function_text,
+                        arity,
+                        enclosing_namespace_context(node, source).as_deref(),
+                        direct_type_binding_for_call
+                            .as_ref()
+                            .and_then(|binding| binding.unit.as_ref()),
+                    )
+                }) {
+                    return Some(binding);
+                }
+            }
+            direct_type_binding
         }),
         _ => None,
     }
@@ -8417,9 +8627,11 @@ fn resolve_field_method_call_return_binding(
     arity: usize,
     receiver_resolver: Option<&ReceiverResolver<'_>>,
 ) -> Option<CppScanBinding> {
-    if function.kind() != "field_expression" {
-        return None;
-    }
+    debug_assert_eq!(
+        function.kind(),
+        "field_expression",
+        "the member-call return binding answers only for a field-expression callee"
+    );
     let receiver_resolver = receiver_resolver?;
     let field = function.child_by_field_name("field")?;
     let member_name = node_text(function_terminal_node(field), source);
@@ -9041,6 +9253,35 @@ fn find_conditional_include_projection_for_source(
     false
 }
 
+/// Whether `translation_unit`'s unconditional `#include` closure reaches
+/// `header`, directly or through any chain of headers.
+///
+/// The include-closure question asked on its own, for
+/// [`crate::identity::cpp_header_body_files_are_related`]. The walk resolves
+/// each include the way visibility does -- to a unique target or to nothing --
+/// so a duplicated basename relates nothing, and it is memoized per file pair
+/// on the analyzer.
+///
+/// The reference position is `translation_unit` itself: the question is
+/// whether that unit compiles the header, so that unit's own dialect and
+/// preprocessor context govern the walk.
+pub fn cpp_include_closure_reaches(
+    cpp: &dyn CppSource,
+    token: QueryToken<'_>,
+    translation_unit: &ProjectFile,
+    header: &ProjectFile,
+) -> bool {
+    unconditional_include_reaches(
+        cpp,
+        token,
+        cpp.include_target_index(),
+        translation_unit,
+        header,
+        translation_unit,
+        &mut HashSet::default(),
+    )
+}
+
 fn unconditional_include_reaches(
     cpp: &dyn CppSource,
     token: QueryToken<'_>,
@@ -9614,9 +9855,15 @@ fn nameable_callable_declaration_nodes<'tree>(
         .filter_map(|range| {
             let mut declaration =
                 root.descendant_for_byte_range(range.start_byte, range.end_byte)?;
+            // A declaration an attribute-like macro invocation swallowed lives
+            // inside the `ERROR` the parser left, not inside a `declaration`
+            // node, so that envelope is where the climb stops (#2552).
             while !matches!(
                 declaration.kind(),
                 "declaration" | "field_declaration" | "function_definition"
+            ) && !crate::declarations::is_macro_wrapped_declaration_envelope(
+                declaration,
+                prepared.source(),
             ) {
                 declaration = declaration.parent()?;
             }
@@ -10184,12 +10431,19 @@ fn is_split_cpp_language_linkage_wrapper(
     closes_opening_branch && reopens_for_closing_brace
 }
 
-pub fn call_arity(node: Node<'_>) -> usize {
+/// The argument list a call-shaped node supplies: `f(args)`, `new T(args)`,
+/// `T{args}` and the member initializer `: field(args)`, whose grammar gives its
+/// argument list no field name.
+pub fn call_arguments_node(node: Node<'_>) -> Option<Node<'_>> {
     node.child_by_field_name("arguments")
         .or_else(|| node.child_by_field_name("parameters"))
         .or_else(|| node.child_by_field_name("value"))
         .or_else(|| first_named_child_of_kind(node, "argument_list"))
         .or_else(|| first_named_child_of_kind(node, "initializer_list"))
+}
+
+pub fn call_arity(node: Node<'_>) -> usize {
+    call_arguments_node(node)
         .map(|args| argument_children(args).count())
         .unwrap_or(0)
 }
@@ -11035,39 +11289,73 @@ pub fn declaration_is_object_construction_candidate(node: Node<'_>, ctx: &ScanCt
         })
 }
 
-pub fn declaration_constructor_arity(node: Node<'_>, _ctx: &ScanCtx<'_>) -> usize {
+/// How a `T var ...;` declaration initializes its object.
+pub enum DeclarationConstructorInitializer<'tree> {
+    /// Direct initialization, `T var(args)` or `T var{args}`: the argument list
+    /// the declaration hands the constructor.
+    Arguments(Node<'tree>),
+    /// Copy initialization from one expression, `T var = expr`, which supplies a
+    /// single constructor argument without spelling an argument list.
+    Expression(Node<'tree>),
+    /// `T var;`, which names no constructor argument at all.
+    Empty,
+}
+
+pub fn declaration_constructor_initializer(
+    node: Node<'_>,
+) -> DeclarationConstructorInitializer<'_> {
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
         if child.kind() == "init_declarator" {
-            return child
+            let Some(value) = child
                 .child_by_field_name("value")
                 .or_else(|| first_named_child_of_kind(child, "initializer_list"))
                 .or_else(|| first_named_child_of_kind(child, "compound_literal_expression"))
-                .map(declaration_init_value_arity)
-                .unwrap_or(0);
+            else {
+                return DeclarationConstructorInitializer::Empty;
+            };
+            return match value.kind() {
+                "argument_list" | "initializer_list" => {
+                    DeclarationConstructorInitializer::Arguments(value)
+                }
+                "compound_literal_expression" => call_arguments_node(value)
+                    .map_or(DeclarationConstructorInitializer::Empty, |arguments| {
+                        DeclarationConstructorInitializer::Arguments(arguments)
+                    }),
+                _ => DeclarationConstructorInitializer::Expression(value),
+            };
         }
         if is_declarator_node(child) {
-            return declaration_declarator_arity(child);
+            return declarator_parameters(child)
+                .map_or(DeclarationConstructorInitializer::Empty, |parameters| {
+                    DeclarationConstructorInitializer::Arguments(parameters)
+                });
         }
     }
-    0
+    DeclarationConstructorInitializer::Empty
 }
 
-fn declaration_init_value_arity(value: Node<'_>) -> usize {
-    match value.kind() {
-        "argument_list" | "initializer_list" => argument_children(value).count(),
-        "compound_literal_expression" => call_arity(value),
-        _ => 1,
+pub fn declaration_constructor_arity(node: Node<'_>, _ctx: &ScanCtx<'_>) -> usize {
+    match declaration_constructor_initializer(node) {
+        DeclarationConstructorInitializer::Arguments(arguments) => {
+            argument_children(arguments).count()
+        }
+        DeclarationConstructorInitializer::Expression(_) => 1,
+        DeclarationConstructorInitializer::Empty => 0,
     }
 }
 
-fn declaration_declarator_arity(node: Node<'_>) -> usize {
-    if let Some(parameters) = node.child_by_field_name("parameters") {
-        return argument_children(parameters).count();
+/// The parameter list of the innermost declarator, which is where a
+/// `T var(args)` declaration parsed as a function declarator keeps the
+/// constructor arguments.
+fn declarator_parameters(node: Node<'_>) -> Option<Node<'_>> {
+    let mut current = node;
+    loop {
+        if let Some(parameters) = current.child_by_field_name("parameters") {
+            return Some(parameters);
+        }
+        current = current.child_by_field_name("declarator")?;
     }
-    node.child_by_field_name("declarator")
-        .map(declaration_declarator_arity)
-        .unwrap_or(0)
 }
 
 pub(super) fn first_named_child_of_kind<'tree>(
@@ -11385,6 +11673,48 @@ pub fn is_c_sizeof_expression_type_candidate(file: &ProjectFile, node: Node<'_>)
     }
     operand.parent().is_some_and(|parent| {
         parent.kind() == "sizeof_expression" && parent.child_by_field_name("value") == Some(operand)
+    })
+}
+
+/// Whether `node` is a template argument name that tree-sitter spelled with
+/// type syntax.
+///
+/// The grammar cannot tell a type argument from a non-type (value) argument, so
+/// it gives both the same shape:
+/// `template_argument_list -> type_descriptor -> type_identifier`. In
+/// `std::array<W, N>` the type `W` and the constant `N` parse identically, and
+/// so do `std::span<const uint8_t, ED448_LEN>`'s length and a nested type
+/// member used as a real type argument.
+///
+/// This helper reports only the syntactic position. A caller must still prove
+/// which namespace explains the spelling: forward navigation asks the type
+/// namespace first and reads the leaf as a value only when no type explains it,
+/// and the inverse field scan admits the leaf only when no visible type does
+/// (#2556).
+pub fn is_type_shaped_template_argument_name(node: Node<'_>) -> bool {
+    if node.kind() != "type_identifier" {
+        return false;
+    }
+    let Some(descriptor) = node
+        .parent()
+        .filter(|parent| parent.kind() == "type_descriptor")
+    else {
+        return false;
+    };
+    if descriptor.child_by_field_name("type") != Some(node) {
+        return false;
+    }
+    let Some(arguments) = descriptor
+        .parent()
+        .filter(|parent| parent.kind() == "template_argument_list")
+    else {
+        return false;
+    };
+    arguments.parent().is_some_and(|owner| {
+        matches!(
+            owner.kind(),
+            "template_type" | "template_function" | "template_method"
+        ) && owner.child_by_field_name("arguments") == Some(arguments)
     })
 }
 
@@ -14302,12 +14632,34 @@ pub fn cpp_class_declaration_strength(
     analyzer: &CppGraphSource<'_>,
     candidate: &CodeUnit,
 ) -> CppClassDeclarationStrength {
-    if let Some(prepared) = analyzer
-        .cpp
-        .and_then(|cpp| cpp.prepared_syntax(analyzer.token, candidate.source()))
+    // The answer is a pure function of the unit's ranges and its file's tree,
+    // and the inverse scan asks it once per declaration seed. On a translation
+    // unit the parser could not fully recover, each ask re-derives the
+    // export-macro recovery shapes from the file's `ERROR` subtrees, so without
+    // this memo one file's scan is quadratic in its own size: 97% of Catch2's
+    // 284 s inverse scan of `extras/catch_amalgamated.cpp` was in this call
+    // (#1496).
+    let Some(cpp) = analyzer.cpp else {
+        return uncached_cpp_class_declaration_strength(analyzer, candidate);
+    };
+    if let Some(strength) = cpp.cached_class_declaration_strength(candidate) {
+        return strength;
+    }
+    let strength = uncached_cpp_class_declaration_strength(analyzer, candidate);
+    cpp.cache_class_declaration_strength(candidate, strength);
+    strength
+}
+
+fn uncached_cpp_class_declaration_strength(
+    analyzer: &CppGraphSource<'_>,
+    candidate: &CodeUnit,
+) -> CppClassDeclarationStrength {
+    if let Some(cpp) = analyzer.cpp
+        && let Some(prepared) = cpp.prepared_syntax(analyzer.token, candidate.source())
     {
         return cpp_class_declaration_strength_in_tree(
             analyzer,
+            &cpp.recovered_export_class_index(analyzer.token, candidate.source()),
             candidate,
             prepared.source(),
             prepared.tree().root_node(),
@@ -14330,11 +14682,22 @@ pub fn cpp_class_declaration_strength(
     let Some(tree) = parser.parse(&source, None) else {
         return CppClassDeclarationStrength::Unknown;
     };
-    cpp_class_declaration_strength_in_tree(analyzer, candidate, &source, tree.root_node())
+    // This branch reparses a file the analyzer has no prepared tree for, so its
+    // recovery index is that one tree's and cannot be shared.
+    let recovered_export_classes =
+        CppRecoveredExportClassIndex::build(tree.root_node(), source.as_str());
+    cpp_class_declaration_strength_in_tree(
+        analyzer,
+        &recovered_export_classes,
+        candidate,
+        &source,
+        tree.root_node(),
+    )
 }
 
 fn cpp_class_declaration_strength_in_tree(
     analyzer: &CppGraphSource<'_>,
+    recovered_export_classes: &CppRecoveredExportClassIndex,
     candidate: &CodeUnit,
     source: &str,
     root: Node<'_>,
@@ -14342,74 +14705,50 @@ fn cpp_class_declaration_strength_in_tree(
     let ranges = analyzer.ranges(candidate);
     let mut saw_forward = false;
     for range in ranges {
-        let mut stack = vec![root];
-        while let Some(node) = stack.pop() {
-            if recovered_function_like_export_class_pair_has_body(
-                node,
-                source,
-                candidate.identifier(),
-                &range,
-            ) {
-                return CppClassDeclarationStrength::Full;
-            }
-            if recovered_embedded_function_like_export_class_has_body(
-                node,
-                source,
-                candidate.identifier(),
-                &range,
-            ) {
-                return CppClassDeclarationStrength::Full;
-            }
-            if node.start_byte() == range.start_byte
-                && recovered_fragmented_plain_class_has_body(
-                    node,
-                    source,
-                    candidate.identifier(),
-                    &range,
-                )
-            {
-                return CppClassDeclarationStrength::Full;
-            }
-            // Macro-decorated exported classes are recovered from a malformed
-            // function_definition/declaration wrapper. Their indexed class range starts at
-            // the displaced class name, while the wrapper starts at `class EXPORT`; recovery
-            // may also extend the indexed range beyond the wrapper through trailing class
-            // fragments. Match the structured container that owns the range start by its
-            // recovered name instead of requiring identical boundaries.
-            if node.start_byte() <= range.start_byte
-                && range.start_byte < node.end_byte()
-                && let Some(has_body) =
-                    recovered_exported_class_has_body(node, source, candidate.identifier())
-            {
-                if has_body {
-                    return CppClassDeclarationStrength::Full;
-                }
+        // The recovered export-macro shapes answer for their own ranges; only a
+        // range no recovery claims is read as a plain specifier.
+        match recovered_class_body_at(
+            recovered_export_classes,
+            root,
+            source,
+            candidate.identifier(),
+            &range,
+        ) {
+            Some(true) => return CppClassDeclarationStrength::Full,
+            Some(false) => {
                 saw_forward = true;
                 continue;
             }
-            if node.start_byte() > range.start_byte || node.end_byte() < range.start_byte {
-                continue;
-            }
-            if node.start_byte() == range.start_byte && node.end_byte() == range.end_byte {
-                if matches!(
+            None => {}
+        }
+        // Only a node covering the range's start byte can be the specifier for
+        // this range, so apply that test where nodes enter the stack rather
+        // than where they leave it. Pushing first meant one ask enqueued every
+        // sibling at every level it descended, which on a translation unit with
+        // thousands of top-level declarations is a per-ask cost proportional to
+        // the file (#1496).
+        let covers_range_start = |node: &Node<'_>| {
+            node.start_byte() <= range.start_byte && node.end_byte() >= range.start_byte
+        };
+        let mut stack = Vec::new();
+        if covers_range_start(&root) {
+            stack.push(root);
+        }
+        while let Some(node) = stack.pop() {
+            if node.start_byte() == range.start_byte
+                && node.end_byte() == range.end_byte
+                && matches!(
                     node.kind(),
                     "class_specifier" | "struct_specifier" | "union_specifier" | "enum_specifier"
-                ) {
-                    if cpp_class_node_has_body(node) {
-                        return CppClassDeclarationStrength::Full;
-                    }
-                    saw_forward = true;
-                } else if let Some(has_body) =
-                    recovered_exported_class_has_body(node, source, candidate.identifier())
-                {
-                    if has_body {
-                        return CppClassDeclarationStrength::Full;
-                    }
-                    saw_forward = true;
+                )
+            {
+                if cpp_class_node_has_body(node) {
+                    return CppClassDeclarationStrength::Full;
                 }
+                saw_forward = true;
             }
             let mut cursor = node.walk();
-            stack.extend(node.named_children(&mut cursor));
+            stack.extend(node.named_children(&mut cursor).filter(covers_range_start));
         }
     }
     if saw_forward {
@@ -15127,5 +15466,271 @@ enum class value_t { null };
 struct next_type {};
 "#;
         assert_eq!(first_enum_flattened_namespace(incomplete), None);
+    }
+}
+
+/// Comparator laws for the total C++ lookup order introduced by #1876.
+///
+/// `sort_lookup_units` is the single tie-break the C++ resolver applies before
+/// any "first wins" selection (template families in #1836, the visible
+/// identifier index, the type-candidate lists). If its comparator is not a
+/// total order over CodeUnit identity, some pair stays tied and the survivor
+/// falls back to the order the units arrived in -- which is FxHash iteration
+/// order over keys whose hash covers the absolute workspace root. That is the
+/// exact mechanism behind #1836 and the #414 / #432 heisenbug, so the laws are
+/// checked generatively rather than on one hand-picked list.
+///
+/// CodeUnit identity is `source`, `kind`, `fq`, `package_segment_count`,
+/// `signature` and `synthetic` (see `impl PartialEq for CodeUnit`); a CodeUnit
+/// carries no range, so declaration ranges are covered by the workspace-level
+/// property in `tests/suite_analyzers/determinism_properties.rs` instead.
+#[cfg(test)]
+mod lookup_order_properties {
+    use super::*;
+    use proptest::prelude::*;
+
+    /// Segment spellings the C++ extractor and the shared renderer actually
+    /// produce, including the `$`-joined nested spellings and non-ASCII
+    /// identifiers that a byte-wise comparison has to keep apart.
+    const ATOMS: [&str; 9] = ["a", "b", "A", "a$b", "a$", "$a", "ab", "naïve", "識別子"];
+    const REL_PATHS: [&str; 3] = ["a.cpp", "b.cpp", "sub/a.cpp"];
+    /// Two roots so the order is pinned across workspaces as well as inside
+    /// one: the root path is precisely the byte string that used to leak into
+    /// iteration order.
+    const ROOT_NAMES: [&str; 2] = ["ws", "ws_much_longer_root_name"];
+    const SIGNATURES: [Option<&str>; 3] = [None, Some("()"), Some("(int)")];
+    const KINDS: [CodeUnitType; 6] = [
+        CodeUnitType::Class,
+        CodeUnitType::Function,
+        CodeUnitType::Field,
+        CodeUnitType::Module,
+        CodeUnitType::Macro,
+        CodeUnitType::FileScope,
+    ];
+
+    /// Where one unit sits relative to another under the comparator that
+    /// `sort_lookup_units` owns.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum ProbedOrder {
+        Before,
+        Tied,
+        After,
+        /// Both directions reported "strictly first": the comparator is not
+        /// dual, and no sort over it can be order-independent.
+        Contradictory,
+    }
+
+    impl ProbedOrder {
+        fn mirror(self) -> Self {
+            match self {
+                ProbedOrder::Before => ProbedOrder::After,
+                ProbedOrder::After => ProbedOrder::Before,
+                other => other,
+            }
+        }
+
+        /// -1 / 0 / +1, so transitivity reads as the `<= 0` law.
+        fn signum(self) -> i8 {
+            match self {
+                ProbedOrder::Before => -1,
+                ProbedOrder::Tied => 0,
+                ProbedOrder::After => 1,
+                ProbedOrder::Contradictory => panic!("probed a non-dual comparator"),
+            }
+        }
+    }
+
+    /// Read the comparator through its only caller.
+    ///
+    /// `sort_lookup_units` is a stable sort, so for a two-element slice the
+    /// output says exactly whether the comparator put the second element
+    /// strictly first. Sorting both arrangements of one pair therefore reports
+    /// the comparator's verdict in both directions, including the contradictory
+    /// case a single sort would hide.
+    fn probe_order(left: &CodeUnit, right: &CodeUnit) -> ProbedOrder {
+        if left == right {
+            // A stable sort cannot distinguish two equal values, and `Equal` is
+            // the only verdict a total order can give them.
+            return ProbedOrder::Tied;
+        }
+        let mut forward = vec![left.clone(), right.clone()];
+        sort_lookup_units(&mut forward);
+        let mut backward = vec![right.clone(), left.clone()];
+        sort_lookup_units(&mut backward);
+        let left_first = backward[0] == *left;
+        let right_first = forward[0] == *right;
+        match (left_first, right_first) {
+            (true, true) => ProbedOrder::Contradictory,
+            (true, false) => ProbedOrder::Before,
+            (false, true) => ProbedOrder::After,
+            (false, false) => ProbedOrder::Tied,
+        }
+    }
+
+    /// `(kind, text)` per segment. `CodeUnit`'s own `Debug` prints interned
+    /// segment IDs, which are process-local and say nothing about a failure.
+    fn fq_segments(unit: &CodeUnit) -> Vec<(&'static str, &'static str)> {
+        let interner = segment_interner();
+        unit.fq()
+            .segments()
+            .iter()
+            .map(|&id| {
+                let (text, kind) = interner.resolve(id);
+                (kind.name(), text)
+            })
+            .collect()
+    }
+
+    fn code_unit_strategy() -> impl Strategy<Value = CodeUnit> {
+        (
+            0..ROOT_NAMES.len(),
+            0..REL_PATHS.len(),
+            0..KINDS.len(),
+            prop::collection::vec((0..ATOMS.len(), 0..SegmentKind::ALL.len()), 1..=3),
+            0..3usize,
+            0..SIGNATURES.len(),
+            any::<bool>(),
+        )
+            .prop_map(
+                |(root, rel_path, kind, segments, package_prefix, signature, synthetic)| {
+                    let source = ProjectFile::new(
+                        std::env::temp_dir().join(ROOT_NAMES[root]),
+                        REL_PATHS[rel_path],
+                    );
+                    let interner = segment_interner();
+                    let mut fq = FqName::new();
+                    for (atom, segment_kind) in &segments {
+                        fq.push(interner.intern(ATOMS[*atom], SegmentKind::ALL[*segment_kind]));
+                    }
+                    // `from_fq` requires a non-empty declaration tail.
+                    let package_segment_count = package_prefix % fq.len();
+                    CodeUnit::from_fq(
+                        source,
+                        KINDS[kind],
+                        fq,
+                        package_segment_count,
+                        SIGNATURES[signature].map(str::to_string),
+                        synthetic,
+                    )
+                },
+            )
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(256))]
+
+        /// Reflexivity and duality: a unit ties with itself, and no pair is
+        /// strictly first in both directions.
+        #[test]
+        fn lookup_order_is_reflexive_and_dual(
+            left in code_unit_strategy(),
+            right in code_unit_strategy(),
+        ) {
+            prop_assert_eq!(
+                probe_order(&left, &left),
+                ProbedOrder::Tied,
+                "a unit must tie with itself: {:?}",
+                left
+            );
+            let forward = probe_order(&left, &right);
+            prop_assert_ne!(
+                forward,
+                ProbedOrder::Contradictory,
+                "comparator put each of these strictly first: left={:?} right={:?}",
+                left,
+                right
+            );
+            prop_assert_eq!(
+                probe_order(&right, &left),
+                forward.mirror(),
+                "compare(b, a) must reverse compare(a, b): left={:?} right={:?}",
+                left,
+                right
+            );
+        }
+
+        /// Transitivity: `a <= b` and `b <= c` imply `a <= c`.
+        #[test]
+        fn lookup_order_is_transitive(
+            a in code_unit_strategy(),
+            b in code_unit_strategy(),
+            c in code_unit_strategy(),
+        ) {
+            let ab = probe_order(&a, &b);
+            let bc = probe_order(&b, &c);
+            let ac = probe_order(&a, &c);
+            for (probed, pair) in [(ab, "a,b"), (bc, "b,c"), (ac, "a,c")] {
+                prop_assert_ne!(
+                    probed,
+                    ProbedOrder::Contradictory,
+                    "comparator is not dual over {}: a={:?} b={:?} c={:?}",
+                    pair,
+                    a,
+                    b,
+                    c
+                );
+            }
+            if ab.signum() <= 0 && bc.signum() <= 0 {
+                prop_assert!(
+                    ac.signum() <= 0,
+                    "transitivity broken: a<=b ({:?}) and b<=c ({:?}) but a?c is {:?}; \
+                     a={:?} b={:?} c={:?}",
+                    ab,
+                    bc,
+                    ac,
+                    a,
+                    b,
+                    c
+                );
+            }
+        }
+
+        /// The property #1876 exists for: only identical identities may tie.
+        /// A tie between distinct units is the residual hash-order dependence.
+        #[test]
+        fn lookup_order_separates_distinct_identities(
+            left in code_unit_strategy(),
+            right in code_unit_strategy(),
+        ) {
+            if probe_order(&left, &right) == ProbedOrder::Tied {
+                prop_assert_eq!(
+                    &left,
+                    &right,
+                    "distinct identities tied, so their order is whatever order they \
+                     arrived in: left_segments={:?} right_segments={:?}",
+                    fq_segments(&left),
+                    fq_segments(&right)
+                );
+            }
+        }
+
+        /// The consequence the resolver relies on: the sorted list is a
+        /// function of the SET of units, not of the order they were pushed in.
+        #[test]
+        fn lookup_sort_is_permutation_invariant(
+            units in prop::collection::vec(code_unit_strategy(), 1..=8),
+        ) {
+            let mut sorted = units.clone();
+            sort_lookup_units(&mut sorted);
+            for rotation in 0..units.len() {
+                for reversed in [false, true] {
+                    let mut permuted = units.clone();
+                    permuted.rotate_left(rotation);
+                    if reversed {
+                        permuted.reverse();
+                    }
+                    sort_lookup_units(&mut permuted);
+                    prop_assert_eq!(
+                        &permuted,
+                        &sorted,
+                        "sorting a permutation gave a different list \
+                         (rotation={}, reversed={}): input={:?}",
+                        rotation,
+                        reversed,
+                        units
+                    );
+                }
+            }
+        }
     }
 }

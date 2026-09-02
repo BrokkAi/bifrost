@@ -63,8 +63,47 @@ A saved query may select planning-only explain or measured profile mode with `(e
 > unsupported semantics, cancellation, or exhausted budgets remain non-clean
 > completion states rather than empty successful results.
 
+### Scan a project (`bifrost scan`)
+
+`bifrost scan` is the shipped product's canonical entry point: it evaluates
+every built-in policy pack on one project path with zero configuration -- no
+`--policy-file`, no selectors:
+
+```bash
+bifrost scan /path/to/project
+```
+
+The path defaults to the current directory. Before the report, the scan
+witnesses the activated pack set on stderr -- one
+`builtin-policy-pack <id>@<version> policies=<count>` line per shipped pack
+plus the catalog SHA-256, the exact line shape `bifrost --version` prints --
+so an external evaluation can record exactly which shipped catalog decided.
+In a `--format json` report, each run additionally records its policy ID and
+manifest semantic hash. A build that ships no packs scans to a clean, empty
+result and says so instead of erroring.
+
+`bifrost scan --list-builtin-policies` prints the shipped catalog as JSON
+without running anything (the same document as `--list-policies`). A scan
+accepts `--format`, `--fail-on`, `--evaluation-date`, `--output`, `--verbose`,
+and `--color` with the meanings documented below, shares the policy exit
+contract (0 clean, 1 gated findings, 2 unreliable), and reads the default
+suppression, scope, and baseline documents beneath the scanned root. For
+explicit selection, custom suppression files, baselines, or diff gating, use
+the policy options on the flag surface -- the scan subcommand never changes
+their behavior.
+
+### Explicit policy selection
+
+Evaluate the built-in policy packs with zero configuration on the flag
+surface -- a policy invocation with no `--policy-file` and no built-in
+selector activates every shipped pack:
+
+```bash
+bifrost --root /path/to/project --policy
+```
+
 Run one or more workspace-relative `.rqlp` policy roots and emit one combined
-canonical report:
+canonical report -- an explicit selection replaces the built-in default:
 
 ```bash
 bifrost --root /path/to/project \
@@ -95,7 +134,16 @@ one deduplicated union in manifest order. They can be combined with
 `--policy-file`; built-in and workspace policies share one analyzer snapshot,
 budget, suppression audit, report, and exit status. `--list-policies` prints the
 deterministic manifest without constructing an analyzer and cannot be combined
-with evaluation options.
+with evaluation options. `--list-row-schemas` prints the versioned
+`bifrost_relation_schema/v1` catalog of row domains, fields, and expansions a
+relational policy may bind, under the same rules; the two listings exclude each
+other. `--no-builtin-policies` keeps a controlled run free of
+shipped policies: it requires at least one `--policy-file`, refuses the built-in
+selectors, and turns an accidentally input-free invocation into an error instead
+of the built-in default. `bifrost --version` records the shipped pack
+identities (id, version, policy count) and a catalog SHA-256 beneath the
+version line, so a benchmark can pin exactly which built-in catalog a run
+activated.
 
 `--policy-file` is repeatable. Every root must be a `(policy ...)` document;
 passing a diagnostic-neutral `(endpoint ...)` as a root is a status-2 report.
@@ -119,7 +167,8 @@ endpoint IDs; in a normal CLI run, the same policy can discover endpoints
 through a `match-directory` closure before selecting exact IDs. The CLI does
 not scan for workspace policies or endpoint catalogs on its own;
 `.bifrost/packs.json` is the explicit shared semantic-pack configuration.
-Built-in policies are selected only through the explicit selectors above.
+Built-in policies run by default only when no explicit policy input is given;
+otherwise they are selected through the explicit selectors above.
 Policy reports include dependency activation mode and the decisions that
 explain selected, missing, incompatible, disabled, or incomplete packs.
 
@@ -304,6 +353,15 @@ bifrost --root /path/to/project --tool get_symbol_sources --sources src --source
 
 An explicit `--sources` selection overrides `.bifrostignore` for the selected
 files.
+
+A `--sources` run answers cross-file questions over only the files you named, so
+its results say so. `scan_usages_by_reference`, `scan_usages_by_location`,
+`usage_graph`, `most_relevant_files`, `search_symbols`, `query_code`, and
+`get_active_workspace` each report `"session_subset": {"files": N}` giving the
+number of files the session covers -- on `scan_usages` inside its `scope` block,
+elsewhere at the top level. Read "no results" from such a run as "nothing in
+those N files", not "nothing in the repository". A run without `--sources` omits
+the field entirely.
 
 File-bearing CLI tool arguments also accept git history paths in `<commit-ish>:<path>` form, such as `HEAD~2:src/main.rs`. Parser-backed tools build the one-shot analyzer workspace with that historical content.
 

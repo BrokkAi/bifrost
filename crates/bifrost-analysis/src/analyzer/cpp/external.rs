@@ -427,6 +427,7 @@ impl DependencyPackAdapter for CppDependencyPackAdapter {
                 type_parameters: Vec::new(),
                 type_parameter_constraints: Vec::new(),
                 underlying_type: None,
+                value_semantics: None,
                 embedded_types: Vec::new(),
                 hierarchy: record
                     .direct_bases
@@ -523,6 +524,7 @@ impl DependencyPackAdapter for CppDependencyPackAdapter {
                         r#type,
                         optional: false,
                         variadic,
+                        passing_mode: Default::default(),
                     })
                     .collect(),
                 returns: return_type,
@@ -540,6 +542,7 @@ impl DependencyPackAdapter for CppDependencyPackAdapter {
                 is_static: false,
                 is_abstract: false,
                 is_virtual: false,
+                implicit_operation: None,
                 callable_family_complete: false,
                 signature,
                 receiver: Some(ReceiverFact { pointer: false }),
@@ -557,11 +560,12 @@ impl DependencyPackAdapter for CppDependencyPackAdapter {
         members.dedup_by(|left, right| left.id == right.id);
 
         let (diagnostics, suppressed_diagnostics) = diagnostics.finish();
-        let completeness = if partial || !diagnostics.is_empty() || suppressed_diagnostics != 0 {
-            Completeness::Partial
-        } else {
-            Completeness::Complete
-        };
+        let completeness =
+            if partial || !diagnostics.is_empty() || suppressed_diagnostics.total() != 0 {
+                Completeness::Partial
+            } else {
+                Completeness::Complete
+            };
         let selector = dependency
             .evidence
             .package
@@ -693,15 +697,19 @@ pub fn resolve_cpp_semantic_pack_dependencies(
             ),
         });
     }
-    let (diagnostics, bounded_diagnostics_suppressed) = diagnostics.finish();
-    let suppressed_diagnostics =
-        undiscovered_dependencies.saturating_add(bounded_diagnostics_suppressed);
+    let (diagnostics, mut suppressed_diagnostics) = diagnostics.finish();
+    // Dependencies dropped by the dependency limit are not diagnostics. They
+    // join the non-error bucket so `errors` stays an exact count of dropped
+    // error-severity diagnostics.
+    suppressed_diagnostics.warnings = suppressed_diagnostics
+        .warnings
+        .saturating_add(undiscovered_dependencies);
     DependencyDiscoveryOutcome {
         profile: DependencyDiscoveryProfile {
             metadata_inputs_considered: 1,
             dependencies_resolved: dependencies.len(),
         },
-        complete: diagnostics.is_empty() && suppressed_diagnostics == 0,
+        complete: diagnostics.is_empty() && suppressed_diagnostics.total() == 0,
         dependencies,
         diagnostics,
         suppressed_diagnostics,
@@ -1188,6 +1196,7 @@ mod tests {
             },
             optional: false,
             variadic: false,
+            passing_mode: Default::default(),
         };
 
         assert_eq!(
@@ -1205,6 +1214,7 @@ mod tests {
                     },
                     optional: false,
                     variadic: false,
+                    passing_mode: Default::default(),
                 },
             ],
             parameters("assign", 2),
@@ -1228,6 +1238,7 @@ mod tests {
                     },
                     optional: false,
                     variadic: false,
+                    passing_mode: Default::default(),
                 },
                 Parameter {
                     name: None,
@@ -1237,6 +1248,7 @@ mod tests {
                     },
                     optional: false,
                     variadic: true,
+                    passing_mode: Default::default(),
                 },
             ],
             parameters("log", 2),
@@ -1495,7 +1507,11 @@ mod tests {
 
         assert!(!discovery.complete, "{discovery:#?}");
         assert_eq!(1, discovery.diagnostics.len(), "{discovery:#?}");
-        assert_eq!(1, discovery.suppressed_diagnostics, "{discovery:#?}");
+        assert_eq!(
+            1,
+            discovery.suppressed_diagnostics.total(),
+            "{discovery:#?}"
+        );
         let diagnostic = &discovery.diagnostics[0];
         assert_eq!("cpp.header_discovery_failed", diagnostic.code);
         assert_eq!(
@@ -1539,7 +1555,7 @@ mod tests {
 
         assert!(!discovery.complete, "{discovery:#?}");
         assert_eq!(1, discovery.dependencies.len());
-        assert_eq!(1, discovery.suppressed_diagnostics);
+        assert_eq!(1, discovery.suppressed_diagnostics.total());
         assert!(
             discovery
                 .diagnostics

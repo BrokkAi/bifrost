@@ -26,11 +26,13 @@ fn rust_segment(text: &str, kind: SegmentKind) -> SegmentId {
 }
 
 pub fn rust_file_package_fq(file: &ProjectFile) -> FqName {
-    let mut fq = FqName::new();
-    for component in rust_package_components(file) {
-        fq.push(rust_segment(&component, SegmentKind::Package));
-    }
-    fq
+    with_rust_package_components(file, |components| {
+        let mut fq = FqName::new();
+        for component in components {
+            fq.push(rust_segment(component, SegmentKind::Package));
+        }
+        fq
+    })
 }
 
 pub fn rust_semantic_package_fq(package_name: &str) -> FqName {
@@ -334,16 +336,21 @@ pub fn parse_rust_file(file: &ProjectFile, source: &str, tree: &Tree) -> ParsedF
 }
 
 pub fn rust_package_name(file: &ProjectFile) -> String {
-    rust_package_components(file).join(".")
+    with_rust_package_components(file, |components| components.join("."))
 }
 
-/// Crate-anchored package components when a `Cargo.toml` governs `file`,
-/// otherwise the legacy path-derived scheme.
-fn rust_package_components(file: &ProjectFile) -> Vec<String> {
-    if let Some(paths) = crate::crate_naming::rust_crate_paths(file) {
-        return paths.package;
+/// Hands `read` the crate-anchored package components when a `Cargo.toml`
+/// governs `file`, otherwise the legacy path-derived scheme.
+///
+/// Borrowed rather than returned: the crate-anchored components are memoized
+/// behind an `Arc` (see `crate_naming`), and this is one of the hottest
+/// questions a scan asks, so handing out an owned `Vec` would reinstate the
+/// per-call allocation the memo removes.
+fn with_rust_package_components<T>(file: &ProjectFile, read: impl FnOnce(&[String]) -> T) -> T {
+    match crate::crate_naming::rust_crate_paths(file) {
+        Some(paths) => read(&paths.package),
+        None => read(&rust_path_derived_package_components(file)),
     }
-    rust_path_derived_package_components(file)
 }
 
 /// Directory-derived naming, kept verbatim for manifest-less trees.
@@ -419,9 +426,13 @@ fn visit_rust_class_like(
     if in_test_region {
         parsed.mark_test_region(&code_unit);
     }
-    parsed.add_signature(
+    parsed.add_signature_with_metadata(
         code_unit.clone(),
-        rust_type_signature(node, source, package_name.is_empty()),
+        SignatureMetadata::new(
+            rust_type_signature(node, source, package_name.is_empty()),
+            Vec::new(),
+        )
+        .with_recorded_type_parameters(rust_declared_type_parameters(node, source)),
     );
 
     if let Some(body) = node.child_by_field_name("body") {
@@ -1676,9 +1687,10 @@ fn visit_rust_alias(
     if in_test_region {
         parsed.mark_test_region(&code_unit);
     }
-    parsed.add_signature(
+    parsed.add_signature_with_metadata(
         code_unit.clone(),
-        rust_bounded_declaration_label(node, source),
+        SignatureMetadata::new(rust_bounded_declaration_label(node, source), Vec::new())
+            .with_recorded_type_parameters(rust_declared_type_parameters(node, source)),
     );
     parsed.mark_type_alias(code_unit.clone());
     Some(code_unit)
@@ -2121,6 +2133,36 @@ fn enclosing_rust_impl_item(node: Node<'_>) -> Option<Node<'_>> {
         parent = candidate.parent();
     }
     None
+}
+
+/// The names of the type parameters `node` writes, in declaration order.
+///
+/// Read from the declaration's own `type_parameters` field, which every Rust
+/// type declaration carries (`struct_item`, `enum_item`, `union_item`,
+/// `trait_item`, `type_item`). An absent field is a declaration that writes no
+/// parameter list, which is a recorded arity of zero, not an unknown one.
+///
+/// Lifetimes and const generics are counted with the types. Generic arity here
+/// is the length of the written parameter list, which is what separates
+/// `Slice<'a, T>` from `Slice`; it is not a count of the parameters that
+/// happen to name types.
+fn rust_declared_type_parameters(node: Node<'_>, source: &str) -> Vec<String> {
+    let Some(parameters) = node.child_by_field_name("type_parameters") else {
+        return Vec::new();
+    };
+    let mut cursor = parameters.walk();
+    parameters
+        .named_children(&mut cursor)
+        .filter(|parameter| {
+            matches!(
+                parameter.kind(),
+                "const_parameter" | "lifetime_parameter" | "metavariable" | "type_parameter"
+            )
+        })
+        .map(|parameter| parameter.child_by_field_name("name").unwrap_or(parameter))
+        .map(|name| rust_node_text(name, source).trim().to_string())
+        .filter(|name| !name.is_empty())
+        .collect()
 }
 
 fn rust_signature_metadata(signature: String, node: Node<'_>, source: &str) -> SignatureMetadata {
@@ -2662,6 +2704,75 @@ impl Widget {
                 .iter()
                 .any(|name| name.ends_with("test_only_helper")),
             "impl member should be tainted: {tainted:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod type_parameter_metadata_tests {
+    use super::*;
+
+    /// The recorded `(short_name, arity)` pairs of every declaration whose
+    /// signature metadata read a type-parameter list.
+    fn recorded_arities(source: &str) -> Vec<(String, usize)> {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .expect("Rust parser language");
+        let tree = parser.parse(source, None).expect("parse Rust fixture");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let file = ProjectFile::new(
+            temp.path().canonicalize().expect("canonical root"),
+            "src/lib.rs",
+        );
+        let parsed = parse_rust_file(&file, source, &tree);
+        let mut recorded = parsed
+            .signature_metadata
+            .iter()
+            .flat_map(|(unit, metadata)| {
+                metadata
+                    .iter()
+                    .filter(|entry| entry.type_parameters_recorded())
+                    .map(|entry| (unit.short_name().to_string(), entry.type_parameters().len()))
+            })
+            .collect::<Vec<_>>();
+        recorded.sort();
+        recorded
+    }
+
+    /// Every Rust type declaration records its own parameter list, so a
+    /// nongeneric type is a proven zero rather than an unread list (#1651).
+    /// Lifetimes and const generics are parameters of that list and count.
+    #[test]
+    fn rust_type_declarations_record_their_type_parameters() {
+        let recorded = recorded_arities(
+            r#"
+pub struct Plain;
+pub struct Generic<T> { pub value: T }
+pub struct Pair<K, V> { pub key: K, pub value: V }
+pub struct Borrowed<'a, T, const N: usize> { pub items: &'a [T; N] }
+pub enum Choice<T> { Only(T) }
+pub trait Marker {}
+pub trait Convert<T> { fn convert(&self) -> T; }
+pub type Alias<T> = Option<T>;
+pub type Plainest = usize;
+pub fn free<T>(value: T) -> T { value }
+"#,
+        );
+        assert_eq!(
+            recorded,
+            vec![
+                ("Alias".to_string(), 1),
+                ("Borrowed".to_string(), 3),
+                ("Choice".to_string(), 1),
+                ("Convert".to_string(), 1),
+                ("Generic".to_string(), 1),
+                ("Marker".to_string(), 0),
+                ("Pair".to_string(), 2),
+                ("Plain".to_string(), 0),
+                ("Plainest".to_string(), 0),
+            ],
+            "a callable's type parameters stay unrecorded; every type declaration records"
         );
     }
 }

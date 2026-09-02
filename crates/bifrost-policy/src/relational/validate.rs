@@ -60,6 +60,10 @@ pub enum RelationalAssertionPlanError {
     UnknownField {
         binding: String,
         field: String,
+        /// Every field the binding actually carries at the point of failure,
+        /// in schema order. Complete on purpose: the author needs the
+        /// alternatives, not a count.
+        known_fields: Vec<String>,
     },
     JoinTypeMismatch {
         left: String,
@@ -224,9 +228,19 @@ impl fmt::Display for RelationalAssertionPlanError {
             Self::UnknownAggregate { group, name } => {
                 write!(formatter, "unknown aggregate `{group}.{name}`")
             }
-            Self::UnknownField { binding, field } => {
-                write!(formatter, "unknown field `{binding}.{field}`")
-            }
+            Self::UnknownField {
+                binding,
+                field,
+                known_fields,
+            } => write!(
+                formatter,
+                "unknown field `{binding}.{field}`; `{binding}` has {}; see `bifrost --list-row-schemas`",
+                if known_fields.is_empty() {
+                    String::from("no fields")
+                } else {
+                    format!("fields: {}", known_fields.join(", "))
+                }
+            ),
             Self::JoinTypeMismatch {
                 left,
                 left_type,
@@ -476,6 +490,7 @@ fn validate_relation(
                 return Err(RelationalAssertionPlanError::UnknownField {
                     binding: binding.as_str().to_string(),
                     field: "<schema>".to_string(),
+                    known_fields: expected.field_names_of(binding.as_str()),
                 });
             }
         }
@@ -594,6 +609,7 @@ fn column_field<'a>(
         .ok_or_else(|| RelationalAssertionPlanError::UnknownField {
             binding: column.qualifier.clone(),
             field: column.name.clone(),
+            known_fields: schema.field_names_of(&column.qualifier),
         })
 }
 
@@ -668,13 +684,7 @@ fn validate_predicate(
             }
         }
         IrPredicate::IsNull { column, .. } => {
-            let field =
-                schema
-                    .field(column)
-                    .ok_or_else(|| RelationalAssertionPlanError::UnknownField {
-                        binding: column.qualifier.clone(),
-                        field: column.name.clone(),
-                    })?;
+            let field = column_field(schema, column)?;
             if !field.nullable {
                 return Err(RelationalAssertionPlanError::NullTestOnRequiredField {
                     field: column.to_string(),

@@ -402,6 +402,7 @@ mod tests {
                     cancellation,
                     cvss_overlays: &[],
                     organizational_risk: &[],
+                    incremental: None,
                 },
                 &mut PolicyBudget::default(),
             )

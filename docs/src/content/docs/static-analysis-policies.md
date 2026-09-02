@@ -34,16 +34,28 @@ into a match policy behind the author's back.
 
 ### Built-in code-smell pack
 
-The installed binary embeds `bifrost.code-smells`, a catalog of fourteen
-structured policies: ten match policies and four assertion policies. It covers
+The installed binary embeds `bifrost.code-smells`, which contains fifteen
+structured policies: ten match policies and five assertion policies. It covers
 dynamic evaluation, unsafe Python object deserialization, success-gated Go API
-results, rayon parallelism inside blocking Rust lazy initializers,
+results, wrong zero-valued errors returned from exact Go API failure paths,
+rayon parallelism inside blocking Rust lazy initializers,
 loop-invariant sorting, and review prompts for regular-expression compilation,
 file reads, serialization, parsing, database calls, network calls,
 subprocesses, sleep, and expensive operations beneath nested loops. Every rule
-is an ordinary checked-in `.rqlp` source with a stable ID and semantic hash; the
-manifest also records its category, claimed languages, required capabilities,
-severity rationale, and remediation.
+is an ordinary checked-in `.rqlp` source with a stable ID and semantic hash;
+its pack manifest also records the category, claimed languages, required
+capabilities, severity rationale, and remediation.
+
+### Built-in security pack
+
+The installed binary also embeds `bifrost.security`. Version 1.0 contains one
+high-precision Java rule: a Servlet request parameter reaching the exact `sql`
+operand of `Statement.execute(String)`. The rule uses semantic declaration and
+actual-to-formal identity plus value-flow reachability. It does not treat
+PreparedStatement value binding or unrelated same-named methods as SQL-text
+sinks, and unresolved or incomplete dispatch remains inconclusive instead of
+clean. The built-in catalog groups the code-smell and security manifests in
+stable pack order and permits selection by pack, category, or policy ID.
 
 Pack version 1.1 adds Rust coverage to eight performance policies. The Rust
 selectors recognize the standard slice `sort*` family, `Regex::new`,
@@ -165,10 +177,63 @@ the standard-library claim. A declarations-only `bytes` pack records the exact
 rule can prove that `pem.Decode(bytes.TrimSpace(data))` still receives exactly
 one argument; the pack makes no broader behavioral claim about `bytes`.
 
+Pack version 2.7 adds
+`bifrost.correctness.go-wrong-error-on-failure-path`. It starts from the same
+canonical reviewed Go result contracts, identifies the exact edge where a
+condition result establishes failure, and reports when a call returned from
+that edge consumes a different error binding whose exact reaching value is
+Go's zero value. A correct condition result, an independently established
+sentinel, a direct return, a statement-only call, a success-arm use, or an
+incomplete origin does not match. The initial returned-call-argument scope is
+deliberately narrower than every syntactically possible wrong-error pattern;
+broader consumer kinds require independent live precision evidence before they
+join the built-in policy.
+
+Pack version 2.8 replaces the specialized
+`bifrost.correctness.go-result-used-before-success-check` finding with
+`bifrost.correctness.go-nil-dereference`. The new policy reports only exact
+`Nil` or `MaybeNil` facts at structured Go dereferences, field accesses, and
+reviewed receiver operations. Exact unguarded result/error contracts remain
+available as a second origin in that same nilness relation, preserving the
+reviewed standard-library cases under one finding identity. Unknown scalar
+facts, nil-tolerant methods, and arbitrary pointer receiver calls do not
+report.
+
+Pack version 2.10 finishes what 2.2 started: the seven remaining in-loop
+review prompts -- serialization, regular-expression compilation, sleeps,
+network calls, database calls, subprocess launches, and expensive operations
+beneath nested loops -- become assertion policies carrying the same
+`assert-origin-shape` exclusion at eight elements. Every policy ID, message,
+severity, and claimed language is unchanged; only the analysis type and the
+withdrawal are new. The proof coverage is the one 2.2 documented: JS/TS
+`const`/`let`/`var`, Rust `let`, and Java local declarators establish a
+binding a proof can read, and every establishing initializer must qualify, so
+a literal later reassigned from a call still reports. Loops whose iterated
+value is out of evidence keep reporting: while and counting loops, call
+results, parameters, Java fields, Java `new String[] {...}` array-creation
+iterables (the iterated node is the creation expression, not the initializer
+literal inside it), and Python names bound only by assignment. `sleep-in-loop`
+keeps its 1.3 narrowing to `for_loop`, so a sleep in a poll or backoff `while`
+is still outside the rule rather than merely unproven.
+
+`expensive-operation-in-nested-loop` resolves the inner loop -- the one whose
+iteration the operation is written under. A proven small inner literal makes
+the nest's work linear in the outer loop rather than multiplicative, which is
+exactly the claim that policy makes, and the outer loop remains the reported
+location. The mirror case, a small outer loop over an unbounded inner one,
+stays reported: the exclusion withdraws a prompt only on proof, never on
+plausibility.
+
 Use `bifrost --list-policies` or MCP `list_policies` to inspect the exact catalog
-in the running build. Select it with `--policy-pack bifrost.code-smells`, a
-`--policy-category`, or a stable `--policy-id`; MCP `run_policy` exposes the same
-pack/category/ID selectors. The match policies are deliberately
+in the running build. A CLI policy invocation with no `--policy-file` and no
+built-in selector -- `bifrost --root . --policy` is the plain form -- evaluates
+every built-in pack; any explicit selection replaces that default, and
+`--no-builtin-policies` refuses it for controlled runs that must evaluate only
+their own `--policy-file` inputs. Select a subset with
+`--policy-pack bifrost.code-smells`, a `--policy-category`, or a stable
+`--policy-id`; MCP `run_policy` exposes the same pack/category/ID selectors.
+`bifrost --version` prints each shipped pack's id, version, and policy count
+plus a catalog SHA-256, so a shipped-catalog change is a visible version event. The match policies are deliberately
 review-oriented: a call name or lexical location is evidence of the parsed
 shape, not proof of runtime dispatch, loop invariance, or measured cost.
 `bifrost.performance.loop-invariant-sort` is the exception that proves the rule
@@ -562,6 +627,19 @@ route -- `(assert-route ... :via re_export)` is how "this facade genuinely
 forwards the origin" is spelled. A traversal that ends in a cycle or a
 truncation is inconclusive, never evidence of absence.
 
+What counts as a re-export follows each language's own rule. Rust re-exports
+through `pub use`, and JavaScript and TypeScript through `export ... from`.
+Python names no re-export in its syntax, so Bifrost applies the rule its typing
+ecosystem enforces (PEP 484 stub semantics, which pyright and mypy apply in
+strict mode): a name on the module's `__all__`, either redundant-alias form
+(`from x import y as y`, `import x as x`), and `from x import *` as one star
+hop are re-exports. A plain `from .impl import helper` in a package
+`__init__.py` that states no `__all__` is not; the facade convention alone does
+not make a name public, and the import relation already reports it. When a
+module computes its `__all__` (`__all__ = build()`, `__all__.extend(other)`),
+membership is unknown, so that file's import, export and re-export rows report
+incomplete and an absent re-export proves nothing.
+
 `(assert-round-trip :id ID :at CAPTURE :role ROLE)` requires forward
 resolution and inverse enumeration to close: every declaration the site's
 route reaches must reach the site back through inverse edges over the involved
@@ -590,6 +668,34 @@ A group that violates its assertion becomes one finding anchored at the exact
 source ranges of the rows that produced it. A binding the query engine had to
 truncate makes the run inconclusive, never clean; the run's diagnostics then
 name each assertion whose verdict that truncation blocked.
+
+##### Discovering the row fields
+
+The rows are a registry, not a convention, so the fields, scalar types,
+nullability, join keys, enum values, and admitted expansions are all published.
+`bifrost --list-row-schemas` prints the whole versioned catalog as
+`bifrost_relation_schema/v1` JSON, without constructing a workspace. The REPL's
+`:doc <row-domain>` prints one domain of that same catalog, and the validator
+enforces exactly what the catalog states, so a field named there is a field the
+plan can bind.
+
+The first lines `:doc call_argument` prints, as an example of the shape:
+
+```
+call_argument — row domain for relational policy bindings
+id: stable_id (join key)
+group_id: stable_id (join key)
+site_id: stable_id (join key)
+argument_index: integer
+```
+
+Enum columns list their admitted values, and each domain ends with the
+`expansions: STEP -> DOMAIN` steps `(bind :from ... :step ...)` accepts.
+
+The catalog is the source of truth; this page does not restate it. A field
+reference the catalog does not carry fails at policy load time, and the
+`unknown field` diagnostic lists the complete set of fields the binding does
+carry.
 
 ##### Row predicates
 
@@ -940,6 +1046,11 @@ justified by the structured call site. `optimistic` preserves existing facts
 without introducing unseen-body transfers, while `require-model` abstains when
 no applicable model exists. Every fallback retains incomplete call-boundary
 evidence; none of these settings turns an unresolved call into proof of safety.
+
+`:on-unknown` is a different question and is accepted on every analysis type:
+`:call-modeling` decides which facts cross an unmodeled call, while
+`:on-unknown` decides what the run does once some verdict could not be reached
+at all. See [Declare What An Unknown Result Does](#declare-what-an-unknown-result-does).
 
 Endpoint categories and display/report text remain outside automaton and
 interprocedural-summary keys; the protocol analysis consumes resolved endpoint
@@ -1344,7 +1455,7 @@ API identity:
 
 ```json
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "pack_id": "acme.http-effects",
   "version": "1.0.0",
   "producer": { "name": "acme-platform", "version": "1.0.0" },
@@ -1494,6 +1605,18 @@ therefore declaration-identity equality, and the witness's
 row, so "show me the exact call this transitive finding came from" is a join
 rather than a text search.
 
+The schema-v1 `timing` field preserves the semantic pack's authored
+`immediate`, `deferred`, or `unknown` schedule. The additive
+`execution_timing` field uses the analyzer's canonical execution labels;
+common effect rows report `same_evaluation`, `same_invocation`,
+`different_task`, `deferred_callback`, or `unknown`, and the complete finite
+domain is published by the query schema. Bifrost composes the modeled schedule
+with the exact source call and every transitive call edge before it publishes
+`execution_timing`; an unsupported or conflicting composition becomes
+`unknown`. In particular, authored `immediate` means "before the modeled call
+returns," so it composes as `same_invocation`, not the stronger
+`same_evaluation` claim.
+
 Over `effects/java/finding/App.java` the policy reports two findings — the
 direct call at depth 1 and the helper call at depth 2 — and exits 1. The same
 helper without the marker is not reported, and neither is a marked procedure
@@ -1598,7 +1721,12 @@ read `unknown` as evidence of absence.
 relational assertion finding explains its assertion, group key, contributing
 rows, and any coverage obligations. `explain_candidate` serves `match` and
 `assertion` policies, and a relational candidate reports the first row binding
-it is absent from. The families each entry point does not serve — `typestate`
+it is absent from. When a binding's query does return the candidate's row, the
+answer also replays every `filter` the plan attaches directly to that binding,
+and a filter that removed the row is reported as a `filter_predicate` node
+naming the predicate and the value the row carried. Joins, group keys, and
+aggregates are still not replayed, so a candidate that survives every binding
+and every such filter is `unknown`, never `satisfied`. The families each entry point does not serve — `typestate`
 for `why`, and `flow`, `taint`, and `typestate` for `why-not` — are refused
 with an explicit adapter-unavailable answer that names the supported analysis
 types. `why-not` over a flow or taint policy is not a projection of anything
@@ -1695,7 +1823,7 @@ than explained from a differently-modeled run.
 | Declared effects | `declared_effects` on a procedure summary, propagated with depth, certainty, timing, and coverage | Path-conditional effects are a P0 non-goal; effect timing is the pack's declaration, not an inference about scheduling syntax |
 | Annotation markers | The normalized `decorators` role | Matches the written annotation name, not a resolved annotation type |
 | Negative claims | Absence requires exhaustive coverage; an unmet obligation is structured data on the run | An open effect set or an unresolved callee is exit 2, never exit 0 |
-| Explanations | `explain_finding` over `match`, `assertion`, `flow`, and `taint` findings and `explain_candidate` over `match` and `assertion` policies, plus the MCP `explain_policy` tool and the CLI `--explain-finding`/`--explain-candidate` flags | A `why` answer projects retained evidence only, so it is exactly as complete as the report; typestate findings, and every `why-not` over a flow or taint policy, are refused rather than answered |
+| Explanations | `explain_finding` over `match`, `assertion`, `flow`, and `taint` findings and `explain_candidate` over `match` and `assertion` policies, plus the MCP `explain_policy` tool and the CLI `--explain-finding`/`--explain-candidate` flags | A `why` answer projects retained evidence only, so it is exactly as complete as the report; typestate findings, and every `why-not` over a flow or taint policy, are refused rather than answered; a relational `why-not` replays row-binding membership and the `filter` records attached to a binding, and reports the plan's joins, group keys, and aggregates as unreplayed |
 | Near-miss ranking | `rank_near_misses` over `match` and `assertion` policies, published as `bifrost_policy_near_miss/v1`, plus the MCP `explain_policy` `near_misses` form and the CLI `--explain-near-misses N` flag | Distance is the count of unsatisfied declared predicates and nothing else; candidates are the caller's list or the policy's own seed scope, never a repository scan, and a seed with no kind union is refused; a relational subject that clears every row binding is `unknown`, because the joins, group keys, and aggregates are not replayed |
 | Model activation | Two routes, above; the CLI policy runner activates both | A `review_required` workspace model stays inert without an `enable` entry, reported as a warning |
 
@@ -1714,6 +1842,29 @@ A policy run is not just a list of findings:
   negative claim.
 - Query diagnostics carry typed impact. Capability or work omissions propagate
   into policy completion instead of being flattened into an empty match set.
+
+### Declare What An Unknown Result Does
+
+A policy declares how the gate should treat a verdict its evidence could not
+reach:
+
+```lisp
+(analysis :type taint
+  :on-unknown (on-unknown :verdict abstain|warn-unreliable|fail-closed)
+  ...)
+```
+
+| Verdict | Findings and completion | Exit status |
+| --- | --- | --- |
+| `abstain` (default) | Retained; the run stays `inconclusive` with its typed reasons | Unreliable (2) |
+| `warn-unreliable` | Retained unchanged; the run also carries `unknown_verdict` in its report JSON | Whatever the findings alone produce |
+| `fail-closed` | Retained unchanged, plus an `unknown_verdict_fail_closed` diagnostic naming the reasons | As if a finding at the policy's severity were present |
+
+Omitting the record is exactly `abstain`, so a policy written before this
+vocabulary existed behaves identically and keeps its canonical semantic hash.
+`warn-unreliable` and `fail-closed` apply only to an `inconclusive` run: an
+`unsupported` or `failed` run is an engine outcome, not a policy verdict, and
+still exits unreliable whatever the policy declared.
 
 Every finding is built from one canonical typed model. Human, canonical JSON,
 and SARIF 2.1.0 therefore retain the same rule and semantic hashes, finding ID,

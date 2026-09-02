@@ -403,7 +403,7 @@ impl ExactDependencyArtifact {
 pub struct DependencyPackProduction {
     pub pack: Option<AuthoredSemanticModelPack>,
     pub diagnostics: Vec<ProducerDiagnostic>,
-    pub suppressed_diagnostics: usize,
+    pub suppressed_diagnostics: SuppressedDiagnostics,
 }
 
 /// The exact, compiled result of producing one dependency semantic pack.
@@ -418,7 +418,7 @@ pub struct CompiledDependencyProduction {
     pub compiled: super::CompiledSemanticModelPack,
     pub completeness: Completeness,
     pub diagnostics: Vec<ProducerDiagnostic>,
-    pub suppressed_diagnostics: usize,
+    pub suppressed_diagnostics: SuppressedDiagnostics,
 }
 
 /// Why exact dependency production did not return a compiled pack.
@@ -430,22 +430,22 @@ pub struct CompiledDependencyProduction {
 pub enum DependencyProductionFailure {
     NoPack {
         diagnostics: Vec<ProducerDiagnostic>,
-        suppressed_diagnostics: usize,
+        suppressed_diagnostics: SuppressedDiagnostics,
     },
     InvalidOutput {
         code: String,
         message: String,
         diagnostics: Vec<ProducerDiagnostic>,
-        suppressed_diagnostics: usize,
+        suppressed_diagnostics: SuppressedDiagnostics,
     },
     Compilation {
         diagnostics: Vec<Diagnostic>,
         producer_diagnostics: Vec<ProducerDiagnostic>,
-        suppressed_diagnostics: usize,
+        suppressed_diagnostics: SuppressedDiagnostics,
     },
     Cancelled {
         diagnostics: Vec<ProducerDiagnostic>,
-        suppressed_diagnostics: usize,
+        suppressed_diagnostics: SuppressedDiagnostics,
     },
 }
 
@@ -539,7 +539,7 @@ pub fn compile_exact_dependency_production(
     if is_cancelled(cancellation) {
         return Err(DependencyProductionFailure::Cancelled {
             diagnostics: Vec::new(),
-            suppressed_diagnostics: 0,
+            suppressed_diagnostics: SuppressedDiagnostics::default(),
         });
     }
 
@@ -550,7 +550,7 @@ pub fn compile_exact_dependency_production(
                 code: "production.identity".to_owned(),
                 message: error.to_string(),
                 diagnostics: Vec::new(),
-                suppressed_diagnostics: 0,
+                suppressed_diagnostics: SuppressedDiagnostics::default(),
             }
         })?;
     let production = {
@@ -563,7 +563,7 @@ pub fn compile_exact_dependency_production(
     let production_has_errors = producer_diagnostics
         .iter()
         .any(|diagnostic| diagnostic.severity == ProducerDiagnosticSeverity::Error)
-        || suppressed_diagnostics > 0;
+        || suppressed_diagnostics.total() > 0;
     let Some(mut pack) = production.pack else {
         return Err(DependencyProductionFailure::NoPack {
             diagnostics: producer_diagnostics,
@@ -727,7 +727,7 @@ pub struct DependencyPackPreparationOutcome {
     pub installed_packs: Vec<PreparedInstalledDependencyPack>,
     pub evidence: Vec<SemanticModelActivationEvidence>,
     pub diagnostics: Vec<DependencyPackDiagnostic>,
-    pub suppressed_diagnostics: usize,
+    pub suppressed_diagnostics: SuppressedDiagnostics,
     pub complete: bool,
     pub cancelled: bool,
     pub profile: DependencyPackPreparationProfile,
@@ -743,7 +743,7 @@ pub struct DependencyDiscoveryProfile {
 pub struct DependencyDiscoveryOutcome {
     pub dependencies: Vec<ResolvedDependency>,
     pub diagnostics: Vec<DependencyPackDiagnostic>,
-    pub suppressed_diagnostics: usize,
+    pub suppressed_diagnostics: SuppressedDiagnostics,
     pub complete: bool,
     pub cancelled: bool,
     pub profile: DependencyDiscoveryProfile,
@@ -758,7 +758,7 @@ impl DependencyDiscoveryOutcome {
             },
             dependencies,
             diagnostics: Vec::new(),
-            suppressed_diagnostics: 0,
+            suppressed_diagnostics: SuppressedDiagnostics::default(),
             complete: true,
             cancelled: false,
         }
@@ -1353,9 +1353,7 @@ pub fn prepare_dependency_semantic_packs(
                         diagnostics: producer_diagnostics,
                         suppressed_diagnostics,
                     } => {
-                        diagnostics.suppressed = diagnostics
-                            .suppressed
-                            .saturating_add(suppressed_diagnostics);
+                        diagnostics.suppressed += suppressed_diagnostics;
                         for diagnostic in producer_diagnostics {
                             diagnostics.producer(Some(&dependency.id), diagnostic);
                         }
@@ -1366,9 +1364,7 @@ pub fn prepare_dependency_semantic_packs(
                         diagnostics: producer_diagnostics,
                         suppressed_diagnostics,
                     } => {
-                        diagnostics.suppressed = diagnostics
-                            .suppressed
-                            .saturating_add(suppressed_diagnostics);
+                        diagnostics.suppressed += suppressed_diagnostics;
                         for diagnostic in producer_diagnostics {
                             diagnostics.producer(Some(&dependency.id), diagnostic);
                         }
@@ -1379,9 +1375,7 @@ pub fn prepare_dependency_semantic_packs(
                         producer_diagnostics,
                         suppressed_diagnostics,
                     } => {
-                        diagnostics.suppressed = diagnostics
-                            .suppressed
-                            .saturating_add(suppressed_diagnostics);
+                        diagnostics.suppressed += suppressed_diagnostics;
                         for diagnostic in producer_diagnostics {
                             diagnostics.producer(Some(&dependency.id), diagnostic);
                         }
@@ -1402,9 +1396,7 @@ pub fn prepare_dependency_semantic_packs(
                 continue;
             }
         };
-        diagnostics.suppressed = diagnostics
-            .suppressed
-            .saturating_add(production.suppressed_diagnostics);
+        diagnostics.suppressed += production.suppressed_diagnostics;
         let production_has_diagnostics = !production.diagnostics.is_empty();
         for diagnostic in production.diagnostics.iter().cloned() {
             diagnostics.producer(Some(&dependency.id), diagnostic);
@@ -1763,7 +1755,7 @@ fn compatible_installed_pack_candidates(
     };
     let mut candidates = Vec::new();
     let mut accounted_manifests: HashSet<String> = set_with_capacity(4);
-    for candidate in catalog.candidates(&query)? {
+    for candidate in catalog.dependency_candidates(&query)? {
         if !matches!(
             candidate.source_kind(),
             CatalogPackSourceKind::Installed
@@ -1845,8 +1837,10 @@ fn describe_not_activation_ready(
             format!("error rejects {} != 0", accounting.error_reject_count)
         }
         Some(accounting) => format!(
-            "named gaps {} != reject count {}",
+            "accounted rejects {} (declaration gaps {}, source entries {}) != reject count {}",
+            accounting.gaps.len() + accounting.source_entries.len(),
             accounting.gaps.len(),
+            accounting.source_entries.len(),
             accounting.reject_count
         ),
     };
@@ -1872,17 +1866,20 @@ pub fn prepare_discovered_dependency_semantic_packs(
         limits,
         cancellation,
     );
-    let mut diagnostics = discovery.diagnostics;
-    diagnostics.append(&mut outcome.diagnostics);
-    if diagnostics.len() > limits.max_diagnostics {
-        outcome.suppressed_diagnostics = outcome
-            .suppressed_diagnostics
-            .saturating_add(diagnostics.len() - limits.max_diagnostics);
-        diagnostics.truncate(limits.max_diagnostics);
+    // Merge through the bounded collector rather than truncating the joined
+    // list. Discovery diagnostics arrive first, so a plain truncation drops
+    // the preparation errors that decided the outcome.
+    let mut merged = BoundedDependencyDiagnostics::new(limits);
+    for diagnostic in discovery
+        .diagnostics
+        .into_iter()
+        .chain(outcome.diagnostics.drain(..))
+    {
+        merged.push(diagnostic);
     }
-    outcome.suppressed_diagnostics = outcome
-        .suppressed_diagnostics
-        .saturating_add(discovery.suppressed_diagnostics);
+    let (diagnostics, merge_suppressed) = merged.finish();
+    outcome.suppressed_diagnostics += merge_suppressed;
+    outcome.suppressed_diagnostics += discovery.suppressed_diagnostics;
     outcome.complete &= discovery.complete;
     outcome.cancelled |= discovery.cancelled;
     outcome.diagnostics = diagnostics;
@@ -2057,9 +2054,63 @@ fn is_cancelled(cancellation: Option<&CancellationToken>) -> bool {
     cancellation.is_some_and(CancellationToken::is_cancelled)
 }
 
+/// The diagnostics a bounded collector could not retain.
+///
+/// `errors` counts dropped error-severity diagnostics: the number that says
+/// the evidence for a failure is missing. `warnings` counts every other
+/// bounded omission recorded alongside them, so `total()` remains the single
+/// number callers reported before the split.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SuppressedDiagnostics {
+    pub warnings: usize,
+    pub errors: usize,
+}
+
+impl SuppressedDiagnostics {
+    pub fn total(&self) -> usize {
+        self.warnings.saturating_add(self.errors)
+    }
+}
+
+impl std::ops::AddAssign for SuppressedDiagnostics {
+    fn add_assign(&mut self, other: Self) {
+        self.warnings = self.warnings.saturating_add(other.warnings);
+        self.errors = self.errors.saturating_add(other.errors);
+    }
+}
+
+/// Decide whether one arriving diagnostic can take a slot in a bounded vector
+/// that already holds its maximum, and record what that decision suppresses.
+///
+/// An arriving warning is dropped and counted. An arriving error evicts the
+/// last retained warning and takes its slot: removing the last warning rather
+/// than the first keeps the retained prefix in arrival order, so the earliest
+/// context survives. When every retained diagnostic is already an error there
+/// is nothing to evict, so the arriving error is dropped and counted.
+///
+/// Returns whether the caller should now push the arriving diagnostic.
+pub(crate) fn admit_into_full_diagnostics<T>(
+    retained: &mut Vec<T>,
+    suppressed: &mut SuppressedDiagnostics,
+    incoming_is_warning: bool,
+    is_warning: impl Fn(&T) -> bool,
+) -> bool {
+    if incoming_is_warning {
+        suppressed.warnings = suppressed.warnings.saturating_add(1);
+        return false;
+    }
+    let Some(index) = retained.iter().rposition(is_warning) else {
+        suppressed.errors = suppressed.errors.saturating_add(1);
+        return false;
+    };
+    retained.remove(index);
+    suppressed.warnings = suppressed.warnings.saturating_add(1);
+    true
+}
+
 pub(crate) struct BoundedDependencyDiagnostics {
     diagnostics: Vec<DependencyPackDiagnostic>,
-    suppressed: usize,
+    suppressed: SuppressedDiagnostics,
     max_diagnostics: usize,
     max_message_bytes: usize,
 }
@@ -2068,7 +2119,7 @@ impl BoundedDependencyDiagnostics {
     pub(crate) fn new(limits: &DependencyPackLimits) -> Self {
         Self {
             diagnostics: Vec::new(),
-            suppressed: 0,
+            suppressed: SuppressedDiagnostics::default(),
             max_diagnostics: limits.max_diagnostics,
             max_message_bytes: limits.max_diagnostic_message_bytes,
         }
@@ -2140,14 +2191,19 @@ impl BoundedDependencyDiagnostics {
 
     pub(crate) fn push(&mut self, mut diagnostic: DependencyPackDiagnostic) {
         diagnostic.message = truncate_utf8(&diagnostic.message, self.max_message_bytes);
-        if self.diagnostics.len() < self.max_diagnostics {
+        if self.diagnostics.len() < self.max_diagnostics
+            || admit_into_full_diagnostics(
+                &mut self.diagnostics,
+                &mut self.suppressed,
+                diagnostic.severity == DependencyPackDiagnosticSeverity::Warning,
+                |retained| retained.severity == DependencyPackDiagnosticSeverity::Warning,
+            )
+        {
             self.diagnostics.push(diagnostic);
-        } else {
-            self.suppressed = self.suppressed.saturating_add(1);
         }
     }
 
-    pub(crate) fn finish(self) -> (Vec<DependencyPackDiagnostic>, usize) {
+    pub(crate) fn finish(self) -> (Vec<DependencyPackDiagnostic>, SuppressedDiagnostics) {
         (self.diagnostics, self.suppressed)
     }
 }
@@ -2212,5 +2268,117 @@ mod semantic_diagnostic_evidence_tests {
             )),
             vec![SemanticDiagnosticIncompleteReason::Truncated]
         );
+    }
+}
+
+#[cfg(test)]
+mod bounded_dependency_diagnostics_tests {
+    use super::*;
+
+    fn diagnostic(
+        severity: DependencyPackDiagnosticSeverity,
+        code: impl Into<String>,
+    ) -> DependencyPackDiagnostic {
+        DependencyPackDiagnostic {
+            severity,
+            code: code.into(),
+            dependency_id: None,
+            location: None,
+            message: "bounded diagnostic".to_owned(),
+        }
+    }
+
+    fn codes(diagnostics: &[DependencyPackDiagnostic]) -> Vec<&str> {
+        diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.code.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn error_at_the_cap_evicts_the_last_retained_warning() {
+        let limits = DependencyPackLimits::default();
+        let mut collector = BoundedDependencyDiagnostics::new(&limits);
+        for index in 0..limits.max_diagnostics {
+            collector.push(diagnostic(
+                DependencyPackDiagnosticSeverity::Warning,
+                format!("warning.{index}"),
+            ));
+        }
+        collector.push(diagnostic(
+            DependencyPackDiagnosticSeverity::Error,
+            "compile_pack",
+        ));
+        let (diagnostics, suppressed) = collector.finish();
+
+        assert_eq!(diagnostics.len(), limits.max_diagnostics);
+        let mut expected: Vec<String> = (0..limits.max_diagnostics - 1)
+            .map(|index| format!("warning.{index}"))
+            .collect();
+        expected.push("compile_pack".to_owned());
+        assert_eq!(codes(&diagnostics), expected);
+        assert_eq!(
+            suppressed,
+            SuppressedDiagnostics {
+                warnings: 1,
+                errors: 0
+            }
+        );
+    }
+
+    #[test]
+    fn a_full_error_vector_counts_both_suppressed_severities() {
+        let limits = DependencyPackLimits::default();
+        let mut collector = BoundedDependencyDiagnostics::new(&limits);
+        for index in 0..limits.max_diagnostics {
+            collector.push(diagnostic(
+                DependencyPackDiagnosticSeverity::Error,
+                format!("error.{index}"),
+            ));
+        }
+        collector.push(diagnostic(
+            DependencyPackDiagnosticSeverity::Warning,
+            "late.warning",
+        ));
+        collector.push(diagnostic(
+            DependencyPackDiagnosticSeverity::Error,
+            "late.error",
+        ));
+        let (diagnostics, suppressed) = collector.finish();
+
+        let expected: Vec<String> = (0..limits.max_diagnostics)
+            .map(|index| format!("error.{index}"))
+            .collect();
+        assert_eq!(codes(&diagnostics), expected);
+        assert_eq!(
+            suppressed,
+            SuppressedDiagnostics {
+                warnings: 1,
+                errors: 1
+            }
+        );
+    }
+
+    #[test]
+    fn below_the_cap_nothing_is_suppressed_and_arrival_order_holds() {
+        let limits = DependencyPackLimits::default();
+        let mut collector = BoundedDependencyDiagnostics::new(&limits);
+        collector.push(diagnostic(
+            DependencyPackDiagnosticSeverity::Warning,
+            "first",
+        ));
+        collector.push(diagnostic(
+            DependencyPackDiagnosticSeverity::Error,
+            "second",
+        ));
+        collector.push(diagnostic(
+            DependencyPackDiagnosticSeverity::Warning,
+            "third",
+        ));
+        let (diagnostics, suppressed) = collector.finish();
+
+        assert_eq!(codes(&diagnostics), vec!["first", "second", "third"]);
+        assert_eq!(suppressed, SuppressedDiagnostics::default());
+        assert_eq!(suppressed.total(), 0);
     }
 }

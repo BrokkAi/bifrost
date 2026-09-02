@@ -1,0 +1,38 @@
+; Exact Go ordinary-access conflicts over a bounded spawn-rooted task slice.
+;
+; The structural union is only a cost seed. A terminal `Go` spelling never
+; supplies task semantics: reviewed exact API identity must bind a task-spawn
+; effect before the solver enters its callback. Open target, heap, ordering,
+; lock, atomic, and synchronization evidence remains queryable but cannot
+; become a finding.
+(policy
+  :schema-version 1
+  :id "bifrost.correctness.go-data-race"
+  :name "Go data race"
+  :message "these exact accesses to the same Go location may execute concurrently without ordering or compatible protection"
+  :severity error
+  :description "Two ordinary Go memory accesses identify the same exact runtime location, at least one writes, their task instances may execute concurrently, and no modeled happens-before edge, compatible must-held lock, or all-atomic access pair protects them. Findings require proven and exhaustive workspace evidence; unresolved or unsupported concurrency remains open."
+  :help-uri "https://bifrost.brokk.ai/static-analysis-policies/#built-in-code-smell-pack"
+  :tags ["correctness" "go" "concurrency" "data-race"]
+  :analysis (analysis
+    :type assertion
+    (bind :name conflict
+      :query (rql :schema-version 1
+        (union
+          (language go
+            (concurrent-access-conflicts
+              (procedure-of
+                (concurrent_spawn))))
+          (language go
+            (concurrent-access-conflicts
+              (procedure-of
+                (call :callee "Go")))))))
+    (filter :over conflict
+      :where ((conflict.verdict eq conflict)
+              (conflict.ordering eq unordered)
+              (conflict.protection eq unprotected)
+              (conflict.proof eq proven)
+              (conflict.coverage eq exhaustive)))
+    (group :name by-shared-location :by (conflict.location_id)
+      (aggregate :name conflicts :op count))
+    (assert :group by-shared-location :value conflicts :cardinality (exactly 0))))

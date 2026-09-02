@@ -508,7 +508,7 @@ fn pack_source(
     language: &dyn FixtureLanguage,
 ) -> String {
     let pack = AuthoredSemanticModelPack {
-        schema_version: 1,
+        schema_version: 2,
         pack_id: FIXTURE_PACK_ID.to_owned(),
         version: FIXTURE_PACKAGE_VERSION.to_owned(),
         producer: Producer {
@@ -566,10 +566,12 @@ fn pack_source(
                     locations: Vec::new(),
                     transfers: entry.transfers.clone(),
                     effects: Vec::new(),
+                    concurrency_effects: Vec::new(),
                     declared_effects: Vec::new(),
                     preconditions: None,
                     result_contracts: Vec::new(),
                     conditional_result_refinements: Vec::new(),
+                    conditional_indirect_writes: Vec::new(),
                     normal_return_refinements: Vec::new(),
                 }],
             },

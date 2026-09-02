@@ -42,7 +42,10 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             let location = self.session.add_memory_location(
                 builder,
                 entry,
-                MemoryLocationKind::Capture { lexical_parent },
+                MemoryLocationKind::Capture {
+                    lexical_parent,
+                    binding: Some(value),
+                },
             )?;
             let expected = lexical_capture_destination(spec.captures_receiver, index)?;
             if location != expected {

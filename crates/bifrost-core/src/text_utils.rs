@@ -127,9 +127,15 @@ pub fn is_ident_byte(byte: u8) -> bool {
 pub fn find_word(haystack: &str, needle: &str) -> Option<usize> {
     let needle_bytes = needle.as_bytes();
     let bytes = haystack.as_bytes();
-    if needle_bytes.is_empty() || needle_bytes.len() > bytes.len() {
+    let first_char = needle.chars().next()?;
+    if needle_bytes.len() > bytes.len() {
         return None;
     }
+    // A rejected candidate is retried from the next character, not the next
+    // byte: restarting mid code point would slice `haystack` off a char
+    // boundary, and stepping a whole needle would skip a candidate that
+    // overlaps the rejected one.
+    let step = first_char.len_utf8();
     let mut start = 0;
     while let Some(rel) = haystack[start..].find(needle) {
         let candidate = start + rel;
@@ -139,8 +145,12 @@ pub fn find_word(haystack: &str, needle: &str) -> Option<usize> {
         if before_ok && after_ok {
             return Some(candidate);
         }
-        // Advance past this candidate's first byte so we don't loop forever.
-        start = candidate + 1;
+        debug_assert!(
+            haystack.is_char_boundary(candidate + step),
+            "needle {needle:?} matched at {candidate} of {haystack:?} but its first \
+             character does not end on a char boundary"
+        );
+        start = candidate + step;
     }
     None
 }
@@ -190,7 +200,9 @@ pub fn trimmed_snippet_around_line(
         let line = source[start..end]
             .trim_end_matches('\n')
             .trim_end_matches('\r');
-        if !buf.is_empty() {
+        // Separate on every row after the first, so a blank leading row still
+        // occupies a row and snippet row N stays table row `snippet_start + N`.
+        if idx > snippet_start {
             buf.push('\n');
         }
         buf.push_str(line);
@@ -377,8 +389,8 @@ fn render_virtual_requested_line(
 #[cfg(test)]
 mod tests {
     use super::{
-        compute_line_starts, find_line_index_for_offset, line_column_for_offset,
-        render_location_diagnostic,
+        compute_line_starts, find_line_index_for_offset, find_word, line_column_for_offset,
+        render_location_diagnostic, trimmed_snippet_around_line,
     };
 
     #[test]
@@ -416,6 +428,31 @@ mod tests {
                 "offset {offset}"
             );
         }
+    }
+
+    #[test]
+    fn find_word_retries_after_a_rejected_multi_byte_candidate() {
+        // The rejected candidate starts with a 4-byte character, so the retry
+        // point must be the next character, not the next byte.
+        assert_eq!(find_word("\u{1f600}a", "\u{1f600}"), None);
+        assert_eq!(find_word("a\u{1f600} \u{1f600}", "\u{1f600}"), Some(6));
+        // A candidate that overlaps a rejected one is still considered.
+        assert_eq!(find_word("za.a.a", "a.a"), Some(3));
+    }
+
+    #[test]
+    fn trimmed_snippet_keeps_blank_rows_before_the_first_content_row() {
+        let source = "\n\n\n";
+        let starts = compute_line_starts(source);
+        assert_eq!(vec![0, 1, 2, 3], starts);
+        assert_eq!("\n", trimmed_snippet_around_line(source, &starts, 0, 1));
+
+        let source = "\n\nlast";
+        let starts = compute_line_starts(source);
+        assert_eq!(
+            "\n\nlast",
+            trimmed_snippet_around_line(source, &starts, 2, 2)
+        );
     }
 
     #[test]
@@ -490,5 +527,526 @@ mod tests {
         assert!(rendered.contains("…"));
         assert!(rendered.contains("requested line 1, column 400"));
         assert!(rendered.len() < 400, "{rendered}");
+    }
+}
+
+/// Generative properties for the line table and the byte-offset helpers built
+/// on top of it.
+///
+/// The historical defects these cover are all convention mismatches at a seam:
+/// a CRLF pair counted as two terminators, a CR-only file whose line count came
+/// from `str::lines`, and a byte offset that landed inside a UTF-8 code point
+/// and was then used to slice. The generators therefore build content out of
+/// line-terminator atoms (`\n`, `\r\n`, lone `\r`) interleaved with characters
+/// that are 1, 2, 3, and 4 UTF-8 bytes wide.
+#[cfg(test)]
+mod text_utils_properties {
+    use super::{
+        compute_line_starts, find_line_index_for_offset, find_word, identifier_at_offset,
+        identifier_prefix_before_offset, identifier_span_at_offset, is_ident_byte,
+        line_column_for_offset, render_location_diagnostic, snippet_around_line,
+        trimmed_snippet_around_line, trimmed_snippet_around_range,
+    };
+    use proptest::prelude::*;
+
+    /// Atoms whose concatenations reproduce every line-ending and code-point
+    /// width combination the line table claims to support.
+    const CONTENT_ATOMS: &[&str] = &[
+        "\n",
+        "\r\n",
+        "\r",
+        "a",
+        "xyz",
+        "\u{e9}",
+        "\u{4e16}",
+        "\u{1f600}",
+    ];
+
+    /// Shapes a uniform concatenation reaches only rarely: an empty file, a
+    /// file that is only terminators, and a lone CR at end of file.
+    const CONTENT_EDGE_CASES: &[&str] = &[
+        "",
+        "\n",
+        "\r",
+        "\r\n",
+        "a\n",
+        "a\r",
+        "a\r\n",
+        "\n\n\n",
+        "\r\r\r",
+        "\r\n\r\n",
+        "\u{1f600}\r\n",
+        "a\rb\r\n\u{e9}\nd",
+    ];
+
+    /// The identifier and word helpers need identifier bytes adjacent to the
+    /// multi-byte atoms, so they draw from a superset of [`CONTENT_ATOMS`].
+    const IDENTIFIER_ATOMS: &[&str] = &[
+        "a",
+        "xyz",
+        "foo_bar",
+        "9",
+        "_",
+        " ",
+        ".",
+        "(",
+        "\n",
+        "\r\n",
+        "\r",
+        "\u{e9}",
+        "\u{4e16}",
+        "\u{1f600}",
+    ];
+
+    const ASCII_NEEDLES: &[&str] = &["a", "xyz", "foo_bar", "9", "_", "zz"];
+
+    const MULTI_BYTE_NEEDLES: &[&str] = &["\u{e9}", "\u{4e16}", "\u{1f600}", "\u{e9}a"];
+
+    fn content() -> impl Strategy<Value = String> {
+        prop_oneof![
+            3 => prop::sample::select(CONTENT_EDGE_CASES.to_vec()).prop_map(|atom| atom.to_string()),
+            7 => prop::collection::vec(prop::sample::select(CONTENT_ATOMS.to_vec()), 0..12)
+                .prop_map(|atoms| atoms.concat()),
+        ]
+    }
+
+    fn identifier_content() -> impl Strategy<Value = String> {
+        prop::collection::vec(prop::sample::select(IDENTIFIER_ATOMS.to_vec()), 0..10)
+            .prop_map(|atoms| atoms.concat())
+    }
+
+    fn char_boundaries(content: &str) -> Vec<usize> {
+        (0..=content.len())
+            .filter(|&offset| content.is_char_boundary(offset))
+            .collect()
+    }
+
+    /// Count lines with a CR state machine rather than with the lookahead
+    /// [`compute_line_starts`] uses, so a defect in the lookahead cannot hide
+    /// inside a shared expectation. A file always has at least one line; a CRLF
+    /// pair is one terminator, counted at the CR.
+    fn expected_line_count(content: &str) -> usize {
+        let mut lines = 1usize;
+        let mut previous_was_cr = false;
+        for ch in content.chars() {
+            match ch {
+                '\r' => {
+                    lines += 1;
+                    previous_was_cr = true;
+                }
+                '\n' => {
+                    if !previous_was_cr {
+                        lines += 1;
+                    }
+                    previous_was_cr = false;
+                }
+                _ => previous_was_cr = false,
+            }
+        }
+        lines
+    }
+
+    /// Build the same table by pushing a start after every CR and then, when an
+    /// LF follows, correcting that start instead of peeking ahead first.
+    fn reference_line_starts(content: &str) -> Vec<usize> {
+        let mut starts = vec![0usize];
+        let mut previous_was_cr = false;
+        for (index, ch) in content.char_indices() {
+            match ch {
+                '\r' => {
+                    starts.push(index + 1);
+                    previous_was_cr = true;
+                }
+                '\n' => {
+                    if previous_was_cr {
+                        *starts
+                            .last_mut()
+                            .expect("the table always holds the file start") = index + 1;
+                    } else {
+                        starts.push(index + 1);
+                    }
+                    previous_was_cr = false;
+                }
+                _ => previous_was_cr = false,
+            }
+        }
+        starts
+    }
+
+    fn previous_char_boundary(content: &str, offset: usize) -> usize {
+        (0..=offset.min(content.len()))
+            .rev()
+            .find(|&candidate| content.is_char_boundary(candidate))
+            .expect("offset 0 is always a char boundary")
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig { cases: 256, ..ProptestConfig::default() })]
+
+        /// The table starts at 0, strictly increases, sits on char boundaries,
+        /// and holds exactly one entry per line under the mixed-ending
+        /// convention.
+        #[test]
+        fn compute_line_starts_matches_an_independent_line_table(content in content()) {
+            let starts = compute_line_starts(&content);
+
+            prop_assert_eq!(starts.first().copied(), Some(0), "table for {:?}", content);
+            for window in starts.windows(2) {
+                prop_assert!(
+                    window[0] < window[1],
+                    "line starts must strictly increase, got {starts:?} for {content:?}"
+                );
+            }
+            for &start in &starts {
+                prop_assert!(
+                    start <= content.len(),
+                    "line start {start} past end of {content:?}"
+                );
+                prop_assert!(
+                    content.is_char_boundary(start),
+                    "line start {start} is inside a code point of {content:?}"
+                );
+            }
+            prop_assert_eq!(
+                starts.len(),
+                expected_line_count(&content),
+                "line count for {:?}",
+                content
+            );
+            prop_assert_eq!(
+                &starts,
+                &reference_line_starts(&content),
+                "line table for {:?}",
+                content
+            );
+        }
+
+        /// Every char-boundary offset resolves to the line whose table range
+        /// contains it, and the reported column counts chars from that line
+        /// start. Offsets past end of file clamp instead of panicking.
+        #[test]
+        fn line_lookups_agree_with_the_line_table(content in content()) {
+            let starts = compute_line_starts(&content);
+
+            for offset in char_boundaries(&content) {
+                let index = find_line_index_for_offset(&starts, offset);
+                prop_assert!(
+                    index < starts.len(),
+                    "line index {index} out of table {starts:?} for offset {offset}"
+                );
+                prop_assert!(
+                    starts[index] <= offset,
+                    "line {index} starts after offset {offset} in {content:?}"
+                );
+                if let Some(&next) = starts.get(index + 1) {
+                    prop_assert!(
+                        offset < next,
+                        "offset {offset} belongs to a later line than {index} in {content:?}"
+                    );
+                }
+
+                let (line, column) = line_column_for_offset(&content, &starts, offset);
+                prop_assert_eq!(
+                    line,
+                    index + 1,
+                    "1-based line disagrees with the table at offset {} of {:?}",
+                    offset,
+                    content
+                );
+                prop_assert_eq!(
+                    column,
+                    content[starts[index]..offset].chars().count() + 1,
+                    "column at offset {} of {:?}",
+                    offset,
+                    content
+                );
+            }
+
+            let at_eof = line_column_for_offset(&content, &starts, content.len());
+            for past_eof in [1usize, 7, 1024] {
+                prop_assert_eq!(
+                    line_column_for_offset(&content, &starts, content.len() + past_eof),
+                    at_eof,
+                    "offset {} past end of {:?} must clamp to end of file",
+                    content.len() + past_eof,
+                    content
+                );
+            }
+        }
+
+        /// An offset inside a UTF-8 code point resolves as if it were the start
+        /// of that code point instead of panicking or slicing mid-char.
+        #[test]
+        fn line_column_snaps_offsets_inside_a_code_point(content in content()) {
+            let starts = compute_line_starts(&content);
+
+            for offset in 0..=content.len() {
+                if content.is_char_boundary(offset) {
+                    continue;
+                }
+                prop_assert_eq!(
+                    line_column_for_offset(&content, &starts, offset),
+                    line_column_for_offset(
+                        &content,
+                        &starts,
+                        previous_char_boundary(&content, offset)
+                    ),
+                    "offset {} inside a code point of {:?}",
+                    offset,
+                    content
+                );
+            }
+        }
+
+        /// Identifier spans lie on char boundaries inside the buffer, cover the
+        /// requested offset, contain only identifier bytes, and are maximal.
+        #[test]
+        fn identifier_spans_are_bounded_char_boundary_slices(content in identifier_content()) {
+            let bytes = content.as_bytes();
+
+            for offset in 0..=content.len() + 3 {
+                let Some((start, end)) = identifier_span_at_offset(&content, offset) else {
+                    continue;
+                };
+                prop_assert!(
+                    start < end && end <= content.len(),
+                    "span {start}..{end} out of bounds for {content:?}"
+                );
+                prop_assert!(
+                    content.is_char_boundary(start) && content.is_char_boundary(end),
+                    "span {start}..{end} is inside a code point of {content:?}"
+                );
+                let clamped = offset.min(content.len());
+                prop_assert!(
+                    start <= clamped && clamped <= end,
+                    "span {start}..{end} does not touch offset {clamped} of {content:?}"
+                );
+                prop_assert!(
+                    content[start..end].bytes().all(is_ident_byte),
+                    "span {start}..{end} of {content:?} holds a non-identifier byte"
+                );
+                prop_assert!(
+                    start == 0 || !is_ident_byte(bytes[start - 1]),
+                    "span {start}..{end} of {content:?} is not maximal to the left"
+                );
+                prop_assert!(
+                    end == content.len() || !is_ident_byte(bytes[end]),
+                    "span {start}..{end} of {content:?} is not maximal to the right"
+                );
+                prop_assert_eq!(
+                    identifier_at_offset(&content, offset),
+                    Some(&content[start..end]),
+                    "slice and span disagree at offset {} of {:?}",
+                    offset,
+                    content
+                );
+            }
+        }
+
+        /// The completion prefix helper never walks past the cursor, never
+        /// returns an empty match, and only reports a slice when the cursor is
+        /// on a char boundary.
+        #[test]
+        fn identifier_prefixes_end_at_the_cursor(content in identifier_content()) {
+            for offset in 0..=content.len() + 3 {
+                let Some(prefix) = identifier_prefix_before_offset(&content, offset) else {
+                    continue;
+                };
+                prop_assert!(offset <= content.len(), "prefix returned past end of file");
+                prop_assert!(
+                    content.is_char_boundary(offset),
+                    "prefix {prefix:?} reported for offset {offset} inside a code point"
+                );
+                prop_assert!(!prefix.is_empty(), "empty prefix at offset {offset}");
+                prop_assert!(
+                    prefix.bytes().all(is_ident_byte),
+                    "prefix {prefix:?} holds a non-identifier byte"
+                );
+                prop_assert!(
+                    content[..offset].ends_with(prefix),
+                    "prefix {prefix:?} does not end at offset {offset} of {content:?}"
+                );
+                let start = offset - prefix.len();
+                prop_assert!(
+                    start == 0 || !is_ident_byte(content.as_bytes()[start - 1]),
+                    "prefix {prefix:?} at offset {offset} of {content:?} is not maximal"
+                );
+            }
+        }
+
+        /// A word match starts on a char boundary and is bounded by
+        /// non-identifier bytes or by the buffer edges.
+        #[test]
+        fn find_word_matches_are_word_bounded(
+            haystack in identifier_content(),
+            needle in prop::sample::select(ASCII_NEEDLES.to_vec()),
+        ) {
+            let Some(index) = find_word(&haystack, needle) else {
+                return Ok(());
+            };
+            prop_assert!(
+                haystack.is_char_boundary(index),
+                "match at {index} is inside a code point of {haystack:?}"
+            );
+            prop_assert!(
+                haystack[index..].starts_with(needle),
+                "match at {index} of {haystack:?} is not {needle:?}"
+            );
+            let bytes = haystack.as_bytes();
+            prop_assert!(
+                index == 0 || !is_ident_byte(bytes[index - 1]),
+                "match at {index} of {haystack:?} runs into an identifier on the left"
+            );
+            let after = index + needle.len();
+            prop_assert!(
+                after >= bytes.len() || !is_ident_byte(bytes[after]),
+                "match at {index} of {haystack:?} runs into an identifier on the right"
+            );
+        }
+
+        /// The same invariant with a needle whose first character is multi-byte.
+        #[test]
+        fn find_word_handles_multi_byte_needles(
+            haystack in identifier_content(),
+            needle in prop::sample::select(MULTI_BYTE_NEEDLES.to_vec()),
+        ) {
+            let Some(index) = find_word(&haystack, needle) else {
+                return Ok(());
+            };
+            prop_assert!(
+                haystack.is_char_boundary(index),
+                "match at {index} is inside a code point of {haystack:?}"
+            );
+            prop_assert!(
+                haystack[index..].starts_with(needle),
+                "match at {index} of {haystack:?} is not {needle:?}"
+            );
+        }
+
+        /// A snippet is the exact contiguous slice spanned by the requested
+        /// table rows, for any row index and context width.
+        #[test]
+        fn snippets_are_contiguous_slices_of_the_source(
+            content in content(),
+            line_idx in 0usize..20,
+            context_lines in 0usize..4,
+        ) {
+            let starts = compute_line_starts(&content);
+            let snippet = snippet_around_line(&content, &starts, line_idx, context_lines);
+
+            let first = line_idx.saturating_sub(context_lines);
+            let last = (line_idx + context_lines).min(starts.len() - 1);
+            let expected = if first > last {
+                ""
+            } else {
+                let end = starts.get(last + 1).copied().unwrap_or(content.len());
+                &content[starts[first]..end]
+            };
+            prop_assert_eq!(
+                snippet.as_str(),
+                expected,
+                "rows {}..={} of {:?}",
+                first,
+                last,
+                content
+            );
+        }
+
+        /// The trimmed snippet drops every line terminator: no CR survives, and
+        /// the only LFs are the separators the helper inserts.
+        #[test]
+        fn trimmed_snippets_drop_line_terminators(
+            content in content(),
+            line_idx in 0usize..20,
+            context_lines in 0usize..4,
+        ) {
+            let starts = compute_line_starts(&content);
+            let trimmed = trimmed_snippet_around_line(&content, &starts, line_idx, context_lines);
+
+            prop_assert!(
+                !trimmed.contains('\r'),
+                "trimmed snippet {trimmed:?} of {content:?} kept a CR"
+            );
+            for line in trimmed.split('\n') {
+                prop_assert!(
+                    content.contains(line),
+                    "trimmed line {line:?} is not a slice of {content:?}"
+                );
+            }
+        }
+
+        /// One output row per table row in range.
+        #[test]
+        fn trimmed_snippets_keep_one_row_per_line(
+            content in content(),
+            line_idx in 0usize..20,
+            context_lines in 0usize..4,
+        ) {
+            let starts = compute_line_starts(&content);
+            let trimmed = trimmed_snippet_around_line(&content, &starts, line_idx, context_lines);
+
+            let first = line_idx.saturating_sub(context_lines);
+            let last = (line_idx + context_lines).min(starts.len() - 1);
+            if first > last {
+                prop_assert!(trimmed.is_empty(), "expected no rows, got {trimmed:?}");
+                return Ok(());
+            }
+            prop_assert_eq!(
+                trimmed.split('\n').count(),
+                last - first + 1,
+                "rows {}..={} of {:?} rendered as {:?}",
+                first,
+                last,
+                content,
+                trimmed
+            );
+        }
+
+        /// The range form is a trimmed substring of the source for any pair of
+        /// offsets with `start <= end`, including offsets inside a code point.
+        #[test]
+        fn trimmed_snippet_around_range_returns_a_source_substring(
+            content in content(),
+            first in 0usize..64,
+            second in 0usize..64,
+            context_lines in 0usize..3,
+        ) {
+            let starts = compute_line_starts(&content);
+            let start = first.min(second);
+            let end = first.max(second);
+            let snippet =
+                trimmed_snippet_around_range(&content, &starts, start, end, context_lines);
+
+            prop_assert!(
+                content.contains(snippet.as_str()),
+                "snippet {snippet:?} for {start}..{end} is not a slice of {content:?}"
+            );
+        }
+
+        /// The location renderer accepts any 1-based line, including 0 and
+        /// lines past end of file, and always reports the recovery hint.
+        #[test]
+        fn render_location_diagnostic_accepts_any_requested_location(
+            content in content(),
+            line in 0usize..24,
+            column in prop::option::of(0usize..24),
+        ) {
+            let rendered = render_location_diagnostic(
+                &content,
+                "src/demo.rs",
+                line,
+                column,
+                "no target at location",
+                "move the target to a declaration token",
+            );
+            prop_assert!(
+                rendered.ends_with("Recovery: move the target to a declaration token"),
+                "diagnostic for line {line} column {column:?} of {content:?}: {rendered}"
+            );
+            prop_assert!(
+                rendered.contains(&format!("{line}")),
+                "diagnostic omitted the requested line {line}: {rendered}"
+            );
+        }
     }
 }

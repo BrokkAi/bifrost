@@ -17,7 +17,7 @@ use super::occurrences::{
     Namespace, OccurrenceRole, OccurrenceRoleSupport, default_occurrence_namespace,
 };
 use super::resolution::{BindingActivation, LexicalEnvironmentSupport};
-use super::routes::{IdentityRouteSupport, RouteHopKind};
+use super::routes::{CuratedExportSurface, IdentityRouteSupport, RouteHopKind};
 use crate::analyzer::{Language, Range};
 use crate::cancellation::CancellationToken;
 use crate::hash::HashMap;
@@ -243,16 +243,36 @@ pub trait StructuralSpec: Send + Sync + 'static {
         default_occurrence_namespace(role, declares)
     }
 
+    /// The public surface the file rooted at `root` curates by listing names
+    /// rather than by marking each declaration (Python's module-level
+    /// `__all__`), gathered once per file so
+    /// [`Self::indirection_relation`] can read it per token.
+    ///
+    /// The default is [`CuratedExportSurface::Absent`], which is the honest
+    /// answer for a language whose exports are decided declaration by
+    /// declaration.
+    fn curated_export_surface(&self, _root: Node<'_>, _source: &str) -> CuratedExportSurface {
+        CuratedExportSurface::Absent
+    }
+
     /// The indirection relation an import/export token participates in:
     /// `Import` for a plain import, `Export` for an export of a local
     /// declaration, `ReExport` for an export whose subject comes from
-    /// elsewhere (`pub use`, `export ... from`). Read from the token's
-    /// enclosing statement through AST fields.
+    /// elsewhere (`pub use`, `export ... from`, a name on Python's `__all__`).
+    /// Read from the token's enclosing statement through AST fields, plus the
+    /// file's `surface` from [`Self::curated_export_surface`].
     ///
-    /// `None` means the adapter cannot classify the statement; the derivation
-    /// layer then treats an import-target token as a plain `Import`, which is
-    /// what the occurrence role already states.
-    fn indirection_relation(&self, _token: Node<'_>) -> Option<RouteHopKind> {
+    /// `None` means the adapter cannot classify this token; the derivation
+    /// layer then treats an import-target token as a plain `Import` — which is
+    /// what the occurrence role already states — and reports the file's
+    /// import, export and re-export rows as incomplete, so absence of a
+    /// re-export row proves nothing.
+    fn indirection_relation(
+        &self,
+        _token: Node<'_>,
+        _source: &str,
+        _surface: &CuratedExportSurface,
+    ) -> Option<RouteHopKind> {
         None
     }
 

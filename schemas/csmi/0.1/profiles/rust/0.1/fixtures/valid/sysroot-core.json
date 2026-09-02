@@ -1,0 +1,8 @@
+{
+  "kind": "sysroot-crate",
+  "crateName": "core",
+  "artifactPurl": "pkg:generic/rust-sysroot@1.85.0",
+  "compilerRelease": "1.85.0",
+  "targetTriple": "x86_64-unknown-linux-gnu",
+  "componentSha256": "bb4c8d8871d98d149567c29b1b2e16ccdb686f7e431e5408f282e0939aab4363"
+}

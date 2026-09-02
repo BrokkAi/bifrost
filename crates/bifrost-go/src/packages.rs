@@ -711,14 +711,14 @@ mod tests {
     use brokk_bifrost_core::analyzer::project::{Project, TestProject};
     use brokk_bifrost_core::analyzer::{Language, ProjectFile};
     use std::collections::BTreeSet;
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
     use std::sync::Mutex;
 
     static CACHE_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn vendor_alias_uses_the_last_real_vendor_directory_and_structured_suffix() {
-        let root = PathBuf::from("/workspace");
+        let root = std::env::current_dir().expect("test working directory must be available");
         for (path, canonical, expected) in [
             (
                 "vendor/k8s.io/utils/strings/strings.go",

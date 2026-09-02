@@ -1884,6 +1884,7 @@ assert.strictEqual(runtime(), 2);
         );
     }
 
+    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
     #[test]
     fn deleted_dependency_recovers_surviving_tests_from_the_base_graph() {
         let temp = tempfile::tempdir().expect("temporary repository");
@@ -2021,6 +2022,7 @@ assert.strictEqual(runtime(), 2);
         assert_eq!(1, result.test_scopes[0].minimum_dependency_distance);
     }
 
+    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
     #[test]
     fn rust_inline_tests_are_distance_zero_candidates() {
         let temp = tempfile::tempdir().expect("temporary repository");
@@ -2271,6 +2273,7 @@ mod inline_tests {
         );
     }
 
+    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
     #[test]
     fn removed_import_between_surviving_files_uses_only_target_state() {
         let temp = tempfile::tempdir().expect("temporary repository");
@@ -2514,6 +2517,7 @@ mod inline_tests {
         assert_eq!(0, result.analysis.unavailable_removed_test_count);
     }
 
+    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
     #[test]
     fn removed_tests_are_omitted_and_counted_unavailable() {
         let temp = tempfile::tempdir().expect("temporary repository");
@@ -2993,6 +2997,7 @@ mod inline_tests {
         oids
     }
 
+    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
     #[test]
     fn repeated_immutable_requests_parse_nothing_the_second_time() {
         let temp = tempfile::tempdir().expect("temporary repository");
@@ -3066,6 +3071,7 @@ mod inline_tests {
         );
     }
 
+    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
     #[test]
     fn an_immutable_request_leaves_no_workspace_projection_rows() {
         let temp = tempfile::tempdir().expect("temporary repository");

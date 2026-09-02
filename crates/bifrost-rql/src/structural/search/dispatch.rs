@@ -99,6 +99,10 @@ pub(super) struct DispatchSiteAnswer {
     pub(super) semantic_unsupported: Option<&'static str>,
     pub(super) exceeded_limit: Option<&'static str>,
     pub(super) arms: Vec<DispatchArm>,
+    /// Exact semantic owner of every source observation. Arms retain their
+    /// ordinal into this list, so consumers never infer ownership from lexical
+    /// containment.
+    pub(super) call_contexts: Vec<DispatchCallContext>,
     /// The boundary kinds the answer published that name no target at all,
     /// in publication order.
     ///
@@ -128,6 +132,7 @@ impl DispatchSiteAnswer {
             semantic_unsupported,
             exceeded_limit,
             arms: Vec::new(),
+            call_contexts: Vec::new(),
             // An interrupted dispatch published no boundary set at all, so it
             // states no residual either; the interruption is the reason.
             unnamed_boundaries: Vec::new(),
@@ -152,6 +157,11 @@ impl DispatchSiteAnswer {
 /// target the workspace does not materialize.
 #[derive(Debug, Clone)]
 pub(super) struct DispatchArm {
+    pub(super) call_context: usize,
+    /// Canonical execution timing for this particular target arm. A targeted
+    /// deferred boundary can weaken the source call's timing without weakening
+    /// ordinary or independently spawned arms at the same source site.
+    pub(super) execution_timing: crate::analyzer::semantic::ExecutionTiming,
     pub(super) target_id: String,
     pub(super) target_path: String,
     pub(super) target_unit: Option<CodeUnit>,
@@ -173,6 +183,17 @@ pub(super) struct DispatchArm {
     pub(super) proof: &'static str,
     pub(super) completeness: &'static str,
     pub(super) boundary_kind: Option<&'static str>,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct DispatchCallContext {
+    /// The smallest workspace declaration containing the semantic caller.
+    /// Anonymous nested callables intentionally map to their lexical parent's
+    /// declaration, so consumers must also require `caller_is_exact` before
+    /// attributing execution to this unit.
+    pub(super) caller: Option<CodeUnit>,
+    /// Whether the semantic procedure's own anchor equals a range of `caller`.
+    pub(super) caller_is_exact: bool,
 }
 
 /// Derive the dispatch answer for one pipeline input position and project the

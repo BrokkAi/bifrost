@@ -55,7 +55,7 @@ const PACK_ACTIVATION_POLICY: &str = r#"(policy
 "#;
 
 const PACK_ACTIVATION_JDK: &str = r#"{
-  "schema_version": 1,
+  "schema_version": 2,
   "pack_id": "fixture.jdk",
   "version": "21.0.2",
   "producer": { "name": "bifrost-fixture", "version": "1.0.0" },
@@ -248,6 +248,7 @@ fn pack_activation_project(ecosystems: &str, install_pack: bool) -> common::Buil
     project
 }
 
+#[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
 #[test]
 fn mcp_bound_policy_reports_exact_pack_activation_and_honest_near_misses() {
     let homes = TempDir::new().expect("fake JDK home root");
@@ -450,7 +451,16 @@ fn bifrost_searchtools_server_speaks_mcp_stdio() {
     )
     .expect("set remote default");
 
-    let mut child = spawn_server(fixture_root.path(), "searchtools", &[]);
+    let mut child = Command::new(mcp_server_binary())
+        .arg("--root")
+        .arg(fixture_root.path())
+        .arg("--mcp")
+        .arg("searchtools")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn bifrost");
 
     let mut stdin = child.stdin.take().expect("stdin");
     let stdout = child.stdout.take().expect("stdout");
@@ -1103,6 +1113,7 @@ fn cognitive_complexity_reports_every_supported_language_in_one_mcp_call() {
     assert!(status.success(), "bifrost exited unsuccessfully: {status}");
 }
 
+#[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
 #[test]
 fn bifrost_defaults_to_cwd_searchtools_server() {
     let fixture_root = TempDir::new().expect("temp dir");
@@ -1291,6 +1302,7 @@ fn bifrost_mcp_query_code_transports_explain_and_profile_reports() {
     assert!(status.success(), "bifrost exited unsuccessfully: {status}");
 }
 
+#[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
 #[test]
 fn bifrost_mcp_run_policy_uses_the_active_snapshot_and_durable_suppressions() {
     let initial = InlineTestProject::with_language(Language::Python)
@@ -1692,16 +1704,22 @@ fn bifrost_mcp_lists_and_runs_built_in_policies() {
         }),
     );
     assert_eq!(listed["result"]["isError"], false, "{listed}");
-    assert_eq!(
-        listed["result"]["structuredContent"]["id"],
-        "bifrost.code-smells"
+    let catalog = &listed["result"]["structuredContent"];
+    assert_eq!(catalog["schema_version"], 1);
+    let packs = catalog["packs"].as_array().expect("policy packs");
+    assert_eq!(packs.len(), 2);
+    assert_eq!(packs[0]["id"], "bifrost.code-smells");
+    let correctness_policies = packs[0]["policies"]
+        .as_array()
+        .expect("correctness policies");
+    assert_eq!(correctness_policies.len(), 16);
+    assert!(
+        correctness_policies
+            .iter()
+            .any(|policy| policy["id"] == "bifrost.correctness.go-data-race")
     );
-    assert_eq!(
-        listed["result"]["structuredContent"]["policies"]
-            .as_array()
-            .map(Vec::len),
-        Some(14)
-    );
+    assert_eq!(packs[1]["id"], "bifrost.security");
+    assert_eq!(packs[1]["policies"].as_array().map(Vec::len), Some(1));
 
     let run = round_trip(
         &mut stdin,
@@ -1761,7 +1779,9 @@ fn bifrost_mcp_lists_and_runs_built_in_policies() {
         category_ids,
         vec![
             "bifrost.correctness.dynamic-evaluation",
-            "bifrost.correctness.go-result-used-before-success-check",
+            "bifrost.correctness.go-data-race",
+            "bifrost.correctness.go-nil-dereference",
+            "bifrost.correctness.go-wrong-error-on-failure-path",
             "bifrost.correctness.rayon-in-blocking-lazy-init",
             "bifrost.correctness.unsafe-deserialization"
         ],
@@ -1797,7 +1817,9 @@ fn bifrost_mcp_lists_and_runs_built_in_policies() {
         pack_ids,
         vec![
             "bifrost.correctness.dynamic-evaluation",
-            "bifrost.correctness.go-result-used-before-success-check",
+            "bifrost.correctness.go-data-race",
+            "bifrost.correctness.go-nil-dereference",
+            "bifrost.correctness.go-wrong-error-on-failure-path",
             "bifrost.correctness.rayon-in-blocking-lazy-init",
             "bifrost.correctness.unsafe-deserialization",
             "bifrost.performance.database-call-in-loop",
@@ -2088,6 +2110,7 @@ fn bifrost_mcp_reports_absolute_paths_outside_workspace_as_tool_errors() {
     assert!(status.success(), "bifrost exited unsuccessfully: {status}");
 }
 
+#[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
 #[test]
 fn bifrost_mcp_absolute_paths_follow_activated_workspace() {
     let initial_root = TempDir::new().expect("initial temp dir");
@@ -2522,6 +2545,7 @@ fn call_tool(
     response
 }
 
+#[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
 #[test]
 fn rootless_mcp_binds_to_client_roots_without_analyzing_process_cwd() {
     let plugin_dir = TempDir::new().expect("plugin dir");
@@ -3683,6 +3707,7 @@ fn output_schema_reaches_new_clients_and_stays_off_the_legacy_wire() {
     assert!(child.wait().expect("wait bifrost").success());
 }
 
+#[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
 #[test]
 fn output_schema_describes_real_workspace_and_policy_results() {
     let workspace = InlineTestProject::new()
@@ -3753,7 +3778,7 @@ fn output_schema_describes_real_workspace_and_policy_results() {
     // Without this the schema check would pass on an empty manifest, proving
     // nothing about the entry shape.
     assert!(
-        policies["result"]["structuredContent"]["policies"]
+        policies["result"]["structuredContent"]["packs"]
             .as_array()
             .is_some_and(|entries| !entries.is_empty()),
         "{policies}"
@@ -3819,6 +3844,7 @@ fn output_schema_describes_real_workspace_and_policy_results() {
 /// `SEARCH_SYMBOLS_MAX_RANKED_CANDIDATES` (10_000), which is why this workspace
 /// carries a generated file with that many declarations; the other three shapes
 /// share the server so the corpus is indexed once.
+#[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
 #[test]
 fn output_schema_describes_search_symbols_hits_bounds_and_overload() {
     let generated_declarations: String = (0..10_000)
@@ -5247,9 +5273,6 @@ fn spawn_server(root: &std::path::Path, mode: &str, extra_args: &[&str]) -> std:
 /// select the wrong budget by passing the wrong argument.
 fn spawn_server_at_production_budget(root: &std::path::Path, mode: &str) -> std::process::Child {
     Command::new(mcp_server_binary())
-        // This guard measures the source workspace cold-start contract. Pack
-        // activation has dedicated tests with a controlled fake JDK.
-        .env_remove("JAVA_HOME")
         .arg("--root")
         .arg(root)
         .arg("--mcp")
@@ -5487,15 +5510,7 @@ fn profiled_stderr_capture_bounds_tail_and_transport_evidence() {
 
 fn mcp_server_command(root: &std::path::Path, mode: &str, extra_args: &[&str]) -> Command {
     let mut command = Command::new(mcp_server_binary());
-    // Ordinary protocol fixtures must not inherit dependency-pack work from
-    // the developer machine. Pack-activation tests set their fake JDK after
-    // constructing this command.
-    command
-        .env_remove("JAVA_HOME")
-        .arg("--root")
-        .arg(root)
-        .arg("--mcp")
-        .arg(mode);
+    command.arg("--root").arg(root).arg("--mcp").arg(mode);
     for arg in extra_args {
         command.arg(arg);
     }
@@ -5694,7 +5709,6 @@ fn spawn_rootless_server(cwd: &std::path::Path, mode: &str) -> std::process::Chi
     // not cold-start latency.
     apply_test_request_budget(&mut command);
     command
-        .env_remove("JAVA_HOME")
         .arg("--mcp")
         .arg(mode)
         .current_dir(cwd)
@@ -5713,7 +5727,6 @@ fn spawn_server_no_args(cwd: &std::path::Path) -> std::process::Child {
     // not cold-start latency.
     apply_test_request_budget(&mut command);
     command
-        .env_remove("JAVA_HOME")
         .current_dir(cwd)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

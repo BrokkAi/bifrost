@@ -245,6 +245,20 @@ where
         self.entries.get(key).or_else(|| self.revive(key))
     }
 
+    /// Whether a same-key materialization is already running.
+    ///
+    /// [`Self::acquire`] follows such a build, which is right for a caller
+    /// with nothing else to do. A caller that has a cheaper alternative --
+    /// a scan over the same facts the value would accelerate -- asks this
+    /// first and takes the alternative, so it pays its own cost instead of
+    /// the build's (#2879).
+    pub fn build_in_flight(&self, key: &K) -> bool {
+        self.in_flight
+            .lock()
+            .expect("complete-value single-flight map mutex poisoned")
+            .contains_key(key)
+    }
+
     /// Ready-cache misses that a still-live instance answered instead of a
     /// rebuild. Non-zero means the weight bound is evicting values the process
     /// is still using.

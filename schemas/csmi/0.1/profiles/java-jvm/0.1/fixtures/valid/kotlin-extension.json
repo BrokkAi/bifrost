@@ -1,0 +1,16 @@
+{
+  "$profileSchema": "java-source-identity",
+  "profileVersion": "0.1",
+  "language": "kotlin",
+  "package": ["org", "example", "text"],
+  "ownerPath": [],
+  "declaration": {
+    "kind": "function",
+    "name": "normalized",
+    "signature": {
+      "receiverType": { "canonicalName": "kotlin.String", "nullability": "non-null" },
+      "parameterTypes": []
+    }
+  },
+  "origin": "named"
+}

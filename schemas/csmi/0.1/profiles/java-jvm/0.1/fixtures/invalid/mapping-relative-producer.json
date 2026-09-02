@@ -1,0 +1,15 @@
+{
+  "$profileSchema": "java-jvm-mapping",
+  "profileVersion": "0.1",
+  "resolution": "established",
+  "sourceSymbol": "java-normalize",
+  "binarySymbols": ["jvm-normalize"],
+  "mappingKind": "direct",
+  "evidence": [
+    {
+      "kind": "verified-build-output",
+      "producer": "build-42",
+      "digest": "4444444444444444444444444444444444444444444444444444444444444444"
+    }
+  ]
+}

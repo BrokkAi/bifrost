@@ -1,0 +1,13 @@
+{
+  "$profileSchema": "jvm-binary-identity",
+  "profileVersion": "0.1",
+  "owner": "org/example/Strings",
+  "binaryEntity": {
+    "kind": "method",
+    "name": "normalize"
+  },
+  "variant": {
+    "entryPath": "org/example/Strings.class",
+    "release": 0
+  }
+}

@@ -4,7 +4,7 @@ use super::super::capabilities::SemanticCapability;
 use super::super::ids::{
     AllocationId, BlockId, CallSiteId, CaptureId, EvidenceId, GuardId, MemoryLocationId,
     ProcedureId, ProgramPointId, SemanticGapId, SemanticLocator, SourceMappingId, StableDigest,
-    StructuralNodeIdentity, ValueId,
+    StructuralNodeIdentity, SwitchFactId, ValueId,
 };
 use super::super::provider::SemanticBudgetExceeded;
 pub use crate::analyzer::DispatchExtensibility;
@@ -34,6 +34,7 @@ pub enum SemanticIrErrorKind {
     GapContract,
     DuplicateEdge,
     GuardContract,
+    SwitchContract,
 }
 
 impl SemanticIrErrorKind {
@@ -61,6 +62,7 @@ impl SemanticIrErrorKind {
             Self::GapContract => "gap_contract",
             Self::DuplicateEdge => "duplicate_edge",
             Self::GuardContract => "guard_contract",
+            Self::SwitchContract => "switch_contract",
         }
     }
 }
@@ -197,6 +199,124 @@ impl ProcedureInvocationKind {
     }
 }
 
+/// Whether dispatch participates in an ordinary caller-local call operation
+/// or starts detached work. This is deliberately orthogonal to
+/// [`ExecutionTiming`] and [`ProcedureInvocationKind`]: `Ordinary` preserves
+/// caller-local continuations and result transfer but does not claim that an
+/// async or generator target body executes synchronously. Detached work may
+/// use any timing a language proves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum CallInvocationMode {
+    Ordinary,
+    Detached,
+}
+
+impl CallInvocationMode {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Ordinary => "ordinary",
+            Self::Detached => "detached",
+        }
+    }
+}
+
+/// When the target of a semantic relation is evaluated, relative to the
+/// evaluation that triggered it (issue #2446).
+///
+/// This is the analyzer's one execution-timing vocabulary. It applies both to
+/// value-flow relations and to call/effect execution: "lexically inside" is
+/// not "executes now", so a producer that has no scheduling evidence must say
+/// [`ExecutionTiming::Unknown`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ExecutionTiming {
+    /// Source and target belong to one indivisible program-point evaluation.
+    SameEvaluation,
+    /// The target runs later in the same synchronous procedure invocation.
+    SameInvocation,
+    /// The target runs later in the same cooperative scheduler turn.
+    LaterSameTurn,
+    /// The target runs after its task suspended and resumed.
+    AfterSuspension,
+    /// The target runs in a different task or goroutine.
+    DifferentTask,
+    /// The target runs on a different thread.
+    DifferentThread,
+    /// Another component retains or schedules the target for later execution.
+    DeferredCallback,
+    /// A consumer resumes a suspended generator or iterator.
+    GeneratorResume,
+    /// The target runs while an activation unwinds or is cancelled.
+    CancellationCleanup,
+    /// Available evidence does not establish execution timing.
+    Unknown,
+}
+
+impl ExecutionTiming {
+    /// The stable value domain shared by timing-bearing public facts.
+    pub const LABELS: &'static [&'static str] = &[
+        "same_evaluation",
+        "same_invocation",
+        "later_same_turn",
+        "after_suspension",
+        "different_task",
+        "different_thread",
+        "deferred_callback",
+        "generator_resume",
+        "cancellation_cleanup",
+        "unknown",
+    ];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::SameEvaluation => "same_evaluation",
+            Self::SameInvocation => "same_invocation",
+            Self::LaterSameTurn => "later_same_turn",
+            Self::AfterSuspension => "after_suspension",
+            Self::DifferentTask => "different_task",
+            Self::DifferentThread => "different_thread",
+            Self::DeferredCallback => "deferred_callback",
+            Self::GeneratorResume => "generator_resume",
+            Self::CancellationCleanup => "cancellation_cleanup",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    /// Whether the target remains in the trigger's synchronous activation.
+    pub const fn is_synchronous(self) -> bool {
+        matches!(self, Self::SameEvaluation | Self::SameInvocation)
+    }
+
+    /// Compose timing across one exact call edge.
+    ///
+    /// `self` is when the call executes relative to its caller and `nested` is
+    /// when a callee effect executes relative to that call. The deliberately
+    /// small exact table covers the call modes and declared-effect timings the
+    /// current producers emit. Richer combinations fail open as `Unknown`.
+    pub const fn compose(self, nested: Self) -> Self {
+        match (self, nested) {
+            (Self::Unknown, _) | (_, Self::Unknown) => Self::Unknown,
+            (Self::SameEvaluation, nested) => nested,
+            (outer, Self::SameEvaluation) => outer,
+            (Self::SameInvocation, Self::SameInvocation) => Self::SameInvocation,
+            (Self::SameInvocation, Self::DifferentTask) => Self::DifferentTask,
+            (Self::SameInvocation, Self::DifferentThread) => Self::DifferentThread,
+            (Self::SameInvocation, Self::DeferredCallback) => Self::DeferredCallback,
+            (Self::DifferentTask, Self::SameInvocation) => Self::DifferentTask,
+            (Self::DifferentThread, Self::SameInvocation) => Self::DifferentThread,
+            _ => Self::Unknown,
+        }
+    }
+
+    /// Join independent paths attributing the same effect.
+    pub const fn join(self, other: Self) -> Self {
+        if self as u8 == other as u8 {
+            self
+        } else {
+            Self::Unknown
+        }
+    }
+}
+
 /// Orthogonal properties that should not be encoded in [`ProcedureKind`].
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ProcedureProperties {
@@ -270,6 +390,13 @@ pub enum SemanticValueKind {
     /// referenced source without conflating ordinary value propagation with
     /// address creation.
     Address,
+    /// The language's distinguished null or nil value.
+    Null,
+    /// A compile-time Boolean value.
+    Boolean(bool),
+    /// A non-negative compile-time integer magnitude that fits in `u128`.
+    UnsignedInteger(u128),
+    /// A compile-time constant whose payload is not represented structurally.
     Constant,
     Exception,
     Callable,
@@ -347,12 +474,22 @@ impl SemanticValueKind {
             Self::Return => "return",
             Self::Temporary => "temporary",
             Self::Address => "address",
+            Self::Null => "null",
+            Self::Boolean(_) => "boolean",
+            Self::UnsignedInteger(_) => "unsigned_integer",
             Self::Constant => "constant",
             Self::Exception => "exception",
             Self::Callable => "callable",
             Self::AwaitResult => "await_result",
             Self::LanguageDefined(_) => "language_defined",
         }
+    }
+
+    pub const fn is_constant(&self) -> bool {
+        matches!(
+            self,
+            Self::Null | Self::Boolean(_) | Self::UnsignedInteger(_) | Self::Constant
+        )
     }
 }
 
@@ -369,6 +506,8 @@ pub struct SemanticValue {
 pub enum AllocationKind {
     Object,
     Array,
+    /// One fresh backing store whose slice values may share element storage.
+    Slice,
     Callable,
     ClosureEnvironment,
     SharedCell,
@@ -380,6 +519,7 @@ impl AllocationKind {
         match self {
             Self::Object => "object",
             Self::Array => "array",
+            Self::Slice => "slice",
             Self::Callable => "callable",
             Self::ClosureEnvironment => "closure_environment",
             Self::SharedCell => "shared_cell",
@@ -412,6 +552,13 @@ pub enum MemoryLocationKind {
     Index {
         base: ValueId,
         index: Option<ValueId>,
+        /// Exact non-negative integer magnitude when the adapter proved one.
+        ///
+        /// `index` retains the evaluated value and its evidence. This field is
+        /// the arithmetic identity used to compose bounded backing-store
+        /// views without recovering a number from source text.
+        constant_index: Option<u128>,
+        identity: IndexedLocationIdentity,
     },
     /// A creator-local mutable cell backing a lexical binding.  This is the
     /// principled source for shared/mutable captures in languages whose
@@ -425,7 +572,23 @@ pub enum MemoryLocationKind {
     /// by many runtime environment instances.
     Capture {
         lexical_parent: ProcedureId,
+        binding: Option<ValueId>,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum IndexedLocationIdentity {
+    Element,
+    Aggregate,
+}
+
+impl IndexedLocationIdentity {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Element => "element",
+            Self::Aggregate => "aggregate",
+        }
+    }
 }
 
 impl MemoryLocationKind {
@@ -444,9 +607,10 @@ impl MemoryLocationKind {
     pub fn uses_value(&self, value: ValueId) -> bool {
         match self {
             Self::Field { base, .. } => *base == value,
-            Self::Index { base, index } => *base == value || *index == Some(value),
+            Self::Index { base, index, .. } => *base == value || *index == Some(value),
             Self::LexicalCell { binding } => *binding == value,
-            Self::Static { .. } | Self::Capture { .. } => false,
+            Self::Capture { binding, .. } => *binding == Some(value),
+            Self::Static { .. } => false,
         }
     }
 }
@@ -668,6 +832,13 @@ impl ControlContinuation {
 pub struct SemanticCallSite {
     pub id: CallSiteId,
     pub point: ProgramPointId,
+    /// Whether this is an ordinary caller-local call operation or a detached
+    /// spawn. Target-level async/generator behavior is refined separately.
+    pub invocation_mode: CallInvocationMode,
+    /// When this invocation executes relative to the source construct that
+    /// registered or started it. The call row's source/evidence pair proves
+    /// this fact; `Unknown` is never interpreted as synchronous execution.
+    pub execution_timing: ExecutionTiming,
     pub callee: ValueId,
     pub receiver: Option<ValueId>,
     pub arguments: Box<[SemanticCallArgument]>,
@@ -981,7 +1152,8 @@ impl SemanticGapImpacts {
             | SemanticCapability::NonLocalControl
             // An unnormalized guard leaves open which successor executes, so
             // its downstream consequences are the control-flow ones.
-            | SemanticCapability::GuardFacts => Self::CONTROL_FLOW,
+            | SemanticCapability::GuardFacts
+            | SemanticCapability::SwitchFacts => Self::CONTROL_FLOW,
             SemanticCapability::Assignments
             | SemanticCapability::Values
             | SemanticCapability::LocalFlow
@@ -1008,7 +1180,9 @@ impl SemanticGapImpacts {
             },
             SemanticCapability::CallableReferences => Self::NONE,
             SemanticCapability::DeferredExecution => Self::DEFERRED_EFFECTS,
-            SemanticCapability::ConcurrentSpawn => Self::CALL_EVALUATION,
+            SemanticCapability::ConcurrentSpawn | SemanticCapability::Synchronization => {
+                Self::CALL_EVALUATION
+            }
             SemanticCapability::DynamicDispatch => {
                 Self::single(SemanticGapImpact::DispatchCoverage)
             }
@@ -1056,11 +1230,12 @@ impl SemanticGapImpacts {
 /// positive proof that depends on the retained parent successor topology, not
 /// on liveness, evaluation effects, or spawned work.
 /// `CanonicalIndexIdentity` marks a memory-location-scoped index gap where the
-/// producer retained one exact value for every occurrence of the same literal
-/// index. Consumers such as value flow may discharge the identity question
-/// after verifying that structured location and constant value. The marker
-/// does not claim that flow state projects indexed properties, so the raw gap
-/// remains available to consumers that need that separate capability.
+/// producer retained one exact value and numeric magnitude for every
+/// occurrence of the same literal index. Consumers such as value flow may
+/// discharge the identity question after verifying that structured location
+/// and constant value. The marker does not claim that flow state projects
+/// indexed properties, so the raw gap remains available to consumers that
+/// need that separate capability.
 /// `NonRejoiningExceptionalExit` marks an omitted exceptional transfer that
 /// cannot resume this procedure's normal evaluation after the gap point and
 /// whose exact lowering scope has no already-active handler or cleanup user
@@ -1154,18 +1329,21 @@ pub(crate) fn gap_certifies_canonical_index_identity(
         return false;
     };
     let Some(MemoryLocation {
-        kind: MemoryLocationKind::Index {
-            index: Some(index), ..
-        },
+        kind:
+            MemoryLocationKind::Index {
+                index: Some(index),
+                constant_index: Some(_),
+                ..
+            },
         ..
     }) = memory_locations.get(location.index())
     else {
         return false;
     };
-    let constant_index = values
+    let constant_index_value = values
         .get(index.index())
-        .is_some_and(|value| matches!(value.kind, SemanticValueKind::Constant));
-    constant_index
+        .is_some_and(|value| value.kind.is_constant());
+    constant_index_value
         && points.get(gap.point.index()).is_some_and(|point| {
             point.events.iter().any(|event| {
                 matches!(
@@ -1184,13 +1362,151 @@ pub(crate) fn gap_certifies_canonical_index_identity(
         })
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum BackingStoreOffset {
+    Zero,
+    Constant(u128),
+    Value(ValueId),
+}
+
+/// How a by-value transfer relates the destination's value and identity to
+/// the source.
+///
+/// Every kind creates a distinct storage/object identity for the target while
+/// preserving logical value dependence on the source. No kind implies storage
+/// aliasing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TransferKind {
+    /// The value is duplicated; the source is unaffected.
+    Copy,
+    /// A whole aggregate value is copied into independent element storage.
+    /// Modeling copied element contents is a separate, explicitly incomplete
+    /// concern.
+    AggregateCopy,
+    /// The value (and, where the language defines it, ownership) transfers to
+    /// the target and the source stops holding it.
+    Move { invalidation: MoveInvalidation },
+    /// The target holds a converted form of the source's value.
+    Conversion { preservation: ValuePreservation },
+    /// The source value is wrapped into a distinct container object.
+    Boxing,
+    /// The contained value is extracted out of a container object.
+    Unboxing,
+}
+
+impl TransferKind {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Copy => "copy",
+            Self::AggregateCopy => "aggregate_copy",
+            Self::Move { .. } => "move",
+            Self::Conversion { .. } => "conversion",
+            Self::Boxing => "boxing",
+            Self::Unboxing => "unboxing",
+        }
+    }
+}
+
+/// What a move leaves behind in the source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MoveInvalidation {
+    /// The source no longer holds the relevant value after the transfer.
+    Invalidated,
+    /// The language or producer cannot state what the source holds afterward.
+    /// The event's evidence must not claim proven, complete knowledge.
+    Unknown,
+}
+
+impl MoveInvalidation {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Invalidated => "invalidated",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// Whether a conversion preserves the relevant value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ValuePreservation {
+    /// The target holds the identical value in an identical representation.
+    Identity,
+    /// The representation changes but the relevant value is preserved.
+    Preserving,
+    /// The relevant value is not preserved (narrowing, lossy, reinterpreting).
+    Changing,
+}
+
+impl ValuePreservation {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Identity => "identity",
+            Self::Preserving => "preserving",
+            Self::Changing => "changing",
+        }
+    }
+}
+
+/// The exact operation the language selected to perform a transfer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TransferOperation {
+    /// No distinct operation runs (a trivial or bitwise transfer).
+    None,
+    /// The selected operation is the procedure invoked at this call site. The
+    /// call site's dispatch facts carry the exact callable identity; the
+    /// transfer does not duplicate it.
+    CallSite(CallSiteId),
+    /// An operation runs but was not selected exactly. The event's evidence
+    /// must not claim proven, complete knowledge.
+    Unknown,
+}
+
+impl TransferOperation {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::CallSite(_) => "call_site",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// One identity-separating by-value transfer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ValueTransfer {
+    pub kind: TransferKind,
+    pub operation: TransferOperation,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ValueFlowKind {
     Local,
+    /// The target receives the source's value in a distinct storage/object
+    /// identity.
+    ///
+    /// The producer must emit this immediately after its matching `Assignment`
+    /// at the same program point. It overrides that assignment
+    /// for identity consumers while remaining ordinary value dependence.
+    /// Access-path and heap-origin walks must stop rather than mistake it for
+    /// an alias.
+    Transfer(ValueTransfer),
+    /// `target` denotes the same indexed backing store as `source`. Its start
+    /// is zero, an exact non-negative element constant, or a semantic value
+    /// evaluated at the slice boundary. A consumer may retain allocation
+    /// identity when that value is not exactly refinable, but overlap remains
+    /// open.
+    ///
+    /// This is a storage-identity relation as well as ordinary local value
+    /// flow. Languages with by-value arrays must not use it for array copies.
+    BackingStore {
+        offset: BackingStoreOffset,
+    },
     Parameter,
     Receiver,
     Return,
-    IndexedReturn { ordinal: u32 },
+    IndexedReturn {
+        ordinal: u32,
+    },
     LanguageDefined,
 }
 
@@ -1198,6 +1514,8 @@ impl ValueFlowKind {
     pub const fn label(self) -> &'static str {
         match self {
             Self::Local => "local",
+            Self::Transfer(_) => "transfer",
+            Self::BackingStore { .. } => "backing_store",
             Self::Parameter => "parameter",
             Self::Receiver => "receiver",
             Self::Return => "return",
@@ -1243,6 +1561,27 @@ impl MemoryAccessKind {
             Self::Index => "index",
             Self::LexicalCell => "lexical_cell",
             Self::Capture => "capture",
+        }
+    }
+}
+
+/// A language-level synchronization operation whose subject is an exact
+/// semantic value. API-backed synchronization is projected separately from
+/// reviewed procedure summaries so dense actual-argument IDs do not enter the
+/// authored model format.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SynchronizationOperation {
+    ChannelSend,
+    ChannelReceive,
+    ChannelClose,
+}
+
+impl SynchronizationOperation {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::ChannelSend => "channel_send",
+            Self::ChannelReceive => "channel_receive",
+            Self::ChannelClose => "channel_close",
         }
     }
 }
@@ -1310,6 +1649,10 @@ pub enum SemanticEffect {
         location: MemoryLocationId,
         value: ValueId,
     },
+    Synchronization {
+        operation: SynchronizationOperation,
+        subject: ValueId,
+    },
     CallableCreation {
         result: ValueId,
         callable: CallableValue,
@@ -1361,6 +1704,7 @@ impl SemanticEffect {
             Self::Allocation { .. } => "allocation",
             Self::MemoryLoad { .. } => "memory_load",
             Self::MemoryStore { .. } => "memory_store",
+            Self::Synchronization { .. } => "synchronization",
             Self::CallableCreation { .. } => "callable_creation",
             Self::CallableReference { .. } => "callable_reference",
             Self::CaptureBind { .. } => "capture_bind",
@@ -1394,6 +1738,30 @@ impl SemanticEvent {
             evidence,
         }
     }
+}
+
+/// The identity-separating transfer that immediately overrides one Assignment
+/// for identity consumers, when the producer authored one.
+///
+/// Artifact validation guarantees the matching immediate-successor contract.
+/// Consumers use this helper inside event scans they already account for;
+/// deriving a second procedure-wide edge table would hide semantic work.
+pub(crate) fn assignment_transfer(
+    events: &[SemanticEvent],
+    assignment_index: usize,
+    source: ValueId,
+    target: ValueId,
+) -> Option<ValueTransfer> {
+    events
+        .get(assignment_index + 1)
+        .and_then(|event| match event.effect {
+            SemanticEffect::ValueFlow {
+                kind: ValueFlowKind::Transfer(transfer),
+                source: actual_source,
+                target: actual_target,
+            } if actual_source == source && actual_target == target => Some(transfer),
+            _ => None,
+        })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -1577,6 +1945,64 @@ pub struct GuardFactParts {
     pub evidence: EvidenceId,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SwitchFactKind {
+    Expression,
+    Expressionless,
+    Type,
+}
+
+impl SwitchFactKind {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Expression => "expression",
+            Self::Expressionless => "expressionless",
+            Self::Type => "type",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SwitchSelectorDomain {
+    Boolean,
+    Open,
+}
+
+impl SwitchSelectorDomain {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Boolean => "boolean",
+            Self::Open => "open",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SwitchEdgeParts {
+    pub source_point: ProgramPointId,
+    pub arm: GuardArm,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SwitchCaseFactParts {
+    pub value: ValueId,
+    pub edge: SwitchEdgeParts,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct SwitchFactParts {
+    pub id: SwitchFactId,
+    pub kind: SwitchFactKind,
+    pub point: ProgramPointId,
+    pub selector: Option<ValueId>,
+    pub selector_domain: SwitchSelectorDomain,
+    pub cases: Vec<SwitchCaseFactParts>,
+    pub default_edge: Option<SwitchEdgeParts>,
+    pub default_present: bool,
+    pub source: SourceMappingId,
+    pub evidence: EvidenceId,
+}
+
 /// Mutable construction parts. Once accepted by
 /// [`crate::analyzer::semantic::SemanticArtifact::try_new`],
 /// every collection is boxed and only shared immutably.
@@ -1601,6 +2027,7 @@ pub struct ProcedureSemanticsParts {
     pub points: Vec<ProgramPoint>,
     pub control_edges: Vec<ControlEdge>,
     pub guard_facts: Vec<GuardFactParts>,
+    pub switch_facts: Vec<SwitchFactParts>,
 }
 
 impl ProcedureSemanticsParts {
@@ -1631,6 +2058,7 @@ impl ProcedureSemanticsParts {
             points: Vec::new(),
             control_edges: Vec::new(),
             guard_facts: Vec::new(),
+            switch_facts: Vec::new(),
         }
     }
 }

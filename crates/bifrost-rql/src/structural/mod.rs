@@ -10,6 +10,7 @@ pub use crate::query;
 pub use crate::query::*;
 pub use brokk_bifrost_analysis::analyzer::structural::*;
 pub use brokk_bifrost_flow::flow_state;
+pub use brokk_bifrost_flow::scalar_state;
 
 pub use analysis_context::*;
 pub use execution::*;

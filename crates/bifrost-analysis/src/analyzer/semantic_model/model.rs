@@ -2,7 +2,7 @@ use schemars::JsonSchema;
 use semver::Version;
 use serde::{Deserialize, Serialize};
 
-pub const SEMANTIC_MODEL_SCHEMA_VERSION: u32 = 1;
+pub const SEMANTIC_MODEL_SCHEMA_VERSION: u32 = 2;
 pub const PROCEDURE_SUMMARY_CONTRACT_VERSION: u32 = 1;
 pub const MAX_PROCEDURE_SUMMARY_ORDINAL: u32 = 65_535;
 pub const MAX_PROCEDURE_SUMMARY_LOCATIONS: usize = 65_536;
@@ -28,11 +28,12 @@ pub const MAX_PROCEDURE_SUMMARY_NORMAL_RETURN_REFINEMENTS: usize = 64;
 /// parameters. These rows are API contracts rather than observed executions,
 /// so one summary should need only a small set.
 pub const MAX_PROCEDURE_SUMMARY_CONDITIONAL_RESULT_REFINEMENTS: usize = 64;
+pub const MAX_PROCEDURE_SUMMARY_CONDITIONAL_INDIRECT_WRITES: usize = 64;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AuthoredSemanticModelPack {
-    #[schemars(range(min = 1, max = 1))]
+    #[schemars(range(min = 2, max = 2))]
     pub schema_version: u32,
     pub pack_id: String,
     pub version: String,
@@ -202,6 +203,11 @@ pub struct AuthoredProcedureSummary {
     pub transfers: Vec<AuthoredSummaryTransfer>,
     #[serde(default)]
     pub effects: Vec<AuthoredSummaryEffect>,
+    /// Reviewed concurrency semantics for this exact callable. These effects
+    /// name receiver or parameter ports and are projected at an applicable
+    /// call site; they do not add value-flow edges to `effects`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub concurrency_effects: Vec<AuthoredConcurrencyEffect>,
     /// Namespaced effect identifiers the reviewed pack attributes to this exact
     /// procedure identity (#2437), for example `acme.network_io`.
     ///
@@ -237,6 +243,11 @@ pub struct AuthoredProcedureSummary {
     /// opposite runtime value.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub conditional_result_refinements: Vec<AuthoredConditionalResultRefinement>,
+    /// Outcome-sensitive writes through one pointer-like parameter. The
+    /// target is deliberately one-step: deeper access paths require explicit
+    /// location machinery rather than an encoded path string.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub conditional_indirect_writes: Vec<AuthoredConditionalIndirectWrite>,
     /// Reviewed predicates established for parameters whenever this procedure
     /// returns normally. These are path postconditions, not unconditional
     /// claims about the argument at call entry.
@@ -254,6 +265,25 @@ pub struct AuthoredConditionalResultRefinement {
     pub parameter_ordinal: u32,
     pub predicate: AuthoredResultPredicate,
     pub proof_effect: AuthoredPredicateProofEffect,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AuthoredConditionalIndirectWrite {
+    #[schemars(range(max = 65535))]
+    pub result_ordinal: u32,
+    pub outcome: bool,
+    #[schemars(range(max = 65535))]
+    pub parameter_ordinal: u32,
+    pub target: AuthoredIndirectWriteTarget,
+}
+
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthoredIndirectWriteTarget {
+    Pointee,
 }
 
 #[derive(
@@ -331,6 +361,8 @@ pub struct AuthoredOperationPrecondition {
 pub enum AuthoredResultPredicate {
     Null,
     NonNull,
+    True,
+    False,
 }
 
 /// One namespaced effect a reviewed pack attributes to a procedure (#2437).
@@ -372,6 +404,22 @@ pub enum DeclaredEffectCertainty {
     Possible,
 }
 
+// `authored_procedure_target_identity` is the one reader of the rule below.
+// Every index and match site goes through it instead of splitting `symbol`
+// itself, so the authored side and `modeled_procedure_key` agree by
+// construction (#2610).
+/// The exact declaration one reviewed summary speaks for.
+///
+/// `symbol` has two authored forms, and they differ in what supplies the
+/// procedure's owner. A qualified symbol names its own owner, so `Acme.run` at
+/// `path: "src/acme.ts"` keys on owner `Acme` and member `run`; the path is
+/// provenance and the artifact locator, and does not enter the identity. A
+/// bare symbol is a module-level declaration, which has no owner in its name at
+/// all: the module the `path` names is its owner, so `run` at
+/// `path: "src/run.ts"` keys on owner `src/run` and member `run`, the path with
+/// its extension removed. The bare form is the only one available for a
+/// top-level function in a language that qualifies nothing by package, such as
+/// JavaScript, TypeScript, or Ruby.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AuthoredProcedureTarget {
@@ -492,6 +540,65 @@ pub enum AuthoredSummaryEffect {
     },
 }
 
+#[derive(
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum AuthoredConcurrencyEffect {
+    Unsupported {
+        protocol: String,
+    },
+    TaskSpawn {
+        callable: AuthoredSummaryInput,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        group: Option<AuthoredSummaryInput>,
+    },
+    TaskJoin {
+        group: AuthoredSummaryInput,
+    },
+    LockAcquire {
+        lock: AuthoredSummaryInput,
+        mode: AuthoredLockMode,
+    },
+    LockRelease {
+        lock: AuthoredSummaryInput,
+        mode: AuthoredLockMode,
+    },
+    WaitGroupAdd {
+        group: AuthoredSummaryInput,
+        delta: AuthoredSummaryInput,
+    },
+    WaitGroupDone {
+        group: AuthoredSummaryInput,
+    },
+    WaitGroupWait {
+        group: AuthoredSummaryInput,
+    },
+    Atomic {
+        location: AuthoredSummaryInput,
+        operation: AuthoredAtomicOperation,
+    },
+}
+
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthoredLockMode {
+    Shared,
+    Exclusive,
+}
+
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthoredAtomicOperation {
+    Load,
+    Store,
+    ReadModifyWrite,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ActivationSelector {
@@ -536,6 +643,11 @@ pub struct TypeFact {
     pub type_parameter_constraints: Vec<TypeParameterConstraint>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub underlying_type: Option<StructuredTypeExpression>,
+    /// Type-wide value-transfer semantics. This is deliberately optional:
+    /// absence means that the producer did not review implicit value
+    /// operations, rather than that the type has no such operations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value_semantics: Option<TypeValueSemantics>,
     #[serde(default)]
     pub embedded_types: Vec<EmbeddedTypeFact>,
     #[serde(default)]
@@ -547,6 +659,32 @@ pub struct TypeFact {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub guard: Option<DeclarationGuard>,
     pub locator: Locator,
+}
+
+/// Reviewed value semantics for a declared type. Copy behavior and move
+/// invalidation are independent because a type such as `std::string` can have
+/// both a copy constructor and an invalidating move. Member references use
+/// stable declaration ids, never names or rendered signatures.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TypeValueSemantics {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub copy: Option<TypeCopySemantics>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub move_semantics: Option<TypeMoveSemantics>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum TypeCopySemantics {
+    Trivial,
+    ViaMember { member: String },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum TypeMoveSemantics {
+    Invalidating,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -599,6 +737,10 @@ pub struct MemberFact {
     pub is_abstract: bool,
     #[serde(default)]
     pub is_virtual: bool,
+    /// Reviewed role of this exact member in implicit value operations.
+    /// The member's own stable `id` is the operation identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub implicit_operation: Option<ImplicitOperation>,
     /// The authored declarations contain every callable with this member's
     /// exact owner, name, receiver form, and fixed arity.
     ///
@@ -623,6 +765,17 @@ pub struct MemberFact {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub guard: Option<DeclarationGuard>,
     pub locator: Locator,
+}
+
+/// A declaration-level role for an implicit value operation. Conversion
+/// operators retain their structured target type; consumers must still bind
+/// the member by its exact declaration id and signature.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ImplicitOperation {
+    CopyConstructor,
+    MoveConstructor,
+    ConversionOperator { target: TypeRef },
 }
 
 /// The condition under which one activation declares a record.
@@ -910,6 +1063,37 @@ pub struct Parameter {
     pub optional: bool,
     #[serde(default)]
     pub variadic: bool,
+    #[serde(default, skip_serializing_if = "ParameterPassingMode::is_default")]
+    pub passing_mode: ParameterPassingMode,
+}
+
+/// Which source-level argument forms may bind one formal parameter.
+///
+/// Most languages permit both positional and named application. Python stubs
+/// additionally use `/` and `*` to declare positional-only and named-only
+/// regions; preserving that distinction prevents an exact model binding from
+/// accepting a call the declared API itself rejects.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ParameterPassingMode {
+    PositionalOnly,
+    #[default]
+    PositionalOrNamed,
+    NamedOnly,
+}
+
+impl ParameterPassingMode {
+    pub const fn accepts_positional(self) -> bool {
+        matches!(self, Self::PositionalOnly | Self::PositionalOrNamed)
+    }
+
+    pub const fn accepts_named(self) -> bool {
+        matches!(self, Self::PositionalOrNamed | Self::NamedOnly)
+    }
+
+    fn is_default(value: &Self) -> bool {
+        *value == Self::default()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]

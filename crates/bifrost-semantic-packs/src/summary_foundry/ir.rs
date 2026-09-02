@@ -503,10 +503,12 @@ impl FoundryEntry {
             locations: Vec::new(),
             transfers: self.transfers.clone(),
             effects: Vec::new(),
+            concurrency_effects: Vec::new(),
             declared_effects: Vec::new(),
             preconditions: None,
             result_contracts: Vec::new(),
             conditional_result_refinements: Vec::new(),
+            conditional_indirect_writes: Vec::new(),
             normal_return_refinements: Vec::new(),
         })
     }

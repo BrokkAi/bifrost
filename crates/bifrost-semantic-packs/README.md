@@ -75,6 +75,8 @@ the production semantic-model compiler:
 ```text
 bifrost-semantic-pack validate pack.yaml --format json
 bifrost-semantic-pack lint pack.yaml
+bifrost-semantic-pack csmi-check model.csmi.json --format json
+bifrost-semantic-pack csmi-check pack-manifest.json
 bifrost-semantic-pack compile pack.yaml compiled-pack
 bifrost-semantic-pack workspace-check /path/to/workspace
 bifrost-semantic-pack list /path/to/catalog activation.json --format json
@@ -83,6 +85,14 @@ bifrost-semantic-pack list /path/to/catalog activation.json --format json
 Human output is the default. JSON reports use versioned format identifiers.
 Invalid models and lint findings return status 1. Invalid arguments and
 incomplete bounded operations return status 2.
+
+`csmi-check` validates standalone CSMI documents directly. When the input is a
+pack manifest, it also resolves the manifest's declared resources relative to
+that file and verifies canonical bytes, sizes, and digests. Its report keeps
+structural validity, semantic validity, integrity, and consumer-specific
+interpretability separate. A conforming document can therefore exit
+successfully while reporting that its required vocabulary is not interpretable
+by this consumer.
 
 Workspace rules are opt-in direct files under `.bifrost/semantic-models/`.
 Discovery rejects links and path escape. It reports an exact content hash for

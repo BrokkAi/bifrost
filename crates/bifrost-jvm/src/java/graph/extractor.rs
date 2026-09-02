@@ -119,6 +119,29 @@ pub struct ReturnTypeCaches<'a> {
     pub file_return: &'a FileReturnCache,
 }
 
+/// Query-scoped owner of the return-type caches.
+///
+/// One usage query scans many files, and a referenced file's return facts are
+/// the same for every scanned file in that query. The owner lives beside the
+/// query's file loop so `build_java_file_return_facts` parses each referenced
+/// file once per query, not once per scanned file.
+#[derive(Default)]
+pub struct OwnedReturnTypeCaches {
+    method_return: MethodReturnCache,
+    method_anonymous_return: MethodAnonymousReturnCache,
+    file_return: FileReturnCache,
+}
+
+impl OwnedReturnTypeCaches {
+    pub fn caches(&self) -> ReturnTypeCaches<'_> {
+        ReturnTypeCaches {
+            method_return: &self.method_return,
+            method_anonymous_return: &self.method_anonymous_return,
+            file_return: &self.file_return,
+        }
+    }
+}
+
 pub struct ScanCtx<'a> {
     pub java: &'a dyn JavaSource,
     pub graph: &'a JavaGraphSource<'a>,

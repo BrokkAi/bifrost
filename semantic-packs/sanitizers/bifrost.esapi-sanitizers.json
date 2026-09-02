@@ -20,7 +20,7 @@
     "generated_code_only": false,
     "review_required": true
   },
-  "schema_version": 1,
+  "schema_version": 2,
   "shards": [
     {
       "activation": [

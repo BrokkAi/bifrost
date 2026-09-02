@@ -1559,47 +1559,26 @@ fn cpp_canonical_selectors_with_facts(
     out
 }
 
-/// Partition resolved overloads into distinct selectable definitions, preserving
-/// first-seen order. Overloads of one symbol share a selector and scan together.
-/// An FQN present in multiple language/file domains is file-anchored in every
-/// domain so each ambiguity candidate can be re-queried without looping.
+/// Partition resolved declarations into predictable, addressable groups while
+/// preserving first-seen order. Declarations from one source file share a
+/// selector, including overloads. Declarations from independently addressable
+/// files are file-anchored so every ambiguity candidate can be re-queried.
+/// Structured canonical selectors may prove that declarations in several files
+/// form one logical definition (currently C++ declaration/definition families).
 pub(super) fn distinct_definitions(
     analyzer: &dyn IAnalyzer,
     token: QueryToken<'_>,
     overloads: Vec<CodeUnit>,
 ) -> Vec<(String, Vec<CodeUnit>)> {
-    // An FQN's units are file-anchored into distinct `path#fqn` candidates for
-    // either of two reasons:
-    //
-    //  1. Cross-domain: the FQN spans more than one (language, module-scoped
-    //     file) domain — the pre-existing module-scoped/cross-language rule.
-    //
-    //  2. Genuine cross-file duplicate (#1057): within one FQN, some *callable
-    //     signature* is declared in more than one distinct file. That is the
-    //     duplicate shape — scala-2/scala-3 twins, Go build-tag twins, C#
-    //     partial-class parts (which share an empty signature key). Pure
-    //     overload sets — each *differing* signature living in a single file —
-    //     are deliberately NOT split: the codebase models overloads under one
-    //     FQN, and every surface (get_symbol_sources / get_summaries /
-    //     scan_usages) keeps merging their call sites under one selector.
-    //
-    // The signature key is `CodeUnitIndex::signatures(unit)` (the parameter-bearing
-    // overload label list), NOT `CodeUnit::signature()`: the latter is absent
-    // for some macro-headed C++ declarations. The structured inventory returns
-    // distinct labels for overloads (`compute(value: Int)` vs
-    // `compute(left: Int, right: Int)`) and an identical label (or empty list)
-    // for twins/partial parts, which is exactly the discriminator we need.
-    //
-    // A unique FQN in one file, and same-file overloads, satisfy neither reason
-    // and keep their existing `definition_selector` rendering (module-scoped
-    // languages still render file-anchored there).
-    let mut domains_by_fqn: HashMap<String, HashSet<(Language, Option<String>)>> =
-        HashMap::default();
+    // Rendered signature equality is deliberately absent from this decision.
+    // It is an internal presentation detail, not proof that two declarations
+    // are the same logical symbol, and callers cannot predict it. File identity
+    // is structured and already addressable. The only cross-file coalescing
+    // comes from a structured canonical selector established by the analyzer.
     let mut scala_fqns_by_display: HashMap<String, HashSet<String>> = HashMap::default();
     let cpp_facts = CppSelectorFacts::load(analyzer, &overloads);
     let cpp_canonical = cpp_canonical_selectors_with_facts(analyzer, token, &overloads, &cpp_facts);
-    let mut files_by_fqn_signature: HashMap<(String, Vec<String>), HashSet<String>> =
-        HashMap::default();
+    let mut addressable_sources_by_fqn: HashMap<String, HashSet<String>> = HashMap::default();
     for unit in &overloads {
         let language = language_for_target(unit);
         if language == Language::Scala {
@@ -1608,20 +1587,8 @@ pub(super) fn distinct_definitions(
                 .or_default()
                 .insert(unit.fq_name());
         }
-        let module_path = UsageEcosystem::of(language)
-            .is_module_scoped()
-            .then(|| rel_path_string(unit.source()));
-        domains_by_fqn
+        addressable_sources_by_fqn
             .entry(unit.fq_name())
-            .or_default()
-            .insert((language, module_path));
-        let signature = if language == Language::Cpp && unit.is_callable() {
-            cpp_facts.signature_key(unit)
-        } else {
-            selector_signatures(analyzer, unit)
-        };
-        files_by_fqn_signature
-            .entry((unit.fq_name(), signature))
             .or_default()
             .insert(
                 cpp_canonical
@@ -1631,20 +1598,12 @@ pub(super) fn distinct_definitions(
             );
     }
 
-    // FQNs where some (identical) signature is declared in more than one file.
-    let mut collision_split_fqns: HashSet<String> = HashSet::default();
-    for ((fqn, _signature), files) in &files_by_fqn_signature {
-        if files.len() > 1 {
-            collision_split_fqns.insert(fqn.clone());
-        }
-    }
-
     let mut groups: Vec<(String, Vec<CodeUnit>)> = Vec::new();
     for unit in overloads {
         let fqn = unit.fq_name();
-        let cross_domain = domains_by_fqn
+        let spans_addressable_sources = addressable_sources_by_fqn
             .get(&fqn)
-            .is_some_and(|domains| domains.len() > 1);
+            .is_some_and(|sources| sources.len() > 1);
         let scala_companion_display = (language_for_target(&unit) == Language::Scala)
             .then(|| display_symbol_for_target(&unit))
             .filter(|display| {
@@ -1652,7 +1611,7 @@ pub(super) fn distinct_definitions(
                     .get(display)
                     .is_some_and(|fqns| fqns.len() > 1)
             });
-        let selector = if cross_domain || collision_split_fqns.contains(&fqn) {
+        let selector = if spans_addressable_sources {
             cpp_canonical
                 .get(&unit)
                 .cloned()

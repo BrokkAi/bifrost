@@ -11,9 +11,12 @@
 
 use crate::analyzer::common::language_for_file as file_language;
 use crate::analyzer::tree_sitter_analyzer::BulkFileStateSource;
-use crate::analyzer::{CodeUnit, ImportAnalysisProvider, ImportInfo, Language, ProjectFile};
+use crate::analyzer::{
+    CodeUnit, IAnalyzer, ImportAnalysisProvider, ImportInfo, Language, ProjectFile,
+};
 use crate::hash::{HashMap, HashSet};
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
+use brokk_bifrost_jvm::kotlin::graph_support::KotlinSource;
 use brokk_bifrost_jvm::kotlin::imports::{
     compute_kotlin_same_package_reference_index, is_kotlin_importable_top_level,
     kotlin_could_import_file, kotlin_import_path, resolve_kotlin_import_infos,
@@ -205,6 +208,65 @@ impl ImportAnalysisProvider for KotlinAnalyzer {
         }
     }
 
+    /// Kotlin answers "could this file import the target" by resolving each
+    /// import path against the workspace's declarations, so the shared
+    /// candidate walk charged one relational point batch per distinct import
+    /// path per request (#1748's shape, Rust's batch precedent). Every path
+    /// the walk will ask about is derivable from the import facts it already
+    /// has, so resolve them all here through the same two batched reads the
+    /// point path would issue one name at a time.
+    fn prefetch_import_targets(
+        &self,
+        files: &[ProjectFile],
+        import_infos: Option<&HashMap<ProjectFile, Vec<ImportInfo>>>,
+        cancellation: &crate::cancellation::CancellationToken,
+    ) {
+        // Without an open request scope there is no shared memo to fill, so a
+        // prefetch would resolve into a lookup nobody else can see.
+        if self.inner.definition_lookup_memo().is_none() {
+            return;
+        }
+        let scope = AnalyzerQueryScope::new(self);
+        let token = scope.token();
+        let packages = self.top_level_declarations_by_package();
+        let mut paths: Vec<String> = Vec::new();
+        for file in files {
+            if cancellation.is_cancelled() {
+                return;
+            }
+            if file_language(file) != Language::Kotlin {
+                continue;
+            }
+            let owned_imports;
+            let imports = match import_infos.and_then(|all| all.get(file)) {
+                Some(imports) => imports.as_slice(),
+                None => {
+                    owned_imports = self.inner.import_info_of(token, file);
+                    &owned_imports
+                }
+            };
+            for import in imports {
+                let Some(path) = kotlin_import_path(import) else {
+                    continue;
+                };
+                // A star import over a workspace package answers from the
+                // per-generation package export table, not the fqn memo; only
+                // the object-star and single-name forms reach the lookup.
+                if import.is_wildcard && packages.contains_key(&path) {
+                    continue;
+                }
+                paths.push(path);
+            }
+        }
+        if cancellation.is_cancelled() {
+            return;
+        }
+        paths.sort_unstable();
+        paths.dedup();
+        let lookup = crate::analyzer::AnalyzerDefinitionLookup::new(self, Language::Kotlin);
+        lookup.prefetch_fqns(&paths);
+    }
+
     /// Kotlin files that reference `file`.
     ///
     /// Deliberately Kotlin-to-Kotlin, even under a multi-language analyzer.
@@ -255,5 +317,80 @@ impl ImportAnalysisProvider for KotlinAnalyzer {
     ) -> bool {
         let scope = AnalyzerQueryScope::new(self);
         kotlin_could_import_file(self, scope.token(), source_file, imports, target)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::analyzer::{AnalyzerDefinitionLookup, KotlinAnalyzer};
+    use crate::inline_project::InlineTestProject;
+
+    /// Cost pin for the scan-path milestone: after `prefetch_import_targets`,
+    /// resolving the import paths the candidate walk will ask about costs no
+    /// further store reads, and the memoized answers are the point path's.
+    #[test]
+    fn import_target_prefetch_fills_the_shared_definition_memo() {
+        let fixture = InlineTestProject::with_language(Language::Kotlin)
+            .file(
+                "Service.kt",
+                "package api\n\nclass Service { fun run() {} }\n",
+            )
+            .file(
+                "Registry.kt",
+                "package api\n\nobject Registry { fun register() {} }\n",
+            )
+            .file(
+                "Consumer.kt",
+                "package app\n\nimport api.Service\nimport api.Registry.*\n\
+                 import api.missing.Thing\n\n\
+                 class Consumer { fun call(service: Service) { service.run() } }\n",
+            )
+            .build();
+        let files = [
+            ProjectFile::new(fixture.root(), "Service.kt"),
+            ProjectFile::new(fixture.root(), "Registry.kt"),
+            ProjectFile::new(fixture.root(), "Consumer.kt"),
+        ];
+        let analyzer = KotlinAnalyzer::new(fixture.project_arc());
+        let names = ["api.Service", "api.Registry", "api.missing.Thing"];
+        let unprefetched: Vec<_> = {
+            let _scope = AnalyzerQueryScope::new(&analyzer);
+            let lookup = AnalyzerDefinitionLookup::new(&analyzer, Language::Kotlin);
+            names.iter().map(|name| lookup.fqn(name)).collect()
+        };
+        assert_eq!(
+            unprefetched[0]
+                .iter()
+                .map(|unit| unit.fq_name())
+                .collect::<Vec<_>>(),
+            vec!["api.Service".to_string()],
+            "the fixture's class must resolve, or this test pins nothing"
+        );
+        assert_eq!(
+            unprefetched[1]
+                .iter()
+                .map(|unit| unit.fq_name())
+                .collect::<Vec<_>>(),
+            vec!["api.Registry".to_string()],
+            "the single-line object must resolve: its misparse is recovered \
+             by the declaration walk"
+        );
+
+        let _scope = AnalyzerQueryScope::new(&analyzer);
+        analyzer.prefetch_import_targets(&files, None, &crate::CancellationToken::new());
+
+        let before = analyzer.relational_batch_reader_checkouts_for_test();
+        let lookup = AnalyzerDefinitionLookup::new(&analyzer, Language::Kotlin);
+        let prefetched: Vec<_> = names.iter().map(|name| lookup.fqn(name)).collect();
+        assert_eq!(
+            analyzer.relational_batch_reader_checkouts_for_test() - before,
+            0,
+            "every import path the walk will ask about must answer from the shared memo"
+        );
+        assert_eq!(
+            prefetched, unprefetched,
+            "a memoized answer must equal the point path's"
+        );
     }
 }

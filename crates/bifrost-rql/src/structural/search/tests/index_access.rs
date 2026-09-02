@@ -7,7 +7,7 @@ fn value_flow_registration_failures_keep_their_domain_in_mixed_queries() {
             path: "src/Flow.java".into(),
         }),
     };
-    let result = query_analysis_context_error_result(error);
+    let result = query_analysis_context_error_result(None, error);
 
     assert_eq!(result.diagnostics.len(), 1);
     assert_eq!(
@@ -539,6 +539,7 @@ fn snapshot_import_topology_matches_request_local_and_reuses_across_requests() {
     assert_eq!(forward_profile.cache.import_forward.complete_hits, 1);
 }
 
+#[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
 #[test]
 fn auto_import_topology_builds_only_after_observing_reuse() {
     let temp = tempfile::tempdir().expect("temp dir");
@@ -625,6 +626,7 @@ fn auto_import_topology_builds_only_after_observing_reuse() {
     );
 }
 
+#[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
 #[test]
 fn snapshot_import_topology_resets_on_update_and_mutable_overlay_generation() {
     let temp = tempfile::tempdir().expect("temp dir");
@@ -781,6 +783,7 @@ fn snapshot_import_topology_resets_on_update_and_mutable_overlay_generation() {
     );
 }
 
+#[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
 #[test]
 fn multi_analyzer_owns_and_shares_one_workspace_import_topology() {
     let temp = tempfile::tempdir().expect("temp dir");
@@ -843,6 +846,7 @@ fn multi_analyzer_owns_and_shares_one_workspace_import_topology() {
     );
 }
 
+#[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
 #[test]
 fn multi_analyzer_tracks_every_delegate_overlay_generation() {
     let java_temp = tempfile::tempdir().expect("Java temp dir");
@@ -1249,6 +1253,7 @@ fn mutable_overlay_generation_invalidates_cached_postings() {
     );
 }
 
+#[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
 #[test]
 fn auto_reuses_but_does_not_build_a_whole_snapshot_for_a_narrow_scope() {
     let temp = tempfile::tempdir().expect("temp dir");
@@ -1307,6 +1312,7 @@ fn auto_builds_only_after_a_viable_scope_is_reused() {
     assert_eq!(third_profile.access_path.index_builds, 0);
 }
 
+#[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
 #[test]
 fn indexed_rql_and_json_queries_are_response_equivalent() {
     let temp = tempfile::tempdir().expect("temp dir");
@@ -1345,6 +1351,7 @@ fn indexed_rql_and_json_queries_are_response_equivalent() {
     assert_eq!(rql_result.work, json_result.work);
 }
 
+#[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
 #[test]
 fn indexed_candidates_preserve_nested_capture_negation_and_budget_cutoffs() {
     let temp = tempfile::tempdir().expect("temp dir");
@@ -1481,4 +1488,63 @@ fn indexed_candidates_preserve_nested_capture_negation_and_budget_cutoffs() {
             );
         }
     }
+}
+
+#[test]
+fn auto_defers_its_snapshot_build_to_the_background_warm_and_scans_until_it_lands() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let root = temp.path().canonicalize().expect("canonical root");
+    // Auto only admits a build for a scope worth indexing, so the fixture must
+    // carry at least MIN_AUTO_STRUCTURAL_INDEX_FILES files.
+    for index in 0..12 {
+        ProjectFile::new(root.clone(), format!("bench/Unit{index}.java"))
+            .write(format!(
+                "package bench; public class Unit{index} {{ void run() {{ audit(); }} \
+                 void audit() {{}} }}\n"
+            ))
+            .expect("write fixture");
+    }
+    let analyzer = language_analyzer(Language::Java, TestProject::new(root, Language::Java));
+    let query = CodeQuery::from_json(&json!({
+        "match": { "kind": "call", "callee": { "name": "audit" } }
+    }))
+    .expect("query");
+    let run = |mode| {
+        execute_code_query_with_access_mode(
+            analyzer.as_ref(),
+            &query,
+            CodeQueryExecutionLimits::default(),
+            mode,
+            true,
+        )
+        .expect("query executes")
+        .profile
+        .expect("captured profile")
+        .access_path
+    };
+
+    // Nothing has asked for a posting index yet, so there is nothing to warm.
+    assert!(analyzer.structural_indexes_warm());
+
+    let first = run(StructuralAccessMode::Auto);
+    assert_eq!(first.selected, "scan_only", "{first:?}");
+    assert_eq!(first.index_builds, 0, "{first:?}");
+    assert!(
+        !analyzer.structural_indexes_warm(),
+        "the first Auto request must leave a posting index outstanding"
+    );
+
+    analyzer.warm_structural_indexes();
+    assert!(
+        analyzer.structural_indexes_warm(),
+        "the warm must answer every outstanding posting index"
+    );
+
+    let after_warm = run(StructuralAccessMode::Auto);
+    assert!(
+        after_warm.selected.starts_with("posting:"),
+        "the request after the warm must use the index: {after_warm:?}"
+    );
+    assert_eq!(after_warm.index_hits, 1, "{after_warm:?}");
+    assert_eq!(after_warm.index_builds, 0, "{after_warm:?}");
 }

@@ -669,6 +669,7 @@ mod tests {
         assert!(result.result.all_hits_including_imports().is_empty());
     }
 
+    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
     #[test]
     fn issue_1416_late_cancellation_keeps_the_hits_the_graph_scan_already_proved() {
         // The graph scan returns what it accumulated before the token tripped.
@@ -1004,6 +1005,7 @@ mod tests {
     /// reports no scope at all. Only cancellation after the scope is fixed -- the #1416
     /// late window -- may report candidates, and it reports the whole scope, never a
     /// half-expanded one that a caller reading `candidate_files` would take for complete.
+    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
     #[test]
     fn c_cancellation_during_a_supplemental_augmentation_abandons_the_query() {
         let (_temp, analyzer, target) = php_composer_fixture();

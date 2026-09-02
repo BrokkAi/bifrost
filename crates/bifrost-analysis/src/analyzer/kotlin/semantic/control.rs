@@ -44,13 +44,14 @@ pub(super) fn lower_procedure<'tree, 'targets>(
         constructible_types,
         receiver: None,
         captured_receiver: None,
+        captured_bindings: HashMap::default(),
         boundary_label: lambda_boundary_label(prepared.source(), spec.callable),
         is_lambda: spec.callable.kind() == "lambda_literal",
         procedure_targets,
         cleanups: Vec::new(),
     };
     context.emit_procedure_inputs(&mut builder, spec.callable, spec.kind, spec.properties)?;
-    context.emit_captured_receiver(&mut builder, entry, spec)?;
+    context.emit_capture_inputs(&mut builder, entry, spec)?;
     context.emit_local_bindings(&mut builder, spec.body.scan_root())?;
 
     if spec.kind == ProcedureKind::Initializer {
@@ -926,6 +927,8 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     MemoryLocationKind::Index {
                         base: base_value,
                         index: index_value,
+                        constant_index: None,
+                        identity: crate::analyzer::semantic::IndexedLocationIdentity::Element,
                     },
                 )?;
                 self.add_gap(
@@ -1990,6 +1993,8 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             MemoryLocationKind::Index {
                 base: base_value,
                 index: index_value,
+                constant_index: None,
+                identity: crate::analyzer::semantic::IndexedLocationIdentity::Element,
             },
         )?;
         self.append_effect(
@@ -2058,7 +2063,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let resolution = callee_node
             .filter(|callee| callee.kind() == "simple_identifier")
             .and_then(|callee| node_text(self.prepared.source(), callee))
-            .and_then(|name| self.local_callables.get(name).copied())
+            .and_then(|name| self.local_callables.get(name).cloned())
             .map_or(CallableTargetResolution::Unknown, |target| {
                 CallableTargetResolution::Proven(CallableTarget::Local(target.id))
             });
@@ -2171,22 +2176,24 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         next: EdgeTarget,
     ) -> Result<(), KotlinLoweringError> {
         let result = self.expression_value(builder, node, SemanticValueKind::Callable)?;
-        let target = self.procedure_targets.get(&node.id()).copied();
+        let target = self.procedure_targets.get(&node.id()).cloned();
         let resolution = target
+            .as_ref()
             .map(|target| CallableTargetResolution::Proven(CallableTarget::Local(target.id)))
             .unwrap_or(CallableTargetResolution::Unknown);
         let metadata = self.metadata(entry)?;
-        let environment =
-            if target.is_some_and(|target| target.receiver_capture_destination.is_some()) {
-                Some(self.session.add_allocation(
-                    builder,
-                    entry,
-                    result,
-                    AllocationKind::ClosureEnvironment,
-                )?)
-            } else {
-                None
-            };
+        let environment = if target.as_ref().is_some_and(|target| {
+            target.receiver_capture_destination.is_some() || !target.captures.is_empty()
+        }) {
+            Some(self.session.add_allocation(
+                builder,
+                entry,
+                result,
+                AllocationKind::ClosureEnvironment,
+            )?)
+        } else {
+            None
+        };
         self.append_effect(
             builder,
             entry,
@@ -2202,10 +2209,12 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             },
         )?;
         if let (Some(target), Some(environment), Some(captured), Some(destination)) = (
-            target,
+            target.as_ref(),
             environment,
             self.receiver.or(self.captured_receiver),
-            target.and_then(|target| target.receiver_capture_destination),
+            target
+                .as_ref()
+                .and_then(|target| target.receiver_capture_destination),
         ) {
             self.session.add_capture(
                 builder,
@@ -2217,6 +2226,32 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 destination,
                 CaptureMode::Value,
             )?;
+        }
+        if let (Some(target), Some(environment)) = (target.as_ref(), environment) {
+            for (index, capture) in target.captures.iter().enumerate() {
+                let source = self
+                    .local_declaration_value(&capture.name, capture.declaration_start)
+                    .ok_or_else(|| {
+                        KotlinLoweringError::Invalid(format!(
+                            "precomputed Kotlin capture `{}` has no parent binding",
+                            capture.name
+                        ))
+                    })?;
+                let destination = lexical_capture_destination(
+                    target.receiver_capture_destination.is_some(),
+                    index,
+                )?;
+                self.session.add_capture(
+                    builder,
+                    entry,
+                    result,
+                    target.id,
+                    environment,
+                    CaptureSource::Value(source),
+                    destination,
+                    CaptureMode::Value,
+                )?;
+            }
         }
         if resolution == CallableTargetResolution::Unknown {
             self.add_gap(

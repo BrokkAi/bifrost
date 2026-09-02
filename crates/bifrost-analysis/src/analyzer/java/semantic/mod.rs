@@ -6,7 +6,7 @@
 
 use tree_sitter::Node;
 
-use crate::analyzer::lexical_definitions::formal_parameter_slots;
+use crate::analyzer::lexical_definitions::formal_parameter_slots_for_owner_with_nodes;
 use crate::analyzer::semantic::cfg::{
     CleanupRegionId, CompletionKind, CompletionRequest, CompletionRoute, ProcedureCfgBuilder,
     ScopeBinding, ScopeFrameId,
@@ -16,10 +16,10 @@ use crate::analyzer::semantic::*;
 use crate::analyzer::tree_sitter_analyzer::{
     PreparedSyntaxTree, WalkControl, try_walk_named_tree_preorder,
 };
-use crate::analyzer::{JavaAnalyzer, Language, ProjectFile, Range};
+use crate::analyzer::{JavaAnalyzer, Language, ProjectFile};
 use crate::hash::{HashMap, HashSet};
 
-const ADAPTER_VERSION: &[u8] = b"java-value-semantics-v9";
+const ADAPTER_VERSION: &[u8] = b"java-value-semantics-v10";
 
 impl_program_semantics_provider!(JavaAnalyzer, JavaSemanticLowerer);
 
@@ -311,6 +311,7 @@ struct LoweringContext<'tree, 'targets> {
     type_name_roots: HashSet<Box<str>>,
     local_types: HashMap<ValueId, Box<str>>,
     local_type_nodes: HashMap<ValueId, Node<'tree>>,
+    array_values: HashSet<ValueId>,
     non_null_values: HashSet<ValueId>,
     catch_binders: HashMap<ProgramPointId, ValueId>,
     parameters: HashMap<Box<str>, ValueId>,

@@ -17,7 +17,8 @@ pub(in crate::analyzer::usages) use brokk_bifrost_csharp::graph::extractor::{
     is_declaration_name as csharp_is_declaration_name, member_access_name, member_access_receiver,
 };
 pub(in crate::analyzer::usages) use brokk_bifrost_csharp::graph::resolver::{
-    CSharpDeclaredType, argument_count as csharp_argument_count, canonical_builtin_type_identity,
+    CSharpDeclaredType, CSharpInitializerOwnerLookups, CSharpInitializerOwnerTarget,
+    argument_count as csharp_argument_count, canonical_builtin_type_identity,
     collection_target_element_type_node as csharp_collection_target_element_type_node,
     first_type_child as csharp_first_type_child,
     is_type_reference_node as csharp_is_type_reference_node,
@@ -28,10 +29,8 @@ pub(in crate::analyzer::usages) use brokk_bifrost_csharp::graph::resolver::{
     method_return_type_fq_name_for_arity as csharp_method_return_type_fq_name_for_arity,
     method_return_type_fq_name_for_arity_in_session as csharp_method_return_type_fq_name_for_arity_in_session,
     node_text as csharp_node_text, object_created_type as csharp_object_created_type,
-    object_creation_assignment_target as csharp_object_creation_assignment_target,
-    object_creation_collection_target as csharp_object_creation_collection_target,
     object_initializer_for_label as csharp_object_initializer_for_label,
-    object_initializer_owner_type_node as csharp_object_initializer_owner_type_node,
+    object_initializer_owners as csharp_object_initializer_owners,
     reference_type_text as csharp_reference_type_text,
     resolve_type_fq_name as csharp_resolve_type_fq_name,
     seed_bindings_before as seed_csharp_bindings_before,

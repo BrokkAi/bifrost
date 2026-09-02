@@ -808,6 +808,7 @@ mod tests {
         assert!(cached.join("SHA256SUMS").is_file());
     }
 
+    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
     #[test]
     fn checksum_mismatch_does_not_install_requested_generated_production() {
         let fixture = generated_bundle_fixture();

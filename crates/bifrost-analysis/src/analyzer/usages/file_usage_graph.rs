@@ -220,10 +220,11 @@ fn file_graph(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
-
     fn file(path: &str) -> ProjectFile {
-        ProjectFile::new(PathBuf::from("/workspace"), path)
+        ProjectFile::new(
+            std::env::current_dir().expect("test working directory must be available"),
+            path,
+        )
     }
 
     #[test]

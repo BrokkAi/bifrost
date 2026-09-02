@@ -1,0 +1,89 @@
+{
+  "documentType": "semantic-document",
+  "schema": "https://csmi.brokk.ai/schema/0.1/schema.json",
+  "semanticModelVersion": "0.1",
+  "serializationVersion": "0.1-json",
+  "provenanceRecords": [
+    {
+      "id": "manual-model",
+      "producer": {
+        "identifier": "https://example.org/processes/reviewed-models",
+        "version": "git:abc123"
+      },
+      "generationMethod": "manual-authoring"
+    }
+  ],
+  "defaultProvenance": "manual-model",
+  "semanticModels": [
+    {
+      "artifactSelectors": [
+        { "purl": "pkg:pypi/example-decoder@2.0.0" }
+      ],
+      "symbols": [
+        {
+          "id": "decode",
+          "scheme": "org.example.python-import",
+          "schemeVersion": "0.1",
+          "stability": "portable",
+          "descriptors": [
+            { "role": "namespace", "name": "example_decoder" },
+            { "role": "callable", "name": "decode" }
+          ]
+        }
+      ],
+      "declarations": [
+        {
+          "symbol": "decode",
+          "category": "callable",
+          "callable": {
+            "kind": "function",
+            "parameters": [
+              {
+                "position": 0,
+                "binding": "positional-or-named",
+                "label": "value",
+                "required": true
+              }
+            ],
+            "results": [
+              { "position": 0, "type": { "kind": "unknown" } }
+            ]
+          }
+        }
+      ],
+      "procedureSummaries": [
+        {
+          "callable": "decode",
+          "transfers": [
+            {
+              "source": {
+                "root": {
+                  "phase": "input",
+                  "role": "parameter",
+                  "position": 0
+                }
+              },
+              "destination": {
+                "root": {
+                  "phase": "output",
+                  "role": "result",
+                  "position": 0
+                }
+              }
+            }
+          ]
+        }
+      ],
+      "completenessStatements": [
+        {
+          "family": "procedure-summaries",
+          "scope": { "callable": "decode" },
+          "status": "partial",
+          "limitations": [
+            { "kind": "budget-exhausted" }
+          ]
+        }
+      ]
+    }
+  ]
+}

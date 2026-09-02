@@ -251,11 +251,16 @@ macro_rules! lang_epoch {
 // carry a source-coordinate identity that separates same-named locals in
 // overloaded methods. Warm rows either omit the enum-body owners entirely or
 // retain the old collapsed local-class FQNs.
+// Salt bumped again (#1651): a type declaration's signature metadata now
+// records the declaration's own type-parameter list, which
+// `canonical_identity_of` projects as the identity's generic arity. A warm row
+// carries no such record, so a cached declaration would compare unequal to the
+// same declaration reparsed from unchanged source.
 lang_epoch!(
     Java,
     "java",
     "treesitter/java/",
-    "synthetic-file-scope-code-units-2026-07;no-implicit-constructor-units-2026-07;source-backed-package-modules-2026-07;ast-test-detection-2026-07;callable-arity-metadata-2026-07;annotated-spread-parameter-metadata-2026-07;compact-record-constructors-2026-07;fq-interned-segments-2026-07;field-modifier-metadata-2026-08;static-import-path-kind-2026-08;jvm-query-assets-in-brokk-bifrost-jvm-2026-08;class-like-static-metadata-2026-08;native-callable-modifier-metadata-2026-08;local-anonymous-and-enum-body-owners-2026-08;nested-anonymous-owner-identity-2026-08;enum-constant-body-and-coordinate-local-class-owners-2026-08;same-package-type-identifier-facts-2026-08"
+    "synthetic-file-scope-code-units-2026-07;no-implicit-constructor-units-2026-07;source-backed-package-modules-2026-07;ast-test-detection-2026-07;callable-arity-metadata-2026-07;annotated-spread-parameter-metadata-2026-07;compact-record-constructors-2026-07;fq-interned-segments-2026-07;field-modifier-metadata-2026-08;static-import-path-kind-2026-08;jvm-query-assets-in-brokk-bifrost-jvm-2026-08;class-like-static-metadata-2026-08;native-callable-modifier-metadata-2026-08;local-anonymous-and-enum-body-owners-2026-08;nested-anonymous-owner-identity-2026-08;enum-constant-body-and-coordinate-local-class-owners-2026-08;same-package-type-identifier-facts-2026-08;declaration-type-parameter-arity-2026-09"
 );
 // Salt bumped: Go `package_name` is now the canonical import path, changing
 // every persisted Go `fq_name`. Forces stale rows to be re-analyzed.
@@ -541,6 +546,18 @@ pub(super) fn cpp_epoch_before_macro_argument_typedef_declarator() -> String {
 }
 
 #[cfg(test)]
+pub(super) fn kotlin_epoch_before_type_alias_type_identity() -> String {
+    let prior = salt_before_bump(Kotlin::SALT, "kotlin-type-alias-type-identity-2026-09");
+    compute_epoch::<Kotlin>(&crate::analyzer::kotlin::language::LANGUAGE.into(), prior)
+}
+
+#[cfg(test)]
+pub(super) fn scala_epoch_before_type_alias_type_identity() -> String {
+    let prior = salt_before_bump(Scala::SALT, "scala-type-alias-type-identity-2026-09");
+    compute_epoch::<Scala>(&crate::analyzer::scala::language::LANGUAGE.into(), prior)
+}
+
+#[cfg(test)]
 pub(super) fn scala_epoch_before_top_level_extension_declarations() -> String {
     let prior = salt_before_bump(Scala::SALT, "top-level-extension-declarations-2026-08");
     compute_epoch::<Scala>(&crate::analyzer::scala::language::LANGUAGE.into(), prior)
@@ -766,11 +783,16 @@ lang_epoch!(
 // `extern crate` the file writes, not only the ones at its top level. Warm rows
 // omit a `use` written inside `mod tests { ... }` or any other inline module,
 // so the coarse file graph loses the file edges those imports name.
+// Salt bumped again (#1651): a type declaration's signature metadata now
+// records the declaration's own type-parameter list, which
+// `canonical_identity_of` projects as the identity's generic arity. A warm row
+// carries no such record, so a cached declaration would compare unequal to the
+// same declaration reparsed from unchanged source.
 lang_epoch!(
     Rust,
     "rust",
     "treesitter/rust/",
-    "synthetic-file-scope-code-units-2026-07;embedded-macro-rules-code-units-2026-07;ast-test-detection-2026-07;canonical-impl-owner-identities-2026-07;macro-invocation-item-reparse-2026-07;proven-macro-definition-replay-2026-07;per-declaration-test-taint-2026-07;raw-identifier-normalization-2026-07;inline-module-const-static-type-items-2026-07;fq-interned-segments-2026-07;structural-macro-invocation-arguments-2026-08;structural-attributes-and-fields-2026-08;anchored-fq-encoding-2026-08;crate-aware-packages-2026-08;rust-query-assets-in-brokk-bifrost-rust-2026-08;renamed-import-impl-owner-route-2026-08;per-file-usage-facts-2026-08;cargo-route-facts-2026-08;include-edge-facts-2026-08;import-cfg-and-extern-crate-2026-08;enum-variant-named-fields-2026-08;callable-parameter-type-spellings-2026-08;raw-identifier-cargo-module-routes-2026-08;bounded-declaration-labels-2026-08;nested-and-extern-crate-import-facts-2026-08"
+    "synthetic-file-scope-code-units-2026-07;embedded-macro-rules-code-units-2026-07;ast-test-detection-2026-07;canonical-impl-owner-identities-2026-07;macro-invocation-item-reparse-2026-07;proven-macro-definition-replay-2026-07;per-declaration-test-taint-2026-07;raw-identifier-normalization-2026-07;inline-module-const-static-type-items-2026-07;fq-interned-segments-2026-07;structural-macro-invocation-arguments-2026-08;structural-attributes-and-fields-2026-08;anchored-fq-encoding-2026-08;crate-aware-packages-2026-08;rust-query-assets-in-brokk-bifrost-rust-2026-08;renamed-import-impl-owner-route-2026-08;per-file-usage-facts-2026-08;cargo-route-facts-2026-08;include-edge-facts-2026-08;import-cfg-and-extern-crate-2026-08;enum-variant-named-fields-2026-08;callable-parameter-type-spellings-2026-08;raw-identifier-cargo-module-routes-2026-08;bounded-declaration-labels-2026-08;nested-and-extern-crate-import-facts-2026-08;declaration-type-parameter-arity-2026-09"
 );
 
 #[cfg(test)]
@@ -840,11 +862,22 @@ pub(super) fn php_epoch_before_conditional_free_function_declarations() -> Strin
 // ordinary walk handled `extension` only inside a template body, which is not
 // where Scala 3 usually writes one, so warm rows hold no declaration at all for
 // a file whose only content is top-level extension methods.
+// Salt bumped again (#1651): a type declaration's signature metadata now
+// records the declaration's own type-parameter list, which
+// `canonical_identity_of` projects as the identity's generic arity. A warm row
+// carries no such record, so a cached declaration would compare unequal to the
+// same declaration reparsed from unchanged source.
+// Salt bumped again (#2878): a `type` alias now mints a `Class` code unit whose
+// own segment is a `Type` segment, the same identity rule classes and traits
+// use. `declaration_id` hashes segment kinds, so every warm row holds the old
+// `Field`/`Member` identity for every Scala type alias -- and, where an alias
+// and a `val` share one owner and one name, holds only one of the two
+// declarations.
 lang_epoch!(
     Scala,
     "scala",
     "treesitter/scala/",
-    "synthetic-file-scope-code-units-2026-07;scala-raw-supertypes-and-traits-2026-07;ast-test-detection-2026-07;curried-constructor-and-parameter-field-semantics-2026-07;recovered-indentation-type-ownership-2026-07;parser-backed-export-facts-2026-07;parameterized-enum-case-declarations-2026-07;supertype-package-prefix-context-2026-07;supertype-lexical-scope-context-2026-07;tree-sitter-scala-bifrost-patches-1016-1068-1073-2026-07;comment-immune-tuple-pattern-binding-names-2026-07;fq-interned-segments-2026-07;scalachess-fqn-recovery-2026-07;jvm-query-assets-in-brokk-bifrost-jvm-2026-08;tree-sitter-scala-0.26.2-2026-08;scala-anonymous-template-code-units-2026-08;package-object-package-scope-2026-08;same-package-type-identifier-facts-2026-08;top-level-extension-declarations-2026-08"
+    "synthetic-file-scope-code-units-2026-07;scala-raw-supertypes-and-traits-2026-07;ast-test-detection-2026-07;curried-constructor-and-parameter-field-semantics-2026-07;recovered-indentation-type-ownership-2026-07;parser-backed-export-facts-2026-07;parameterized-enum-case-declarations-2026-07;supertype-package-prefix-context-2026-07;supertype-lexical-scope-context-2026-07;tree-sitter-scala-bifrost-patches-1016-1068-1073-2026-07;comment-immune-tuple-pattern-binding-names-2026-07;fq-interned-segments-2026-07;scalachess-fqn-recovery-2026-07;jvm-query-assets-in-brokk-bifrost-jvm-2026-08;tree-sitter-scala-0.26.2-2026-08;scala-anonymous-template-code-units-2026-08;package-object-package-scope-2026-08;same-package-type-identifier-facts-2026-08;top-level-extension-declarations-2026-08;declaration-type-parameter-arity-2026-09;scala-type-alias-type-identity-2026-09"
 );
 // Salt bumped (#1548 stage 3 fleet): the C# `.scm` query assets moved from this
 // crate's `resources/treesitter/c_sharp/` into `brokk-bifrost-csharp`, so the
@@ -878,11 +911,21 @@ lang_epoch!(
 // per type. Analyzer-level classification propagates that evidence to derived
 // test classes, so prior rows lack both inputs even when `contains_tests` for
 // the base file itself was true.
+// Salt bumped again (#1651): a type declaration's signature metadata now
+// records the declaration's own type-parameter list, which
+// `canonical_identity_of` projects as the identity's generic arity. A warm row
+// carries no such record, so a cached declaration would compare unequal to the
+// same declaration reparsed from unchanged source.
+// Salt bumped again (#2225): a C# callable now publishes the written type of
+// each of its parameters, and a C# type declaration now publishes whether it
+// is an interface. Both are read as published facts rather than reparsed, so a
+// warm row would answer "no parameter types recorded" and "not an interface"
+// for source that says otherwise.
 lang_epoch!(
     CSharp,
     "csharp",
     "treesitter/c_sharp/",
-    "synthetic-file-scope-code-units-2026-07;ast-test-detection-2026-07;static-using-type-identifiers-2026-07;as-expression-type-identifiers-2026-07;generic-type-identity-2026-07;attribute-type-identifiers-2026-07;callable-arity-and-static-import-metadata-2026-07;generic-method-arity-identity-2026-07;structured-return-type-metadata-2026-07;tuple-element-type-identifiers-2026-07;nameof-type-identifiers-2026-07;callable-dispatch-extensibility-metadata-2026-07;fq-interned-segments-2026-07;csharp-query-assets-in-brokk-bifrost-csharp-2026-08;interop-optional-callable-arity-2026-08;callable-modifier-metadata-2026-08;preprocessor-directive-aware-parsing-2026-08;multiplication-not-pointer-type-reference-2026-08;verbatim-identifier-canonical-declaration-names-2026-08;structured-csharp-runnable-test-classification-2026-08;csharp-inherited-test-classification-2026-08"
+    "synthetic-file-scope-code-units-2026-07;ast-test-detection-2026-07;static-using-type-identifiers-2026-07;as-expression-type-identifiers-2026-07;generic-type-identity-2026-07;attribute-type-identifiers-2026-07;callable-arity-and-static-import-metadata-2026-07;generic-method-arity-identity-2026-07;structured-return-type-metadata-2026-07;tuple-element-type-identifiers-2026-07;nameof-type-identifiers-2026-07;callable-dispatch-extensibility-metadata-2026-07;fq-interned-segments-2026-07;csharp-query-assets-in-brokk-bifrost-csharp-2026-08;interop-optional-callable-arity-2026-08;callable-modifier-metadata-2026-08;preprocessor-directive-aware-parsing-2026-08;multiplication-not-pointer-type-reference-2026-08;verbatim-identifier-canonical-declaration-names-2026-08;structured-csharp-runnable-test-classification-2026-08;csharp-inherited-test-classification-2026-08;declaration-type-parameter-arity-2026-09;callable-parameter-types-and-interface-marker-2026-09"
 );
 
 #[cfg(test)]
@@ -938,13 +981,25 @@ lang_epoch!(
 // Candidate discovery consumes that fact to avoid the impossible polymorphic
 // descendant expansion for constructor usage scans, so warm rows with the
 // compatible false default must be re-extracted.
-// `brokk-tree-sitter-kotlin-0.4.1`: grammar changes can alter parse trees and
-// derived declarations, so persisted Kotlin rows from 0.4.0 must be rebuilt.
+// `brokk-tree-sitter-kotlin-0.4.3`: grammar changes can alter parse trees and
+// derived declarations, so persisted Kotlin rows from older parser releases
+// must be rebuilt.
+// Salt bumped again (#1651): a type declaration's signature metadata now
+// records the declaration's own type-parameter list, which
+// `canonical_identity_of` projects as the identity's generic arity. A warm row
+// carries no such record, so a cached declaration would compare unequal to the
+// same declaration reparsed from unchanged source.
+// Salt bumped again (#2892): a `typealias` now mints a `Class` code unit whose
+// own segment is a `Type` segment, the same identity rule classes and objects
+// use. `declaration_id` hashes segment kinds, so every warm row holds the old
+// `Field`/`Member` identity for every Kotlin type alias -- and, where an alias
+// and a `val` share one owner and one name, holds only one of the two
+// declarations.
 lang_epoch!(
     Kotlin,
     "kotlin",
     "treesitter/kotlin/",
-    "brokk-tree-sitter-kotlin-0.4.1-2026-08;kotlin-core-indexing-2026-07;kotlin-class-parameter-default-arity-2026-07;kotlin-backtick-identifier-names-2026-07;kotlin-jvm-realm-imports-supertypes-2026-07;kotlin-signature-returns-receivers-2026-07;kotlin-companion-object-marker-2026-07;kotlin-structured-signature-types-2026-08;jvm-query-assets-in-brokk-bifrost-jvm-2026-08;kotlin-constructor-callable-metadata-2026-08"
+    "brokk-tree-sitter-kotlin-0.4.3-2026-09;kotlin-core-indexing-2026-07;kotlin-class-parameter-default-arity-2026-07;kotlin-backtick-identifier-names-2026-07;kotlin-jvm-realm-imports-supertypes-2026-07;kotlin-signature-returns-receivers-2026-07;kotlin-companion-object-marker-2026-07;kotlin-structured-signature-types-2026-08;jvm-query-assets-in-brokk-bifrost-jvm-2026-08;kotlin-constructor-callable-metadata-2026-08;declaration-type-parameter-arity-2026-09;kotlin-type-alias-type-identity-2026-09"
 );
 
 #[cfg(test)]

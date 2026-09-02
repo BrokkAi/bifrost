@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "id": "bifrost.security",
+  "version": "1.0.0",
+  "name": "Bifrost security",
+  "description": "High-precision security policies backed by exact structural identity and value-flow evidence.",
+  "policies": [
+    {
+      "path": "policies/jvm/servlet-parameter-to-jdbc.rqlp",
+      "id": "bifrost.security.java.servlet-parameter-to-jdbc",
+      "semantic_hash": "3b62d7d3dbc90110cc078e8d19a0a3a892c0b90c8ee6322e96d9e510517aeb4c",
+      "category": "security",
+      "supported_languages": [
+        "java"
+      ],
+      "required_capabilities": [
+        "taint",
+        "exact-call-target",
+        "actual-to-formal-binding",
+        "semantic-model-provenance",
+        "scoped-callable-completeness"
+      ],
+      "severity_rationale": "Attacker-controlled data used as JDBC SQL structure can change the executed statement and compromise application data.",
+      "remediation": "Use a PreparedStatement with placeholders and bind untrusted values through typed setter methods instead of concatenating SQL text."
+    }
+  ]
+}

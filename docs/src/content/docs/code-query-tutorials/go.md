@@ -3,7 +3,7 @@ title: Go
 description: Query Go selector calls, multi-value assignments, imports, methods, and capability diagnostics with query_code.
 ---
 
-> Last verified end to end: 2026-07-18 (`query_code` schema version 1).
+> Last verified end to end: 2026-09-01 (`query_code` schema version 1).
 
 For exact inbound and outbound symbol edges, proof tiers, and adapter-specific caveats, see [Reference Traversal](../reference-traversal/).
 
@@ -90,6 +90,40 @@ Both services call `Send`. `not_has` removes the call containing the literal `"b
         {"name":"context","text":"context.Background()","start_line":24},
         {"name":"value","text":"value","start_line":24}
       ],
+      "enclosing_symbol": "go.run"
+    }
+  ],
+  "truncated": false
+}
+```
+
+## Match A Concurrent Spawn
+
+Go statements have their own `concurrent_spawn` kind. The match retains the
+whole spawn expression while exposing the spawned call's ordinary call roles.
+
+<!-- code-query-case:concurrent-spawn:rql -->
+```lisp
+(language go (concurrent_spawn))
+```
+
+<!-- code-query-case:concurrent-spawn:json -->
+```json
+{"languages":["go"],"match":{"kind":"concurrent_spawn"}}
+```
+
+<!-- code-query-case:concurrent-spawn:expected -->
+```json
+{
+  "results": [
+    {
+      "result_type": "structural_match",
+      "path": "go/app.go",
+      "language": "go",
+      "kind": "concurrent_spawn",
+      "start_line": 22,
+      "end_line": 22,
+      "text": "go func() { backup.Send(context.Background(), \"background\") }()",
       "enclosing_symbol": "go.run"
     }
   ],

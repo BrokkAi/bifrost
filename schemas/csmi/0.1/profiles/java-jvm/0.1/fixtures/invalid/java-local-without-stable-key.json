@@ -1,0 +1,14 @@
+{
+  "$profileSchema": "java-source-identity",
+  "profileVersion": "0.1",
+  "language": "java",
+  "package": ["org", "example"],
+  "ownerPath": [
+    { "kind": "class", "name": "Outer" }
+  ],
+  "declaration": {
+    "kind": "type",
+    "name": "Local"
+  },
+  "origin": "local"
+}

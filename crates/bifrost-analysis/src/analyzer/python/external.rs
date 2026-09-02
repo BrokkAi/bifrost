@@ -18,10 +18,11 @@ use crate::analyzer::semantic_model::{
     DependencyPackDiagnostic, DependencyPackDiagnosticSeverity, DependencyPackLimits,
     DependencyPackProduction, DependencyProvenance, ExactArtifact, ExactDependencyArtifact,
     ExternalArtifactKind, ExternalArtifactPackProducer, GuardVersion, HierarchyFact, Locator,
-    MemberFact, MemberIdentity, MemberKind, NameSelector, Parameter, Producer, ProducerDiagnostic,
-    ProducerDiagnosticSeverity, Provenance, ResolvedDependency, ResolvedDependencyArtifact, Safety,
-    SemanticModelActivationEvidence, Signature, TypeFact, TypeIdentity, TypeKind, TypeRef,
-    Visibility, member_declaration_id, read_exact_artifact_while, type_declaration_id,
+    MemberFact, MemberIdentity, MemberKind, NameSelector, Parameter, ParameterPassingMode,
+    Producer, ProducerDiagnostic, ProducerDiagnosticSeverity, Provenance, ResolvedDependency,
+    ResolvedDependencyArtifact, Safety, SemanticModelActivationEvidence, Signature,
+    SuppressedDiagnostics, TypeFact, TypeIdentity, TypeKind, TypeRef, Visibility,
+    member_declaration_id, read_exact_artifact_while, type_declaration_id,
 };
 use crate::analyzer::topology::DependencyScope;
 use crate::analyzer::{Project, PythonAnalyzerConfig, PythonEnvironmentConfig};
@@ -60,7 +61,7 @@ impl DependencyPackAdapter for PythonDependencyPackAdapter {
         let mut types = Vec::new();
         let mut members = Vec::new();
         let mut diagnostics = Vec::new();
-        let mut suppressed_diagnostics = 0usize;
+        let mut suppressed_diagnostics = SuppressedDiagnostics::default();
         let mut completeness = Completeness::Complete;
         let stub_modules = artifacts
             .iter()
@@ -71,6 +72,7 @@ impl DependencyPackAdapter for PythonDependencyPackAdapter {
             if cancellation.is_some_and(CancellationToken::is_cancelled) {
                 diagnostics.push(ProducerDiagnostic {
                     severity: ProducerDiagnosticSeverity::Error,
+                    source_entry: None,
                     code: "artifact.cancelled".to_owned(),
                     location: None,
                     declaration: None,
@@ -82,6 +84,7 @@ impl DependencyPackAdapter for PythonDependencyPackAdapter {
             let Some(module) = artifact.module() else {
                 diagnostics.push(ProducerDiagnostic {
                     severity: ProducerDiagnosticSeverity::Error,
+                    source_entry: None,
                     code: "python.artifact_module".to_owned(),
                     location: Some(artifact.path().display().to_string()),
                     declaration: None,
@@ -108,8 +111,7 @@ impl DependencyPackAdapter for PythonDependencyPackAdapter {
                 module,
             );
             completeness = combine_completeness(completeness, production.completeness);
-            suppressed_diagnostics =
-                suppressed_diagnostics.saturating_add(production.suppressed_diagnostics);
+            suppressed_diagnostics += production.suppressed_diagnostics;
             diagnostics.extend(production.diagnostics);
             if let Some(pack) = production.pack {
                 for shard in pack.shards {
@@ -202,6 +204,7 @@ impl PythonArtifactPackProducer {
             return ArtifactProduction::failed(
                 ProducerDiagnostic {
                     severity: ProducerDiagnosticSeverity::Error,
+                    source_entry: None,
                     code: "artifact.kind".to_owned(),
                     location: None,
                     declaration: None,
@@ -240,6 +243,7 @@ impl PythonArtifactPackProducer {
             return ArtifactProduction::failed(
                 ProducerDiagnostic {
                     severity: ProducerDiagnosticSeverity::Error,
+                    source_entry: None,
                     code: "artifact.kind".to_owned(),
                     location: None,
                     declaration: None,
@@ -254,6 +258,7 @@ impl PythonArtifactPackProducer {
                 return ArtifactProduction::failed(
                     ProducerDiagnostic {
                         severity: ProducerDiagnosticSeverity::Error,
+                        source_entry: None,
                         code: "python.source.encoding".to_owned(),
                         location: Some(artifact.path().display().to_string()),
                         declaration: None,
@@ -267,6 +272,7 @@ impl PythonArtifactPackProducer {
             return ArtifactProduction::failed(
                 ProducerDiagnostic {
                     severity: ProducerDiagnosticSeverity::Error,
+                    source_entry: None,
                     code: "python.source.parse".to_owned(),
                     location: Some(artifact.path().display().to_string()),
                     declaration: None,
@@ -297,7 +303,7 @@ impl PythonArtifactPackProducer {
             );
         }
         let (diagnostics, suppressed_diagnostics) = diagnostics.finish();
-        let completeness = if diagnostics.is_empty() && suppressed_diagnostics == 0 {
+        let completeness = if diagnostics.is_empty() && suppressed_diagnostics.total() == 0 {
             Completeness::Complete
         } else {
             Completeness::Partial
@@ -358,6 +364,7 @@ impl PythonArtifactPackProducer {
             return ArtifactProduction::failed(
                 ProducerDiagnostic {
                     severity: ProducerDiagnosticSeverity::Error,
+                    source_entry: None,
                     code: "artifact.kind".to_owned(),
                     location: None,
                     declaration: None,
@@ -434,7 +441,7 @@ impl PythonArtifactPackProducer {
         dedup_declarations(&mut types, &mut members);
         resolve_hierarchy_references(&mut types);
         let (diagnostics, suppressed_diagnostics) = diagnostics.finish();
-        let completeness = if diagnostics.is_empty() && suppressed_diagnostics == 0 {
+        let completeness = if diagnostics.is_empty() && suppressed_diagnostics.total() == 0 {
             Completeness::Complete
         } else {
             Completeness::Partial
@@ -1236,6 +1243,7 @@ impl<'a, 'd> PythonApiCollector<'a, 'd> {
             type_parameters,
             type_parameter_constraints: Vec::new(),
             underlying_type: None,
+            value_semantics: None,
             embedded_types: Vec::new(),
             hierarchy,
             aliases: Vec::new(),
@@ -1306,6 +1314,7 @@ impl<'a, 'd> PythonApiCollector<'a, 'd> {
             is_static,
             is_abstract: false,
             is_virtual: false,
+            implicit_operation: None,
             callable_family_complete: false,
             signature,
             receiver: None,
@@ -1615,47 +1624,85 @@ fn is_type_alias_annotation(node: Node<'_>, source: &str) -> bool {
 /// annotation makes two overloads of one name indistinguishable.
 fn function_signature(node: Node<'_>, source: &str, max_depth: usize) -> Option<Signature> {
     let parameters = node.child_by_field_name("parameters")?;
-    let parameters = named_children(parameters)
-        .filter_map(|parameter| {
-            let (annotation, optional, variadic) = match parameter.kind() {
-                "identifier" => (None, false, false),
-                "typed_parameter" => (
-                    parameter.child_by_field_name("type"),
-                    false,
-                    named_children(parameter).any(|child| {
-                        matches!(
-                            child.kind(),
-                            "list_splat_pattern" | "dictionary_splat_pattern"
-                        )
-                    }),
-                ),
-                "default_parameter" | "typed_default_parameter" => {
-                    (parameter.child_by_field_name("type"), true, false)
-                }
-                "list_splat_pattern" | "dictionary_splat_pattern" => (None, false, true),
-                _ => return None,
-            };
-            Some(Parameter {
-                name: brokk_bifrost_python::declarations::python_parameter_label_node(parameter)
-                    .and_then(|label| node_identifier(Some(label), source)),
-                r#type: annotation
-                    .map(|annotation| type_ref(annotation, source, max_depth))
-                    .unwrap_or_else(any_type),
-                optional,
-                variadic,
-            })
-        })
-        .collect();
+    let parameter_nodes = named_children(parameters).collect::<Vec<_>>();
+    let positional_separator = parameter_nodes
+        .iter()
+        .position(|parameter| parameter.kind() == "positional_separator");
+    let keyword_boundary = parameter_nodes.iter().position(|parameter| {
+        parameter.kind() == "keyword_separator"
+            || python_variadic_parameter_mode(*parameter)
+                == Some(ParameterPassingMode::PositionalOnly)
+    });
+    let mut modeled_parameters = Vec::new();
+    for (index, parameter) in parameter_nodes.into_iter().enumerate() {
+        let variadic_mode = python_variadic_parameter_mode(parameter);
+        let (annotation, optional, variadic) = match parameter.kind() {
+            "identifier" => (None, false, false),
+            "typed_parameter" => (
+                parameter.child_by_field_name("type"),
+                false,
+                variadic_mode.is_some(),
+            ),
+            "default_parameter" | "typed_default_parameter" => {
+                (parameter.child_by_field_name("type"), true, false)
+            }
+            "list_splat_pattern" | "dictionary_splat_pattern" => (None, false, true),
+            "positional_separator" | "keyword_separator" => continue,
+            _ => continue,
+        };
+        let passing_mode = variadic_mode.unwrap_or_else(|| {
+            if positional_separator.is_some_and(|separator| index < separator) {
+                ParameterPassingMode::PositionalOnly
+            } else if keyword_boundary.is_some_and(|separator| index > separator) {
+                ParameterPassingMode::NamedOnly
+            } else {
+                ParameterPassingMode::PositionalOrNamed
+            }
+        });
+        modeled_parameters.push(Parameter {
+            name: brokk_bifrost_python::declarations::python_parameter_label_node(parameter)
+                .and_then(|label| node_identifier(Some(label), source)),
+            r#type: annotation
+                .map(|annotation| type_ref(annotation, source, max_depth))
+                .unwrap_or_else(any_type),
+            optional,
+            variadic,
+            passing_mode,
+        });
+    }
     Some(Signature {
         type_parameters: node
             .child_by_field_name("type_parameters")
             .map(|list| type_parameter_names(list, source))
             .unwrap_or_default(),
-        parameters,
+        parameters: modeled_parameters,
         returns: node
             .child_by_field_name("return_type")
             .map(|annotation| type_ref(annotation, source, max_depth)),
     })
+}
+
+fn python_variadic_parameter_mode(parameter: Node<'_>) -> Option<ParameterPassingMode> {
+    let kind = if matches!(
+        parameter.kind(),
+        "list_splat_pattern" | "dictionary_splat_pattern"
+    ) {
+        Some(parameter.kind())
+    } else {
+        named_children(parameter)
+            .find(|child| {
+                matches!(
+                    child.kind(),
+                    "list_splat_pattern" | "dictionary_splat_pattern"
+                )
+            })
+            .map(|child| child.kind())
+    };
+    match kind {
+        Some("list_splat_pattern") => Some(ParameterPassingMode::PositionalOnly),
+        Some("dictionary_splat_pattern") => Some(ParameterPassingMode::NamedOnly),
+        _ => None,
+    }
 }
 
 /// The names a PEP 695 `[T, S]` type-parameter list declares.
@@ -2164,7 +2211,7 @@ struct DiscoveryState<'a> {
     environment: &'a PythonEnvironmentConfig,
     limits: &'a DependencyPackLimits,
     diagnostics: Vec<DependencyPackDiagnostic>,
-    suppressed_diagnostics: usize,
+    suppressed_diagnostics: SuppressedDiagnostics,
     metadata_inputs_considered: usize,
     directories_considered: usize,
     candidate_bytes: u64,
@@ -2177,7 +2224,7 @@ impl<'a> DiscoveryState<'a> {
             environment,
             limits,
             diagnostics: Vec::new(),
-            suppressed_diagnostics: 0,
+            suppressed_diagnostics: SuppressedDiagnostics::default(),
             metadata_inputs_considered: 0,
             directories_considered: 0,
             candidate_bytes: 0,
@@ -2215,7 +2262,7 @@ impl<'a> DiscoveryState<'a> {
                 metadata_inputs_considered: self.metadata_inputs_considered,
                 dependencies_resolved: dependencies.len(),
             },
-            complete: !self.incomplete && self.suppressed_diagnostics == 0,
+            complete: !self.incomplete && self.suppressed_diagnostics.total() == 0,
             dependencies,
             diagnostics: self.diagnostics,
             suppressed_diagnostics: self.suppressed_diagnostics,
@@ -2818,7 +2865,8 @@ impl<'a> DiscoveryState<'a> {
                 .max_diagnostics
                 .min(self.limits.max_diagnostics)
         {
-            self.suppressed_diagnostics = self.suppressed_diagnostics.saturating_add(1);
+            self.suppressed_diagnostics.errors =
+                self.suppressed_diagnostics.errors.saturating_add(1);
             return;
         }
         self.diagnostics.push(DependencyPackDiagnostic {
@@ -3213,11 +3261,48 @@ def run(
             assert!(!parameters[0].optional);
             assert!(parameters[8].optional, "shell has an exact default");
             assert!(parameters[10].optional, "capture_output is keyword-only");
+            assert!(
+                parameters[..10]
+                    .iter()
+                    .all(|parameter| parameter.passing_mode
+                        == ParameterPassingMode::PositionalOrNamed)
+            );
+            assert!(
+                parameters[10..]
+                    .iter()
+                    .all(|parameter| parameter.passing_mode == ParameterPassingMode::NamedOnly)
+            );
             assert!(!parameters.iter().any(|parameter| parameter.variadic));
         }
         drop(collector);
         let (diagnostics, suppressed) = diagnostics.finish();
         assert!(diagnostics.is_empty(), "{diagnostics:#?}");
-        assert_eq!(suppressed, 0);
+        assert_eq!(suppressed, SuppressedDiagnostics::default());
+    }
+
+    #[test]
+    fn stub_signature_preserves_python_parameter_passing_regions() {
+        let source = "def api(first: int, /, second: int, *values: int, third: int, **rest: int) -> None: ...\n";
+        let tree = brokk_bifrost_python::declarations::parse_python_tree(source).unwrap();
+        let definition = tree.root_node().named_child(0).expect("function");
+
+        let signature = function_signature(definition, source, 32).expect("signature");
+
+        assert_eq!(
+            signature
+                .parameters
+                .iter()
+                .map(|parameter| parameter.passing_mode)
+                .collect::<Vec<_>>(),
+            [
+                ParameterPassingMode::PositionalOnly,
+                ParameterPassingMode::PositionalOrNamed,
+                ParameterPassingMode::PositionalOnly,
+                ParameterPassingMode::NamedOnly,
+                ParameterPassingMode::NamedOnly,
+            ]
+        );
+        assert!(signature.parameters[2].variadic, "*values is variadic");
+        assert!(signature.parameters[4].variadic, "**rest is variadic");
     }
 }

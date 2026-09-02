@@ -244,7 +244,12 @@ pub fn spelled_generic_arity(
 /// The child that spells a chain node's own segment: the named field where the
 /// grammar has one, otherwise the last named child (the positional convention
 /// of field-less chain nodes such as Java's `scoped_type_identifier`).
-fn chain_name_child<'tree>(node: Node<'tree>, name_field: Option<&str>) -> Option<Node<'tree>> {
+///
+/// Public because occurrence-role classification asks the same question the
+/// chain walkers above do -- "is this token the chain node's own segment, or
+/// one of its scope segments?" -- and a chain node without fields must not be
+/// answered with a field lookup that is false for every child.
+pub fn chain_name_child<'tree>(node: Node<'tree>, name_field: Option<&str>) -> Option<Node<'tree>> {
     match name_field {
         Some(field) => node.child_by_field_name(field),
         None => {

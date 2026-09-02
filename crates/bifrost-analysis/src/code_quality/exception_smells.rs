@@ -358,6 +358,7 @@ mod tests {
         assert!(!result.truncated);
     }
 
+    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
     #[test]
     fn exception_smells_meaningful_body_below_threshold_is_filtered() {
         let body = "      System.out.println(1);\n      System.out.println(2);\n      System.out.println(3);\n";

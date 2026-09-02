@@ -8,7 +8,7 @@ use crate::analyzer::semantic_model::{
     DependencyPackProduction, ExactArtifact, ExactDependencyArtifact, ExternalArtifactKind,
     ExternalArtifactPackProducer, NameSelector, Producer, ProducerDiagnostic,
     ProducerDiagnosticSeverity, Provenance, ResolvedDependency, SEMANTIC_MODEL_SCHEMA_VERSION,
-    Safety, TypeFact, TypeRef, read_exact_artifact_while,
+    Safety, SuppressedDiagnostics, TypeFact, TypeRef, read_exact_artifact_while,
 };
 use crate::hash::{HashMap, HashSet};
 
@@ -57,6 +57,7 @@ impl RubyGemArchivePackProducer {
             return ArtifactProduction::failed(
                 ProducerDiagnostic {
                     severity: ProducerDiagnosticSeverity::Error,
+                    source_entry: None,
                     code: "artifact.kind".to_owned(),
                     location: None,
                     declaration: None,
@@ -85,7 +86,7 @@ impl RubyGemArchivePackProducer {
             read_gem_declaration_entries(artifact.sha256(), artifact.bytes(), limits, cancellation);
         let mut diagnostics = BoundedProducerDiagnostics::new(limits);
         append_diagnostics(&mut diagnostics, archive.diagnostics);
-        let mut complete = archive.complete && archive.suppressed_diagnostics == 0;
+        let mut complete = archive.complete && archive.suppressed_diagnostics.total() == 0;
         let (types, members, projection_complete) = merge_entries(
             artifact.sha256(),
             &archive.entries,
@@ -108,8 +109,7 @@ impl RubyGemArchivePackProducer {
             Completeness::Partial
         };
         let (diagnostics, mut suppressed_diagnostics) = diagnostics.finish();
-        suppressed_diagnostics =
-            suppressed_diagnostics.saturating_add(archive.suppressed_diagnostics);
+        suppressed_diagnostics += archive.suppressed_diagnostics;
         let mut activation = request.activation.clone();
         for selector in &mut activation {
             selector.artifact_sha256 = Some(artifact.sha256().to_owned());
@@ -336,7 +336,7 @@ fn merge_entries(
             }
         };
         aliases.extend(projected_aliases);
-        complete &= entry_complete && suppressed == 0;
+        complete &= entry_complete && suppressed.total() == 0;
         append_diagnostics(diagnostics, projected_diagnostics);
         for mut incoming in projected_types {
             if types.len().saturating_add(members.len()) >= limits.max_records {
@@ -738,12 +738,13 @@ fn failed(code: &str, message: &str) -> DependencyPackProduction {
         pack: None,
         diagnostics: vec![ProducerDiagnostic {
             severity: ProducerDiagnosticSeverity::Error,
+            source_entry: None,
             code: code.to_owned(),
             location: None,
             declaration: None,
             message: message.to_owned(),
         }],
-        suppressed_diagnostics: 0,
+        suppressed_diagnostics: SuppressedDiagnostics::default(),
     }
 }
 
@@ -835,7 +836,7 @@ mod tests {
         let (diagnostics, suppressed) = diagnostics.finish();
 
         assert!(!complete);
-        assert_eq!(suppressed, 0);
+        assert_eq!(suppressed, SuppressedDiagnostics::default());
         assert_eq!(
             members
                 .iter()

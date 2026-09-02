@@ -364,7 +364,7 @@ impl PhysicalQueryNodeId {
         self.0
     }
 
-    const fn index(self) -> usize {
+    pub(crate) const fn index(self) -> usize {
         self.0 as usize
     }
 
@@ -514,6 +514,12 @@ impl PhysicalQueryPlan {
 
     pub(crate) const fn root(&self) -> PhysicalQueryNodeId {
         self.root
+    }
+
+    /// How many operators this plan holds. Node ids are dense over this range,
+    /// so a per-node counter is a vector of this length.
+    pub(crate) fn node_count(&self) -> usize {
+        self.nodes.len()
     }
 
     pub(crate) fn node(&self, id: PhysicalQueryNodeId) -> &PhysicalQueryNode {
@@ -840,6 +846,7 @@ pub struct CodeQuerySemanticRequest {
     pub dispatch: bool,
     pub program_points: bool,
     pub control_edges: bool,
+    pub switch_facts: bool,
     pub typestate: bool,
     pub value_flow: bool,
     pub taint: bool,
@@ -857,9 +864,11 @@ impl CodeQuerySemanticRequest {
                 QuerySemanticFacet::Dispatch => request.dispatch = true,
                 QuerySemanticFacet::ProgramPoints => request.program_points = true,
                 QuerySemanticFacet::ControlEdges => request.control_edges = true,
+                QuerySemanticFacet::SwitchFacts => request.switch_facts = true,
                 QuerySemanticFacet::Typestate => request.typestate = true,
                 QuerySemanticFacet::ValueFlow => request.value_flow = true,
                 QuerySemanticFacet::Taint => request.taint = true,
+                QuerySemanticFacet::Concurrency => {}
             }
         }
         Some(request)
@@ -1258,6 +1267,7 @@ mod tests {
                     dispatch: false,
                     program_points: false,
                     control_edges: false,
+                    switch_facts: false,
                     typestate: false,
                     value_flow: false,
                     taint: false,
@@ -1267,6 +1277,7 @@ mod tests {
                     dispatch: false,
                     program_points: true,
                     control_edges: false,
+                    switch_facts: false,
                     typestate: false,
                     value_flow: false,
                     taint: false,
@@ -1276,6 +1287,7 @@ mod tests {
                     dispatch: false,
                     program_points: true,
                     control_edges: true,
+                    switch_facts: false,
                     typestate: false,
                     value_flow: false,
                     taint: false,
@@ -1315,6 +1327,7 @@ mod tests {
                     dispatch: true,
                     program_points: true,
                     control_edges: true,
+                    switch_facts: false,
                     typestate: false,
                     value_flow: false,
                     taint: false,
@@ -1324,6 +1337,7 @@ mod tests {
                     dispatch: true,
                     program_points: true,
                     control_edges: true,
+                    switch_facts: false,
                     typestate: false,
                     value_flow: false,
                     taint: false,
@@ -1333,6 +1347,7 @@ mod tests {
                     dispatch: true,
                     program_points: true,
                     control_edges: true,
+                    switch_facts: false,
                     typestate: false,
                     value_flow: false,
                     taint: false,
@@ -1371,6 +1386,7 @@ mod tests {
                     dispatch: false,
                     program_points: false,
                     control_edges: false,
+                    switch_facts: false,
                     typestate: false,
                     value_flow: false,
                     taint: false,
@@ -1380,6 +1396,7 @@ mod tests {
                     dispatch: false,
                     program_points: false,
                     control_edges: false,
+                    switch_facts: false,
                     typestate: true,
                     value_flow: false,
                     taint: false,
@@ -1418,6 +1435,7 @@ mod tests {
                     dispatch: false,
                     program_points: false,
                     control_edges: false,
+                    switch_facts: false,
                     typestate: false,
                     value_flow: false,
                     taint: false,
@@ -1427,6 +1445,7 @@ mod tests {
                     dispatch: false,
                     program_points: false,
                     control_edges: false,
+                    switch_facts: false,
                     typestate: false,
                     value_flow: true,
                     taint: false,

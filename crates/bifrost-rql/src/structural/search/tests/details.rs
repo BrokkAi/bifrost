@@ -6,6 +6,7 @@ use super::*;
 /// without relying on the local spelling (#2644). Concrete method and
 /// constructor parameters must carry the complete semantic owner, ordinal,
 /// and value-port identity; syntax-only rows remain explicitly incomplete.
+#[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
 #[test]
 fn decorated_parameter_rows_expose_aliased_import_identity_and_near_miss() {
     let source = r#"
@@ -249,6 +250,7 @@ interface Contract {
     ));
 }
 
+#[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
 #[test]
 fn detailed_execution_aligns_evidence_hashes_owners_and_direct_work() {
     let source = r#"export function handler(input: string) {
@@ -309,6 +311,104 @@ sink(input);
     assert_eq!(detailed.work.examined_references, 0);
 }
 
+#[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
+#[test]
+fn detailed_field_write_evidence_is_anchored_to_the_rhs_ast() {
+    let source = r#"class Box { value = ""; }
+export function write(input: string) {
+    const box = new Box();
+    box.value = input;
+}
+"#;
+    let temp = tempfile::tempdir().expect("temp dir");
+    let root = temp.path().canonicalize().expect("canonical root");
+    let file = ProjectFile::new(root.clone(), PathBuf::from("app.ts"));
+    file.write(source).expect("write source");
+    let analyzer = TypescriptAnalyzer::from_project(TestProject::new(root, Language::TypeScript));
+    let query = CodeQuery::from_json(&json!({
+        "match": {
+            "kind": "assignment",
+            "operator": { "text": { "regex": "^=$" } },
+            "left": {
+                "kind": "field_access",
+                "capture": "write_target",
+                "name": "value"
+            },
+            "right": { "capture": "dangerous" }
+        },
+        "steps": [
+            { "op": "member_targets", "capture": "write_target" },
+            { "op": "field_write_value" }
+        ],
+        "result_detail": "full"
+    }))
+    .expect("field-write query");
+
+    let detailed =
+        execute_code_query_detailed(&analyzer, &query, CodeQueryExecutionLimits::default(), None);
+    assert_eq!(
+        detailed.result.results.len(),
+        1,
+        "{}",
+        detailed.result.render_text()
+    );
+    let row = match &detailed.result.results[0].value {
+        CodeQueryResultValue::FieldWriteValue { value } => value,
+        other => panic!("expected field-write value, got {other:?}"),
+    };
+    assert_eq!(row.text, "input");
+    assert_ne!(row.assignment_ast_id, row.rhs_ast_id);
+
+    let evidence = &detailed.evidence[0];
+    assert_eq!(evidence.domain, DetailedCodeQueryDomain::FieldWriteValue);
+    assert!(matches!(
+        &evidence.key,
+        DetailedCodeQueryKey::FieldWriteValue {
+            id,
+            assignment_ast_id,
+            rhs_ast_id,
+            receiver_identity_id,
+            member_target_id,
+        } if id == &row.id
+            && assignment_ast_id == &row.assignment_ast_id
+            && rhs_ast_id == &row.rhs_ast_id
+            && receiver_identity_id == &row.receiver_identity_id
+            && member_target_id == &row.member_target_id
+    ));
+    let byte_span = evidence.byte_span.clone().expect("RHS byte span");
+    assert_eq!(&source[byte_span.clone()], "input");
+    assert_eq!(
+        evidence.source_slice_sha256,
+        Some(Sha256::digest(&source.as_bytes()[byte_span]).into())
+    );
+    assert!(matches!(
+        &evidence.identities,
+        DetailedCodeQueryProvenanceIdentities::Primary(Some(_))
+    ));
+    assert!(matches!(
+        &evidence.stable_owner_candidate,
+        Some(CodeQueryStableOwnerCandidate {
+            derivation: CodeQueryStableOwnerDerivation::CanonicalAstIdentity,
+            ..
+        })
+    ));
+    assert!(
+        evidence
+            .provenance
+            .iter()
+            .flat_map(|trace| trace.steps.iter())
+            .any(|step| step.result.domain == DetailedCodeQueryDomain::MemberTargetAnalysis)
+    );
+    assert!(
+        evidence
+            .provenance
+            .iter()
+            .flat_map(|trace| trace.steps.iter())
+            .any(|step| step.result.domain == DetailedCodeQueryDomain::FieldWriteValue)
+    );
+}
+
+#[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
 #[test]
 fn detailed_file_terminal_is_artifact_only() {
     let source = "export function handler() { sink(); }\n";
@@ -338,6 +438,7 @@ fn detailed_file_terminal_is_artifact_only() {
     assert!(detailed.evidence[0].stable_owner_candidate.is_none());
 }
 
+#[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
 #[test]
 fn detailed_execution_covers_every_semantic_terminal_domain() {
     let source = r#"export function target(payload: string) { return payload; }
@@ -442,6 +543,7 @@ export function invoke(service: Service) { service.run(); }
     }
 }
 
+#[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
 #[test]
 fn cross_file_declaration_hydration_is_charged_or_degrades_to_weak_evidence() {
     let target_source = "export function target() {}\n";
@@ -503,6 +605,7 @@ fn cross_file_declaration_hydration_is_charged_or_degrades_to_weak_evidence() {
     assert!(partial.work.scanned_source_bytes <= tight_limit as u64);
 }
 
+#[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
 #[test]
 fn cross_file_call_nested_rendering_cannot_retry_an_exhausted_source() {
     let target_source = "export function target() {}\n";
@@ -588,11 +691,12 @@ fn receiver_budget_projects_one_remaining_fact_cap_across_all_work() {
 
 #[test]
 fn tiny_receiver_budget_returns_an_explicit_exceeded_row() {
-    let source = r#"class Service { run() {} }
+    let source = r#"class Service { run() {} value = ""; }
 function makeService() { return new Service(); }
-export function caller() {
+export function caller(input: string) {
 const service = makeService();
 service.run();
+service.value = input;
 }
 "#;
     let temp = tempfile::tempdir().expect("temp dir");
@@ -672,6 +776,39 @@ service.run();
         ReceiverAnalysisBudget::tiny(),
     );
     assert!(evidence.results.is_empty());
+
+    let field_write_query = CodeQuery::from_json(&json!({
+        "match": {
+            "kind": "assignment",
+            "operator": { "text": { "regex": "^=$" } },
+            "left": {
+                "kind": "field_access",
+                "capture": "write_target",
+                "name": "value"
+            },
+            "right": { "capture": "dangerous" }
+        },
+        "steps": [
+            { "op": "member_targets", "capture": "write_target" },
+            { "op": "field_write_value" }
+        ]
+    }))
+    .expect("field-write query");
+    let field_write = execute_with_receiver_budget_for_test(
+        &analyzer,
+        &field_write_query,
+        ReceiverAnalysisBudget::tiny(),
+    );
+    assert!(
+        field_write.results.is_empty(),
+        "{}",
+        field_write.render_text()
+    );
+    assert!(field_write.truncated, "{}", field_write.render_text());
+    assert!(field_write.diagnostics.iter().any(|diagnostic| {
+        diagnostic.code == CodeQueryDiagnosticCode::ReceiverAnalysisPartial
+            && diagnostic.message.contains("scope_nodes")
+    }));
 }
 
 #[test]
@@ -952,6 +1089,7 @@ export function caller() { const service = new Service(); const alias = service;
 /// A receiver that may hold either of two allocation types keeps both
 /// candidates visible: the outcome row is ambiguous with open coverage, and
 /// each candidate type has its own evidence row.
+#[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
 #[test]
 fn ambiguous_receiver_keeps_both_types_as_open_evidence() {
     let source = r#"class ServiceA { run() {} }
@@ -1188,6 +1326,7 @@ public class Caller {
     );
 }
 
+#[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
 #[test]
 fn csharp_cross_file_receiver_step_reuses_bounded_reference_facts() {
     let definitions = r#"
@@ -1248,7 +1387,7 @@ public class Caller {
         matches!(
             result.results.as_slice(),
             [CodeQueryResultItem {
-                value: CodeQueryResultValue::ReceiverAnalysis { value },
+                value: CodeQueryResultValue::MemberTargetAnalysis { value },
                 ..
             }] if value.outcome == "precise"
                 && matches!(
@@ -1261,6 +1400,7 @@ public class Caller {
     );
 }
 
+#[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
 #[test]
 fn cancelled_composed_query_retains_no_partial_rows() {
     let temp = tempfile::tempdir().expect("temp dir");
@@ -1574,6 +1714,42 @@ fn result_contract_use_schema_exposes_exact_call_argument_identity() {
 }
 
 #[test]
+fn result_contract_rows_publish_finite_boolean_predicate_values() {
+    for (domain, fields, names) in [
+        (
+            "call_result_contract",
+            DetailedCodeQueryDomain::CallResultContract.row_fields(),
+            &["predicate", "result_success_predicate"][..],
+        ),
+        (
+            "result_contract_use",
+            DetailedCodeQueryDomain::ResultContractUse.row_fields(),
+            &[
+                "acquisition_predicate",
+                "result_success_predicate",
+                "required_predicate",
+            ][..],
+        ),
+    ] {
+        for name in names {
+            let field = fields
+                .iter()
+                .find(|field| field.name == *name)
+                .unwrap_or_else(|| panic!("missing {domain}.{name}"));
+            let values = field
+                .value_domain
+                .and_then(CodeQueryEnumDomain::labels)
+                .expect("a result predicate has a finite registered domain");
+            assert_eq!(
+                values,
+                ["null", "non_null", "true", "false"],
+                "{domain}.{name}"
+            );
+        }
+    }
+}
+
+#[test]
 fn result_contract_failure_use_schema_separates_call_and_structural_site_identity() {
     let fields = DetailedCodeQueryDomain::ResultContractFailureUse.row_fields();
     for name in [
@@ -1764,6 +1940,7 @@ fn occurrence_row_projection_does_not_invent_one_identity_for_ambiguous_targets(
 /// terminal row that states the derivation's status, and every required
 /// registered field projects on it. Zero rows can therefore never be read as
 /// "this call performs no effect".
+#[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
 #[test]
 fn effect_row_domains_project_their_registered_surface_without_an_active_pack() {
     let source = r#"class App {
@@ -1836,4 +2013,69 @@ fn effect_row_domains_project_their_registered_surface_without_an_active_pack() 
     assert_eq!(value.derivation, "none");
     assert_eq!(value.coverage, "exhaustive");
     assert_row_projects_its_whole_registered_surface(&procedure_effects.results[0].value);
+}
+
+/// A row rendered from a file that an earlier row's nested rendering probed
+/// keeps its own source coordinates.
+///
+/// `PipelineRenderCache` seals its source loads after the first row so a
+/// render pass cannot hydrate the whole workspace. The seal is about the
+/// probe, not about the file: recording a refused probe as a negative cache
+/// entry used to make the later budgeted retention of that same file a no-op,
+/// and every row of that file then rendered the fallback coordinates -- column
+/// 1 for both ends -- instead of its own. Here `src/a.ts` resolves into
+/// `src/b.ts` and is rendered first, so `src/b.ts` is probed while sealed and
+/// its own rows come afterwards.
+#[test]
+fn a_probe_refused_by_the_render_seal_leaves_that_file_its_own_coordinates() {
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file(
+            "src/a.ts",
+            "import { helper } from './b';\nexport function first() {\n  return helper();\n}\n",
+        )
+        .file(
+            "src/b.ts",
+            "import { other } from './c';\nexport function helper() {\n  return other();\n}\n",
+        )
+        .file("src/c.ts", "export function other() {\n  return 1;\n}\n")
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let query = CodeQuery::from_json(&json!({
+        "schema_version": 1,
+        "occurrences": { "class": "reference" },
+        "limit": 100,
+        "result_detail": "full"
+    }))
+    .expect("occurrence query");
+
+    let result = execute_workspace(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &query,
+    );
+    let rows: Vec<(String, usize, usize)> = result
+        .results
+        .iter()
+        .map(|item| match &item.value {
+            CodeQueryResultValue::Occurrence { value } => (
+                value.path.clone(),
+                value.range.start_column,
+                value.start_byte,
+            ),
+            other => panic!("expected an occurrence row, got {other:?}"),
+        })
+        .collect();
+    assert!(
+        rows.iter().any(|(path, _, _)| path == "src/b.ts"),
+        "the middle file contributes its own occurrence rows: {rows:?}"
+    );
+    for (path, start_column, start_byte) in &rows {
+        // Every fixture occurrence starts on its own line, so the column is
+        // the byte offset from that line's start plus one. A row that lost its
+        // source renders column 1 for a token that is not at the line start.
+        assert!(
+            *start_column > 1 || *start_byte == 0,
+            "{path} row at byte {start_byte} rendered the fallback column"
+        );
+    }
 }

@@ -1,0 +1,178 @@
+{
+  "documentType": "semantic-document",
+  "schema": "https://csmi.brokk.ai/schema/0.1/schema.json",
+  "semanticModelVersion": "0.1",
+  "serializationVersion": "0.1-json",
+  "provenanceRecords": [
+    {
+      "id": "verified-java-build",
+      "producer": {
+        "identifier": "https://example.org/tools/java-csmi-exporter",
+        "version": "1.0.0"
+      },
+      "generationMethod": "manual-authoring"
+    }
+  ],
+  "defaultProvenance": "verified-java-build",
+  "semanticModels": [
+    {
+      "artifactSelectors": [
+        {
+          "purl": "pkg:maven/org.example/normalize@1.4.2?type=jar",
+          "digests": [
+            {
+              "algorithm": "sha-256",
+              "coverage": "jar",
+              "value": "1111111111111111111111111111111111111111111111111111111111111111"
+            }
+          ]
+        }
+      ],
+      "compatibilityConstraints": [
+        {
+          "vocabulary": "csmi.jvm-compatibility",
+          "version": "0.1",
+          "value": {
+            "profileVersion": "0.1",
+            "constraints": {
+              "javaRelease": { "minimum": 17 },
+              "classFileMajor": { "maximum": 61 },
+              "targetPlatform": "jvm"
+            }
+          }
+        }
+      ],
+      "vocabularyUses": [
+        {
+          "identifier": "csmi.java-source-identity",
+          "version": "0.1",
+          "schema": "https://csmi.brokk.ai/schema/profiles/java-jvm/0.1/java-source-identity.schema.json",
+          "requirement": "required",
+          "affects": [
+            {
+              "kind": "core-slot",
+              "slot": "symbol.identity-scheme",
+              "target": { "symbol": "java-normalize" }
+            }
+          ]
+        },
+        {
+          "identifier": "csmi.jvm-binary-identity",
+          "version": "0.1",
+          "schema": "https://csmi.brokk.ai/schema/profiles/java-jvm/0.1/jvm-binary-identity.schema.json",
+          "requirement": "required",
+          "affects": [
+            {
+              "kind": "core-slot",
+              "slot": "symbol.identity-scheme",
+              "target": { "symbol": "jvm-normalize" }
+            }
+          ]
+        },
+        {
+          "identifier": "csmi.java-jvm-mapping",
+          "version": "0.1",
+          "schema": "https://csmi.brokk.ai/schema/profiles/java-jvm/0.1/java-jvm-mapping.schema.json",
+          "requirement": "required",
+          "affects": [
+            {
+              "kind": "fact-family",
+              "family": "java-jvm-mapping",
+              "scope": { "sourceSymbol": "java-normalize" }
+            }
+          ]
+        },
+        {
+          "identifier": "csmi.jvm-compatibility",
+          "version": "0.1",
+          "schema": "https://csmi.brokk.ai/schema/profiles/java-jvm/0.1/jvm-compatibility.schema.json",
+          "requirement": "required",
+          "affects": [
+            {
+              "kind": "core-slot",
+              "slot": "semantic-model.compatibility",
+              "target": { "artifactSelectors": "model" }
+            }
+          ]
+        }
+      ],
+      "symbols": [
+        {
+          "id": "java-normalize",
+          "artifactSelectors": [
+            {
+              "purl": "pkg:maven/org.example/normalize@1.4.2?classifier=sources&type=jar",
+              "digests": [
+                {
+                  "algorithm": "sha-256",
+                  "coverage": "source-archive",
+                  "value": "2222222222222222222222222222222222222222222222222222222222222222"
+                }
+              ]
+            }
+          ],
+          "scheme": "csmi.java-source-identity",
+          "schemeVersion": "0.1",
+          "stability": "portable",
+          "descriptors": [
+            { "role": "namespace", "name": "org" },
+            { "role": "namespace", "name": "example" },
+            { "role": "type", "name": "Strings" },
+            {
+              "role": "callable",
+              "name": "normalize",
+              "disambiguator": "{\"parameterTypes\":[{\"canonicalName\":\"java.lang.String\",\"nullability\":\"unspecified\",\"parameterMode\":\"value\"}]}"
+            }
+          ]
+        },
+        {
+          "id": "jvm-normalize",
+          "scheme": "csmi.jvm-binary-identity",
+          "schemeVersion": "0.1",
+          "stability": "portable",
+          "descriptors": [
+            { "role": "namespace", "name": "org" },
+            { "role": "namespace", "name": "example" },
+            { "role": "type", "name": "Strings" },
+            {
+              "role": "callable",
+              "name": "normalize",
+              "disambiguator": "(Ljava/lang/String;)Ljava/lang/String;"
+            }
+          ]
+        }
+      ],
+      "extensionFacts": [
+        {
+          "vocabulary": "csmi.java-jvm-mapping",
+          "version": "0.1",
+          "family": "java-jvm-mapping",
+          "scope": { "sourceSymbol": "java-normalize" },
+          "payload": {
+            "profileVersion": "0.1",
+            "resolution": "established",
+            "sourceSymbol": "java-normalize",
+            "binarySymbols": ["jvm-normalize"],
+            "mappingKind": "direct",
+            "evidence": [
+              {
+                "kind": "verified-build-output",
+                "producer": "https://example.org/builds/normalize-1.4.2",
+                "digest": "3333333333333333333333333333333333333333333333333333333333333333"
+              }
+            ]
+          }
+        }
+      ],
+      "completenessStatements": [
+        {
+          "vocabulary": "csmi.java-jvm-mapping",
+          "version": "0.1",
+          "family": "java-jvm-mapping",
+          "scope": { "sourceSymbol": "java-normalize" },
+          "status": "complete"
+        }
+      ]
+    }
+  ]
+}

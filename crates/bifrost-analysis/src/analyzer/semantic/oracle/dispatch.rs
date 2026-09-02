@@ -14,6 +14,9 @@ use super::relation::{
 };
 use crate::analyzer::languages::{LanguageSupport, language_support};
 use crate::analyzer::{CallableArity, Language, SignatureMetadata};
+use brokk_bifrost_core::path_utils::path_suffix_key;
+use std::borrow::Cow;
+use std::path::Path;
 
 /// One materialized workspace target for an exact semantic call site.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -503,6 +506,11 @@ impl UnmaterializedExternalTarget {
         if self.has_receiver {
             return false;
         }
+        if self.language() == SemanticLanguage::Standard(Language::Python)
+            && self.resolver_owned_call_shape
+        {
+            return true;
+        }
         match self.language() {
             SemanticLanguage::Standard(Language::Java) => self
                 .normalized_static_owner
@@ -634,9 +642,55 @@ fn is_unmaterialized_external_identity(
 /// (#1978). This reads a resolved or authored call-target string, not a
 /// `CodeUnit` name accessor, so it does not re-infer declaration structure.
 pub fn split_qualified_member(symbol: &str) -> Option<(&str, &str)> {
-    let without_parameters = symbol.split_once('(').map_or(symbol, |(head, _tail)| head);
+    let without_parameters = callable_symbol_head(symbol);
     let (owner, member) = without_parameters.rsplit_once('.')?;
     (!owner.is_empty() && !member.is_empty()).then_some((owner.trim(), member.trim()))
+}
+
+/// A callee symbol without its optional trailing parameter list. The parameter
+/// types never enter a canonical identity, so every reader of an authored or
+/// resolved symbol cuts them off the same way (#1978).
+fn callable_symbol_head(symbol: &str) -> &str {
+    symbol.split_once('(').map_or(symbol, |(head, _tail)| head)
+}
+
+/// The owner identity of a module-level declaration: the declaring file's
+/// workspace-relative path with its extension removed, rendered slash-canonical
+/// (#2610).
+///
+/// A module-level function in JavaScript, TypeScript, PHP without a namespace,
+/// or Ruby has no owner segment in its fully-qualified name and no package, so
+/// nothing in the name alone can qualify it. Its module is what does: `src/run`
+/// for `src/run.ts`. The rendering reads [`Path`] components rather than the
+/// platform path string, so a Windows workspace and a Unix one publish the same
+/// owner for the same file, and an authored `path` and a workspace declaration
+/// meet on one spelling.
+pub fn module_identity_owner(rel_path: &Path) -> Option<String> {
+    path_suffix_key(&rel_path.with_extension(""))
+}
+
+/// The canonical `(owner, member)` identity one authored procedure target
+/// names.
+///
+/// An authored target carries a `path` beside its `symbol`, and the symbol has
+/// two forms. A qualified symbol (`Acme.run`) names its own owner and the path
+/// is only provenance. A bare symbol (`run`) is a module-level declaration: the
+/// module the `path` names is its owner, so it keys on
+/// [`module_identity_owner`] of that path. Both forms produce the same identity
+/// the declaration side builds in `modeled_procedure_key`, which is what lets a
+/// reviewed summary bind a workspace declaration.
+pub fn authored_procedure_target_identity<'a>(
+    path: &str,
+    symbol: &'a str,
+) -> Option<(Cow<'a, str>, &'a str)> {
+    if let Some((owner, member)) = split_qualified_member(symbol) {
+        return Some((Cow::Borrowed(owner), member));
+    }
+    let member = callable_symbol_head(symbol).trim();
+    if member.is_empty() {
+        return None;
+    }
+    Some((Cow::Owned(module_identity_owner(Path::new(path))?), member))
 }
 
 /// Split a *call-site* callee spelling into the canonical dot-joined
@@ -953,6 +1007,49 @@ mod split_qualified_member_tests {
 }
 
 #[cfg(test)]
+mod authored_procedure_target_identity_tests {
+    use super::authored_procedure_target_identity;
+
+    /// A qualified symbol names its own owner; the authored path is provenance
+    /// and never enters the identity.
+    #[test]
+    fn a_qualified_symbol_keeps_the_owner_it_spells() {
+        let (owner, member) = authored_procedure_target_identity(
+            "com/acme/AcmeHttpClient.java",
+            "com.acme.AcmeHttpClient.send(java.lang.String)",
+        )
+        .expect("qualified identity");
+        assert_eq!(owner, "com.acme.AcmeHttpClient");
+        assert_eq!(member, "send");
+    }
+
+    /// A bare symbol is module-level: the module the path names is its owner
+    /// (#2610).
+    #[test]
+    fn a_bare_symbol_takes_the_module_the_path_names() {
+        let (owner, member) =
+            authored_procedure_target_identity("src/run.ts", "run").expect("module identity");
+        assert_eq!(owner, "src/run");
+        assert_eq!(member, "run");
+    }
+
+    #[test]
+    fn a_bare_symbol_drops_its_parameter_list_the_same_way() {
+        let (owner, member) = authored_procedure_target_identity("src/run.php", "run(int $count)")
+            .expect("module identity");
+        assert_eq!(owner, "src/run");
+        assert_eq!(member, "run");
+    }
+
+    /// Neither half can be empty: an identity nothing names is no identity.
+    #[test]
+    fn refuses_a_target_with_no_symbol_or_no_path() {
+        assert!(authored_procedure_target_identity("src/run.ts", "").is_none());
+        assert!(authored_procedure_target_identity("", "run").is_none());
+    }
+}
+
+#[cfg(test)]
 mod split_canonical_qualified_callee_tests {
     use super::split_canonical_qualified_callee;
     use crate::analyzer::Language;
@@ -996,6 +1093,26 @@ mod split_canonical_qualified_callee_tests {
         assert_eq!(
             split_canonical_qualified_callee("from_utf8(x)", Language::Rust),
             None
+        );
+    }
+
+    /// #2606: C++ writes `::` too, and the cut takes the last separator, so a
+    /// nested class or namespace qualification keeps the whole prefix as the
+    /// owner instead of splitting at the first separator.
+    #[test]
+    fn canonicalizes_a_cpp_qualified_path_on_the_last_separator() {
+        assert_eq!(
+            split_canonical_qualified_callee("std::filesystem::exists", Language::Cpp),
+            Some(("std.filesystem".to_owned(), "exists".to_owned()))
+        );
+        assert_eq!(
+            split_canonical_qualified_callee("ns::Type::method", Language::Cpp),
+            Some(("ns.Type".to_owned(), "method".to_owned()))
+        );
+        // A global-scope root is the same identity.
+        assert_eq!(
+            split_canonical_qualified_callee("::ns::Type::method", Language::Cpp),
+            Some(("ns.Type".to_owned(), "method".to_owned()))
         );
     }
 

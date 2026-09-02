@@ -1,0 +1,41 @@
+{
+  "documentType": "semantic-document",
+  "schema": "https://csmi.brokk.ai/schema/0.1/schema.json",
+  "semanticModelVersion": "0.1",
+  "serializationVersion": "0.1-json",
+  "provenanceRecords": [
+    {
+      "id": "manual",
+      "producer": {
+        "identifier": "https://example.org/process/model",
+        "version": "1"
+      },
+      "generationMethod": "manual-authoring"
+    }
+  ],
+  "defaultProvenance": "manual",
+  "semanticModels": [
+    {
+      "artifactSelectors": [
+        { "purl": "pkg:generic/example@1.0.0" }
+      ],
+      "declarations": [
+        {
+          "symbol": "f",
+          "category": "callable",
+          "callable": {
+            "kind": "function",
+            "parameters": [
+              {
+                "position": 0,
+                "binding": "named-only",
+                "required": true
+              }
+            ],
+            "results": []
+          }
+        }
+      ]
+    }
+  ]
+}

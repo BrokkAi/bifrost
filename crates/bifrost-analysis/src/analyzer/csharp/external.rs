@@ -10,9 +10,9 @@ use crate::analyzer::semantic_model::{
     ExternalArtifactKind, ExternalArtifactPackProducer, HierarchyFact, HierarchyKind, Locator,
     MemberFact, MemberIdentity, MemberKind, NameSelector, Parameter, Producer, ProducerDiagnostic,
     ProducerDiagnosticSeverity, Provenance, ResolvedDependency, ResolvedDependencyArtifact, Safety,
-    SemanticModelActivationEvidence, Signature, TypeFact, TypeIdentity, TypeKind, TypeRef,
-    Visibility, member_declaration_id, normalize_artifact_locator_paths, read_exact_artifact_while,
-    type_declaration_id,
+    SemanticModelActivationEvidence, Signature, SuppressedDiagnostics, TypeFact, TypeIdentity,
+    TypeKind, TypeRef, Visibility, member_declaration_id, normalize_artifact_locator_paths,
+    read_exact_artifact_while, type_declaration_id,
 };
 use crate::analyzer::topology::DependencyScope;
 use crate::analyzer::{CSharpAnalyzerConfig, Project};
@@ -401,6 +401,7 @@ impl CSharpExternalDeclarationIndex {
                         },
                         code: diagnostic.code,
                         location: diagnostic.location,
+                        source_entry: None,
                         declaration: None,
                         message: diagnostic.message,
                     }),
@@ -805,9 +806,11 @@ pub fn resolve_csharp_semantic_pack_dependencies(
         .into_iter()
         .map(resolved_csharp_dependency)
         .collect();
-    let mut suppressed_diagnostics = 0;
+    let mut suppressed_diagnostics = SuppressedDiagnostics::default();
     if dependencies.len() > limits.max_dependencies {
-        suppressed_diagnostics = dependencies.len() - limits.max_dependencies;
+        // Dropped dependencies are not diagnostics; the breach itself is
+        // reported as an error diagnostic below.
+        suppressed_diagnostics.warnings = dependencies.len() - limits.max_dependencies;
         dependencies.truncate(limits.max_dependencies);
         diagnostic_messages.push(format!(
             ".NET dependency discovery exceeded the configured limit {}",
@@ -825,8 +828,10 @@ pub fn resolve_csharp_semantic_pack_dependencies(
         })
         .collect();
     if diagnostics.len() > limits.max_diagnostics {
-        suppressed_diagnostics =
-            suppressed_diagnostics.saturating_add(diagnostics.len() - limits.max_diagnostics);
+        // Every discovery diagnostic here is error severity.
+        suppressed_diagnostics.errors = suppressed_diagnostics
+            .errors
+            .saturating_add(diagnostics.len() - limits.max_diagnostics);
         diagnostics.truncate(limits.max_diagnostics);
     }
     DependencyDiscoveryOutcome {
@@ -835,7 +840,7 @@ pub fn resolve_csharp_semantic_pack_dependencies(
             dependencies_resolved: dependencies.len(),
         },
         dependencies,
-        complete: diagnostics.is_empty() && suppressed_diagnostics == 0,
+        complete: diagnostics.is_empty() && suppressed_diagnostics.total() == 0,
         diagnostics,
         suppressed_diagnostics,
         cancelled: false,
@@ -852,7 +857,7 @@ fn csharp_cancelled_discovery() -> DependencyDiscoveryOutcome {
             location: None,
             message: ".NET dependency discovery was cancelled".to_owned(),
         }],
-        suppressed_diagnostics: 0,
+        suppressed_diagnostics: SuppressedDiagnostics::default(),
         complete: false,
         cancelled: true,
         profile: DependencyDiscoveryProfile::default(),
@@ -887,12 +892,13 @@ impl DependencyPackAdapter for CSharpDependencyPackAdapter {
                 pack: None,
                 diagnostics: vec![ProducerDiagnostic {
                     severity: ProducerDiagnosticSeverity::Error,
+                    source_entry: None,
                     code: "artifact.count".to_owned(),
                     location: None,
                     declaration: None,
                     message: ".NET dependency production requires exactly one assembly".to_owned(),
                 }],
-                suppressed_diagnostics: 0,
+                suppressed_diagnostics: SuppressedDiagnostics::default(),
             };
         };
         let mut request = csharp_dependency_production_request(dependency);
@@ -951,6 +957,7 @@ impl CSharpAssemblyPackProducer {
             return ArtifactProduction::failed(
                 ProducerDiagnostic {
                     severity: ProducerDiagnosticSeverity::Error,
+                    source_entry: None,
                     code: "artifact.kind".to_owned(),
                     location: None,
                     declaration: None,
@@ -983,6 +990,7 @@ impl CSharpAssemblyPackProducer {
             return ArtifactProduction::failed(
                 ProducerDiagnostic {
                     severity: ProducerDiagnosticSeverity::Error,
+                    source_entry: None,
                     code: "artifact.size".to_owned(),
                     location: Some(artifact.path().to_string_lossy().into_owned()),
                     declaration: None,
@@ -1001,6 +1009,7 @@ impl CSharpAssemblyPackProducer {
                 return ArtifactProduction::failed(
                     ProducerDiagnostic {
                         severity: ProducerDiagnosticSeverity::Error,
+                        source_entry: None,
                         code: "artifact.cancelled".to_owned(),
                         location: None,
                         declaration: None,
@@ -1012,6 +1021,7 @@ impl CSharpAssemblyPackProducer {
             return ArtifactProduction::failed(
                 ProducerDiagnostic {
                     severity: ProducerDiagnosticSeverity::Error,
+                    source_entry: None,
                     code: "csharp.metadata.invalid".to_owned(),
                     location: None,
                     declaration: None,
@@ -1029,6 +1039,7 @@ impl CSharpAssemblyPackProducer {
             return ArtifactProduction::failed(
                 ProducerDiagnostic {
                     severity: ProducerDiagnosticSeverity::Error,
+                    source_entry: None,
                     code: "artifact.path_encoding".to_owned(),
                     location: None,
                     declaration: None,
@@ -1129,6 +1140,7 @@ impl CSharpAssemblyPackProducer {
                 type_parameters: ty.type_parameters.clone(),
                 type_parameter_constraints: Vec::new(),
                 underlying_type: None,
+                value_semantics: None,
                 embedded_types: Vec::new(),
                 hierarchy,
                 aliases: Vec::new(),
@@ -1223,6 +1235,7 @@ impl CSharpAssemblyPackProducer {
                     is_static: member.is_static,
                     is_abstract: member.is_abstract,
                     is_virtual: member.is_virtual,
+                    implicit_operation: None,
                     callable_family_complete: false,
                     signature: Some(Signature {
                         type_parameters: member.type_parameters.clone(),
@@ -1233,6 +1246,7 @@ impl CSharpAssemblyPackProducer {
                                 r#type,
                                 optional: false,
                                 variadic: false,
+                                passing_mode: Default::default(),
                             })
                             .collect(),
                         returns,
@@ -1271,7 +1285,7 @@ impl CSharpAssemblyPackProducer {
             selector.artifact_sha256 = Some(artifact.sha256().to_owned());
         }
         let (diagnostics, suppressed_diagnostics) = diagnostics.finish();
-        let completeness = if diagnostics.is_empty() && suppressed_diagnostics == 0 {
+        let completeness = if diagnostics.is_empty() && suppressed_diagnostics.total() == 0 {
             Completeness::Complete
         } else {
             Completeness::Partial

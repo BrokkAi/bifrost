@@ -70,10 +70,11 @@ impl Liveness {
     /// start on a large repository does not hash the clean files it can read
     /// from the index. That scan describes the instant it ran, so it is not an
     /// answer for later calls: every path is stat-checked against the stat it
-    /// was last resolved under, and a path whose file has moved since is
-    /// re-hashed from the working tree. That is what makes an incremental
-    /// re-resolution -- `update_paths`, a watcher delta, `refresh` -- report
-    /// the edited blob rather than the one the scan saw.
+    /// was last resolved under, and an explicitly reported path is invalidated
+    /// before an incremental re-resolution. The explicit invalidation covers
+    /// edits that preserve both size and mtime; either signal makes
+    /// `update_paths`, a watcher delta, or `refresh` report the edited blob
+    /// rather than the one the scan saw.
     pub fn oids_for_files(&self, files: &[ProjectFile]) -> Result<HashMap<ProjectFile, Oid>> {
         Ok(self
             .oids_and_stats_for_files(files)?
@@ -161,6 +162,30 @@ impl Liveness {
             .startup_identity
             .lock()
             .expect("liveness startup identity mutex poisoned") = None;
+    }
+
+    /// Force explicitly changed files off the startup scan's clean-index fast
+    /// path while retaining that scan for every other workspace file.
+    pub fn invalidate_startup_oids_for_files<'a>(
+        &self,
+        files: impl IntoIterator<Item = &'a ProjectFile>,
+    ) -> Result<()> {
+        let rel_paths = files
+            .into_iter()
+            .map(|file| {
+                self.rel_path_from_workdir(file)
+                    .map(|path| path.to_string_lossy().replace('\\', "/"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        if let Some(identity) = self
+            .startup_identity
+            .lock()
+            .expect("liveness startup identity mutex poisoned")
+            .as_ref()
+        {
+            identity.invalidate_paths(rel_paths);
+        }
+        Ok(())
     }
 
     #[cfg(test)]
@@ -561,6 +586,39 @@ impl LivePathMap {
         }
     }
 
+    /// Fork this mutable projection from one immutable analyzer generation.
+    ///
+    /// Query-time source reads may refresh the map owned by an older analyzer.
+    /// A later analyzer generation must not inherit those observations for
+    /// files it did not reconcile, because their indexed state still belongs
+    /// to `snapshot`.
+    pub fn fork_from_snapshot(&self, snapshot: Arc<LiveSnapshot>) -> Self {
+        Self {
+            revalidate_filesystem: self.revalidate_filesystem,
+            state: Mutex::new(LivePathMapState {
+                generation: 0,
+                paths: snapshot.path_to_state.clone(),
+                additional_mounts: snapshot.additional_mounts.clone(),
+                snapshot: Some(MemoizedLivePathMapSnapshot {
+                    generation: 0,
+                    snapshot,
+                }),
+            }),
+        }
+    }
+
+    /// Files owned by this analyzer generation, without revalidating current
+    /// filesystem stats or probing persisted parse products.
+    pub fn files(&self) -> Vec<ProjectFile> {
+        self.state
+            .lock()
+            .expect("live path map mutex poisoned")
+            .paths
+            .keys()
+            .cloned()
+            .collect()
+    }
+
     pub fn refresh(&self, entries: impl IntoIterator<Item = LivePathEntry>) {
         let mut guard = self.state.lock().expect("live path map mutex poisoned");
         let mut changed = false;
@@ -678,6 +736,15 @@ pub struct LiveSnapshot {
     oid_to_paths: HashMap<Oid, Vec<ProjectFile>>,
     path_to_state: HashMap<ProjectFile, PathState>,
     additional_mounts: HashMap<ProjectFile, BTreeSet<String>>,
+    /// The paths this snapshot takes from an unsaved overlay rather than the
+    /// filesystem, derived once when the snapshot is minted.
+    ///
+    /// A query that needs the files whose in-memory state overrides the store
+    /// needs exactly this set, and it is bounded by the open buffers a host
+    /// has handed the analyzer. Deriving it here is what lets those queries
+    /// stop walking every cached file state to find the handful that are
+    /// overlays (#2883).
+    overlay_files: Vec<ProjectFile>,
     /// The #2449 content identity of this exact live file set, derived once.
     ///
     /// A snapshot is immutable and is itself memoized by its owning
@@ -781,6 +848,18 @@ impl LiveSnapshot {
         self.path_to_state
             .get(file)
             .is_some_and(|state| state.is_overlay)
+    }
+
+    /// Every path [`Self::is_overlay_path`] answers `true` for, in path order.
+    pub(crate) fn overlay_files(&self) -> &[ProjectFile] {
+        &self.overlay_files
+    }
+
+    /// Whether any path in this frozen generation comes from an unsaved
+    /// overlay. Relational reads consult this on every lookup to decide
+    /// whether overlay-authoritative file states can exist at all.
+    pub(crate) fn has_overlay_paths(&self) -> bool {
+        !self.overlay_files.is_empty()
     }
 
     pub fn validated_oid_for_path(&self, file: &ProjectFile) -> Option<Oid> {
@@ -913,11 +992,23 @@ fn build_snapshot(
     oid_to_paths.retain(|_, paths| !paths.is_empty());
     Ok(LiveSnapshot {
         oid_to_paths,
+        overlay_files: overlay_files_of(&path_to_state),
         path_to_state,
         additional_mounts: HashMap::default(),
         content_digest: OnceLock::new(),
         overlaid_content_digest: Mutex::new(None),
     })
+}
+
+/// The overlay-sourced paths in one path map, in path order.
+fn overlay_files_of(path_to_state: &HashMap<ProjectFile, PathState>) -> Vec<ProjectFile> {
+    let mut files = path_to_state
+        .iter()
+        .filter(|(_, state)| state.is_overlay)
+        .map(|(file, _)| file.clone())
+        .collect::<Vec<_>>();
+    files.sort();
+    files
 }
 
 fn snapshot_from_path_states(
@@ -945,6 +1036,7 @@ fn snapshot_from_path_states(
     }
     LiveSnapshot {
         oid_to_paths,
+        overlay_files: overlay_files_of(&live_states),
         path_to_state: live_states,
         additional_mounts: additional_mounts
             .iter()

@@ -22,10 +22,20 @@ use sha2::{Digest, Sha256};
 
 use brokk_bifrost_analysis::CancellationToken;
 use brokk_bifrost_analysis::analyzer::Range as AnalyzerRange;
-use brokk_bifrost_analysis::analyzer::semantic::WorkspaceRelativePath;
+use brokk_bifrost_analysis::analyzer::common::language_for_file;
+use brokk_bifrost_analysis::analyzer::invalidation::{
+    ArtifactVerdict, BudgetMode, DerivedArtifactId, DerivedArtifactKind, InvalidationReason,
+    RetentionReason,
+};
+use brokk_bifrost_analysis::analyzer::read_ledger::ReadLedger;
+use brokk_bifrost_analysis::analyzer::semantic::{SemanticWork, WorkspaceRelativePath};
 use brokk_bifrost_analysis::analyzer::semantic_model::ActiveSemanticModelSnapshot;
-use brokk_bifrost_analysis::analyzer::usages::{UsageHitSurface, UsageProof};
-use brokk_bifrost_analysis::analyzer::{CodeUnit, IAnalyzer, ProjectFile, WorkspaceAnalyzer};
+use brokk_bifrost_analysis::analyzer::usages::{CallRelationLimits, UsageHitSurface, UsageProof};
+use brokk_bifrost_analysis::analyzer::{
+    AnalyzerQueryScope, CodeUnit, HeadInputs, IAnalyzer, LookupMemo, LookupReplayLimits,
+    ProjectFile, ReadVerdict, WorkspaceAnalyzer, verify_read_set,
+};
+use brokk_bifrost_analysis::path_utils::rel_path_string;
 use brokk_bifrost_flow::flow_state::{
     FileFlowState, FlowRelation, FlowStateAxis, FlowStateDerivation, FlowStateRequest, FlowSubject,
     StateEventClass, StateEventRow, flow_state_for_file,
@@ -50,12 +60,14 @@ use brokk_bifrost_rql::structural::search::{
     CodeQueryOccurrence, CodeQueryOccurrenceTarget, CodeQueryResolutionCandidate,
 };
 use brokk_bifrost_rql::structural::search::{
-    CodeQueryStableOwnerDerivation, DetailedCodeQueryDomain, DetailedCodeQueryEvidence,
-    DetailedCodeQueryIdentityCandidate, DetailedCodeQueryKey, DetailedCodeQueryProvenanceEvidence,
-    DetailedCodeQueryProvenanceIdentities, DetailedCodeQueryProvenanceRefEvidence,
-    execute_code_query_detailed_eager_index,
+    CodeQueryExecutionScope, CodeQueryStableOwnerDerivation, DetailedCodeQueryDomain,
+    DetailedCodeQueryEvidence, DetailedCodeQueryKey, UnitExecutionResult, UnitRowEvidence,
+    UnitRowIdentities, UnitRowIdentityCandidate, UnitRowItem, UnitRowItemProvenance,
+    UnitRowItemRef, UnitRowItemRefValue, UnitRowItemTerminal, UnitRowItemValue, UnitRowProvenance,
+    UnitRowProvenanceRef, execute_code_query_detailed_eager_index,
     execute_code_query_detailed_eager_index_without_targets,
-    execute_code_query_detailed_eager_index_workspace,
+    execute_code_query_detailed_eager_index_workspace, execute_code_query_unit, merge_unit_rows,
+    plan_seed_files,
 };
 use brokk_bifrost_rql::structural::{BoundaryStatus, PrecedenceTier};
 use brokk_bifrost_rql::structural::{
@@ -65,9 +77,8 @@ use brokk_bifrost_rql::structural::{
 };
 use brokk_bifrost_rql::structural::{
     CodeQuery, CodeQueryCompletion, CodeQueryDiagnostic, CodeQueryDiagnosticCode,
-    CodeQueryDiagnosticImpact, CodeQueryExecutionWork, CodeQueryProvenance, CodeQueryRange,
-    CodeQueryResultDetail, CodeQueryResultItem, CodeQueryResultRef, CodeQueryResultValue,
-    QueryValueKind,
+    CodeQueryDiagnosticImpact, CodeQueryExecutionLimits, CodeQueryExecutionWork, CodeQueryRange,
+    CodeQueryResultDetail, CodeQueryResultItem, CodeQueryResultValue, QueryValueKind,
 };
 use brokk_bifrost_rql::structural::{
     NormalizedKind, OccurrenceRow as InternalOccurrenceRow,
@@ -75,8 +86,8 @@ use brokk_bifrost_rql::structural::{
 };
 use brokk_bifrost_rql::{
     ArityConstraint, BindingOfOptions, CandidateFilter, CodeQueryPlan, CodeQueryPlanSource,
-    CodeQuerySeed, GenerationSiteSeed, OccurrenceSeed, Pattern, QueryStep, SCHEMA_VERSION,
-    ScopeSeed, exact_path_globs,
+    CodeQuerySeed, GenerationSiteSeed, OccurrenceSeed, Pattern, PlanPartitioning, QueryStep,
+    SCHEMA_VERSION, ScopeSeed, exact_path_globs,
 };
 use std::sync::Arc;
 
@@ -105,9 +116,10 @@ use super::finding::{
     PolicyDiagnosticImpact, PolicyDiagnosticSeverity, PolicyDisplayRegion, PolicyFailureReason,
     PolicyFinding, PolicyFindingEvidence, PolicyIncompleteReason, PolicyLocationRelationship,
     PolicyQueryProof, PolicyQueryProvenance, PolicyQueryProvenanceStep, PolicyQueryResultRef,
-    PolicyRun, PolicyRunCompletion, PolicyRunError, PolicySourceLocation, PolicyWorkReport,
-    ProofMetadata, ProofReason, ProofState, RelatedPolicyLocation, ReportValueError,
-    insert_policy_diagnostic_bounded, normalize_policy_diagnostics_bounded,
+    PolicyRun, PolicyRunCompletion, PolicyRunError, PolicySourceLocation, PolicyWorkMetric,
+    PolicyWorkReport, PolicyWorkUnit, ProofMetadata, ProofReason, ProofState,
+    RelatedPolicyLocation, ReportValueError, insert_policy_diagnostic_bounded,
+    normalize_policy_diagnostics_bounded,
 };
 use super::finding_identity::{
     EvidenceRef, FindingIdentityStability, MatchFindingAnchor, MatchResultDomain, OpaqueFindingKey,
@@ -124,6 +136,10 @@ use super::projection::{
 };
 use super::resolved::{LoadedPolicy, ResolvedTaintPolicySpec, ResolvedTypestatePolicySpec};
 use super::retained::RetainedSize;
+use super::units::{
+    IncrementalMode, PolicyIncrementalContext, PolicyIncrementalRun, PolicyUnit, PolicyUnitKey,
+    PolicyUnitProduct, UnitPartition, WidenReason,
+};
 
 const MATCH_SELECTOR_PATH: &str = "/analysis/selector";
 const WEAK_KEY_DOMAIN: &[u8] = b"bifrost-policy-match-weak-key/v1";
@@ -140,6 +156,13 @@ pub struct PolicyEvaluationContext<'a> {
     pub cancellation: Option<&'a CancellationToken>,
     pub cvss_overlays: &'a [CvssEvaluationOverlay],
     pub organizational_risk: &'a [OrganizationalRiskOverlay],
+    /// The units this evaluation may reuse, and the workspace to verify them
+    /// against.
+    ///
+    /// `None` is the ordinary case and is exactly today's evaluation: no
+    /// store to look a unit up in, so nothing to reuse and nothing to publish.
+    /// A `--diff-base` run with `incremental` on supplies one on both sides.
+    pub incremental: Option<&'a PolicyIncrementalContext<'a>>,
 }
 
 #[derive(Debug, Clone)]
@@ -490,6 +513,16 @@ impl PolicyEvaluator for DefaultPolicyEvaluator<'_> {
         budget: &mut PolicyBudget,
     ) -> Result<PolicyRun, PolicyRunError> {
         let host_budget = *budget;
+        // Every family accounts for itself. Only the match family is sliced in
+        // this milestone, so the others state that they were evaluated whole
+        // rather than being absent from the review.
+        if let Some(incremental) = context.incremental
+            && !matches!(policy.definition().analysis, PolicyAnalysis::Match { .. })
+        {
+            incremental.record_run(PolicyIncrementalRun::whole_family(
+                policy.definition().metadata.id.clone(),
+            ));
+        }
         match &policy.definition().analysis {
             PolicyAnalysis::Match { .. } => evaluate_match_policy(policy, context, &host_budget),
             PolicyAnalysis::Assertion { spec } => evaluate_assertion_policy(
@@ -641,15 +674,61 @@ fn evaluate_match_policy(
     context: &PolicyEvaluationContext<'_>,
     budget: &PolicyBudget,
 ) -> Result<PolicyRun, PolicyRunError> {
-    let evaluated =
-        evaluate_match_policy_candidates(policy, context.analyzer, budget, context.cancellation);
-    assemble_match_run(policy, evaluated, context, budget)
+    // An evaluation that holds an incremental context has units to reuse and a
+    // workspace to verify them against; one that does not executes exactly as
+    // it always has. The two paths meet again at `assemble_match_run`, over
+    // the same rendered rows.
+    let evaluated = match context.incremental {
+        Some(incremental) => evaluate_match_policy_by_unit(policy, incremental, context, budget),
+        None => {
+            evaluate_match_policy_candidates(policy, context.analyzer, budget, context.cancellation)
+        }
+    };
+    assemble_match_run(
+        policy,
+        evaluated,
+        context.cvss_overlays,
+        context.organizational_risk,
+        budget,
+    )
+}
+
+/// Rebuild one match policy's run from the units it was merged from, with no
+/// analyzer and no execution.
+///
+/// This is the base half of a run that reused a persisted evaluation: the
+/// units are the base's own products, the merge is the one the base performed
+/// (its order is what the units arrive in), and everything after it -- ordinal
+/// assignment, identity, retention -- is the same code the base ran, over the
+/// same vector, under the budget the base was scaled to. Nothing here consults
+/// a workspace, which is what makes skipping the base build possible at all.
+pub(crate) fn match_run_from_units(
+    policy: &LoadedPolicy,
+    products: Vec<UnitExecutionResult>,
+    budget: &PolicyBudget,
+) -> Result<PolicyRun, PolicyRunError> {
+    let merged = merge_unit_rows(products);
+    let completion = merged.completion();
+    let evaluated = adapt_match_execution(
+        &policy.definition().metadata.id,
+        merged.items,
+        merged.evidence,
+        &merged.diagnostics,
+        completion,
+        merged.truncated,
+        merged.work,
+        budget,
+    );
+    // A base evaluation carries neither overlay: the base run is the head's
+    // stripped options, and both overlays are host inputs the base never had.
+    assemble_match_run(policy, evaluated, &[], &[], budget)
 }
 
 fn assemble_match_run(
     policy: &LoadedPolicy,
     mut evaluated: EvaluatedMatchPolicy,
-    context: &PolicyEvaluationContext<'_>,
+    cvss_overlays: &[CvssEvaluationOverlay],
+    organizational_risk: &[OrganizationalRiskOverlay],
     budget: &PolicyBudget,
 ) -> Result<PolicyRun, PolicyRunError> {
     let metadata = &policy.definition().metadata;
@@ -686,7 +765,7 @@ fn assemble_match_run(
         retained_evidence_refs.sort();
         retained_evidence_refs.dedup();
         let organizational_risk = match reduce_organizational_risk(
-            context.organizational_risk,
+            organizational_risk,
             &metadata.id,
             &expected_id,
             &[],
@@ -756,7 +835,7 @@ fn assemble_match_run(
             CvssFindingProjection::Match {
                 anchor: candidate.evidence.anchor(),
             },
-            context.cvss_overlays,
+            cvss_overlays,
             &retained_evidence_refs,
             &[],
             cvss_retained_bytes,
@@ -860,7 +939,13 @@ fn assemble_match_run(
         budget,
     )
 }
-fn finding_severity(
+/// The report severity a finding of this policy carries.
+///
+/// `cvss` is the finding's own assessment set. Passing `None` therefore asks
+/// the same question about the policy itself: the severity a finding would
+/// carry before any CVSS evidence exists, which is what a run-level gate such
+/// as `(on-unknown :verdict fail-closed)` has to compare against.
+pub(crate) fn finding_severity(
     spec: &PolicySeveritySpec,
     cvss: Option<&super::cvss::CvssAssessmentSet>,
 ) -> FindingSeverity {
@@ -2225,6 +2310,413 @@ pub(crate) struct EvaluatedMatchPolicy {
     pub(crate) work: PolicyWorkReport,
 }
 
+/// What one policy's sliced attempt did, whether or not it widened.
+#[derive(Debug, Default)]
+struct MatchUnitAttempt {
+    total: u64,
+    reused: u64,
+    recomputed: u64,
+    unbounded: u64,
+}
+
+impl MatchUnitAttempt {
+    fn into_run(
+        self,
+        policy_id: PolicyId,
+        widen_reason: Option<WidenReason>,
+    ) -> PolicyIncrementalRun {
+        PolicyIncrementalRun {
+            policy_id,
+            mode: match widen_reason {
+                None => IncrementalMode::Sliced,
+                Some(_) => IncrementalMode::Full,
+            },
+            units_total: self.total,
+            units_reused: self.reused,
+            units_recomputed: self.recomputed,
+            units_unbounded: self.unbounded,
+            widen_reason,
+        }
+    }
+}
+
+/// Evaluate one match policy unit by unit, or in full with a stated reason.
+///
+/// Widening is never silent and never a diagnostic: the policy is evaluated
+/// exactly as a run without any units would evaluate it, and the reason is
+/// reported beside the report rather than inside it.
+fn evaluate_match_policy_by_unit(
+    policy: &LoadedPolicy,
+    incremental: &PolicyIncrementalContext<'_>,
+    context: &PolicyEvaluationContext<'_>,
+    budget: &PolicyBudget,
+) -> EvaluatedMatchPolicy {
+    let mut attempt = MatchUnitAttempt::default();
+    let policy_id = policy.definition().metadata.id.clone();
+    let (evaluated, reason) =
+        match sliced_match_candidates(policy, incremental, context, budget, &mut attempt) {
+            Ok(evaluated) => (evaluated, None),
+            Err(reason) => (
+                widened_match_candidates(policy, incremental, context, budget),
+                Some(reason),
+            ),
+        };
+    let run = attempt.into_run(policy_id, reason);
+    note_incremental_run(&run, incremental);
+    incremental.record_run(run);
+    evaluated
+}
+
+/// Report one policy's reuse under `BIFROST_TIMING`.
+///
+/// The counts are in the review either way; what only this reports is the
+/// verdict log's running totals, which are how many reuse decisions this
+/// evaluation has earned against how many rebuilds it has forced. Costs one
+/// relaxed load when timing is off.
+fn note_incremental_run(run: &PolicyIncrementalRun, incremental: &PolicyIncrementalContext<'_>) {
+    brokk_bifrost_analysis::profiling::note_with(|| {
+        let (retained, invalidated) = incremental.verdicts().totals();
+        format!(
+            "policy.units policy={} mode={} total={} reused={} recomputed={} unbounded={} widened={} verdicts_retained={retained} verdicts_invalidated={invalidated}",
+            run.policy_id,
+            run.mode.stable_label(),
+            run.units_total,
+            run.units_reused,
+            run.units_recomputed,
+            run.units_unbounded,
+            run.widen_reason.map_or("none", WidenReason::stable_label),
+        )
+    });
+}
+
+/// Evaluate one match policy as the merge of one execution per seed file.
+///
+/// `Err` is the demand to evaluate the whole policy instead, with the reason
+/// that demand exists. `Ok` is a product that equals the whole execution's:
+/// every unit was exhaustive, diagnostic-free and fully attributed, and the
+/// merged counters proved that no cumulative cap the whole execution enforces
+/// was reached.
+fn sliced_match_candidates(
+    policy: &LoadedPolicy,
+    incremental: &PolicyIncrementalContext<'_>,
+    context: &PolicyEvaluationContext<'_>,
+    budget: &PolicyBudget,
+    attempt: &mut MatchUnitAttempt,
+) -> Result<EvaluatedMatchPolicy, WidenReason> {
+    let query = match match_policy_query(policy) {
+        Ok(query) => query,
+        Err(refusal) => return Ok(refusal.into_run(budget)),
+    };
+    let executable = match executable_match_query(query, budget) {
+        Ok(executable) => executable,
+        Err(refusal) => return Ok(refusal.into_run(budget)),
+    };
+    if !PlanPartitioning::classify(&executable.plan).is_by_seed() {
+        return Err(WidenReason::PlanCrossesSeeds);
+    }
+    // A changed-fact set that could not be completed is smaller than the
+    // truth, and a smaller set would let a changed input pass verification.
+    if !incremental.changed().is_complete() {
+        return Err(WidenReason::ReverseDependencyEvidenceMissing);
+    }
+
+    let limits = budget.query_limits();
+    // Computed once per policy: every unit hands the same whole-workspace
+    // enumeration to the scanners that still need it, which is what keeps
+    // unit-wise execution linear in the file count.
+    let workspace_files = context.analyzer.analyzed_files();
+    let seed_files = plan_seed_files(&executable.plan, &workspace_files);
+    attempt.total = u64::try_from(seed_files.len()).unwrap_or(u64::MAX);
+    let inputs = incremental.inputs();
+    let head_inputs = inputs.head_inputs(policy);
+    let replay_limits = lookup_replay_limits(&limits);
+    let mut memo = LookupMemo::new();
+    let mut products = Vec::with_capacity(seed_files.len());
+
+    let mut keys = Vec::with_capacity(seed_files.len());
+    for file in &seed_files {
+        let language = language_for_file(file);
+        let rel_path = rel_path_string(file);
+        let Some(blob) = incremental.changed().head_blob(language, &rel_path) else {
+            // Without the blob this path resolves to there is no content
+            // identity to key the unit by, which is missing evidence rather
+            // than evidence of sameness.
+            return Err(WidenReason::ReverseDependencyEvidenceMissing);
+        };
+        keys.push(inputs.unit_key(
+            policy,
+            UnitPartition::Seed {
+                language,
+                rel_path: Box::from(rel_path.as_str()),
+                blob,
+            },
+        ));
+    }
+    // Every key this policy will ask about, in one batch, before the first
+    // lookup: a persisted store answers one query instead of one per seed
+    // file. A store that cannot answer has said nothing about what was
+    // published, so the policy widens instead of reading its silence as
+    // absence.
+    if let Err(error) = incremental.store().borrow_mut().prefetch(&keys) {
+        brokk_bifrost_analysis::profiling::note_with(|| {
+            format!(
+                "policy.units policy={} store_error={error}",
+                policy.definition().metadata.id
+            )
+        });
+        return Err(WidenReason::ProductLoadFailed);
+    }
+
+    for (file, key) in seed_files.iter().zip(keys.iter()) {
+        let reused = reuse_published_unit(
+            incremental,
+            key,
+            &head_inputs,
+            replay_limits,
+            &limits,
+            &mut memo,
+        )?;
+        let (product, reads) = match reused {
+            Some(product) => {
+                attempt.reused = attempt.reused.saturating_add(1);
+                (product, None)
+            }
+            None => {
+                attempt.recomputed = attempt.recomputed.saturating_add(1);
+                let ledger = Arc::new(ReadLedger::new());
+                let product = {
+                    let _reads =
+                        AnalyzerQueryScope::with_read_ledger(context.analyzer, Arc::clone(&ledger));
+                    execute_code_query_unit(
+                        context.analyzer,
+                        &executable,
+                        limits,
+                        context.cancellation,
+                        CodeQueryExecutionScope::for_seed_files(
+                            std::slice::from_ref(file),
+                            &workspace_files,
+                        ),
+                    )
+                };
+                if !ledger.is_bounded() {
+                    attempt.unbounded = attempt.unbounded.saturating_add(1);
+                    return Err(WidenReason::UnitUnbounded);
+                }
+                (product, Some(ledger.keys()))
+            }
+        };
+        // Exhaustiveness is checked on the product rather than on how it was
+        // obtained: a unit that truncated or raised a diagnostic is not a
+        // partition of a whole execution, whichever run computed it.
+        if product.truncated {
+            return Err(WidenReason::UnitNotExhaustive);
+        }
+        if !product.diagnostics.is_empty() {
+            return Err(WidenReason::UnitDiagnostics);
+        }
+        if let Some(reads) = reads {
+            incremental.store().borrow_mut().publish(PolicyUnit::new(
+                key.clone(),
+                PolicyUnitProduct::Rows(product.clone()),
+                reads,
+                BudgetMode::Exhaustive,
+            ));
+        }
+        products.push(product);
+    }
+
+    let merged = merge_unit_rows(products);
+    if merged.reached_limit(&limits, executable.limit).is_some() {
+        return Err(WidenReason::MergedLimitReached);
+    }
+    // Every unit of this policy is published and merged, so this list is what
+    // another run replays to reproduce the product without executing anything.
+    incremental.record_units(policy.definition().metadata.id.clone(), keys);
+    let completion = merged.completion();
+    Ok(adapt_match_execution(
+        &policy.definition().metadata.id,
+        merged.items,
+        merged.evidence,
+        &merged.diagnostics,
+        completion,
+        merged.truncated,
+        merged.work,
+        budget,
+    ))
+}
+
+/// Reuse one published unit's product, if the head still reads what it read.
+///
+/// `Ok(None)` means the unit must be recomputed: either nothing was published
+/// under its key, or a recorded read moved. `Err` means the whole policy must
+/// be evaluated, because a verification that cannot be completed is not a
+/// verification that failed.
+fn reuse_published_unit(
+    incremental: &PolicyIncrementalContext<'_>,
+    key: &PolicyUnitKey,
+    head_inputs: &HeadInputs,
+    replay_limits: LookupReplayLimits,
+    limits: &CodeQueryExecutionLimits,
+    memo: &mut LookupMemo,
+) -> Result<Option<UnitExecutionResult>, WidenReason> {
+    let store = incremental.store().borrow();
+    let Some(unit) = store.lookup(key) else {
+        return Ok(None);
+    };
+    if unit.budget_mode() != BudgetMode::Exhaustive {
+        return Err(WidenReason::UnitNotExhaustive);
+    }
+    // A whole evaluation of this policy may open `max_scanned_files` files,
+    // and every replayed lookup opens at least one, so a verification pass
+    // that needs more distinct answers than that has stopped being cheaper
+    // than the evaluation it is avoiding.
+    if memo.len() >= limits.max_scanned_files {
+        return Err(WidenReason::VerificationBudgetExceeded);
+    }
+    let artifact = DerivedArtifactId::new(
+        DerivedArtifactKind::PolicyEvaluationUnit,
+        unit.read_digest().digest(),
+    );
+    match verify_read_set(
+        incremental.workspace(),
+        incremental.changed(),
+        head_inputs,
+        unit.reads(),
+        replay_limits,
+        memo,
+    ) {
+        ReadVerdict::Unchanged => {
+            incremental.verdicts().record(ArtifactVerdict::Retained(
+                RetentionReason::InputsUnchanged { artifact },
+            ));
+            Ok(Some(unit.product().rows().clone()))
+        }
+        ReadVerdict::Changed(changed) => {
+            let missing = matches!(
+                changed.reason,
+                InvalidationReason::ReverseDependencyEvidenceMissing { .. }
+                    | InvalidationReason::ContentIdentityEvidenceMissing { .. }
+            );
+            incremental
+                .verdicts()
+                .record(ArtifactVerdict::Invalidated(changed.reason));
+            if missing {
+                return Err(WidenReason::ReverseDependencyEvidenceMissing);
+            }
+            Ok(None)
+        }
+    }
+}
+
+/// Evaluate one match policy in full and publish it as a single whole unit.
+///
+/// The execution is the whole-workspace one -- the same entry point a unit
+/// takes, with the seed enumeration not narrowed, which is what every
+/// non-incremental run already does -- held open under a ledger so the
+/// published unit names the inputs it actually read. A run that truncated,
+/// raised a diagnostic, or performed a read the ledger could not name
+/// publishes nothing: there would be no honest read set to verify it by.
+fn widened_match_candidates(
+    policy: &LoadedPolicy,
+    incremental: &PolicyIncrementalContext<'_>,
+    context: &PolicyEvaluationContext<'_>,
+    budget: &PolicyBudget,
+) -> EvaluatedMatchPolicy {
+    let query = match match_policy_query(policy) {
+        Ok(query) => query,
+        Err(refusal) => return refusal.into_run(budget),
+    };
+    let executable = match executable_match_query(query, budget) {
+        Ok(executable) => executable,
+        Err(refusal) => return refusal.into_run(budget),
+    };
+    let ledger = Arc::new(ReadLedger::new());
+    let product = {
+        let _reads = AnalyzerQueryScope::with_read_ledger(context.analyzer, Arc::clone(&ledger));
+        execute_code_query_unit(
+            context.analyzer,
+            &executable,
+            budget.query_limits(),
+            context.cancellation,
+            CodeQueryExecutionScope::whole_workspace(),
+        )
+    };
+    if ledger.is_bounded() && !product.truncated && product.diagnostics.is_empty() {
+        let key = incremental.inputs().unit_key(policy, UnitPartition::Whole);
+        incremental.store().borrow_mut().publish(PolicyUnit::new(
+            key.clone(),
+            PolicyUnitProduct::Rows(product.clone()),
+            ledger.keys(),
+            BudgetMode::Exhaustive,
+        ));
+        incremental.record_units(policy.definition().metadata.id.clone(), vec![key]);
+    }
+    let mut items = Vec::with_capacity(product.rows.len());
+    let mut evidence = Vec::with_capacity(product.rows.len());
+    for row in product.rows {
+        items.push(row.item);
+        evidence.push(row.evidence);
+    }
+    adapt_match_execution(
+        &policy.definition().metadata.id,
+        items,
+        evidence,
+        &product.diagnostics,
+        product.completion,
+        product.truncated,
+        product.work,
+        budget,
+    )
+}
+
+/// The limits a replayed lookup re-runs its funnel under.
+///
+/// The policy's own full lanes, not whatever a unit had left when it recorded
+/// the answer: a complete answer replays identically under limits at least as
+/// wide as the ones that produced it, and a narrower replay would report a
+/// budget artifact as a change.
+fn lookup_replay_limits(limits: &CodeQueryExecutionLimits) -> LookupReplayLimits {
+    LookupReplayLimits {
+        call_relations: CallRelationLimits {
+            max_files: limits.max_scanned_files,
+            max_source_bytes: limits.max_scanned_source_bytes,
+            max_candidates: limits.max_pipeline_rows,
+        },
+        max_usage_files: limits.max_scanned_files,
+        max_usages: limits.max_pipeline_rows,
+        semantic: SemanticWork::default_limits(),
+    }
+}
+
+/// The authored query of a match policy, or the failure that stops it.
+fn match_policy_query(
+    policy: &LoadedPolicy,
+) -> Result<&brokk_bifrost_rql::structural::CodeQuery, MatchPolicyRefusal> {
+    if !matches!(policy.definition().analysis, PolicyAnalysis::Match { .. }) {
+        return Err(MatchPolicyRefusal {
+            reason: PolicyFailureReason::InvalidExecutionPlan,
+            message: "match evaluation requires a match policy",
+        });
+    }
+    let Some(selector) = policy
+        .resolved_selectors()
+        .iter()
+        .find(|selector| selector.path.as_str() == MATCH_SELECTOR_PATH)
+    else {
+        return Err(MatchPolicyRefusal {
+            reason: PolicyFailureReason::InternalInvariant,
+            message: "resolved match policy is missing /analysis/selector",
+        });
+    };
+    let Some((_, query)) = selector.as_query() else {
+        return Err(MatchPolicyRefusal {
+            reason: PolicyFailureReason::InvalidExecutionPlan,
+            message: "match policies require a query selector; row selectors are endpoint-only",
+        });
+    };
+    Ok(query)
+}
+
 /// Evaluate the match selector stored in a fully resolved policy.
 pub(crate) fn evaluate_match_policy_candidates(
     policy: &LoadedPolicy,
@@ -2232,30 +2724,9 @@ pub(crate) fn evaluate_match_policy_candidates(
     budget: &PolicyBudget,
     cancellation: Option<&CancellationToken>,
 ) -> EvaluatedMatchPolicy {
-    if !matches!(policy.definition().analysis, PolicyAnalysis::Match { .. }) {
-        return failed_before_execution(
-            PolicyFailureReason::InvalidExecutionPlan,
-            "match evaluation requires a match policy",
-            budget,
-        );
-    }
-    let Some(selector) = policy
-        .resolved_selectors()
-        .iter()
-        .find(|selector| selector.path.as_str() == MATCH_SELECTOR_PATH)
-    else {
-        return failed_before_execution(
-            PolicyFailureReason::InternalInvariant,
-            "resolved match policy is missing /analysis/selector",
-            budget,
-        );
-    };
-    let Some((_, query)) = selector.as_query() else {
-        return failed_before_execution(
-            PolicyFailureReason::InvalidExecutionPlan,
-            "match policies require a query selector; row selectors are endpoint-only",
-            budget,
-        );
+    let query = match match_policy_query(policy) {
+        Ok(query) => query,
+        Err(refusal) => return refusal.into_run(budget),
     };
     evaluate_match_query_candidates(
         &policy.definition().metadata.id,
@@ -2266,16 +2737,38 @@ pub(crate) fn evaluate_match_policy_candidates(
     )
 }
 
-fn evaluate_match_query_candidates(
-    policy_id: &PolicyId,
-    analyzer: &dyn IAnalyzer,
+/// Why a match policy stopped before it executed anything.
+///
+/// Carried instead of the built `EvaluatedMatchPolicy` because the refusal is
+/// two words and the run it becomes is two hundred bytes; the caller mints the
+/// run at the one place it returns.
+#[derive(Debug, Clone, Copy)]
+struct MatchPolicyRefusal {
+    reason: PolicyFailureReason,
+    message: &'static str,
+}
+
+impl MatchPolicyRefusal {
+    /// The failed run this refusal states.
+    fn into_run(self, budget: &PolicyBudget) -> EvaluatedMatchPolicy {
+        failed_before_execution(self.reason, self.message, budget)
+    }
+}
+
+/// The exact query a match policy executes, or the failure that stops it.
+///
+/// Every path a match policy takes -- one whole execution, or one execution
+/// per seed file -- runs this query and no other, so a sliced run and a whole
+/// run cannot differ by their result detail, their row limit, or which plans
+/// they refuse.
+fn executable_match_query(
     query: &brokk_bifrost_rql::structural::CodeQuery,
     budget: &PolicyBudget,
-    cancellation: Option<&CancellationToken>,
-) -> EvaluatedMatchPolicy {
+) -> Result<brokk_bifrost_rql::structural::CodeQuery, MatchPolicyRefusal> {
     match query.validate_steps() {
         Ok(
             QueryValueKind::ReceiverAnalysis
+            | QueryValueKind::MemberTargetAnalysis
             | QueryValueKind::ReceiverOutcome
             | QueryValueKind::ReceiverEvidence
             | QueryValueKind::CallShape
@@ -2287,6 +2780,10 @@ fn evaluate_match_query_candidates(
             | QueryValueKind::CallResultContract
             | QueryValueKind::ResultContractUse
             | QueryValueKind::ResultContractFailureUse
+            | QueryValueKind::NilnessOperation
+            | QueryValueKind::SwitchCoverage
+            | QueryValueKind::ConcurrentAccessConflict
+            | QueryValueKind::DetachedTaskTransfer
             | QueryValueKind::ProcedureEffect
             | QueryValueKind::CallableSignature
             | QueryValueKind::SignatureParameter
@@ -2316,11 +2813,10 @@ fn evaluate_match_query_candidates(
             | QueryValueKind::FlowWitness
             | QueryValueKind::TaintFinding,
         ) => {
-            return failed_before_execution(
-                PolicyFailureReason::InvalidExecutionPlan,
-                "analysis-only query values are not positive match-policy terminal domains",
-                budget,
-            );
+            return Err(MatchPolicyRefusal {
+                reason: PolicyFailureReason::InvalidExecutionPlan,
+                message: "analysis-only query values are not positive match-policy terminal domains",
+            });
         }
         Ok(
             QueryValueKind::StructuralMatch
@@ -2329,6 +2825,7 @@ fn evaluate_match_query_candidates(
             | QueryValueKind::CallSite
             | QueryValueKind::ExpressionSite
             | QueryValueKind::JsxAttributeValue
+            | QueryValueKind::FieldWriteValue
             | QueryValueKind::Occurrence
             // A binding and a resolution candidate are both exact facts about
             // one source position, so a match policy listing suspicious
@@ -2356,11 +2853,10 @@ fn evaluate_match_query_candidates(
             | QueryValueKind::File,
         ) => {}
         Err(_) => {
-            return failed_before_execution(
-                PolicyFailureReason::InvalidExecutionPlan,
-                "match policy contains an invalid query plan",
-                budget,
-            );
+            return Err(MatchPolicyRefusal {
+                reason: PolicyFailureReason::InvalidExecutionPlan,
+                message: "match policy contains an invalid query plan",
+            });
         }
     }
 
@@ -2370,6 +2866,21 @@ fn evaluate_match_query_candidates(
     let mut executable = query.clone();
     executable.result_detail = CodeQueryResultDetail::Full;
     executable.limit = budget.max_findings();
+    Ok(executable)
+}
+
+/// Execute one match policy's query over the whole workspace and adapt it.
+fn evaluate_match_query_candidates(
+    policy_id: &PolicyId,
+    analyzer: &dyn IAnalyzer,
+    query: &brokk_bifrost_rql::structural::CodeQuery,
+    budget: &PolicyBudget,
+    cancellation: Option<&CancellationToken>,
+) -> EvaluatedMatchPolicy {
+    let executable = match executable_match_query(query, budget) {
+        Ok(executable) => executable,
+        Err(refusal) => return refusal.into_run(budget),
+    };
     // Policy batches run many selectors against one immutable snapshot, so
     // index reuse is guaranteed: build the snapshot index on first use
     // instead of letting Auto's first-request deferral scan the workspace
@@ -2380,19 +2891,55 @@ fn evaluate_match_query_candidates(
         budget.query_limits(),
         cancellation,
     );
+    adapt_match_execution(
+        policy_id,
+        // One adapter serves the whole run and the unit path: the whole run's
+        // rendered rows are projected into exactly the product a unit
+        // publishes before adaptation, so no finding can differ by which path
+        // produced it.
+        detailed
+            .result
+            .results
+            .iter()
+            .map(UnitRowItem::project)
+            .collect(),
+        detailed
+            .evidence
+            .iter()
+            .map(UnitRowEvidence::project)
+            .collect(),
+        &detailed.result.diagnostics,
+        detailed.result.completion(),
+        detailed.result.truncated,
+        detailed.work,
+        budget,
+    )
+}
 
-    let query_completion = detailed.result.completion();
-    let query_truncated = detailed.result.truncated;
+/// Turn one execution's rendered rows into the policy's match candidates.
+///
+/// Both paths end here: a whole execution's rows and a merge of per-unit rows
+/// are the same vector by construction, so everything that decides a finding's
+/// identity, ordinal, completeness and the run's completion is computed once,
+/// in one place, from that vector.
+#[allow(clippy::too_many_arguments)]
+fn adapt_match_execution(
+    policy_id: &PolicyId,
+    rows: Vec<UnitRowItem>,
+    evidence: Vec<UnitRowEvidence>,
+    query_diagnostics: &[CodeQueryDiagnostic],
+    query_completion: CodeQueryCompletion,
+    query_truncated: bool,
+    work: CodeQueryExecutionWork,
+    budget: &PolicyBudget,
+) -> EvaluatedMatchPolicy {
     let mut incomplete_reasons = incomplete_reasons(&query_completion, query_truncated);
     let mut failure_reasons = failure_reasons(&query_completion);
-    let result_limit_reached = detailed
-        .result
-        .diagnostics
+    let result_limit_reached = query_diagnostics
         .iter()
         .any(|diagnostic| diagnostic.code == CodeQueryDiagnosticCode::ResultLimitReached);
 
-    let adapted_diagnostics =
-        adapt_query_diagnostics(&detailed.result.diagnostics, budget.max_diagnostics());
+    let adapted_diagnostics = adapt_query_diagnostics(query_diagnostics, budget.max_diagnostics());
     let mut diagnostics = adapted_diagnostics.diagnostics;
     let mut diagnostics_truncated = adapted_diagnostics.truncated;
     if diagnostics_truncated {
@@ -2407,12 +2954,7 @@ fn evaluate_match_query_candidates(
         );
     }
 
-    let adapted_candidates = adapt_match_candidates(
-        policy_id,
-        detailed.result.results,
-        detailed.evidence,
-        &detailed.result.diagnostics,
-    );
+    let adapted_candidates = adapt_match_candidates(policy_id, rows, evidence, query_diagnostics);
     let mut candidates = adapted_candidates.candidates;
     if matches!(query_completion, CodeQueryCompletion::ProvenSubset { .. }) {
         for candidate in &mut candidates {
@@ -2474,7 +3016,7 @@ fn evaluate_match_query_candidates(
         PolicyRunCompletion::Complete
     };
     let work = work_report(
-        detailed.work,
+        work,
         candidates.len(),
         u64::from(result_limit_reached)
             .saturating_add(adapted_candidates.omitted_findings_lower_bound),
@@ -2503,6 +3045,17 @@ fn adapt_query_diagnostics(
     let mut truncated = false;
     let mut adaptation_failed = false;
     for diagnostic in query_diagnostics {
+        // The broad-query advisory is a measurement of the execution that
+        // raised it: its message renders that execution's own scan counters,
+        // and the report's `work` section already carries those numbers. It
+        // advises an interactive `query_code` caller to add an anchor, which a
+        // policy that audits the whole workspace by design cannot take; and
+        // because only a whole execution can raise it, forwarding it would
+        // make a sliced run differ from a full one both in the report's bytes
+        // and at the retention boundary it feeds.
+        if diagnostic.code == CodeQueryDiagnosticCode::BroadQuery {
+            continue;
+        }
         if diagnostics.len() >= max_diagnostics {
             truncated = true;
             break;
@@ -2557,11 +3110,11 @@ struct AdaptedMatchCandidates {
 
 fn adapt_match_candidates(
     policy_id: &PolicyId,
-    results: Vec<CodeQueryResultItem>,
-    evidence: Vec<DetailedCodeQueryEvidence>,
+    rows: Vec<UnitRowItem>,
+    evidence: Vec<UnitRowEvidence>,
     query_diagnostics: &[CodeQueryDiagnostic],
 ) -> AdaptedMatchCandidates {
-    let result_count = results.len();
+    let result_count = rows.len();
     let evidence_count = evidence.len();
     let paired_count = result_count.min(evidence_count);
     let mut conversion_failed = result_count != evidence_count;
@@ -2569,7 +3122,7 @@ fn adapt_match_candidates(
         u64::try_from(result_count.saturating_sub(paired_count)).unwrap_or(u64::MAX);
     let mut ordinals: HashMap<StrongOrdinalKey, u32> = HashMap::new();
     let mut candidates = Vec::with_capacity(paired_count);
-    for (item, evidence) in results.into_iter().zip(evidence) {
+    for (item, evidence) in rows.into_iter().zip(evidence) {
         match adapt_match_candidate(policy_id, item, evidence, query_diagnostics, &mut ordinals) {
             Ok(candidate) => candidates.push(candidate),
             Err(()) => {
@@ -2587,13 +3140,13 @@ fn adapt_match_candidates(
 
 fn adapt_match_candidate(
     policy_id: &PolicyId,
-    item: CodeQueryResultItem,
-    evidence: DetailedCodeQueryEvidence,
+    item: UnitRowItem,
+    evidence: UnitRowEvidence,
     query_diagnostics: &[CodeQueryDiagnostic],
     ordinals: &mut HashMap<StrongOrdinalKey, u32>,
 ) -> Result<EvaluatedMatchCandidate, ()> {
     let result_domain = match_domain(evidence.domain).ok_or(())?;
-    let path = WorkspaceRelativePath::try_from_path(evidence.file.rel_path()).map_err(|_| ())?;
+    let path = workspace_relative_path(&evidence.rel_path)?;
     let (location, mut candidate_reasons, proof) = terminal_presentation(
         &item.value,
         evidence.domain,
@@ -2670,7 +3223,11 @@ fn adapt_match_candidate(
         )
         .map_err(|_| ())?
     } else {
-        MatchFindingAnchor::weak(result_domain, path.clone(), weak_finding_key(&evidence))
+        MatchFindingAnchor::weak(
+            result_domain,
+            path.clone(),
+            weak_finding_key(&evidence, &path),
+        )
     };
 
     if item.provenance.len() != evidence.provenance.len() {
@@ -2741,6 +3298,16 @@ fn adapt_match_candidate(
     })
 }
 
+/// The workspace-relative path a projected row and its evidence agree on.
+///
+/// A unit product carries the normalized workspace-relative spelling rather
+/// than a `ProjectFile`, because a unit produced under one workspace root is
+/// adapted under another. The spelling is the same in both, which is the whole
+/// reason a base unit can answer a head question.
+fn workspace_relative_path(rel_path: &str) -> Result<WorkspaceRelativePath, ()> {
+    WorkspaceRelativePath::try_from_path(std::path::Path::new(rel_path)).map_err(|_| ())
+}
+
 #[derive(Debug)]
 enum OwnerCandidate {
     Absent,
@@ -2757,62 +3324,48 @@ struct StrongOrdinalKey {
 }
 
 fn terminal_presentation(
-    value: &CodeQueryResultValue,
+    value: &UnitRowItemValue,
     expected_domain: DetailedCodeQueryDomain,
     expected_path: &WorkspaceRelativePath,
     byte_span: Option<&std::ops::Range<usize>>,
 ) -> Result<(PolicySourceLocation, Vec<CertaintyReason>, ProofMetadata), ()> {
-    let (actual_domain, path, range, certainty, proof_state, proof_reason) = match value {
-        CodeQueryResultValue::StructuralMatch { value } => (
-            DetailedCodeQueryDomain::StructuralMatch,
-            value.path.as_str(),
-            value.node_range,
+    // An analysis-only row is refused before any field of it is read: it is a
+    // projection over a call site or a declaration, and the finding anchors at
+    // the row it names rather than at the projection.
+    let UnitRowItemValue::Presented {
+        domain: actual_domain,
+        path,
+        range,
+        terminal,
+    } = value
+    else {
+        return Err(());
+    };
+    let (certainty, proof_state, proof_reason) = match terminal {
+        UnitRowItemTerminal::StructuralMatch { .. } => (
             Vec::new(),
             ProofState::Proven,
             ProofReason::DirectStructuralMatch,
         ),
-        CodeQueryResultValue::Declaration { value } => (
-            DetailedCodeQueryDomain::Declaration,
-            value.path.as_str(),
-            value.node_range,
+        UnitRowItemTerminal::Declaration { .. } => (
             Vec::new(),
             ProofState::Proven,
             ProofReason::ResolvedDeclaration,
         ),
-        CodeQueryResultValue::File { value } => (
-            DetailedCodeQueryDomain::File,
-            value.path.as_str(),
-            None,
+        UnitRowItemTerminal::File => (
             Vec::new(),
             ProofState::Proven,
             ProofReason::DirectStructuralMatch,
         ),
-        CodeQueryResultValue::ReferenceSite { value } => {
-            let (certainty, state) = proof_certainty(value.proof);
-            (
-                DetailedCodeQueryDomain::ReferenceSite,
-                value.path.as_str(),
-                Some(value.range),
-                certainty,
-                state,
-                ProofReason::ResolvedReference,
-            )
+        UnitRowItemTerminal::ReferenceSite { proof, .. } => {
+            let (certainty, state) = proof_certainty(proof);
+            (certainty, state, ProofReason::ResolvedReference)
         }
-        CodeQueryResultValue::CallSite { value } => {
-            let (certainty, state) = proof_certainty(value.proof);
-            (
-                DetailedCodeQueryDomain::CallSite,
-                value.path.as_str(),
-                Some(value.range),
-                certainty,
-                state,
-                ProofReason::ExactCallTarget,
-            )
+        UnitRowItemTerminal::CallSite { proof, .. } => {
+            let (certainty, state) = proof_certainty(proof);
+            (certainty, state, ProofReason::ExactCallTarget)
         }
-        CodeQueryResultValue::ExpressionSite { value } => (
-            DetailedCodeQueryDomain::ExpressionSite,
-            value.path.as_str(),
-            Some(value.range),
+        UnitRowItemTerminal::ExpressionSite { .. } => (
             vec![
                 CertaintyReason::analyzer_ambiguity("expression-site-proof-unavailable")
                     .map_err(|_| ())?,
@@ -2820,14 +3373,14 @@ fn terminal_presentation(
             ProofState::Unproven,
             ProofReason::PartialWitness,
         ),
-        CodeQueryResultValue::DecoratedParameter { value } => {
-            let complete = value.terminal
-                && value.completion == "complete"
-                && value.coverage == "complete";
+        UnitRowItemTerminal::DecoratedParameter {
+            terminal,
+            completion,
+            coverage,
+            ..
+        } => {
+            let complete = *terminal && &**completion == "complete" && &**coverage == "complete";
             (
-                DetailedCodeQueryDomain::DecoratedParameter,
-                value.path.as_str(),
-                Some(value.range),
                 Vec::new(),
                 if complete {
                     ProofState::Proven
@@ -2841,268 +3394,67 @@ fn terminal_presentation(
                 },
             )
         }
-        CodeQueryResultValue::JsxAttributeValue { value } => {
-            let certainty = if value.coverage == "complete" {
+        UnitRowItemTerminal::JsxAttributeValue {
+            coverage, reason, ..
+        } => {
+            let certainty = if &**coverage == "complete" {
                 Vec::new()
             } else {
-                vec![CertaintyReason::analyzer_ambiguity(
-                    value.reason.unwrap_or("jsx-attribute-value-incomplete"),
-                )
-                .map_err(|_| ())?]
+                vec![
+                    CertaintyReason::analyzer_ambiguity(
+                        reason
+                            .as_deref()
+                            .unwrap_or("jsx-attribute-value-incomplete"),
+                    )
+                    .map_err(|_| ())?,
+                ]
             };
             (
-                DetailedCodeQueryDomain::JsxAttributeValue,
-                value.path.as_str(),
-                Some(value.range),
                 certainty,
                 ProofState::Proven,
                 ProofReason::DirectStructuralMatch,
             )
         }
-        CodeQueryResultValue::Procedure { .. }
-        | CodeQueryResultValue::ProgramPoint { .. }
-        | CodeQueryResultValue::ControlEdge { .. }
-        | CodeQueryResultValue::TypestateFinding { .. }
-        | CodeQueryResultValue::TypestateWitness { .. }
-        | CodeQueryResultValue::FlowEndpoint { .. }
-        | CodeQueryResultValue::FlowWitness { .. }
-        | CodeQueryResultValue::TaintFinding { .. }
-        | CodeQueryResultValue::ReceiverAnalysis { .. }
-        | CodeQueryResultValue::ReceiverOutcome { .. }
-        | CodeQueryResultValue::ReceiverEvidence { .. }
-        | CodeQueryResultValue::CallShape { .. }
-        | CodeQueryResultValue::CallArgumentGroup { .. }
-        | CodeQueryResultValue::CallArgument { .. }
-        | CodeQueryResultValue::CallBinding { .. }
-        // An effect row is an analysis projection over a call site or a
-        // procedure, so a finding anchors at the call-shape or declaration row
-        // it names rather than at the effect row itself (#2437).
-        | CodeQueryResultValue::CallEffect { .. }
-        | CodeQueryResultValue::CallResultContract { .. }
-        | CodeQueryResultValue::ResultContractUse { .. }
-        | CodeQueryResultValue::ResultContractFailureUse { .. }
-        | CodeQueryResultValue::ProcedureEffect { .. }
-        // A callable-signature row describes a declaration's declared shape. It
-        // is an analysis projection anchored at the declaration, not a
-        // position a finding is reported at; the declaration row is.
-        | CodeQueryResultValue::CallableSignature { .. }
-        | CodeQueryResultValue::SignatureParameter { .. }
-        // An applicability row and its selection summary explain the resolution
-        // of a reference occurrence. The occurrence is the position a finding
-        // is anchored at; these are the analysis projection that explains it.
-        | CodeQueryResultValue::CallableApplicability { .. }
-        | CodeQueryResultValue::OverloadSelection { .. }
-        | CodeQueryResultValue::MemberSelection { .. }
-        // A hierarchy hop explains part of one candidate's route. It is an
-        // analysis projection, not a position a finding is anchored at; the
-        // candidate row it joins to is.
-        | CodeQueryResultValue::CandidateHop { .. }
-        // A dispatch row explains one call site's bounded target set. Like a
-        // hierarchy hop it is an analysis projection, not a position a finding
-        // is anchored at; the call site the rows join to is.
-        | CodeQueryResultValue::DispatchOutcome { .. }
-        | CodeQueryResultValue::DispatchTarget { .. }
-        | CodeQueryResultValue::MemberFamily { .. }
-        | CodeQueryResultValue::MemberFamilyEdge { .. } => return Err(()),
-        CodeQueryResultValue::Occurrence { value } => (
-            DetailedCodeQueryDomain::Occurrence,
-            value.path.as_str(),
-            Some(value.range),
+        UnitRowItemTerminal::FieldWriteValue {
+            proof,
+            completeness,
+            coverage,
+            ..
+        } => {
+            if &**proof != "precise" || &**completeness != "complete" || &**coverage != "exhaustive"
+            {
+                return Err(());
+            }
+            (
+                Vec::new(),
+                ProofState::Proven,
+                ProofReason::ResolvedReference,
+            )
+        }
+        UnitRowItemTerminal::CallResult { proof } => (
             Vec::new(),
-            // An occurrence row is a parser fact about an exact token, so its
-            // own presence is proven; whether its *target* resolved is carried
-            // by the row's target field, not by this location's proof state.
-            ProofState::Proven,
-            ProofReason::DirectStructuralMatch,
-        ),
-        CodeQueryResultValue::LexicalScope { value } => (
-            DetailedCodeQueryDomain::LexicalScope,
-            value.path.as_str(),
-            Some(value.range),
-            Vec::new(),
-            ProofState::Proven,
-            ProofReason::DirectStructuralMatch,
-        ),
-        CodeQueryResultValue::Binding { value } => (
-            DetailedCodeQueryDomain::Binding,
-            value.path.as_str(),
-            Some(value.range),
-            Vec::new(),
-            ProofState::Proven,
-            ProofReason::DirectStructuralMatch,
-        ),
-        CodeQueryResultValue::ResolutionCandidate { value } => (
-            DetailedCodeQueryDomain::ResolutionCandidate,
-            value.path.as_str(),
-            Some(value.range),
-            Vec::new(),
-            // The row is an exact record of what the resolver considered at
-            // this position. Whether that consideration was *complete* is the
-            // trace's own completeness field, not this location's proof state.
-            ProofState::Proven,
-            ProofReason::DirectStructuralMatch,
-        ),
-        CodeQueryResultValue::GenerationSite { value } => (
-            DetailedCodeQueryDomain::GenerationSite,
-            value.path.as_str(),
-            Some(value.range),
-            Vec::new(),
-            ProofState::Proven,
-            ProofReason::DirectStructuralMatch,
-        ),
-        // The flow-state rows are exact records of what the derivation
-        // computed at this site; per-axis completeness is the row's own
-        // `completeness` field and the response's diagnostics, not a proof
-        // tier of the site itself (issue #1480; the temporal asserts that
-        // consume these arrive in milestone 5).
-        CodeQueryResultValue::StateEvent { value } => (
-            DetailedCodeQueryDomain::StateEvent,
-            value.path.as_str(),
-            Some(value.range),
-            Vec::new(),
-            ProofState::Proven,
-            ProofReason::DirectStructuralMatch,
-        ),
-        // A rewrite-path row is an exact record of a bounded chase the
-        // production analysis ran; its completeness is the row's own
-        // `completeness` field and the response's diagnostics, not a proof tier
-        // of the origin site (issue #1480; the termination assert that consumes
-        // these arrives in milestone 5).
-        CodeQueryResultValue::RewritePath { value } => (
-            DetailedCodeQueryDomain::RewritePath,
-            value.path.as_str(),
-            Some(value.range),
-            Vec::new(),
-            ProofState::Proven,
-            ProofReason::DirectStructuralMatch,
-        ),
-        CodeQueryResultValue::FlowRelation { value } => (
-            DetailedCodeQueryDomain::FlowRelation,
-            value.path.as_str(),
-            Some(value.range),
-            Vec::new(),
-            ProofState::Proven,
-            ProofReason::DirectStructuralMatch,
-        ),
-        // A control-relation row is an exact record of what a shared
-        // control-flow algorithm answered over one procedure; whether that
-        // answer is the whole truth is the row's own `completeness` and the
-        // response's diagnostics, not a proof tier of a source site (#2443).
-        CodeQueryResultValue::ControlRelation { value } => (
-            DetailedCodeQueryDomain::ControlRelation,
-            value.path.as_str(),
-            Some(value.range),
-            Vec::new(),
-            ProofState::Proven,
-            ProofReason::DirectStructuralMatch,
-        ),
-        // A guard row is an exact record of what the lowerer normalized the
-        // condition to. Its own `proof` and `completeness` columns carry the
-        // IR evidence; the row's presence is not itself in doubt (#2443).
-        CodeQueryResultValue::Guard { value } => (
-            DetailedCodeQueryDomain::Guard,
-            value.path.as_str(),
-            Some(value.range),
-            Vec::new(),
-            ProofState::Proven,
-            ProofReason::DirectStructuralMatch,
-        ),
-        CodeQueryResultValue::CallResult { value } => (
-            DetailedCodeQueryDomain::CallResult,
-            value.path.as_str(),
-            Some(value.range),
-            Vec::new(),
-            if value.proof == "proven" {
+            if &**proof == "proven" {
                 ProofState::Proven
             } else {
                 ProofState::Unproven
             },
             ProofReason::DirectStructuralMatch,
         ),
-        // A topology row is an exact record of what a build file declares. Its
-        // location is that build file, anchored at the file's own first line
-        // because the topology vocabulary records no position inside it; the
-        // row publishes its display anchor and this reads it rather than
-        // restating it. Whether the whole set was readable is the row's own
-        // `completeness` and the response's diagnostics, not a proof tier of a
-        // source site (#2448).
-        CodeQueryResultValue::SourceSet { value: row } => (
-            DetailedCodeQueryDomain::SourceSet,
-            row.build_file.as_str(),
-            value.display_range(),
+        // Every remaining presented family is an exact record of what one
+        // producer derived at one position: its own presence is proven, and
+        // whatever completeness the row states is the row's own column, not a
+        // proof tier of the position.
+        UnitRowItemTerminal::SourcePosition => (
             Vec::new(),
-            ProofState::Proven,
-            ProofReason::DirectStructuralMatch,
-        ),
-        CodeQueryResultValue::BuildTarget { value: row } => (
-            DetailedCodeQueryDomain::BuildTarget,
-            row.build_file.as_str(),
-            value.display_range(),
-            Vec::new(),
-            ProofState::Proven,
-            ProofReason::DirectStructuralMatch,
-        ),
-        CodeQueryResultValue::TopologyEdge { value: row } => (
-            DetailedCodeQueryDomain::TopologyEdge,
-            row.build_file.as_str(),
-            value.display_range(),
-            Vec::new(),
-            ProofState::Proven,
-            ProofReason::DirectStructuralMatch,
-        ),
-        CodeQueryResultValue::ReferenceEdge { value } => (
-            DetailedCodeQueryDomain::ReferenceEdge,
-            value.path.as_str(),
-            Some(value.range),
-            Vec::new(),
-            // The row is an exact record of what one producer derived at this
-            // site; the edge's own proof field carries the resolver/usage
-            // uncertainty, and set-level completeness is the diagnostics'.
-            ProofState::Proven,
-            ProofReason::DirectStructuralMatch,
-        ),
-        CodeQueryResultValue::QualifiedPath { value } => (
-            DetailedCodeQueryDomain::QualifiedPath,
-            value.path.as_str(),
-            Some(value.range),
-            Vec::new(),
-            ProofState::Proven,
-            ProofReason::DirectStructuralMatch,
-        ),
-        CodeQueryResultValue::Export { value } => (
-            DetailedCodeQueryDomain::Export,
-            value.path.as_str(),
-            Some(value.range),
-            Vec::new(),
-            ProofState::Proven,
-            ProofReason::DirectStructuralMatch,
-        ),
-        CodeQueryResultValue::DeclarationState { value } => (
-            DetailedCodeQueryDomain::DeclarationState,
-            value.path.as_str(),
-            // A state row about a declaration whose range the analyzer does
-            // not state locates at the artifact, like a file row.
-            value.range,
-            Vec::new(),
-            ProofState::Proven,
-            ProofReason::DirectStructuralMatch,
-        ),
-        CodeQueryResultValue::PathSegment { value } => (
-            DetailedCodeQueryDomain::PathSegment,
-            value.path.as_str(),
-            Some(value.range),
-            Vec::new(),
-            // The segment row is a parser fact; whether its prefix *resolved*
-            // is the row's own resolution status, not this location's proof.
             ProofState::Proven,
             ProofReason::DirectStructuralMatch,
         ),
     };
-    if actual_domain != expected_domain || path != expected_path.as_str() {
+    if *actual_domain != expected_domain || path.as_ref() != expected_path.as_str() {
         return Err(());
     }
-    let location = if actual_domain == DetailedCodeQueryDomain::File
-        || (actual_domain == DetailedCodeQueryDomain::DeclarationState
+    let location = if *actual_domain == DetailedCodeQueryDomain::File
+        || (*actual_domain == DetailedCodeQueryDomain::DeclarationState
             && byte_span.is_none()
             && range.is_none())
     {
@@ -3121,40 +3473,58 @@ fn terminal_presentation(
 }
 
 fn adapt_terminal_result(
-    value: &CodeQueryResultValue,
+    value: &UnitRowItemValue,
     expected_domain: DetailedCodeQueryDomain,
     key: &DetailedCodeQueryKey,
-    identities: &DetailedCodeQueryProvenanceIdentities,
+    identities: &UnitRowIdentities,
     expected_path: &WorkspaceRelativePath,
     location: &PolicySourceLocation,
 ) -> Result<(PolicyQueryResultRef, bool), ()> {
-    match (value, expected_domain, key, identities) {
+    let UnitRowItemValue::Presented {
+        path,
+        range,
+        terminal,
+        ..
+    } = value
+    else {
+        return Err(());
+    };
+    if path.as_ref() != expected_path.as_str() {
+        return Err(());
+    }
+    match (terminal, expected_domain, key, identities) {
         (
-            CodeQueryResultValue::StructuralMatch { value },
+            UnitRowItemTerminal::StructuralMatch { kind },
             DetailedCodeQueryDomain::StructuralMatch,
-            DetailedCodeQueryKey::StructuralMatch { kind, .. },
-            DetailedCodeQueryProvenanceIdentities::Primary(identity),
-        ) if value.path == expected_path.as_str() && value.kind == kind => Ok((
+            DetailedCodeQueryKey::StructuralMatch {
+                kind: detailed_kind,
+                ..
+            },
+            UnitRowIdentities::Primary(identity),
+        ) if kind.as_ref() == detailed_kind.as_str() => Ok((
             PolicyQueryResultRef::StructuralMatch {
-                kind: kind.clone(),
+                kind: detailed_kind.clone(),
                 location: location.clone(),
                 identity: validated_provenance_identity(identity.as_ref()),
             },
             false,
         )),
         (
-            CodeQueryResultValue::Declaration { value },
+            UnitRowItemTerminal::Declaration { kind, fq_name },
             DetailedCodeQueryDomain::Declaration,
-            DetailedCodeQueryKey::Declaration { kind, fq_name, .. },
-            DetailedCodeQueryProvenanceIdentities::Primary(identity),
-        ) if value.path == expected_path.as_str()
-            && value.kind == kind
-            && value.fq_name == *fq_name =>
+            DetailedCodeQueryKey::Declaration {
+                kind: detailed_kind,
+                fq_name: detailed_fq_name,
+                ..
+            },
+            UnitRowIdentities::Primary(identity),
+        ) if kind.as_ref() == detailed_kind.as_str()
+            && fq_name.as_ref() == detailed_fq_name.as_str() =>
         {
             Ok((
                 PolicyQueryResultRef::Declaration {
-                    kind: kind.clone(),
-                    fq_name: fq_name.clone(),
+                    kind: detailed_kind.clone(),
+                    fq_name: detailed_fq_name.clone(),
                     location: location.clone(),
                     identity: validated_provenance_identity(identity.as_ref()),
                 },
@@ -3162,104 +3532,116 @@ fn adapt_terminal_result(
             ))
         }
         (
-            CodeQueryResultValue::File { value },
+            UnitRowItemTerminal::File,
             DetailedCodeQueryDomain::File,
             DetailedCodeQueryKey::File,
-            DetailedCodeQueryProvenanceIdentities::None,
-        ) if value.path == expected_path.as_str() => {
-            Ok((PolicyQueryResultRef::file(expected_path.clone()), false))
-        }
+            UnitRowIdentities::None,
+        ) => Ok((PolicyQueryResultRef::file(expected_path.clone()), false)),
         (
-            CodeQueryResultValue::ReferenceSite { value },
+            UnitRowItemTerminal::ReferenceSite {
+                proof,
+                target_fq_name,
+                usage_kind,
+            },
             DetailedCodeQueryDomain::ReferenceSite,
-            DetailedCodeQueryKey::ReferenceSite { target_fq_name, .. },
-            DetailedCodeQueryProvenanceIdentities::ReferenceTarget(target_identity),
-        ) if value.path == expected_path.as_str() && value.target.fq_name == *target_fq_name => {
+            DetailedCodeQueryKey::ReferenceSite {
+                target_fq_name: detailed_target,
+                ..
+            },
+            UnitRowIdentities::ReferenceTarget(target_identity),
+        ) if target_fq_name.as_ref() == detailed_target.as_str() => {
             let target_identity = validated_provenance_identity(target_identity.as_ref());
-            let identity_uncertain = value.proof == "proven" && target_identity.is_none();
+            let identity_uncertain = &**proof == "proven" && target_identity.is_none();
             Ok((
                 PolicyQueryResultRef::ReferenceSite {
                     location: location.clone(),
-                    target_fq_name: target_fq_name.clone(),
+                    target_fq_name: detailed_target.clone(),
                     target_identity,
-                    usage_kind: Some(value.usage_kind.to_string()),
+                    usage_kind: Some(usage_kind.to_string()),
                     proof: if identity_uncertain {
                         PolicyQueryProof::NameBased
                     } else {
-                        policy_query_proof(value.proof)
+                        policy_query_proof(proof)
                     },
                 },
                 identity_uncertain,
             ))
         }
         (
-            CodeQueryResultValue::CallSite { value },
-            DetailedCodeQueryDomain::CallSite,
-            DetailedCodeQueryKey::CallSite {
+            UnitRowItemTerminal::CallSite {
+                proof,
                 caller_fq_name,
                 callee_fq_name,
             },
-            DetailedCodeQueryProvenanceIdentities::Call { caller, callee },
-        ) if value.path == expected_path.as_str()
-            && value.caller.fq_name == *caller_fq_name
-            && value.callee.fq_name == *callee_fq_name =>
+            DetailedCodeQueryDomain::CallSite,
+            DetailedCodeQueryKey::CallSite {
+                caller_fq_name: detailed_caller,
+                callee_fq_name: detailed_callee,
+            },
+            UnitRowIdentities::Call { caller, callee },
+        ) if caller_fq_name.as_ref() == detailed_caller.as_str()
+            && callee_fq_name.as_ref() == detailed_callee.as_str() =>
         {
             let caller_identity = validated_provenance_identity(caller.as_ref());
             let callee_identity = validated_provenance_identity(callee.as_ref());
             let identity_uncertain =
-                value.proof == "proven" && (caller_identity.is_none() || callee_identity.is_none());
+                &**proof == "proven" && (caller_identity.is_none() || callee_identity.is_none());
             Ok((
                 PolicyQueryResultRef::CallSite {
                     location: location.clone(),
-                    caller_fq_name: caller_fq_name.clone(),
+                    caller_fq_name: detailed_caller.clone(),
                     caller_identity,
-                    callee_fq_name: callee_fq_name.clone(),
+                    callee_fq_name: detailed_callee.clone(),
                     callee_identity,
                     proof: if identity_uncertain {
                         PolicyQueryProof::NameBased
                     } else {
-                        policy_query_proof(value.proof)
+                        policy_query_proof(proof)
                     },
                 },
                 identity_uncertain,
             ))
         }
         (
-            CodeQueryResultValue::ExpressionSite { value },
-            DetailedCodeQueryDomain::ExpressionSite,
-            DetailedCodeQueryKey::ExpressionSite {
+            UnitRowItemTerminal::ExpressionSite {
                 input_kind,
                 parameter_index,
                 parameter_name,
             },
-            DetailedCodeQueryProvenanceIdentities::None,
-        ) if value.path == expected_path.as_str()
-            && value.input_kind == input_kind
-            && value
-                .parameter_index
-                .and_then(|index| u32::try_from(index).ok())
-                == *parameter_index
-            && value.parameter_name == *parameter_name =>
+            DetailedCodeQueryDomain::ExpressionSite,
+            DetailedCodeQueryKey::ExpressionSite {
+                input_kind: detailed_input,
+                parameter_index: detailed_index,
+                parameter_name: detailed_name,
+            },
+            UnitRowIdentities::None,
+        ) if input_kind.as_ref() == detailed_input.as_str()
+            && parameter_index.and_then(|index| u32::try_from(index).ok()) == *detailed_index
+            && parameter_name.as_deref() == detailed_name.as_deref() =>
         {
             Ok((
                 PolicyQueryResultRef::ExpressionSite {
                     location: location.clone(),
-                    input_kind: input_kind.clone(),
-                    parameter_index: *parameter_index,
-                    parameter_name: parameter_name.clone(),
+                    input_kind: detailed_input.clone(),
+                    parameter_index: *detailed_index,
+                    parameter_name: detailed_name.clone(),
                 },
                 false,
             ))
         }
         (
-            CodeQueryResultValue::DecoratedParameter { value },
+            UnitRowItemTerminal::DecoratedParameter {
+                id, parameter_id, ..
+            },
             DetailedCodeQueryDomain::DecoratedParameter,
-            DetailedCodeQueryKey::DecoratedParameter { id, parameter_id },
-            DetailedCodeQueryProvenanceIdentities::None,
-        ) if value.path == expected_path.as_str()
-            && value.id == *id
-            && value.parameter_id == *parameter_id
-            && Some(value.range)
+            DetailedCodeQueryKey::DecoratedParameter {
+                id: detailed_id,
+                parameter_id: detailed_parameter_id,
+            },
+            UnitRowIdentities::None,
+        ) if id.as_ref() == detailed_id.as_str()
+            && parameter_id.as_ref() == detailed_parameter_id.as_str()
+            && *range
                 == location.region().map(|region| CodeQueryRange {
                     start_line: region.start_line() as usize,
                     start_column: region.start_column() as usize,
@@ -3281,48 +3663,73 @@ fn adapt_terminal_result(
             ))
         }
         (
-            CodeQueryResultValue::JsxAttributeValue { value },
+            UnitRowItemTerminal::JsxAttributeValue {
+                id,
+                ast_id,
+                element_identity,
+                coverage,
+                ..
+            },
             DetailedCodeQueryDomain::JsxAttributeValue,
-            DetailedCodeQueryKey::JsxAttributeValue { id, ast_id },
-            DetailedCodeQueryProvenanceIdentities::Primary(_),
-        ) if value.path == expected_path.as_str() && value.id == *id && value.ast_id == *ast_id => {
+            DetailedCodeQueryKey::JsxAttributeValue {
+                id: detailed_id,
+                ast_id: detailed_ast_id,
+            },
+            UnitRowIdentities::Primary(_),
+        ) if id.as_ref() == detailed_id.as_str() && ast_id.as_ref() == detailed_ast_id.as_str() => {
             Ok((
                 PolicyQueryResultRef::JsxAttributeValue {
                     location: location.clone(),
-                    ast_id: ast_id.clone(),
-                    element_identity: value.element_identity.to_string(),
-                    coverage: value.coverage.to_string(),
+                    ast_id: detailed_ast_id.clone(),
+                    element_identity: element_identity.to_string(),
+                    coverage: coverage.to_string(),
                 },
-                value.coverage != "complete",
+                &**coverage != "complete",
             ))
         }
         (
-            CodeQueryResultValue::Procedure { .. }
-            | CodeQueryResultValue::ProgramPoint { .. }
-            | CodeQueryResultValue::ControlEdge { .. }
-            | CodeQueryResultValue::ReceiverAnalysis { .. },
-            _,
-            _,
-            _,
-        )
-        | (
-            _,
-            DetailedCodeQueryDomain::Procedure
-            | DetailedCodeQueryDomain::ProgramPoint
-            | DetailedCodeQueryDomain::ControlEdge,
-            _,
-            _,
-        )
-        | (
-            _,
-            _,
-            DetailedCodeQueryKey::Procedure { .. }
-            | DetailedCodeQueryKey::ProgramPoint { .. }
-            | DetailedCodeQueryKey::ControlEdge { .. },
-            _,
-        )
-        | (_, DetailedCodeQueryDomain::ReceiverAnalysis, _, _)
-        | (_, _, DetailedCodeQueryKey::ReceiverAnalysis { .. }, _) => Err(()),
+            UnitRowItemTerminal::FieldWriteValue {
+                id,
+                assignment_ast_id,
+                rhs_ast_id,
+                receiver_identity_id,
+                member_target_id,
+                proof,
+                completeness,
+                coverage,
+            },
+            DetailedCodeQueryDomain::FieldWriteValue,
+            DetailedCodeQueryKey::FieldWriteValue {
+                id: detailed_id,
+                assignment_ast_id: detailed_assignment_ast_id,
+                rhs_ast_id: detailed_rhs_ast_id,
+                receiver_identity_id: detailed_receiver_identity_id,
+                member_target_id: detailed_member_target_id,
+            },
+            UnitRowIdentities::Primary(_),
+        ) if id.as_ref() == detailed_id.as_str()
+            && assignment_ast_id.as_ref() == detailed_assignment_ast_id.as_str()
+            && rhs_ast_id.as_ref() == detailed_rhs_ast_id.as_str()
+            && receiver_identity_id.as_ref() == detailed_receiver_identity_id.as_str()
+            && member_target_id.as_ref() == detailed_member_target_id.as_str()
+            && &**proof == "precise"
+            && &**completeness == "complete"
+            && &**coverage == "exhaustive" =>
+        {
+            Ok((
+                PolicyQueryResultRef::FieldWriteValue {
+                    location: location.clone(),
+                    assignment_ast_id: assignment_ast_id.to_string(),
+                    rhs_ast_id: detailed_rhs_ast_id.clone(),
+                    receiver_identity_id: receiver_identity_id.to_string(),
+                    member_target_id: detailed_member_target_id.clone(),
+                    proof: proof.to_string(),
+                    completeness: completeness.to_string(),
+                    coverage: coverage.to_string(),
+                },
+                false,
+            ))
+        }
         _ => Err(()),
     }
 }
@@ -3359,8 +3766,8 @@ fn policy_span_location(
 }
 
 fn adapt_provenance(
-    provenance: CodeQueryProvenance,
-    detailed: DetailedCodeQueryProvenanceEvidence,
+    provenance: UnitRowItemProvenance,
+    detailed: UnitRowProvenance,
 ) -> Result<(PolicyQueryProvenance, bool, bool), ()> {
     if provenance.branch != detailed.branch || provenance.steps.len() != detailed.steps.len() {
         return Err(());
@@ -3377,7 +3784,9 @@ fn adapt_provenance(
         .into_iter()
         .zip(detailed.steps)
         .map(|(step, detailed)| {
-            if step.op != detailed.op || step.via.is_some() != detailed.via.is_some() {
+            if step.op.as_ref() != detailed.op.as_str()
+                || step.via.is_some() != detailed.via.is_some()
+            {
                 return Err(());
             }
             let (result, result_partial, result_identity_uncertain) =
@@ -3395,7 +3804,7 @@ fn adapt_provenance(
                 (None, None) => None,
                 _ => return Err(()),
             };
-            PolicyQueryProvenanceStep::try_new(step.op, result, via).map_err(|_| ())
+            PolicyQueryProvenanceStep::try_new(detailed.op, result, via).map_err(|_| ())
         })
         .collect::<Result<Vec<_>, _>>()?;
     PolicyQueryProvenance::try_new(branch, seed, steps)
@@ -3404,48 +3813,42 @@ fn adapt_provenance(
 }
 
 fn adapt_provenance_ref(
-    value: CodeQueryResultRef,
-    detailed: DetailedCodeQueryProvenanceRefEvidence,
+    value: UnitRowItemRef,
+    detailed: UnitRowProvenanceRef,
 ) -> Result<(PolicyQueryResultRef, bool, bool), ()> {
-    let DetailedCodeQueryProvenanceRefEvidence {
+    let UnitRowProvenanceRef {
         domain,
         key,
-        file,
+        rel_path,
         byte_span,
         display_range,
         identities,
         source_slice_sha256,
     } = detailed;
-    let path = WorkspaceRelativePath::try_from_path(file.rel_path()).map_err(|_| ())?;
+    let path = workspace_relative_path(&rel_path)?;
+    if value.path.as_ref() != path.as_str() {
+        return Err(());
+    }
     let source_exact = domain == DetailedCodeQueryDomain::File
         || (source_slice_sha256.is_some() && byte_span.is_some() && display_range.is_some());
     if !source_exact {
-        let kind = public_provenance_kind(&value);
-        if public_provenance_path(&value) != path.as_str() {
-            return Err(());
-        }
-        return Ok((unsupported_provenance_ref(kind, path), true, false));
+        return Ok((unsupported_provenance_ref(&value.kind, path), true, false));
     }
 
     let mut identity_uncertain = false;
-    let adapted = match (value, domain, key, identities) {
+    let adapted = match (value.value, domain, key, identities) {
         (
-            CodeQueryResultRef::StructuralMatch {
-                path: public_path,
+            UnitRowItemRefValue::StructuralMatch {
                 kind,
                 node_range: Some(range),
-                ..
             },
             DetailedCodeQueryDomain::StructuralMatch,
             DetailedCodeQueryKey::StructuralMatch {
                 kind: detailed_kind,
                 ..
             },
-            DetailedCodeQueryProvenanceIdentities::Primary(identity),
-        ) if public_path == path.as_str()
-            && kind == detailed_kind
-            && Some(range) == display_range =>
-        {
+            UnitRowIdentities::Primary(identity),
+        ) if kind.as_ref() == detailed_kind.as_str() && Some(range) == display_range => {
             PolicyQueryResultRef::StructuralMatch {
                 kind: detailed_kind,
                 location: policy_span_location(
@@ -3457,22 +3860,19 @@ fn adapt_provenance_ref(
             }
         }
         (
-            CodeQueryResultRef::DecoratedParameter {
-                path: public_path,
-                range,
+            UnitRowItemRefValue::DecoratedParameter {
                 id,
                 parameter_id,
-                ..
+                range,
             },
             DetailedCodeQueryDomain::DecoratedParameter,
             DetailedCodeQueryKey::DecoratedParameter {
                 id: detailed_id,
                 parameter_id: detailed_parameter_id,
             },
-            DetailedCodeQueryProvenanceIdentities::None,
-        ) if public_path == path.as_str()
-            && id == detailed_id
-            && parameter_id == detailed_parameter_id
+            UnitRowIdentities::None,
+        ) if id.as_ref() == detailed_id.as_str()
+            && parameter_id.as_ref() == detailed_parameter_id.as_str()
             && Some(range) == display_range =>
         {
             PolicyQueryResultRef::StructuralMatch {
@@ -3486,12 +3886,10 @@ fn adapt_provenance_ref(
             }
         }
         (
-            CodeQueryResultRef::Declaration {
-                path: public_path,
+            UnitRowItemRefValue::Declaration {
                 kind,
                 fq_name,
                 node_range: Some(range),
-                ..
             },
             DetailedCodeQueryDomain::Declaration,
             DetailedCodeQueryKey::Declaration {
@@ -3499,10 +3897,9 @@ fn adapt_provenance_ref(
                 fq_name: detailed_fq_name,
                 ..
             },
-            DetailedCodeQueryProvenanceIdentities::Primary(identity),
-        ) if public_path == path.as_str()
-            && kind == detailed_kind
-            && fq_name == detailed_fq_name
+            UnitRowIdentities::Primary(identity),
+        ) if kind.as_ref() == detailed_kind.as_str()
+            && fq_name.as_ref() == detailed_fq_name.as_str()
             && Some(range) == display_range =>
         {
             PolicyQueryResultRef::Declaration {
@@ -3517,34 +3914,29 @@ fn adapt_provenance_ref(
             }
         }
         (
-            CodeQueryResultRef::File { path: public_path },
+            UnitRowItemRefValue::File,
             DetailedCodeQueryDomain::File,
             DetailedCodeQueryKey::File,
-            DetailedCodeQueryProvenanceIdentities::None,
-        ) if public_path == path.as_str() && byte_span.is_none() && display_range.is_none() => {
-            PolicyQueryResultRef::file(path)
-        }
+            UnitRowIdentities::None,
+        ) if byte_span.is_none() && display_range.is_none() => PolicyQueryResultRef::file(path),
         (
-            CodeQueryResultRef::ReferenceSite {
-                path: public_path,
+            UnitRowItemRefValue::ReferenceSite {
                 range,
                 target_fq_name,
                 usage_kind,
                 proof,
-                ..
             },
             DetailedCodeQueryDomain::ReferenceSite,
             DetailedCodeQueryKey::ReferenceSite {
                 target_fq_name: detailed_target,
                 ..
             },
-            DetailedCodeQueryProvenanceIdentities::ReferenceTarget(target_identity),
-        ) if public_path == path.as_str()
-            && target_fq_name == detailed_target
+            UnitRowIdentities::ReferenceTarget(target_identity),
+        ) if target_fq_name.as_ref() == detailed_target.as_str()
             && Some(range) == display_range =>
         {
             let target_identity = validated_provenance_identity(target_identity.as_ref());
-            identity_uncertain = proof == "proven" && target_identity.is_none();
+            identity_uncertain = &*proof == "proven" && target_identity.is_none();
             PolicyQueryResultRef::ReferenceSite {
                 location: policy_span_location(
                     path,
@@ -3553,17 +3945,16 @@ fn adapt_provenance_ref(
                 )?,
                 target_fq_name: detailed_target,
                 target_identity,
-                usage_kind: usage_kind.map(str::to_string),
+                usage_kind: usage_kind.map(|kind| kind.to_string()),
                 proof: if identity_uncertain {
                     PolicyQueryProof::NameBased
                 } else {
-                    policy_query_proof(proof)
+                    policy_query_proof(&proof)
                 },
             }
         }
         (
-            CodeQueryResultRef::CallSite {
-                path: public_path,
+            UnitRowItemRefValue::CallSite {
                 range,
                 caller_fq_name,
                 callee_fq_name,
@@ -3574,16 +3965,15 @@ fn adapt_provenance_ref(
                 caller_fq_name: detailed_caller,
                 callee_fq_name: detailed_callee,
             },
-            DetailedCodeQueryProvenanceIdentities::Call { caller, callee },
-        ) if public_path == path.as_str()
-            && caller_fq_name == detailed_caller
-            && callee_fq_name == detailed_callee
+            UnitRowIdentities::Call { caller, callee },
+        ) if caller_fq_name.as_ref() == detailed_caller.as_str()
+            && callee_fq_name.as_ref() == detailed_callee.as_str()
             && Some(range) == display_range =>
         {
             let caller_identity = validated_provenance_identity(caller.as_ref());
             let callee_identity = validated_provenance_identity(callee.as_ref());
             identity_uncertain =
-                proof == "proven" && (caller_identity.is_none() || callee_identity.is_none());
+                &*proof == "proven" && (caller_identity.is_none() || callee_identity.is_none());
             PolicyQueryResultRef::CallSite {
                 location: policy_span_location(
                     path,
@@ -3597,13 +3987,12 @@ fn adapt_provenance_ref(
                 proof: if identity_uncertain {
                     PolicyQueryProof::NameBased
                 } else {
-                    policy_query_proof(proof)
+                    policy_query_proof(&proof)
                 },
             }
         }
         (
-            CodeQueryResultRef::ExpressionSite {
-                path: public_path,
+            UnitRowItemRefValue::ExpressionSite {
                 range,
                 input_kind,
                 parameter_index,
@@ -3615,11 +4004,10 @@ fn adapt_provenance_ref(
                 parameter_index: detailed_index,
                 parameter_name: detailed_name,
             },
-            DetailedCodeQueryProvenanceIdentities::None,
-        ) if public_path == path.as_str()
-            && input_kind == detailed_input
+            UnitRowIdentities::None,
+        ) if input_kind.as_ref() == detailed_input.as_str()
             && parameter_index.and_then(|index| u32::try_from(index).ok()) == detailed_index
-            && parameter_name == detailed_name
+            && parameter_name.as_deref() == detailed_name.as_deref()
             && Some(range) == display_range =>
         {
             PolicyQueryResultRef::ExpressionSite {
@@ -3634,10 +4022,9 @@ fn adapt_provenance_ref(
             }
         }
         (
-            CodeQueryResultRef::JsxAttributeValue {
+            UnitRowItemRefValue::JsxAttributeValue {
                 id,
                 ast_id,
-                path: public_path,
                 range,
                 element_identity,
                 coverage,
@@ -3647,27 +4034,98 @@ fn adapt_provenance_ref(
                 id: detailed_id,
                 ast_id: detailed_ast_id,
             },
-            DetailedCodeQueryProvenanceIdentities::Primary(_),
-        ) if public_path == path.as_str()
-            && id == detailed_id
-            && ast_id == detailed_ast_id
+            UnitRowIdentities::Primary(_),
+        ) if id.as_ref() == detailed_id.as_str()
+            && ast_id.as_ref() == detailed_ast_id.as_str()
             && Some(range) == display_range =>
         {
-            identity_uncertain = coverage != "complete";
+            identity_uncertain = &*coverage != "complete";
             PolicyQueryResultRef::JsxAttributeValue {
                 location: policy_span_location(
                     path,
                     byte_span.as_ref().ok_or(())?,
                     display_range.ok_or(())?,
                 )?,
-                ast_id,
+                ast_id: detailed_ast_id,
                 element_identity: element_identity.to_string(),
                 coverage: coverage.to_string(),
             }
         }
         (
-            CodeQueryResultRef::ReceiverAnalysis {
-                path: public_path,
+            UnitRowItemRefValue::MemberTargetAnalysis {
+                site_id,
+                receiver_range,
+                outcome,
+                coverage,
+                capture,
+            },
+            DetailedCodeQueryDomain::MemberTargetAnalysis,
+            DetailedCodeQueryKey::MemberTargetAnalysis {
+                site_id: detailed_site_id,
+            },
+            UnitRowIdentities::None,
+        ) if site_id.as_ref() == detailed_site_id.as_str()
+            && Some(receiver_range) == display_range =>
+        {
+            PolicyQueryResultRef::MemberTargetAnalysis {
+                location: policy_span_location(
+                    path,
+                    byte_span.as_ref().ok_or(())?,
+                    display_range.ok_or(())?,
+                )?,
+                outcome: outcome.to_string(),
+                coverage: coverage.to_string(),
+                capture: capture.map(|capture| capture.to_string()),
+            }
+        }
+        (
+            UnitRowItemRefValue::FieldWriteValue {
+                id,
+                assignment_ast_id,
+                rhs_ast_id,
+                receiver_identity_id,
+                member_target_id,
+                range,
+                proof,
+                completeness,
+                coverage,
+            },
+            DetailedCodeQueryDomain::FieldWriteValue,
+            DetailedCodeQueryKey::FieldWriteValue {
+                id: detailed_id,
+                assignment_ast_id: detailed_assignment_ast_id,
+                rhs_ast_id: detailed_rhs_ast_id,
+                receiver_identity_id: detailed_receiver_identity_id,
+                member_target_id: detailed_member_target_id,
+            },
+            UnitRowIdentities::Primary(_),
+        ) if id.as_ref() == detailed_id.as_str()
+            && assignment_ast_id.as_ref() == detailed_assignment_ast_id.as_str()
+            && rhs_ast_id.as_ref() == detailed_rhs_ast_id.as_str()
+            && receiver_identity_id.as_ref() == detailed_receiver_identity_id.as_str()
+            && member_target_id.as_ref() == detailed_member_target_id.as_str()
+            && &*proof == "precise"
+            && &*completeness == "complete"
+            && &*coverage == "exhaustive"
+            && Some(range) == display_range =>
+        {
+            PolicyQueryResultRef::FieldWriteValue {
+                location: policy_span_location(
+                    path,
+                    byte_span.as_ref().ok_or(())?,
+                    display_range.ok_or(())?,
+                )?,
+                assignment_ast_id: assignment_ast_id.to_string(),
+                rhs_ast_id: rhs_ast_id.to_string(),
+                receiver_identity_id: receiver_identity_id.to_string(),
+                member_target_id: member_target_id.to_string(),
+                proof: proof.to_string(),
+                completeness: completeness.to_string(),
+                coverage: coverage.to_string(),
+            }
+        }
+        (
+            UnitRowItemRefValue::ReceiverAnalysis {
                 range,
                 analysis_kind,
                 outcome,
@@ -3679,11 +4137,10 @@ fn adapt_provenance_ref(
                 outcome: detailed_outcome,
                 capture: detailed_capture,
             },
-            DetailedCodeQueryProvenanceIdentities::None,
-        ) if public_path == path.as_str()
-            && analysis_kind == detailed_analysis
-            && outcome == detailed_outcome
-            && capture == detailed_capture
+            UnitRowIdentities::None,
+        ) if analysis_kind.as_ref() == detailed_analysis.as_str()
+            && outcome.as_ref() == detailed_outcome.as_str()
+            && capture.as_deref() == detailed_capture.as_deref()
             && Some(range) == display_range =>
         {
             PolicyQueryResultRef::ReceiverAnalysis {
@@ -3718,10 +4175,10 @@ fn lower_proof_for_missing_identity(proof: ProofMetadata) -> Result<ProofMetadat
 }
 
 fn validated_provenance_identity(
-    candidate: Option<&DetailedCodeQueryIdentityCandidate>,
+    candidate: Option<&UnitRowIdentityCandidate>,
 ) -> Option<StableSemanticIdentity> {
     let candidate = candidate?;
-    let path = WorkspaceRelativePath::try_from_path(candidate.file.rel_path()).ok()?;
+    let path = workspace_relative_path(&candidate.rel_path).ok()?;
     let identity = match candidate.candidate.derivation {
         CodeQueryStableOwnerDerivation::AnalyzerDeclarationId => {
             StableSemanticIdentity::analyzer_declaration_id(
@@ -3740,130 +4197,6 @@ fn validated_provenance_identity(
         CodeQueryStableOwnerDerivation::SemanticWireId => return None,
     };
     identity.ok()
-}
-
-fn public_provenance_kind(value: &CodeQueryResultRef) -> &'static str {
-    match value {
-        CodeQueryResultRef::StructuralMatch { .. } => "structural_match",
-        CodeQueryResultRef::Declaration { .. } => "declaration",
-        CodeQueryResultRef::Procedure { .. } => "procedure",
-        CodeQueryResultRef::ProgramPoint { .. } => "program_point",
-        CodeQueryResultRef::ControlEdge { .. } => "control_edge",
-        CodeQueryResultRef::TypestateFinding { .. } => "typestate_finding",
-        CodeQueryResultRef::TypestateWitness { .. } => "typestate_witness",
-        CodeQueryResultRef::FlowEndpoint { .. } => "flow_endpoint",
-        CodeQueryResultRef::FlowWitness { .. } => "flow_witness",
-        CodeQueryResultRef::TaintFinding { .. } => "taint_finding",
-        CodeQueryResultRef::File { .. } => "file",
-        CodeQueryResultRef::ReferenceSite { .. } => "reference_site",
-        CodeQueryResultRef::CallSite { .. } => "call_site",
-        CodeQueryResultRef::ExpressionSite { .. } => "expression_site",
-        CodeQueryResultRef::JsxAttributeValue { .. } => "jsx_attribute_value",
-        CodeQueryResultRef::ReceiverAnalysis { .. } => "receiver_analysis",
-        CodeQueryResultRef::ReceiverOutcome { .. } => "receiver_outcome",
-        CodeQueryResultRef::MemberSelection { .. } => "member_selection",
-        CodeQueryResultRef::CandidateHop { .. } => "candidate_hop",
-        CodeQueryResultRef::DispatchOutcome { .. } => "dispatch_outcome",
-        CodeQueryResultRef::DispatchTarget { .. } => "dispatch_target",
-        CodeQueryResultRef::MemberFamily { .. } => "member_family",
-        CodeQueryResultRef::MemberFamilyEdge { .. } => "member_family_edge",
-        CodeQueryResultRef::ReceiverEvidence { .. } => "receiver_evidence",
-        CodeQueryResultRef::CallShape { .. } => "call_shape",
-        CodeQueryResultRef::CallResult { .. } => "call_result",
-        CodeQueryResultRef::CallArgumentGroup { .. } => "call_argument_group",
-        CodeQueryResultRef::CallArgument { .. } => "call_argument",
-        CodeQueryResultRef::CallBinding { .. } => "call_binding",
-        CodeQueryResultRef::CallEffect { .. } => "call_effect",
-        CodeQueryResultRef::CallResultContract { .. } => "call_result_contract",
-        CodeQueryResultRef::ResultContractUse { .. } => "result_contract_use",
-        CodeQueryResultRef::ResultContractFailureUse { .. } => "result_contract_failure_use",
-        CodeQueryResultRef::ProcedureEffect { .. } => "procedure_effect",
-        CodeQueryResultRef::CallableSignature { .. } => "callable_signature",
-        CodeQueryResultRef::SignatureParameter { .. } => "signature_parameter",
-        CodeQueryResultRef::DecoratedParameter { .. } => "decorated_parameter",
-        CodeQueryResultRef::CallableApplicability { .. } => "callable_applicability",
-        CodeQueryResultRef::OverloadSelection { .. } => "overload_selection",
-        CodeQueryResultRef::Occurrence { .. } => "occurrence",
-        CodeQueryResultRef::LexicalScope { .. } => "lexical_scope",
-        CodeQueryResultRef::Binding { .. } => "binding",
-        CodeQueryResultRef::ResolutionCandidate { .. } => "resolution_candidate",
-        CodeQueryResultRef::GenerationSite { .. } => "generation_site",
-        CodeQueryResultRef::Export { .. } => "export",
-        CodeQueryResultRef::DeclarationState { .. } => "declaration_state",
-        CodeQueryResultRef::ReferenceEdge { .. } => "reference_edge",
-        CodeQueryResultRef::StateEvent { .. } => "state_event",
-        CodeQueryResultRef::FlowRelation { .. } => "flow_relation",
-        CodeQueryResultRef::ControlRelation { .. } => "control_relation",
-        CodeQueryResultRef::Guard { .. } => "guard",
-        CodeQueryResultRef::SourceSet { .. } => "source_set",
-        CodeQueryResultRef::BuildTarget { .. } => "build_target",
-        CodeQueryResultRef::TopologyEdge { .. } => "topology_edge",
-        CodeQueryResultRef::RewritePath { .. } => "rewrite_path",
-        CodeQueryResultRef::QualifiedPath { .. } => "qualified_path",
-        CodeQueryResultRef::PathSegment { .. } => "path_segment",
-    }
-}
-
-fn public_provenance_path(value: &CodeQueryResultRef) -> &str {
-    match value {
-        CodeQueryResultRef::StructuralMatch { path, .. }
-        | CodeQueryResultRef::Declaration { path, .. }
-        | CodeQueryResultRef::Procedure { path, .. }
-        | CodeQueryResultRef::ProgramPoint { path, .. }
-        | CodeQueryResultRef::ControlEdge { path, .. }
-        | CodeQueryResultRef::TypestateFinding { path, .. }
-        | CodeQueryResultRef::TypestateWitness { path, .. }
-        | CodeQueryResultRef::FlowEndpoint { path, .. }
-        | CodeQueryResultRef::FlowWitness { path, .. }
-        | CodeQueryResultRef::TaintFinding { path, .. }
-        | CodeQueryResultRef::File { path }
-        | CodeQueryResultRef::ReferenceSite { path, .. }
-        | CodeQueryResultRef::CallSite { path, .. }
-        | CodeQueryResultRef::ExpressionSite { path, .. }
-        | CodeQueryResultRef::JsxAttributeValue { path, .. }
-        | CodeQueryResultRef::ReceiverAnalysis { path, .. }
-        | CodeQueryResultRef::ReceiverOutcome { path, .. }
-        | CodeQueryResultRef::ReceiverEvidence { path, .. }
-        | CodeQueryResultRef::CallShape { path, .. }
-        | CodeQueryResultRef::CallResult { path, .. }
-        | CodeQueryResultRef::CallArgumentGroup { path, .. }
-        | CodeQueryResultRef::CallArgument { path, .. }
-        | CodeQueryResultRef::CallBinding { path, .. }
-        | CodeQueryResultRef::CallEffect { path, .. }
-        | CodeQueryResultRef::CallResultContract { path, .. }
-        | CodeQueryResultRef::ResultContractUse { path, .. }
-        | CodeQueryResultRef::ResultContractFailureUse { path, .. }
-        | CodeQueryResultRef::ProcedureEffect { path, .. }
-        | CodeQueryResultRef::CallableSignature { path, .. }
-        | CodeQueryResultRef::SignatureParameter { path, .. }
-        | CodeQueryResultRef::DecoratedParameter { path, .. }
-        | CodeQueryResultRef::CallableApplicability { path, .. }
-        | CodeQueryResultRef::OverloadSelection { path, .. }
-        | CodeQueryResultRef::MemberSelection { path, .. }
-        | CodeQueryResultRef::CandidateHop { path, .. }
-        | CodeQueryResultRef::DispatchOutcome { path, .. }
-        | CodeQueryResultRef::DispatchTarget { path, .. }
-        | CodeQueryResultRef::MemberFamily { path, .. }
-        | CodeQueryResultRef::MemberFamilyEdge { path, .. }
-        | CodeQueryResultRef::Occurrence { path, .. }
-        | CodeQueryResultRef::LexicalScope { path, .. }
-        | CodeQueryResultRef::Binding { path, .. }
-        | CodeQueryResultRef::ResolutionCandidate { path, .. }
-        | CodeQueryResultRef::GenerationSite { path, .. }
-        | CodeQueryResultRef::Export { path, .. }
-        | CodeQueryResultRef::DeclarationState { path, .. }
-        | CodeQueryResultRef::ReferenceEdge { path, .. }
-        | CodeQueryResultRef::StateEvent { path, .. }
-        | CodeQueryResultRef::FlowRelation { path, .. }
-        | CodeQueryResultRef::ControlRelation { path, .. }
-        | CodeQueryResultRef::Guard { path, .. }
-        | CodeQueryResultRef::SourceSet { path, .. }
-        | CodeQueryResultRef::BuildTarget { path, .. }
-        | CodeQueryResultRef::TopologyEdge { path, .. }
-        | CodeQueryResultRef::RewritePath { path, .. } => path,
-        CodeQueryResultRef::QualifiedPath { path, .. }
-        | CodeQueryResultRef::PathSegment { path, .. } => path,
-    }
 }
 
 fn unsupported_provenance_ref(kind: &str, path: WorkspaceRelativePath) -> PolicyQueryResultRef {
@@ -3889,6 +4222,7 @@ fn match_domain(domain: DetailedCodeQueryDomain) -> Option<MatchResultDomain> {
         DetailedCodeQueryDomain::CallSite => Some(MatchResultDomain::CallSite),
         DetailedCodeQueryDomain::ExpressionSite => Some(MatchResultDomain::ExpressionSite),
         DetailedCodeQueryDomain::JsxAttributeValue => Some(MatchResultDomain::JsxAttributeValue),
+        DetailedCodeQueryDomain::FieldWriteValue => Some(MatchResultDomain::FieldWriteValue),
         DetailedCodeQueryDomain::File => Some(MatchResultDomain::File),
         DetailedCodeQueryDomain::Occurrence => Some(MatchResultDomain::Occurrence),
         DetailedCodeQueryDomain::LexicalScope => Some(MatchResultDomain::LexicalScope),
@@ -3923,6 +4257,7 @@ fn match_domain(domain: DetailedCodeQueryDomain) -> Option<MatchResultDomain> {
         | DetailedCodeQueryDomain::FlowWitness
         | DetailedCodeQueryDomain::TaintFinding
         | DetailedCodeQueryDomain::ReceiverAnalysis
+        | DetailedCodeQueryDomain::MemberTargetAnalysis
         | DetailedCodeQueryDomain::ReceiverOutcome
         | DetailedCodeQueryDomain::ReceiverEvidence
         | DetailedCodeQueryDomain::CallShape
@@ -3934,6 +4269,10 @@ fn match_domain(domain: DetailedCodeQueryDomain) -> Option<MatchResultDomain> {
         | DetailedCodeQueryDomain::CallResultContract
         | DetailedCodeQueryDomain::ResultContractUse
         | DetailedCodeQueryDomain::ResultContractFailureUse
+        | DetailedCodeQueryDomain::NilnessOperation
+        | DetailedCodeQueryDomain::SwitchCoverage
+        | DetailedCodeQueryDomain::ConcurrentAccessConflict
+        | DetailedCodeQueryDomain::DetachedTaskTransfer
         | DetailedCodeQueryDomain::ProcedureEffect
         | DetailedCodeQueryDomain::CallableSignature
         | DetailedCodeQueryDomain::SignatureParameter
@@ -3948,17 +4287,20 @@ fn match_domain(domain: DetailedCodeQueryDomain) -> Option<MatchResultDomain> {
     }
 }
 
-fn weak_finding_key(evidence: &DetailedCodeQueryEvidence) -> OpaqueFindingKey {
+/// The opaque identity of a finding with no strong anchor.
+///
+/// `path` is the normalized workspace-relative spelling the adapter already
+/// derived, not a second rendering of the evidence file: a unit produced at
+/// one workspace root is adapted at another, so the one spelling that is the
+/// same in both is the only sound input to a pinned finding identity.
+fn weak_finding_key(evidence: &UnitRowEvidence, path: &WorkspaceRelativePath) -> OpaqueFindingKey {
     let mut hasher = Sha256::new();
     update_hash(&mut hasher, WEAK_KEY_DOMAIN);
     // The registry's own label, never a second copy of it: this byte
     // sequence is inside a pinned finding identity, so a divergent
     // duplicate would silently change every finding id (issue #2498).
     update_hash(&mut hasher, evidence.domain.label().as_bytes());
-    update_hash(
-        &mut hasher,
-        evidence.file.rel_path().to_string_lossy().as_bytes(),
-    );
+    update_hash(&mut hasher, path.as_str().as_bytes());
     if let Some(span) = &evidence.byte_span {
         update_hash(&mut hasher, &span.start.to_be_bytes());
         update_hash(&mut hasher, &span.end.to_be_bytes());
@@ -3986,6 +4328,19 @@ fn weak_finding_key(evidence: &DetailedCodeQueryEvidence) -> OpaqueFindingKey {
         DetailedCodeQueryKey::JsxAttributeValue { id, ast_id } => {
             update_hash(&mut hasher, id.as_bytes());
             update_hash(&mut hasher, ast_id.as_bytes());
+        }
+        DetailedCodeQueryKey::FieldWriteValue {
+            id,
+            assignment_ast_id,
+            rhs_ast_id,
+            receiver_identity_id,
+            member_target_id,
+        } => {
+            update_hash(&mut hasher, id.as_bytes());
+            update_hash(&mut hasher, assignment_ast_id.as_bytes());
+            update_hash(&mut hasher, rhs_ast_id.as_bytes());
+            update_hash(&mut hasher, receiver_identity_id.as_bytes());
+            update_hash(&mut hasher, member_target_id.as_bytes());
         }
         DetailedCodeQueryKey::ProgramPoint { id, procedure_id }
         | DetailedCodeQueryKey::ControlEdge { id, procedure_id } => {
@@ -4187,6 +4542,9 @@ fn weak_finding_key(evidence: &DetailedCodeQueryEvidence) -> OpaqueFindingKey {
             update_hash(&mut hasher, outcome.as_bytes());
             update_optional_hash(&mut hasher, capture.as_deref());
         }
+        DetailedCodeQueryKey::MemberTargetAnalysis { site_id } => {
+            update_hash(&mut hasher, site_id.as_bytes());
+        }
         DetailedCodeQueryKey::ReceiverOutcome { id, site_id }
         | DetailedCodeQueryKey::ReceiverEvidence { id, site_id }
         | DetailedCodeQueryKey::CallShape { id, site_id }
@@ -4202,6 +4560,19 @@ fn weak_finding_key(evidence: &DetailedCodeQueryEvidence) -> OpaqueFindingKey {
         | DetailedCodeQueryKey::ResultContractFailureUse { id, acquisition_id } => {
             update_hash(&mut hasher, id.as_bytes());
             update_hash(&mut hasher, acquisition_id.as_bytes());
+        }
+        DetailedCodeQueryKey::NilnessOperation { id, procedure_id }
+        | DetailedCodeQueryKey::SwitchCoverage { id, procedure_id }
+        | DetailedCodeQueryKey::DetachedTaskTransfer { id, procedure_id } => {
+            update_hash(&mut hasher, id.as_bytes());
+            update_hash(&mut hasher, procedure_id.as_bytes());
+        }
+        DetailedCodeQueryKey::ConcurrentAccessConflict {
+            id,
+            root_procedure_id,
+        } => {
+            update_hash(&mut hasher, id.as_bytes());
+            update_hash(&mut hasher, root_procedure_id.as_bytes());
         }
         DetailedCodeQueryKey::ProcedureEffect { id, procedure_id } => {
             update_hash(&mut hasher, id.as_bytes());
@@ -4299,7 +4670,7 @@ fn update_optional_hash(hasher: &mut Sha256, value: Option<&str>) {
 
 fn certainty_reasons(
     diagnostics: &[CodeQueryDiagnostic],
-    provenance: &[DetailedCodeQueryProvenanceEvidence],
+    provenance: &[UnitRowProvenance],
 ) -> Vec<CertaintyReason> {
     let mut reasons = diagnostics
         .iter()
@@ -4558,6 +4929,59 @@ fn work_report(
         Vec::new(),
     )
     .expect("an empty metric set always satisfies the work-report schema")
+}
+
+fn relational_work_report(
+    work: CodeQueryExecutionWork,
+    relational: super::relational::RelationalEvaluationWork,
+    retained_findings: usize,
+    omitted_findings_lower_bound: u64,
+) -> PolicyWorkReport {
+    let metrics = [
+        (
+            "assertion.relational_input_rows",
+            PolicyWorkUnit::Rows,
+            relational.input_rows,
+        ),
+        (
+            "assertion.relational_materialized_rows",
+            PolicyWorkUnit::Rows,
+            relational.materialized_rows,
+        ),
+        (
+            "assertion.relational_join_key_probes",
+            PolicyWorkUnit::Count,
+            relational.join_key_probes,
+        ),
+        (
+            "assertion.relational_produced_groups",
+            PolicyWorkUnit::Rows,
+            relational.produced_groups,
+        ),
+        (
+            "assertion.relational_assertion_checks",
+            PolicyWorkUnit::Count,
+            relational.assertion_checks,
+        ),
+    ]
+    .into_iter()
+    .map(|(name, unit, value)| {
+        PolicyWorkMetric::try_new(name, unit, value)
+            .expect("static relational work metric names are canonical")
+    })
+    .collect();
+    PolicyWorkReport::try_new(
+        work.scanned_files,
+        work.scanned_source_bytes,
+        work.fact_nodes,
+        work.pipeline_rows,
+        work.examined_references,
+        u64::try_from(retained_findings).expect("usize fits in u64 on supported targets"),
+        omitted_findings_lower_bound,
+        0,
+        metrics,
+    )
+    .expect("the fixed relational metric set satisfies the work-report schema")
 }
 
 #[cfg(test)]

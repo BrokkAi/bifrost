@@ -123,7 +123,9 @@ require_archive_file brokk-bifrost-rust resources/treesitter/rust/imports.scm
 require_archive_file brokk-bifrost-analysis migrations/semantic-pack-catalog/0001-current-baseline.sql
 require_archive_file brokk-bifrost-analysis testdata/semantic-model-packs/declarations-v1.json
 require_archive_file brokk-bifrost-policy src/lib.rs
-require_archive_file brokk-bifrost-policy policy-packs/bifrost.code-smells/manifest.json
+for policy_manifest in "$repo_root"/crates/bifrost-policy/policy-packs/*/manifest.json; do
+  require_archive_file brokk-bifrost-policy "${policy_manifest#"$repo_root/crates/bifrost-policy/"}"
+done
 require_archive_file brokk-bifrost-semantic-packs src/lib.rs
 require_archive_file brokk-bifrost-semantic-packs src/release_bundle.rs
 require_archive_file brokk-bifrost-semantic-packs src/bin/bifrost-semantic-pack.rs
@@ -136,28 +138,48 @@ require_archive_file brokk-bifrost-semantic-packs embedded/go-stdlib-crypto-x509
 require_archive_file brokk-bifrost-semantic-packs embedded/go-stdlib-crypto-x509/shards/go.stdlib.crypto-x509.parameter-preconditions.json
 require_archive_file brokk-bifrost-semantic-packs embedded/go-stdlib-crypto-x509-declarations/manifest.json
 require_archive_file brokk-bifrost-semantic-packs embedded/go-stdlib-crypto-x509-declarations/shards/go.stdlib.crypto-x509.declarations.json
+require_archive_file brokk-bifrost-semantic-packs models/go-concurrency.json
+require_archive_file brokk-bifrost-semantic-packs models/go-concurrency-declarations.json
+require_archive_file brokk-bifrost-semantic-packs embedded/go-concurrency/manifest.json
+require_archive_file brokk-bifrost-semantic-packs embedded/go-concurrency/shards/go.concurrency.errgroup.deflate
+require_archive_file brokk-bifrost-semantic-packs embedded/go-concurrency/shards/go.concurrency.sync.deflate
+require_archive_file brokk-bifrost-semantic-packs embedded/go-concurrency-declarations/manifest.json
+require_archive_file brokk-bifrost-semantic-packs embedded/go-concurrency-declarations/shards/go.concurrency.errgroup.declarations.deflate
+require_archive_file brokk-bifrost-semantic-packs embedded/go-concurrency-declarations/shards/go.concurrency.sync.declarations.deflate
+require_archive_file brokk-bifrost-semantic-packs models/go-stdlib-sync-atomic.json
+require_archive_file brokk-bifrost-semantic-packs models/go-stdlib-sync-atomic-declarations.json
+require_archive_file brokk-bifrost-semantic-packs embedded/go-stdlib-sync-atomic/manifest.json
+require_archive_file brokk-bifrost-semantic-packs embedded/go-stdlib-sync-atomic/shards/go.stdlib.sync-atomic.concurrency.deflate
+require_archive_file brokk-bifrost-semantic-packs embedded/go-stdlib-sync-atomic-declarations/manifest.json
+require_archive_file brokk-bifrost-semantic-packs embedded/go-stdlib-sync-atomic-declarations/shards/go.stdlib.sync-atomic.declarations.deflate
+require_archive_file brokk-bifrost-semantic-packs embedded/node-child-process-javascript-declarations/manifest.json
+require_archive_file brokk-bifrost-semantic-packs embedded/node-child-process-javascript-declarations/shards/declarations.child-process-exec-sync.deflate
+require_archive_file brokk-bifrost-semantic-packs embedded/node-child-process-typescript-declarations/manifest.json
+require_archive_file brokk-bifrost-semantic-packs embedded/node-child-process-typescript-declarations/shards/declarations.child-process-exec-sync.deflate
 require_archive_file brokk-bifrost-runtime src/extension/mod.rs
 require_archive_file brokk-bifrost-runtime src/extension/workspace.rs
 
-manifest_policy_files="$temporary/manifest-policy-files.txt"
-checked_in_policy_files="$temporary/checked-in-policy-files.txt"
-jq -r '.policies[].path' crates/bifrost-policy/policy-packs/bifrost.code-smells/manifest.json \
-  | sed 's@^@policy-packs/bifrost.code-smells/@' \
-  | LC_ALL=C sort > "$manifest_policy_files"
-find crates/bifrost-policy/policy-packs/bifrost.code-smells/policies -type f -name '*.rqlp' -print \
-  | sed 's@^crates/bifrost-policy/@@' \
-  | LC_ALL=C sort > "$checked_in_policy_files"
-if ! cmp -s "$manifest_policy_files" "$checked_in_policy_files"; then
-  echo "Built-in policy manifest does not match the checked-in .rqlp inventory" >&2
-  diff -u "$manifest_policy_files" "$checked_in_policy_files" >&2 || true
-  exit 1
-fi
-while IFS= read -r required_file; do
-  require_archive_file brokk-bifrost-policy "$required_file"
-done < "$checked_in_policy_files"
+for policy_manifest in "$repo_root"/crates/bifrost-policy/policy-packs/*/manifest.json; do
+  manifest_policy_files="$temporary/manifest-policy-files.txt"
+  checked_in_policy_files="$temporary/checked-in-policy-files.txt"
+  jq -r '.policies[].path' "$policy_manifest" \
+    | sed "s@^@policy-packs/$(basename "$(dirname "$policy_manifest")")/@" \
+    | LC_ALL=C sort > "$manifest_policy_files"
+  find "$(dirname "$policy_manifest")/policies" -type f -name '*.rqlp' -print \
+    | sed "s@^$repo_root/crates/bifrost-policy/@@" \
+    | LC_ALL=C sort > "$checked_in_policy_files"
+  if ! cmp -s "$manifest_policy_files" "$checked_in_policy_files"; then
+    echo "Built-in policy manifest does not match the checked-in .rqlp inventory: $policy_manifest" >&2
+    diff -u "$manifest_policy_files" "$checked_in_policy_files" >&2 || true
+    exit 1
+  fi
+  while IFS= read -r required_file; do
+    require_archive_file brokk-bifrost-policy "$required_file"
+  done < "$checked_in_policy_files"
+done
 
 require_archive_file brokk-bifrost-mcp resources/agent-guidance/bifrost-agents.md
-require_archive_file brokk-bifrost schemas/semantic-model-pack-v1.schema.json
+require_archive_file brokk-bifrost schemas/semantic-model-pack-v2.schema.json
 require_archive_file brokk-bifrost schemas/workspace-packs-v1.schema.json
 
 root_archive=$(archive_for brokk-bifrost)

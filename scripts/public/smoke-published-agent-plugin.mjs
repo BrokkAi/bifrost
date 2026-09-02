@@ -147,9 +147,22 @@ export async function validatePublishedPackage(pluginDir, expectedVersion) {
 export function assertPolicyCatalog(response, host) {
   assert.equal(response.result?.isError, false, `${host} list_policies returned an MCP error`);
   const content = response.result?.structuredContent;
-  assert.equal(content?.id, "bifrost.code-smells", `${host} returned the wrong policy pack`);
-  assert.ok(Array.isArray(content?.policies) && content.policies.length > 0, `${host} returned no policies`);
-  return content;
+  assert.equal(content?.schema_version, 1, `${host} returned the wrong policy catalog schema`);
+  const packs = content?.packs;
+  assert.ok(Array.isArray(packs) && packs.length === 2, `${host} returned the wrong policy catalog envelope`);
+  const codeSmells = packs.find((pack) => pack.id === "bifrost.code-smells");
+  const security = packs.find((pack) => pack.id === "bifrost.security");
+  assert.ok(codeSmells, `${host} omitted the bifrost.code-smells pack`);
+  assert.ok(security, `${host} omitted the bifrost.security pack`);
+  assert.ok(
+    Array.isArray(codeSmells.policies) && codeSmells.policies.length > 0,
+    `${host} returned no code-smell policies`,
+  );
+  assert.ok(
+    Array.isArray(security.policies) && security.policies.length > 0,
+    `${host} returned no security policies`,
+  );
+  return codeSmells;
 }
 
 export function validateMarketplaceManifests(codexMarketplace, claudeMarketplace) {

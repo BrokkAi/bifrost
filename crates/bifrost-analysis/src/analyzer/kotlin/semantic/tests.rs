@@ -51,7 +51,7 @@ fn capability_table_is_total_and_partitioned() {
         });
 
     assert_eq!(counts.iter().sum::<usize>(), SemanticCapability::COUNT);
-    assert_eq!(counts, [9, 19, 4]);
+    assert_eq!(counts, [9, 19, 6]);
 }
 
 /// Whether the adapter proves a first iteration for `for (i in <iterable>)`.

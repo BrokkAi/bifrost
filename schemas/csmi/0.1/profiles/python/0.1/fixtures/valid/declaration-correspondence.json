@@ -1,0 +1,13 @@
+{
+  "kind": "declaration-correspondence",
+  "mappings": [
+    {
+      "declaration": "stub-request",
+      "runtime": "runtime-request",
+      "relation": "describes",
+      "conditions": {
+        "python": "vers:generic/>=3.9|<4"
+      }
+    }
+  ]
+}

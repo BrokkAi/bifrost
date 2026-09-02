@@ -137,7 +137,12 @@ impl TargetSpec {
         target: &CodeUnit,
     ) -> Option<Self> {
         let fq_name = target.fq_name();
-        if target.is_class() || is_kotlin_type_alias(graph, target) {
+        // Every Kotlin type-namespace declaration is a `Class` unit, a
+        // `typealias` included since #2892, so this one question admits them
+        // all. An alias is referenced in type positions (`val v: Parent`), so a
+        // query for one is a type query and must not fall into the property arm
+        // below, which answers by receiver typing an alias never has.
+        if target.is_class() {
             return Some(Self {
                 target: target.clone(),
                 kind: TargetKind::Type,
@@ -887,25 +892,6 @@ pub fn owner_declares_member(
         })
 }
 
-/// Whether `unit` is a Kotlin `typealias`.
-///
-/// `declarations.rs` indexes a type alias as a `Field` `CodeUnit` and records the
-/// alias-ness separately, so `is_class()` is false for one. That makes the flag
-/// load-bearing here twice over: an alias is *referenced* in type positions
-/// (`val v: Parent`), so a query for one is a type query, and a spelled name can
-/// *resolve* to one, so the name ladder has to count it as an existing type.
-/// Without this, a query for an alias would fall into the property arm and be
-/// answered by receiver typing, which an alias never has. The #1238 definition
-/// ladder in `brokk-bifrost-analysis` asks the same question through its
-/// `usages::kotlin_graph` wrapper (#2696), so this helper is shared rather
-/// than restated there.
-pub fn is_kotlin_type_alias(graph: &KotlinGraphSource<'_>, unit: &CodeUnit) -> bool {
-    unit.is_field()
-        && graph
-            .type_alias
-            .is_some_and(|provider| provider.is_type_alias(unit))
-}
-
 /// The file-level half of a Kotlin name scope: what the file declares itself to
 /// be in, and what it imported.
 struct KotlinFileFacts {
@@ -1042,8 +1028,10 @@ impl<'a> KotlinNameResolver<'a> {
     }
 
     pub fn resolve_type_components(&self, components: &[String], byte: usize) -> Option<String> {
+        // A spelled type name can denote a `typealias`, which is a `Class` unit
+        // like every other Kotlin type declaration since #2892.
         self.resolve_components(components, byte, |unit| {
-            !unit.is_synthetic() && (unit.is_class() || is_kotlin_type_alias(self.graph, unit))
+            !unit.is_synthetic() && unit.is_class()
         })
         .resolved()
     }

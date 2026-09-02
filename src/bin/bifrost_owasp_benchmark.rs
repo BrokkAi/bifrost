@@ -6,7 +6,8 @@
 //!       Digest the resolved ESAPI jar and write the pinned sanitizer pack.
 //!
 //!   run --benchmark <dir> --packs-dir <dir> --deps <dir> --jdk-catalog <dir>
-//!       --out <path> [--esapi-digest <hex>] [--limit <n>] [--timeout-secs <s>]
+//!       --out <path> [--progress-out <path>] [--esapi-digest <hex>]
+//!       [--limit <n>] [--timeout-secs <s>]
 //!       Build the Benchmark workspace, activate the curated sanitizer/summary
 //!       packs and, through the product dependency-pack path (#2558), the real
 //!       `bifrost.jdk` release bundle installed at `--jdk-catalog`; run one
@@ -46,7 +47,8 @@ fn main() -> ExitCode {
 mod imp {
     use std::collections::BTreeMap;
     use std::env;
-    use std::fs;
+    use std::fs::{self, OpenOptions};
+    use std::io::Write;
     use std::path::{Path, PathBuf};
     use std::time::Duration;
 
@@ -60,6 +62,7 @@ mod imp {
     use semver::Version;
     use serde::Serialize;
     use sha2::{Digest, Sha256};
+    use tempfile::NamedTempFile;
 
     pub fn run() -> Result<(), String> {
         let mut args = env::args().skip(1);
@@ -520,6 +523,94 @@ mod imp {
         real_abstained_inconclusive: u32,
     }
 
+    #[derive(Serialize)]
+    struct ProgressRunStarted<'a> {
+        schema: &'static str,
+        event: &'static str,
+        bifrost_version: &'static str,
+        bifrost_commit: Option<String>,
+        benchmark_repo: &'static str,
+        benchmark_commit: Option<String>,
+        benchmark_version: &'static str,
+        timeout_secs_per_category: u64,
+        dependency_jars: usize,
+        case_limit: Option<usize>,
+        final_artifact: &'a str,
+    }
+
+    #[derive(Serialize)]
+    struct ProgressTerminal<'a> {
+        event: &'static str,
+        final_artifact: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error: Option<&'a str>,
+    }
+
+    fn write_progress_record(
+        path: &Path,
+        record: &impl Serialize,
+        truncate: bool,
+    ) -> Result<(), String> {
+        let mut rendered = serde_json::to_vec(record)
+            .map_err(|error| format!("serialize OWASP progress record: {error}"))?;
+        rendered.push(b'\n');
+        let mut options = OpenOptions::new();
+        options.create(true).write(true);
+        if truncate {
+            options.truncate(true);
+        } else {
+            options.append(true);
+        }
+        let mut file = options
+            .open(path)
+            .map_err(|error| format!("open OWASP progress {}: {error}", path.display()))?;
+        file.write_all(&rendered)
+            .map_err(|error| format!("write OWASP progress {}: {error}", path.display()))?;
+        file.sync_data()
+            .map_err(|error| format!("sync OWASP progress {}: {error}", path.display()))
+    }
+
+    fn output_identity(path: &Path) -> Result<PathBuf, String> {
+        let file_name = path
+            .file_name()
+            .ok_or_else(|| format!("output path must name a file: {}", path.display()))?;
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("mkdir {}: {error}", parent.display()))?;
+        let canonical_parent = fs::canonicalize(parent)
+            .map_err(|error| format!("resolve output directory {}: {error}", parent.display()))?;
+        Ok(canonical_parent.join(file_name))
+    }
+
+    fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("mkdir {}: {error}", parent.display()))?;
+        let mut temporary = NamedTempFile::new_in(parent).map_err(|error| {
+            format!(
+                "create temporary OWASP artifact beside {}: {error}",
+                path.display()
+            )
+        })?;
+        temporary
+            .write_all(bytes)
+            .and_then(|()| temporary.flush())
+            .and_then(|()| temporary.as_file().sync_all())
+            .map_err(|error| format!("write temporary OWASP artifact: {error}"))?;
+        temporary.into_temp_path().persist(path).map_err(|error| {
+            format!(
+                "atomically replace OWASP artifact {}: {error}",
+                path.display()
+            )
+        })
+    }
+
     fn run_command(args: &[String]) -> Result<(), String> {
         let flags = parse_flags(args)?;
         let benchmark_root = PathBuf::from(
@@ -535,6 +626,18 @@ mod imp {
         let out = flags
             .get("out")
             .ok_or_else(|| "--out <path> is required".to_owned())?;
+        let progress_path = flags
+            .get("progress-out")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(format!("{out}.progress.jsonl")));
+        let artifact_identity = output_identity(Path::new(out))?;
+        let progress_identity = output_identity(&progress_path)?;
+        if artifact_identity == progress_identity {
+            return Err(format!(
+                "--out and --progress-out must name different files: {}",
+                artifact_identity.display()
+            ));
+        }
         // #2558: an operator catalog directory with the real `bifrost.jdk`
         // release bundle already installed
         // (`bifrost-semantic-pack install <bundle> <this dir>`). The JDK
@@ -603,22 +706,83 @@ mod imp {
             timeout,
             case_limit,
             jdk_catalog_root,
+            progress_path: Some(progress_path.clone()),
         };
 
+        if let Some(parent) = progress_path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            fs::create_dir_all(parent)
+                .map_err(|error| format!("mkdir {}: {error}", parent.display()))?;
+        }
+        write_progress_record(
+            &progress_path,
+            &ProgressRunStarted {
+                schema: "bifrost.owasp-benchmark-java.progress.v1",
+                event: "run_started",
+                bifrost_version: env!("CARGO_PKG_VERSION"),
+                bifrost_commit: git_head(Path::new(".")),
+                benchmark_repo: "https://github.com/OWASP-Benchmark/BenchmarkJava",
+                benchmark_commit: git_head(&benchmark_root),
+                benchmark_version: "1.2",
+                timeout_secs_per_category: timeout.as_secs(),
+                dependency_jars: config.dependency_jars.len(),
+                case_limit,
+                final_artifact: out,
+            },
+            true,
+        )?;
+        eprintln!(
+            "[owasp-progress] writing progress to {}",
+            progress_path.display()
+        );
+
         eprintln!("building benchmark workspace and running taint policies...");
-        let result = run_bakeoff(&config)?;
+        let result = match run_bakeoff(&config) {
+            Ok(result) => result,
+            Err(error) => {
+                if let Err(progress_error) = write_progress_record(
+                    &progress_path,
+                    &ProgressTerminal {
+                        event: "run_failed",
+                        final_artifact: out,
+                        error: Some(&error),
+                    },
+                    false,
+                ) {
+                    return Err(format!(
+                        "{error}; additionally failed to record run_failed: {progress_error}"
+                    ));
+                }
+                return Err(error);
+            }
+        };
         let artifact = assemble_artifact(&benchmark_root, &result, esapi_digest, &config);
         let mut rendered = serde_json::to_string_pretty(&artifact)
             .map_err(|error| format!("serialize artifact: {error}"))?;
         rendered.push('\n');
-        if let Some(parent) = Path::new(out).parent() {
+        if let Some(parent) = Path::new(out)
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
             fs::create_dir_all(parent)
                 .map_err(|error| format!("mkdir {}: {error}", parent.display()))?;
         }
-        fs::write(out, rendered.as_bytes()).map_err(|error| format!("write {out}: {error}"))?;
+        write_atomic(Path::new(out), rendered.as_bytes())?;
+        write_progress_record(
+            &progress_path,
+            &ProgressTerminal {
+                event: "run_completed",
+                final_artifact: out,
+                error: None,
+            },
+            false,
+        )?;
 
         print_summary(&result);
         println!("wrote artifact to {out}");
+        println!("wrote progress stream to {}", progress_path.display());
         Ok(())
     }
 
@@ -799,5 +963,33 @@ mod imp {
 
     fn fmt_rate(value: Option<f64>) -> String {
         value.map_or_else(|| "-".to_owned(), |v| format!("{v:.2}"))
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn output_identity_collapses_equivalent_parent_paths() {
+            let scratch = tempfile::tempdir().expect("scratch dir");
+            let direct = scratch.path().join("result.json");
+            let dotted = scratch.path().join(".").join("result.json");
+            assert_eq!(
+                output_identity(&direct).expect("direct identity"),
+                output_identity(&dotted).expect("dotted identity")
+            );
+        }
+
+        #[test]
+        fn atomic_write_replaces_the_complete_artifact() {
+            let scratch = tempfile::tempdir().expect("scratch dir");
+            let output = scratch.path().join("result.json");
+            fs::write(&output, b"old").expect("write old artifact");
+            write_atomic(&output, b"{\"complete\":true}\n").expect("replace artifact");
+            assert_eq!(
+                fs::read_to_string(output).expect("read replacement"),
+                "{\"complete\":true}\n"
+            );
+        }
     }
 }

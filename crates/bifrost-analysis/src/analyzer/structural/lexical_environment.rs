@@ -1229,6 +1229,7 @@ mod tests {
 
     /// A Java local is in effect from the end of its declaration, so a read
     /// above it reaches nothing at all.
+    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
     #[test]
     fn java_local_read_before_its_declaration_reaches_nothing() {
         let source = concat!(

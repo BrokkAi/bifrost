@@ -25,8 +25,9 @@
 //!   analysis; the analyzer hands the decoded base-specifier strings across.
 
 use crate::compile_context::CppCompileContext;
+use crate::declarations::CppRecoveredExportClassIndex;
 use crate::graph::CppWorkspaceSource;
-use crate::graph::resolver::SourceUsingIndex;
+use crate::graph::resolver::{CppClassDeclarationStrength, SourceUsingIndex};
 use crate::identity::CppCallableUnitRole;
 use crate::imports::IncludeTargetIndex;
 use brokk_bifrost_core::analyzer::capabilities::{TypeAliasProvider, TypeHierarchyProvider};
@@ -150,6 +151,42 @@ pub trait CppSource:
         donor_source: &ProjectFile,
         reference_is_c: bool,
         reaches: bool,
+    );
+
+    /// The file's embedded export-macro class recovery, resolved once per file.
+    ///
+    /// Built by [`crate::declarations::CppRecoveredExportClassIndex::build`],
+    /// which is a pure function of the file's parsed content. Memoized on the
+    /// analyzer for the same reason as [`Self::source_using_index`]: the
+    /// declaration-strength question asks it once per class-like unit, and
+    /// re-deriving it walks and sorts every `ERROR` subtree in the file (#1496).
+    fn recovered_export_class_index(
+        &self,
+        token: QueryToken<'_>,
+        file: &ProjectFile,
+    ) -> Arc<CppRecoveredExportClassIndex>;
+
+    /// The memoized answer of
+    /// [`crate::graph::resolver::cpp_class_declaration_strength`] for one
+    /// class-like unit, when a previous ask stored it.
+    ///
+    /// The answer is a pure function of the unit's declaration ranges and its
+    /// file's parse tree, so it is stable for an analyzer generation. Memoized
+    /// on the analyzer for the same reason as [`Self::source_using_index`]: the
+    /// inverse scan asks it once per declaration seed, and on a translation
+    /// unit the parser could not fully recover each ask re-derives the
+    /// export-macro recovery shapes from the file's `ERROR` subtrees, which is
+    /// quadratic in the file's size (#1496).
+    fn cached_class_declaration_strength(
+        &self,
+        candidate: &CodeUnit,
+    ) -> Option<CppClassDeclarationStrength>;
+
+    /// Store a completed declaration-strength answer.
+    fn cache_class_declaration_strength(
+        &self,
+        candidate: &CodeUnit,
+        strength: CppClassDeclarationStrength,
     );
 
     /// The declaration's syntactic owner, which unlike

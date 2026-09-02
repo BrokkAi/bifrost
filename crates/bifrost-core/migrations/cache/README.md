@@ -85,3 +85,21 @@ structural-facts snapshot with a manifest and normalized node, structural-role,
 and occurrence-role rows. The relational schema retains the existing
 whole-file hydration behavior while making the persisted facts queryable by
 SQLite.
+
+Migration `0035-signature-type-parameters-recorded.sql` adds one column that
+says whether a signature row's `type_parameters` list was read or defaulted.
+It invalidates nothing on its own: existing rows read back as unrecorded,
+which is what their producers actually knew. The languages whose type
+declarations now record the list bump their own per-language epoch salt.
+
+Migration `0036-policy-evaluation-units.sql` persists policy evaluation units
+and the base evaluations that published them. A unit row carries its key, the
+rendered rows it produced as one JSON product column, and the digest of the
+read set that licenses reusing it; `policy_read_keys` interns those reads as
+ordinary columns and `policy_unit_reads` records the membership. A
+`policy_evaluations` row records that one policy set evaluated completely over
+one committed subtree, so a later `--diff-base` run reuses that work instead of
+exporting and evaluating the base again. Unit rows follow their seed blob out
+of the cache through `ON DELETE CASCADE`, which is exactly when the recorded
+content is gone; evaluations are retired by an age and count sweep, because a
+tree id has no blob to hang from.

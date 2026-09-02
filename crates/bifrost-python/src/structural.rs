@@ -3,6 +3,7 @@
 //! See `src/analyzer/structural/spec.rs` for the contract and
 //! `.agent/ISSUE_328_SEARCH_AST_EXECPLAN.md` for the design.
 
+use brokk_bifrost_core::analyzer::common::node_source_text;
 use brokk_bifrost_core::analyzer::structural::adapter_helpers::{
     attach_argument_role_with_derived_name, attach_role_with_derived_name, attach_terminal_callee,
     field_name_in_parent, first_named_child, nearest_ancestor, node_range,
@@ -23,11 +24,12 @@ use brokk_bifrost_core::analyzer::structural::resolution::{
     LexicalEnvironmentSupport,
 };
 use brokk_bifrost_core::analyzer::structural::routes::{
-    DEEP_IDENTITY_AXES, IdentityRouteSupport, RouteHopKind,
+    CuratedExportSurface, DEEP_IDENTITY_AXES, IdentityRouteSupport, RouteHopKind,
 };
 use brokk_bifrost_core::analyzer::structural::spec::{EmbeddedLeafFact, RoleSink, StructuralSpec};
 use brokk_bifrost_core::analyzer::{Language, Range};
 use brokk_bifrost_core::cancellation::CancellationToken;
+use brokk_bifrost_core::hash::HashSet;
 use tree_sitter::Node;
 
 use crate::syntax::{
@@ -111,6 +113,10 @@ static PYTHON_OCCURRENCE_ROLE_SUPPORT: OccurrenceRoleSupport = OccurrenceRoleSup
 
 /// Whether a `dotted_name` names an imported module rather than an ordinary
 /// attribute chain, which decides whether its tail is an import target.
+///
+/// `relative_import` is the wrapper the grammar puts around the module name of
+/// `from .impl import x`. It is the same import target as the `pkg.impl` of
+/// `from pkg.impl import x`, so it passes through like the other wrappers.
 fn python_dotted_name_is_import(dotted_name: Node<'_>) -> bool {
     let mut current = dotted_name;
     loop {
@@ -121,7 +127,7 @@ fn python_dotted_name_is_import(dotted_name: Node<'_>) -> bool {
             "import_statement" | "import_from_statement" | "future_import_statement" => {
                 return true;
             }
-            "aliased_import" | "dotted_name" => current = parent,
+            "aliased_import" | "dotted_name" | "relative_import" => current = parent,
             _ => return false,
         }
     }
@@ -216,7 +222,14 @@ fn python_definition_is_method(definition: Node<'_>) -> bool {
 /// lives in the comprehension's own implicit scope; the same exception
 /// `analyzer::python::bindings` records as `PythonComprehensionBinding`.
 fn python_binding_activation(binder: Node<'_>, scope: Range) -> Option<BindingActivation> {
-    let form = nearest_ancestor(binder, |kind| {
+    // A binder outside every form below is an ordinary assignment target --
+    // the members of a module-level or block-level `a, b = ...` pattern list,
+    // for example -- and Python's scope-categorical rule makes it a local of
+    // its declaring scope for the whole scope. Answering `None` here made the
+    // whole file's lexical environment incomplete as soon as one such binder
+    // existed (scripts/test-cost/greedy.py's `s, k = heapq.heappop(heap)` at
+    // module scope), which failed every code-smells gate that derived it.
+    let Some(form) = nearest_ancestor(binder, |kind| {
         matches!(
             kind,
             "parameters"
@@ -230,7 +243,13 @@ fn python_binding_activation(binder: Node<'_>, scope: Range) -> Option<BindingAc
                 | "generator_expression"
                 | "function_definition"
         )
-    })?;
+    }) else {
+        return Some(BindingActivation {
+            kind: BindingKind::Local,
+            hoisting: HoistingClass::ScopeWide,
+            activation: scope,
+        });
+    };
     match form.kind() {
         "parameters" | "lambda_parameters" | "function_definition" => Some(BindingActivation {
             kind: BindingKind::Parameter,
@@ -272,6 +291,214 @@ fn python_binding_activation(binder: Node<'_>, scope: Range) -> Option<BindingAc
     }
 }
 
+/// The text one plain string literal denotes, or `None` when the literal is
+/// not plain: an f-string interpolation, an escape sequence this reader does
+/// not decode, or an implicit concatenation. `None` is never an empty name --
+/// it is "this value is computed", which makes the whole surface unreadable.
+fn python_plain_string_text<'a>(node: Node<'_>, source: &'a str) -> Option<&'a str> {
+    if node.kind() != "string" {
+        return None;
+    }
+    let mut cursor = node.walk();
+    let mut content = None;
+    for child in node.named_children(&mut cursor) {
+        match child.kind() {
+            "string_start" | "string_end" => {}
+            "string_content" if content.is_none() && child.named_child_count() == 0 => {
+                content = Some(child);
+            }
+            _ => return None,
+        }
+    }
+    // A literal with no content run is the empty string.
+    Some(content.map_or("", |child| node_source_text(child, source)))
+}
+
+/// Whether every member of a curated surface was read from the parse tree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReadableSurface {
+    Yes,
+    No,
+}
+
+/// Collect the members of an `__all__` value into `names`, reporting whether
+/// every member was readable. Only a list or tuple display of plain string
+/// literals is; anything else is a value the source computes.
+fn python_collect_all_members(
+    value: Node<'_>,
+    source: &str,
+    names: &mut HashSet<String>,
+) -> ReadableSurface {
+    if !matches!(value.kind(), "list" | "tuple") {
+        return ReadableSurface::No;
+    }
+    let mut cursor = value.walk();
+    for element in value.named_children(&mut cursor) {
+        match python_plain_string_text(element, source) {
+            Some(text) => {
+                names.insert(text.to_owned());
+            }
+            None => return ReadableSurface::No,
+        }
+    }
+    ReadableSurface::Yes
+}
+
+/// The names a Python module curates as its public surface: the value of its
+/// module-level `__all__`.
+///
+/// Only the module's own statements are read. An `__all__` inside a function
+/// is a local rather than the module's surface, and a name the module binds
+/// conditionally is still bound by the statement this reader already sees.
+/// A statement that assigns, extends, or mutates `__all__` with anything but a
+/// list or tuple of plain string literals makes the surface unreadable: the
+/// members are then unknown, and no import is classified from them.
+fn python_curated_export_surface(root: Node<'_>, source: &str) -> CuratedExportSurface {
+    let names_all = |node: Option<Node<'_>>| {
+        node.is_some_and(|node| {
+            node.kind() == "identifier" && node_source_text(node, source) == "__all__"
+        })
+    };
+    let mut names: HashSet<String> = HashSet::default();
+    let mut stated = false;
+    let mut readable = ReadableSurface::Yes;
+    let mut cursor = root.walk();
+    for statement in root.named_children(&mut cursor) {
+        if statement.kind() != "expression_statement" {
+            continue;
+        }
+        let mut inner = statement.walk();
+        for expression in statement.named_children(&mut inner) {
+            match expression.kind() {
+                "assignment" | "augmented_assignment" => {
+                    if !names_all(expression.child_by_field_name("left")) {
+                        continue;
+                    }
+                    stated = true;
+                    // An annotation without a value (`__all__: list[str]`)
+                    // binds nothing, so it states no members either way.
+                    let Some(value) = expression.child_by_field_name("right") else {
+                        continue;
+                    };
+                    // `+=` extends the surface; every other augmentation is a
+                    // value this reader does not compute.
+                    let extends = expression.kind() == "assignment"
+                        || expression
+                            .child_by_field_name("operator")
+                            .is_some_and(|operator| operator.kind() == "+=");
+                    if !extends
+                        || python_collect_all_members(value, source, &mut names)
+                            == ReadableSurface::No
+                    {
+                        readable = ReadableSurface::No;
+                    }
+                }
+                // `__all__.extend(other)` and its siblings rewrite the surface
+                // from a value the reader cannot see.
+                "call" => {
+                    let Some(function) = expression.child_by_field_name("function") else {
+                        continue;
+                    };
+                    if function.kind() == "attribute"
+                        && names_all(function.child_by_field_name("object"))
+                    {
+                        stated = true;
+                        readable = ReadableSurface::No;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    match (stated, readable) {
+        (false, _) => CuratedExportSurface::Absent,
+        (true, ReadableSurface::Yes) => CuratedExportSurface::Listed(names),
+        (true, ReadableSurface::No) => CuratedExportSurface::Unreadable,
+    }
+}
+
+/// Which indirection relation one Python import token participates in.
+///
+/// Python's grammar names no re-export, so the relation follows the explicit
+/// re-export rules the typing ecosystem already enforces (PEP 484 stub
+/// semantics, applied by pyright and mypy in strict mode), which makes this
+/// relation agree with what a type checker calls public:
+///
+/// 1. A name on the module's `__all__` is a re-export of whatever binding the
+///    module gives that name.
+/// 2. The redundant-alias forms `from x import y as y` and `import x as x`
+///    are re-exports.
+/// 3. `from x import *` is one star hop that forwards the public surface of
+///    `x`; the expansion is the import machinery's work, not this producer's,
+///    so the hop is recorded on the module reference and nothing is
+///    enumerated here.
+/// 4. Every other import is an ordinary import, including a plain
+///    `from .impl import helper` in a package `__init__.py` that states no
+///    `__all__`. The facade convention alone does not make a name public, and
+///    a consumer that wants every name a facade imports already has the
+///    import relation.
+///
+/// `None` is the answer for a name whose membership only an unreadable
+/// `__all__` could settle; the file's relations then report incomplete rather
+/// than guessing either way.
+fn python_indirection_relation(
+    token: Node<'_>,
+    source: &str,
+    surface: &CuratedExportSurface,
+) -> Option<RouteHopKind> {
+    let statement = nearest_ancestor(token, |kind| {
+        matches!(
+            kind,
+            "import_statement" | "import_from_statement" | "future_import_statement"
+        )
+    })?;
+    // The statement's own child that holds this token: a `module_name` field,
+    // or one `name` field of the import list.
+    let mut clause = token;
+    while let Some(parent) = clause.parent() {
+        if parent.id() == statement.id() {
+            break;
+        }
+        clause = parent;
+    }
+
+    if field_name_in_parent(statement, clause) == Some("module_name") {
+        // `from x import a` binds `a`, not `x`, so the module reference
+        // forwards nothing -- unless the import is the star form, whose one
+        // hop forwards the whole surface of `x`.
+        let mut cursor = statement.walk();
+        let star = statement
+            .children(&mut cursor)
+            .any(|child| child.kind() == "wildcard_import");
+        return Some(if star {
+            RouteHopKind::ReExport
+        } else {
+            RouteHopKind::Import
+        });
+    }
+
+    let bound = match clause.kind() {
+        "aliased_import" => {
+            let name = clause.child_by_field_name("name")?;
+            let alias = clause.child_by_field_name("alias")?;
+            if node_source_text(name, source) == node_source_text(alias, source) {
+                return Some(RouteHopKind::ReExport);
+            }
+            alias
+        }
+        // `import a.b.c` binds the top package `a`; `from m import a` binds
+        // the single-segment name the import list spells.
+        "dotted_name" if statement.kind() == "import_statement" => clause.named_child(0)?,
+        "dotted_name" => clause,
+        _ => return None,
+    };
+    match surface.lists(node_source_text(bound, source)) {
+        Some(true) => Some(RouteHopKind::ReExport),
+        Some(false) => Some(RouteHopKind::Import),
+        None => None,
+    }
+}
+
 impl StructuralSpec for PythonStructuralSpec {
     fn language(&self) -> Language {
         Language::Python
@@ -286,14 +513,12 @@ impl StructuralSpec for PythonStructuralSpec {
     }
 
     fn identity_route_support(&self) -> &IdentityRouteSupport {
-        // `import x as y` is an alias. Python's re-export shapes (an
-        // `__init__` facade, `__all__`) are conventions over files rather
-        // than statements a parse tree names, so the relation stays
-        // unclaimed until a producer models them (see the #1475 ExecPlan
-        // Decision Log, M3).
+        // `import x as y` is an alias, and `python_indirection_relation`
+        // states which imports re-export (issue #1649).
         static SUPPORT: IdentityRouteSupport = DEEP_IDENTITY_AXES
             .supported_relation(RouteHopKind::Alias)
             .supported_relation(RouteHopKind::Import)
+            .supported_relation(RouteHopKind::ReExport)
             .supported_relation(RouteHopKind::NestedOwner);
         &SUPPORT
     }
@@ -319,11 +544,17 @@ impl StructuralSpec for PythonStructuralSpec {
             .collect()
     }
 
-    fn indirection_relation(&self, token: Node<'_>) -> Option<RouteHopKind> {
-        nearest_ancestor(token, |kind| {
-            matches!(kind, "import_statement" | "import_from_statement")
-        })
-        .map(|_| RouteHopKind::Import)
+    fn curated_export_surface(&self, root: Node<'_>, source: &str) -> CuratedExportSurface {
+        python_curated_export_surface(root, source)
+    }
+
+    fn indirection_relation(
+        &self,
+        token: Node<'_>,
+        source: &str,
+        surface: &CuratedExportSurface,
+    ) -> Option<RouteHopKind> {
+        python_indirection_relation(token, source, surface)
     }
 
     fn kind_table(&self) -> &'static [(&'static str, NormalizedKind)] {

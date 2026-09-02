@@ -29,14 +29,15 @@ pub use coverage::{
     MAX_RETAINED_RELATIONAL_OBLIGATIONS, RelationCoverage, RelationalInput, RelationalObligation,
     RelationalObligationKind,
 };
+pub(crate) use eval::ReplayRow;
 pub use eval::{
     MAX_VIOLATION_REPRESENTATIVE_TUPLES, RelationalAssertionEvaluation,
-    RelationalAssertionEvaluationError, RelationalAssertionViolation, RelationalRowSelection,
-    RelationalViolationRow, evaluate_plan_ir, evaluate_row_selector_ir,
+    RelationalAssertionEvaluationError, RelationalAssertionViolation, RelationalEvaluationWork,
+    RelationalRowSelection, RelationalViolationRow, evaluate_plan_ir, evaluate_row_selector_ir,
 };
 pub use introspect::{
     RELATION_SCHEMA_FORMAT, RelationDomainSchema, RelationExpansionSchema, RelationFieldSchema,
-    RelationSchemaCatalog, admitted_expansions, relation_schema_catalog,
+    RelationSchemaCatalog, admitted_expansions, relation_domain_schema, relation_schema_catalog,
 };
 pub use ir::{
     ALL_ROW_EXPANSION_STEPS, IrAggregate, IrAggregateOp, IrAssertion, IrColumn, IrCompareOp,
@@ -202,7 +203,12 @@ pub fn validate_row_selector_plan(
             |literal| matches!(literal, RowLiteral::Boolean(value) if *value == expected),
         )
     };
-    let model = has_literal_predicate(
+    let callable_family = has_literal_predicate(
+        &predicates,
+        "model_callable_id",
+        |literal| matches!(literal, RowLiteral::String(value) if !value.is_empty()),
+    );
+    let model_record = has_literal_predicate(
         &predicates,
         "model_id",
         |literal| matches!(literal, RowLiteral::String(value) if !value.is_empty()),
@@ -216,14 +222,17 @@ pub fn validate_row_selector_plan(
     });
     let declared = lowered.declared_call_binding.as_ref() == Some(&lowered.output_binding);
     let mut requirements = vec![
-        ("model_id eq stable model identity", model),
+        (
+            "model_callable_id eq stable callable identity or model_id eq stable record identity",
+            callable_family || model_record,
+        ),
         (
             "semantic_target_id is-not-null",
             has_not_null_predicate(&predicates, "semantic_target_id"),
         ),
         (
-            "signature_id is-not-null",
-            has_not_null_predicate(&predicates, "signature_id"),
+            "formal_layout_id is-not-null",
+            has_not_null_predicate(&predicates, "formal_layout_id"),
         ),
         ("formal_name or formal_index exact selector", formal),
         ("mapping eq exact", constrained("mapping", "exact")),
@@ -239,6 +248,14 @@ pub fn validate_row_selector_plan(
     ];
     if declared {
         requirements.extend([
+            (
+                "model_id is-not-null",
+                has_not_null_predicate(&predicates, "model_id"),
+            ),
+            (
+                "signature_id is-not-null",
+                has_not_null_predicate(&predicates, "signature_id"),
+            ),
             (
                 "pack_id is-not-null",
                 has_not_null_predicate(&predicates, "pack_id"),

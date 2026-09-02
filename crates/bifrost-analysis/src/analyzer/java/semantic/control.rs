@@ -36,6 +36,7 @@ pub(super) fn lower_procedure<'tree, 'targets>(
         type_name_roots: declaration_inventory.type_roots,
         local_types: HashMap::default(),
         local_type_nodes: HashMap::default(),
+        array_values: HashSet::default(),
         non_null_values: HashSet::default(),
         catch_binders: HashMap::default(),
         parameters: HashMap::default(),
@@ -327,6 +328,8 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 MemoryLocationKind::Index {
                     base,
                     index: Some(index_value),
+                    constant_index: None,
+                    identity: crate::analyzer::semantic::IndexedLocationIdentity::Element,
                 },
             )?;
             self.append_effect(
@@ -1184,6 +1187,35 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 // an undischargeable FieldMemory gap.
                 self.edge(builder, entry, next)
             }
+            "field_access" if self.field_access_is_array_length(node) => {
+                let object = required_field(node, "object")?;
+                let access = self.point(builder, node, Vec::new())?;
+                let base = self.expression_value(builder, object, expression_value_kind(object))?;
+                self.append_effect(
+                    builder,
+                    access,
+                    SemanticEffect::ValueFlow {
+                        kind: ValueFlowKind::LanguageDefined,
+                        source: base,
+                        target: result,
+                    },
+                )?;
+                self.edge(builder, access, next)?;
+                if !self.expression_is_non_null(object) {
+                    // Reading an array length still dereferences the array and
+                    // can throw NullPointerException. Only the pseudo-field
+                    // memory operation is removed.
+                    self.implicit_abort_edge(builder, node, access, scope, None, stack)?;
+                }
+                self.schedule_expressions(
+                    builder,
+                    entry,
+                    &[object],
+                    EdgeTarget::normal(access),
+                    scope,
+                    stack,
+                )
+            }
             "field_access" => {
                 let object = required_field(node, "object")?;
                 let field = required_field(node, "field")?;
@@ -1234,6 +1266,8 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     MemoryLocationKind::Index {
                         base,
                         index: Some(index_value),
+                        constant_index: None,
+                        identity: crate::analyzer::semantic::IndexedLocationIdentity::Element,
                     },
                 )?;
                 self.append_effect(
@@ -2120,16 +2154,30 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let callee = self.source_value(builder, callable_anchor, SemanticValueKind::Callable)?;
         let result = self.expression_value(builder, node, SemanticValueKind::Temporary)?;
         let thrown = self.source_value(builder, callable_anchor, SemanticValueKind::Exception)?;
-        let receiver_node = match node.kind() {
-            "method_invocation" | "explicit_constructor_invocation" => {
-                node.child_by_field_name("object")
-            }
+        // Only a method invocation dispatches on a receiver. A constructor
+        // call never does: the qualifier of `outer.new Inner()` or of
+        // `outer.super(...)` names the enclosing instance, which the JVM
+        // passes as the constructor's hidden leading parameter, so it lowers
+        // as the call's implicit first argument below. Lowering it as a bound
+        // receiver instead contradicts the callable IR contract, which
+        // accepts `bound_receiver` only on a `BoundMethod` callable, and
+        // refused the whole file's materialization (#1910).
+        let receiver_node = (node.kind() == "method_invocation")
+            .then(|| node.child_by_field_name("object"))
+            .flatten();
+        let enclosing_instance_node = match node.kind() {
+            "explicit_constructor_invocation" => node.child_by_field_name("object"),
             "object_creation_expression" => object_creation_qualifier(node),
             _ => None,
         };
         let receiver = receiver_node
             .map(|receiver_node| {
                 self.expression_value(builder, receiver_node, expression_value_kind(receiver_node))
+            })
+            .transpose()?;
+        let enclosing_instance = enclosing_instance_node
+            .map(|qualifier| {
+                self.expression_value(builder, qualifier, expression_value_kind(qualifier))
             })
             .transpose()?;
         let callable_kind = match node.kind() {
@@ -2161,13 +2209,20 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             .child_by_field_name("arguments")
             .map(named_children)
             .unwrap_or_default();
-        let argument_values = arguments
-            .iter()
-            .map(|argument| {
-                self.expression_value(builder, *argument, expression_value_kind(*argument))
-                    .map(|value| SemanticCallArgument::direct(value, ArgumentDomain::Positional))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+        let mut argument_values =
+            Vec::with_capacity(arguments.len() + usize::from(enclosing_instance.is_some()));
+        argument_values.extend(
+            enclosing_instance
+                .map(|value| SemanticCallArgument::direct(value, ArgumentDomain::Positional)),
+        );
+        for argument in &arguments {
+            let value =
+                self.expression_value(builder, *argument, expression_value_kind(*argument))?;
+            argument_values.push(SemanticCallArgument::direct(
+                value,
+                ArgumentDomain::Positional,
+            ));
+        }
         let call_site = self.session.add_call_site(
             builder,
             CallSiteScaffold {
@@ -2242,11 +2297,15 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             )?;
         }
 
-        let mut evaluations =
-            Vec::with_capacity(arguments.len() + usize::from(receiver_node.is_some()));
-        if let Some(receiver_node) = receiver_node {
-            evaluations.push(receiver_node);
-        }
+        // Java evaluates the receiver or the enclosing-instance qualifier
+        // before the argument list.
+        let mut evaluations = Vec::with_capacity(
+            arguments.len()
+                + usize::from(receiver_node.is_some())
+                + usize::from(enclosing_instance_node.is_some()),
+        );
+        evaluations.extend(receiver_node);
+        evaluations.extend(enclosing_instance_node);
         evaluations.extend(arguments);
         self.schedule_expressions(
             builder,

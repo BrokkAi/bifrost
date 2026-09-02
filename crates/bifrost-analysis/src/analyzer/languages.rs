@@ -169,8 +169,8 @@ pub(crate) trait LanguageSupport: Send + Sync {
 
     /// The separator this language writes between the segments of a qualified callee
     /// path *in source*: `java.net.URLDecoder.decode` against `std::str::from_utf8`.
-    /// Only Rust differs from the dotted default so far (#2596); C++ writes `::` too,
-    /// but its external-callee identity has not been reviewed for this route.
+    /// Rust (#2596) and C++ (#2606) write `::`; every other language keeps the dotted
+    /// default.
     ///
     /// This decides only how the spelling is cut. The canonical owner published from
     /// it is always dot-joined, because that is how authored procedure-summary symbols
@@ -1206,6 +1206,7 @@ Kotlin     | Jvm                  | Kotlin | .   | yes      | Kotlin | yes  | - 
 
     /// A support must find its own analyzer and no other's: a mis-wired downcast would
     /// silently answer forward queries from the wrong language's declarations.
+    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
     #[test]
     fn each_support_resolves_only_its_own_forward_query_provider() {
         let temp = tempfile::tempdir().expect("temp dir");

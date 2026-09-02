@@ -1,0 +1,4 @@
+{
+  "kind": "node-runtime",
+  "versionRange": ">=20 <23"
+}

@@ -8,6 +8,7 @@ use super::{
     MemoryLocation, MemoryLocationId, MemoryLocationKind, ProcedureSemanticsParts, ProgramPoint,
     ProgramPointId, SemanticBudget, SemanticBudgetExceeded, SemanticCallSite, SemanticEvent,
     SemanticGap, SemanticLocator, SemanticValue, SemanticWork, SourceMapping, SourceMappingId,
+    SwitchFactId, SwitchFactParts,
 };
 
 #[derive(Debug, Clone)]
@@ -172,6 +173,7 @@ impl ProcedureCfgBuilder {
             AllocationKind::LanguageDefined(name) => name.len(),
             AllocationKind::Object
             | AllocationKind::Array
+            | AllocationKind::Slice
             | AllocationKind::Callable
             | AllocationKind::ClosureEnvironment
             | AllocationKind::SharedCell => 0,
@@ -329,6 +331,25 @@ impl ProcedureCfgBuilder {
             ..SemanticWork::default()
         })?;
         self.parts.guard_facts.push(guard);
+        Ok(id)
+    }
+
+    pub(crate) fn add_switch_fact(
+        &mut self,
+        fact: SwitchFactParts,
+    ) -> Result<SwitchFactId, SemanticBudgetExceeded> {
+        let id = SwitchFactId::try_from_index(self.parts.switch_facts.len())
+            .expect("switch-fact count is bounded by the u32 semantic budget");
+        assert_eq!(fact.id, id, "switch facts must use dense builder IDs");
+        assert!(
+            fact.point.index() < self.points.len(),
+            "switch point must exist"
+        );
+        self.reserve(SemanticWork {
+            nested_entries: fact.cases.len().saturating_add(1),
+            ..SemanticWork::default()
+        })?;
+        self.parts.switch_facts.push(fact);
         Ok(id)
     }
 
@@ -1197,6 +1218,8 @@ mod tests {
                 .add_call_site(SemanticCallSite {
                     id: CallSiteId::new(0),
                     point: ProgramPointId::new(0),
+                    invocation_mode: crate::analyzer::semantic::CallInvocationMode::Ordinary,
+                    execution_timing: crate::analyzer::semantic::ExecutionTiming::SameEvaluation,
                     callee: ValueId::new(0),
                     receiver: None,
                     arguments: Box::new([SemanticCallArgument {

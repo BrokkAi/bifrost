@@ -86,6 +86,7 @@ export default defineConfig({
             { label: '10-Minute Evaluation', slug: 'evaluate-bifrost' },
             { label: 'Install Bifrost', slug: 'install' },
             { label: 'CLI', slug: 'cli' },
+            { label: 'Scan a Codebase', slug: 'scan-a-codebase' },
             { label: 'Workspace Scope', slug: 'workspace-scope' },
           ],
         },
@@ -138,6 +139,7 @@ export default defineConfig({
                   label: 'Language Tutorials',
                   items: [
                     { label: 'Overview', slug: 'code-query-tutorials' },
+                    { label: 'Library Integration', slug: 'code-query-tutorials/library-integration' },
                     { label: 'Import Traversal', slug: 'code-query-tutorials/import-traversal' },
                     { label: 'Set Composition', slug: 'code-query-tutorials/set-composition' },
                     { label: 'Reference Traversal', slug: 'code-query-tutorials/reference-traversal' },

@@ -201,12 +201,6 @@ impl ScalaQueryTargetCatalog {
                     .or_default()
                     .push(target_id);
             }
-            if spec.accepts_term_field_role {
-                exact
-                    .entry((target.clone(), ScalaReferenceRole::Field))
-                    .or_default()
-                    .push(target_id);
-            }
             if spec.kind == TargetKind::Type && spec.accepts_apply_role {
                 exact
                     .entry((target.clone(), ScalaReferenceRole::CompanionValue))
@@ -629,7 +623,6 @@ impl ScalaQueryTargetCatalog {
             accepts_field_implementation: false,
             is_object_type: false,
             accepts_apply_role: false,
-            accepts_term_field_role: false,
             accepts_companion_apply_syntax: false,
         };
         Self {

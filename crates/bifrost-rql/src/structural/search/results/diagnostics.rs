@@ -1,211 +1,141 @@
 use super::*;
 use crate::analyzer::semantic::{SemanticBudgetDimension, SemanticWork};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CodeQueryDiagnosticCode {
-    InvalidPlan,
-    Cancelled,
-    UnsupportedStructuralFeature,
-    MissingStructuralAdapter,
-    UnsupportedImportAnalysis,
-    SemanticResultsOmitted,
-    SemanticWorkspaceRequired,
-    NoEnclosingProcedure,
-    SemanticCapabilityUnsupported,
-    SemanticAnalysisPartial,
-    CallBindingDispatchPartial,
-    SemanticBudgetExhausted,
-    SemanticProviderFailed,
-    UnresolvedProtocolReference,
-    TypestateRegistrationStale,
-    TypestateHandleStale,
-    TypestateRootMismatch,
-    TypestateCapabilityUnsupported,
-    TypestateAnalysisPartial,
-    TypestateProviderFailed,
-    TypestateSolverBudgetExhausted,
-    TypestateFindingBudgetExhausted,
-    TypestateWitnessTruncated,
-    UnresolvedValueFlowPlanReference,
-    ValueFlowRegistrationStale,
-    ValueFlowHandleStale,
-    ValueFlowRootMismatch,
-    ValueFlowCapabilityUnsupported,
-    ValueFlowAnalysisPartial,
-    ValueFlowProviderFailed,
-    ValueFlowSolverBudgetExhausted,
-    ValueFlowWitnessTruncated,
-    UnresolvedTaintResultReference,
-    TaintRegistrationStale,
-    TaintHandleStale,
-    TaintRootMismatch,
-    TaintPlanReportMismatch,
-    TaintProjectionFailed,
-    TaintFindingTruncated,
-    ReceiverAnalysisPartial,
-    ReceiverAnalysisFailed,
-    CallRelationBudgetExhausted,
-    CallRelationParseFailed,
-    CallRelationCandidatesOmitted,
-    CallRelationTargetsAmbiguous,
-    CallRelationCandidateLimit,
-    CallRelationAnalysisFailed,
-    ReferenceSourceBytesTruncated,
-    ReferenceCandidateFilesTruncated,
-    ReferenceCandidatesOmitted,
-    ReferenceTargetsAmbiguous,
-    ReferenceCallsiteLimit,
-    ReferenceAnalysisFailed,
-    UsesParserUnsupported,
-    UsesCandidateLimit,
-    UsesTargetsAmbiguous,
-    UsesCandidatesOmitted,
-    ExecutionBudgetExhausted,
-    PipelineBudgetExhausted,
-    ImportGraphBudgetExhausted,
-    OccurrenceRoleUnsupported,
-    OccurrenceResolutionIncomplete,
-    OccurrenceRowBudgetExhausted,
-    EnvironmentAxisUnsupported,
-    MaterializationAxisUnsupported,
-    MaterializationDerivationIncomplete,
-    MaterializationRowBudgetExhausted,
-    EnvironmentDerivationIncomplete,
-    EnvironmentRowBudgetExhausted,
-    ResolutionTraceIncomplete,
-    EdgeAxisUnsupported,
-    EdgeDerivationIncomplete,
-    FlowStateAxisUnsupported,
-    FlowStateDerivationIncomplete,
-    RewriteDomainUnsupported,
-    RewritePathDerivationIncomplete,
-    ControlRelationDerivationIncomplete,
-    ControlRelationExitPartitionPartial,
-    TopologyDerivationIncomplete,
-    TopologyOwnershipAmbiguous,
-    IdentityAxisUnsupported,
-    PathDerivationIncomplete,
-    EffectDerivationIncomplete,
-    ResultContractDerivationIncomplete,
-    EffectBudgetExhausted,
-    JsxProjectionIncomplete,
-    ResultLimitReached,
-    BroadQuery,
+/// Declare one labeled CodeQuery diagnostic vocabulary once.
+///
+/// The variant list, each variant's wire label, the complete label inventory,
+/// and the `as_str` projection all come from the single table below. A new
+/// variant therefore cannot reach the wire without also reaching `LABELS`,
+/// which is the inventory the Python client's parity test mirrors (#2898).
+macro_rules! code_query_labeled_enum {
+    (
+        $(#[$meta:meta])*
+        $name:ident {
+            $($variant:ident => $label:literal,)+
+        }
+    ) => {
+        $(#[$meta])*
+        pub enum $name {
+            $($variant,)+
+        }
+
+        impl $name {
+            /// Every label this vocabulary publishes, in declaration order.
+            pub const LABELS: &'static [&'static str] = &[$($label,)+];
+
+            /// The `snake_case` label this variant serializes as.
+            pub const fn as_str(self) -> &'static str {
+                match self {
+                    $(Self::$variant => $label,)+
+                }
+            }
+        }
+    };
 }
 
-impl CodeQueryDiagnosticCode {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::InvalidPlan => "invalid_plan",
-            Self::Cancelled => "cancelled",
-            Self::UnsupportedStructuralFeature => "unsupported_structural_feature",
-            Self::MissingStructuralAdapter => "missing_structural_adapter",
-            Self::UnsupportedImportAnalysis => "unsupported_import_analysis",
-            Self::SemanticResultsOmitted => "semantic_results_omitted",
-            Self::SemanticWorkspaceRequired => "semantic_workspace_required",
-            Self::NoEnclosingProcedure => "no_enclosing_procedure",
-            Self::SemanticCapabilityUnsupported => "semantic_capability_unsupported",
-            Self::SemanticAnalysisPartial => "semantic_analysis_partial",
-            Self::CallBindingDispatchPartial => "call_binding_dispatch_partial",
-            Self::SemanticBudgetExhausted => "semantic_budget_exhausted",
-            Self::SemanticProviderFailed => "semantic_provider_failed",
-            Self::UnresolvedProtocolReference => "unresolved_protocol_reference",
-            Self::TypestateRegistrationStale => "typestate_registration_stale",
-            Self::TypestateHandleStale => "typestate_handle_stale",
-            Self::TypestateRootMismatch => "typestate_root_mismatch",
-            Self::TypestateCapabilityUnsupported => "typestate_capability_unsupported",
-            Self::TypestateAnalysisPartial => "typestate_analysis_partial",
-            Self::TypestateProviderFailed => "typestate_provider_failed",
-            Self::TypestateSolverBudgetExhausted => "typestate_solver_budget_exhausted",
-            Self::TypestateFindingBudgetExhausted => "typestate_finding_budget_exhausted",
-            Self::TypestateWitnessTruncated => "typestate_witness_truncated",
-            Self::UnresolvedValueFlowPlanReference => "unresolved_value_flow_plan_reference",
-            Self::ValueFlowRegistrationStale => "value_flow_registration_stale",
-            Self::ValueFlowHandleStale => "value_flow_handle_stale",
-            Self::ValueFlowRootMismatch => "value_flow_root_mismatch",
-            Self::ValueFlowCapabilityUnsupported => "value_flow_capability_unsupported",
-            Self::ValueFlowAnalysisPartial => "value_flow_analysis_partial",
-            Self::ValueFlowProviderFailed => "value_flow_provider_failed",
-            Self::ValueFlowSolverBudgetExhausted => "value_flow_solver_budget_exhausted",
-            Self::ValueFlowWitnessTruncated => "value_flow_witness_truncated",
-            Self::UnresolvedTaintResultReference => "unresolved_taint_result_reference",
-            Self::TaintRegistrationStale => "taint_registration_stale",
-            Self::TaintHandleStale => "taint_handle_stale",
-            Self::TaintRootMismatch => "taint_root_mismatch",
-            Self::TaintPlanReportMismatch => "taint_plan_report_mismatch",
-            Self::TaintProjectionFailed => "taint_projection_failed",
-            Self::TaintFindingTruncated => "taint_finding_truncated",
-            Self::ReceiverAnalysisPartial => "receiver_analysis_partial",
-            Self::ReceiverAnalysisFailed => "receiver_analysis_failed",
-            Self::CallRelationBudgetExhausted => "call_relation_budget_exhausted",
-            Self::CallRelationParseFailed => "call_relation_parse_failed",
-            Self::CallRelationCandidatesOmitted => "call_relation_candidates_omitted",
-            Self::CallRelationTargetsAmbiguous => "call_relation_targets_ambiguous",
-            Self::CallRelationCandidateLimit => "call_relation_candidate_limit",
-            Self::CallRelationAnalysisFailed => "call_relation_analysis_failed",
-            Self::ReferenceSourceBytesTruncated => "reference_source_bytes_truncated",
-            Self::ReferenceCandidateFilesTruncated => "reference_candidate_files_truncated",
-            Self::ReferenceCandidatesOmitted => "reference_candidates_omitted",
-            Self::ReferenceTargetsAmbiguous => "reference_targets_ambiguous",
-            Self::ReferenceCallsiteLimit => "reference_callsite_limit",
-            Self::ReferenceAnalysisFailed => "reference_analysis_failed",
-            Self::UsesParserUnsupported => "uses_parser_unsupported",
-            Self::UsesCandidateLimit => "uses_candidate_limit",
-            Self::UsesTargetsAmbiguous => "uses_targets_ambiguous",
-            Self::UsesCandidatesOmitted => "uses_candidates_omitted",
-            Self::ExecutionBudgetExhausted => "execution_budget_exhausted",
-            Self::PipelineBudgetExhausted => "pipeline_budget_exhausted",
-            Self::ImportGraphBudgetExhausted => "import_graph_budget_exhausted",
-            Self::OccurrenceRoleUnsupported => "occurrence_role_unsupported",
-            Self::OccurrenceResolutionIncomplete => "occurrence_resolution_incomplete",
-            Self::OccurrenceRowBudgetExhausted => "occurrence_row_budget_exhausted",
-            Self::EnvironmentAxisUnsupported => "environment_axis_unsupported",
-            Self::MaterializationAxisUnsupported => "materialization_axis_unsupported",
-            Self::MaterializationDerivationIncomplete => "materialization_derivation_incomplete",
-            Self::MaterializationRowBudgetExhausted => "materialization_row_budget_exhausted",
-            Self::EnvironmentDerivationIncomplete => "environment_derivation_incomplete",
-            Self::EnvironmentRowBudgetExhausted => "environment_row_budget_exhausted",
-            Self::ResolutionTraceIncomplete => "resolution_trace_incomplete",
-            Self::EdgeAxisUnsupported => "edge_axis_unsupported",
-            Self::EdgeDerivationIncomplete => "edge_derivation_incomplete",
-            Self::FlowStateAxisUnsupported => "flow_state_axis_unsupported",
-            Self::FlowStateDerivationIncomplete => "flow_state_derivation_incomplete",
-            Self::RewriteDomainUnsupported => "rewrite_domain_unsupported",
-            Self::RewritePathDerivationIncomplete => "rewrite_path_derivation_incomplete",
-            Self::ControlRelationDerivationIncomplete => "control_relation_derivation_incomplete",
-            Self::ControlRelationExitPartitionPartial => "control_relation_exit_partition_partial",
-            Self::TopologyDerivationIncomplete => "topology_derivation_incomplete",
-            Self::TopologyOwnershipAmbiguous => "topology_ownership_ambiguous",
-            Self::IdentityAxisUnsupported => "identity_axis_unsupported",
-            Self::PathDerivationIncomplete => "path_derivation_incomplete",
-            Self::EffectDerivationIncomplete => "effect_derivation_incomplete",
-            Self::ResultContractDerivationIncomplete => "result_contract_derivation_incomplete",
-            Self::EffectBudgetExhausted => "effect_budget_exhausted",
-            Self::JsxProjectionIncomplete => "jsx_projection_incomplete",
-            Self::ResultLimitReached => "result_limit_reached",
-            Self::BroadQuery => "broad_query",
-        }
+code_query_labeled_enum! {
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    CodeQueryDiagnosticCode {
+        InvalidPlan => "invalid_plan",
+        Cancelled => "cancelled",
+        UnsupportedStructuralFeature => "unsupported_structural_feature",
+        MissingStructuralAdapter => "missing_structural_adapter",
+        UnsupportedImportAnalysis => "unsupported_import_analysis",
+        SemanticResultsOmitted => "semantic_results_omitted",
+        SemanticWorkspaceRequired => "semantic_workspace_required",
+        NoEnclosingProcedure => "no_enclosing_procedure",
+        SemanticCapabilityUnsupported => "semantic_capability_unsupported",
+        SemanticAnalysisPartial => "semantic_analysis_partial",
+        CallBindingDispatchPartial => "call_binding_dispatch_partial",
+        SemanticBudgetExhausted => "semantic_budget_exhausted",
+        SemanticProviderFailed => "semantic_provider_failed",
+        UnresolvedProtocolReference => "unresolved_protocol_reference",
+        TypestateRegistrationStale => "typestate_registration_stale",
+        TypestateHandleStale => "typestate_handle_stale",
+        TypestateRootMismatch => "typestate_root_mismatch",
+        TypestateCapabilityUnsupported => "typestate_capability_unsupported",
+        TypestateAnalysisPartial => "typestate_analysis_partial",
+        TypestateProviderFailed => "typestate_provider_failed",
+        TypestateSolverBudgetExhausted => "typestate_solver_budget_exhausted",
+        TypestateFindingBudgetExhausted => "typestate_finding_budget_exhausted",
+        TypestateWitnessTruncated => "typestate_witness_truncated",
+        UnresolvedValueFlowPlanReference => "unresolved_value_flow_plan_reference",
+        ValueFlowRegistrationStale => "value_flow_registration_stale",
+        ValueFlowHandleStale => "value_flow_handle_stale",
+        ValueFlowRootMismatch => "value_flow_root_mismatch",
+        ValueFlowCapabilityUnsupported => "value_flow_capability_unsupported",
+        ValueFlowAnalysisPartial => "value_flow_analysis_partial",
+        ValueFlowProviderFailed => "value_flow_provider_failed",
+        ValueFlowSolverBudgetExhausted => "value_flow_solver_budget_exhausted",
+        ValueFlowWitnessTruncated => "value_flow_witness_truncated",
+        UnresolvedTaintResultReference => "unresolved_taint_result_reference",
+        TaintRegistrationStale => "taint_registration_stale",
+        TaintHandleStale => "taint_handle_stale",
+        TaintRootMismatch => "taint_root_mismatch",
+        TaintPlanReportMismatch => "taint_plan_report_mismatch",
+        TaintProjectionFailed => "taint_projection_failed",
+        TaintFindingTruncated => "taint_finding_truncated",
+        ReceiverAnalysisPartial => "receiver_analysis_partial",
+        ReceiverAnalysisFailed => "receiver_analysis_failed",
+        CallRelationBudgetExhausted => "call_relation_budget_exhausted",
+        CallRelationParseFailed => "call_relation_parse_failed",
+        CallRelationCandidatesOmitted => "call_relation_candidates_omitted",
+        CallRelationTargetsAmbiguous => "call_relation_targets_ambiguous",
+        CallRelationCandidateLimit => "call_relation_candidate_limit",
+        CallRelationAnalysisFailed => "call_relation_analysis_failed",
+        ReferenceSourceBytesTruncated => "reference_source_bytes_truncated",
+        ReferenceCandidateFilesTruncated => "reference_candidate_files_truncated",
+        ReferenceCandidatesOmitted => "reference_candidates_omitted",
+        ReferenceTargetsAmbiguous => "reference_targets_ambiguous",
+        ReferenceCallsiteLimit => "reference_callsite_limit",
+        ReferenceAnalysisFailed => "reference_analysis_failed",
+        UsesParserUnsupported => "uses_parser_unsupported",
+        UsesCandidateLimit => "uses_candidate_limit",
+        UsesTargetsAmbiguous => "uses_targets_ambiguous",
+        UsesCandidatesOmitted => "uses_candidates_omitted",
+        ExecutionBudgetExhausted => "execution_budget_exhausted",
+        PipelineBudgetExhausted => "pipeline_budget_exhausted",
+        ImportGraphBudgetExhausted => "import_graph_budget_exhausted",
+        OccurrenceRoleUnsupported => "occurrence_role_unsupported",
+        OccurrenceResolutionIncomplete => "occurrence_resolution_incomplete",
+        OccurrenceRowBudgetExhausted => "occurrence_row_budget_exhausted",
+        EnvironmentAxisUnsupported => "environment_axis_unsupported",
+        MaterializationAxisUnsupported => "materialization_axis_unsupported",
+        MaterializationDerivationIncomplete => "materialization_derivation_incomplete",
+        MaterializationRowBudgetExhausted => "materialization_row_budget_exhausted",
+        EnvironmentDerivationIncomplete => "environment_derivation_incomplete",
+        EnvironmentRowBudgetExhausted => "environment_row_budget_exhausted",
+        ResolutionTraceIncomplete => "resolution_trace_incomplete",
+        EdgeAxisUnsupported => "edge_axis_unsupported",
+        EdgeDerivationIncomplete => "edge_derivation_incomplete",
+        FlowStateAxisUnsupported => "flow_state_axis_unsupported",
+        FlowStateDerivationIncomplete => "flow_state_derivation_incomplete",
+        RewriteDomainUnsupported => "rewrite_domain_unsupported",
+        RewritePathDerivationIncomplete => "rewrite_path_derivation_incomplete",
+        ControlRelationDerivationIncomplete => "control_relation_derivation_incomplete",
+        ControlRelationExitPartitionPartial => "control_relation_exit_partition_partial",
+        TopologyDerivationIncomplete => "topology_derivation_incomplete",
+        TopologyOwnershipAmbiguous => "topology_ownership_ambiguous",
+        IdentityAxisUnsupported => "identity_axis_unsupported",
+        PathDerivationIncomplete => "path_derivation_incomplete",
+        EffectDerivationIncomplete => "effect_derivation_incomplete",
+        ResultContractDerivationIncomplete => "result_contract_derivation_incomplete",
+        EffectBudgetExhausted => "effect_budget_exhausted",
+        JsxProjectionIncomplete => "jsx_projection_incomplete",
+        ResultLimitReached => "result_limit_reached",
+        BroadQuery => "broad_query",
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CodeQueryDiagnosticImpact {
-    Advisory,
-    DeclaredNonExhaustive,
-    Incomplete,
-    Invalid,
-}
-
-impl CodeQueryDiagnosticImpact {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Advisory => "advisory",
-            Self::DeclaredNonExhaustive => "declared_non_exhaustive",
-            Self::Incomplete => "incomplete",
-            Self::Invalid => "invalid",
-        }
+code_query_labeled_enum! {
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    CodeQueryDiagnosticImpact {
+        Advisory => "advisory",
+        DeclaredNonExhaustive => "declared_non_exhaustive",
+        Incomplete => "incomplete",
+        Invalid => "invalid",
     }
 }
 
@@ -217,6 +147,61 @@ pub struct CodeQueryDiagnostic {
     pub branch: Vec<usize>,
     pub language: &'static str,
     pub message: String,
+}
+
+/// Read one diagnostic back, resolving its language label to the one static
+/// spelling this crate emits.
+///
+/// Written by hand because the label is a `&'static str`: a derived reader
+/// would demand that every input outlive the program. A diagnostic names the
+/// language whose analysis produced it, or one of the two whole-execution
+/// labels, so a label that is neither is a row this build did not write -- an
+/// error, never a label invented at load time. (`Box::leak` would answer any
+/// string at the cost of leaking one allocation per corrupt row.)
+impl<'de> Deserialize<'de> for CodeQueryDiagnostic {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct Wire {
+            code: CodeQueryDiagnosticCode,
+            impact: CodeQueryDiagnosticImpact,
+            #[serde(default)]
+            branch: Vec<usize>,
+            language: String,
+            message: String,
+        }
+
+        let wire = Wire::deserialize(deserializer)?;
+        let language = static_language_label(&wire.language).ok_or_else(|| {
+            serde::de::Error::custom(format!(
+                "unknown code query diagnostic language `{}`",
+                wire.language
+            ))
+        })?;
+        Ok(Self {
+            code: wire.code,
+            impact: wire.impact,
+            branch: wire.branch,
+            language,
+            message: wire.message,
+        })
+    }
+}
+
+/// The whole-execution language labels, which name no single language.
+const EXECUTION_SCOPE_LABELS: [&str; 2] = ["workspace", "all"];
+
+fn static_language_label(label: &str) -> Option<&'static str> {
+    if let Some(language) = Language::from_config_label(label)
+        && language.config_label() == label
+    {
+        return Some(language.config_label());
+    }
+    EXECUTION_SCOPE_LABELS
+        .into_iter()
+        .find(|known| *known == label)
 }
 
 impl CodeQueryDiagnostic {
@@ -484,7 +469,8 @@ impl CodeQuerySemanticRowLimits {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct CodeQueryExecutionWork {
     pub scanned_files: u64,
     pub scanned_source_bytes: u64,
@@ -511,7 +497,71 @@ impl CodeQueryExecutionWork {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+/// Every budgeted lane an execution charged that `CodeQueryExecutionWork`
+/// does not publish, plus the per-step output counts.
+///
+/// A merge of per-seed executions can only claim to equal one whole execution
+/// while no cumulative cap was reached, and a cap the merge cannot see is a
+/// truncation the sliced run cannot detect. `CodeQueryExecutionWork` is the
+/// caller-facing measurement and its shape is pinned by consumers, so the
+/// three budgeted lanes it drops and the per-step counts it never had live
+/// here, beside it, rather than changing it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CodeQueryBudgetedWork {
+    /// Provenance trace steps charged against `max_pipeline_rows`.
+    pub provenance_steps: u64,
+    /// Files resolved by import traversal, charged against
+    /// `max_scanned_files`.
+    pub import_files_resolved: u64,
+    /// Import edges resolved, charged against `max_pipeline_rows`.
+    pub import_edges_resolved: u64,
+    /// Rows each plan operator emitted, indexed by its physical plan node.
+    ///
+    /// `max_step_outputs` is enforced per step and has no counter of its own,
+    /// so a merge that sums lanes must sum these separately to see a per-step
+    /// truncation. Two executions of the same query lower to the same plan and
+    /// therefore index identically; a node that is not a pipeline step
+    /// contributes zero.
+    pub step_outputs: Vec<u64>,
+}
+
+impl CodeQueryBudgetedWork {
+    /// Sum every lane of two executions of the same query.
+    ///
+    /// Sums over-count whatever two units both reached, so a rule that widens
+    /// when a sum reaches its cap widens more often than strictly necessary,
+    /// never less.
+    pub fn saturating_add(&self, other: &Self) -> Self {
+        assert_eq!(
+            self.step_outputs.len(),
+            other.step_outputs.len(),
+            "per-step output counts of one query's executions have one entry per plan node"
+        );
+        Self {
+            provenance_steps: self.provenance_steps.saturating_add(other.provenance_steps),
+            import_files_resolved: self
+                .import_files_resolved
+                .saturating_add(other.import_files_resolved),
+            import_edges_resolved: self
+                .import_edges_resolved
+                .saturating_add(other.import_edges_resolved),
+            step_outputs: self
+                .step_outputs
+                .iter()
+                .zip(&other.step_outputs)
+                .map(|(left, right)| left.saturating_add(*right))
+                .collect(),
+        }
+    }
+
+    /// The largest number of rows any one step emitted.
+    pub fn max_step_outputs(&self) -> u64 {
+        self.step_outputs.iter().copied().max().unwrap_or(0)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct CodeQuerySemanticWork {
     pub materialization_attempts: u64,
     pub unique_materialized_files: u64,
@@ -612,7 +662,8 @@ impl CodeQuerySemanticWork {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct CodeQueryTypestateWork {
     pub solves: u64,
     pub cache_hits: u64,
@@ -737,7 +788,8 @@ impl CodeQueryTypestateWork {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct CodeQueryValueFlowWork {
     pub solves: u64,
     pub cache_hits: u64,

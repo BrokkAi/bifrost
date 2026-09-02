@@ -50,6 +50,21 @@ impl RowScalar {
     }
 }
 
+/// The value as a diagnostic reads it back: identity and enum labels bare,
+/// integers and booleans in their own spelling.
+impl fmt::Display for RowScalar {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::StableId(value)
+            | Self::String(value)
+            | Self::ConstrainedEnum(value)
+            | Self::DeclarationIdentity(value) => formatter.write_str(value),
+            Self::Integer(value) => write!(formatter, "{value}"),
+            Self::Boolean(value) => write!(formatter, "{value}"),
+        }
+    }
+}
+
 impl From<CodeQueryRowScalarRef<'_>> for RowScalar {
     fn from(value: CodeQueryRowScalarRef<'_>) -> Self {
         match value {
@@ -153,6 +168,19 @@ impl IrSchema {
         self.fields.iter().find(|field| &field.column == column)
     }
 
+    /// Every field name the named binding publishes here, in schema order.
+    ///
+    /// An unknown-field diagnostic names the complete alternative set rather
+    /// than a count, so an author who misspelled a column reads the columns the
+    /// binding actually carries at the point of failure.
+    pub fn field_names_of(&self, qualifier: &str) -> Vec<String> {
+        self.fields
+            .iter()
+            .filter(|field| field.column.qualifier == qualifier)
+            .map(|field| field.column.name.clone())
+            .collect()
+    }
+
     pub fn len(&self) -> usize {
         self.fields.len()
     }
@@ -168,6 +196,15 @@ impl IrSchema {
 pub enum IrOperand {
     Column(IrColumn),
     Literal(RowLiteral),
+}
+
+impl fmt::Display for IrOperand {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Column(column) => write!(formatter, "{column}"),
+            Self::Literal(literal) => write!(formatter, "{literal}"),
+        }
+    }
 }
 
 /// Comparison operators.
@@ -228,6 +265,46 @@ pub enum IrPredicate {
         column: IrColumn,
         values: Vec<RowLiteral>,
     },
+}
+
+impl IrPredicate {
+    /// The row column this test reads.
+    ///
+    /// Every test names exactly one, which is the column a diagnostic reports
+    /// the row's actual value for.
+    pub const fn column(&self) -> &IrColumn {
+        match self {
+            Self::Compare { left, .. } => left,
+            Self::IsNull { column, .. } | Self::InSet { column, .. } => column,
+        }
+    }
+}
+
+/// The authored spelling of one row test, rendered in one place so that every
+/// diagnostic naming a predicate names it the way the policy source wrote it.
+impl fmt::Display for IrPredicate {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Compare { left, op, right } => {
+                write!(formatter, "({left} {} {right})", op.label())
+            }
+            Self::IsNull { column, negated } => write!(
+                formatter,
+                "({column} {})",
+                if *negated { "is-not-null" } else { "is-null" }
+            ),
+            Self::InSet { column, values } => {
+                write!(formatter, "({column} in (")?;
+                for (index, value) in values.iter().enumerate() {
+                    if index > 0 {
+                        formatter.write_str(" ")?;
+                    }
+                    write!(formatter, "{value}")?;
+                }
+                formatter.write_str("))")
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]

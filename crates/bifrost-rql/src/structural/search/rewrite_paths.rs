@@ -257,7 +257,10 @@ mod tests {
         RewritePath {
             domain: RewriteDomainKind::RustImportAlias,
             origin: RewriteOrigin {
-                file: ProjectFile::new(std::path::Path::new("/tmp"), "src/lib.rs"),
+                file: ProjectFile::new(
+                    std::env::current_dir().expect("test working directory must be available"),
+                    "src/lib.rs",
+                ),
                 specifier: "a".to_string(),
                 range: crate::analyzer::Range {
                     start_byte: 0,

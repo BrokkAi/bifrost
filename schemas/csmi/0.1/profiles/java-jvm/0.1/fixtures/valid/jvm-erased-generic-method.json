@@ -1,0 +1,16 @@
+{
+  "$profileSchema": "jvm-binary-identity",
+  "profileVersion": "0.1",
+  "owner": "org/example/Box",
+  "binaryEntity": {
+    "kind": "method",
+    "name": "value",
+    "descriptor": "()Ljava/lang/Object;"
+  },
+  "variant": {
+    "entryPath": "org/example/Box.class",
+    "release": 0,
+    "classFileMajor": 61
+  },
+  "genericSignature": "()TT;"
+}

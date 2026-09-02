@@ -167,6 +167,100 @@ pub struct CodeQueryReceiverAnalysis {
     pub limit: Option<&'static str>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct CodeQueryMemberTarget {
+    pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub language: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub start_line: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub end_line: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub node_range: Option<CodeQueryRange>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub receiver_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub receiver_fq_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub receiver_kind: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub receiver_declaration: Option<CodeQueryDeclaration>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub receiver_semantic_model:
+        Option<Box<crate::analyzer::semantic_model::SemanticModelProvenance>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub receiver_proof: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub receiver_binding_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub receiver_binding_range: Option<CodeQueryRange>,
+    pub name: String,
+    pub fq_name: String,
+    pub kind: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub declaration: Option<CodeQueryDeclaration>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub semantic_model: Option<Box<crate::analyzer::semantic_model::SemanticModelProvenance>>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CodeQueryMemberTargetAnalysis {
+    pub site_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub site_ast_id: Option<String>,
+    pub path: String,
+    pub language: &'static str,
+    #[serde(rename = "range")]
+    pub receiver_range: CodeQueryRange,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub member_range: Option<CodeQueryRange>,
+    #[serde(rename = "text")]
+    pub receiver_text: String,
+    pub input_kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capture: Option<String>,
+    pub outcome: &'static str,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub member_targets: Vec<CodeQueryMemberTarget>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit: Option<&'static str>,
+    pub coverage: &'static str,
+}
+
+/// Exact value written by one proven static-member assignment. The primary
+/// range and text belong to the RHS expression; the other ranges retain the
+/// write relation without changing policy `matched-value` semantics.
+#[derive(Debug, Clone, Serialize)]
+pub struct CodeQueryFieldWriteValue {
+    pub id: String,
+    pub write_site_id: String,
+    pub assignment_ast_id: String,
+    pub left_ast_id: String,
+    pub receiver_ast_id: String,
+    pub member_ast_id: String,
+    pub rhs_ast_id: String,
+    pub path: String,
+    pub language: &'static str,
+    pub range: CodeQueryRange,
+    pub text: String,
+    pub assignment_range: CodeQueryRange,
+    pub receiver_range: CodeQueryRange,
+    pub member_range: CodeQueryRange,
+    pub receiver_identity_id: String,
+    pub member_target_id: String,
+    pub member_target: CodeQueryMemberTarget,
+    pub proof: &'static str,
+    pub completeness: &'static str,
+    pub coverage: &'static str,
+}
+
 /// The mandatory terminal row for one receiver/value analysis site. Evidence
 /// rows may be empty, but this row always states why and whether that absence
 /// is exhaustive.
@@ -671,6 +765,14 @@ pub struct CodeQueryCallBinding {
     /// both accept it, which is a selection nobody made.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub signature_id: Option<String>,
+    /// Exact semantic-model callable family, independent of overload-record
+    /// selection.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_callable_id: Option<String>,
+    /// Exact formal layout for this application, independent of overload-
+    /// record selection.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub formal_layout_id: Option<String>,
     /// Stable identity of the model symbol that supplied an external target,
     /// when this row is model-backed rather than source-materialized.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -757,8 +859,9 @@ pub struct CodeQueryCallBinding {
 /// The row states that an activated semantic-model pack declares `effect_id`
 /// for the callee this call's dispatch answer named. Nothing about the effect
 /// is inferred from source text: `proof` and `coverage` are the dispatch
-/// oracle's own words, and `timing`, `certainty` and the pack provenance are
-/// the reviewed declaration's.
+/// oracle's own words; `timing`, `certainty`, and pack provenance are the
+/// reviewed declaration's, while `execution_timing` composes that schedule
+/// with the exact semantic call site.
 ///
 /// At least one row exists per call site. `terminal` marks the row that states
 /// the site's status when no declaration applies — a call whose callee nobody
@@ -795,9 +898,14 @@ pub struct CodeQueryCallEffect {
     /// Always `direct` on this domain; transitive attribution lives on
     /// `procedure_effect`.
     pub classification: &'static str,
-    /// `immediate`, `deferred`, or `unknown`, from the declaration.
+    /// The semantic pack's authored schedule: `immediate`, `deferred`, or
+    /// `unknown`. Preserved for schema-v1 consumers.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timing: Option<&'static str>,
+    /// Canonical execution timing after composing the exact source call with
+    /// the modeled schedule.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub execution_timing: Option<&'static str>,
     /// `definite` or `possible`: the meet of the declaration's own certainty
     /// and the dispatch arm's proof.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -962,6 +1070,121 @@ pub struct CodeQueryResultContractUse {
     pub summary_id: Option<String>,
 }
 
+/// One source-backed pointer operation with its local scalar nilness fact.
+#[derive(Debug, Clone, Serialize)]
+pub struct CodeQueryNilnessOperation {
+    pub id: String,
+    pub procedure_id: String,
+    pub operation_point_id: String,
+    pub subject_value_id: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ast_id: Option<String>,
+    pub path: String,
+    pub language: &'static str,
+    pub range: CodeQueryRange,
+    pub use_kind: &'static str,
+    pub fact: &'static str,
+    pub origin: &'static str,
+    pub proof: &'static str,
+    pub coverage: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<&'static str>,
+}
+
+/// One structured switch with the coverage conclusion justified by its
+/// adapter-published selector and case facts.
+#[derive(Debug, Clone, Serialize)]
+pub struct CodeQuerySwitchCoverage {
+    pub id: String,
+    pub procedure_id: String,
+    pub switch_fact_id: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ast_id: Option<String>,
+    pub path: String,
+    pub language: &'static str,
+    pub range: CodeQueryRange,
+    pub kind: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub selector_value_id: Option<u64>,
+    pub selector_domain: &'static str,
+    pub case_count: usize,
+    pub has_true_case: bool,
+    pub has_false_case: bool,
+    pub default_present: bool,
+    pub verdict: &'static str,
+    pub proof: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<&'static str>,
+}
+
+/// One exact same-location ordinary-access pair in a bounded concurrent task
+/// slice. Built-in policies select only `proven` and `exhaustive` rows whose
+/// ordering is `unordered` and whose protection is `unprotected`.
+#[derive(Debug, Clone, Serialize)]
+pub struct CodeQueryConcurrentAccessConflict {
+    pub id: String,
+    pub root_procedure_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ast_id: Option<String>,
+    pub path: String,
+    pub language: &'static str,
+    pub range: CodeQueryRange,
+    pub location_id: String,
+    pub location_kind: String,
+    pub first_procedure_id: String,
+    pub first_point_id: u32,
+    pub first_access: &'static str,
+    pub first_path: String,
+    pub first_range: CodeQueryRange,
+    #[serde(skip)]
+    pub first_start_byte: usize,
+    #[serde(skip)]
+    pub first_end_byte: usize,
+    pub second_procedure_id: String,
+    pub second_point_id: u32,
+    pub second_access: &'static str,
+    pub second_path: String,
+    pub second_range: CodeQueryRange,
+    #[serde(skip)]
+    pub second_start_byte: usize,
+    #[serde(skip)]
+    pub second_end_byte: usize,
+    pub task_relation: &'static str,
+    pub ordering: &'static str,
+    pub protection: &'static str,
+    pub verdict: &'static str,
+    pub proof: &'static str,
+    pub coverage: &'static str,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub reasons: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CodeQueryDetachedTaskTransfer {
+    pub id: String,
+    pub procedure_id: String,
+    pub call_id: String,
+    pub call_point_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ast_id: Option<String>,
+    pub path: String,
+    pub language: &'static str,
+    pub range: CodeQueryRange,
+    pub role: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ordinal: Option<u32>,
+    pub value_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub object_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub object_cardinality: Option<&'static str>,
+    pub timing: &'static str,
+    pub proof: &'static str,
+    pub coverage: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<&'static str>,
+}
+
 /// One structured value consumed inside an exact reviewed failure arm.
 #[derive(Debug, Clone, Serialize)]
 pub struct CodeQueryResultContractFailureUse {
@@ -1047,10 +1270,14 @@ pub struct CodeQueryProcedureEffect {
     /// `definite` or `possible`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub certainty: Option<&'static str>,
-    /// `immediate`, `deferred`, or `unknown`. A path through a deferred
-    /// declaration keeps the deferred timing.
+    /// The semantic pack's authored schedule propagated unchanged across call
+    /// edges. Independent origins with different schedules join to `unknown`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timing: Option<&'static str>,
+    /// Canonical execution timing composed across every retained call edge.
+    /// Conflicting or unsupported compositions become `unknown`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub execution_timing: Option<&'static str>,
     /// Call hops from this procedure to the declaring one. `0` means the pack
     /// declares the effect on this procedure itself.
     #[serde(skip_serializing_if = "Option::is_none")]

@@ -1806,3 +1806,70 @@ fn issue_1775_cpp_directive_lines_do_not_join_a_macros_comment_block() {
     assert_eq!(12, fast.start_line, "{fast:#?}");
     assert_eq!(reported_lines(&fast), fast.text, "{fast:#?}");
 }
+
+/// Cost pin for #2880: a module target's outline must ask the index for the
+/// module's own name, not scan and hydrate every declaration in the workspace.
+///
+/// The behavior the seek has to keep is the multi-file answer. A Java package
+/// is declared once per file in it, and the outline lists every defining file,
+/// which is why `definitions` cannot answer this: its definition ordering
+/// keeps one module per name on purpose.
+#[test]
+fn module_outline_lists_defining_files_without_a_workspace_declaration_scan() {
+    use crate::analyzer::AnalyzerConfig;
+    use crate::inline_project::InlineTestProject;
+
+    let project = InlineTestProject::with_language(Language::Java)
+        .file(
+            "src/main/java/org/example/Alpha.java",
+            "package org.example;\nclass Alpha {}\n",
+        )
+        .file(
+            "src/main/java/org/example/Beta.java",
+            "package org.example;\nclass Beta {}\n",
+        )
+        .file(
+            "src/main/java/org/example/Gamma.java",
+            "package org.example;\nclass Gamma {}\n",
+        )
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let analyzer = workspace.analyzer();
+    analyzer
+        .test_hooks()
+        .reset_full_declaration_scan_count_for_test();
+
+    let result = get_symbol_sources(
+        analyzer,
+        SymbolLookupParams {
+            symbols: vec!["org.example".to_string()],
+        },
+    );
+
+    let paths: Vec<&str> = result
+        .sources
+        .iter()
+        .map(|block| block.path.as_str())
+        .collect();
+    assert_eq!(
+        paths,
+        vec![
+            "src/main/java/org/example/Alpha.java",
+            "src/main/java/org/example/Beta.java",
+            "src/main/java/org/example/Gamma.java",
+        ],
+        "{result:#?}"
+    );
+    assert!(
+        result
+            .sources
+            .iter()
+            .all(|block| block.presentation.as_deref() == Some("file_listing")),
+        "{result:#?}"
+    );
+    assert_eq!(
+        analyzer.test_hooks().full_declaration_scan_count_for_test(),
+        0,
+        "the module outline must resolve its defining files by name, not by scanning the workspace"
+    );
+}

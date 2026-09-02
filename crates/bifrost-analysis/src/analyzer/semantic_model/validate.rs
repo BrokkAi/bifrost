@@ -69,6 +69,9 @@ fn validate_pack_internal(
         limits,
         stable_ids: HashMap::new(),
         declaration_ids: HashSet::new(),
+        member_ids: HashSet::new(),
+        member_owners: HashMap::new(),
+        member_operations: HashMap::new(),
         procedure_ids: HashSet::new(),
         procedure_targets: HashMap::new(),
         type_parameters_by_id: HashMap::new(),
@@ -88,6 +91,9 @@ struct Validator {
     limits: ValidationLimits,
     stable_ids: HashMap<String, String>,
     declaration_ids: HashSet<String>,
+    member_ids: HashSet<String>,
+    member_owners: HashMap<String, String>,
+    member_operations: HashMap<String, Option<ImplicitOperation>>,
     procedure_ids: HashSet<String>,
     procedure_targets: HashMap<(String, String), String>,
     type_parameters_by_id: HashMap<String, Vec<String>>,
@@ -172,6 +178,18 @@ impl Validator {
                     .extend(types.iter().map(|fact| fact.id.clone()));
                 self.declaration_ids
                     .extend(members.iter().map(|fact| fact.id.clone()));
+                self.member_ids
+                    .extend(members.iter().map(|fact| fact.id.clone()));
+                self.member_owners.extend(
+                    members
+                        .iter()
+                        .map(|fact| (fact.id.clone(), fact.owner.clone())),
+                );
+                self.member_operations.extend(
+                    members
+                        .iter()
+                        .map(|fact| (fact.id.clone(), fact.implicit_operation.clone())),
+                );
                 self.type_parameters_by_id.extend(
                     types
                         .iter()
@@ -345,6 +363,52 @@ impl Validator {
                             &fact.type_parameters,
                         );
                     }
+                    if let Some(value_semantics) = &fact.value_semantics {
+                        if value_semantics.copy.is_none()
+                            && value_semantics.move_semantics.is_none()
+                        {
+                            self.error(
+                                "declaration.empty_value_semantics",
+                                format!("{fact_path}.value_semantics"),
+                                "value_semantics must state copy or move behavior",
+                            );
+                        }
+                        if let Some(TypeCopySemantics::ViaMember { member }) = &value_semantics.copy
+                        {
+                            self.stable_reference(
+                                &format!("{fact_path}.value_semantics.copy.member"),
+                                member,
+                            );
+                            if self.validate_references && !self.member_ids.contains(member) {
+                                self.error(
+                                    "reference.missing_member",
+                                    format!("{fact_path}.value_semantics.copy.member"),
+                                    format!("unknown member declaration id `{member}`"),
+                                );
+                            } else if let Some(owner) = self.member_owners.get(member)
+                                && owner != &fact.id
+                            {
+                                self.error(
+                                        "reference.member_owner_mismatch",
+                                        format!("{fact_path}.value_semantics.copy.member"),
+                                        format!("copy member `{member}` is owned by `{owner}`, not type `{}`", fact.id),
+                                    );
+                            } else if self.validate_references
+                                && !matches!(
+                                    self.member_operations.get(member),
+                                    Some(Some(ImplicitOperation::CopyConstructor))
+                                )
+                            {
+                                self.error(
+                                        "reference.copy_member_role_mismatch",
+                                        format!("{fact_path}.value_semantics.copy.member"),
+                                        format!(
+                                            "copy member `{member}` must carry the copy_constructor implicit-operation role"
+                                        ),
+                                    );
+                            }
+                        }
+                    }
                     for (embedded_index, embedded) in fact.embedded_types.iter().enumerate() {
                         self.type_ref(
                             &format!("{fact_path}.embedded_types[{embedded_index}].target"),
@@ -376,6 +440,40 @@ impl Validator {
                     self.stable_id(&format!("{fact_path}.id"), &fact.id);
                     self.language_identifier(&format!("{fact_path}.name"), &fact.name);
                     self.locator(&format!("{fact_path}.locator"), &fact.locator);
+                    if let Some(operation) = &fact.implicit_operation {
+                        match operation {
+                            ImplicitOperation::CopyConstructor
+                            | ImplicitOperation::MoveConstructor
+                                if !matches!(fact.member_kind, MemberKind::Constructor) =>
+                            {
+                                self.error(
+                                    "declaration.implicit_operation_requires_constructor",
+                                    format!("{fact_path}.implicit_operation"),
+                                    "copy and move constructor roles require member_kind: constructor",
+                                );
+                            }
+                            ImplicitOperation::ConversionOperator { target } => {
+                                if !matches!(fact.member_kind, MemberKind::Method) {
+                                    self.error(
+                                        "declaration.implicit_conversion_requires_method",
+                                        format!("{fact_path}.implicit_operation"),
+                                        "conversion operator role requires member_kind: method",
+                                    );
+                                }
+                                let owner_parameters = self
+                                    .type_parameters_by_id
+                                    .get(&fact.owner)
+                                    .cloned()
+                                    .unwrap_or_default();
+                                self.type_ref(
+                                    &format!("{fact_path}.implicit_operation.target"),
+                                    target,
+                                    &owner_parameters,
+                                );
+                            }
+                            _ => {}
+                        }
+                    }
                     if fact.callable_family_complete {
                         if !matches!(
                             fact.member_kind,
@@ -577,6 +675,15 @@ impl Validator {
                 format!("summary has more than {MAX_PROCEDURE_SUMMARY_EFFECTS} effects"),
             );
         }
+        if summary.concurrency_effects.len() > MAX_PROCEDURE_SUMMARY_EFFECTS {
+            self.error(
+                "limit.summary_concurrency_effects",
+                format!("{path}.concurrency_effects"),
+                format!(
+                    "summary has more than {MAX_PROCEDURE_SUMMARY_EFFECTS} concurrency effects"
+                ),
+            );
+        }
         let effect_references = summary.effects.iter().fold(0usize, |count, effect| {
             count.saturating_add(match effect {
                 AuthoredSummaryEffect::Call { .. } => 1,
@@ -597,23 +704,30 @@ impl Validator {
                 ),
             );
         }
+        // A complete empty summary is an explicit negative claim: the author
+        // reviewed the procedure's complete transfer scope and found no
+        // transfer. A partial empty summary proves nothing and remains invalid.
+        //
         // A declared effect (#2437) is metadata about the procedure, not a
         // modeled port, so it deliberately does not satisfy this rule. Result
-        // contracts and conditional-result refinements do: they are
-        // substantive relations among modeled ports even when the summary
-        // moves no values.
+        // contracts, conditional-result refinements, and conditional indirect
+        // writes do: they are substantive relations among modeled ports even
+        // when the summary moves no values.
         if summary.transfers.is_empty()
             && summary.effects.is_empty()
+            && summary.concurrency_effects.is_empty()
             && summary.preconditions.is_none()
             && summary.result_contracts.is_empty()
             && summary.conditional_result_refinements.is_empty()
+            && summary.conditional_indirect_writes.is_empty()
             && summary.normal_return_refinements.is_empty()
             && !summary.normal_continuation_absent
+            && summary.completeness != Completeness::Complete
         {
             self.error(
                 "summary.empty",
                 path,
-                "a procedure summary must declare at least one transfer, effect, operation precondition review, result contract, conditional-result refinement, normal-return refinement, or absent normal continuation",
+                "a partial procedure summary must declare at least one transfer, effect, concurrency effect, operation precondition review, result contract, conditional-result refinement, conditional indirect write, normal-return refinement, or absent normal continuation",
             );
         }
 
@@ -661,6 +775,13 @@ impl Validator {
                     "normal_continuation_absent conflicts with conditional-result refinements",
                 );
             }
+            if !summary.conditional_indirect_writes.is_empty() {
+                self.error(
+                    "summary.normal_continuation_conflict",
+                    format!("{path}.conditional_indirect_writes"),
+                    "normal_continuation_absent conflicts with conditional indirect writes",
+                );
+            }
             if !summary.normal_return_refinements.is_empty() {
                 self.error(
                     "summary.normal_continuation_conflict",
@@ -672,14 +793,16 @@ impl Validator {
 
         self.declared_effects(path, &summary.declared_effects);
         self.operation_preconditions(path, &summary.preconditions, &summary.target);
+        self.concurrency_effects(path, &summary.concurrency_effects, &summary.target);
         if summary.normal_result_count.is_none()
             && (!summary.result_contracts.is_empty()
-                || !summary.conditional_result_refinements.is_empty())
+                || !summary.conditional_result_refinements.is_empty()
+                || !summary.conditional_indirect_writes.is_empty())
         {
             self.error(
                 "summary.result_count_required",
                 format!("{path}.normal_result_count"),
-                "normal_result_count is required when result contracts or conditional-result refinements are non-empty",
+                "normal_result_count is required when result contracts, conditional-result refinements, or conditional indirect writes are non-empty",
             );
         }
         self.result_contracts(path, summary.normal_result_count, &summary.result_contracts);
@@ -688,6 +811,12 @@ impl Validator {
             &summary.target,
             summary.normal_result_count,
             &summary.conditional_result_refinements,
+        );
+        self.conditional_indirect_writes(
+            path,
+            &summary.target,
+            summary.normal_result_count,
+            &summary.conditional_indirect_writes,
         );
         self.normal_return_refinements(path, &summary.target, &summary.normal_return_refinements);
 
@@ -789,6 +918,96 @@ impl Validator {
                 );
             }
             AuthoredSummaryInput::Receiver {} | AuthoredSummaryInput::Parameter { .. } => {}
+        }
+    }
+
+    fn concurrency_effects(
+        &mut self,
+        path: &str,
+        effects: &[AuthoredConcurrencyEffect],
+        target: &AuthoredProcedureTarget,
+    ) {
+        let mut seen = HashMap::new();
+        let mut task_joins = HashSet::new();
+        let mut wait_group_waits = HashSet::new();
+        for (index, effect) in effects.iter().enumerate() {
+            let effect_path = format!("{path}.concurrency_effects[{index}]");
+            if let Some(first_index) = seen.insert(effect, index) {
+                self.error(
+                    "summary.duplicate_concurrency_effect",
+                    effect_path.clone(),
+                    format!(
+                        "concurrency effect duplicates {path}.concurrency_effects[{first_index}]"
+                    ),
+                );
+            }
+            match effect {
+                AuthoredConcurrencyEffect::Unsupported { protocol } => {
+                    if protocol.trim().is_empty() {
+                        self.error(
+                            "summary.invalid_unsupported_concurrency_protocol",
+                            format!("{effect_path}.protocol"),
+                            "an unsupported concurrency protocol name must be non-empty",
+                        );
+                    }
+                }
+                AuthoredConcurrencyEffect::TaskSpawn { callable, group } => {
+                    self.summary_input(&format!("{effect_path}.callable"), callable, target);
+                    if !matches!(callable, AuthoredSummaryInput::Parameter { .. }) {
+                        self.error(
+                            "summary.invalid_task_callable",
+                            format!("{effect_path}.callable"),
+                            "a spawned callable must be a parameter port",
+                        );
+                    }
+                    if let Some(group) = group {
+                        self.summary_input(&format!("{effect_path}.group"), group, target);
+                        if group == callable {
+                            self.error(
+                                "summary.conflicting_concurrency_effect",
+                                effect_path,
+                                "task callable and task group must be distinct ports",
+                            );
+                        }
+                    }
+                }
+                AuthoredConcurrencyEffect::TaskJoin { group } => {
+                    self.summary_input(&format!("{effect_path}.group"), group, target);
+                    task_joins.insert(group);
+                }
+                AuthoredConcurrencyEffect::LockAcquire { lock, .. }
+                | AuthoredConcurrencyEffect::LockRelease { lock, .. } => {
+                    self.summary_input(&format!("{effect_path}.lock"), lock, target);
+                }
+                AuthoredConcurrencyEffect::WaitGroupAdd { group, delta } => {
+                    self.summary_input(&format!("{effect_path}.group"), group, target);
+                    self.summary_input(&format!("{effect_path}.delta"), delta, target);
+                    if group == delta {
+                        self.error(
+                            "summary.conflicting_concurrency_effect",
+                            effect_path,
+                            "wait-group receiver and delta must be distinct ports",
+                        );
+                    }
+                }
+                AuthoredConcurrencyEffect::WaitGroupDone { group } => {
+                    self.summary_input(&format!("{effect_path}.group"), group, target);
+                }
+                AuthoredConcurrencyEffect::WaitGroupWait { group } => {
+                    self.summary_input(&format!("{effect_path}.group"), group, target);
+                    wait_group_waits.insert(group);
+                }
+                AuthoredConcurrencyEffect::Atomic { location, .. } => {
+                    self.summary_input(&format!("{effect_path}.location"), location, target);
+                }
+            }
+        }
+        for group in task_joins.intersection(&wait_group_waits) {
+            self.error(
+                "summary.conflicting_concurrency_effect",
+                format!("{path}.concurrency_effects"),
+                format!("task_join and wait_group_wait make duplicate join claims for {group:?}"),
+            );
         }
     }
 
@@ -1340,6 +1559,89 @@ impl Validator {
                         ),
                     );
                 }
+            }
+        }
+    }
+
+    fn conditional_indirect_writes(
+        &mut self,
+        path: &str,
+        target: &AuthoredProcedureTarget,
+        normal_result_count: Option<u32>,
+        writes: &[AuthoredConditionalIndirectWrite],
+    ) {
+        if writes.len() > MAX_PROCEDURE_SUMMARY_CONDITIONAL_INDIRECT_WRITES {
+            self.error(
+                "limit.summary_conditional_indirect_writes",
+                format!("{path}.conditional_indirect_writes"),
+                format!(
+                    "summary declares more than {MAX_PROCEDURE_SUMMARY_CONDITIONAL_INDIRECT_WRITES} conditional indirect writes"
+                ),
+            );
+        }
+
+        let mut seen = HashMap::new();
+        for (index, write) in writes.iter().enumerate() {
+            let write_path = format!("{path}.conditional_indirect_writes[{index}]");
+            if write.result_ordinal > MAX_PROCEDURE_SUMMARY_ORDINAL {
+                self.error(
+                    "summary.invalid_result_ordinal",
+                    format!("{write_path}.result_ordinal"),
+                    format!("result ordinal exceeds {MAX_PROCEDURE_SUMMARY_ORDINAL}"),
+                );
+            }
+            if normal_result_count.is_some_and(|count| write.result_ordinal >= count) {
+                self.error(
+                    "summary.result_ordinal_out_of_range",
+                    format!("{write_path}.result_ordinal"),
+                    format!(
+                        "result ordinal {} is outside normal_result_count {}",
+                        write.result_ordinal,
+                        normal_result_count.expect("checked as some")
+                    ),
+                );
+            }
+            if write.parameter_ordinal > MAX_PROCEDURE_SUMMARY_ORDINAL {
+                self.error(
+                    "summary.invalid_parameter_ordinal",
+                    format!("{write_path}.parameter_ordinal"),
+                    format!("parameter ordinal exceeds {MAX_PROCEDURE_SUMMARY_ORDINAL}"),
+                );
+            }
+            if write.parameter_ordinal >= target.parameter_count {
+                self.error(
+                    "summary.parameter_ordinal_out_of_range",
+                    format!("{write_path}.parameter_ordinal"),
+                    format!(
+                        "parameter ordinal {} is outside parameter_count {}",
+                        write.parameter_ordinal, target.parameter_count
+                    ),
+                );
+            } else if target.variadic
+                && target.parameter_count.checked_sub(1) == Some(write.parameter_ordinal)
+            {
+                self.error(
+                    "summary.unsupported_variadic_tail_reference",
+                    format!("{write_path}.parameter_ordinal"),
+                    format!(
+                        "conditional indirect write cannot reference variadic tail ordinal {}",
+                        write.parameter_ordinal
+                    ),
+                );
+            }
+
+            let key = (
+                write.result_ordinal,
+                write.outcome,
+                write.parameter_ordinal,
+                write.target,
+            );
+            if let Some(first_path) = seen.insert(key, write_path.clone()) {
+                self.error(
+                    "summary.duplicate_conditional_indirect_write",
+                    write_path,
+                    format!("conditional indirect write duplicates {first_path}"),
+                );
             }
         }
     }

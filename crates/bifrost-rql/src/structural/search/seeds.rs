@@ -208,6 +208,18 @@ pub(super) fn prepare_seed_access(
                 .defer_auto_build(cache, content_identity);
             return scan_access(state, files.len(), None);
         }
+        if cache.build_in_flight(content_identity) {
+            // Somebody else is already building this snapshot's postings --
+            // normally the host's background warm. Following it would bill
+            // this request for a whole-snapshot build it did not start, and
+            // the scan the index accelerates is available right now, so take
+            // the scan and record the fallback (#2879).
+            return scan_access(
+                state,
+                files.len(),
+                Some("structural index build already in flight"),
+            );
+        }
     }
     let acquisition = ready_index.map_or_else(
         || cache.acquire(provider, cancellation),
@@ -280,6 +292,25 @@ pub(super) fn prepare_seed_access(
                     access.retained_bytes =
                         access.retained_bytes.saturating_add(index.retained_bytes());
                 }
+            }
+            if state.analyzer.read_ledger_attached() {
+                // Recorded here and nowhere earlier: this is the one point at
+                // which the answer is drawn from the posting index, which is
+                // derived from this language's whole analyzed file set. A seed
+                // scan reads only the files it opens and records a `File` key
+                // for each, so charging it the language scope would make every
+                // edit anywhere invalidate every unit.
+                //
+                // The identity is the analyzer's own scope fold rather than
+                // the index's raw key, because that is the value verification
+                // recomputes on the head; an analyzer that states none has
+                // nothing this read can be named by, and the unattested
+                // identity says so instead of claiming a match.
+                state.analyzer.record_read(
+                    state
+                        .analyzer
+                        .workspace_scope_read_key(&[provider.structural_language()]),
+                );
             }
             let selection = index.select(
                 plan.structural_access(),
@@ -407,6 +438,107 @@ pub(super) fn prepare_seed_access(
     }
 }
 
+/// The files one seed family enumerates, in the family's own `ProjectFile`
+/// order.
+///
+/// The whole-workspace enumeration filters the analyzer's analyzed file set;
+/// a narrowed execution scope filters exactly the files it was handed.
+///
+/// Neither records a whole-language scope key. The enumeration's dependency is
+/// the files it opens, and every one of those records a `File` key when its
+/// facts are hydrated. Charging a unit the language scope would make an edit
+/// anywhere invalidate every unit of the workspace, which is exactly the reuse
+/// the plan exists to keep; and which files a unit is seeded from is the
+/// coordinator's enumeration over the head's analyzed files, not an input the
+/// unit itself read.
+pub(super) fn seed_scan_files(
+    state: &QueryExecutionState<'_>,
+    languages: &[Language],
+    where_globs: &[glob::Pattern],
+) -> Vec<ProjectFile> {
+    let mut files: Vec<ProjectFile> = match state.scope.seed_files() {
+        Some(seed_files) => seed_files
+            .iter()
+            .filter(|file| seed_file_in_scope(file, languages, where_globs))
+            .cloned()
+            .collect(),
+        None => state
+            .analyzer
+            .analyzed_files()
+            .into_iter()
+            .filter(|file| seed_file_in_scope(file, languages, where_globs))
+            .collect(),
+    };
+    files.sort();
+    files
+}
+
+/// Whether one file is inside a seed's declared language and path scope.
+fn seed_file_in_scope(
+    file: &ProjectFile,
+    languages: &[Language],
+    where_globs: &[glob::Pattern],
+) -> bool {
+    let language = crate::analyzer::common::language_for_file(file);
+    (languages.is_empty() || languages.contains(&language))
+        && (where_globs.is_empty() || {
+            let path = rel_path_string(file);
+            where_globs.iter().any(|glob| glob.matches(&path))
+        })
+}
+
+/// The whole-workspace enumeration the structural seed still needs for its
+/// diagnostic-only language walk and its per-provider file counts.
+///
+/// A unit must see every file here even though it seeds from one: narrowing
+/// this walk would change which `MissingStructuralAdapter` diagnostics a unit
+/// reports, and diagnostics decide the result's completion.
+pub(super) fn workspace_files_for_scope<'scope, 'owned>(
+    state: &QueryExecutionState<'scope>,
+    owned: &'owned mut Vec<ProjectFile>,
+) -> &'owned [ProjectFile]
+where
+    'scope: 'owned,
+{
+    match state.scope.workspace_files() {
+        Some(files) => files,
+        None => {
+            *owned = state.analyzer.analyzed_files();
+            owned
+        }
+    }
+}
+
+/// One structural provider's seed candidates, with the provider's whole file
+/// count for the index-admission rule.
+///
+/// The count stays whole under a narrowed scope: a unit over one seed file
+/// must reach the same admission verdict the survey states it reaches (a slice
+/// is never viable for an auto index build), so it takes the scan path rather
+/// than building an index over its own slice.
+pub(super) fn provider_scope_files(
+    state: &QueryExecutionState<'_>,
+    provider: &dyn StructuralFactProvider,
+    language: Language,
+    workspace_files: &[ProjectFile],
+) -> (Vec<ProjectFile>, usize) {
+    let Some(seed_files) = state.scope.seed_files() else {
+        let files = provider.structural_files();
+        let count = files.len();
+        return (files, count);
+    };
+    let files = seed_files
+        .iter()
+        .filter(|file| crate::analyzer::common::language_for_file(file) == language)
+        .cloned()
+        .collect();
+    let count = workspace_files
+        .iter()
+        .filter(|file| crate::analyzer::common::language_for_file(file) == language)
+        .count();
+    (files, count)
+}
+
 /// Derive occurrence rows straight from workspace facts.
 ///
 /// Unlike the structural seed there is no pattern to prune with, so the scope
@@ -436,20 +568,7 @@ pub(super) fn execute_occurrence_seed(
         };
     }
 
-    let mut files: Vec<ProjectFile> = state
-        .analyzer
-        .analyzed_files()
-        .into_iter()
-        .filter(|file| {
-            let language = crate::analyzer::common::language_for_file(file);
-            (seed.languages.is_empty() || seed.languages.contains(&language))
-                && (seed.where_globs.is_empty() || {
-                    let path = rel_path_string(file);
-                    seed.where_globs.iter().any(|glob| glob.matches(&path))
-                })
-        })
-        .collect();
-    files.sort();
+    let files = seed_scan_files(state, &seed.languages, &seed.where_globs);
 
     let mut rows: Vec<PipelineRow> = Vec::new();
     let mut indexes: HashMap<PipelineKey, usize> = HashMap::default();
@@ -554,20 +673,7 @@ pub(super) fn execute_environment_seed(
         };
     }
 
-    let mut files: Vec<ProjectFile> = state
-        .analyzer
-        .analyzed_files()
-        .into_iter()
-        .filter(|file| {
-            let language = crate::analyzer::common::language_for_file(file);
-            (languages.is_empty() || languages.contains(&language))
-                && (where_globs.is_empty() || {
-                    let path = rel_path_string(file);
-                    where_globs.iter().any(|glob| glob.matches(&path))
-                })
-        })
-        .collect();
-    files.sort();
+    let files = seed_scan_files(state, languages, where_globs);
 
     let required_axes = match kind {
         EnvironmentSeedKind::Scopes(_) => environment::SCOPE_QUERY_AXES,
@@ -683,20 +789,7 @@ pub(super) fn execute_materialization_seed(
         };
     }
 
-    let mut files: Vec<ProjectFile> = state
-        .analyzer
-        .analyzed_files()
-        .into_iter()
-        .filter(|file| {
-            let language = crate::analyzer::common::language_for_file(file);
-            (languages.is_empty() || languages.contains(&language))
-                && (where_globs.is_empty() || {
-                    let path = rel_path_string(file);
-                    where_globs.iter().any(|glob| glob.matches(&path))
-                })
-        })
-        .collect();
-    files.sort();
+    let files = seed_scan_files(state, languages, where_globs);
 
     let required_axes = match kind {
         MaterializationSeedKind::GenerationSites(_) => materialization::GENERATION_SITE_QUERY_AXES,
@@ -804,20 +897,7 @@ pub(super) fn execute_path_seed(
         };
     }
 
-    let mut files: Vec<ProjectFile> = state
-        .analyzer
-        .analyzed_files()
-        .into_iter()
-        .filter(|file| {
-            let language = crate::analyzer::common::language_for_file(file);
-            (languages.is_empty() || languages.contains(&language))
-                && (where_globs.is_empty() || {
-                    let path = rel_path_string(file);
-                    where_globs.iter().any(|glob| glob.matches(&path))
-                })
-        })
-        .collect();
-    files.sort();
+    let files = seed_scan_files(state, languages, where_globs);
 
     let mut rows: Vec<PipelineRow> = Vec::new();
     let mut indexes: HashMap<PipelineKey, usize> = HashMap::default();
@@ -962,8 +1042,10 @@ pub(super) fn execute_seed(
         seed.languages.is_empty() || seed.languages.contains(&provider.structural_language())
     });
 
+    let mut owned_workspace_files = Vec::new();
+    let workspace_files = workspace_files_for_scope(state, &mut owned_workspace_files);
     let mut scoped_languages = BTreeSet::new();
-    for file in state.analyzer.analyzed_files() {
+    for file in workspace_files {
         if state
             .cancellation
             .is_some_and(CancellationToken::is_cancelled)
@@ -975,9 +1057,9 @@ pub(super) fn execute_seed(
                 pipeline_halted: false,
             };
         }
-        let language = crate::analyzer::common::language_for_file(&file);
+        let language = crate::analyzer::common::language_for_file(file);
         let requested = seed.languages.is_empty() || seed.languages.contains(&language);
-        if requested && file_matches_globs(&file, seed) {
+        if requested && file_matches_globs(file, seed) {
             scoped_languages.insert(language);
         }
     }
@@ -987,8 +1069,8 @@ pub(super) fn execute_seed(
     for provider in providers {
         let language = provider.structural_language();
         supported.insert(language);
-        let mut files = provider.structural_files();
-        let provider_file_count = files.len();
+        let (mut files, provider_file_count) =
+            provider_scope_files(state, provider, language, workspace_files);
         files.retain(|file| file_matches_globs(file, seed));
         files.sort();
         let explicitly_requested = seed.languages.contains(&language);

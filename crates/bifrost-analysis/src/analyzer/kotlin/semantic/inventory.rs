@@ -13,6 +13,14 @@ pub(super) struct ProcedureSpec<'tree> {
     pub(super) is_suspend: bool,
     pub(super) delegated: bool,
     pub(super) captures_receiver: bool,
+    pub(super) captures: Box<[LexicalCaptureSpec<'tree>]>,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct LexicalCaptureSpec<'tree> {
+    pub(super) name: &'tree str,
+    pub(super) declaration_start: usize,
+    pub(super) reference: Node<'tree>,
 }
 
 /// What a procedure executes, already classified by the inventory so control
@@ -63,13 +71,37 @@ impl ReceiverCaptureSpec for ProcedureSpec<'_> {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(super) struct NestedProcedureTarget {
     pub(super) id: ProcedureId,
     pub(super) receiver_capture_destination: Option<MemoryLocationId>,
+    pub(super) captures: Box<[LexicalCaptureSource]>,
+}
+
+#[derive(Clone)]
+pub(super) struct LexicalCaptureSource {
+    pub(super) name: Box<str>,
+    pub(super) declaration_start: usize,
 }
 
 pub(super) type ProcedureEnumeration<'tree> = ProcedureInventoryOutcome<Vec<ProcedureSpec<'tree>>>;
+
+enum KotlinInventoryPrepassStop {
+    Budget(ProcedureInventoryStop),
+    Cancelled,
+}
+
+fn charge_kotlin_inventory_prepass(
+    inventory: &mut ProcedureInventoryBuilder<'_>,
+    cancellation: &CancellationToken,
+) -> Result<(), KotlinInventoryPrepassStop> {
+    if cancellation.is_cancelled() {
+        return Err(KotlinInventoryPrepassStop::Cancelled);
+    }
+    inventory
+        .charge_traversal_entry()
+        .map_err(KotlinInventoryPrepassStop::Budget)
+}
 
 struct ProcedureEnumerationFrame<'tree> {
     node: Node<'tree>,
@@ -147,6 +179,7 @@ pub(super) fn enumerate_procedures<'tree>(
                 is_suspend: shape.is_suspend,
                 delegated: shape.delegated,
                 captures_receiver,
+                captures: Box::new([]),
             });
             child_parent = Some(identity.id);
             child_path = identity.declaration_path;
@@ -161,7 +194,148 @@ pub(super) fn enumerate_procedures<'tree>(
         }
     }
 
+    match populate_lexical_capture_specs(&mut specs, source, &mut inventory, cancellation) {
+        Ok(()) => {}
+        Err(KotlinInventoryPrepassStop::Budget(stop)) => return Ok(stop.into_outcome()),
+        Err(KotlinInventoryPrepassStop::Cancelled) => return Ok(inventory.cancelled()),
+    }
     Ok(inventory.complete(specs))
+}
+
+/// Inventory the exact Kotlin capture subset represented by the shared IR:
+/// one immutable `val` declared in the direct lexical parent before the
+/// nested callable, read by that child without a child-local declaration of
+/// the same name. Kotlin forbids reassignment of a `val`, so the declaration
+/// node and its lexical scope are the stable storage identity.
+fn populate_lexical_capture_specs<'tree>(
+    specs: &mut [ProcedureSpec<'tree>],
+    source: &'tree str,
+    inventory: &mut ProcedureInventoryBuilder<'_>,
+    cancellation: &CancellationToken,
+) -> Result<(), KotlinInventoryPrepassStop> {
+    #[derive(Clone, Copy)]
+    struct ParentBinding<'tree> {
+        name: &'tree str,
+        declaration_start: usize,
+        visible_from: usize,
+        scope_start: usize,
+        scope_end: usize,
+    }
+
+    let mut bindings = vec![Vec::<ParentBinding<'tree>>::new(); specs.len()];
+    for spec in specs.iter() {
+        let mut found = Vec::new();
+        try_walk_named_tree_preorder(spec.body.scan_root(), true, |node| {
+            charge_kotlin_inventory_prepass(inventory, cancellation)?;
+            if node.id() != spec.body.scan_root().id() && is_kotlin_nested_execution_boundary(node)
+            {
+                return Ok(WalkControl::SkipChildren);
+            }
+            if node.kind() == "property_declaration"
+                && child_of_kind(node, "binding_pattern_kind")
+                    .and_then(|kind| node_text(source, kind))
+                    == Some("val")
+                && let Some(binding) = binding_node(node)
+                && binding.kind() == "variable_declaration"
+                && let Some(name_node) = binding_names(binding).first().copied()
+                && let Some(name) = node_text(source, name_node)
+                && property_initializer(node).is_some()
+                && let Some((scope_start, scope_end)) = kotlin_local_scope(name_node)
+            {
+                found.push(ParentBinding {
+                    name,
+                    declaration_start: name_node.start_byte(),
+                    visible_from: node.end_byte(),
+                    scope_start,
+                    scope_end,
+                });
+            }
+            Ok(WalkControl::Continue)
+        })?;
+        bindings[spec.id.index()] = found;
+    }
+
+    let mut captures = vec![Vec::<LexicalCaptureSpec<'tree>>::new(); specs.len()];
+    for child in specs.iter() {
+        let Some(parent) = child.lexical_parent else {
+            continue;
+        };
+        let mut child_bindings = HashSet::<Box<str>>::default();
+        try_walk_named_tree_preorder(child.callable, true, |node| {
+            charge_kotlin_inventory_prepass(inventory, cancellation)?;
+            if node.id() == child.body.scan_root().id() {
+                return Ok(WalkControl::SkipChildren);
+            }
+            if matches!(
+                node.kind(),
+                "parameter" | "class_parameter" | "parameter_with_optional_type"
+            ) && let Some(name) =
+                child_of_kind(node, "simple_identifier").and_then(|name| node_text(source, name))
+            {
+                child_bindings.insert(name.into());
+            }
+            Ok(WalkControl::Continue)
+        })?;
+        try_walk_named_tree_preorder(child.body.scan_root(), true, |node| {
+            charge_kotlin_inventory_prepass(inventory, cancellation)?;
+            if node.id() != child.body.scan_root().id() && is_kotlin_nested_execution_boundary(node)
+            {
+                return Ok(WalkControl::SkipChildren);
+            }
+            if matches!(
+                node.kind(),
+                "variable_declaration" | "multi_variable_declaration"
+            ) {
+                for name in binding_names(node) {
+                    if let Some(text) = node_text(source, name) {
+                        child_bindings.insert(text.into());
+                    }
+                }
+            }
+            Ok(WalkControl::Continue)
+        })?;
+
+        let mut first_references = HashMap::<Box<str>, Node<'tree>>::default();
+        try_walk_named_tree_preorder(child.body.scan_root(), true, |node| {
+            charge_kotlin_inventory_prepass(inventory, cancellation)?;
+            if node.id() != child.body.scan_root().id() && is_kotlin_nested_execution_boundary(node)
+            {
+                return Ok(WalkControl::SkipChildren);
+            }
+            if node.kind() == "simple_identifier"
+                && let Some(name) = node_text(source, node)
+                && !child_bindings.contains(name)
+            {
+                first_references.entry(name.into()).or_insert(node);
+            }
+            Ok(WalkControl::Continue)
+        })?;
+
+        for (name, reference) in first_references {
+            let Some(binding) = bindings[parent.index()]
+                .iter()
+                .filter(|binding| {
+                    binding.name == name.as_ref()
+                        && binding.visible_from <= child.callable.start_byte()
+                        && binding.scope_start <= child.callable.start_byte()
+                        && child.callable.start_byte() < binding.scope_end
+                })
+                .min_by_key(|binding| binding.scope_end - binding.scope_start)
+            else {
+                continue;
+            };
+            captures[child.id.index()].push(LexicalCaptureSpec {
+                name: binding.name,
+                declaration_start: binding.declaration_start,
+                reference,
+            });
+        }
+        captures[child.id.index()].sort_by_key(|capture| capture.declaration_start);
+    }
+    for (spec, captures) in specs.iter_mut().zip(captures) {
+        spec.captures = captures.into_boxed_slice();
+    }
+    Ok(())
 }
 
 /// The class names this file declares that a bare call can construct.

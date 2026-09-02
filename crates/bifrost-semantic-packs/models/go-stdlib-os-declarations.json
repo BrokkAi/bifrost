@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "pack_id": "bifrost.go.stdlib.os-declarations",
   "version": "1.0.0",
   "producer": {
@@ -13,7 +13,7 @@
     "toolchains": []
   },
   "provenance": {
-    "source": "https://pkg.go.dev/os",
+    "source": "https://go.dev/src/os/",
     "revision": "go1.26.0"
   },
   "license": "BSD-3-Clause",
@@ -116,9 +116,80 @@
               "path": "os/types.go",
               "symbol": "os.FileMode"
             }
+          },
+          {
+            "id": "type.bd136ce0b789c51ec8c122bb17fd07278003e6ea3fd05c7b9a23b836cd3bb1b9",
+            "name": "os/exec",
+            "type_kind": "module",
+            "visibility": "package",
+            "is_abstract": false,
+            "is_sealed": false,
+            "has_explicit_type_terms": false,
+            "type_parameters": [],
+            "type_parameter_constraints": [],
+            "embedded_types": [],
+            "hierarchy": [],
+            "aliases": [
+              "exec"
+            ],
+            "extension_surfaces": [],
+            "locator": {
+              "kind": "artifact",
+              "path": "os/exec/exec.go",
+              "symbol": "os/exec"
+            }
+          },
+          {
+            "id": "type.86a98c3d180e55d4afc0494522fc4e306760766d0ffc5e3dbb00f3f65364e7da",
+            "name": "os/exec.ExitError",
+            "type_kind": "struct",
+            "visibility": "public",
+            "is_abstract": false,
+            "is_sealed": false,
+            "has_explicit_type_terms": false,
+            "type_parameters": [],
+            "type_parameter_constraints": [],
+            "embedded_types": [],
+            "hierarchy": [],
+            "aliases": [],
+            "extension_surfaces": [],
+            "locator": {
+              "kind": "artifact",
+              "path": "os/exec/exec.go",
+              "symbol": "os/exec.ExitError"
+            }
           }
         ],
         "members": [
+          {
+            "id": "member.88137385ffda835f211c2f79b6484ac5a1ba872277e2becee33eba7477cddba4",
+            "owner": "type.86a98c3d180e55d4afc0494522fc4e306760766d0ffc5e3dbb00f3f65364e7da",
+            "name": "ExitCode",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "is_abstract": false,
+            "is_virtual": false,
+            "signature": {
+              "type_parameters": [],
+              "parameters": [],
+              "returns": {
+                "kind": "named",
+                "name": "int",
+                "arguments": [],
+                "nullable": false
+              }
+            },
+            "receiver": {
+              "pointer": true
+            },
+            "aliases": [],
+            "locator": {
+              "kind": "artifact",
+              "path": "os/exec/exec.go",
+              "symbol": "os/exec.ExitError.ExitCode"
+            }
+          },
           {
             "id": "member.85632bc6db7982435d0a1c7e9cbcf6a396b05a2d7a832fb2cfe56ff439f8d0f5",
             "owner": "type.98a1235b91e4f66cb179865e5a323fd24dce0996c65a2383595eb2373409b147",

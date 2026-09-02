@@ -20,6 +20,7 @@ use crate::analyzer::{
 };
 use crate::hash::HashSet;
 use brokk_bifrost_core::analyzer::canonical_hash::CanonicalHasher;
+use brokk_bifrost_jvm::java::graph::extractor::OwnedReturnTypeCaches;
 use brokk_bifrost_jvm::java::graph::extractor::{JavaFileEvidenceBuildOutcome, ScanState};
 use std::collections::BTreeSet;
 
@@ -166,6 +167,7 @@ impl<'a> UsageQueryResolver<'a> for JavaQueryResolver<'a> {
             limit_exceeded: &mut limit_exceeded,
         };
         let mut relational_session = None;
+        let return_caches = OwnedReturnTypeCaches::default();
         for file in &files {
             let _scan_scope = crate::profiling::scope("java_graph::scan_file");
             let cache_key = java_evidence_cache_key(analyzer, file, overloads, &spec);
@@ -187,6 +189,7 @@ impl<'a> UsageQueryResolver<'a> for JavaQueryResolver<'a> {
                             token,
                             file,
                             &spec,
+                            &return_caches,
                             cancellation,
                         );
                         match evidence {
@@ -257,6 +260,7 @@ impl<'a> UsageQueryResolver<'a> for JavaQueryResolver<'a> {
                     token,
                     file,
                     &spec,
+                    &return_caches,
                     cancellation,
                 );
                 match evidence {
