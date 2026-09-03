@@ -32,10 +32,7 @@ jobs:
         run: cargo metadata --locked --no-deps --format-version 1
 
       - name: Run source-owned unit tests
-        # Several workspace-initialization tests intentionally coordinate
-        # background analyzer builds with bounded deadlines. Serial execution
-        # avoids turning hosted-runner CPU contention into false failures.
-        run: cargo test --workspace --lib --locked -- --test-threads=1
+        run: cargo test --workspace --lib --locked
 
       - name: Run public doctests
         run: cargo test --workspace --doc --locked

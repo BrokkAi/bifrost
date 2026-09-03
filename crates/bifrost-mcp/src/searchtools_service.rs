@@ -5632,6 +5632,10 @@ mod watcher_startup_tests {
     use std::time::Duration;
 
     const WATCHER_FAILURE: &str = "injected watcher startup failure";
+    // Session construction can take roughly 100 seconds on the smallest hosted
+    // runner. This is a hang watchdog, not a workspace-startup performance
+    // contract.
+    const WATCHER_STARTUP_TIMEOUT: Duration = Duration::from_secs(180);
 
     fn workspace(file: &str, source: &str) -> (tempfile::TempDir, PathBuf) {
         let temp = tempfile::tempdir().unwrap();
@@ -5852,8 +5856,7 @@ mod watcher_startup_tests {
         // Under the full library suite, persisted workspace construction can
         // legitimately delay the first watcher-starter callback well beyond
         // the single-test runtime. Keep a bounded hang watchdog here, but do
-        // not treat five seconds as a suite-wide performance contract.
-        const STARTUP_PUBLISH_TIMEOUT: Duration = Duration::from_secs(30);
+        // not treat a short callback threshold as a performance contract.
         let (_temp, root) = workspace("Concurrent.java", "class Concurrent {}\n");
         let calls = Arc::new(AtomicUsize::new(0));
         let (startup_started_tx, startup_started_rx) = mpsc::channel();
@@ -5900,7 +5903,7 @@ mod watcher_startup_tests {
             .collect::<Vec<_>>();
         barrier.wait();
         startup_started_rx
-            .recv_timeout(STARTUP_PUBLISH_TIMEOUT)
+            .recv_timeout(WATCHER_STARTUP_TIMEOUT)
             .expect("one caller should begin watcher startup");
         for _ in 0..CALLERS {
             release_startup_tx
@@ -5954,7 +5957,7 @@ mod watcher_startup_tests {
             .bind_client_workspace(root)
             .expect("client binding should start a deferred build");
         startup_started_rx
-            .recv_timeout(Duration::from_secs(30))
+            .recv_timeout(WATCHER_STARTUP_TIMEOUT)
             .expect("deferred build should wait in watcher startup");
 
         let querying = Arc::clone(&service);
@@ -6122,7 +6125,7 @@ mod watcher_startup_tests {
             .bind_client_workspace(root)
             .expect("client binding should start a deferred build");
         startup_started_rx
-            .recv_timeout(Duration::from_secs(30))
+            .recv_timeout(WATCHER_STARTUP_TIMEOUT)
             .expect("deferred build should reach watcher startup");
         let cancellation = CancellationToken::default().with_timeout(Duration::ZERO);
 
@@ -6222,7 +6225,7 @@ mod watcher_startup_tests {
             .bind_client_workspace(root)
             .expect("client binding should start a deferred build");
         startup_started_rx
-            .recv_timeout(Duration::from_secs(30))
+            .recv_timeout(WATCHER_STARTUP_TIMEOUT)
             .expect("deferred build should reach watcher startup");
 
         let result = service
@@ -6280,8 +6283,6 @@ mod watcher_startup_tests {
     #[test]
     fn valid_suppression_preflight_is_carried_into_policy_execution() {
         let (_temp, root) = workspace("Policy.java", "class Policy {}");
-        let service = SearchToolsService::new_manual_ephemeral(root.clone())
-            .expect("manual service should start");
         let suppression_path = root.join(".bifrost/suppressions.json");
         std::fs::create_dir_all(suppression_path.parent().expect("suppression parent"))
             .expect("create suppression directory");
@@ -6290,6 +6291,13 @@ mod watcher_startup_tests {
             r#"{"schema_version":1,"suppressions":[]}"#,
         )
         .expect("write valid suppressions");
+        std::fs::write(
+            root.join(".bifrost/packs.json"),
+            r#"{"schema_version":1,"ecosystems":[]}"#,
+        )
+        .expect("disable unrelated dependency packs");
+        let service = SearchToolsService::new_manual_ephemeral(root.clone())
+            .expect("manual service should start");
         let arguments = json!({
             "policy_ids": ["bifrost.correctness.dynamic-evaluation"],
             "evaluation_date": "2026-07-29",
@@ -6349,7 +6357,7 @@ mod watcher_startup_tests {
             .bind_client_workspace(root)
             .expect("client binding should start a deferred build");
         startup_started_rx
-            .recv_timeout(Duration::from_secs(30))
+            .recv_timeout(WATCHER_STARTUP_TIMEOUT)
             .expect("deferred build should reach watcher startup");
         let cancellation = CancellationToken::default().with_timeout(Duration::ZERO);
 
@@ -6420,7 +6428,7 @@ mod watcher_startup_tests {
             .bind_client_workspace(root)
             .expect("client binding should start one deferred build");
         startup_started_rx
-            .recv_timeout(Duration::from_secs(30))
+            .recv_timeout(WATCHER_STARTUP_TIMEOUT)
             .expect("deferred build should reach watcher startup");
 
         let waiters = (0..2)
@@ -6534,7 +6542,7 @@ mod watcher_startup_tests {
                 release_first_rx
                     .lock()
                     .expect("release lock")
-                    .recv_timeout(Duration::from_secs(5))
+                    .recv_timeout(WATCHER_STARTUP_TIMEOUT)
                     .expect("test should release the first build");
                 let watcher = ProjectChangeWatcher::start_polling_with_claimed_files_for_tests(
                     project,
@@ -6557,7 +6565,7 @@ mod watcher_startup_tests {
             .bind_client_workspace(first_root)
             .expect("first client binding should start");
         first_started_rx
-            .recv_timeout(Duration::from_secs(30))
+            .recv_timeout(WATCHER_STARTUP_TIMEOUT)
             .expect("first build should reach watcher startup");
         service
             .bind_client_workspace(second_root.clone())
@@ -6576,7 +6584,7 @@ mod watcher_startup_tests {
             .send(())
             .expect("release superseded workspace build");
         first_finished_rx
-            .recv_timeout(Duration::from_secs(5))
+            .recv_timeout(WATCHER_STARTUP_TIMEOUT)
             .expect("superseded workspace build should finish");
         assert_eq!(service.active_workspace_root(), Some(second_root));
     }
