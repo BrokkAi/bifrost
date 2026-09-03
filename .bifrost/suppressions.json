@@ -363,7 +363,7 @@
     },
     {
       "policy_id": "bifrost.performance.parsing-in-loop",
-      "finding_id": "ea19ebbc43275b5b39fc633925f9fb9e2a28b2e3957f34d9efd0487737931d6c",
+      "finding_id": "0feb65b6ecbbe531e05a8616ef0980dcc0476284a59e64fa21a4cfcf082bf685",
       "path": "src/bin/bifrost.rs",
       "identity_stability": "strong",
       "status": "accepted",
