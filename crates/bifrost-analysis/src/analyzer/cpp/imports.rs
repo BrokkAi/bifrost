@@ -96,6 +96,13 @@ pub enum HeaderLanguageAttribution {
 impl TestDetectionProvider for CppAnalyzer {}
 
 impl ImportAnalysisProvider for CppAnalyzer {
+    fn import_infos_for_files(
+        &self,
+        files: &[ProjectFile],
+    ) -> Option<crate::hash::HashMap<ProjectFile, Vec<crate::analyzer::ImportInfo>>> {
+        Some(self.inner.bulk_import_infos(files.iter().cloned()))
+    }
+
     fn file_dependency_facts_for_files(
         &self,
         files: &[ProjectFile],
