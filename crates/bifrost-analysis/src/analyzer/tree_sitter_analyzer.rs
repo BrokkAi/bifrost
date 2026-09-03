@@ -2890,6 +2890,7 @@ pub struct TreeSitterAnalyzer<A> {
     sql_definitions_query_count: Arc<AtomicUsize>,
     definition_candidates_query_count: Arc<AtomicUsize>,
     definition_prefetch_batch_count: Arc<AtomicUsize>,
+    relational_definition_batch_call_count: Arc<AtomicUsize>,
     definition_candidate_row_read_count: Arc<AtomicUsize>,
     /// Candidate spellings dropped by `definition_candidate_short_names`
     /// because the persisted `short_name` vocabulary for this adapter's
@@ -2953,6 +2954,9 @@ impl<A> Clone for TreeSitterAnalyzer<A> {
             sql_definitions_query_count: Arc::clone(&self.sql_definitions_query_count),
             definition_candidates_query_count: Arc::clone(&self.definition_candidates_query_count),
             definition_prefetch_batch_count: Arc::clone(&self.definition_prefetch_batch_count),
+            relational_definition_batch_call_count: Arc::clone(
+                &self.relational_definition_batch_call_count,
+            ),
             definition_candidate_row_read_count: Arc::clone(
                 &self.definition_candidate_row_read_count,
             ),
@@ -3199,6 +3203,7 @@ where
             sql_definitions_query_count: Arc::new(AtomicUsize::new(0)),
             definition_candidates_query_count: Arc::new(AtomicUsize::new(0)),
             definition_prefetch_batch_count: Arc::new(AtomicUsize::new(0)),
+            relational_definition_batch_call_count: Arc::new(AtomicUsize::new(0)),
             definition_candidate_row_read_count: Arc::new(AtomicUsize::new(0)),
             structural_miss_spelling_count: Arc::new(AtomicUsize::new(0)),
             enclosing_code_unit_query_count: Arc::new(AtomicUsize::new(0)),
@@ -3609,6 +3614,7 @@ where
             sql_definitions_query_count: Arc::new(AtomicUsize::new(0)),
             definition_candidates_query_count: Arc::new(AtomicUsize::new(0)),
             definition_prefetch_batch_count: Arc::new(AtomicUsize::new(0)),
+            relational_definition_batch_call_count: Arc::new(AtomicUsize::new(0)),
             definition_candidate_row_read_count: Arc::new(AtomicUsize::new(0)),
             structural_miss_spelling_count: Arc::new(AtomicUsize::new(0)),
             enclosing_code_unit_query_count: Arc::new(AtomicUsize::new(0)),
@@ -8639,6 +8645,22 @@ where
         self.definition_prefetch_batch_count.load(Ordering::Relaxed)
     }
 
+    /// Relational-store round trips issued by `RelationalDefinitionLookup::batch`,
+    /// one per call regardless of how many requests it carried. A caller that
+    /// resolves many distinct names one at a time drives this as high as the
+    /// name count; a caller that batches them first keeps it flat (bifrost#15).
+    #[doc(hidden)]
+    pub fn reset_relational_definition_batch_call_count_for_test(&self) {
+        self.relational_definition_batch_call_count
+            .store(0, Ordering::Relaxed);
+    }
+
+    #[doc(hidden)]
+    pub fn relational_definition_batch_call_count_for_test(&self) -> usize {
+        self.relational_definition_batch_call_count
+            .load(Ordering::Relaxed)
+    }
+
     /// Persisted candidate-row reads that actually reached the store, one per
     /// (short name, ordering) the request has not already read. Paired with
     /// `definition_candidates_query_count_for_test` it separates "one read for
@@ -12249,6 +12271,8 @@ where
         let values = if unique.is_empty() {
             Vec::new()
         } else {
+            self.relational_definition_batch_call_count
+                .fetch_add(1, Ordering::Relaxed);
             let current = self.store_context.store.relational_definition_values(
                 self.adapter.as_ref(),
                 self.project.root(),
@@ -12984,6 +13008,10 @@ where
         TreeSitterAnalyzer::active_query_cancellation(self)
     }
 
+    fn prefetch_definitions(&self, fq_names: &[String]) {
+        TreeSitterAnalyzer::prefetch_definitions(self, fq_names);
+    }
+
     fn active_query_semantic_model_overlay(
         &self,
     ) -> Option<Option<Arc<crate::analyzer::semantic_model::SemanticModelOverlay>>> {
@@ -13457,6 +13485,14 @@ where
 
     fn definition_prefetch_batch_count_for_test(&self) -> usize {
         TreeSitterAnalyzer::definition_prefetch_batch_count_for_test(self)
+    }
+
+    fn reset_relational_definition_batch_call_count_for_test(&self) {
+        TreeSitterAnalyzer::reset_relational_definition_batch_call_count_for_test(self);
+    }
+
+    fn relational_definition_batch_call_count_for_test(&self) -> usize {
+        TreeSitterAnalyzer::relational_definition_batch_call_count_for_test(self)
     }
 
     fn reset_definition_candidate_row_read_count_for_test(&self) {

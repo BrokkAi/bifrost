@@ -1114,6 +1114,10 @@ impl IAnalyzer for RustAnalyzer {
         self.inner.end_query(context);
     }
 
+    fn prefetch_definitions(&self, fq_names: &[String]) {
+        self.inner.prefetch_definitions(fq_names);
+    }
+
     fn record_query_failure(&self, error: crate::analyzer::store::StoreError) {
         self.inner.record_query_failure(error);
     }
@@ -1381,6 +1385,18 @@ impl crate::analyzer::AnalyzerTestHooks for RustAnalyzer {
         self.inner
             .test_hooks()
             .definition_candidates_query_count_for_test()
+    }
+
+    fn reset_relational_definition_batch_call_count_for_test(&self) {
+        self.inner
+            .test_hooks()
+            .reset_relational_definition_batch_call_count_for_test();
+    }
+
+    fn relational_definition_batch_call_count_for_test(&self) -> usize {
+        self.inner
+            .test_hooks()
+            .relational_definition_batch_call_count_for_test()
     }
 
     fn reset_full_declaration_scan_count_for_test(&self) {

@@ -1614,6 +1614,12 @@ impl IAnalyzer for MultiAnalyzer {
         self.attached_read_ledgers.load(Ordering::Relaxed) > 0
     }
 
+    fn prefetch_definitions(&self, fq_names: &[String]) {
+        self.delegates
+            .values()
+            .for_each(|delegate| delegate.analyzer().prefetch_definitions(fq_names));
+    }
+
     fn active_query_cancellation(&self) -> Option<crate::CancellationToken> {
         self.query_contexts
             .lock()
@@ -2511,6 +2517,48 @@ impl crate::analyzer::AnalyzerTestHooks for MultiAnalyzer {
                     .analyzer()
                     .test_hooks()
                     .definition_candidates_query_count_for_test()
+            })
+            .sum()
+    }
+
+    fn reset_definition_prefetch_batch_count_for_test(&self) {
+        for delegate in self.delegates.values() {
+            delegate
+                .analyzer()
+                .test_hooks()
+                .reset_definition_prefetch_batch_count_for_test();
+        }
+    }
+
+    fn definition_prefetch_batch_count_for_test(&self) -> usize {
+        self.delegates
+            .values()
+            .map(|delegate| {
+                delegate
+                    .analyzer()
+                    .test_hooks()
+                    .definition_prefetch_batch_count_for_test()
+            })
+            .sum()
+    }
+
+    fn reset_relational_definition_batch_call_count_for_test(&self) {
+        for delegate in self.delegates.values() {
+            delegate
+                .analyzer()
+                .test_hooks()
+                .reset_relational_definition_batch_call_count_for_test();
+        }
+    }
+
+    fn relational_definition_batch_call_count_for_test(&self) -> usize {
+        self.delegates
+            .values()
+            .map(|delegate| {
+                delegate
+                    .analyzer()
+                    .test_hooks()
+                    .relational_definition_batch_call_count_for_test()
             })
             .sum()
     }

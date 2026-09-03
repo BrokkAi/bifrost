@@ -1037,6 +1037,16 @@ pub trait IAnalyzer: CodeUnitIndex + Send + Sync + Any {
         false
     }
 
+    /// Best-effort batch-warm the request-scoped `definitions()` memo for
+    /// many names at once. A caller that already knows a name superset (for
+    /// instance every declaration a whole-workspace scan already enumerated)
+    /// can call this once so later individual `definitions()` lookups against
+    /// those same names -- inside `get_definition`'s per-occurrence
+    /// resolution, for instance -- hit a warm memo instead of paying one
+    /// relational round trip each. A no-op with no open query boundary, and
+    /// for analyzers without a `definitions()` memo to warm.
+    fn prefetch_definitions(&self, _fq_names: &[String]) {}
+
     /// The cancellation token carried by the innermost active query boundary.
     ///
     /// Compatibility APIs such as `CodeUnitIndex::definitions` cannot accept a
@@ -1885,6 +1895,18 @@ pub trait AnalyzerTestHooks {
 
     #[doc(hidden)]
     fn definition_prefetch_batch_count_for_test(&self) -> usize {
+        0
+    }
+
+    /// Relational-store round trips issued by `RelationalDefinitionLookup::batch`,
+    /// one per call regardless of how many requests it carried. Paired with
+    /// a test that also counts the distinct names it resolved, to show "one
+    /// batched call for many names" instead of "one call per name" (bifrost#15).
+    #[doc(hidden)]
+    fn reset_relational_definition_batch_call_count_for_test(&self) {}
+
+    #[doc(hidden)]
+    fn relational_definition_batch_call_count_for_test(&self) -> usize {
         0
     }
 

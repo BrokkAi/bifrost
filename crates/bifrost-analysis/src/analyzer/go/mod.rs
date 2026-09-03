@@ -793,6 +793,10 @@ impl IAnalyzer for GoAnalyzer {
         self.inner.end_query(context);
     }
 
+    fn prefetch_definitions(&self, fq_names: &[String]) {
+        self.inner.prefetch_definitions(fq_names);
+    }
+
     fn record_query_failure(&self, error: crate::analyzer::store::StoreError) {
         self.inner.record_query_failure(error);
     }
@@ -1013,6 +1017,42 @@ impl crate::analyzer::AnalyzerTestHooks for GoAnalyzer {
         self.inner
             .test_hooks()
             .evaluation_root_continuation_semantic_cache_revivals_for_test()
+    }
+
+    fn reset_relational_definition_batch_call_count_for_test(&self) {
+        self.inner
+            .test_hooks()
+            .reset_relational_definition_batch_call_count_for_test();
+    }
+
+    fn relational_definition_batch_call_count_for_test(&self) -> usize {
+        self.inner
+            .test_hooks()
+            .relational_definition_batch_call_count_for_test()
+    }
+
+    fn reset_definition_candidates_query_count_for_test(&self) {
+        self.inner
+            .test_hooks()
+            .reset_definition_candidates_query_count_for_test();
+    }
+
+    fn definition_candidates_query_count_for_test(&self) -> usize {
+        self.inner
+            .test_hooks()
+            .definition_candidates_query_count_for_test()
+    }
+
+    fn reset_definition_prefetch_batch_count_for_test(&self) {
+        self.inner
+            .test_hooks()
+            .reset_definition_prefetch_batch_count_for_test();
+    }
+
+    fn definition_prefetch_batch_count_for_test(&self) -> usize {
+        self.inner
+            .test_hooks()
+            .definition_prefetch_batch_count_for_test()
     }
 
     fn reset_full_declaration_scan_count_for_test(&self) {
