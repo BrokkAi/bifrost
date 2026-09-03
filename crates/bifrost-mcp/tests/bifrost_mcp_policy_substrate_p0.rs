@@ -27,9 +27,7 @@ use std::path::Path;
 use std::process::{Child, Command, Stdio};
 
 use brokk_bifrost_analysis::Language;
-use brokk_bifrost_mcp::benchmark_api::{
-    BENCHMARK_MCP_REQUEST_BUDGET_SECS, MCP_ANALYZER_REQUEST_BUDGET_SECS_ENV,
-};
+use brokk_bifrost_mcp::benchmark_api::MCP_ANALYZER_REQUEST_BUDGET_SECS_ENV;
 use common::InlineTestProject;
 use serde_json::{Value, json};
 
@@ -43,6 +41,9 @@ const UNRELIABLE_APP: &str = include_str!("fixtures/policy-substrate-p0/Unreliab
 
 const POLICY_PATH: &str = "policies/acme-pure-has-no-network-io.rqlp";
 const MODEL_PATH: &str = ".bifrost/semantic-models/acme-http-client.json";
+// This is a functional wire test, not a cold-start latency assertion. Small
+// hosted runners can need more than a minute to construct the initial analyzer.
+const FUNCTIONAL_MCP_REQUEST_BUDGET_SECS: u64 = 180;
 
 fn mcp_server_binary() -> &'static str {
     option_env!("CARGO_BIN_EXE_bifrost-mcp-test-server")
@@ -63,7 +64,7 @@ fn spawn_server(root: &Path) -> Child {
         // `crates/bifrost-mcp/tests/bifrost_mcp_server.rs`.
         .env(
             MCP_ANALYZER_REQUEST_BUDGET_SECS_ENV,
-            BENCHMARK_MCP_REQUEST_BUDGET_SECS.to_string(),
+            FUNCTIONAL_MCP_REQUEST_BUDGET_SECS.to_string(),
         )
         .arg("--root")
         .arg(root)
