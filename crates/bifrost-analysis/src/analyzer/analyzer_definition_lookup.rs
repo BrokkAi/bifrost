@@ -454,8 +454,7 @@ impl<'a> AnalyzerDefinitionLookup<'a> {
     /// what the point path would compute. A cancelled or failed batch
     /// memoizes nothing: every name stays unmemoized and the point path
     /// retries it with unchanged results.
-    pub(crate) fn prefetch_fqns(&self, fqns: &[String]) {
-        for language in self.query_languages() {
+    pub(crate) fn prefetch_fqn_in_language(&self, language: Language, fqns: &[String]) {
             let missing: Vec<String> = {
                 let cache = self
                     .memo
@@ -542,6 +541,11 @@ impl<'a> AnalyzerDefinitionLookup<'a> {
                 units.dedup();
                 cache.insert((language, fqn), units);
             }
+    }
+
+    pub(crate) fn prefetch_fqns(&self, fqns: &[String]) {
+        for language in self.query_languages() {
+            self.prefetch_fqn_in_language(language, fqns);
         }
     }
 }
