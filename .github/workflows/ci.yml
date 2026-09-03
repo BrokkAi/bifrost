@@ -12,6 +12,10 @@ jobs:
   source-contract:
     runs-on: ubuntu-latest
     timeout-minutes: 120
+    env:
+      # Test fixtures must not parse the runner's full JDK source archive.
+      # javac and jar remain available through PATH for tests that need them.
+      JAVA_HOME: ''
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
