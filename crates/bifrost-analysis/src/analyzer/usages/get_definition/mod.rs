@@ -998,12 +998,32 @@ fn resolve_definition_requests_traced<'a>(
         .collect()
 }
 
+/// Test-only count of [`resolve_definition_batch_with_source`] invocations,
+/// so a batching caller can assert it collapsed many per-edge calls into one
+/// call per file rather than re-deriving that from timing (bifrost#15).
+#[cfg(test)]
+pub(crate) static RESOLVE_DEFINITION_BATCH_WITH_SOURCE_CALL_COUNT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+pub(crate) fn reset_resolve_definition_batch_with_source_call_count_for_test() {
+    RESOLVE_DEFINITION_BATCH_WITH_SOURCE_CALL_COUNT.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(test)]
+pub(crate) fn resolve_definition_batch_with_source_call_count_for_test() -> usize {
+    RESOLVE_DEFINITION_BATCH_WITH_SOURCE_CALL_COUNT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 pub fn resolve_definition_batch_with_source(
     analyzer: &dyn IAnalyzer,
     requests: Vec<DefinitionLookupRequest>,
     file: ProjectFile,
     source: Arc<str>,
 ) -> Vec<DefinitionLookupOutcome> {
+    #[cfg(test)]
+    RESOLVE_DEFINITION_BATCH_WITH_SOURCE_CALL_COUNT
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let scope = AnalyzerQueryScope::new(analyzer);
     let token = scope.token();
     let scope = AnalyzerQueryScope::new(analyzer);

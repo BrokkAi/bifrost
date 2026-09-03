@@ -2823,10 +2823,13 @@ pub fn usage_graph(analyzer: &dyn IAnalyzer, params: UsageGraphParams) -> UsageG
     } else {
         eligible_files.clone()
     };
-    let root_catalog = if rooted {
-        WorkspaceUsageCatalog::build_for_files(analyzer, &root_files)
-    } else {
-        WorkspaceUsageCatalog::build(analyzer)
+    let root_catalog = {
+        let _scope = profiling::scope("usage_graph::root_catalog_build");
+        if rooted {
+            WorkspaceUsageCatalog::build_for_files(analyzer, &root_files)
+        } else {
+            WorkspaceUsageCatalog::build(analyzer)
+        }
     };
 
     let mut declarations: Vec<(CodeUnit, Option<Range>)> = root_catalog
@@ -2860,6 +2863,13 @@ pub fn usage_graph(analyzer: &dyn IAnalyzer, params: UsageGraphParams) -> UsageG
     let definitions = AnalyzerDefinitionLookup::new(analyzer, Language::None);
     let mut endpoints_by_name: HashMap<(UsageEcosystem, String), Vec<CodeUnit>> =
         HashMap::default();
+    // `declarations` only grows within the depth loop (newly-discovered
+    // targets are pushed onto it as the frontier expands), so the catalog
+    // built from it is stable within one iteration and only needs rebuilding
+    // once a later iteration has appended more entries -- not on every
+    // iteration of `params.depth`, which just re-clones and re-sorts the
+    // same, unchanged prefix each time.
+    let mut layer_catalog_once: Option<(usize, WorkspaceUsageCatalog)> = None;
 
     for _ in 0..params.depth {
         if frontier.is_empty() {
@@ -2883,19 +2893,22 @@ pub fn usage_graph(analyzer: &dyn IAnalyzer, params: UsageGraphParams) -> UsageG
         let mut authoritative_exact_sites: HashSet<UsageGraphSiteKey> = HashSet::default();
         let mut structural_exact_loaded = false;
         let mut inverse_exact_targets: HashSet<(UsageEcosystem, String)> = HashSet::default();
-        let layer_declaration_units = declarations
-            .iter()
-            .map(|(unit, _)| unit.clone())
-            .collect::<Vec<_>>();
-        let layer_catalog = WorkspaceUsageCatalog::from_declarations(
-            layer_declaration_units
-                .iter()
-                .cloned()
-                .map(|unit| (unit, None))
-                .collect(),
-            &CancellationToken::default(),
-        )
-        .expect("uncancelled exact layer catalog construction");
+        if layer_catalog_once
+            .as_ref()
+            .is_none_or(|(built_len, _)| *built_len != declarations.len())
+        {
+            let _scope = profiling::scope("usage_graph::layer_catalog_build");
+            let catalog = WorkspaceUsageCatalog::from_declarations(
+                declarations
+                    .iter()
+                    .map(|(unit, _)| (unit.clone(), None))
+                    .collect(),
+                &CancellationToken::default(),
+            )
+            .expect("uncancelled exact layer catalog construction");
+            layer_catalog_once = Some((declarations.len(), catalog));
+        }
+        let layer_catalog = &layer_catalog_once.as_ref().unwrap().1;
 
         let mut legacy_edges: BTreeMap<
             (UsageEcosystem, String, String),
@@ -2965,15 +2978,31 @@ pub fn usage_graph(analyzer: &dyn IAnalyzer, params: UsageGraphParams) -> UsageG
                     }
                 }
                 Some(crate::analyzer::languages::LanguageEdgeSites::Scoped(result)) => {
+                    // This branch has the same two costs the `Fqn` branch above was
+                    // just fixed for: a store round trip per edge target, and a
+                    // linear scan of `declarations` per edge for the caller. Batch
+                    // and index once per pass instead of once per edge (bifrost#15).
+                    let target_fqns = result
+                        .edges
+                        .keys()
+                        .map(|(_, to)| to.fqn.clone())
+                        .collect::<Vec<_>>();
+                    for language in [Language::TypeScript, Language::JavaScript] {
+                        definitions.prefetch_fqn_in_language(language, &target_fqns);
+                    }
+                    let mut callers_by_key: HashMap<(ProjectFile, String), Vec<CodeUnit>> =
+                        HashMap::default();
+                    for (unit, _) in &declarations {
+                        callers_by_key
+                            .entry((unit.source().clone(), unit.fq_name()))
+                            .or_default()
+                            .push(unit.clone());
+                    }
                     for ((from, to), sites) in result.edges {
-                        let callers = declarations
-                            .iter()
-                            .map(|(unit, _)| unit)
-                            .filter(|unit| {
-                                unit.source() == &from.file && unit.fq_name() == from.fqn
-                            })
+                        let callers = callers_by_key
+                            .get(&(from.file.clone(), from.fqn.clone()))
                             .cloned()
-                            .collect::<Vec<_>>();
+                            .unwrap_or_default();
                         let targets = [Language::TypeScript, Language::JavaScript]
                             .into_iter()
                             .flat_map(|language| definitions.fqn_in_language(&to.fqn, language))
@@ -3036,36 +3065,74 @@ pub fn usage_graph(analyzer: &dyn IAnalyzer, params: UsageGraphParams) -> UsageG
             .map(|(ecosystem, _, target)| (*ecosystem, target.clone()))
             .chain(legacy_truncated.keys().cloned())
             .collect::<BTreeSet<_>>();
-        for endpoint_key in endpoint_keys {
-            endpoints_by_name
-                .entry(endpoint_key)
-                .or_insert_with_key(|(ecosystem, to_name)| {
-                    let mut endpoints = declarations
-                        .iter()
-                        .map(|(unit, _)| unit)
-                        .filter(|unit| {
-                            UsageEcosystem::of(language_for_target(unit)) == *ecosystem
-                                && unit.fq_name() == *to_name
-                        })
-                        .cloned()
-                        .collect::<Vec<_>>();
-                    if endpoints.is_empty() {
-                        endpoints.extend(
-                            ecosystem_languages(*ecosystem)
-                                .iter()
-                                .flat_map(|language| {
-                                    definitions.fqn_in_language(to_name, *language)
-                                })
-                                .filter(is_graph_declaration)
-                                .filter(|unit| {
-                                    test_files
-                                        .as_ref()
-                                        .is_none_or(|exclusion| !exclusion.excludes(unit.source()))
-                                }),
-                        );
-                    }
-                    endpoints
-                });
+
+        // Names with no local-layer match fall back to the relational store,
+        // one exact-name round trip per distinct name. On a large workspace
+        // that is thousands of sequential round trips; batch them into one
+        // call per language instead. See bifrost issue #15.
+        //
+        // Grouping every declaration by (ecosystem, fq_name) once turns both
+        // the "does this exist locally" check below and the endpoint lookup
+        // further down into O(1) map lookups instead of an O(declarations)
+        // scan repeated per endpoint key -- O(endpoint_keys * declarations)
+        // on a large workspace otherwise. See bifrost issue #15.
+        let mut declarations_by_key: HashMap<(UsageEcosystem, String), Vec<CodeUnit>> =
+            HashMap::default();
+        {
+            let _scope = profiling::scope("usage_graph::declarations_by_key_build");
+            for (unit, _) in &declarations {
+                declarations_by_key
+                    .entry((
+                        UsageEcosystem::of(language_for_target(unit)),
+                        unit.fq_name(),
+                    ))
+                    .or_default()
+                    .push(unit.clone());
+            }
+        }
+        let mut store_fallback_names: HashMap<Language, Vec<String>> = HashMap::default();
+        for (ecosystem, to_name) in &endpoint_keys {
+            if !declarations_by_key.contains_key(&(*ecosystem, to_name.clone())) {
+                for language in ecosystem_languages(*ecosystem) {
+                    store_fallback_names
+                        .entry(*language)
+                        .or_default()
+                        .push(to_name.clone());
+                }
+            }
+        }
+        for (language, names) in store_fallback_names {
+            definitions.prefetch_fqn_in_language(language, &names);
+        }
+
+        {
+            let _scope = profiling::scope("usage_graph::endpoint_keys_resolution");
+            for endpoint_key in endpoint_keys {
+                endpoints_by_name
+                    .entry(endpoint_key)
+                    .or_insert_with_key(|(ecosystem, to_name)| {
+                        let mut endpoints = declarations_by_key
+                            .get(&(*ecosystem, to_name.clone()))
+                            .cloned()
+                            .unwrap_or_default();
+                        if endpoints.is_empty() {
+                            endpoints.extend(
+                                ecosystem_languages(*ecosystem)
+                                    .iter()
+                                    .flat_map(|language| {
+                                        definitions.fqn_in_language(to_name, *language)
+                                    })
+                                    .filter(is_graph_declaration)
+                                    .filter(|unit| {
+                                        test_files.as_ref().is_none_or(|exclusion| {
+                                            !exclusion.excludes(unit.source())
+                                        })
+                                    }),
+                            );
+                        }
+                        endpoints
+                    });
+            }
         }
 
         // The structural exact table below is only ever probed at the site
@@ -3090,13 +3157,40 @@ pub fn usage_graph(analyzer: &dyn IAnalyzer, params: UsageGraphParams) -> UsageG
         };
 
         let mut next = BTreeSet::new();
-        for ((ecosystem, from_name, to_name), sites) in legacy_edges {
+
+        // A file referenced by many ambiguous edges was hitting the slow
+        // `get_definition` fallback once per edge, and each call built a
+        // fresh `DefinitionBatchContext` with empty tree/source caches --
+        // re-parsing that file's AST once per edge instead of once total. On
+        // the k8s reproduction, files touched by the fallback averaged
+        // 9-17x as many calls as distinct files (and climbing). Deferring
+        // the slow path and batching it per file below collapses that back
+        // to one call per file; the fast-path scan (this pass) and the
+        // per-site finalization (the last pass, below) are unchanged. See
+        // bifrost#15.
+        struct DeferredSlowPathSite {
+            site_key: UsageGraphSiteKey,
+            from_name: String,
+            to_name: String,
+            line: usize,
+            spans: Vec<(usize, usize)>,
+            endpoints_snapshot: Vec<CodeUnit>,
+        }
+        let mut pending_slow_path: HashMap<ProjectFile, Vec<DeferredSlowPathSite>> =
+            HashMap::default();
+        let mut endpoints_by_edge: HashMap<(UsageEcosystem, String, String), Vec<CodeUnit>> =
+            HashMap::default();
+
+        for ((ecosystem, from_name, to_name), sites) in &legacy_edges {
+            let ecosystem = *ecosystem;
+            let from_name = from_name.clone();
+            let to_name = to_name.clone();
             let endpoint_key = (ecosystem, to_name.clone());
             let mut endpoints = endpoints_by_name[&endpoint_key].clone();
             if unique_graph_unit(&endpoints).is_none()
                 && inverse_exact_targets.insert(endpoint_key.clone())
             {
-                for site in &sites {
+                for site in sites {
                     let site_key = (
                         site.path.clone(),
                         site.line,
@@ -3147,73 +3241,16 @@ pub fn usage_graph(analyzer: &dyn IAnalyzer, params: UsageGraphParams) -> UsageG
                             }
                         }
                     }
-                    let Some(source) = analyzer.indexed_source(file) else {
-                        continue;
-                    };
-                    let requests = site
-                        .spans
-                        .iter()
-                        .map(|(start, end)| {
-                            crate::analyzer::usages::get_definition::DefinitionLookupRequest {
-                                file: file.clone(),
-                                line: None,
-                                column: None,
-                                start_byte: Some(*start),
-                                end_byte: Some(*end),
-                            }
-                        })
-                        .collect::<Vec<_>>();
-                    let outcomes = crate::analyzer::usages::get_definition::resolve_definition_batch_with_source(
-                        analyzer,
-                        requests,
-                        file.clone(),
-                        source.into(),
+                    pending_slow_path.entry(file.clone()).or_default().push(
+                        DeferredSlowPathSite {
+                            site_key,
+                            from_name: from_name.clone(),
+                            to_name: to_name.clone(),
+                            line: site.line,
+                            spans: site.spans.clone(),
+                            endpoints_snapshot: endpoints.clone(),
+                        },
                     );
-                    let mut point_pairs = BTreeSet::new();
-                    for ((start, end), outcome) in site.spans.iter().zip(outcomes) {
-                        if outcome.status
-                            != crate::analyzer::usages::get_definition::DefinitionLookupStatus::Resolved
-                        {
-                            continue;
-                        }
-                        let range = Range {
-                            start_byte: *start,
-                            end_byte: *end,
-                            start_line: site.line,
-                            end_line: site.line,
-                        };
-                        let Some(source_unit) = analyzer
-                            .enclosing_code_unit(file, &range)
-                            .filter(|unit| unit.fq_name() == from_name)
-                        else {
-                            continue;
-                        };
-                        let Some(source_index) =
-                            layer_catalog.index_for_id(&source_unit.declaration_id())
-                        else {
-                            continue;
-                        };
-                        let source_id = layer_catalog.nodes[source_index].key.id.clone();
-                        let mut resolved_targets = outcome
-                            .definitions
-                            .into_iter()
-                            .filter(|unit| unit.fq_name() == to_name)
-                            .filter_map(|unit| {
-                                canonical_graph_unit_for_id(&endpoints, &unit.declaration_id())
-                            })
-                            .collect::<Vec<_>>();
-                        resolved_targets.sort_by_key(CodeUnit::declaration_id);
-                        resolved_targets.dedup_by_key(|unit| unit.declaration_id());
-                        if let Some(target) = resolved_targets.first() {
-                            point_pairs.insert((source_id.clone(), target.declaration_id()));
-                        }
-                    }
-                    if point_pairs.len() == 1 {
-                        point_exact_by_site
-                            .entry(site_key)
-                            .or_default()
-                            .extend(point_pairs);
-                    }
                 }
                 if !structural_exact_loaded {
                     structural_exact_loaded = true;
@@ -3250,11 +3287,21 @@ pub fn usage_graph(analyzer: &dyn IAnalyzer, params: UsageGraphParams) -> UsageG
                 // identity for only this layer's admitted files. This is a rare
                 // ambiguity join, not a second unconditional workspace scan.
                 let admitted_files = scan_files.iter().cloned().collect::<HashSet<_>>();
+                // This scan's `ReferenceEngine` never carries a real deadline
+                // (no `.with_cancellation` above), so the interruptible,
+                // per-candidate importer scan `references_to_edges` uses by
+                // default buys nothing here -- it only protects a caller that
+                // can actually be cancelled mid-scan. Passing the import-graph
+                // provider explicitly routes candidate discovery through the
+                // cached reverse-import-index path instead, which a workspace
+                // the size of a large monorepo otherwise re-scans from
+                // scratch for every ambiguous target (bifrost#15).
                 let exact = ReferenceEngine::new()
                     .with_file_filter(|file| admitted_files.contains(file))
-                    .references_to_edges(
+                    .references_to_edges_with_provider(
                         analyzer,
                         &endpoints,
+                        Some(&crate::analyzer::usages::ImportGraphCandidateProvider::new()),
                         scan_files.len(),
                         crate::analyzer::usages::inverted_edges::MAX_CALLSITES
                             .saturating_mul(endpoints.len()),
@@ -3287,6 +3334,98 @@ pub fn usage_graph(analyzer: &dyn IAnalyzer, params: UsageGraphParams) -> UsageG
                         .insert((source.declaration_id(), row.target_id()));
                 }
             }
+            endpoints_by_edge.insert((ecosystem, from_name.clone(), to_name.clone()), endpoints);
+        }
+
+        // Batch every deferred slow-path site, one `resolve_definition_batch_with_source`
+        // call per file instead of one per edge (see the comment above
+        // `pending_slow_path`'s declaration).
+        for (file, pending_sites) in &pending_slow_path {
+            let Some(source) = analyzer.indexed_source(file) else {
+                continue;
+            };
+            let mut all_requests = Vec::new();
+            let mut request_counts = Vec::with_capacity(pending_sites.len());
+            for pending in pending_sites {
+                let before = all_requests.len();
+                all_requests.extend(pending.spans.iter().map(|(start, end)| {
+                    crate::analyzer::usages::get_definition::DefinitionLookupRequest {
+                        file: file.clone(),
+                        line: None,
+                        column: None,
+                        start_byte: Some(*start),
+                        end_byte: Some(*end),
+                    }
+                }));
+                request_counts.push(all_requests.len() - before);
+            }
+            let all_outcomes =
+                crate::analyzer::usages::get_definition::resolve_definition_batch_with_source(
+                    analyzer,
+                    all_requests,
+                    file.clone(),
+                    source.into(),
+                );
+            let mut offset = 0;
+            for (pending, count) in pending_sites.iter().zip(&request_counts) {
+                let outcomes_slice = &all_outcomes[offset..offset + count];
+                offset += count;
+                let mut point_pairs = BTreeSet::new();
+                for ((start, end), outcome) in pending.spans.iter().zip(outcomes_slice) {
+                    if outcome.status
+                        != crate::analyzer::usages::get_definition::DefinitionLookupStatus::Resolved
+                    {
+                        continue;
+                    }
+                    let range = Range {
+                        start_byte: *start,
+                        end_byte: *end,
+                        start_line: pending.line,
+                        end_line: pending.line,
+                    };
+                    let Some(source_unit) = analyzer
+                        .enclosing_code_unit(file, &range)
+                        .filter(|unit| unit.fq_name() == pending.from_name)
+                    else {
+                        continue;
+                    };
+                    let Some(source_index) =
+                        layer_catalog.index_for_id(&source_unit.declaration_id())
+                    else {
+                        continue;
+                    };
+                    let source_id = layer_catalog.nodes[source_index].key.id.clone();
+                    let mut resolved_targets = outcome
+                        .definitions
+                        .iter()
+                        .cloned()
+                        .filter(|unit| unit.fq_name() == pending.to_name)
+                        .filter_map(|unit| {
+                            canonical_graph_unit_for_id(
+                                &pending.endpoints_snapshot,
+                                &unit.declaration_id(),
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    resolved_targets.sort_by_key(CodeUnit::declaration_id);
+                    resolved_targets.dedup_by_key(|unit| unit.declaration_id());
+                    if let Some(target) = resolved_targets.first() {
+                        point_pairs.insert((source_id.clone(), target.declaration_id()));
+                    }
+                }
+                if point_pairs.len() == 1 {
+                    point_exact_by_site
+                        .entry(pending.site_key.clone())
+                        .or_default()
+                        .extend(point_pairs);
+                }
+            }
+        }
+
+        for ((ecosystem, from_name, to_name), sites) in legacy_edges {
+            let endpoints = endpoints_by_edge
+                .remove(&(ecosystem, from_name.clone(), to_name.clone()))
+                .unwrap_or_default();
             for site in sites {
                 let site_key = (
                     site.path.clone(),
@@ -5603,6 +5742,242 @@ mod tests {
             analyzer.test_hooks().full_declaration_scan_count_for_test(),
             0,
             "a rooted usage graph must not hydrate the workspace declaration inventory"
+        );
+    }
+
+    #[test]
+    fn go_import_infos_for_files_batches_instead_of_defaulting_to_none() {
+        let fixture = AnalyzerFixture::new_for_language(
+            Language::Go,
+            &[
+                ("go.mod", "module example.com/repro\n"),
+                ("helpers/alpha.go", "package helpers\n\nfunc Alpha() {}\n"),
+                (
+                    "caller/main.go",
+                    "package caller\n\nimport \"example.com/repro/helpers\"\n\nfunc Run() {\n\thelpers.Alpha()\n}\n",
+                ),
+            ],
+        );
+        let analyzer = fixture.analyzer.analyzer();
+        let files: Vec<ProjectFile> = analyzer
+            .analyzed_files()
+            .into_iter()
+            .filter(|file| {
+                let path = rel_path_string(file);
+                path == "helpers/alpha.go" || path == "caller/main.go"
+            })
+            .collect();
+        assert_eq!(files.len(), 2, "the fixture's two Go files must both be analyzed");
+
+        let provider = analyzer
+            .import_analysis_provider()
+            .expect("GoAnalyzer must expose an ImportAnalysisProvider");
+
+        // Before this fix, Go fell through to the trait's `None` default here,
+        // forcing find_direct_importers_with_cancellation to call
+        // `import_info_of` once per file inside its per-candidate parallel
+        // loop instead of one batched store read (bifrost#15).
+        let batched = provider
+            .import_infos_for_files(&files)
+            .expect("Go must implement the batched import-facts read, not fall back to None");
+        assert_eq!(
+            batched.len(),
+            2,
+            "the batch must return an entry for every requested file"
+        );
+
+        let caller = files
+            .iter()
+            .find(|file| rel_path_string(file) == "caller/main.go")
+            .expect("caller/main.go must be in the fixture");
+        let caller_imports = batched
+            .get(caller)
+            .expect("caller/main.go must have a batched entry");
+        assert!(
+            caller_imports
+                .iter()
+                .any(|info| info.raw_snippet.contains("example.com/repro/helpers")),
+            "the batched import facts for caller/main.go must include its real import, got {caller_imports:?}"
+        );
+
+        let helpers = files
+            .iter()
+            .find(|file| rel_path_string(file) == "helpers/alpha.go")
+            .expect("helpers/alpha.go must be in the fixture");
+        assert!(
+            batched.get(helpers).expect("helpers/alpha.go must have a batched entry").is_empty(),
+            "helpers/alpha.go declares no imports of its own"
+        );
+    }
+
+    #[test]
+    fn ambiguous_edges_sharing_a_file_batch_one_resolve_definition_batch_with_source_call() {
+        let fixture = AnalyzerFixture::new_for_language(
+            Language::Go,
+            &[
+                ("go.mod", "module example.com/repro\n"),
+                // Two declarations sharing one fq name make the target
+                // genuinely ambiguous (`unique_graph_unit` returns None),
+                // which is what gates entry into the slow-path fallback.
+                ("dup/a.go", "package dup\n\nfunc Widget() {}\n"),
+                ("dup/b.go", "package dup\n\nfunc Widget() {}\n"),
+                ("dup2/a.go", "package dup2\n\nfunc Gadget() {}\n"),
+                ("dup2/b.go", "package dup2\n\nfunc Gadget() {}\n"),
+                (
+                    "caller/main.go",
+                    "package caller\n\nimport (\n\t\"example.com/repro/dup\"\n\t\"example.com/repro/dup2\"\n)\n\nfunc RunMany() {\n\tdup.Widget()\n\tdup.Widget()\n\tdup2.Gadget()\n\tdup2.Gadget()\n}\n",
+                ),
+            ],
+        );
+        let analyzer = fixture.analyzer.analyzer();
+
+        crate::analyzer::usages::get_definition::reset_resolve_definition_batch_with_source_call_count_for_test();
+        crate::analyzer::usages::candidates::reset_find_direct_importers_with_cancellation_call_count_for_test();
+        let graph = usage_graph(
+            analyzer,
+            UsageGraphParams {
+                include_tests: false,
+                paths: None,
+                depth: 1,
+            },
+        );
+        let calls =
+            crate::analyzer::usages::get_definition::resolve_definition_batch_with_source_call_count_for_test();
+        let importer_scan_calls =
+            crate::analyzer::usages::candidates::find_direct_importers_with_cancellation_call_count_for_test();
+
+        // Two ambiguous targets (Widget, Gadget) each called twice from the
+        // same file are four fallback-eligible sites; batched by file they
+        // must collapse into exactly one call, not one per site (bifrost#15).
+        assert_eq!(
+            calls, 1,
+            "four ambiguous-edge fallback sites sharing caller/main.go must batch into \
+             exactly one resolve_definition_batch_with_source call, got {calls}"
+        );
+        // usage_graph()'s ReferenceEngine never carries a real cancellation
+        // deadline, so its ambiguous-target candidate discovery must route
+        // through the cached reverse-import-index path (ImportGraphCandidateProvider)
+        // instead of the interruptible, uncached per-file importer scan that
+        // path exists to protect a caller with a real deadline (bifrost#15).
+        assert_eq!(
+            importer_scan_calls, 0,
+            "usage_graph's candidate discovery must not fall back to the uncached \
+             per-candidate importer scan, got {importer_scan_calls} calls"
+        );
+        // The graph is still allowed to omit an edge it genuinely cannot
+        // disambiguate; this test's job is the call-count assertion above,
+        // not asserting a specific resolved edge for an intentionally
+        // ambiguous target.
+        let _ = graph;
+    }
+
+    #[test]
+    fn prefetch_definitions_reaches_the_go_analyzer_through_the_ianalyzer_trait() {
+        let fixture = AnalyzerFixture::new_for_language(
+            Language::Go,
+            &[
+                ("go.mod", "module example.com/repro\n"),
+                ("helpers/alpha.go", "package helpers\n\nfunc Alpha() {}\n"),
+                ("helpers/beta.go", "package helpers\n\nfunc Beta() {}\n"),
+            ],
+        );
+        let analyzer = fixture.analyzer.analyzer();
+        let names = ["Alpha", "Beta"]
+            .map(|name| format!("example.com/repro/helpers.{name}"))
+            .to_vec();
+
+        let scope = std::sync::Arc::new(crate::analyzer::AnalyzerQueryContext::default());
+        analyzer.begin_query(&scope);
+        analyzer
+            .test_hooks()
+            .reset_definition_candidates_query_count_for_test();
+        analyzer
+            .test_hooks()
+            .reset_definition_prefetch_batch_count_for_test();
+
+        // usage_graph() only has `&dyn IAnalyzer`, so the batched prefetch it
+        // calls before resolving structural-exact sites must actually reach
+        // GoAnalyzer's inner analyzer through the trait, not silently no-op
+        // against the trait's own default (bifrost#15).
+        analyzer.prefetch_definitions(&names);
+        assert_eq!(
+            analyzer
+                .test_hooks()
+                .definition_prefetch_batch_count_for_test(),
+            1,
+            "one batched prefetch call through the IAnalyzer trait must reach \
+             GoAnalyzer's inner analyzer"
+        );
+
+        for name in &names {
+            assert_eq!(
+                analyzer.definitions(name).count(),
+                1,
+                "{name} must resolve to its declaration after the trait-level prefetch"
+            );
+        }
+        assert_eq!(
+            analyzer
+                .test_hooks()
+                .definition_candidates_query_count_for_test(),
+            0,
+            "a name warmed by prefetch_definitions must not fall back to a point lookup"
+        );
+        analyzer.end_query(&scope);
+    }
+
+    #[test]
+    fn prefetch_fqn_in_language_resolves_many_names_in_one_relational_store_call() {
+        let fixture = AnalyzerFixture::new_for_language(
+            Language::Go,
+            &[
+                ("go.mod", "module example.com/repro\n"),
+                ("helpers/alpha.go", "package helpers\n\nfunc Alpha() {}\n"),
+                ("helpers/beta.go", "package helpers\n\nfunc Beta() {}\n"),
+                ("helpers/gamma.go", "package helpers\n\nfunc Gamma() {}\n"),
+                ("helpers/delta.go", "package helpers\n\nfunc Delta() {}\n"),
+            ],
+        );
+        let analyzer = fixture.analyzer.analyzer();
+        let names = ["Alpha", "Beta", "Gamma", "Delta"]
+            .map(|name| format!("example.com/repro/helpers.{name}"))
+            .to_vec();
+        let definitions = AnalyzerDefinitionLookup::new(analyzer, Language::None);
+
+        analyzer
+            .test_hooks()
+            .reset_relational_definition_batch_call_count_for_test();
+        definitions.prefetch_fqn_in_language(Language::Go, &names);
+
+        // Four distinct cross-package names in one language: resolving them
+        // one at a time takes 8 round trips (an exact-name attempt plus an
+        // identifier-candidate fallback per name, since a package-qualified
+        // reference like this misses the exact-name store index). Batching
+        // both phases collapses that to one round trip per phase regardless
+        // of how many distinct names a `usage_graph` request resolves
+        // (bifrost#15).
+        assert_eq!(
+            analyzer
+                .test_hooks()
+                .relational_definition_batch_call_count_for_test(),
+            2,
+            "prefetching four names in one language must batch both the exact-name attempt \
+             and the identifier-candidate fallback into one round trip each"
+        );
+
+        for name in &names {
+            assert_eq!(
+                definitions.fqn_in_language(name, Language::Go).len(),
+                1,
+                "{name} must resolve to its declaration after the prefetch populated the cache"
+            );
+        }
+        assert_eq!(
+            analyzer
+                .test_hooks()
+                .relational_definition_batch_call_count_for_test(),
+            2,
+            "a cache hit after the prefetch must not issue another store round trip"
         );
     }
 
