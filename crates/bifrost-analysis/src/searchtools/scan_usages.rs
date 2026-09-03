@@ -2891,7 +2891,6 @@ pub fn usage_graph(analyzer: &dyn IAnalyzer, params: UsageGraphParams) -> UsageG
         let mut structural_exact_by_site = UsageGraphExactSites::default();
         let mut inverse_exact_by_site = UsageGraphExactSites::default();
         let mut authoritative_exact_sites: HashSet<UsageGraphSiteKey> = HashSet::default();
-        let mut structural_exact_loaded = false;
         let mut inverse_exact_targets: HashSet<(UsageEcosystem, String)> = HashSet::default();
         if layer_catalog_once
             .as_ref()
@@ -3178,91 +3177,202 @@ pub fn usage_graph(analyzer: &dyn IAnalyzer, params: UsageGraphParams) -> UsageG
         }
         let mut pending_slow_path: HashMap<ProjectFile, Vec<DeferredSlowPathSite>> =
             HashMap::default();
-        let mut endpoints_by_edge: HashMap<(UsageEcosystem, String, String), Vec<CodeUnit>> =
-            HashMap::default();
 
+        // Every ambiguous target's fast-path scan and exact-reference scan is
+        // independent of every other target's: site keys embed `to_name`, so
+        // two different targets can never write the same key, and `endpoints`
+        // starts fresh from `endpoints_by_name` for each one. On a workspace
+        // the size of a large monorepo this loop ran hundreds of these scans
+        // sequentially, each taking anywhere from single-digit milliseconds
+        // to several seconds -- collectively most of usage_graph's remaining
+        // runtime after the fixes above. Select the ambiguous targets first
+        // (cheap, sequential, and must preserve today's "first edge in
+        // BTreeMap order wins" semantics for a to_name shared by several
+        // edges), run each target's scan in parallel on the shared heavy-scan
+        // pool, then merge every result back in sequentially. See bifrost#15.
+        struct AmbiguousTarget<'a> {
+            ecosystem: UsageEcosystem,
+            from_name: &'a str,
+            to_name: &'a str,
+            sites: &'a [crate::analyzer::usages::inverted_edges::CallSite],
+        }
+        let mut ambiguous_targets: Vec<AmbiguousTarget<'_>> = Vec::new();
         for ((ecosystem, from_name, to_name), sites) in &legacy_edges {
-            let ecosystem = *ecosystem;
-            let from_name = from_name.clone();
-            let to_name = to_name.clone();
-            let endpoint_key = (ecosystem, to_name.clone());
-            let mut endpoints = endpoints_by_name[&endpoint_key].clone();
-            if unique_graph_unit(&endpoints).is_none()
-                && inverse_exact_targets.insert(endpoint_key.clone())
+            let endpoint_key = (*ecosystem, to_name.clone());
+            if unique_graph_unit(&endpoints_by_name[&endpoint_key]).is_none()
+                && inverse_exact_targets.insert(endpoint_key)
             {
-                for site in sites {
-                    let site_key = (
-                        site.path.clone(),
-                        site.line,
-                        from_name.clone(),
-                        to_name.clone(),
-                    );
-                    if authoritative_exact_sites.contains(&site_key) || site.spans.is_empty() {
-                        continue;
-                    }
-                    let Some(file) = scan_files_by_path.get(&site.path) else {
-                        continue;
-                    };
-                    if !site.exact_targets.is_empty() {
-                        let (start, end) = site.spans[0];
-                        let range = Range {
-                            start_byte: start,
-                            end_byte: end,
-                            start_line: site.line,
-                            end_line: site.line,
-                        };
-                        if let Some(source_unit) = analyzer
-                            .enclosing_code_unit(file, &range)
-                            .filter(|unit| unit.fq_name() == from_name)
-                            && let Some(source_index) =
-                                layer_catalog.index_for_id(&source_unit.declaration_id())
+                ambiguous_targets.push(AmbiguousTarget {
+                    ecosystem: *ecosystem,
+                    from_name,
+                    to_name,
+                    sites,
+                });
+            }
+        }
+
+        if !ambiguous_targets.is_empty() {
+            let structural =
+                ReferenceEngine::new().scan_file_edges_at_lines(analyzer, &structural_exact_sites);
+            if !structural.completeness.is_complete() {
+                incomplete.insert((
+                    "exact_reference_join_incomplete".to_string(),
+                    "structural exact reference attribution was incomplete".to_string(),
+                ));
+            }
+            for row in structural.edges {
+                let Some(source) = row.site.enclosing.as_ref() else {
+                    continue;
+                };
+                let site_key = (
+                    rel_path_string(&row.site.file),
+                    row.site.range.start_line,
+                    source.fq_name(),
+                    row.target.fq_name(),
+                );
+                if authoritative_exact_sites.contains(&site_key) {
+                    continue;
+                }
+                structural_exact_by_site
+                    .entry(site_key)
+                    .or_default()
+                    .insert((source.declaration_id(), row.target_id()));
+            }
+        }
+
+        struct AmbiguousTargetResult {
+            ecosystem: UsageEcosystem,
+            to_name: String,
+            endpoints: Vec<CodeUnit>,
+            new_authoritative_sites: Vec<UsageGraphSiteKey>,
+            new_exact_by_site: Vec<(UsageGraphSiteKey, BTreeSet<UsageGraphEndpointPair>)>,
+            new_pending_slow_path: Vec<(ProjectFile, DeferredSlowPathSite)>,
+            new_inverse_exact_by_site: UsageGraphExactSites,
+            incomplete_reasons: Vec<(String, String)>,
+        }
+        // The bounded semantic pass deliberately aggregates by its legacy
+        // graph key. When that key names multiple exact declarations, ask
+        // the same language plugin's target side to retain the overload
+        // identity for only this layer's admitted files. This is a rare
+        // ambiguity join, not a second unconditional workspace scan.
+        let admitted_files = scan_files.iter().cloned().collect::<HashSet<_>>();
+        // `authoritative_exact_sites` as it stands before this parallel
+        // section is safe to share read-only: nothing below writes into it
+        // until the sequential merge, and a key any worker below could ever
+        // query embeds that worker's own `to_name`, so no worker can
+        // possibly need to see another worker's (still pending) insertion.
+        let authoritative_exact_sites_snapshot = &authoritative_exact_sites;
+        let results: Vec<AmbiguousTargetResult> = HEAVY_SCAN_POOL.install(|| {
+            ambiguous_targets
+                .par_iter()
+                .map(|target| {
+                    let endpoint_key = (target.ecosystem, target.to_name.to_string());
+                    let mut endpoints = endpoints_by_name[&endpoint_key].clone();
+                    let mut new_authoritative_sites = Vec::new();
+                    let mut new_exact_by_site = Vec::new();
+                    let mut new_pending_slow_path = Vec::new();
+                    for site in target.sites {
+                        let site_key = (
+                            site.path.clone(),
+                            site.line,
+                            target.from_name.to_string(),
+                            target.to_name.to_string(),
+                        );
+                        if authoritative_exact_sites_snapshot.contains(&site_key)
+                            || site.spans.is_empty()
                         {
-                            let source_id = layer_catalog.nodes[source_index].key.id.clone();
-                            let pairs = site
-                                .exact_targets
-                                .iter()
-                                .filter(|target| {
-                                    target.fq_name() == to_name && is_graph_declaration(target)
-                                })
-                                .map(|target| {
-                                    if !endpoints.iter().any(|endpoint| {
-                                        endpoint.declaration_id() == target.declaration_id()
-                                    }) {
-                                        endpoints.push(target.clone());
-                                    }
-                                    target.clone()
-                                })
-                                .map(|target| (source_id.clone(), target.declaration_id()))
-                                .collect::<BTreeSet<_>>();
-                            if !pairs.is_empty() {
-                                authoritative_exact_sites.insert(site_key.clone());
-                                exact_by_site.insert(site_key, pairs);
-                                continue;
+                            continue;
+                        }
+                        let Some(file) = scan_files_by_path.get(&site.path) else {
+                            continue;
+                        };
+                        if !site.exact_targets.is_empty() {
+                            let (start, end) = site.spans[0];
+                            let range = Range {
+                                start_byte: start,
+                                end_byte: end,
+                                start_line: site.line,
+                                end_line: site.line,
+                            };
+                            if let Some(source_unit) = analyzer
+                                .enclosing_code_unit(file, &range)
+                                .filter(|unit| unit.fq_name() == target.from_name)
+                                && let Some(source_index) =
+                                    layer_catalog.index_for_id(&source_unit.declaration_id())
+                            {
+                                let source_id = layer_catalog.nodes[source_index].key.id.clone();
+                                let pairs = site
+                                    .exact_targets
+                                    .iter()
+                                    .filter(|candidate| {
+                                        candidate.fq_name() == target.to_name
+                                            && is_graph_declaration(candidate)
+                                    })
+                                    .map(|candidate| {
+                                        if !endpoints.iter().any(|endpoint| {
+                                            endpoint.declaration_id()
+                                                == candidate.declaration_id()
+                                        }) {
+                                            endpoints.push(candidate.clone());
+                                        }
+                                        candidate.clone()
+                                    })
+                                    .map(|candidate| (source_id.clone(), candidate.declaration_id()))
+                                    .collect::<BTreeSet<_>>();
+                                if !pairs.is_empty() {
+                                    new_authoritative_sites.push(site_key.clone());
+                                    new_exact_by_site.push((site_key, pairs));
+                                    continue;
+                                }
                             }
                         }
-                    }
-                    pending_slow_path.entry(file.clone()).or_default().push(
-                        DeferredSlowPathSite {
-                            site_key,
-                            from_name: from_name.clone(),
-                            to_name: to_name.clone(),
-                            line: site.line,
-                            spans: site.spans.clone(),
-                            endpoints_snapshot: endpoints.clone(),
-                        },
-                    );
-                }
-                if !structural_exact_loaded {
-                    structural_exact_loaded = true;
-                    let structural = ReferenceEngine::new()
-                        .scan_file_edges_at_lines(analyzer, &structural_exact_sites);
-                    if !structural.completeness.is_complete() {
-                        incomplete.insert((
-                            "exact_reference_join_incomplete".to_string(),
-                            "structural exact reference attribution was incomplete".to_string(),
+                        new_pending_slow_path.push((
+                            file.clone(),
+                            DeferredSlowPathSite {
+                                site_key,
+                                from_name: target.from_name.to_string(),
+                                to_name: target.to_name.to_string(),
+                                line: site.line,
+                                spans: site.spans.clone(),
+                                endpoints_snapshot: endpoints.clone(),
+                            },
                         ));
                     }
-                    for row in structural.edges {
+
+                    // This scan's `ReferenceEngine` never carries a real
+                    // deadline (no `.with_cancellation` above), so the
+                    // interruptible, per-candidate importer scan
+                    // `references_to_edges` uses by default buys nothing
+                    // here -- it only protects a caller that can actually be
+                    // cancelled mid-scan. Passing the import-graph provider
+                    // explicitly routes candidate discovery through the
+                    // cached reverse-import-index path instead, which a
+                    // workspace the size of a large monorepo otherwise
+                    // re-scans from scratch for every ambiguous target
+                    // (bifrost#15).
+                    let exact = ReferenceEngine::new()
+                        .with_file_filter(|file| admitted_files.contains(file))
+                        .references_to_edges_with_provider(
+                            analyzer,
+                            &endpoints,
+                            Some(&crate::analyzer::usages::ImportGraphCandidateProvider::new()),
+                            scan_files.len(),
+                            crate::analyzer::usages::inverted_edges::MAX_CALLSITES
+                                .saturating_mul(endpoints.len()),
+                            None,
+                        );
+                    let mut incomplete_reasons = Vec::new();
+                    if !exact.completeness.is_complete() {
+                        incomplete_reasons.push((
+                            "exact_reference_join_incomplete".to_string(),
+                            format!(
+                                "exact reference attribution was incomplete for ambiguous target {}",
+                                target.to_name
+                            ),
+                        ));
+                    }
+                    let mut new_inverse_exact_by_site = UsageGraphExactSites::default();
+                    for row in exact.edges {
                         let Some(source) = row.site.enclosing.as_ref() else {
                             continue;
                         };
@@ -3272,69 +3382,48 @@ pub fn usage_graph(analyzer: &dyn IAnalyzer, params: UsageGraphParams) -> UsageG
                             source.fq_name(),
                             row.target.fq_name(),
                         );
-                        if authoritative_exact_sites.contains(&site_key) {
+                        if authoritative_exact_sites_snapshot.contains(&site_key) {
                             continue;
                         }
-                        structural_exact_by_site
+                        new_inverse_exact_by_site
                             .entry(site_key)
                             .or_default()
                             .insert((source.declaration_id(), row.target_id()));
                     }
-                }
-                // The bounded semantic pass deliberately aggregates by its legacy
-                // graph key. When that key names multiple exact declarations, ask
-                // the same language plugin's target side to retain the overload
-                // identity for only this layer's admitted files. This is a rare
-                // ambiguity join, not a second unconditional workspace scan.
-                let admitted_files = scan_files.iter().cloned().collect::<HashSet<_>>();
-                // This scan's `ReferenceEngine` never carries a real deadline
-                // (no `.with_cancellation` above), so the interruptible,
-                // per-candidate importer scan `references_to_edges` uses by
-                // default buys nothing here -- it only protects a caller that
-                // can actually be cancelled mid-scan. Passing the import-graph
-                // provider explicitly routes candidate discovery through the
-                // cached reverse-import-index path instead, which a workspace
-                // the size of a large monorepo otherwise re-scans from
-                // scratch for every ambiguous target (bifrost#15).
-                let exact = ReferenceEngine::new()
-                    .with_file_filter(|file| admitted_files.contains(file))
-                    .references_to_edges_with_provider(
-                        analyzer,
-                        &endpoints,
-                        Some(&crate::analyzer::usages::ImportGraphCandidateProvider::new()),
-                        scan_files.len(),
-                        crate::analyzer::usages::inverted_edges::MAX_CALLSITES
-                            .saturating_mul(endpoints.len()),
-                        None,
-                    );
-                if !exact.completeness.is_complete() {
-                    incomplete.insert((
-                        "exact_reference_join_incomplete".to_string(),
-                        format!(
-                            "exact reference attribution was incomplete for ambiguous target {to_name}"
-                        ),
-                    ));
-                }
-                for row in exact.edges {
-                    let Some(source) = row.site.enclosing.as_ref() else {
-                        continue;
-                    };
-                    let site_key = (
-                        rel_path_string(&row.site.file),
-                        row.site.range.start_line,
-                        source.fq_name(),
-                        row.target.fq_name(),
-                    );
-                    if authoritative_exact_sites.contains(&site_key) {
-                        continue;
+
+                    AmbiguousTargetResult {
+                        ecosystem: target.ecosystem,
+                        to_name: target.to_name.to_string(),
+                        endpoints,
+                        new_authoritative_sites,
+                        new_exact_by_site,
+                        new_pending_slow_path,
+                        new_inverse_exact_by_site,
+                        incomplete_reasons,
                     }
-                    inverse_exact_by_site
-                        .entry(site_key)
-                        .or_default()
-                        .insert((source.declaration_id(), row.target_id()));
-                }
+                })
+                .collect()
+        });
+
+        let mut endpoints_by_target: HashMap<(UsageEcosystem, String), Vec<CodeUnit>> =
+            HashMap::default();
+        for result in results {
+            for site_key in result.new_authoritative_sites {
+                authoritative_exact_sites.insert(site_key);
             }
-            endpoints_by_edge.insert((ecosystem, from_name.clone(), to_name.clone()), endpoints);
+            for (site_key, pairs) in result.new_exact_by_site {
+                exact_by_site.insert(site_key, pairs);
+            }
+            for (file, pending) in result.new_pending_slow_path {
+                pending_slow_path.entry(file).or_default().push(pending);
+            }
+            for (site_key, pairs) in result.new_inverse_exact_by_site {
+                inverse_exact_by_site.entry(site_key).or_default().extend(pairs);
+            }
+            for reason in result.incomplete_reasons {
+                incomplete.insert(reason);
+            }
+            endpoints_by_target.insert((result.ecosystem, result.to_name), result.endpoints);
         }
 
         // Batch every deferred slow-path site, one `resolve_definition_batch_with_source`
@@ -3423,9 +3512,14 @@ pub fn usage_graph(analyzer: &dyn IAnalyzer, params: UsageGraphParams) -> UsageG
         }
 
         for ((ecosystem, from_name, to_name), sites) in legacy_edges {
-            let endpoints = endpoints_by_edge
-                .remove(&(ecosystem, from_name.clone(), to_name.clone()))
-                .unwrap_or_default();
+            let endpoints = endpoints_by_target
+                .remove(&(ecosystem, to_name.clone()))
+                .unwrap_or_else(|| {
+                    endpoints_by_name
+                        .get(&(ecosystem, to_name.clone()))
+                        .cloned()
+                        .unwrap_or_default()
+                });
             for site in sites {
                 let site_key = (
                     site.path.clone(),
@@ -5816,16 +5910,22 @@ mod tests {
             Language::Go,
             &[
                 ("go.mod", "module example.com/repro\n"),
-                // Two declarations sharing one fq name make the target
+                // Three declarations sharing one fq name each make the target
                 // genuinely ambiguous (`unique_graph_unit` returns None),
-                // which is what gates entry into the slow-path fallback.
+                // which is what gates entry into the slow-path fallback. Three
+                // distinct ambiguous targets (rather than two) exercise the
+                // parallel per-target resolution with more than a pair of
+                // workers, so a merge bug that only shows up with >2 workers
+                // (e.g. clobbering rather than accumulating) is caught.
                 ("dup/a.go", "package dup\n\nfunc Widget() {}\n"),
                 ("dup/b.go", "package dup\n\nfunc Widget() {}\n"),
                 ("dup2/a.go", "package dup2\n\nfunc Gadget() {}\n"),
                 ("dup2/b.go", "package dup2\n\nfunc Gadget() {}\n"),
+                ("dup3/a.go", "package dup3\n\nfunc Sprocket() {}\n"),
+                ("dup3/b.go", "package dup3\n\nfunc Sprocket() {}\n"),
                 (
                     "caller/main.go",
-                    "package caller\n\nimport (\n\t\"example.com/repro/dup\"\n\t\"example.com/repro/dup2\"\n)\n\nfunc RunMany() {\n\tdup.Widget()\n\tdup.Widget()\n\tdup2.Gadget()\n\tdup2.Gadget()\n}\n",
+                    "package caller\n\nimport (\n\t\"example.com/repro/dup\"\n\t\"example.com/repro/dup2\"\n\t\"example.com/repro/dup3\"\n)\n\nfunc RunMany() {\n\tdup.Widget()\n\tdup.Widget()\n\tdup2.Gadget()\n\tdup2.Gadget()\n\tdup3.Sprocket()\n\tdup3.Sprocket()\n}\n",
                 ),
             ],
         );
@@ -5846,12 +5946,14 @@ mod tests {
         let importer_scan_calls =
             crate::analyzer::usages::candidates::find_direct_importers_with_cancellation_call_count_for_test();
 
-        // Two ambiguous targets (Widget, Gadget) each called twice from the
-        // same file are four fallback-eligible sites; batched by file they
-        // must collapse into exactly one call, not one per site (bifrost#15).
+        // Three ambiguous targets (Widget, Gadget, Sprocket) each called
+        // twice from the same file are six fallback-eligible sites; batched
+        // by file they must collapse into exactly one call, not one per site
+        // and not one per target, regardless of how many targets' resolution
+        // ran in parallel (bifrost#15).
         assert_eq!(
             calls, 1,
-            "four ambiguous-edge fallback sites sharing caller/main.go must batch into \
+            "six ambiguous-edge fallback sites sharing caller/main.go must batch into \
              exactly one resolve_definition_batch_with_source call, got {calls}"
         );
         // usage_graph()'s ReferenceEngine never carries a real cancellation
