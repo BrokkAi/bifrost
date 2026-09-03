@@ -17,7 +17,7 @@ pub mod call_binding;
 pub mod call_relations;
 pub mod call_shape;
 pub mod callable_signature;
-mod candidates;
+pub(crate) mod candidates;
 pub(crate) mod common;
 pub mod cpp_graph;
 pub mod csharp_graph;
