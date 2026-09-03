@@ -38,7 +38,16 @@ jobs:
         run: cargo test --workspace --doc --locked
 
       - name: Run MCP contract tests
-        run: cargo test -p brokk-bifrost-mcp --locked
+        # Each server contract may initialize an analyzer process. Running the
+        # integration binaries serially keeps those independent cold starts
+        # inside their production request budgets on hosted runners. The MCP
+        # library tests already ran in the workspace unit-test step above.
+        run: >-
+          cargo test -p brokk-bifrost-mcp --locked
+          --test bifrost_mcp_policy_substrate_p0
+          --test bifrost_mcp_server
+          --test mcp_wire_schema
+          -- --test-threads=1
 
       - name: Run LSP contract tests
         run: cargo test -p brokk-bifrost-lsp --locked
