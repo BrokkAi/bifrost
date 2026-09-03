@@ -281,12 +281,13 @@ fn cpp_related_callable_source_files(
 /// caller that switched to the cached-reverse-import-index path can assert it
 /// no longer takes the uncached, per-candidate scan (bifrost#15).
 #[cfg(test)]
-pub(crate) static FIND_DIRECT_IMPORTERS_WITH_CANCELLATION_CALL_COUNT: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
+pub(crate) static FIND_DIRECT_IMPORTERS_WITH_CANCELLATION_CALL_COUNT:
+    std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 #[cfg(test)]
 pub(crate) fn reset_find_direct_importers_with_cancellation_call_count_for_test() {
-    FIND_DIRECT_IMPORTERS_WITH_CANCELLATION_CALL_COUNT.store(0, std::sync::atomic::Ordering::Relaxed);
+    FIND_DIRECT_IMPORTERS_WITH_CANCELLATION_CALL_COUNT
+        .store(0, std::sync::atomic::Ordering::Relaxed);
 }
 
 #[cfg(test)]
@@ -302,7 +303,8 @@ fn find_direct_importers_with_cancellation(
     cancellation: &CancellationToken,
 ) -> HashSet<ProjectFile> {
     #[cfg(test)]
-    FIND_DIRECT_IMPORTERS_WITH_CANCELLATION_CALL_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    FIND_DIRECT_IMPORTERS_WITH_CANCELLATION_CALL_COUNT
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let mut files: Vec<_> = files.into_iter().collect();
     // Everything from here to the per-candidate loop is workspace-scale and
     // uninterruptible once entered: sorting every analyzed file, and the

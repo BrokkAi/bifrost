@@ -3418,7 +3418,10 @@ pub fn usage_graph(analyzer: &dyn IAnalyzer, params: UsageGraphParams) -> UsageG
                 pending_slow_path.entry(file).or_default().push(pending);
             }
             for (site_key, pairs) in result.new_inverse_exact_by_site {
-                inverse_exact_by_site.entry(site_key).or_default().extend(pairs);
+                inverse_exact_by_site
+                    .entry(site_key)
+                    .or_default()
+                    .extend(pairs);
             }
             for reason in result.incomplete_reasons {
                 incomplete.insert(reason);
@@ -5861,7 +5864,11 @@ mod tests {
                 path == "helpers/alpha.go" || path == "caller/main.go"
             })
             .collect();
-        assert_eq!(files.len(), 2, "the fixture's two Go files must both be analyzed");
+        assert_eq!(
+            files.len(),
+            2,
+            "the fixture's two Go files must both be analyzed"
+        );
 
         let provider = analyzer
             .import_analysis_provider()
@@ -5899,7 +5906,10 @@ mod tests {
             .find(|file| rel_path_string(file) == "helpers/alpha.go")
             .expect("helpers/alpha.go must be in the fixture");
         assert!(
-            batched.get(helpers).expect("helpers/alpha.go must have a batched entry").is_empty(),
+            batched
+                .get(helpers)
+                .expect("helpers/alpha.go must have a batched entry")
+                .is_empty(),
             "helpers/alpha.go declares no imports of its own"
         );
     }

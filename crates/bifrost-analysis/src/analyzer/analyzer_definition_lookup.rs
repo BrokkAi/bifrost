@@ -444,8 +444,8 @@ impl<'a> AnalyzerDefinitionLookup<'a> {
         matches
     }
 
-    /// Resolve many rendered names into the shared fqn memo with two batched
-    /// relational reads per language instead of one point batch per name.
+    /// Resolve rendered names in one language into the shared fqn memo with
+    /// two batched relational reads instead of one point batch per name.
     ///
     /// The rounds are the same two questions [`Self::exact_for_language`]
     /// asks per name -- an exact persisted-identity seek, then the identifier
@@ -455,94 +455,95 @@ impl<'a> AnalyzerDefinitionLookup<'a> {
     /// memoizes nothing: every name stays unmemoized and the point path
     /// retries it with unchanged results.
     pub(crate) fn prefetch_fqn_in_language(&self, language: Language, fqns: &[String]) {
-            let missing: Vec<String> = {
-                let cache = self
-                    .memo
-                    .fqn_cache
-                    .lock()
-                    .expect("definition fqn cache poisoned");
-                let mut seen = HashSet::default();
-                fqns.iter()
-                    .filter(|fqn| seen.insert(fqn.as_str()))
-                    .filter(|fqn| !cache.contains_key(&(language, (*fqn).clone())))
-                    .cloned()
-                    .collect()
-            };
-            if missing.is_empty() {
-                continue;
-            }
-
-            let mut exact_owners = Vec::new();
-            let mut exact_questions = Vec::new();
-            for (index, fqn) in missing.iter().enumerate() {
-                if let Some(name) = Self::rendered_name(language, fqn) {
-                    exact_owners.push(index);
-                    exact_questions.push((name, RelationalDefinitionQuery::ExactName));
-                }
-            }
-            // A name the language cannot even render as a path resolves to
-            // nothing without a fallback, exactly as the point path answers.
-            let mut parseable = vec![false; missing.len()];
-            let mut units_by_name: Vec<Vec<CodeUnit>> = vec![Vec::new(); missing.len()];
-            if !exact_questions.is_empty() {
-                let expected = exact_questions.len();
-                let values = self.query_values(language, exact_questions);
-                if values.len() != expected {
-                    return;
-                }
-                for (owner, value) in exact_owners.into_iter().zip(values) {
-                    parseable[owner] = true;
-                    match value {
-                        RelationalDefinitionValue::Definitions(units) => {
-                            units_by_name[owner] = units;
-                        }
-                        _ => panic!("an exact-name query returned the wrong result shape"),
-                    }
-                }
-            }
-
-            let mut fallback: Vec<(usize, std::ops::Range<usize>, Vec<String>)> = Vec::new();
-            let mut fallback_questions = Vec::new();
-            for (index, fqn) in missing.iter().enumerate() {
-                units_by_name[index].retain(|unit| unit.fq_name() == *fqn);
-                if !parseable[index] || !units_by_name[index].is_empty() {
-                    continue;
-                }
-                let identifiers = self.rendered_identifier_candidates(language, fqn);
-                let start = fallback_questions.len();
-                fallback_questions.extend(Self::identifier_queries(language, &identifiers, None));
-                fallback.push((index, start..fallback_questions.len(), identifiers));
-            }
-            if !fallback_questions.is_empty() {
-                let expected = fallback_questions.len();
-                let values = self.query_values(language, fallback_questions);
-                if values.len() != expected {
-                    return;
-                }
-                let mut values = values.into_iter().map(Some).collect::<Vec<_>>();
-                for (index, range, identifiers) in fallback {
-                    let name_values = values[range]
-                        .iter_mut()
-                        .map(|value| value.take().expect("each fallback value is consumed once"))
-                        .collect::<Vec<_>>();
-                    units_by_name[index] =
-                        Self::identifier_units_from_values(&identifiers, name_values);
-                    units_by_name[index].retain(|unit| unit.fq_name() == missing[index]);
-                }
-            }
-
-            let mut cache = self
+        let missing: Vec<String> = {
+            let cache = self
                 .memo
                 .fqn_cache
                 .lock()
                 .expect("definition fqn cache poisoned");
-            for (fqn, mut units) in missing.into_iter().zip(units_by_name) {
-                sort_units(&mut units);
-                units.dedup();
-                cache.insert((language, fqn), units);
+            let mut seen = HashSet::default();
+            fqns.iter()
+                .filter(|fqn| seen.insert(fqn.as_str()))
+                .filter(|fqn| !cache.contains_key(&(language, (*fqn).clone())))
+                .cloned()
+                .collect()
+        };
+        if missing.is_empty() {
+            return;
+        }
+
+        let mut exact_owners = Vec::new();
+        let mut exact_questions = Vec::new();
+        for (index, fqn) in missing.iter().enumerate() {
+            if let Some(name) = Self::rendered_name(language, fqn) {
+                exact_owners.push(index);
+                exact_questions.push((name, RelationalDefinitionQuery::ExactName));
             }
+        }
+        // A name the language cannot even render as a path resolves to
+        // nothing without a fallback, exactly as the point path answers.
+        let mut parseable = vec![false; missing.len()];
+        let mut units_by_name: Vec<Vec<CodeUnit>> = vec![Vec::new(); missing.len()];
+        if !exact_questions.is_empty() {
+            let expected = exact_questions.len();
+            let values = self.query_values(language, exact_questions);
+            if values.len() != expected {
+                return;
+            }
+            for (owner, value) in exact_owners.into_iter().zip(values) {
+                parseable[owner] = true;
+                match value {
+                    RelationalDefinitionValue::Definitions(units) => {
+                        units_by_name[owner] = units;
+                    }
+                    _ => panic!("an exact-name query returned the wrong result shape"),
+                }
+            }
+        }
+
+        let mut fallback: Vec<(usize, std::ops::Range<usize>, Vec<String>)> = Vec::new();
+        let mut fallback_questions = Vec::new();
+        for (index, fqn) in missing.iter().enumerate() {
+            units_by_name[index].retain(|unit| unit.fq_name() == *fqn);
+            if !parseable[index] || !units_by_name[index].is_empty() {
+                continue;
+            }
+            let identifiers = self.rendered_identifier_candidates(language, fqn);
+            let start = fallback_questions.len();
+            fallback_questions.extend(Self::identifier_queries(language, &identifiers, None));
+            fallback.push((index, start..fallback_questions.len(), identifiers));
+        }
+        if !fallback_questions.is_empty() {
+            let expected = fallback_questions.len();
+            let values = self.query_values(language, fallback_questions);
+            if values.len() != expected {
+                return;
+            }
+            let mut values = values.into_iter().map(Some).collect::<Vec<_>>();
+            for (index, range, identifiers) in fallback {
+                let name_values = values[range]
+                    .iter_mut()
+                    .map(|value| value.take().expect("each fallback value is consumed once"))
+                    .collect::<Vec<_>>();
+                units_by_name[index] =
+                    Self::identifier_units_from_values(&identifiers, name_values);
+                units_by_name[index].retain(|unit| unit.fq_name() == missing[index]);
+            }
+        }
+
+        let mut cache = self
+            .memo
+            .fqn_cache
+            .lock()
+            .expect("definition fqn cache poisoned");
+        for (fqn, mut units) in missing.into_iter().zip(units_by_name) {
+            sort_units(&mut units);
+            units.dedup();
+            cache.insert((language, fqn), units);
+        }
     }
 
+    /// Resolve many rendered names across every supported language.
     pub(crate) fn prefetch_fqns(&self, fqns: &[String]) {
         for language in self.query_languages() {
             self.prefetch_fqn_in_language(language, fqns);
