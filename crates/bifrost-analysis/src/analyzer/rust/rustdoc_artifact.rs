@@ -195,6 +195,14 @@ impl RustdocJsonPackProducer {
                 bytes,
             );
             limit_production_records(&mut production, remaining, limits);
+            for diagnostic in &mut production.diagnostics {
+                if diagnostic.severity == ProducerDiagnosticSeverity::Warning
+                    && diagnostic.declaration.is_none()
+                    && diagnostic.source_entry.is_none()
+                {
+                    diagnostic.source_entry = Some(path.clone().into_boxed_str());
+                }
+            }
             productions.push(production);
         }
         merge_source_set_productions(request, limits, artifact.sha256(), productions)
@@ -2582,6 +2590,9 @@ mod tests {
 
         let production = RustdocJsonPackProducer
             .produce_loaded_source_set(&request, &limits, None, &artifact, &crates);
+        assert!(production.diagnostics.iter().all(|diagnostic| {
+            diagnostic.declaration.is_some() || diagnostic.source_entry.is_some()
+        }));
         let pack = production
             .pack
             .expect("source set should produce a partial pack");
@@ -2720,12 +2731,54 @@ mod tests {
         );
 
         assert_eq!(production.completeness, Completeness::Partial);
-        assert!(
-            production
-                .diagnostics
-                .iter()
-                .any(|diagnostic| diagnostic.code == "rust.rustdoc.blanket_impl_unprojected")
+        let diagnostic = production
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == "rust.rustdoc.blanket_impl_unprojected")
+            .expect("blanket implementation must remain an explicit reject");
+        assert_eq!(diagnostic.location.as_deref(), Some("item.7"));
+        assert!(diagnostic.source_entry.is_none());
+        assert!(diagnostic.declaration.is_none());
+    }
+
+    #[test]
+    fn rustdoc_source_set_accounts_anonymous_rejects_to_their_source_entry() {
+        let root = tempfile::tempdir().unwrap();
+        let document = document(true);
+        fs::write(
+            root.path().join("core.json"),
+            serde_json::to_vec(&document).unwrap(),
+        )
+        .unwrap();
+        let artifact = read_exact_source_set(
+            root.path(),
+            &[std::path::PathBuf::from("core.json")],
+            1,
+            8,
+            &ArtifactProducerLimits::default(),
+        )
+        .unwrap();
+        let mut request = request(root.path().join("stdlib"));
+        request.artifact_kind = ExternalArtifactKind::RustdocJsonSet;
+        request.activation[0].package = None;
+        request.activation[0].module = None;
+
+        let production = RustdocJsonPackProducer.produce_loaded_source_set(
+            &request,
+            &ArtifactProducerLimits::default(),
+            None,
+            &artifact,
+            &[("widget".to_owned(), "core.json".to_owned())],
         );
+
+        let diagnostic = production
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == "rust.rustdoc.blanket_impl_unprojected")
+            .expect("blanket implementation must remain an explicit reject");
+        assert_eq!(diagnostic.location.as_deref(), Some("item.7"));
+        assert_eq!(diagnostic.source_entry.as_deref(), Some("core.json"));
+        assert!(diagnostic.declaration.is_none());
     }
 
     #[test]
