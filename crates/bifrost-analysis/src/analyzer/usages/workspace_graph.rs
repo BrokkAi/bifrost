@@ -8,6 +8,7 @@ use crate::analyzer::languages::{
 use crate::analyzer::{CodeUnit, DeclarationId, IAnalyzer, Language, ProjectFile, Range};
 use crate::cancellation::CancellationToken;
 use crate::hash::{HashMap, HashSet};
+use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 
@@ -136,41 +137,88 @@ impl WorkspaceUsageCatalog {
             .expect("uncancelled workspace usage catalog construction")
     }
 
-    pub(crate) fn build_with_cancellation(
+    /// Enumerate one file's graph declarations through its persisted summary
+    /// projection, the same per-file cache-backed lookup the rooted path
+    /// (`build_for_files`) already relies on. This is one query per file
+    /// rather than one query per declaration, and each file's lookup is
+    /// independent of every other file's, so callers can run it under
+    /// `rayon::par_iter()` across files (see bifrost#15).
+    fn declarations_for_file(
         analyzer: &dyn IAnalyzer,
-        cancellation: &CancellationToken,
-    ) -> Option<Self> {
+        file: &ProjectFile,
+    ) -> Vec<(CodeUnit, Option<Range>)> {
         let mut declarations = Vec::new();
-        for (unit, range) in analyzer.all_declarations_with_primary_ranges() {
-            if cancellation.is_cancelled() {
-                return None;
+        if let Some(projection) = analyzer.summary_file_projection(file) {
+            let mut stack = projection.top_level_declarations.clone();
+            let mut seen = HashSet::default();
+            while let Some(unit) = stack.pop() {
+                if !seen.insert(unit.clone()) {
+                    continue;
+                }
+                if let Some(children) = projection.children.get(&unit) {
+                    stack.extend(children.iter().cloned());
+                }
+                if is_graph_declaration(&unit) {
+                    declarations.push((
+                        unit.clone(),
+                        projection
+                            .ranges
+                            .get(&unit)
+                            .and_then(|ranges| primary_range(ranges)),
+                    ));
+                }
             }
-            if is_graph_declaration(&unit) {
-                declarations.push((unit, range));
+        } else {
+            for unit in analyzer.declarations(file) {
+                if is_graph_declaration(&unit) {
+                    let range = analyzer.ranges(&unit).into_iter().min_by_key(range_key);
+                    declarations.push((unit, range));
+                }
             }
         }
-
         // The public declaration inventory intentionally excludes synthetic
         // file scopes. Java module descriptors need one graph caller, however,
         // so add the existing `module-info.java` file scope through this
         // graph-only catalog path. This avoids turning the named module into a
         // package Module CodeUnit, which can collide with a package of the same
         // name.
-        for file in analyzer.analyzed_files() {
-            if cancellation.is_cancelled() {
-                return None;
-            }
-            if !is_java_module_descriptor_file(&file) {
-                continue;
-            }
+        if is_java_module_descriptor_file(file) {
             let file_scope = CodeUnit::file_scope(file.clone());
             let range = analyzer
                 .ranges(&file_scope)
                 .into_iter()
-                .min_by_key(|range| (range.start_line, range.start_byte));
+                .min_by_key(range_key);
             declarations.push((file_scope, range));
         }
+        declarations
+    }
 
+    pub(crate) fn build_with_cancellation(
+        analyzer: &dyn IAnalyzer,
+        cancellation: &CancellationToken,
+    ) -> Option<Self> {
+        if cancellation.is_cancelled() {
+            return None;
+        }
+        let files = analyzer.analyzed_files();
+        let declarations: Vec<(CodeUnit, Option<Range>)> = {
+            let _scope = crate::profiling::scope("workspace_graph::parallel_enumeration");
+            files
+                .par_iter()
+                .filter_map(|file| {
+                    if cancellation.is_cancelled() {
+                        return None;
+                    }
+                    Some(Self::declarations_for_file(analyzer, file))
+                })
+                .flatten_iter()
+                .collect()
+        };
+        if cancellation.is_cancelled() {
+            return None;
+        }
+
+        let _scope = crate::profiling::scope("workspace_graph::from_declarations");
         Self::from_declarations(declarations, cancellation)
     }
 
@@ -179,45 +227,10 @@ impl WorkspaceUsageCatalog {
     /// enumerate every declaration in a long-lived workspace cache before it can
     /// answer a handful of changed-file roots.
     pub(crate) fn build_for_files(analyzer: &dyn IAnalyzer, files: &[ProjectFile]) -> Self {
-        let mut declarations = Vec::new();
-        for file in files {
-            if let Some(projection) = analyzer.summary_file_projection(file) {
-                let mut stack = projection.top_level_declarations.clone();
-                let mut seen = HashSet::default();
-                while let Some(unit) = stack.pop() {
-                    if !seen.insert(unit.clone()) {
-                        continue;
-                    }
-                    if let Some(children) = projection.children.get(&unit) {
-                        stack.extend(children.iter().cloned());
-                    }
-                    if is_graph_declaration(&unit) {
-                        declarations.push((
-                            unit.clone(),
-                            projection
-                                .ranges
-                                .get(&unit)
-                                .and_then(|ranges| primary_range(ranges)),
-                        ));
-                    }
-                }
-            } else {
-                for unit in analyzer.declarations(file) {
-                    if is_graph_declaration(&unit) {
-                        let range = analyzer.ranges(&unit).into_iter().min_by_key(range_key);
-                        declarations.push((unit, range));
-                    }
-                }
-            }
-            if is_java_module_descriptor_file(file) {
-                let file_scope = CodeUnit::file_scope(file.clone());
-                let range = analyzer
-                    .ranges(&file_scope)
-                    .into_iter()
-                    .min_by_key(range_key);
-                declarations.push((file_scope, range));
-            }
-        }
+        let declarations = files
+            .iter()
+            .flat_map(|file| Self::declarations_for_file(analyzer, file))
+            .collect();
         Self::from_declarations(declarations, &CancellationToken::default())
             .expect("uncancelled rooted workspace usage catalog construction")
     }
