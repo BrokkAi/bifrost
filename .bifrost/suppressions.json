@@ -134,18 +134,6 @@
       "expires_at": null
     },
     {
-      "policy_id": "bifrost.performance.serialization-in-loop",
-      "finding_id": "2175df8014fc064443d2425243532bed8e2ad9ee917ef165c8cd7e9a31adbfcf",
-      "path": "crates/bifrost-analysis/src/searchtools/scan_usages.rs",
-      "identity_stability": "strong",
-      "status": "accepted",
-      "reason": "Each iteration serializes a distinct item; the serialization is inherent to the loop and cannot be hoisted.",
-      "policy_hash_at_acceptance": "da0b97c9fccd69df43320804e18b2325952a603f136ad01af388816b2a49a4b4",
-      "accepted_by": "dbakereffendi",
-      "accepted_at": "2026-08-04",
-      "expires_at": null
-    },
-    {
       "policy_id": "bifrost.performance.sleep-in-loop",
       "finding_id": "fe639e787c5ab14fa523237e759da98dab58a64b440d731bbf5eccdc97e91ae2",
       "path": "scripts/public/mcp-replay.py",
