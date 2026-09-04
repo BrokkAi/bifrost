@@ -3751,6 +3751,7 @@ mod procedure_claim_agreement_tests {
             input,
             exit_kind: CompiledSummaryExitKind::Normal,
             output: CompiledSummaryOutput::NormalReturn {},
+            value_transfer: None,
         }
     }
 

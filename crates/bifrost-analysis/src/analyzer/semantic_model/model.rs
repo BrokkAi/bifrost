@@ -30,6 +30,12 @@ pub const MAX_PROCEDURE_SUMMARY_NORMAL_RETURN_REFINEMENTS: usize = 64;
 pub const MAX_PROCEDURE_SUMMARY_CONDITIONAL_RESULT_REFINEMENTS: usize = 64;
 pub const MAX_PROCEDURE_SUMMARY_CONDITIONAL_INDIRECT_WRITES: usize = 64;
 
+pub const CPP_RESOLUTION_VOCABULARY: &str = "csmi.c-cpp-resolution";
+pub const CPP_RESOLUTION_VERSION: &str = "0.1.0";
+pub const CPP_DECLARATION_SCHEME: &str = "csmi.cpp.declaration";
+pub const CPP_DECLARATION_SCHEME_VERSION: &str = "0.1.0";
+pub const CPP_SIGNATURE_DISAMBIGUATOR_PREFIX: &str = "cppsig-0.1:";
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AuthoredSemanticModelPack {
@@ -58,7 +64,320 @@ pub struct AuthoredSemanticModelPack {
     /// sources unchanged -- the same discipline `declared_effects` uses.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub carried_sources: Vec<String>,
+    /// Exact resolver-backed C and C++ applicability and declaration evidence.
+    ///
+    /// This is intentionally a pack-level, optional container.  A pack that
+    /// does not carry native C++ evidence omits the field and therefore keeps
+    /// its historical serialized form.  Native declaration ids are the
+    /// references used by this container; display names and rendered
+    /// signatures are never identities.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpp_portability: Option<CppPortabilityEvidence>,
     pub shards: Vec<AuthoredShard>,
+}
+
+/// Exact C/C++ portability evidence imported from the CSMI 0.1 C/C++ profile.
+///
+/// The vectors are sorted into a canonical order by the semantic-pack
+/// compiler.  Their contents remain typed all the way through artifact
+/// encoding and decoding so a consumer can distinguish an exact resolver
+/// result from a missing or unsupported one without inspecting JSON values.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CppPortabilityEvidence {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub resolution_contexts: Vec<CppResolutionContextRecord>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub symbols: Vec<CppPortableSymbolRecord>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub type_aliases: Vec<CppTypeAliasEvidence>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub special_members: Vec<CppSpecialMemberEvidence>,
+}
+
+/// A complete resolver context and the exact digest used to refer to it from
+/// alias and special-member facts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CppResolutionContextRecord {
+    pub context_digest: String,
+    pub language: CppLanguage,
+    pub translation_unit: String,
+    pub compile_arguments_digest: String,
+    pub direct_headers: Vec<CppDirectHeader>,
+    pub header_closure: CppHeaderClosure,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CppLanguage {
+    C,
+    Cpp,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CppHeaderClosure {
+    Complete,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CppDirectHeader {
+    pub include_name: String,
+    pub artifact: CppArtifactSelector,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CppArtifactSelector {
+    pub purl: String,
+    pub digests: Vec<CppArtifactDigest>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CppArtifactDigest {
+    pub algorithm: CppDigestAlgorithm,
+    pub coverage: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub canonicalization: Option<String>,
+    pub value: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum CppDigestAlgorithm {
+    Sha256,
+}
+
+/// A portable C++ symbol key retained alongside the native declaration id
+/// that the Bifrost pack uses for references.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CppPortableSymbolRecord {
+    pub native_id: String,
+    pub key: CppPortableSymbolKey,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CppPortableSymbolKey {
+    pub artifact_selectors: Vec<CppArtifactSelector>,
+    pub scheme: String,
+    pub scheme_version: String,
+    pub stability: CppIdentityStability,
+    pub descriptors: Vec<CppSymbolDescriptor>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CppIdentityStability {
+    Portable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CppSymbolDescriptor {
+    pub role: CppDescriptorRole,
+    pub name: String,
+    pub disambiguator: String,
+}
+
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum CppDescriptorRole {
+    Namespace,
+    Type,
+    Callable,
+}
+
+/// A type alias fact keyed by the native alias declaration id.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CppTypeAliasEvidence {
+    pub alias: String,
+    pub target: CppCanonicalType,
+    pub resolution_context: CppResolutionContextRef,
+}
+
+/// The CSMI resolution-profile reference carried by a C++ profile fact.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CppResolutionContextRef {
+    pub vocabulary: String,
+    pub version: String,
+    pub context_digest: String,
+    pub language: CppLanguage,
+    pub header_closure: CppHeaderClosure,
+}
+
+/// Closed canonical type tree for C++ identity.  Declared and template
+/// primary references use native declaration ids whose complete portable keys
+/// are retained in `CppPortabilityEvidence::symbols`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum CppCanonicalType {
+    Fundamental {
+        name: CppFundamentalTypeName,
+    },
+    Declared {
+        symbol: String,
+    },
+    TemplateSpecialization {
+        primary: String,
+        arguments: Vec<CppCanonicalType>,
+    },
+    Qualified {
+        qualifiers: Vec<CppTypeQualifier>,
+        r#type: Box<CppCanonicalType>,
+    },
+    Reference {
+        reference_kind: CppReferenceKind,
+        referent: Box<CppCanonicalType>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CppFundamentalTypeName {
+    Char,
+}
+
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum CppTypeQualifier {
+    Const,
+    Volatile,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CppReferenceKind {
+    Lvalue,
+    Rvalue,
+}
+
+/// An exact copy/move special-member declaration identity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CppSpecialMemberEvidence {
+    pub owner: String,
+    pub member: String,
+    pub operation: CppSpecialMemberOperation,
+    pub signature: CppCallableSignature,
+    pub member_disambiguator: String,
+    pub resolution_context: CppResolutionContextRef,
+}
+
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum CppSpecialMemberOperation {
+    CopyConstructor,
+    CopyAssignment,
+    MoveConstructor,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CppCallableSignature {
+    pub callable_kind: CppCallableKind,
+    pub owner: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receiver: Option<CppCanonicalType>,
+    pub parameters: Vec<CppCanonicalType>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<CppCanonicalType>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CppCallableKind {
+    Constructor,
+    Method,
+}
+
+impl CppPortabilityEvidence {
+    pub(crate) fn normalize(&mut self) {
+        self.resolution_contexts
+            .sort_by(|left, right| left.context_digest.cmp(&right.context_digest));
+        self.symbols
+            .sort_by(|left, right| left.native_id.cmp(&right.native_id));
+        self.type_aliases
+            .sort_by(|left, right| left.alias.cmp(&right.alias));
+        self.special_members.sort_by(|left, right| {
+            (&left.owner, &left.member, &left.operation).cmp(&(
+                &right.owner,
+                &right.member,
+                &right.operation,
+            ))
+        });
+        for context in &mut self.resolution_contexts {
+            context.direct_headers.sort_by_key(canonical_json_key);
+            for header in &mut context.direct_headers {
+                normalize_artifact_selector(&mut header.artifact);
+            }
+        }
+        for symbol in &mut self.symbols {
+            for selector in &mut symbol.key.artifact_selectors {
+                normalize_artifact_selector(selector);
+            }
+            symbol
+                .key
+                .artifact_selectors
+                .sort_by_key(canonical_json_key);
+            for pair in symbol.key.descriptors.windows(2) {
+                debug_assert!(
+                    pair[0].role <= pair[1].role,
+                    "descriptor roles are ordered by resolver ownership"
+                );
+            }
+        }
+        for alias in &mut self.type_aliases {
+            normalize_cpp_type(&mut alias.target);
+        }
+        for member in &mut self.special_members {
+            if let Some(receiver) = &mut member.signature.receiver {
+                normalize_cpp_type(receiver);
+            }
+            for parameter in &mut member.signature.parameters {
+                normalize_cpp_type(parameter);
+            }
+            if let Some(result) = &mut member.signature.result {
+                normalize_cpp_type(result);
+            }
+        }
+    }
+}
+
+fn canonical_json_key<T: Serialize>(value: &T) -> Vec<u8> {
+    serde_json::to_vec(value).expect("C++ portability evidence is JSON serializable")
+}
+
+fn normalize_artifact_selector(selector: &mut CppArtifactSelector) {
+    selector.digests.sort_by_key(canonical_json_key);
+}
+
+fn normalize_cpp_type(ty: &mut CppCanonicalType) {
+    match ty {
+        CppCanonicalType::Fundamental { .. } | CppCanonicalType::Declared { .. } => {}
+        CppCanonicalType::TemplateSpecialization { arguments, .. } => {
+            for argument in arguments {
+                normalize_cpp_type(argument);
+            }
+        }
+        CppCanonicalType::Qualified { qualifiers, r#type } => {
+            qualifiers.sort_unstable();
+            normalize_cpp_type(r#type);
+        }
+        CppCanonicalType::Reference { referent, .. } => normalize_cpp_type(referent),
+    }
 }
 
 /// The distinct `Locator::Source` paths across a pack's declaration facts, in
@@ -490,6 +809,95 @@ pub struct AuthoredSummaryTransfer {
     pub input: AuthoredSummaryInput,
     pub exit_kind: AuthoredSummaryExitKind,
     pub output: AuthoredSummaryOutput,
+    /// Optional identity-separating value-transfer semantics for this core
+    /// transfer. The endpoints remain the core transfer's ports; this field
+    /// only classifies the value/identity relationship and selected
+    /// operation. Omission means this profile was not reviewed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value_transfer: Option<SummaryValueTransfer>,
+}
+
+/// Typed identity-separating semantics attached to one procedure-summary
+/// transfer. This is intentionally separate from the core transfer endpoints
+/// so a consumer can distinguish value-flow coverage from profile coverage.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SummaryValueTransfer {
+    pub kind: SummaryValueTransferKind,
+    pub operation: SummaryValueTransferOperation,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum SummaryValueTransferKind {
+    Copy {},
+    AggregateCopy {},
+    Move {
+        invalidation: SummaryMoveInvalidation,
+    },
+    Conversion {
+        preservation: SummaryValuePreservation,
+    },
+    Boxing {},
+    Unboxing {},
+}
+
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum SummaryMoveInvalidation {
+    Invalidated,
+    Unknown,
+}
+
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum SummaryValuePreservation {
+    Identity,
+    Preserving,
+    Changing,
+    Unknown,
+}
+
+/// The selected operation behind one value transfer. An implicit operation
+/// names the exact stable member declaration id; it never carries a display
+/// name or rendered signature. Unknown operation identity remains typed and
+/// carries the reason it could not be established.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum SummaryValueTransferOperation {
+    None {},
+    Implicit {
+        member: String,
+    },
+    Unknown {
+        limitation: SummaryValueTransferLimitation,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SummaryValueTransferLimitation {
+    pub kind: SummaryValueTransferLimitationKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum SummaryValueTransferLimitationKind {
+    BudgetExhausted,
+    Cancelled,
+    Unsupported,
+    UnresolvedIdentity,
+    AmbiguousIdentity,
+    IncompleteInput,
+    Other,
 }
 
 #[derive(
@@ -775,7 +1183,15 @@ pub struct MemberFact {
 pub enum ImplicitOperation {
     CopyConstructor,
     MoveConstructor,
-    ConversionOperator { target: TypeRef },
+    /// Construction creates a distinct object whose relevant logical value is
+    /// preserved from one source argument. Consumers must still prove that the
+    /// exact member accepts the source expression at the call site.
+    ValuePreservingConstructor,
+    CopyAssignment,
+    MoveAssignment,
+    ConversionOperator {
+        target: TypeRef,
+    },
 }
 
 /// The condition under which one activation declares a record.
@@ -1121,6 +1537,11 @@ pub enum TypeRef {
     },
     ByRef {
         element: Box<TypeRef>,
+        /// The reference category, when the source language distinguishes
+        /// lvalue and rvalue references. Existing producers omit this field
+        /// and therefore retain the historical lvalue-reference meaning.
+        #[serde(default, skip_serializing_if = "TypeRefReferenceKind::is_lvalue")]
+        reference_kind: TypeRefReferenceKind,
     },
     Pointer {
         element: Box<TypeRef>,
@@ -1153,6 +1574,27 @@ pub enum TypeRef {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         result: Option<Box<TypeRef>>,
     },
+}
+
+/// The source-level category of a by-reference type.
+///
+/// This is separate from the tagged [`TypeRef`] variant because the outer
+/// `kind` field already identifies the type constructor. Keeping the category
+/// here lets C++ copy and move overloads retain distinct parameter identities,
+/// while producers that do not distinguish categories continue to use the
+/// default lvalue form.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum TypeRefReferenceKind {
+    #[default]
+    Lvalue,
+    Rvalue,
+}
+
+impl TypeRefReferenceKind {
+    fn is_lvalue(&self) -> bool {
+        matches!(self, Self::Lvalue)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]

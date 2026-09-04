@@ -1,0 +1,8 @@
+{
+  "kind": "transfer",
+  "transferKind": { "kind": "move", "invalidation": "unknown" },
+  "operation": {
+    "kind": "unknown",
+    "limitation": { "kind": "unresolved-identity" }
+  }
+}

@@ -1,6 +1,6 @@
 //! Structural and semantic conformance checks for CSMI v0.1.
 
-use super::canonical::{canonical_pack_manifest, canonical_semantic_document};
+use super::canonical::{canonical_digest, canonical_pack_manifest, canonical_semantic_document};
 use super::model::*;
 use super::pack::{
     CsmiResourceError, CsmiResourceResolver, validate_resource_path, verify_resources,
@@ -21,6 +21,8 @@ const NODE_COMPATIBILITY_SCHEMA_JSON: &str =
     include_str!("profiles/node-compatibility.schema.json");
 const PYTHON_SCHEMA_JSON: &str = include_str!("profiles/python.schema.json");
 const RUST_SCHEMA_JSON: &str = include_str!("profiles/rust.schema.json");
+const VALUE_TRANSFER_SCHEMA_JSON: &str = include_str!("profiles/value-transfer.schema.json");
+const CPP_SCHEMA_JSON: &str = include_str!("profiles/cpp.schema.json");
 const JAVA_SOURCE_IDENTITY_SCHEMA_JSON: &str =
     include_str!("profiles/java-source-identity.schema.json");
 const JVM_BINARY_IDENTITY_SCHEMA_JSON: &str =
@@ -415,6 +417,31 @@ const KNOWN_PROFILES: &[KnownProfile] = &[
         ],
     },
     KnownProfile {
+        identifier: CSMI_VALUE_TRANSFER_PROFILE_ID,
+        version: CSMI_VALUE_TRANSFER_PROFILE_VERSION,
+        schema: CSMI_VALUE_TRANSFER_PROFILE_SCHEMA,
+        schema_json: VALUE_TRANSFER_SCHEMA_JSON,
+        payload_definitions: &[
+            "transferAttachment",
+            "typeValueSemantics",
+            "implicitOperation",
+        ],
+    },
+    KnownProfile {
+        identifier: CSMI_C_CPP_RESOLUTION_PROFILE_ID,
+        version: CSMI_C_CPP_RESOLUTION_PROFILE_VERSION,
+        schema: CSMI_C_CPP_RESOLUTION_PROFILE_SCHEMA,
+        schema_json: CPP_SCHEMA_JSON,
+        payload_definitions: &["resolutionContext"],
+    },
+    KnownProfile {
+        identifier: CSMI_CPP_PROFILE_ID,
+        version: CSMI_CPP_PROFILE_VERSION,
+        schema: CSMI_CPP_PROFILE_SCHEMA,
+        schema_json: CPP_SCHEMA_JSON,
+        payload_definitions: &["typeAlias", "specialMember"],
+    },
+    KnownProfile {
         identifier: "csmi.java-source-identity",
         version: "0.1",
         schema: "https://csmi.brokk.ai/schema/profiles/java-jvm/0.1/java-source-identity.schema.json",
@@ -449,7 +476,14 @@ fn known_profile(identifier: &str, schema: &str) -> Option<(usize, KnownProfile)
         .iter()
         .copied()
         .enumerate()
-        .find(|(_, profile)| profile.identifier == identifier || profile.schema == schema)
+        .find(|(_, profile)| profile.identifier == identifier)
+        .or_else(|| {
+            KNOWN_PROFILES
+                .iter()
+                .copied()
+                .enumerate()
+                .find(|(_, profile)| profile.schema == schema)
+        })
 }
 
 fn profile_schema_validators() -> &'static Vec<Option<jsonschema::Validator>> {
@@ -829,6 +863,1033 @@ fn validate_semantic_document_shape(
                 "other generation methods require diagnostic metadata",
             );
             valid = false;
+        }
+    }
+    valid
+}
+
+fn validate_value_transfer_affect(
+    affect: &CsmiAffectedUnit,
+    symbols: &HashSet<String>,
+    declaration_categories: &HashMap<String, CsmiDeclarationCategory>,
+    path: &str,
+    diagnostics: &mut Vec<CsmiDiagnostic>,
+) -> bool {
+    match affect {
+        CsmiAffectedUnit::FactFamily(family) => {
+            if family.kind != CsmiAffectedFactFamilyKind::FactFamily {
+                return false;
+            }
+            validate_value_transfer_scope(
+                &family.family,
+                &family.scope,
+                symbols,
+                declaration_categories,
+                &format!("{path}.scope"),
+                diagnostics,
+            )
+        }
+        CsmiAffectedUnit::Attachment(attachment) => {
+            let callable = attachment.target.get("callable").and_then(Value::as_str);
+            let expected = callable.map(|callable| serde_json::json!({"callable": callable}));
+            let mut valid = attachment.kind == CsmiAffectedAttachmentKind::Attachment
+                && attachment.attachment_point == "procedure-summary-transfer"
+                && expected.as_ref() == Some(&attachment.target);
+            if !valid {
+                error(
+                    diagnostics,
+                    "semantic.value_transfer_attachment_scope",
+                    path,
+                    "value-transfer attachments require procedure-summary-transfer and an exact callable target",
+                );
+            }
+            if let Some(callable) = callable
+                && (!symbols.contains(callable)
+                    || !matches!(
+                        declaration_categories.get(callable),
+                        Some(CsmiDeclarationCategory::Callable)
+                    ))
+            {
+                error(
+                    diagnostics,
+                    "semantic.value_transfer_callable",
+                    format!("{path}.target.callable"),
+                    "attachment target must be a local callable declaration",
+                );
+                valid = false;
+            }
+            valid
+        }
+        CsmiAffectedUnit::CoreSlot(_) => {
+            error(
+                diagnostics,
+                "semantic.value_transfer_affect_kind",
+                path,
+                "value-transfer uses may affect only their attachment and fact families",
+            );
+            false
+        }
+    }
+}
+
+fn validate_value_transfer_scope(
+    family: &str,
+    scope: &Value,
+    symbols: &HashSet<String>,
+    declaration_categories: &HashMap<String, CsmiDeclarationCategory>,
+    path: &str,
+    diagnostics: &mut Vec<CsmiDiagnostic>,
+) -> bool {
+    let mut valid = true;
+    match family {
+        "type-value-semantics" => {
+            let type_id = scope.get("type").and_then(Value::as_str);
+            let aspect = scope.get("aspect").and_then(Value::as_str);
+            match (type_id, aspect) {
+                (Some(type_id), Some("copy" | "move")) => {
+                    valid &= require_value_transfer_type(
+                        type_id,
+                        symbols,
+                        declaration_categories,
+                        &format!("{path}.type"),
+                        diagnostics,
+                    );
+                }
+                _ => valid = false,
+            }
+            let expected = type_id
+                .zip(aspect)
+                .map(|(type_id, aspect)| serde_json::json!({"type": type_id, "aspect": aspect}));
+            if expected.as_ref() != Some(scope) {
+                valid = false;
+            }
+        }
+        "implicit-operations" => {
+            let owner = scope.get("owner").and_then(Value::as_str);
+            let operation = scope.get("operation").and_then(Value::as_str);
+            let operation = operation.and_then(|value| {
+                serde_json::from_value::<CsmiImplicitOperationRole>(Value::String(value.to_owned()))
+                    .ok()
+            });
+            match (owner, operation) {
+                (Some(owner), Some(_)) => {
+                    valid &= require_value_transfer_type(
+                        owner,
+                        symbols,
+                        declaration_categories,
+                        &format!("{path}.owner"),
+                        diagnostics,
+                    );
+                }
+                _ => valid = false,
+            }
+            if operation == Some(CsmiImplicitOperationRole::ConversionOperator) {
+                let target = scope.get("target").and_then(Value::as_str);
+                if let Some(target) = target {
+                    valid &= require_value_transfer_type(
+                        target,
+                        symbols,
+                        declaration_categories,
+                        &format!("{path}.target"),
+                        diagnostics,
+                    );
+                } else {
+                    valid = false;
+                }
+            }
+            let expected = owner.zip(operation).map(|(owner, operation)| {
+                let mut expected = serde_json::json!({"owner": owner, "operation": operation});
+                if operation == CsmiImplicitOperationRole::ConversionOperator {
+                    expected["target"] = scope.get("target").cloned().unwrap_or(Value::Null);
+                }
+                expected
+            });
+            if expected.as_ref() != Some(scope) {
+                valid = false;
+            }
+        }
+        "identity-separating-transfers" => {
+            let callable = scope.get("callable").and_then(Value::as_str);
+            if callable.is_none()
+                || !symbols.contains(callable.expect("checked above"))
+                || !matches!(
+                    declaration_categories.get(callable.expect("checked above")),
+                    Some(CsmiDeclarationCategory::Callable)
+                )
+            {
+                valid = false;
+            }
+            let expected = callable.map(|callable| serde_json::json!({"callable": callable}));
+            if expected.as_ref() != Some(scope) {
+                valid = false;
+            }
+        }
+        _ => {
+            valid = false;
+        }
+    }
+    if !valid {
+        error(
+            diagnostics,
+            "semantic.value_transfer_scope",
+            path,
+            "value-transfer affected scopes must use the exact profile family shape",
+        );
+    }
+    valid
+}
+
+fn require_value_transfer_type(
+    id: &str,
+    symbols: &HashSet<String>,
+    declaration_categories: &HashMap<String, CsmiDeclarationCategory>,
+    path: &str,
+    diagnostics: &mut Vec<CsmiDiagnostic>,
+) -> bool {
+    if !symbols.contains(id) {
+        error(
+            diagnostics,
+            "semantic.value_transfer_local_type",
+            path,
+            format!("type {id:?} is not a local symbol"),
+        );
+        return false;
+    }
+    if !matches!(
+        declaration_categories.get(id),
+        Some(CsmiDeclarationCategory::Type | CsmiDeclarationCategory::TypeAlias)
+    ) {
+        error(
+            diagnostics,
+            "semantic.value_transfer_local_type",
+            path,
+            "value-transfer type references must target a type or type-alias declaration",
+        );
+        return false;
+    }
+    true
+}
+
+fn require_value_transfer_callable(
+    id: &str,
+    symbols: &HashSet<String>,
+    declaration_categories: &HashMap<String, CsmiDeclarationCategory>,
+    callable_declarations: &HashMap<String, &CsmiCallableShape>,
+    path: &str,
+    diagnostics: &mut Vec<CsmiDiagnostic>,
+) -> bool {
+    if !symbols.contains(id)
+        || !matches!(
+            declaration_categories.get(id),
+            Some(CsmiDeclarationCategory::Callable)
+        )
+        || !callable_declarations.contains_key(id)
+    {
+        error(
+            diagnostics,
+            "semantic.value_transfer_local_callable",
+            path,
+            "value-transfer callable references must target one local callable declaration",
+        );
+        return false;
+    }
+    true
+}
+
+fn declaration_owner<'a>(model: &'a CsmiSemanticModel, symbol: &str) -> Option<&'a str> {
+    model
+        .declarations
+        .iter()
+        .find(|declaration| declaration.symbol == symbol)
+        .and_then(|declaration| declaration.owner.as_deref())
+}
+
+fn validate_value_semantics(
+    value: &CsmiTypeValueSemantics,
+    path: &str,
+    diagnostics: &mut Vec<CsmiDiagnostic>,
+) -> bool {
+    let valid = match value.aspect {
+        CsmiTypeValueSemanticsAspect::Copy => matches!(
+            value.semantics,
+            CsmiTypeSemantics::Trivial {}
+                | CsmiTypeSemantics::ViaMember { .. }
+                | CsmiTypeSemantics::Unknown { .. }
+                | CsmiTypeSemantics::Unsupported { .. }
+        ),
+        CsmiTypeValueSemanticsAspect::Move => matches!(
+            value.semantics,
+            CsmiTypeSemantics::Invalidating {}
+                | CsmiTypeSemantics::Unknown { .. }
+                | CsmiTypeSemantics::Unsupported { .. }
+        ),
+    };
+    let limitation_valid = match &value.semantics {
+        CsmiTypeSemantics::Unknown { limitation } => validate_profile_limitation(
+            limitation,
+            &format!("{path}.semantics.limitation"),
+            diagnostics,
+        ),
+        CsmiTypeSemantics::Unsupported { reason } => {
+            reason.as_ref().is_some_and(|reason| !reason.is_empty())
+        }
+        _ => true,
+    };
+    if !valid {
+        error(
+            diagnostics,
+            "semantic.value_transfer_semantics",
+            format!("{path}.payload.semantics"),
+            "copy and move aspects permit only their corresponding semantic variants",
+        );
+    }
+    if !limitation_valid {
+        error(
+            diagnostics,
+            "semantic.value_transfer_limitation",
+            format!("{path}.payload.semantics"),
+            "unknown and unsupported semantics require a typed non-empty limitation",
+        );
+    }
+    valid && limitation_valid
+}
+
+fn validate_profile_limitation(
+    limitation: &CsmiProfileLimitation,
+    path: &str,
+    diagnostics: &mut Vec<CsmiDiagnostic>,
+) -> bool {
+    if limitation.kind == CsmiProfileLimitationKind::Other
+        && !limitation
+            .message
+            .as_ref()
+            .is_some_and(|message| !message.is_empty())
+    {
+        error(
+            diagnostics,
+            "semantic.value_transfer_limitation",
+            path,
+            "an other limitation requires a non-empty message",
+        );
+        false
+    } else {
+        true
+    }
+}
+
+fn validate_value_operation_shape(
+    operation: &CsmiImplicitOperationFact,
+    callable_declarations: &HashMap<String, &CsmiCallableShape>,
+    path: &str,
+    diagnostics: &mut Vec<CsmiDiagnostic>,
+) -> bool {
+    let Some(shape) = callable_declarations.get(&operation.symbol) else {
+        return false;
+    };
+    let expected = match operation.operation {
+        CsmiImplicitOperationRole::CopyConstructor | CsmiImplicitOperationRole::MoveConstructor => {
+            CsmiCallableKind::Constructor
+        }
+        CsmiImplicitOperationRole::CopyAssignment
+        | CsmiImplicitOperationRole::MoveAssignment
+        | CsmiImplicitOperationRole::ConversionOperator => CsmiCallableKind::Method,
+    };
+    if shape.kind != expected {
+        error(
+            diagnostics,
+            "semantic.value_transfer_operation_shape",
+            format!("{path}.payload.symbol"),
+            "implicit operation role is incompatible with the callable declaration kind",
+        );
+        false
+    } else {
+        true
+    }
+}
+
+fn value_fact_affect(value: &CsmiTypeValueSemantics) -> CsmiAffectedUnit {
+    CsmiAffectedUnit::FactFamily(CsmiAffectedFactFamily {
+        kind: CsmiAffectedFactFamilyKind::FactFamily,
+        family: "type-value-semantics".to_owned(),
+        scope: serde_json::json!({"type": value.r#type, "aspect": value.aspect}),
+    })
+}
+
+fn operation_fact_affect(value: &CsmiImplicitOperationFact) -> CsmiAffectedUnit {
+    let mut scope = serde_json::json!({"owner": value.owner, "operation": value.operation});
+    if value.operation == CsmiImplicitOperationRole::ConversionOperator {
+        scope["target"] = serde_json::json!(value.target);
+    }
+    CsmiAffectedUnit::FactFamily(CsmiAffectedFactFamily {
+        kind: CsmiAffectedFactFamilyKind::FactFamily,
+        family: "implicit-operations".to_owned(),
+        scope,
+    })
+}
+
+fn require_value_transfer_affect(
+    model: &CsmiSemanticModel,
+    expected: &CsmiAffectedUnit,
+    path: &str,
+    diagnostics: &mut Vec<CsmiDiagnostic>,
+) -> bool {
+    let exact_uses = model.vocabulary_uses.iter().filter(|use_| {
+        use_.identifier == CSMI_VALUE_TRANSFER_PROFILE_ID
+            && use_.version == CSMI_VALUE_TRANSFER_PROFILE_VERSION
+            && use_.schema == CSMI_VALUE_TRANSFER_PROFILE_SCHEMA
+    });
+    let mut declared = false;
+    let mut required = false;
+    for use_ in exact_uses {
+        if use_.affects.iter().any(|affect| affect == expected) {
+            declared = true;
+            required |= use_.requirement == CsmiVocabularyRequirement::Required;
+        }
+    }
+    if !declared {
+        error(
+            diagnostics,
+            "semantic.value_transfer_affects",
+            path,
+            "the exact value-transfer fact or attachment scope is not declared by vocabularyUses",
+        );
+    } else if !required {
+        error(
+            diagnostics,
+            "semantic.value_transfer_required_use",
+            path,
+            "a participating value-transfer vocabulary use must be required",
+        );
+    }
+    declared && required
+}
+
+fn validate_value_transfer_attachment(
+    attachment: &CsmiValueTransferAttachment,
+    implicit_facts: &[CsmiImplicitOperationFact],
+    symbols: &HashSet<String>,
+    declaration_categories: &HashMap<String, CsmiDeclarationCategory>,
+    callable_declarations: &HashMap<String, &CsmiCallableShape>,
+    path: &str,
+    diagnostics: &mut Vec<CsmiDiagnostic>,
+) -> bool {
+    let mut valid = true;
+    match &attachment.operation {
+        CsmiValueTransferOperation::None {} => {}
+        CsmiValueTransferOperation::Unknown { limitation } => {
+            if !validate_profile_limitation(
+                limitation,
+                &format!("{path}.extensions.operation.limitation"),
+                diagnostics,
+            ) {
+                valid = false;
+            }
+        }
+        CsmiValueTransferOperation::Implicit { symbol } => {
+            if !require_value_transfer_callable(
+                symbol,
+                symbols,
+                declaration_categories,
+                callable_declarations,
+                &format!("{path}.extensions.operation.symbol"),
+                diagnostics,
+            ) {
+                valid = false;
+            }
+            let candidates = implicit_facts
+                .iter()
+                .filter(|fact| fact.symbol == *symbol)
+                .collect::<Vec<_>>();
+            if candidates.len() != 1 {
+                error(
+                    diagnostics,
+                    "semantic.value_transfer_operation_fact",
+                    format!("{path}.extensions.operation.symbol"),
+                    "an implicit operation reference must resolve to exactly one fact",
+                );
+                valid = false;
+            } else if !value_transfer_role_compatible(
+                &attachment.transfer_kind,
+                candidates[0].operation,
+            ) {
+                error(
+                    diagnostics,
+                    "semantic.value_transfer_operation_role",
+                    format!("{path}.extensions.operation.symbol"),
+                    "the referenced implicit operation role is incompatible with transfer kind",
+                );
+                valid = false;
+            }
+        }
+    }
+    if value_transfer_has_unknown_detail(attachment) {
+        // Unknown details are valid positive evidence; completeness rejects
+        // them separately and must not erase the typed uncertainty here.
+    }
+    valid
+}
+
+fn value_transfer_role_compatible(
+    transfer_kind: &CsmiValueTransferKind,
+    operation: CsmiImplicitOperationRole,
+) -> bool {
+    match transfer_kind {
+        CsmiValueTransferKind::Copy {} | CsmiValueTransferKind::AggregateCopy {} => matches!(
+            operation,
+            CsmiImplicitOperationRole::CopyConstructor | CsmiImplicitOperationRole::CopyAssignment
+        ),
+        CsmiValueTransferKind::Move { .. } => matches!(
+            operation,
+            CsmiImplicitOperationRole::MoveConstructor | CsmiImplicitOperationRole::MoveAssignment
+        ),
+        CsmiValueTransferKind::Conversion { .. } => {
+            operation == CsmiImplicitOperationRole::ConversionOperator
+        }
+        CsmiValueTransferKind::Boxing {} | CsmiValueTransferKind::Unboxing {} => false,
+    }
+}
+
+fn value_transfer_has_unknown_detail(attachment: &CsmiValueTransferAttachment) -> bool {
+    match &attachment.transfer_kind {
+        CsmiValueTransferKind::Move { invalidation } => {
+            *invalidation == CsmiMoveInvalidation::Unknown
+        }
+        CsmiValueTransferKind::Conversion { preservation } => {
+            *preservation == CsmiValuePreservation::Unknown
+        }
+        _ => matches!(
+            attachment.operation,
+            CsmiValueTransferOperation::Unknown { .. }
+        ),
+    }
+}
+
+fn validate_non_transfer_value_attachments(
+    extensions: &[CsmiExtensionAttachment],
+    path: &str,
+    diagnostics: &mut Vec<CsmiDiagnostic>,
+    allow_transfer: bool,
+) -> bool {
+    let mut valid = true;
+    for (index, extension) in extensions.iter().enumerate() {
+        if extension.vocabulary == CSMI_VALUE_TRANSFER_PROFILE_ID
+            && extension.version == CSMI_VALUE_TRANSFER_PROFILE_VERSION
+            && !allow_transfer
+        {
+            error(
+                diagnostics,
+                "semantic.value_transfer_attachment_point",
+                format!("{path}[{index}]"),
+                "value-transfer payloads attach only to a procedure-summary transfer",
+            );
+            valid = false;
+        }
+    }
+    valid
+}
+
+fn validate_cpp_semantics(
+    model: &CsmiSemanticModel,
+    prefix: &str,
+    symbols: &HashSet<String>,
+    declaration_categories: &HashMap<String, CsmiDeclarationCategory>,
+    diagnostics: &mut Vec<CsmiDiagnostic>,
+) -> bool {
+    let mut valid = true;
+    for (index, use_) in model.vocabulary_uses.iter().enumerate() {
+        if matches!(
+            use_.identifier.as_str(),
+            CSMI_C_CPP_RESOLUTION_PROFILE_ID | CSMI_CPP_PROFILE_ID
+        ) && use_.requirement != CsmiVocabularyRequirement::Required
+        {
+            error(
+                diagnostics,
+                "semantic.cpp_required_use",
+                format!("{prefix}.vocabularyUses[{index}].requirement"),
+                "portable C/C++ identity and applicability vocabularies must be required",
+            );
+            valid = false;
+        }
+    }
+
+    let mut contexts = HashMap::new();
+    for (index, constraint) in model.compatibility_constraints.iter().enumerate() {
+        if constraint.vocabulary != CSMI_C_CPP_RESOLUTION_PROFILE_ID
+            || constraint.version != CSMI_C_CPP_RESOLUTION_PROFILE_VERSION
+        {
+            continue;
+        }
+        let path = format!("{prefix}.compatibilityConstraints[{index}].value");
+        match serde_json::from_value::<CsmiResolutionContext>(constraint.value.clone()) {
+            Ok(context) => match canonical_digest(&context) {
+                Ok(digest) => {
+                    if contexts.insert(digest, context.language).is_some() {
+                        error(
+                            diagnostics,
+                            "semantic.cpp_duplicate_context",
+                            path,
+                            "resolution context digest is repeated",
+                        );
+                        valid = false;
+                    }
+                }
+                Err(cause) => {
+                    error(
+                        diagnostics,
+                        "semantic.cpp_context_digest",
+                        path,
+                        cause.to_string(),
+                    );
+                    valid = false;
+                }
+            },
+            Err(cause) => {
+                error(
+                    diagnostics,
+                    "semantic.cpp_resolution_context",
+                    path,
+                    cause.to_string(),
+                );
+                valid = false;
+            }
+        }
+    }
+
+    let cpp_symbols: HashMap<&str, CsmiCppSymbolKey> = model
+        .symbols
+        .iter()
+        .filter(|symbol| symbol.scheme == CSMI_CPP_DECLARATION_IDENTITY_SCHEME)
+        .map(|symbol| {
+            let selectors = symbol
+                .artifact_selectors
+                .as_deref()
+                .unwrap_or(&model.artifact_selectors);
+            (
+                symbol.id.as_str(),
+                CsmiCppSymbolKey {
+                    artifact_selectors: selectors
+                        .iter()
+                        .map(|selector| CsmiCppArtifactSelector {
+                            purl: selector.purl.clone(),
+                            digests: selector
+                                .digests
+                                .iter()
+                                .filter(|digest| digest.algorithm == CsmiDigestAlgorithm::Sha256)
+                                .map(|digest| CsmiCppArtifactDigest {
+                                    algorithm: CsmiCppDigestAlgorithm::Sha256,
+                                    coverage: digest.coverage.clone(),
+                                    canonicalization: digest.canonicalization.clone(),
+                                    value: digest.value.clone(),
+                                })
+                                .collect(),
+                        })
+                        .collect(),
+                    scheme: symbol.scheme.clone(),
+                    scheme_version: symbol.scheme_version.clone(),
+                    stability: CsmiCppIdentityStability::Portable,
+                    descriptors: symbol
+                        .descriptors
+                        .iter()
+                        .filter_map(|descriptor| {
+                            Some(CsmiCppDescriptor {
+                                role: match descriptor.role {
+                                    CsmiDescriptorRole::Namespace => {
+                                        CsmiCppDescriptorRole::Namespace
+                                    }
+                                    CsmiDescriptorRole::Type => CsmiCppDescriptorRole::Type,
+                                    CsmiDescriptorRole::Callable => CsmiCppDescriptorRole::Callable,
+                                    _ => return None,
+                                },
+                                name: descriptor.name.clone()?,
+                                disambiguator: descriptor.disambiguator.clone()?,
+                            })
+                        })
+                        .collect(),
+                },
+            )
+        })
+        .collect();
+    for (id, key) in &cpp_symbols {
+        if !validate_cpp_symbol_key(key, &format!("{prefix}.symbols[{id}]"), diagnostics) {
+            valid = false;
+        }
+    }
+
+    let mut alias_facts: HashMap<String, &Value> = HashMap::new();
+    let mut special_member_facts: HashMap<String, &Value> = HashMap::new();
+    for (index, fact) in model.extension_facts.iter().enumerate() {
+        if fact.vocabulary != CSMI_CPP_PROFILE_ID || fact.version != CSMI_CPP_PROFILE_VERSION {
+            continue;
+        }
+        let path = format!("{prefix}.extensionFacts[{index}]");
+        let payload = match serde_json::from_value::<CsmiCppProfilePayload>(fact.payload.clone()) {
+            Ok(payload) => payload,
+            Err(cause) => {
+                error(
+                    diagnostics,
+                    "semantic.cpp_payload",
+                    format!("{path}.payload"),
+                    cause.to_string(),
+                );
+                valid = false;
+                continue;
+            }
+        };
+        match &payload {
+            CsmiCppProfilePayload::ResolutionContext(_) => {
+                error(
+                    diagnostics,
+                    "semantic.cpp_context_location",
+                    format!("{path}.payload"),
+                    "resolution-context belongs in compatibilityConstraints",
+                );
+                valid = false;
+            }
+            CsmiCppProfilePayload::TypeAlias(alias) => {
+                let expected_scope = serde_json::json!({"alias": alias.alias});
+                if fact.family != "type-alias" || fact.scope != expected_scope {
+                    error(
+                        diagnostics,
+                        "semantic.cpp_alias_family_scope",
+                        format!("{path}.scope"),
+                        "type-alias fact family and scope must be keyed by its alias",
+                    );
+                    valid = false;
+                }
+                if alias_facts
+                    .insert(alias.alias.clone(), &fact.payload)
+                    .is_some_and(|prior| prior != &fact.payload)
+                {
+                    error(
+                        diagnostics,
+                        "semantic.cpp_alias_conflict",
+                        &path,
+                        "equal type-alias keys carry conflicting facts",
+                    );
+                    valid = false;
+                }
+                if declaration_categories.get(&alias.alias)
+                    != Some(&CsmiDeclarationCategory::TypeAlias)
+                {
+                    error(
+                        diagnostics,
+                        "semantic.cpp_alias_symbol",
+                        format!("{path}.payload.alias"),
+                        "type-alias fact must name a declared type alias",
+                    );
+                    valid = false;
+                }
+                if !validate_cpp_type(
+                    &alias.target,
+                    &cpp_symbols,
+                    &format!("{path}.payload.target"),
+                    diagnostics,
+                ) {
+                    valid = false;
+                }
+                if !validate_cpp_context_ref(
+                    &alias.resolution_context,
+                    &contexts,
+                    &format!("{path}.payload.resolutionContext"),
+                    diagnostics,
+                ) {
+                    valid = false;
+                }
+            }
+            CsmiCppProfilePayload::SpecialMember(member) => {
+                let expected_scope = serde_json::json!({
+                    "owner": member.owner,
+                    "operation": member.operation
+                });
+                if fact.family != "special-member" || fact.scope != expected_scope {
+                    error(
+                        diagnostics,
+                        "semantic.cpp_special_member_family_scope",
+                        format!("{path}.scope"),
+                        "special-member fact family and scope must be keyed by owner and operation",
+                    );
+                    valid = false;
+                }
+                let special_key = format!("{}:{:?}", member.owner, member.operation);
+                if special_member_facts
+                    .insert(special_key, &fact.payload)
+                    .is_some_and(|prior| prior != &fact.payload)
+                {
+                    error(
+                        diagnostics,
+                        "semantic.cpp_special_member_conflict",
+                        &path,
+                        "equal special-member keys carry conflicting facts",
+                    );
+                    valid = false;
+                }
+                if declaration_categories.get(&member.owner) != Some(&CsmiDeclarationCategory::Type)
+                    || declaration_categories.get(&member.member)
+                        != Some(&CsmiDeclarationCategory::Callable)
+                    || declaration_owner(model, &member.member) != Some(member.owner.as_str())
+                {
+                    error(
+                        diagnostics,
+                        "semantic.cpp_special_member_identity",
+                        format!("{path}.payload.member"),
+                        "special member must name an exact callable and owner",
+                    );
+                    valid = false;
+                }
+                if !symbols.contains(&member.owner) || !symbols.contains(&member.member) {
+                    valid = false;
+                }
+                let expected = canonical_digest(&member.signature)
+                    .map(|digest| format!("cppsig-0.1:{digest}"));
+                if !expected
+                    .as_ref()
+                    .is_ok_and(|value| value == &member.member_disambiguator)
+                {
+                    error(
+                        diagnostics,
+                        "semantic.cpp_signature_digest",
+                        format!("{path}.payload.memberDisambiguator"),
+                        "member disambiguator must equal the RFC 8785 signature digest",
+                    );
+                    valid = false;
+                }
+                if cpp_symbols.get(member.owner.as_str()) != Some(&member.signature.owner) {
+                    error(
+                        diagnostics,
+                        "semantic.cpp_signature_owner",
+                        format!("{path}.payload.signature.owner"),
+                        "canonical signature owner must equal the declared owner key",
+                    );
+                    valid = false;
+                }
+                if !csmi_cpp_signature_matches_operation(
+                    member.operation,
+                    &member.signature,
+                    &member.signature.owner,
+                ) {
+                    error(
+                        diagnostics,
+                        "semantic.cpp_signature_shape",
+                        format!("{path}.payload.signature"),
+                        "canonical signature shape must match the special-member operation",
+                    );
+                    valid = false;
+                }
+                for (suffix, value) in member
+                    .signature
+                    .receiver
+                    .iter()
+                    .map(|value| ("receiver".to_owned(), value))
+                    .chain(
+                        member
+                            .signature
+                            .parameters
+                            .iter()
+                            .enumerate()
+                            .map(|(index, value)| (format!("parameters[{index}]"), value)),
+                    )
+                    .chain(
+                        member
+                            .signature
+                            .result
+                            .iter()
+                            .map(|value| ("result".to_owned(), value)),
+                    )
+                {
+                    if !validate_cpp_type(
+                        value,
+                        &cpp_symbols,
+                        &format!("{path}.payload.signature.{suffix}"),
+                        diagnostics,
+                    ) {
+                        valid = false;
+                    }
+                }
+                if !validate_cpp_context_ref(
+                    &member.resolution_context,
+                    &contexts,
+                    &format!("{path}.payload.resolutionContext"),
+                    diagnostics,
+                ) {
+                    valid = false;
+                }
+            }
+        }
+    }
+    valid
+}
+
+fn validate_cpp_context_ref(
+    reference: &CsmiCppResolutionContext,
+    contexts: &HashMap<String, CsmiCppLanguage>,
+    path: &str,
+    diagnostics: &mut Vec<CsmiDiagnostic>,
+) -> bool {
+    let valid = reference.version == CSMI_C_CPP_RESOLUTION_PROFILE_VERSION
+        && reference.language == CsmiCppProfileLanguage::Cpp
+        && contexts.get(&reference.context_digest) == Some(&CsmiCppLanguage::Cpp);
+    if !valid {
+        error(
+            diagnostics,
+            "semantic.cpp_context_reference",
+            path,
+            "C++ facts require an exact declared complete resolution context",
+        );
+    }
+    valid
+}
+
+fn csmi_cpp_signature_matches_operation(
+    operation: CsmiCppSpecialMemberOperation,
+    signature: &CsmiCppCallableSignature,
+    owner: &CsmiCppSymbolKey,
+) -> bool {
+    match operation {
+        CsmiCppSpecialMemberOperation::CopyConstructor => {
+            signature.callable_kind == CsmiCppCallableKind::Constructor
+                && signature.receiver.is_none()
+                && signature.result.is_none()
+                && signature.parameters.len() == 1
+                && csmi_cpp_reference_to_owner(
+                    &signature.parameters[0],
+                    CsmiCppReferenceKind::Lvalue,
+                    true,
+                    owner,
+                )
+        }
+        CsmiCppSpecialMemberOperation::CopyAssignment => {
+            signature.callable_kind == CsmiCppCallableKind::Method
+                && signature.receiver.as_ref().is_some_and(|value| {
+                    csmi_cpp_reference_to_owner(value, CsmiCppReferenceKind::Lvalue, false, owner)
+                })
+                && signature.parameters.len() == 1
+                && csmi_cpp_reference_to_owner(
+                    &signature.parameters[0],
+                    CsmiCppReferenceKind::Lvalue,
+                    true,
+                    owner,
+                )
+                && signature.result.as_ref().is_some_and(|value| {
+                    csmi_cpp_reference_to_owner(value, CsmiCppReferenceKind::Lvalue, false, owner)
+                })
+        }
+        CsmiCppSpecialMemberOperation::MoveConstructor => {
+            signature.callable_kind == CsmiCppCallableKind::Constructor
+                && signature.receiver.is_none()
+                && signature.result.is_none()
+                && signature.parameters.len() == 1
+                && csmi_cpp_reference_to_owner(
+                    &signature.parameters[0],
+                    CsmiCppReferenceKind::Rvalue,
+                    false,
+                    owner,
+                )
+        }
+    }
+}
+
+fn csmi_cpp_reference_to_owner(
+    value: &CsmiCppCanonicalType,
+    expected_kind: CsmiCppReferenceKind,
+    expect_const: bool,
+    owner: &CsmiCppSymbolKey,
+) -> bool {
+    let CsmiCppCanonicalType::Reference(reference) = value else {
+        return false;
+    };
+    if reference.reference_kind != expected_kind {
+        return false;
+    }
+    let referent = if expect_const {
+        let CsmiCppCanonicalType::Qualified(qualified) = reference.referent.as_ref() else {
+            return false;
+        };
+        if qualified.qualifiers.as_slice() != [CsmiCppTypeQualifier::Const] {
+            return false;
+        }
+        qualified.r#type.as_ref()
+    } else {
+        reference.referent.as_ref()
+    };
+    matches!(referent, CsmiCppCanonicalType::Declared(declared) if &declared.symbol == owner)
+}
+
+fn validate_cpp_symbol_key(
+    key: &CsmiCppSymbolKey,
+    path: &str,
+    diagnostics: &mut Vec<CsmiDiagnostic>,
+) -> bool {
+    let mut valid = key.scheme == CSMI_CPP_DECLARATION_IDENTITY_SCHEME
+        && key.scheme_version == CSMI_CPP_DECLARATION_IDENTITY_SCHEME_VERSION
+        && !key.artifact_selectors.is_empty()
+        && !key.descriptors.is_empty();
+    for selector in &key.artifact_selectors {
+        if !selector.purl.contains('@')
+            || selector.digests.is_empty()
+            || selector.digests.iter().any(|digest| {
+                digest.value.len() != 64
+                    || !digest
+                        .value
+                        .bytes()
+                        .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+            })
+        {
+            valid = false;
+        }
+    }
+    if !valid {
+        error(
+            diagnostics,
+            "semantic.cpp_symbol_key",
+            path,
+            "portable C++ keys require the exact scheme, descriptors, and artifact SHA-256",
+        );
+    }
+    valid
+}
+
+fn validate_cpp_type(
+    value: &CsmiCppCanonicalType,
+    symbols: &HashMap<&str, CsmiCppSymbolKey>,
+    path: &str,
+    diagnostics: &mut Vec<CsmiDiagnostic>,
+) -> bool {
+    let mut valid = true;
+    let mut stack = vec![(path.to_owned(), value)];
+    while let Some((current_path, current)) = stack.pop() {
+        match current {
+            CsmiCppCanonicalType::Fundamental(_) => {}
+            CsmiCppCanonicalType::Declared(value) => {
+                if !symbols.values().any(|key| key == &value.symbol) {
+                    error(
+                        diagnostics,
+                        "semantic.cpp_type_symbol",
+                        current_path,
+                        "declared canonical type must use a model portable symbol key",
+                    );
+                    valid = false;
+                }
+            }
+            CsmiCppCanonicalType::TemplateSpecialization(value) => {
+                if !symbols.values().any(|key| key == &value.primary) {
+                    error(
+                        diagnostics,
+                        "semantic.cpp_template_primary",
+                        format!("{current_path}.primary"),
+                        "template primary must use a model portable symbol key",
+                    );
+                    valid = false;
+                }
+                for (index, argument) in value.arguments.iter().enumerate().rev() {
+                    stack.push((format!("{current_path}.arguments[{index}]"), argument));
+                }
+            }
+            CsmiCppCanonicalType::Qualified(value) => {
+                stack.push((format!("{current_path}.type"), &value.r#type));
+            }
+            CsmiCppCanonicalType::Reference(value) => {
+                stack.push((format!("{current_path}.referent"), &value.referent));
+            }
         }
     }
     valid
@@ -1229,7 +2290,13 @@ fn validate_model(
     let mut completeness_scopes = HashSet::new();
     for (index, statement) in model.completeness_statements.iter().enumerate() {
         let path = format!("{prefix}.completenessStatements[{index}]");
-        let key = format!("{}:{}", statement.family, canonical_scope(&statement.scope));
+        let key = format!(
+            "{}:{}:{}:{}",
+            statement.vocabulary.as_deref().unwrap_or("core"),
+            statement.version.as_deref().unwrap_or(""),
+            statement.family,
+            canonical_scope(&statement.scope)
+        );
         if !completeness_scopes.insert(key) {
             error(
                 diagnostics,
@@ -1315,6 +2382,25 @@ fn validate_model(
                 valid = false;
             }
         }
+    }
+    if !validate_value_transfer_semantics(
+        model,
+        &prefix,
+        &symbols,
+        &declaration_categories,
+        &callable_declarations,
+        diagnostics,
+    ) {
+        valid = false;
+    }
+    if !validate_cpp_semantics(
+        model,
+        &prefix,
+        &symbols,
+        &declaration_categories,
+        diagnostics,
+    ) {
+        valid = false;
     }
     valid
 }
@@ -1559,6 +2645,590 @@ fn validate_summary(
     valid
 }
 
+fn validate_value_transfer_semantics(
+    model: &CsmiSemanticModel,
+    prefix: &str,
+    symbols: &HashSet<String>,
+    declaration_categories: &HashMap<String, CsmiDeclarationCategory>,
+    callable_declarations: &HashMap<String, &CsmiCallableShape>,
+    diagnostics: &mut Vec<CsmiDiagnostic>,
+) -> bool {
+    let mut valid = true;
+
+    for (index, use_) in model.vocabulary_uses.iter().enumerate() {
+        if use_.identifier != CSMI_VALUE_TRANSFER_PROFILE_ID {
+            continue;
+        }
+        let path = format!("{prefix}.vocabularyUses[{index}]");
+        if use_.version != CSMI_VALUE_TRANSFER_PROFILE_VERSION
+            || use_.schema != CSMI_VALUE_TRANSFER_PROFILE_SCHEMA
+        {
+            continue;
+        }
+        if use_.requirement != CsmiVocabularyRequirement::Required {
+            error(
+                diagnostics,
+                "semantic.value_transfer_required_use",
+                format!("{path}.requirement"),
+                "csmi.value-transfer uses affecting a payload must be required",
+            );
+            valid = false;
+        }
+        for (affect_index, affect) in use_.affects.iter().enumerate() {
+            if !validate_value_transfer_affect(
+                affect,
+                symbols,
+                declaration_categories,
+                &format!("{path}.affects[{affect_index}]"),
+                diagnostics,
+            ) {
+                valid = false;
+            }
+        }
+    }
+
+    let mut value_facts = Vec::new();
+    let mut implicit_facts = Vec::new();
+    for (index, fact) in model.extension_facts.iter().enumerate() {
+        if fact.vocabulary != CSMI_VALUE_TRANSFER_PROFILE_ID
+            || fact.version != CSMI_VALUE_TRANSFER_PROFILE_VERSION
+        {
+            continue;
+        }
+        let path = format!("{prefix}.extensionFacts[{index}]");
+        let payload =
+            match serde_json::from_value::<CsmiValueTransferProfilePayload>(fact.payload.clone()) {
+                Ok(payload) => payload,
+                Err(error_value) => {
+                    error(
+                        diagnostics,
+                        "semantic.value_transfer_payload",
+                        format!("{path}.payload"),
+                        format!(
+                            "payload does not match the typed value-transfer profile: {error_value}"
+                        ),
+                    );
+                    valid = false;
+                    continue;
+                }
+            };
+        match &payload {
+            CsmiValueTransferProfilePayload::Transfer(_) => {
+                error(
+                    diagnostics,
+                    "semantic.value_transfer_fact_attachment",
+                    format!("{path}.payload"),
+                    "transfer payloads belong on procedure-summary-transfer attachments",
+                );
+                valid = false;
+            }
+            CsmiValueTransferProfilePayload::TypeValue(value) => {
+                let expected_scope = serde_json::json!({
+                    "type": value.r#type,
+                    "aspect": value.aspect,
+                });
+                if fact.family != "type-value-semantics" || fact.scope != expected_scope {
+                    error(
+                        diagnostics,
+                        "semantic.value_transfer_fact_scope",
+                        format!("{path}.scope"),
+                        "type-value-semantics scope must exactly repeat type and aspect",
+                    );
+                    valid = false;
+                }
+                if !require_value_transfer_type(
+                    &value.r#type,
+                    symbols,
+                    declaration_categories,
+                    &format!("{path}.payload.type"),
+                    diagnostics,
+                ) {
+                    valid = false;
+                }
+                if !validate_value_semantics(value, &path, diagnostics) {
+                    valid = false;
+                }
+                value_facts.push(value.clone());
+            }
+            CsmiValueTransferProfilePayload::ImplicitOperation(operation) => {
+                let mut expected_scope = serde_json::json!({
+                    "owner": operation.owner,
+                    "operation": operation.operation,
+                });
+                if operation.operation == CsmiImplicitOperationRole::ConversionOperator {
+                    expected_scope["target"] = serde_json::json!(operation.target);
+                }
+                if fact.family != "implicit-operations" || fact.scope != expected_scope {
+                    error(
+                        diagnostics,
+                        "semantic.value_transfer_fact_scope",
+                        format!("{path}.scope"),
+                        "implicit-operations scope must exactly repeat owner, operation, and conversion target",
+                    );
+                    valid = false;
+                }
+                if !require_value_transfer_type(
+                    &operation.owner,
+                    symbols,
+                    declaration_categories,
+                    &format!("{path}.payload.owner"),
+                    diagnostics,
+                ) {
+                    valid = false;
+                }
+                if !require_value_transfer_callable(
+                    &operation.symbol,
+                    symbols,
+                    declaration_categories,
+                    callable_declarations,
+                    &format!("{path}.payload.symbol"),
+                    diagnostics,
+                ) {
+                    valid = false;
+                }
+                if declaration_owner(model, &operation.symbol) != Some(operation.owner.as_str()) {
+                    error(
+                        diagnostics,
+                        "semantic.value_transfer_owner",
+                        format!("{path}.payload.symbol"),
+                        "implicit operation symbol must be declared with the scoped owner",
+                    );
+                    valid = false;
+                }
+                if let Some(target) = &operation.target {
+                    if operation.operation != CsmiImplicitOperationRole::ConversionOperator
+                        || !require_value_transfer_type(
+                            target,
+                            symbols,
+                            declaration_categories,
+                            &format!("{path}.payload.target"),
+                            diagnostics,
+                        )
+                    {
+                        if operation.operation != CsmiImplicitOperationRole::ConversionOperator {
+                            error(
+                                diagnostics,
+                                "semantic.value_transfer_operation_target",
+                                format!("{path}.payload.target"),
+                                "only conversion operators may carry a target",
+                            );
+                        }
+                        valid = false;
+                    }
+                } else if operation.operation == CsmiImplicitOperationRole::ConversionOperator {
+                    error(
+                        diagnostics,
+                        "semantic.value_transfer_operation_target",
+                        format!("{path}.payload.target"),
+                        "conversion operators require a local target type",
+                    );
+                    valid = false;
+                }
+                if !validate_value_operation_shape(
+                    operation,
+                    callable_declarations,
+                    &path,
+                    diagnostics,
+                ) {
+                    valid = false;
+                }
+                implicit_facts.push(operation.clone());
+            }
+        }
+    }
+
+    // The previous pass parses and checks fact-local shape.  Check every
+    // typed fact against its exact required fact-family declaration here.
+    for (index, fact) in model.extension_facts.iter().enumerate() {
+        if fact.vocabulary != CSMI_VALUE_TRANSFER_PROFILE_ID
+            || fact.version != CSMI_VALUE_TRANSFER_PROFILE_VERSION
+        {
+            continue;
+        }
+        let path = format!("{prefix}.extensionFacts[{index}]");
+        let Ok(payload) =
+            serde_json::from_value::<CsmiValueTransferProfilePayload>(fact.payload.clone())
+        else {
+            continue;
+        };
+        let expected = match payload {
+            CsmiValueTransferProfilePayload::TypeValue(value) => value_fact_affect(&value),
+            CsmiValueTransferProfilePayload::ImplicitOperation(operation) => {
+                operation_fact_affect(&operation)
+            }
+            CsmiValueTransferProfilePayload::Transfer(_) => continue,
+        };
+        if !require_value_transfer_affect(model, &expected, &path, diagnostics) {
+            valid = false;
+        }
+    }
+
+    for (summary_index, summary) in model.procedure_summaries.iter().enumerate() {
+        for (transfer_index, transfer) in summary.transfers.iter().enumerate() {
+            let path =
+                format!("{prefix}.procedureSummaries[{summary_index}].transfers[{transfer_index}]");
+            if !validate_non_transfer_value_attachments(
+                &transfer.extensions,
+                &format!("{path}.extensions"),
+                diagnostics,
+                true,
+            ) {
+                valid = false;
+            }
+            let attachments = transfer
+                .extensions
+                .iter()
+                .filter(|extension| {
+                    extension.vocabulary == CSMI_VALUE_TRANSFER_PROFILE_ID
+                        && extension.version == CSMI_VALUE_TRANSFER_PROFILE_VERSION
+                })
+                .collect::<Vec<_>>();
+            if attachments.is_empty() {
+                continue;
+            }
+            if attachments.len() != 1 {
+                error(
+                    diagnostics,
+                    "semantic.value_transfer_duplicate_attachment",
+                    format!("{path}.extensions"),
+                    "a transfer has exactly one value-transfer attachment",
+                );
+                valid = false;
+            }
+            let payload = match serde_json::from_value::<CsmiValueTransferProfilePayload>(
+                attachments[0].payload.clone(),
+            ) {
+                Ok(CsmiValueTransferProfilePayload::Transfer(payload)) => payload,
+                Ok(_) => {
+                    error(
+                        diagnostics,
+                        "semantic.value_transfer_attachment_payload",
+                        format!("{path}.extensions"),
+                        "a procedure-summary-transfer extension must contain a transfer payload",
+                    );
+                    valid = false;
+                    continue;
+                }
+                Err(error_value) => {
+                    error(
+                        diagnostics,
+                        "semantic.value_transfer_attachment_payload",
+                        format!("{path}.extensions"),
+                        format!("invalid transfer attachment payload: {error_value}"),
+                    );
+                    valid = false;
+                    continue;
+                }
+            };
+            let expected = CsmiAffectedUnit::Attachment(CsmiAffectedAttachment {
+                kind: CsmiAffectedAttachmentKind::Attachment,
+                attachment_point: "procedure-summary-transfer".to_owned(),
+                target: serde_json::json!({"callable": summary.callable}),
+            });
+            if !require_value_transfer_affect(model, &expected, &path, diagnostics) {
+                valid = false;
+            }
+            let identity_expected = CsmiAffectedUnit::FactFamily(CsmiAffectedFactFamily {
+                kind: CsmiAffectedFactFamilyKind::FactFamily,
+                family: "identity-separating-transfers".to_owned(),
+                scope: serde_json::json!({"callable": summary.callable}),
+            });
+            if !require_value_transfer_affect(model, &identity_expected, &path, diagnostics) {
+                valid = false;
+            }
+            if !validate_value_transfer_attachment(
+                &payload,
+                &implicit_facts,
+                symbols,
+                declaration_categories,
+                callable_declarations,
+                &path,
+                diagnostics,
+            ) {
+                valid = false;
+            }
+        }
+    }
+
+    for (index, statement) in model.completeness_statements.iter().enumerate() {
+        if statement.vocabulary.as_deref() != Some(CSMI_VALUE_TRANSFER_PROFILE_ID) {
+            continue;
+        }
+        let path = format!("{prefix}.completenessStatements[{index}]");
+        if statement.vocabulary.as_deref() != Some(CSMI_VALUE_TRANSFER_PROFILE_ID)
+            || statement.version.as_deref() != Some(CSMI_VALUE_TRANSFER_PROFILE_VERSION)
+        {
+            error(
+                diagnostics,
+                "semantic.value_transfer_completeness_identity",
+                &path,
+                "value-transfer completeness must declare the exact vocabulary and version",
+            );
+            valid = false;
+            continue;
+        }
+        if !validate_value_transfer_scope(
+            &statement.family,
+            &statement.scope,
+            symbols,
+            declaration_categories,
+            &format!("{path}.scope"),
+            diagnostics,
+        ) {
+            valid = false;
+        }
+        let expected = CsmiAffectedUnit::FactFamily(CsmiAffectedFactFamily {
+            kind: CsmiAffectedFactFamilyKind::FactFamily,
+            family: statement.family.clone(),
+            scope: statement.scope.clone(),
+        });
+        if !require_value_transfer_affect(model, &expected, &path, diagnostics) {
+            valid = false;
+        }
+        if statement.status != CsmiCoverageStatus::Complete {
+            continue;
+        }
+        match statement.family.as_str() {
+            "type-value-semantics" => {
+                let matches = value_facts.iter().filter(|fact| {
+                    value_fact_affect(fact)
+                        == CsmiAffectedUnit::FactFamily(CsmiAffectedFactFamily {
+                            kind: CsmiAffectedFactFamilyKind::FactFamily,
+                            family: statement.family.clone(),
+                            scope: statement.scope.clone(),
+                        })
+                });
+                let matching = matches.collect::<Vec<_>>();
+                if matching.is_empty() {
+                    error(
+                        diagnostics,
+                        "semantic.value_transfer_complete_empty",
+                        &path,
+                        "complete type-value coverage requires a typed fact",
+                    );
+                    valid = false;
+                }
+                if matching.first().is_some_and(|first| {
+                    matching
+                        .iter()
+                        .skip(1)
+                        .any(|fact| fact.semantics != first.semantics)
+                }) {
+                    error(
+                        diagnostics,
+                        "semantic.value_transfer_complete_conflict",
+                        &path,
+                        "complete type-value coverage cannot contain conflicting semantics",
+                    );
+                    valid = false;
+                }
+                if matching.iter().any(|fact| {
+                    matches!(
+                        fact.semantics,
+                        CsmiTypeSemantics::Unknown { .. } | CsmiTypeSemantics::Unsupported { .. }
+                    )
+                }) {
+                    error(
+                        diagnostics,
+                        "semantic.value_transfer_complete_unknown",
+                        &path,
+                        "complete type-value coverage cannot retain unknown or unsupported semantics",
+                    );
+                    valid = false;
+                }
+            }
+            "implicit-operations" => {
+                if !implicit_facts.iter().any(|operation| {
+                    operation_fact_affect(operation)
+                        == CsmiAffectedUnit::FactFamily(CsmiAffectedFactFamily {
+                            kind: CsmiAffectedFactFamilyKind::FactFamily,
+                            family: statement.family.clone(),
+                            scope: statement.scope.clone(),
+                        })
+                }) {
+                    error(
+                        diagnostics,
+                        "semantic.value_transfer_complete_empty",
+                        &path,
+                        "complete implicit-operation coverage requires a typed fact",
+                    );
+                    valid = false;
+                }
+            }
+            "identity-separating-transfers" => {
+                let callable = statement.scope.get("callable").and_then(Value::as_str);
+                let Some(callable) = callable else {
+                    continue;
+                };
+                let Some(summary) = model
+                    .procedure_summaries
+                    .iter()
+                    .find(|summary| summary.callable == callable)
+                else {
+                    error(
+                        diagnostics,
+                        "semantic.value_transfer_complete_empty",
+                        &path,
+                        "complete transfer classification requires the scoped procedure summary",
+                    );
+                    valid = false;
+                    continue;
+                };
+                for (transfer_index, transfer) in summary.transfers.iter().enumerate() {
+                    let attachments = transfer
+                        .extensions
+                        .iter()
+                        .filter(|extension| {
+                            extension.vocabulary == CSMI_VALUE_TRANSFER_PROFILE_ID
+                                && extension.version == CSMI_VALUE_TRANSFER_PROFILE_VERSION
+                        })
+                        .collect::<Vec<_>>();
+                    if attachments.len() != 1 {
+                        error(
+                            diagnostics,
+                            "semantic.value_transfer_complete_unclassified",
+                            format!("{path}.scope.transfers[{transfer_index}]"),
+                            "complete identity-separating coverage requires one classified transfer attachment",
+                        );
+                        valid = false;
+                        continue;
+                    }
+                    if let Ok(CsmiValueTransferProfilePayload::Transfer(attachment)) =
+                        serde_json::from_value(attachments[0].payload.clone())
+                        && value_transfer_has_unknown_detail(&attachment)
+                    {
+                        error(
+                            diagnostics,
+                            "semantic.value_transfer_complete_unknown",
+                            format!("{path}.scope.transfers[{transfer_index}]"),
+                            "complete identity-separating coverage cannot retain unknown transfer details",
+                        );
+                        valid = false;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // Value-transfer attachments are point-specific.  Keep an extension on a
+    // fact or another core object from silently changing its meaning.
+    if !validate_non_transfer_value_attachments(
+        &model.extensions,
+        &format!("{prefix}.extensions"),
+        diagnostics,
+        false,
+    ) {
+        valid = false;
+    }
+    for (index, symbol) in model.symbols.iter().enumerate() {
+        if !validate_non_transfer_value_attachments(
+            &symbol.extensions,
+            &format!("{prefix}.symbols[{index}].extensions"),
+            diagnostics,
+            false,
+        ) {
+            valid = false;
+        }
+    }
+    for (index, declaration) in model.declarations.iter().enumerate() {
+        let path = format!("{prefix}.declarations[{index}]");
+        if !validate_non_transfer_value_attachments(
+            &declaration.extensions,
+            &format!("{path}.extensions"),
+            diagnostics,
+            false,
+        ) {
+            valid = false;
+        }
+        for (generic_index, generic) in declaration.generic_parameters.iter().enumerate() {
+            if !validate_non_transfer_value_attachments(
+                &generic.extensions,
+                &format!("{path}.genericParameters[{generic_index}].extensions"),
+                diagnostics,
+                false,
+            ) {
+                valid = false;
+            }
+        }
+        if let Some(shape) = &declaration.callable {
+            if !validate_non_transfer_value_attachments(
+                &shape.extensions,
+                &format!("{path}.callable.extensions"),
+                diagnostics,
+                false,
+            ) {
+                valid = false;
+            }
+            if let Some(receiver) = &shape.receiver
+                && !validate_non_transfer_value_attachments(
+                    &receiver.extensions,
+                    &format!("{path}.callable.receiver.extensions"),
+                    diagnostics,
+                    false,
+                )
+            {
+                valid = false;
+            }
+            for (parameter_index, parameter) in shape.parameters.iter().enumerate() {
+                if !validate_non_transfer_value_attachments(
+                    &parameter.extensions,
+                    &format!("{path}.callable.parameters[{parameter_index}].extensions"),
+                    diagnostics,
+                    false,
+                ) {
+                    valid = false;
+                }
+            }
+            for (result_index, result) in shape.results.iter().enumerate() {
+                if !validate_non_transfer_value_attachments(
+                    &result.extensions,
+                    &format!("{path}.callable.results[{result_index}].extensions"),
+                    diagnostics,
+                    false,
+                ) {
+                    valid = false;
+                }
+            }
+        }
+    }
+    for (index, relationship) in model.relationships.iter().enumerate() {
+        let extensions = match relationship {
+            CsmiRelationship::Type(relationship) => &relationship.extensions,
+            CsmiRelationship::Member(relationship) => &relationship.extensions,
+        };
+        if !validate_non_transfer_value_attachments(
+            extensions,
+            &format!("{prefix}.relationships[{index}].extensions"),
+            diagnostics,
+            false,
+        ) {
+            valid = false;
+        }
+    }
+    for (index, summary) in model.procedure_summaries.iter().enumerate() {
+        if !validate_non_transfer_value_attachments(
+            &summary.extensions,
+            &format!("{prefix}.procedureSummaries[{index}].extensions"),
+            diagnostics,
+            false,
+        ) {
+            valid = false;
+        }
+    }
+    for (index, fact) in model.extension_facts.iter().enumerate() {
+        if !validate_non_transfer_value_attachments(
+            &fact.extensions,
+            &format!("{prefix}.extensionFacts[{index}].extensions"),
+            diagnostics,
+            false,
+        ) {
+            valid = false;
+        }
+    }
+    valid
+}
+
 fn validate_input_location(
     location: &CsmiInputLocation,
     shape: &CsmiCallableShape,
@@ -1602,7 +3272,9 @@ fn validate_output_location(
     diagnostics: &mut Vec<CsmiDiagnostic>,
 ) -> bool {
     match &location.root {
-        CsmiOutputBoundaryRoot::Receiver(_) if shape.receiver.is_none() => {
+        CsmiOutputBoundaryRoot::Receiver(_)
+            if shape.receiver.is_none() && shape.kind != CsmiCallableKind::Constructor =>
+        {
             error(
                 diagnostics,
                 "semantic.receiver_root",

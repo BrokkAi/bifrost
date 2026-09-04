@@ -766,6 +766,7 @@ pub fn translate_joern_semantics(file: &str, semantics: &[JoernFlowSemantic]) ->
                 input,
                 exit_kind: AuthoredSummaryExitKind::Normal,
                 output,
+                value_transfer: None,
             });
         }
         let states_no_flow = semantic.mappings.is_empty() && !semantic.passthrough;

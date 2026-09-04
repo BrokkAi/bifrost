@@ -2352,7 +2352,7 @@ fn rust_trait_member_kind(
     if trait_member.is_function() {
         return Some(RustTraitMemberKind::Method);
     }
-    if trait_member.is_field() && rust.is_type_alias(trait_member) {
+    if rust.is_type_alias(trait_member) {
         return Some(RustTraitMemberKind::AssociatedType);
     }
     None
@@ -2360,7 +2360,7 @@ fn rust_trait_member_kind(
 
 fn rust_code_unit_kind_matches(code_unit: &CodeUnit, member_kind: RustTraitMemberKind) -> bool {
     match member_kind {
-        RustTraitMemberKind::AssociatedType => code_unit.is_field(),
+        RustTraitMemberKind::AssociatedType => code_unit.is_class(),
         RustTraitMemberKind::Method => code_unit.is_function(),
     }
 }

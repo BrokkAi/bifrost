@@ -34,7 +34,7 @@ use tree_sitter::Node;
 
 use crate::syntax::{
     expression_name_node, python_deferred_annotation_identifier_ranges,
-    python_keyword_argument_label, python_node_is_in_annotation,
+    python_keyword_argument_label, python_node_is_in_annotation, python_plain_string_literal,
 };
 
 #[derive(Debug, Default)]
@@ -295,25 +295,6 @@ fn python_binding_activation(binder: Node<'_>, scope: Range) -> Option<BindingAc
 /// not plain: an f-string interpolation, an escape sequence this reader does
 /// not decode, or an implicit concatenation. `None` is never an empty name --
 /// it is "this value is computed", which makes the whole surface unreadable.
-fn python_plain_string_text<'a>(node: Node<'_>, source: &'a str) -> Option<&'a str> {
-    if node.kind() != "string" {
-        return None;
-    }
-    let mut cursor = node.walk();
-    let mut content = None;
-    for child in node.named_children(&mut cursor) {
-        match child.kind() {
-            "string_start" | "string_end" => {}
-            "string_content" if content.is_none() && child.named_child_count() == 0 => {
-                content = Some(child);
-            }
-            _ => return None,
-        }
-    }
-    // A literal with no content run is the empty string.
-    Some(content.map_or("", |child| node_source_text(child, source)))
-}
-
 /// Whether every member of a curated surface was read from the parse tree.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ReadableSurface {
@@ -334,7 +315,7 @@ fn python_collect_all_members(
     }
     let mut cursor = value.walk();
     for element in value.named_children(&mut cursor) {
-        match python_plain_string_text(element, source) {
+        match python_plain_string_literal(element, source) {
             Some(text) => {
                 names.insert(text.to_owned());
             }

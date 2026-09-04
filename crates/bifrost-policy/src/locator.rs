@@ -127,8 +127,11 @@ pub(super) fn resolve_policy_definition_locators(
             resolve_taint_set(&mut spec.sources, analyzer)?;
             resolve_taint_set(&mut spec.sinks, analyzer)?;
             resolve_taint_set(&mut spec.sanitizers, analyzer)?;
+            resolve_taint_set(&mut spec.entry_points, analyzer)?;
             resolve_taint_set(&mut spec.transforms, analyzer)?;
-            resolve_taint_set(&mut spec.external_models, analyzer)
+            resolve_taint_set(&mut spec.external_models, analyzer)?;
+            resolve_taint_entries(&mut spec.store_writes, analyzer)?;
+            resolve_taint_entries(&mut spec.store_reads, analyzer)
         }
         PolicyAnalysis::Typestate { spec } => {
             for subject in &mut spec.subjects.entries {
@@ -151,7 +154,17 @@ fn resolve_taint_set<T>(
 where
     T: TaintSelectorAccess,
 {
-    for entry in &mut set.entries {
+    resolve_taint_entries(&mut set.entries, analyzer)
+}
+
+fn resolve_taint_entries<T>(
+    entries: &mut [T],
+    analyzer: Option<&dyn IAnalyzer>,
+) -> Result<(), PolicySourceError>
+where
+    T: TaintSelectorAccess,
+{
+    for entry in entries {
         resolve_selector_locators(entry.selector_mut(), analyzer)?;
     }
     Ok(())
@@ -192,6 +205,16 @@ impl TaintSelectorAccess for TaintSanitizerSpec {
     }
 }
 
+impl TaintSelectorAccess for TaintEntryPointSpec {
+    fn selector(&self) -> &PolicySelector {
+        &self.selector
+    }
+
+    fn selector_mut(&mut self) -> &mut PolicySelector {
+        &mut self.selector
+    }
+}
+
 impl TaintSelectorAccess for TaintTransformSpec {
     fn selector(&self) -> &PolicySelector {
         &self.selector
@@ -203,6 +226,26 @@ impl TaintSelectorAccess for TaintTransformSpec {
 }
 
 impl TaintSelectorAccess for TaintExternalModelSpec {
+    fn selector(&self) -> &PolicySelector {
+        &self.selector
+    }
+
+    fn selector_mut(&mut self) -> &mut PolicySelector {
+        &mut self.selector
+    }
+}
+
+impl TaintSelectorAccess for TaintStoreWriteSpec {
+    fn selector(&self) -> &PolicySelector {
+        &self.selector
+    }
+
+    fn selector_mut(&mut self) -> &mut PolicySelector {
+        &mut self.selector
+    }
+}
+
+impl TaintSelectorAccess for TaintStoreReadSpec {
     fn selector(&self) -> &PolicySelector {
         &self.selector
     }
@@ -237,8 +280,11 @@ pub(super) fn resolved_locator_metadata(
             collect_taint_set_locators(&spec.sources, &mut locators);
             collect_taint_set_locators(&spec.sinks, &mut locators);
             collect_taint_set_locators(&spec.sanitizers, &mut locators);
+            collect_taint_set_locators(&spec.entry_points, &mut locators);
             collect_taint_set_locators(&spec.transforms, &mut locators);
             collect_taint_set_locators(&spec.external_models, &mut locators);
+            collect_taint_entry_locators(&spec.store_writes, &mut locators);
+            collect_taint_entry_locators(&spec.store_reads, &mut locators);
         }
         PolicyAnalysis::Typestate { spec } => {
             for subject in &spec.subjects.entries {
@@ -258,7 +304,14 @@ fn collect_taint_set_locators<'a, T: TaintSelectorAccess>(
     set: &'a TaintEndpointSet<T>,
     locators: &mut Vec<&'a ResolvedPolicyLocator>,
 ) {
-    for entry in &set.entries {
+    collect_taint_entry_locators(&set.entries, locators);
+}
+
+fn collect_taint_entry_locators<'a, T: TaintSelectorAccess>(
+    entries: &'a [T],
+    locators: &mut Vec<&'a ResolvedPolicyLocator>,
+) {
+    for entry in entries {
         collect_selector_locators(entry.selector(), locators);
     }
 }

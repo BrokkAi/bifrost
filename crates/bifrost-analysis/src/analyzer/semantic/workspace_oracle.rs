@@ -13,7 +13,7 @@ pub(super) use dispatch::{
     CallableDefinitionIdentity, retain_dispatch_candidate, scoped_procedure_dispatch_gap,
 };
 pub(crate) use dispatch::{
-    exact_source_for_procedure, external_constant_field_read_discharges_gap,
+    exact_call_range, exact_source_for_procedure, external_constant_field_read_discharges_gap,
 };
 // Policy lowering resolves authored source ranges to procedures through these,
 // so they are public where the rest of dispatch stays crate-internal.
@@ -24,8 +24,10 @@ pub use dispatch::{
 pub use source::PreparedSourceDispatchSession;
 // Read-set verification replays dispatch on the head workspace and must fold
 // the answer with the same helper the recording used, never a second copy.
-pub(crate) use source::dispatch_answer_digest;
 pub use source::{SourceDispatchObservation, SourceDispatchResult, SourcePointsToResult};
+pub(crate) use source::{
+    dispatch_answer_digest, dispatch_question, one_call_dispatch_answer_digest,
+};
 // The value-flow plan re-applies these relevance rules when it decides
 // whether a snapshot's residual openness was refined by its own complete
 // call resolutions (#1952).

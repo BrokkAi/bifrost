@@ -371,6 +371,7 @@ mod value_domain {
     };
     use brokk_bifrost_core::analyzer::structural::routes::SegmentResolutionStatus;
     use brokk_bifrost_flow::dataflow::SemanticInputStatus;
+    use brokk_bifrost_flow::type_flow::ClassSetStatus;
 
     pub(super) const LANGUAGE: &[&str] = Language::CONFIG_LABELS;
     pub(super) const STRUCTURAL_KIND: &[&str] = NormalizedKind::LABELS;
@@ -537,9 +538,10 @@ mod value_domain {
     pub(super) const CONCURRENT_ORDERING: &[&str] = &["unordered", "happens_before", "open"];
     pub(super) const CONCURRENT_PROTECTION: &[&str] =
         &["unprotected", "compatible_lock", "atomic_only", "open"];
-    pub(super) const CONCURRENT_VERDICT: &[&str] = &["conflict"];
+    pub(super) const CONCURRENT_VERDICT: &[&str] = &["conflict", "ordered", "protected"];
     pub(super) const CONCURRENT_PROOF: &[&str] = &["proven", "open"];
     pub(super) const CONCURRENT_COVERAGE: &[&str] = &["exhaustive", "open"];
+    pub(super) const CLASS_SET_STATUS: &[&str] = ClassSetStatus::LABELS;
     pub(super) const SWITCH_PROOF: &[&str] = &["exact", "unknown"];
     pub(super) const SWITCH_REASON: &[&str] = &[
         "type_switch",
@@ -678,6 +680,18 @@ pub struct CodeQueryRowFieldError {
 }
 
 impl CodeQueryRowFieldError {
+    /// The refusal any reader of a row's field surface raises for a field the
+    /// row's domain does not declare.
+    ///
+    /// Named here rather than built at each reader, because a projection of a
+    /// row must refuse exactly what the row itself refuses.
+    pub fn unregistered(domain: DetailedCodeQueryDomain, field: &str) -> Self {
+        Self {
+            domain,
+            field: field.to_string(),
+        }
+    }
+
     pub const fn domain(&self) -> DetailedCodeQueryDomain {
         self.domain
     }
@@ -957,6 +971,8 @@ detailed_row_domains! {
                     CodeQueryRowField::required("first_start_column", Scalar::Integer),
                     CodeQueryRowField::required("first_end_line", Scalar::Integer),
                     CodeQueryRowField::required("first_end_column", Scalar::Integer),
+                    CodeQueryRowField::required("first_start_byte", Scalar::Integer),
+                    CodeQueryRowField::required("first_end_byte", Scalar::Integer),
                     CodeQueryRowField::required("second_procedure_id", Scalar::StableId),
                     CodeQueryRowField::required("second_point_id", Scalar::Integer),
                     CodeQueryRowField::required_enum("second_access", value_domain::CONCURRENT_ACCESS_MODE),
@@ -965,6 +981,8 @@ detailed_row_domains! {
                     CodeQueryRowField::required("second_start_column", Scalar::Integer),
                     CodeQueryRowField::required("second_end_line", Scalar::Integer),
                     CodeQueryRowField::required("second_end_column", Scalar::Integer),
+                    CodeQueryRowField::required("second_start_byte", Scalar::Integer),
+                    CodeQueryRowField::required("second_end_byte", Scalar::Integer),
                     CodeQueryRowField::required_enum("task_relation", value_domain::CONCURRENT_TASK_RELATION),
                     CodeQueryRowField::required_enum("ordering", value_domain::CONCURRENT_ORDERING),
                     CodeQueryRowField::required_enum("protection", value_domain::CONCURRENT_PROTECTION),
@@ -1001,6 +1019,31 @@ detailed_row_domains! {
                     CodeQueryRowField::required("endpoint_id", Scalar::StableId),
                     CodeQueryRowField::required("witness_index", Scalar::Integer),
                     CodeQueryRowField::required("truncated", Scalar::Boolean),
+        ],
+    },
+    ClassSetRow => "class_set_row" {
+        display_range: |value| Some(value.range),
+        identities: None,
+        fields: [
+                    CodeQueryRowField::required("id", Scalar::StableId),
+                    CodeQueryRowField::required("member", Scalar::String),
+                    CodeQueryRowField::optional("class", Scalar::String),
+                    CodeQueryRowField::required_open_enum(
+                        "origin",
+                        "an unknown origin embeds the engine's unknown:<reason> label, and the type-flow reason vocabulary grows with the language adapters"
+                    ),
+                    CodeQueryRowField::required_enum("status", value_domain::CLASS_SET_STATUS),
+        ],
+    },
+    AbsentMemberFinding => "absent_member_finding" {
+        display_range: |value| Some(value.range),
+        identities: None,
+        fields: [
+                    CodeQueryRowField::required("id", Scalar::StableId),
+                    CodeQueryRowField::required("member", Scalar::String),
+                    CodeQueryRowField::required("class", Scalar::String),
+                    CodeQueryRowField::required("caller", Scalar::String),
+                    CodeQueryRowField::required("witness_steps", Scalar::Integer),
         ],
     },
     TaintFinding => "taint_finding" {
@@ -2090,6 +2133,9 @@ detailed_row_domains! {
                     CodeQueryRowField::optional("null_target_id", Scalar::StableId),
                     CodeQueryRowField::optional("equality_negated", Scalar::Boolean),
                     CodeQueryRowField::optional("constant_value", Scalar::Integer),
+                    CodeQueryRowField::optional("guarded_value", Scalar::Integer),
+                    CodeQueryRowField::optional("classes_value", Scalar::Integer),
+                    CodeQueryRowField::optional("member_value", Scalar::Integer),
                     CodeQueryRowField::optional("opaque_digest", Scalar::Integer),
                     CodeQueryRowField::optional("subject_value", Scalar::Integer),
                     CodeQueryRowField::optional("true_edge_id", Scalar::StableId),
@@ -2231,10 +2277,7 @@ impl<'a> CodeQueryRowRef<'a> {
         name: &str,
     ) -> Result<Option<CodeQueryRowScalarRef<'a>>, CodeQueryRowFieldError> {
         let Some(schema) = self.fields().iter().find(|field| field.name == name) else {
-            return Err(CodeQueryRowFieldError {
-                domain: self.domain(),
-                field: name.to_string(),
-            });
+            return Err(CodeQueryRowFieldError::unregistered(self.domain(), name));
         };
         let value = project_code_query_row_field(self.value, name);
         debug_assert!(
@@ -2408,6 +2451,18 @@ fn project_code_query_row_field<'a>(
                     .expect("usize fits in u64 on supported targets"),
             ))
         }
+        (CodeQueryResultValue::ConcurrentAccessConflict { value }, "first_start_byte") => {
+            Some(Scalar::Integer(
+                u64::try_from(value.first_start_byte)
+                    .expect("usize fits in u64 on supported targets"),
+            ))
+        }
+        (CodeQueryResultValue::ConcurrentAccessConflict { value }, "first_end_byte") => {
+            Some(Scalar::Integer(
+                u64::try_from(value.first_end_byte)
+                    .expect("usize fits in u64 on supported targets"),
+            ))
+        }
         (CodeQueryResultValue::ConcurrentAccessConflict { value }, "second_procedure_id") => {
             Some(Scalar::StableId(&value.second_procedure_id))
         }
@@ -2441,6 +2496,18 @@ fn project_code_query_row_field<'a>(
         (CodeQueryResultValue::ConcurrentAccessConflict { value }, "second_end_column") => {
             Some(Scalar::Integer(
                 u64::try_from(value.second_range.end_column)
+                    .expect("usize fits in u64 on supported targets"),
+            ))
+        }
+        (CodeQueryResultValue::ConcurrentAccessConflict { value }, "second_start_byte") => {
+            Some(Scalar::Integer(
+                u64::try_from(value.second_start_byte)
+                    .expect("usize fits in u64 on supported targets"),
+            ))
+        }
+        (CodeQueryResultValue::ConcurrentAccessConflict { value }, "second_end_byte") => {
+            Some(Scalar::Integer(
+                u64::try_from(value.second_end_byte)
                     .expect("usize fits in u64 on supported targets"),
             ))
         }
@@ -2493,6 +2560,34 @@ fn project_code_query_row_field<'a>(
         }
         (CodeQueryResultValue::FlowWitness { value }, "truncated") => {
             Some(Scalar::Boolean(value.truncated))
+        }
+        (CodeQueryResultValue::ClassSetRow { value }, "id") => Some(Scalar::StableId(&value.id)),
+        (CodeQueryResultValue::ClassSetRow { value }, "member") => {
+            Some(Scalar::String(&value.member))
+        }
+        (CodeQueryResultValue::ClassSetRow { value }, "class") => {
+            value.class.as_deref().map(Scalar::String)
+        }
+        (CodeQueryResultValue::ClassSetRow { value }, "origin") => {
+            Some(Scalar::ConstrainedEnum(&value.origin))
+        }
+        (CodeQueryResultValue::ClassSetRow { value }, "status") => {
+            Some(Scalar::ConstrainedEnum(value.status))
+        }
+        (CodeQueryResultValue::AbsentMemberFinding { value }, "id") => {
+            Some(Scalar::StableId(&value.id))
+        }
+        (CodeQueryResultValue::AbsentMemberFinding { value }, "member") => {
+            Some(Scalar::String(&value.member))
+        }
+        (CodeQueryResultValue::AbsentMemberFinding { value }, "class") => {
+            Some(Scalar::String(&value.class))
+        }
+        (CodeQueryResultValue::AbsentMemberFinding { value }, "caller") => {
+            Some(Scalar::String(&value.caller))
+        }
+        (CodeQueryResultValue::AbsentMemberFinding { value }, "witness_steps") => {
+            Some(Scalar::Integer(value.witness_steps as u64))
         }
         (CodeQueryResultValue::TaintFinding { value }, "id") => Some(Scalar::StableId(&value.id)),
         (CodeQueryResultValue::TaintFinding { value }, "sink_event_id") => {
@@ -4266,6 +4361,15 @@ fn project_code_query_row_field<'a>(
         (CodeQueryResultValue::Guard { value }, "constant_value") => {
             value.constant_value.map(Scalar::Integer)
         }
+        (CodeQueryResultValue::Guard { value }, "guarded_value") => {
+            value.guarded_value.map(Scalar::Integer)
+        }
+        (CodeQueryResultValue::Guard { value }, "classes_value") => {
+            value.classes_value.map(Scalar::Integer)
+        }
+        (CodeQueryResultValue::Guard { value }, "member_value") => {
+            value.member_value.map(Scalar::Integer)
+        }
         (CodeQueryResultValue::Guard { value }, "opaque_digest") => {
             value.opaque_digest.map(Scalar::Integer)
         }
@@ -4378,6 +4482,12 @@ pub enum DetailedCodeQueryKey {
     FlowWitness {
         id: String,
         endpoint_id: String,
+    },
+    ClassSetRow {
+        id: String,
+    },
+    AbsentMemberFinding {
+        id: String,
     },
     TaintFinding {
         id: String,
@@ -4875,6 +4985,18 @@ fn detailed_semantic_identity(
                 endpoint_id: value.endpoint_id.clone(),
             },
         )),
+        CodeQueryResultValue::ClassSetRow { value } => Some((
+            DetailedCodeQueryDomain::ClassSetRow,
+            DetailedCodeQueryKey::ClassSetRow {
+                id: value.id.clone(),
+            },
+        )),
+        CodeQueryResultValue::AbsentMemberFinding { value } => Some((
+            DetailedCodeQueryDomain::AbsentMemberFinding,
+            DetailedCodeQueryKey::AbsentMemberFinding {
+                id: value.id.clone(),
+            },
+        )),
         CodeQueryResultValue::TaintFinding { value } => Some((
             DetailedCodeQueryDomain::TaintFinding,
             DetailedCodeQueryKey::TaintFinding {
@@ -5001,6 +5123,8 @@ fn semantic_wire_id(key: &DetailedCodeQueryKey) -> Option<&str> {
         | DetailedCodeQueryKey::NilnessOperation { .. }
         | DetailedCodeQueryKey::SwitchCoverage { .. }
         | DetailedCodeQueryKey::ConcurrentAccessConflict { .. }
+        | DetailedCodeQueryKey::ClassSetRow { .. }
+        | DetailedCodeQueryKey::AbsentMemberFinding { .. }
         | DetailedCodeQueryKey::DetachedTaskTransfer { .. }
         | DetailedCodeQueryKey::ProcedureEffect { .. }
         | DetailedCodeQueryKey::CallableSignature { .. }
@@ -5129,6 +5253,43 @@ mod toy_domain {
             fields[1].value_domain,
             Some(CodeQueryEnumDomain::Labels(&["round", "square"])),
             "an enum field carries its value domain through the same entry"
+        );
+    }
+}
+
+#[cfg(test)]
+mod registry {
+    use super::*;
+
+    /// #2956: the class-set Unknown reasons (`unknown:<label>` origins) are
+    /// row values behind a registered open enum, so renaming `budget` to
+    /// `solver_budget` and adding `semantic_budget`/`incomplete_root` moves
+    /// no query's parse and the RQL schema version stays 1. Closing this enum
+    /// would be the schema-version event.
+    #[test]
+    fn class_set_row_origin_is_an_open_enum_and_status_stays_closed() {
+        use brokk_bifrost_flow::type_flow::ClassSetStatus;
+
+        let fields = DetailedCodeQueryDomain::ClassSetRow.row_fields();
+        let origin = fields
+            .iter()
+            .find(|field| field.name == "origin")
+            .expect("class_set_row registers its origin field");
+        assert!(
+            matches!(
+                origin.value_domain,
+                Some(CodeQueryEnumDomain::Unenumerable(_))
+            ),
+            "the unknown:<reason> vocabulary grows with the language adapters: {origin:?}",
+        );
+        let status = fields
+            .iter()
+            .find(|field| field.name == "status")
+            .expect("class_set_row registers its status field");
+        assert_eq!(
+            status.value_domain,
+            Some(CodeQueryEnumDomain::Labels(ClassSetStatus::LABELS)),
+            "the closed status vocabulary is unchanged",
         );
     }
 }

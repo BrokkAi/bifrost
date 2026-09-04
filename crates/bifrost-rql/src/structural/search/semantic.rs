@@ -29,7 +29,7 @@ use crate::analyzer::semantic::{
     SemanticBudget, SemanticBudgetDimension, SemanticBudgetScopeSnapshot, SemanticCallSite,
     SemanticCapability, SemanticEvent, SemanticExecutionBudget, SemanticExecutionBudgetSnapshot,
     SemanticGap, SemanticLocator, SemanticOutcome, SemanticRequest, SemanticValue, SemanticWork,
-    SourceMapping, ValueAtPoint, ValueHandle, ValueId,
+    SourceMapping, ValueAtPoint, ValueHandle, ValueId, WorkspaceIcfgProvider,
 };
 use crate::analyzer::semantic_model::{ActiveSemanticModelSnapshot, SemanticModelOverlay};
 use crate::analyzer::{ProjectFile, WorkspaceAnalyzer};
@@ -250,6 +250,7 @@ pub(super) struct SemanticQueryContext<'a> {
     /// The activation snapshot shared by every semantic row family in this
     /// query, including each ICFG provider created on a cache miss.
     active_semantic_model_snapshot: Option<Arc<ActiveSemanticModelSnapshot>>,
+    semantic_summaries: Arc<brokk_bifrost_flow::dataflow::ProductionSemanticSummaryRepository>,
     budget: SemanticBudget,
     cache: HashMap<ProjectFile, CachedSemanticMaterialization>,
     diagnostics: Vec<CodeQueryDiagnostic>,
@@ -274,6 +275,7 @@ pub(super) struct SemanticQueryContext<'a> {
     typestate: TypestateQueryState,
     value_flow: ValueFlowQueryState,
     taint: TaintQueryState,
+    type_flow: super::type_flow::TypeFlowQueryState,
 }
 
 impl<'a> SemanticQueryContext<'a> {
@@ -294,6 +296,7 @@ impl<'a> SemanticQueryContext<'a> {
             0,
             None,
             active_semantic_model_snapshot,
+            None,
         )
     }
 
@@ -308,6 +311,9 @@ impl<'a> SemanticQueryContext<'a> {
         workspace_generation: u64,
         analysis_context: Option<&'a QueryAnalysisContext>,
         active_semantic_model_snapshot: Option<Arc<ActiveSemanticModelSnapshot>>,
+        semantic_summaries: Option<
+            Arc<brokk_bifrost_flow::dataflow::ProductionSemanticSummaryRepository>,
+        >,
     ) -> Self {
         debug_assert!(limits.all_positive());
         let budget = SemanticBudget::new(semantic_budget_limits(limits))
@@ -322,6 +328,7 @@ impl<'a> SemanticQueryContext<'a> {
             workspace_generation,
             analysis_context,
             active_semantic_model_snapshot,
+            semantic_summaries,
             budget,
             None,
             None,
@@ -339,6 +346,9 @@ impl<'a> SemanticQueryContext<'a> {
         workspace_generation: u64,
         analysis_context: Option<&'a QueryAnalysisContext>,
         active_semantic_model_snapshot: Option<Arc<ActiveSemanticModelSnapshot>>,
+        semantic_summaries: Option<
+            Arc<brokk_bifrost_flow::dataflow::ProductionSemanticSummaryRepository>,
+        >,
         parent_scope: &SemanticBudgetScopeSnapshot,
         child_semantic_limits: SemanticWork,
         execution_before: SemanticExecutionBudgetSnapshot,
@@ -356,6 +366,7 @@ impl<'a> SemanticQueryContext<'a> {
             workspace_generation,
             analysis_context,
             active_semantic_model_snapshot,
+            semantic_summaries,
             budget,
             Some((execution_before, execution_child)),
             Some(artifact_leases),
@@ -373,6 +384,9 @@ impl<'a> SemanticQueryContext<'a> {
         workspace_generation: u64,
         analysis_context: Option<&'a QueryAnalysisContext>,
         active_semantic_model_snapshot: Option<Arc<ActiveSemanticModelSnapshot>>,
+        semantic_summaries: Option<
+            Arc<brokk_bifrost_flow::dataflow::ProductionSemanticSummaryRepository>,
+        >,
         budget: SemanticBudget,
         receipt_execution: Option<(SemanticExecutionBudgetSnapshot, SemanticExecutionBudget)>,
         artifact_leases: Option<SemanticArtifactLeaseSnapshot>,
@@ -401,6 +415,9 @@ impl<'a> SemanticQueryContext<'a> {
             workspace_generation,
             analysis_context,
             active_semantic_model_snapshot,
+            semantic_summaries: semantic_summaries.unwrap_or_else(|| {
+                Arc::new(brokk_bifrost_flow::dataflow::ProductionSemanticSummaryRepository::new())
+            }),
             budget,
             cache: HashMap::default(),
             diagnostics: Vec::new(),
@@ -425,6 +442,7 @@ impl<'a> SemanticQueryContext<'a> {
             typestate: TypestateQueryState::default(),
             value_flow: ValueFlowQueryState::default(),
             taint: TaintQueryState::default(),
+            type_flow: super::type_flow::TypeFlowQueryState::default(),
         }
     }
 
@@ -1499,6 +1517,7 @@ impl<'a> SemanticQueryContext<'a> {
         diagnostics.extend(self.typestate.take_diagnostics());
         diagnostics.extend(self.value_flow.take_diagnostics());
         diagnostics.extend(self.taint.take_diagnostics());
+        diagnostics.extend(self.type_flow.take_diagnostics());
         diagnostics
     }
 
@@ -1528,9 +1547,11 @@ impl<'a> SemanticQueryContext<'a> {
             budget_exhausted: self.budget_exhausted
                 || self.typestate.semantic_budget_exhausted()
                 || self.value_flow.semantic_budget_exhausted()
-                || self.value_flow.query_budget_exhausted(),
+                || self.value_flow.query_budget_exhausted()
+                || self.type_flow.semantic_budget_exhausted(),
             typestate: self.typestate.work(),
             value_flow: self.value_flow.work(),
+            type_flow: self.type_flow.work(),
         }
     }
 
@@ -1566,9 +1587,47 @@ impl<'a> SemanticQueryContext<'a> {
         if let Some(collector) = &artifact_collector {
             request = request.with_artifact_collector(collector);
         }
+        let icfg = WorkspaceIcfgProvider::with_active_semantic_model_snapshot(
+            self.workspace,
+            self.active_semantic_model_snapshot.clone(),
+        );
+        let summaries = match brokk_bifrost_flow::typestate::project_production_semantic_summaries(
+            std::slice::from_ref(&procedure.handle),
+            &icfg,
+            &mut request,
+        ) {
+            Ok(summaries) => {
+                if let Err(error) = self
+                    .semantic_summaries
+                    .publish_components(summaries.summaries(), summaries.components())
+                {
+                    self.diagnostics.push(CodeQueryDiagnostic {
+                        code: CodeQueryDiagnosticCode::SemanticAnalysisPartial,
+                        impact: CodeQueryDiagnosticImpact::Incomplete,
+                        branch: Vec::new(),
+                        language: "workspace",
+                        message: format!(
+                            "complete concurrency summaries exceeded workspace retention: {error}"
+                        ),
+                    });
+                }
+                Some(summaries)
+            }
+            Err(error) => {
+                self.diagnostics.push(CodeQueryDiagnostic {
+                    code: CodeQueryDiagnosticCode::SemanticAnalysisPartial,
+                    impact: CodeQueryDiagnosticImpact::Incomplete,
+                    branch: Vec::new(),
+                    language: "workspace",
+                    message: format!("concurrency summary projection was incomplete: {error}"),
+                });
+                None
+            }
+        };
         let provider = WorkspaceConcurrencyProvider::new(
             self.workspace,
             self.active_semantic_model_snapshot.clone(),
+            summaries,
         );
         match brokk_bifrost_flow::concurrency::concurrent_access_conflicts(
             &provider,
@@ -1648,6 +1707,36 @@ impl<'a> SemanticQueryContext<'a> {
     ) -> Vec<SemanticFlowWitnessValue> {
         self.value_flow
             .witnesses(self.workspace, endpoint, traversal, self.value_flow_limits)
+    }
+
+    pub(super) fn class_set_rows(
+        &mut self,
+        procedure: &SemanticProcedureValue,
+    ) -> Vec<super::type_flow::ClassSetRowValue> {
+        let cancellation = self.cancellation.unwrap_or(&self.uncancelled);
+        self.type_flow.class_sets(
+            self.workspace,
+            procedure,
+            &mut self.budget,
+            self.value_flow_limits,
+            cancellation,
+            self.active_semantic_model_snapshot.clone(),
+        )
+    }
+
+    pub(super) fn absent_member_findings(
+        &mut self,
+        procedure: &SemanticProcedureValue,
+    ) -> Vec<super::type_flow::AbsentMemberFindingValue> {
+        let cancellation = self.cancellation.unwrap_or(&self.uncancelled);
+        self.type_flow.absent_member_findings(
+            self.workspace,
+            procedure,
+            &mut self.budget,
+            self.value_flow_limits,
+            cancellation,
+            self.active_semantic_model_snapshot.clone(),
+        )
     }
 
     pub(super) fn taint_findings(
@@ -3074,9 +3163,7 @@ fn point_boundary(handle: &ProgramPointHandle) -> Option<CodeQueryProgramPointBo
 }
 
 pub(crate) fn procedure_wire_id(handle: &ProcedureHandle) -> String {
-    let mut digest = semantic_wire_digest(handle.artifact().as_ref(), b"procedure");
-    push_locator(&mut digest, handle.semantics().locator());
-    digest.finish().to_string()
+    brokk_bifrost_flow::flow_state::procedure_wire_id(handle)
 }
 
 pub(crate) fn program_point_wire_id(handle: &ProgramPointHandle) -> String {
@@ -3396,6 +3483,7 @@ mod tests {
             0,
             None,
             workspace.analyzer().active_semantic_model_snapshot(),
+            None,
             &parent_scope,
             parent_semantic.remaining(),
             execution_before,

@@ -215,6 +215,7 @@ impl DependencyPackAdapter for PhpDependencyPackAdapter {
                     review_required: false,
                 },
                 carried_sources: Vec::new(),
+                cpp_portability: None,
                 shards: vec![AuthoredShard {
                     id: "declarations.php.external".to_owned(),
                     activation,
@@ -412,6 +413,7 @@ impl ComposerPackagePackProducer {
                 completeness,
                 safety: request.safety.clone(),
                 carried_sources: Vec::new(),
+                cpp_portability: None,
                 shards: vec![AuthoredShard {
                     id: "declarations.php.external".to_owned(),
                     activation,

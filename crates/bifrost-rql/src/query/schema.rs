@@ -396,6 +396,23 @@ macro_rules! query_step_ops {
                 matches!(self, Self::FieldWriteValue)
             }
 
+            /// Whether this operation's rows come from an analysis a host
+            /// registered rather than from the workspace alone.
+            ///
+            /// The four are the protocol, plan and taint runners and the
+            /// witness projection over their findings. Each reads the
+            /// interprocedural graph, the summary repository and the
+            /// registration itself through funnels that record no read key,
+            /// so a per-seed unit over one would publish a read set that names
+            /// none of what decided its rows; a plan containing one is
+            /// classified `Whole` (`PlanPartitioning::classify`).
+            pub fn is_registration_dependent(self) -> bool {
+                matches!(
+                    self,
+                    Self::Typestate | Self::ValueFlow | Self::Taint | Self::Witness
+                )
+            }
+
             pub fn allows_typestate_options(self) -> bool {
                 matches!(self, Self::Typestate)
             }
@@ -505,8 +522,10 @@ query_step_ops! {
     CfgEdgeSource { shape: RowLocal, label: "cfg_edge_source", signature: "control_edge -> program_point", description: "Project each control edge to its source program point.", semantic: [Procedures, ProgramPoints, ControlEdges] }
     CfgEdgeTarget { shape: RowLocal, label: "cfg_edge_target", signature: "control_edge -> program_point", description: "Project each control edge to its target program point.", semantic: [Procedures, ProgramPoints, ControlEdges] }
     Typestate { shape: DerivedValue, label: "typestate", signature: "procedure -> typestate_finding", description: "Run one registered diagnostic-neutral typestate analysis for the exact procedure root.", semantic: [Procedures, Typestate] }
-    ConcurrentAccessConflicts { shape: DerivedValue, label: "concurrent_access_conflicts", signature: "procedure -> concurrent_access_conflict", description: "Build a bounded spawn-rooted task slice and project exact ordinary accesses to the same location that may execute concurrently, including explicit ordering, protection, proof, and coverage.", semantic: [Procedures, Dispatch, ProgramPoints, ControlEdges, Concurrency] }
+    ConcurrentAccessConflicts { shape: DerivedValue, label: "concurrent_access_conflicts", signature: "procedure -> concurrent_access_conflict", description: "Build a bounded spawn-rooted task slice and project ordinary accesses to the same location that may execute concurrently, retaining conflict, ordered, and protected verdicts with explicit ordering, protection, proof, and coverage.", semantic: [Procedures, Dispatch, ProgramPoints, ControlEdges, Concurrency] }
     ValueFlow { shape: DerivedValue, label: "value_flow", signature: "procedure -> flow_endpoint", description: "Run one registered diagnostic-neutral value-flow plan for the exact procedure root.", semantic: [Procedures, ValueFlow] }
+    ClassSet { shape: DerivedValue, label: "class_set", signature: "procedure -> class_set_row", description: "Propagate constructor, literal, and declared classes through every call reachable from the procedure and report, for each member access, the classes its receiver may hold. A row whose status is not known carries no proof.", semantic: [Procedures, Dispatch, ValueFlow] }
+    AbsentMember { shape: DerivedValue, label: "absent_member", signature: "procedure -> absent_member_finding", description: "Report member accesses whose receiver class set is fully known and contains a class that does not declare the member, with the site that introduced the class.", semantic: [Procedures, Dispatch, ValueFlow] }
     Taint { shape: DerivedValue, label: "taint", signature: "procedure -> taint_finding", description: "Project findings retained by one host-registered production taint result for the exact procedure root.", semantic: [Procedures, Taint] }
     Witness { shape: DerivedValue, label: "witness", signature: "typestate_finding|flow_endpoint -> typestate_witness|flow_witness", description: "Project bounded retained evidence from each typestate finding or reached flow endpoint without rerunning analysis." }
     FileOf { shape: RowLocal, label: "file_of", signature: "structural_match|declaration|procedure|program_point|control_edge|typestate_finding|typestate_witness|flow_endpoint|flow_witness|taint_finding|reference_site|call_site|expression_site|jsx_attribute_value|receiver_analysis|member_target_analysis|receiver_outcome|receiver_evidence|field_write_value|call_shape|call_argument_group|call_argument|call_binding|call_effect|call_result_contract|result_contract_use|result_contract_failure_use|procedure_effect|callable_signature|signature_parameter|decorated_parameter|callable_applicability|overload_selection|dispatch_outcome|dispatch_target|member_family|member_family_edge|state_event -> file", description: "Map structural matches, declarations, procedures, program points, control edges, typestate findings, typestate witnesses, flow endpoints, flow witnesses, taint findings, reference sites, call sites, expression sites, exact JSX attribute operands, receiver analyses, member-target analyses, receiver outcomes, receiver evidence, exact field-write operands, call-shape rows, call-result-contract rows, typed result-contract operation and failure-use rows, callable-signature rows, decorated-parameter rows, callable-applicability rows, overload-selection rows, dispatch rows, method-family rows, or state-event rows to their workspace files." }
@@ -730,6 +749,8 @@ macro_rules! rql_forms {
                     | Self::Typestate
                     | Self::ConcurrentAccessConflicts
                     | Self::ValueFlow
+                    | Self::ClassSet
+                    | Self::AbsentMember
                     | Self::Taint
                     | Self::Witness
                     | Self::FileOf
@@ -1007,6 +1028,22 @@ rql_forms! {
         signature: "(value-flow :plan-ref namespace:name query)",
         description: (QueryStepOp::ValueFlow),
         step: ValueFlow,
+    }
+    ClassSet {
+        labels: ["class-set", "class_set"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(class-set query)",
+        description: (QueryStepOp::ClassSet),
+        step: ClassSet,
+    }
+    AbsentMember {
+        labels: ["absent-member", "absent_member"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(absent-member query)",
+        description: (QueryStepOp::AbsentMember),
+        step: AbsentMember,
     }
     Taint {
         labels: ["taint"],

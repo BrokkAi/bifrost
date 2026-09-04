@@ -478,11 +478,23 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         stack: &mut Vec<Work<'tree>>,
     ) -> Result<(), TsLoweringError> {
         if let Some(value) = boolean_literal_condition(node) {
-            return if value {
-                self.edge(builder, entry, when_true)
-            } else {
-                self.edge(builder, entry, when_false)
-            };
+            let taken = if value { when_true } else { when_false };
+            self.edge(builder, entry, taken)?;
+            self.session.add_guard_fact(
+                builder,
+                entry,
+                GuardPredicate::ConstantBoolean { value },
+                None,
+                value.then_some(GuardArm {
+                    target_point: when_true.point,
+                    kind: when_true.kind,
+                }),
+                (!value).then_some(GuardArm {
+                    target_point: when_false.point,
+                    kind: when_false.kind,
+                }),
+            )?;
+            return Ok(());
         }
         match (node.kind(), short_circuit_operator(node)) {
             ("binary_expression", Some("&&")) => {
@@ -601,6 +613,21 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 let decision = self.point(builder, node, Vec::new())?;
                 self.edge(builder, decision, when_true)?;
                 self.edge(builder, decision, when_false)?;
+                let (predicate, subject) = self.normalize_guard(builder, node)?;
+                self.session.add_guard_fact(
+                    builder,
+                    decision,
+                    predicate,
+                    subject,
+                    Some(GuardArm {
+                        target_point: when_true.point,
+                        kind: when_true.kind,
+                    }),
+                    Some(GuardArm {
+                        target_point: when_false.point,
+                        kind: when_false.kind,
+                    }),
+                )?;
                 stack.push(Work::Expression {
                     node,
                     entry,
@@ -610,6 +637,97 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 Ok(())
             }
         }
+    }
+
+    fn normalize_guard(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+    ) -> Result<(GuardPredicate, Option<ValueId>), TsLoweringError> {
+        if node.kind() == "binary_expression" {
+            let left = required_field(node, "left")?;
+            let right = required_field(node, "right")?;
+            let operator = required_field(node, "operator")?.kind();
+            match operator {
+                "instanceof" => {
+                    let value =
+                        self.expression_value(builder, left, expression_value_kind(left))?;
+                    let classes =
+                        self.expression_value(builder, right, expression_value_kind(right))?;
+                    let subject =
+                        self.expression_value(builder, node, expression_value_kind(node))?;
+                    return Ok((GuardPredicate::InstanceOf { value, classes }, Some(subject)));
+                }
+                "in" => {
+                    let member =
+                        self.expression_value(builder, left, expression_value_kind(left))?;
+                    let value =
+                        self.expression_value(builder, right, expression_value_kind(right))?;
+                    let subject =
+                        self.expression_value(builder, node, expression_value_kind(node))?;
+                    return Ok((GuardPredicate::HasMember { value, member }, Some(subject)));
+                }
+                "===" | "!==" if left.kind() == "null" || right.kind() == "null" => {
+                    let value = if left.kind() == "null" { right } else { left };
+                    let subject =
+                        self.expression_value(builder, value, expression_value_kind(value))?;
+                    return Ok((
+                        GuardPredicate::NullComparison {
+                            null_on_true: operator == "===",
+                        },
+                        Some(subject),
+                    ));
+                }
+                "===" | "!==" => {
+                    let is_typeof = |candidate: Node<'_>| {
+                        candidate.kind() == "unary_expression"
+                            && candidate
+                                .child_by_field_name("operator")
+                                .is_some_and(|operator| operator.kind() == "typeof")
+                    };
+                    let (subject_node, constant_node) =
+                        if is_typeof(left) && right.kind() == "string" {
+                            (left, right)
+                        } else if is_typeof(right) && left.kind() == "string" {
+                            (right, left)
+                        } else {
+                            let subject =
+                                self.expression_value(builder, node, expression_value_kind(node))?;
+                            return Ok((
+                                GuardPredicate::Opaque {
+                                    digest: GuardConditionDigest::from_syntax_kind(node.kind()),
+                                },
+                                Some(subject),
+                            ));
+                        };
+                    let subject = self.expression_value(
+                        builder,
+                        subject_node,
+                        expression_value_kind(subject_node),
+                    )?;
+                    let constant = self.expression_value(
+                        builder,
+                        constant_node,
+                        expression_value_kind(constant_node),
+                    )?;
+                    return Ok((
+                        GuardPredicate::ConstantEquality {
+                            negated: operator == "!==",
+                            constant,
+                        },
+                        Some(subject),
+                    ));
+                }
+                _ => {}
+            }
+        }
+        let subject = self.expression_value(builder, node, expression_value_kind(node))?;
+        Ok((
+            GuardPredicate::Opaque {
+                digest: GuardConditionDigest::from_syntax_kind(node.kind()),
+            },
+            Some(subject),
+        ))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2215,6 +2333,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     SemanticCallArgument {
                         value,
                         expansion: CallArgumentExpansion::Spread(ArgumentDomain::Positional),
+                        keyword: None,
                     }
                 } else {
                     SemanticCallArgument::direct(value, ArgumentDomain::Positional)

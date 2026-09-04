@@ -213,7 +213,7 @@ impl RustScan<'_> {
 
     fn bare_nominal_namespace(&self, node: Node<'_>) -> Option<RustReferenceNamespace> {
         let candidate = self.refs.resolve_bare(slice(node, self.source))?;
-        rust_unique_nominal_reference_namespace(self.rust, self.support, &candidate)
+        rust_unique_nominal_reference_namespace(self.support, &candidate)
     }
 
     fn bare_pattern_value_callee(&self, node: Node<'_>) -> Option<String> {
@@ -280,7 +280,6 @@ impl RustScan<'_> {
             .iter()
             .filter(|unit| {
                 self.rust.supports_type_hierarchy(unit)
-                    || self.rust.is_type_alias(unit)
                     || is_rust_trait_declaration(self.rust, unit)
             })
             .filter_map(|unit| {
@@ -323,7 +322,6 @@ impl RustScan<'_> {
             .into_iter()
             .filter(|unit| {
                 self.rust.supports_type_hierarchy(unit)
-                    || self.rust.is_type_alias(unit)
                     || is_rust_trait_declaration(self.rust, unit)
             })
             .collect();
@@ -543,9 +541,7 @@ impl RustScan<'_> {
             }
         }?;
         let namespace = explicit_namespace
-            .or_else(|| {
-                rust_unique_nominal_reference_namespace(self.rust, self.support, &candidate)
-            })
+            .or_else(|| rust_unique_nominal_reference_namespace(self.support, &candidate))
             .or_else(|| (focused.kind() == "self").then_some(RustReferenceNamespace::PathPrefix))?;
         self.authorize_nonmember_candidate_segments(
             candidate,
@@ -561,7 +557,7 @@ impl RustScan<'_> {
         unit: &CodeUnit,
         namespace: RustReferenceNamespace,
     ) -> bool {
-        RustSymbolNamespace::of(self.rust, unit)
+        RustSymbolNamespace::of(unit)
             .is_some_and(|symbol_namespace| symbol_namespace.accepts(namespace))
     }
 
@@ -591,15 +587,18 @@ fn scoped_item_matcher(namespace: RustReferenceNamespace) -> Option<fn(&CodeUnit
 }
 
 fn scoped_any_item_matches(unit: &CodeUnit) -> bool {
-    unit.is_function() || unit.is_field()
+    scoped_value_item_matches(unit) || scoped_type_item_matches(unit)
 }
 
 fn scoped_value_item_matches(unit: &CodeUnit) -> bool {
     unit.is_function() || unit.is_field()
 }
 
+/// The associated item `Owner::Name` denotes in type position: an associated
+/// type, which mints a class-kind CodeUnit like every other Rust type
+/// declaration (#2911).
 fn scoped_type_item_matches(unit: &CodeUnit) -> bool {
-    unit.is_field()
+    unit.is_class()
 }
 
 #[derive(Default)]
@@ -799,7 +798,7 @@ fn handle_token_tree_paths(node: Node<'_>, ctx: &mut RustScan<'_>) {
             RustTokenPathRole::Macro => RustReferenceNamespace::Macro,
             RustTokenPathRole::Value => {
                 let Some(namespace) =
-                    rust_unique_nominal_reference_namespace(ctx.rust, ctx.support, &segment.fqn)
+                    rust_unique_nominal_reference_namespace(ctx.support, &segment.fqn)
                 else {
                     continue;
                 };
@@ -815,10 +814,7 @@ fn handle_token_tree_paths(node: Node<'_>, ctx: &mut RustScan<'_>) {
             RustTokenPathRole::Call | RustTokenPathRole::Macro => UsageReferenceKind::Call,
             RustTokenPathRole::Prefix | RustTokenPathRole::Value => {
                 let candidates = ctx.support.fqn(&callee);
-                if candidates
-                    .iter()
-                    .any(|candidate| candidate.is_class() || ctx.rust.is_type_alias(candidate))
-                {
+                if candidates.iter().any(CodeUnit::is_class) {
                     UsageReferenceKind::Type
                 } else if segment.role == RustTokenPathRole::Value
                     && candidates.iter().any(|candidate| {

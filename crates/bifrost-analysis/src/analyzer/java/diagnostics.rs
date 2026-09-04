@@ -25,7 +25,7 @@ pub(crate) fn collect_java_semantic_diagnostics(
         java,
         token,
         &crate::analyzer::AnalyzerDefinitionLookup::new(analyzer, Language::None),
-        &JvmOverlayModel(analyzer.semantic_model_overlay()),
+        &JvmOverlayModel::new(analyzer),
         file,
         source,
     );

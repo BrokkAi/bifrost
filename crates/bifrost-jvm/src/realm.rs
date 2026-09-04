@@ -45,6 +45,18 @@ use brokk_bifrost_core::analyzer::{CodeUnit, CodeUnitIndex, Language};
 pub trait JvmRealmMember: CodeUnitIndex {
     /// Declarations this member indexes under the fully qualified name `fqn`.
     fn forward_definition_fqn(&self, fqn: &str) -> Vec<CodeUnit>;
+
+    /// The direct supertypes of `unit`, as fully qualified names, resolved by
+    /// this member with its own language's rules and the declaring file's own
+    /// imports. `None` when this member does not own the unit's file.
+    ///
+    /// A peer's supertypes are its owner's to resolve (#2918). A Kotlin walk
+    /// that reaches a Java interface through
+    /// [`JvmSourceRealm::peer_types_by_fqn`] holds neither the Java file's
+    /// import ladder nor Java's resolution rules; resolving the Java `extends`
+    /// clause with Kotlin's view of an empty import list loses every supertype
+    /// the Java file reaches only through an import.
+    fn direct_ancestor_fqns(&self, unit: &CodeUnit) -> Option<Vec<String>>;
 }
 
 /// The JVM analyzers a workspace has, viewed as one declaration universe.
@@ -104,5 +116,22 @@ impl<'a> JvmSourceRealm<'a> {
         units.sort();
         units.dedup();
         units
+    }
+
+    /// Direct supertype fully qualified names of `unit`, answered by the realm
+    /// member other than `language` that owns the unit's file, with that
+    /// member's own rules and imports. `None` when no peer owns the file.
+    ///
+    /// The caller's own analyzer is excluded for the same reason as in
+    /// [`Self::peer_types_by_fqn`]: it resolves its own units itself.
+    pub fn peer_direct_ancestor_fqns(
+        &self,
+        unit: &CodeUnit,
+        language: Language,
+    ) -> Option<Vec<String>> {
+        self.members
+            .iter()
+            .filter(|(member, _)| *member != language)
+            .find_map(|(_, provider)| provider.direct_ancestor_fqns(unit))
     }
 }

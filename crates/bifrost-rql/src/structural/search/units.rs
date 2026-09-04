@@ -72,63 +72,183 @@ impl<'a> CodeQueryExecutionScope<'a> {
 /// row's dedup key and evidence projection, every budgeted counter lane, and
 /// the completion the whole run would derive, which is everything
 /// [`merge_unit_rows`] needs.
+///
+/// `workspace` is the generation-bound workspace oracles, when the caller
+/// holds them. It is not a mode: it is exactly the difference between
+/// `execute_code_query_detailed_eager_index` and its `_workspace` sibling, and
+/// a unit must run under whichever of the two its whole execution would have
+/// used, or its rows would not be that execution's rows.
 pub fn execute_code_query_unit(
     analyzer: &dyn IAnalyzer,
+    workspace: Option<&WorkspaceAnalyzer>,
     query: &CodeQuery,
     limits: CodeQueryExecutionLimits,
     cancellation: Option<&CancellationToken>,
     scope: CodeQueryExecutionScope<'_>,
 ) -> UnitExecutionResult {
     let mut row_keys = Vec::new();
-    let detailed =
-        execute_detailed_unit(analyzer, query, limits, cancellation, scope, &mut row_keys);
+    let detailed = execute_detailed_unit(
+        analyzer,
+        workspace,
+        query,
+        limits,
+        cancellation,
+        scope,
+        &mut row_keys,
+    );
+    project_unit_result(&detailed, row_keys)
+}
+
+/// One selector unit's execution, both ways.
+///
+/// `unit` is the publishable projection of the rows -- what the merge sums,
+/// what the caps are checked against, and what is stored under the unit's read
+/// set. `detailed` is the same execution's live rows and evidence, which the
+/// selector compiler reads instead because a selected site is derived from a
+/// row's own typed value rather than from the projection's scalars, and it
+/// still carries the one-shot semantic receipt the caller must charge.
+pub struct SelectorUnitExecution {
+    pub unit: UnitExecutionResult,
+    pub detailed: DetailedCodeQueryResult,
+}
+
+/// Execute one selector unit: `query` over exactly `scope`'s seed files, under
+/// the caller's own semantic ledgers.
+///
+/// This is
+/// [`execute_code_query_detailed_eager_index_workspace_with_semantic_receipt`]
+/// with a seed scope and a unit projection, which is exactly what a policy
+/// selector compiled one seed file at a time needs: the receipt is what lets
+/// the session charge each unit's semantic work cumulatively, in seed order,
+/// so the compile's remaining budget after the last unit is the budget one
+/// whole-workspace selector execution would have left.
+#[allow(clippy::too_many_arguments)]
+pub fn execute_code_query_selector_unit(
+    workspace: &WorkspaceAnalyzer,
+    query: &CodeQuery,
+    limits: CodeQueryExecutionLimits,
+    cancellation: Option<&CancellationToken>,
+    parent_semantic: &SemanticBudget,
+    parent_execution: &SemanticExecutionBudget,
+    artifact_leases: SemanticArtifactLeaseSnapshot,
+    scope: CodeQueryExecutionScope<'_>,
+) -> SelectorUnitExecution {
+    let mut row_keys = Vec::new();
+    let detailed = execute_detailed_selector_unit(
+        workspace,
+        query,
+        limits,
+        cancellation,
+        parent_semantic,
+        parent_execution,
+        artifact_leases,
+        scope,
+        &mut row_keys,
+    );
+    let unit = project_unit_result(&detailed, row_keys);
+    SelectorUnitExecution { unit, detailed }
+}
+
+/// Project one detailed execution onto the product a unit publishes.
+fn project_unit_result(
+    detailed: &DetailedCodeQueryResult,
+    row_keys: Vec<UnitRowKey>,
+) -> UnitExecutionResult {
     let completion = detailed.result.completion();
-    let DetailedCodeQueryResult {
-        result,
-        work,
-        budgeted_work,
-        evidence,
-        ..
-    } = detailed;
-    let CodeQueryResult {
-        results,
-        truncated,
-        diagnostics,
-        ..
-    } = result;
     assert_eq!(
-        results.len(),
+        detailed.result.results.len(),
         row_keys.len(),
         "one dedup key is rendered for every rendered row"
     );
     assert_eq!(
-        results.len(),
-        evidence.len(),
+        detailed.result.results.len(),
+        detailed.evidence.len(),
         "detailed evidence stays aligned with rendered rows"
     );
-    let rows = results
-        .into_iter()
-        .zip(evidence)
+    let rows = detailed
+        .result
+        .results
+        .iter()
+        .zip(&detailed.evidence)
         .zip(row_keys)
         .map(|((item, evidence), key)| UnitRow {
-            item: UnitRowItem::project(&item),
-            evidence: UnitRowEvidence::project(&evidence),
+            item: UnitRowItem::project(item),
+            evidence: UnitRowEvidence::project(evidence),
             key,
         })
         .collect();
     UnitExecutionResult {
         rows,
-        work,
-        budgeted_work,
+        work: detailed.work,
+        budgeted_work: detailed.budgeted_work.clone(),
         completion,
-        diagnostics,
-        truncated,
+        diagnostics: detailed.result.diagnostics.clone(),
+        truncated: detailed.result.truncated,
     }
+}
+
+/// The detailed execution one selector unit runs, with its rows' dedup keys.
+///
+/// The whole-workspace sibling is
+/// `execute_code_query_detailed_eager_index_workspace_with_semantic_receipt`;
+/// only the seed scope and the dedup keys differ, and both must stay that way
+/// or a unit would not be a partition of the execution it replaces.
+#[allow(clippy::too_many_arguments)]
+fn execute_detailed_selector_unit(
+    workspace: &WorkspaceAnalyzer,
+    query: &CodeQuery,
+    limits: CodeQueryExecutionLimits,
+    cancellation: Option<&CancellationToken>,
+    parent_semantic: &SemanticBudget,
+    parent_execution: &SemanticExecutionBudget,
+    artifact_leases: SemanticArtifactLeaseSnapshot,
+    scope: CodeQueryExecutionScope<'_>,
+    row_keys: &mut Vec<UnitRowKey>,
+) -> DetailedCodeQueryResult {
+    let parent_scope = parent_semantic.scope_snapshot();
+    let (execution_before, execution_child) = parent_execution.fork_with_additional_limits(
+        limits.semantic.max_materialized_files,
+        limits.semantic.max_traversal_steps,
+    );
+    let query_scope = AnalyzerQueryScope::new(workspace.analyzer());
+    let token = query_scope.token();
+    let access_mode = match benchmark_structural_access_mode() {
+        StructuralAccessMode::ScanOnly => StructuralAccessMode::ScanOnly,
+        _ => StructuralAccessMode::EagerAuto,
+    };
+    execute_internal_with_analysis_strategy(
+        workspace.analyzer(),
+        token,
+        Some(workspace),
+        None,
+        None,
+        0,
+        query,
+        limits,
+        cancellation,
+        None,
+        false,
+        UnionExecutionStrategy::Auto,
+        CODE_QUERY_SCHEDULER_WORKERS,
+        access_mode,
+        OccurrenceDerivationOptions::ROWS_ONLY,
+        Some(SemanticQueryContinuation {
+            parent_scope,
+            child_semantic_limits: parent_semantic.remaining(),
+            execution_before,
+            execution_child,
+            artifact_leases,
+        }),
+        None,
+        scope,
+        Some(row_keys),
+    )
 }
 
 /// The detailed execution one unit runs, with its rows' dedup keys.
 fn execute_detailed_unit(
     analyzer: &dyn IAnalyzer,
+    workspace: Option<&WorkspaceAnalyzer>,
     query: &CodeQuery,
     limits: CodeQueryExecutionLimits,
     cancellation: Option<&CancellationToken>,
@@ -144,6 +264,7 @@ fn execute_detailed_unit(
     execute_internal_with_analysis_strategy(
         analyzer,
         token,
+        workspace,
         None,
         None,
         0,
@@ -445,6 +566,8 @@ pub(super) fn unit_row_key(key_value: &PipelineKey) -> UnitRowKey {
         PipelineKey::ConcurrentAccessConflict(id) => {
             key("concurrent_access_conflict").text(id).finish()
         }
+        PipelineKey::ClassSetRow(id) => key("class_set_row").text(id).finish(),
+        PipelineKey::AbsentMemberFinding(id) => key("absent_member_finding").text(id).finish(),
         PipelineKey::RewritePath(path) => key("rewrite_path")
             .path(&path.file)
             .number(path.index)
@@ -729,7 +852,23 @@ impl UnitRowIdentities {
 /// unsupported row.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct UnitRowItem {
-    pub value: UnitRowItemValue,
+    pub domain: DetailedCodeQueryDomain,
+    pub path: Box<str>,
+    pub range: Option<CodeQueryRange>,
+    /// Every scalar the row's domain declares and this row carries, in the
+    /// domain's own declaration order.
+    ///
+    /// This is the row's whole addressable surface -- exactly what
+    /// [`CodeQueryRowRef::field`] answers -- carried because a relational
+    /// assertion reads its bindings' rows by field name, and it reads them
+    /// from the merged product of units rather than from a live execution.
+    /// Optional fields the row does not carry are absent rather than null, the
+    /// same answer the live row gives.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fields: Vec<UnitRowField>,
+    /// The per-family fields the policy match adapter reads, or `None` for an
+    /// analysis-only row the adapter refuses before reading any field of it.
+    pub terminal: Option<UnitRowItemTerminal>,
     pub provenance: Vec<UnitRowItemProvenance>,
     pub provenance_truncated: bool,
 }
@@ -737,8 +876,26 @@ pub struct UnitRowItem {
 impl UnitRowItem {
     /// Project one rendered row.
     pub fn project(item: &CodeQueryResultItem) -> Self {
+        let domain = item.value.detailed_domain();
+        let row = item.value.row();
         Self {
-            value: UnitRowItemValue::project(&item.value),
+            domain,
+            path: boxed(row_path(&item.value)),
+            range: item.value.display_range(),
+            fields: domain
+                .row_fields()
+                .iter()
+                .filter_map(|field| {
+                    let value = row
+                        .field(field.name)
+                        .expect("a domain declares only fields its own rows answer")?;
+                    Some(UnitRowField {
+                        name: boxed(field.name),
+                        value: UnitRowScalar::project(value),
+                    })
+                })
+                .collect(),
+            terminal: UnitRowItemTerminal::project(&item.value),
             provenance: item
                 .provenance
                 .iter()
@@ -747,25 +904,79 @@ impl UnitRowItem {
             provenance_truncated: item.provenance_truncated,
         }
     }
+
+    /// One scalar of this row, by the field name its domain declares.
+    ///
+    /// The same answer [`CodeQueryRowRef::field`] gives for the row this was
+    /// projected from: `Err` for a field the domain does not declare, `Ok(None)`
+    /// for a declared field this row does not carry.
+    pub fn field(
+        &self,
+        name: &str,
+    ) -> Result<Option<CodeQueryRowScalarRef<'_>>, CodeQueryRowFieldError> {
+        if !self
+            .domain
+            .row_fields()
+            .iter()
+            .any(|field| field.name == name)
+        {
+            return Err(CodeQueryRowFieldError::unregistered(self.domain, name));
+        }
+        Ok(self
+            .fields
+            .iter()
+            .find(|field| field.name.as_ref() == name)
+            .map(|field| field.value.borrowed()))
+    }
 }
 
-/// One rendered row's terminal value.
+/// One scalar of a row's addressable field surface, owned.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnitRowField {
+    pub name: Box<str>,
+    pub value: UnitRowScalar,
+}
+
+/// The owned form of [`CodeQueryRowScalarRef`].
 ///
-/// `Unsupported` is the analysis-only half of the row registry: those domains
-/// are refused before any field of theirs is read, so the projection carries
-/// none. Every other row is `Presented`, which is the triple every terminal
-/// presentation reads (`detailed_domain`, the row's own path, and
-/// `display_range`) plus the family's own extra fields.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "value", rename_all = "snake_case")]
-pub enum UnitRowItemValue {
-    Unsupported,
-    Presented {
-        domain: DetailedCodeQueryDomain,
-        path: Box<str>,
-        range: Option<CodeQueryRange>,
-        terminal: UnitRowItemTerminal,
-    },
+/// The borrowed form is what a live row answers with and what every reader
+/// consumes; this is the same value in a shape that survives serialization,
+/// and the two convert without loss in either direction.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "scalar", content = "value", rename_all = "snake_case")]
+pub enum UnitRowScalar {
+    StableId(Box<str>),
+    String(Box<str>),
+    Integer(u64),
+    Boolean(bool),
+    ConstrainedEnum(Box<str>),
+    DeclarationIdentity(Box<str>),
+}
+
+impl UnitRowScalar {
+    fn project(value: CodeQueryRowScalarRef<'_>) -> Self {
+        match value {
+            CodeQueryRowScalarRef::StableId(value) => Self::StableId(boxed(value)),
+            CodeQueryRowScalarRef::String(value) => Self::String(boxed(value)),
+            CodeQueryRowScalarRef::Integer(value) => Self::Integer(value),
+            CodeQueryRowScalarRef::Boolean(value) => Self::Boolean(value),
+            CodeQueryRowScalarRef::ConstrainedEnum(value) => Self::ConstrainedEnum(boxed(value)),
+            CodeQueryRowScalarRef::DeclarationIdentity(value) => {
+                Self::DeclarationIdentity(boxed(value))
+            }
+        }
+    }
+
+    fn borrowed(&self) -> CodeQueryRowScalarRef<'_> {
+        match self {
+            Self::StableId(value) => CodeQueryRowScalarRef::StableId(value),
+            Self::String(value) => CodeQueryRowScalarRef::String(value),
+            Self::Integer(value) => CodeQueryRowScalarRef::Integer(*value),
+            Self::Boolean(value) => CodeQueryRowScalarRef::Boolean(*value),
+            Self::ConstrainedEnum(value) => CodeQueryRowScalarRef::ConstrainedEnum(value),
+            Self::DeclarationIdentity(value) => CodeQueryRowScalarRef::DeclarationIdentity(value),
+        }
+    }
 }
 
 /// The per-family fields a presented row carries beyond its domain, path and
@@ -773,12 +984,22 @@ pub enum UnitRowItemValue {
 ///
 /// `SourcePosition` is the shared case: a row whose presentation is decided by
 /// its domain, path and range alone, and which no terminal result shape names.
+/// An analysis-only row has no terminal at all: those domains are refused by
+/// the match adapter before any field of theirs is read, so the projection
+/// carries none (`UnitRowItem::terminal` is `None`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "terminal_kind", rename_all = "snake_case")]
 pub enum UnitRowItemTerminal {
     SourcePosition,
     StructuralMatch {
         kind: Box<str>,
+        /// The matched node's own range, which is where an assertion subject
+        /// row is anchored. Absent when the match carried no node range.
+        node_range: Option<CodeQueryRange>,
+        /// Every capture the pattern bound, which is the whole of an assertion
+        /// subject's join: an assert names a capture, and the capture's AST id
+        /// is what the row families are joined on.
+        captures: Vec<UnitRowCapture>,
     },
     Declaration {
         kind: Box<str>,
@@ -829,17 +1050,47 @@ pub enum UnitRowItemTerminal {
     },
 }
 
+/// One capture of a structural match, projected onto the fields a policy joins
+/// on.
+///
+/// The captured text and its start line are not carried: nothing that consumes
+/// a projected row reads them, and a row's own evidence already locates it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UnitRowCapture {
+    pub name: Box<str>,
+    pub ast_id: Option<Box<str>>,
+    /// The captured node's normalized kind, which says whether the capture is
+    /// an identifier occurrence at all.
+    pub kind: Option<Box<str>>,
+    /// The captured node's display region, which is what a containment assert
+    /// compares a declaring scope against.
+    pub range: Option<CodeQueryRange>,
+}
+
+impl UnitRowCapture {
+    fn project(capture: &CodeQueryCapture) -> Self {
+        Self {
+            name: boxed(&capture.name),
+            ast_id: capture.ast_id.as_deref().map(boxed),
+            kind: capture.kind.map(boxed),
+            range: capture.range,
+        }
+    }
+}
+
 /// Borrow a public row string as the projection's owned form.
 fn boxed(value: &str) -> Box<str> {
     Box::from(value)
 }
 
-impl UnitRowItemValue {
-    fn project(value: &CodeQueryResultValue) -> Self {
+impl UnitRowItemTerminal {
+    fn project(value: &CodeQueryResultValue) -> Option<Self> {
         let terminal = match value {
             CodeQueryResultValue::StructuralMatch { value } => {
                 UnitRowItemTerminal::StructuralMatch {
                     kind: boxed(value.kind),
+                    node_range: value.node_range,
+                    captures: value.captures.iter().map(UnitRowCapture::project).collect(),
                 }
             }
             CodeQueryResultValue::Declaration { value } => UnitRowItemTerminal::Declaration {
@@ -922,6 +1173,8 @@ impl UnitRowItemValue {
             | CodeQueryResultValue::FlowWitness { .. }
             | CodeQueryResultValue::TaintFinding { .. }
             | CodeQueryResultValue::ConcurrentAccessConflict { .. }
+            | CodeQueryResultValue::ClassSetRow { .. }
+            | CodeQueryResultValue::AbsentMemberFinding { .. }
             | CodeQueryResultValue::ReceiverAnalysis { .. }
             | CodeQueryResultValue::MemberTargetAnalysis { .. }
             | CodeQueryResultValue::ReceiverOutcome { .. }
@@ -947,14 +1200,9 @@ impl UnitRowItemValue {
             | CodeQueryResultValue::DispatchOutcome { .. }
             | CodeQueryResultValue::DispatchTarget { .. }
             | CodeQueryResultValue::MemberFamily { .. }
-            | CodeQueryResultValue::MemberFamilyEdge { .. } => return Self::Unsupported,
+            | CodeQueryResultValue::MemberFamilyEdge { .. } => return None,
         };
-        Self::Presented {
-            domain: value.detailed_domain(),
-            path: boxed(row_path(value)),
-            range: value.display_range(),
-            terminal,
-        }
+        Some(terminal)
     }
 }
 
@@ -1003,6 +1251,8 @@ fn row_path(value: &CodeQueryResultValue) -> &str {
         CodeQueryResultValue::FlowWitness { value } => &value.path,
         CodeQueryResultValue::TaintFinding { value } => &value.path,
         CodeQueryResultValue::ConcurrentAccessConflict { value } => &value.path,
+        CodeQueryResultValue::ClassSetRow { value } => &value.file,
+        CodeQueryResultValue::AbsentMemberFinding { value } => &value.file,
         CodeQueryResultValue::ReceiverAnalysis { value } => &value.path,
         CodeQueryResultValue::MemberTargetAnalysis { value } => &value.path,
         CodeQueryResultValue::ReceiverOutcome { value } => &value.path,

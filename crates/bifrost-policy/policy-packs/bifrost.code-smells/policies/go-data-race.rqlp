@@ -26,7 +26,11 @@
           (language go
             (concurrent-access-conflicts
               (procedure-of
-                (call :callee "Go")))))))
+                (call :callee "Go"))))
+          (language go
+            (concurrent-access-conflicts
+              (procedure-of
+                (call :callee "AfterFunc")))))))
     (filter :over conflict
       :where ((conflict.verdict eq conflict)
               (conflict.ordering eq unordered)

@@ -33,7 +33,7 @@ use brokk_bifrost_analysis::analyzer::semantic_model::{
     workspace_semantic_models_not_active,
 };
 use brokk_bifrost_analysis::analyzer::store::policy_units::{
-    PolicyEvaluationRow, PolicyEvaluationRowKey, PolicyUnitRow,
+    PolicyEvaluationRow, PolicyEvaluationRowKey,
 };
 use brokk_bifrost_analysis::analyzer::usages::effects::ModeledProcedureKey;
 use brokk_bifrost_analysis::analyzer::usages::effects::modeled_procedure_key_for_unit;
@@ -61,7 +61,7 @@ use super::finding::{FindingDiffDisposition, PolicyFindingDiff};
 use super::finding::{
     PolicyDiagnostic, PolicyDiagnosticCode, PolicyDiagnosticImpact, PolicyDiagnosticSeverity,
     PolicyFailureReason, PolicyFinding, PolicyIncompleteReason, PolicyRun, PolicyRunCompletion,
-    PolicyWorkReport,
+    PolicyWorkMetric, PolicyWorkReport, PolicyWorkUnit,
 };
 use super::finding_identity::{FindingIdentityStability, PolicyFindingId};
 use super::loading::{PolicyDocumentLoadError, read_rqlp_document};
@@ -98,8 +98,8 @@ use super::suppression::{
 };
 use super::units::{
     InMemoryPolicyUnitStore, IncrementalBaseState, PersistedPolicyUnitStore,
-    PolicyIncrementalContext, PolicyIncrementalReview, PolicyUnitStore, WorkspaceUnitInputs,
-    product_of_row, row_key,
+    PolicyIncrementalContext, PolicyIncrementalReview, PolicyUnitStore, WidenReason,
+    WorkspaceUnitInputs, row_key,
 };
 
 use super::taint_policy::ProductionTaintPolicyEvaluator;
@@ -156,7 +156,19 @@ pub struct PolicyEvaluationOptions {
     /// that milestone lands. It exists now so the equivalence harness can pin
     /// the contract the sliced path must meet before the sliced path exists.
     incremental: bool,
+    /// Record each policy's evaluation wall time as the
+    /// [`EVALUATION_ELAPSED_METRIC`] work metric of its run. Off by default:
+    /// a timing changes from run to run, and the canonical report is
+    /// byte-identical across successful runs unless the caller asks for
+    /// timings (`run_policy` asks with `include_stage_timings`).
+    policy_timings: bool,
 }
+
+/// Work metric a run carries when [`PolicyEvaluationOptions::policy_timings`]
+/// is on: the policy's own evaluation wall time in milliseconds. The batch's
+/// `policy_evaluation` stage timing is the sum over policies; this is the
+/// per-policy split of it.
+pub const EVALUATION_ELAPSED_METRIC: &str = "evaluation.elapsed_ms";
 
 impl PolicyEvaluationOptions {
     pub fn new(evaluation_date: PolicyEvaluationDate) -> Self {
@@ -169,6 +181,7 @@ impl PolicyEvaluationOptions {
             fail_on: PolicyFailOn::Never,
             diff_base: None,
             incremental: true,
+            policy_timings: false,
         }
     }
 
@@ -187,6 +200,7 @@ impl PolicyEvaluationOptions {
             fail_on: PolicyFailOn::Never,
             diff_base: None,
             incremental: true,
+            policy_timings: false,
         }
     }
 
@@ -228,6 +242,16 @@ impl PolicyEvaluationOptions {
     pub const fn with_incremental(mut self, incremental: bool) -> Self {
         self.incremental = incremental;
         self
+    }
+
+    /// Record each policy's evaluation wall time in its run; see the field.
+    pub const fn with_policy_timings(mut self, policy_timings: bool) -> Self {
+        self.policy_timings = policy_timings;
+        self
+    }
+
+    pub const fn policy_timings(&self) -> bool {
+        self.policy_timings
     }
 
     pub const fn evaluation_date(&self) -> PolicyEvaluationDate {
@@ -1019,7 +1043,13 @@ fn deadline_before_evaluation_outcome(
     })
 }
 
-fn evaluate_policy_files_with_limits(
+/// [`evaluate_policy_files`] under a caller-chosen batch budget.
+///
+/// The budget is what decides which lanes a run reaches, so a caller that
+/// needs a run to reach one -- an equivalence harness proving a sliced run
+/// truncates where a whole run truncates -- states the allowance rather than
+/// growing the workspace until the default allowance runs out.
+pub fn evaluate_policy_files_with_limits(
     root: &Path,
     policy_files: &[PathBuf],
     options: &PolicyEvaluationOptions,
@@ -2434,7 +2464,6 @@ fn evaluate_prepared_policy_inputs(
                     &runnable_policies,
                     store,
                     key,
-                    batch_budget,
                 ),
                 _ => None,
             };
@@ -2507,10 +2536,39 @@ fn evaluate_prepared_policy_inputs(
             organizational_risk: &[],
             incremental: head_incremental,
         };
-        let mut run = match evaluator.evaluate(policy, &context, &mut evaluation_budget) {
+        let policy_started = Instant::now();
+        let evaluated = {
+            let _scope = brokk_bifrost_analysis::profiling::scope_with(|| {
+                format!(
+                    "policy_coordinator.evaluate_policy[{}]",
+                    policy.definition().metadata.id.as_str()
+                )
+            });
+            evaluator.evaluate(policy, &context, &mut evaluation_budget)
+        };
+        let policy_elapsed = policy_started.elapsed();
+        let mut run = match evaluated {
             Ok(run) => run,
             Err(error) => failed_evaluation_run(policy, error.to_string(), &evaluation_budget)?,
         };
+        if options.policy_timings() {
+            let elapsed_ms = u64::try_from(policy_elapsed.as_millis()).unwrap_or(u64::MAX);
+            let metric = PolicyWorkMetric::try_new(
+                EVALUATION_ELAPSED_METRIC,
+                PolicyWorkUnit::Milliseconds,
+                elapsed_ms,
+            )
+            .map_err(|error| {
+                PolicyCoordinatorError::new(format!(
+                    "failed to construct the evaluation timing metric: {error}"
+                ))
+            })?;
+            run.work_mut().try_push_metric(metric).map_err(|error| {
+                PolicyCoordinatorError::new(format!(
+                    "failed to record the evaluation timing metric: {error}"
+                ))
+            })?;
+        }
         if !workspace_has_analyzable_files {
             run.mark_inconclusive(PolicyIncompleteReason::NoAnalyzableFiles)
                 .map_err(|error| {
@@ -2707,14 +2765,38 @@ fn evaluate_prepared_policy_inputs(
             PolicyCoordinatorError::new(format!("failed to retain the policy diff review: {error}"))
         })?;
     }
-    if let Some(incremental) = head_incremental {
-        builder
-            .set_incremental(incremental.review())
-            .map_err(|error| {
-                PolicyCoordinatorError::new(format!(
-                    "failed to retain the incremental reuse review: {error}"
-                ))
-            })?;
+    // Every diff-base run reports what it reused, including the run that
+    // reused nothing. The section is charged to the report's retention budget
+    // like the diff review, so a section present in one mode and absent in the
+    // other would be a retained size that depends on how the run executed, and
+    // two runs that must agree byte for byte could retain a different prefix
+    // of the same findings at the exact boundary.
+    let incremental_review = match head_incremental {
+        Some(incremental) => Some(incremental.review()),
+        None => options.diff_base().is_some().then(|| {
+            let reason = if options.incremental() {
+                // Reuse was asked for and there was nothing to reuse against:
+                // the base evaluation produced no comparison, which is the
+                // same missing evidence a verification reports.
+                WidenReason::ReverseDependencyEvidenceMissing
+            } else {
+                WidenReason::IncrementalDisabled
+            };
+            PolicyIncrementalReview::evaluated_in_full(
+                registry
+                    .policies()
+                    .filter(|policy| runnable_ids.contains(&policy.definition().metadata.id))
+                    .map(|policy| policy.definition().metadata.id.clone()),
+                reason,
+            )
+        }),
+    };
+    if let Some(review) = incremental_review.clone() {
+        builder.set_incremental(review).map_err(|error| {
+            PolicyCoordinatorError::new(format!(
+                "failed to retain the incremental reuse review: {error}"
+            ))
+        })?;
     }
     if let Some(review) = packs_review {
         builder.set_packs(review).map_err(|error| {
@@ -2940,7 +3022,7 @@ fn evaluate_prepared_policy_inputs(
         exit_status,
         max_retained_report_bytes: batch_budget.max_retained_report_bytes(),
         max_serialized_report_bytes: batch_budget.max_serialized_report_bytes(),
-        incremental: head_incremental.map(PolicyIncrementalContext::review),
+        incremental: incremental_review,
     })
 }
 
@@ -3012,8 +3094,7 @@ impl BatchUnitStore {
             .store()
             .publish_policy_evaluation(evaluation.clone());
         brokk_bifrost_analysis::profiling::note_with(|| match &published {
-            Ok(true) => "policy.units base_evaluation=published".to_string(),
-            Ok(false) => "policy.units base_evaluation=incomplete".to_string(),
+            Ok(()) => "policy.units base_evaluation=published".to_string(),
             Err(error) => format!("policy.units base_evaluation_failed={error}"),
         });
     }
@@ -3061,15 +3142,19 @@ fn base_evaluation_key(
     }
 }
 
-/// Replay a base evaluation an earlier run already completed, without
-/// exporting or building the base.
+/// Take the findings of a base evaluation an earlier run already completed,
+/// without exporting, building or evaluating the base.
 ///
-/// `None` means there is nothing to replay and the caller must evaluate the
-/// base: no persisted store, no row for this exact question, an evaluation
-/// whose units the cache has since reclaimed, or a head whose difference from
-/// the base cannot be established from the store alone. Every one of those is
-/// reported, because "the base was evaluated again" is a fact a reader needs
-/// to explain a slow run.
+/// The recorded identities are that evaluation's whole answer, for every
+/// policy family: the diff join needs the identities the base concluded, not
+/// the units that produced some of them. A taint policy, which publishes no
+/// unit at all, is served here exactly as a match policy is.
+///
+/// `None` means there is nothing recorded and the caller must evaluate the
+/// base: no persisted store, no row for this exact question, or a head whose
+/// difference from the base cannot be established from the store alone. Every
+/// one of those is reported, because "the base was evaluated again" is a fact
+/// a reader needs to explain a slow run.
 fn reuse_persisted_diff_baseline(
     head_root: &Path,
     head_workspace: &WorkspaceAnalyzer,
@@ -3077,7 +3162,6 @@ fn reuse_persisted_diff_baseline(
     policies: &[&LoadedPolicy],
     store: &BatchUnitStore,
     key: &PolicyEvaluationRowKey,
-    batch_budget: PolicyBatchBudget,
 ) -> Option<PolicyDiffBaselineOutcome> {
     let persisted = store.persisted()?;
     let subtree = match resolve_revision_subtree(head_root, revision) {
@@ -3105,17 +3189,7 @@ fn reuse_persisted_diff_baseline(
             return None;
         }
     };
-    if !evaluation.is_complete() {
-        brokk_bifrost_analysis::profiling::note_with(|| {
-            format!(
-                "policy.units base_incomplete recorded={} loaded={}",
-                evaluation.recorded_unit_count,
-                evaluation.loaded_unit_count()
-            )
-        });
-        return None;
-    }
-    // The head verifies the replayed units against what moved since the base.
+    // The head verifies the units it reuses against what moved since the base.
     // The base's own facts come from the store, because the base workspace
     // this would otherwise need is exactly what is not being built.
     let changed = ChangedFacts::from_committed_tree(head_workspace, subtree.blobs(), &|blob| {
@@ -3131,54 +3205,36 @@ fn reuse_persisted_diff_baseline(
         });
         return None;
     }
-    let budget = batch_budget.per_policy().scaled_for_workspace(
-        evaluation.analyzed_source_bytes,
-        evaluation.analyzed_file_count as usize,
-    );
-    let mut units_by_policy: HashMap<&str, &Vec<PolicyUnitRow>> = HashMap::new();
-    for (policy_id, units) in &evaluation.units {
-        units_by_policy.insert(policy_id.as_str(), units);
+    // The stored identities are keyed by the policy identifier the base ran,
+    // and the evaluation key covers the policy set exactly, so every recorded
+    // identifier is one of this run's policies. Reading the map through the
+    // runnable policies keeps the head's own `PolicyId` values and needs no
+    // reparse of a stored string.
+    let mut recorded: HashMap<&str, &Vec<[u8; 32]>> = HashMap::new();
+    for (policy_id, findings) in &evaluation.identities {
+        recorded.insert(policy_id.as_str(), findings);
     }
     let mut identities: HashMap<PolicyId, HashSet<PolicyFindingId>> = HashMap::new();
     for policy in policies {
         let policy_id = &policy.definition().metadata.id;
-        // A policy with no published unit had none to publish: its family is
-        // whole-policy, or its plan enumerated no seed file. Either way it
-        // contributed no base finding, which is what a run of zero units
-        // reproduces.
-        let Some(rows) = units_by_policy.get(policy_id.as_str()) else {
+        // A policy with no recorded identity found nothing at the base, which
+        // is a fact rather than a gap: the row is written for the whole policy
+        // set at once.
+        let Some(findings) = recorded.remove(policy_id.as_str()) else {
             continue;
         };
-        let mut products = Vec::with_capacity(rows.len());
-        for row in rows.iter() {
-            match product_of_row(row) {
-                Ok(product) => products.push(product),
-                Err(error) => {
-                    brokk_bifrost_analysis::profiling::note_with(|| {
-                        format!("policy.units base_unit_unreadable policy={policy_id} {error}")
-                    });
-                    return None;
-                }
-            }
-        }
-        let run = match super::evaluator::match_run_from_units(policy, products, &budget) {
-            Ok(run) => run,
-            Err(error) => {
-                brokk_bifrost_analysis::profiling::note_with(|| {
-                    format!("policy.units base_replay_failed policy={policy_id} {error:?}")
-                });
-                return None;
-            }
-        };
-        for finding in run.findings() {
-            if finding.identity_stability() == FindingIdentityStability::Strong {
-                identities
-                    .entry(policy_id.clone())
-                    .or_default()
-                    .insert(finding.id());
-            }
-        }
+        identities.insert(
+            policy_id.clone(),
+            findings
+                .iter()
+                .map(|finding| PolicyFindingId::from_bytes(*finding))
+                .collect(),
+        );
     }
+    debug_assert!(
+        recorded.is_empty(),
+        "a base evaluation records identities for the policy set its key names: {recorded:?}"
+    );
     Some(PolicyDiffBaselineOutcome {
         baseline: PolicyDiffBaseline {
             requested_revision: revision.to_string(),
@@ -3442,7 +3498,8 @@ fn evaluate_policy_diff_baseline(
                     key,
                     export.tree_id(),
                     export.commit_id(),
-                    base.workspace(),
+                    report,
+                    &identities,
                     policies,
                 )
             });
@@ -3459,53 +3516,59 @@ fn evaluate_policy_diff_baseline(
     })
 }
 
-/// What this base evaluation records for a later run to replay, or `None` when
-/// it cannot be replayed.
+/// What this base evaluation records for a later run to substitute for
+/// evaluating the base again, or `None` when it may not be substituted.
 ///
-/// A replay reproduces the base's findings by merging its units, so it needs
-/// every runnable policy's units, in the order that policy merged them. A
-/// policy that published nothing -- a whole-policy family, a widened
-/// evaluation that could not publish, a policy the base refused -- leaves a
-/// hole no merge can fill, and one hole makes the whole evaluation
-/// unreplayable rather than partly wrong.
+/// The record is the identities: the head joins against them and never against
+/// the base's units, so a policy family that publishes no unit is recorded
+/// exactly as one that publishes forty. The units ride along so the *head* can
+/// reuse the per-file work behind them, and so the age sweep knows they belong
+/// to a live evaluation.
 ///
-/// The analyzed volume travels with the row because it scaled the base's
-/// per-policy budget, and a replay that scaled a different budget could retain
-/// a different prefix of the same findings.
+/// Every runnable policy must have run exhaustively. A truncated or
+/// inconclusive run found some of the base's findings rather than all of them,
+/// and a later run joining against that set would report a persisting finding
+/// as new. The batch's own exit status does not answer this: a run that found
+/// something exits on the finding gate whatever its completion tier, so the
+/// tier is read per policy here.
 fn base_evaluation_publication(
     incremental: &PolicyIncrementalContext<'_>,
     key: PolicyEvaluationRowKey,
     tree_id: brokk_bifrost_analysis::analyzer::Oid,
     resolved_commit: &str,
-    base_workspace: &WorkspaceAnalyzer,
+    report: &PolicyReportDocument,
+    identities: &HashMap<PolicyId, HashSet<PolicyFindingId>>,
     policies: &[&LoadedPolicy],
 ) -> Option<PolicyEvaluationRow> {
-    let published = incremental.published_units();
-    let covered = published
+    let completions = report
+        .runs()
         .iter()
-        .map(|(policy_id, _)| policy_id)
-        .collect::<HashSet<_>>();
+        .map(|run| (run.policy_id(), run.completion()))
+        .collect::<HashMap<_, _>>();
     for policy in policies {
-        if !covered.contains(&policy.definition().metadata.id) {
+        let policy_id = &policy.definition().metadata.id;
+        let exhaustive = completions
+            .get(policy_id)
+            .is_some_and(|completion| completion.is_exhaustive());
+        if !exhaustive {
             brokk_bifrost_analysis::profiling::note_with(|| {
                 format!(
-                    "policy.units base_unpublishable policy={}",
-                    policy.definition().metadata.id
+                    "policy.units base_unpublishable policy={policy_id} completion={:?}",
+                    completions.get(policy_id)
                 )
             });
             return None;
         }
     }
-    let (analyzed_source_bytes, analyzed_file_count) = analyzed_source_volume(base_workspace);
     Some(PolicyEvaluationRow {
         key: PolicyEvaluationRowKey {
             base_tree_oid: tree_id.to_string(),
             ..key
         },
         resolved_commit: resolved_commit.to_string(),
-        analyzed_source_bytes,
-        analyzed_file_count: analyzed_file_count as u64,
-        units: published
+        identities: sorted_evaluation_identities(identities),
+        units: incremental
+            .published_units()
             .iter()
             .map(|(policy_id, keys)| {
                 (
@@ -3515,6 +3578,30 @@ fn base_evaluation_publication(
             })
             .collect(),
     })
+}
+
+/// The identity map as rows, in one order.
+///
+/// Both levels are sorted because the row is written from a hash map and two
+/// runs of the same base must write the same bytes; the store's own key makes
+/// the set the identity, but a stable order is what makes the write itself
+/// comparable.
+fn sorted_evaluation_identities(
+    identities: &HashMap<PolicyId, HashSet<PolicyFindingId>>,
+) -> Vec<(String, Vec<[u8; 32]>)> {
+    let mut rows = identities
+        .iter()
+        .map(|(policy_id, findings)| {
+            let mut findings = findings
+                .iter()
+                .map(|finding| *finding.as_bytes())
+                .collect::<Vec<_>>();
+            findings.sort_unstable();
+            (policy_id.to_string(), findings)
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by(|left, right| left.0.cmp(&right.0));
+    rows
 }
 
 /// Whether the base activates the shipped semantic models.
@@ -5562,10 +5649,21 @@ mod tests {
         .expect("successful policy report");
 
         // The canonical report stays byte-stable: a successful run publishes
-        // the default execution block, with no timings and no termination.
+        // the default execution block, with no timings and no termination, and
+        // no run carries its own evaluation time either.
         assert_eq!(
             outcome.report().execution(),
             &PolicyExecutionMetadata::default()
+        );
+        assert!(
+            outcome.report().runs().iter().all(|run| {
+                run.work()
+                    .metrics()
+                    .iter()
+                    .all(|metric| metric.name() != EVALUATION_ELAPSED_METRIC)
+            }),
+            "{:?}",
+            outcome.report().runs()[0].work().metrics()
         );
         assert_eq!(
             outcome
@@ -5620,6 +5718,46 @@ mod tests {
                 PolicyExecutionStage::PolicyEvaluation,
                 PolicyExecutionStage::ReportConstruction,
             ]
+        );
+    }
+
+    #[test]
+    fn policy_timings_option_records_each_runs_evaluation_time_in_its_work() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        fs::write(workspace.path().join("app.ts"), "export const value = 1;\n")
+            .expect("source fixture");
+        let project = FilesystemProject::new(workspace.path().to_path_buf()).expect("project");
+        let project: Arc<dyn Project> = Arc::new(project);
+        let analyzer =
+            WorkspaceAnalyzer::build_ephemeral_footgun(project, AnalyzerConfig::default())
+                .expect("ephemeral workspace should build");
+
+        let outcome = evaluate_policy_source(
+            workspace.path(),
+            PolicySourceIdentity::new("policies/timings.rqlp"),
+            &match_policy("test.timings", "Timings"),
+            &analyzer,
+            &brokk_bifrost_flow::FlowWorkspaceState::new(),
+            &evaluation_options().with_policy_timings(true),
+            None,
+        )
+        .expect("successful policy report");
+
+        // The per-policy time rides in the run's work, which is the only
+        // place a reader can split the batch's `policy_evaluation` stage by
+        // policy; the execution block stays at its default either way.
+        assert_eq!(outcome.report().runs().len(), 1);
+        let timings = outcome.report().runs()[0]
+            .work()
+            .metrics()
+            .iter()
+            .filter(|metric| metric.name() == EVALUATION_ELAPSED_METRIC)
+            .collect::<Vec<_>>();
+        assert_eq!(timings.len(), 1, "{:?}", outcome.report().runs()[0].work());
+        assert_eq!(timings[0].unit(), PolicyWorkUnit::Milliseconds);
+        assert_eq!(
+            outcome.report().execution(),
+            &PolicyExecutionMetadata::default()
         );
     }
 

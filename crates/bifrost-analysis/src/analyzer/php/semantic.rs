@@ -773,12 +773,20 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 })
                 .unwrap_or(declaration);
             let metadata = self.value_mapping(builder, mapping_node)?;
+            let parameter_name = slot
+                .unique_name()
+                .map(normalize_php_name)
+                .filter(|name| !name.is_empty())
+                .map(Box::<str>::from);
+            let passing_mode = slot.passing_mode;
             let value = self.session.add_value_with_metadata(
                 builder,
                 metadata,
                 SemanticValueKind::Parameter {
                     ordinal,
                     multiplicity: formal_multiplicity(slot.variadic),
+                    name: parameter_name,
+                    passing_mode,
                 },
             )?;
             ordinal = ordinal
@@ -3084,8 +3092,20 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     SemanticCallArgument::direct(value, ArgumentDomain::Positional)
                 }
                 PhpCallArgumentShape::Named => {
-                    incomplete_argument_mapping = true;
-                    SemanticCallArgument::direct(value, ArgumentDomain::Keyword)
+                    let name = argument
+                        .child_by_field_name("name")
+                        .map(|name| {
+                            normalize_php_name(
+                                node_text(self.prepared.source(), name).unwrap_or_default(),
+                            )
+                        })
+                        .filter(|name| !name.is_empty())
+                        .ok_or_else(|| {
+                            PhpLoweringError::Invalid(
+                                "PHP named argument is missing its structured name".into(),
+                            )
+                        })?;
+                    SemanticCallArgument::keyword(value, name)
                 }
                 PhpCallArgumentShape::ByReferenceOrSpread => {
                     incomplete_argument_mapping = true;
@@ -3120,7 +3140,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 SemanticGapSubject::CallSite(call_site),
                 SemanticCapability::ParameterFlow,
                 SemanticGapKind::Unsupported,
-                "PHP named, unpacked, and by-reference arguments require resolved parameter binding",
+                "PHP unpacked and by-reference arguments require resolved parameter binding",
             )?;
         }
         self.edge(builder, invoke, EdgeTarget::normal(normal))?;
@@ -4390,7 +4410,7 @@ fn php_call_argument_value(argument: Node<'_>) -> Option<Node<'_>> {
 }
 
 fn php_call_argument_shape(argument: Node<'_>) -> PhpCallArgumentShape {
-    if argument.kind() == "named_argument" {
+    if argument.kind() == "named_argument" || argument.child_by_field_name("name").is_some() {
         PhpCallArgumentShape::Named
     } else if argument.kind() == "variadic_unpacking"
         || has_direct_token(argument, "&")

@@ -1,0 +1,5 @@
+{
+  "kind": "transfer",
+  "transferKind": { "kind": "move" },
+  "operation": { "kind": "none" }
+}

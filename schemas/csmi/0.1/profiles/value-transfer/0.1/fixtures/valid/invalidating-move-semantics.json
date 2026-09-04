@@ -1,0 +1,8 @@
+{
+  "kind": "type-value-semantics",
+  "type": "movableType",
+  "aspect": "move",
+  "semantics": {
+    "kind": "invalidating"
+  }
+}

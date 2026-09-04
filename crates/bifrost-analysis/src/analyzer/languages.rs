@@ -201,6 +201,14 @@ pub(crate) trait LanguageSupport: Send + Sync {
         None
     }
 
+    /// Class-set type-propagation adapter for this language, or `None` when the
+    /// engine has no per-language facts for it. The default means class-set
+    /// propagation reports `Unsupported` for this language: an absent adapter
+    /// is an honest capability statement, never an empty class set.
+    fn type_flow_adapter(&self) -> Option<&'static dyn crate::analyzer::semantic::TypeFlowAdapter> {
+        None
+    }
+
     /// Per-file setup and per-query factory for languages whose receiver analysis runs on
     /// their own syntax index instead of through [`StructuralReceiverResolver`].
     ///
@@ -1014,19 +1022,19 @@ mod tests {
     /// `declaration_ranges_limited` need an analyzer and a `CodeUnit`. Each is pinned by its
     /// own behavior test instead.
     const CAPABILITY_MATRIX: &str = "\
-language   | ecosystem            | pass   | sep | strategy | bulk   | recv | facts | hl
-Java       | Jvm                  | Java   | .   | yes      | Java   | -    | -     | yes
-Go         | Go                   | Go     | /   | yes      | Go     | yes  | -     | yes
-Cpp        | Cpp                  | Cpp    | ::  | -        | Cpp    | yes  | -     | yes
-JavaScript | JavaScriptTypeScript | JsTs   | .   | yes      | JsTs   | -    | yes   | yes
-TypeScript | JavaScriptTypeScript | JsTs   | .   | yes      | JsTs   | -    | yes   | yes
-Python     | Python               | Python | .   | -        | Python | yes  | -     | yes
-Rust       | Rust                 | Rust   | .   | yes      | Rust   | yes  | -     | yes
-Php        | Php                  | Php    | .   | yes      | Php    | yes  | -     | yes
-Scala      | Jvm                  | Scala  | .   | yes      | Scala  | yes  | -     | yes
-CSharp     | CSharp               | CSharp | .   | yes      | CSharp | yes  | -     | yes
-Ruby       | Ruby                 | Ruby   | .   | yes      | Ruby   | yes  | -     | yes
-Kotlin     | Jvm                  | Kotlin | .   | yes      | Kotlin | yes  | -     | yes
+language   | ecosystem            | pass   | sep | strategy | bulk   | recv | facts | hl  | tflow
+Java       | Jvm                  | Java   | .   | yes      | Java   | -    | -     | yes | -
+Go         | Go                   | Go     | /   | yes      | Go     | yes  | -     | yes | -
+Cpp        | Cpp                  | Cpp    | ::  | -        | Cpp    | yes  | -     | yes | -
+JavaScript | JavaScriptTypeScript | JsTs   | .   | yes      | JsTs   | -    | yes   | yes | -
+TypeScript | JavaScriptTypeScript | JsTs   | .   | yes      | JsTs   | -    | yes   | yes | -
+Python     | Python               | Python | .   | -        | Python | yes  | -     | yes | yes
+Rust       | Rust                 | Rust   | .   | yes      | Rust   | yes  | -     | yes | -
+Php        | Php                  | Php    | .   | yes      | Php    | yes  | -     | yes | -
+Scala      | Jvm                  | Scala  | .   | yes      | Scala  | yes  | -     | yes | -
+CSharp     | CSharp               | CSharp | .   | yes      | CSharp | yes  | -     | yes | -
+Ruby       | Ruby                 | Ruby   | .   | yes      | Ruby   | yes  | -     | yes | -
+Kotlin     | Jvm                  | Kotlin | .   | yes      | Kotlin | yes  | -     | yes | -
 ";
 
     fn mark(present: bool) -> &'static str {
@@ -1035,13 +1043,13 @@ Kotlin     | Jvm                  | Kotlin | .   | yes      | Kotlin | yes  | - 
 
     fn capability_matrix() -> String {
         let mut rendered = String::from(
-            "language   | ecosystem            | pass   | sep | strategy | bulk   | recv | facts | hl\n",
+            "language   | ecosystem            | pass   | sep | strategy | bulk   | recv | facts | hl  | tflow\n",
         );
         for language in ANALYZABLE {
             let support = support_of(language);
             let dead_code = support.dead_code();
             rendered.push_str(&format!(
-                "{:<10} | {:<20} | {:<6} | {:<3} | {:<8} | {:<6} | {:<4} | {:<5} | {}\n",
+                "{:<10} | {:<20} | {:<6} | {:<3} | {:<8} | {:<6} | {:<4} | {:<5} | {:<3} | {}\n",
                 format!("{language:?}"),
                 format!("{:?}", support.ecosystem()),
                 support
@@ -1056,6 +1064,7 @@ Kotlin     | Jvm                  | Kotlin | .   | yes      | Kotlin | yes  | - 
                 mark(support.structural_receiver().is_some()),
                 mark(support.receiver_facts().is_some()),
                 mark(support.highlight_query().is_some()),
+                mark(support.type_flow_adapter().is_some()),
             ));
         }
         rendered

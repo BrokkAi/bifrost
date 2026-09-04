@@ -1,7 +1,8 @@
 use super::*;
 use brokk_bifrost_cpp::declarations::CppRecoveredExportClassIndex;
 use brokk_bifrost_cpp::graph::resolver::{
-    CppClassDeclarationStrength, EffectiveUsingTarget, OrdinaryTypeImport, PreprocessorGuard,
+    CppClassDeclarationStrength, EffectiveUsingTarget, OrdinaryTypeImport,
+    OrphanedNamespaceScopeIndex, PreprocessorGuard,
 };
 use std::mem::size_of;
 use std::sync::Arc;
@@ -232,6 +233,15 @@ pub(super) fn weight_class_declaration_strength(
 pub(super) fn weight_recovered_export_class_index(
     _key: &ProjectFile,
     value: &Arc<CppRecoveredExportClassIndex>,
+) -> u32 {
+    value.approximate_size().clamp(1, u32::MAX as usize) as u32
+}
+
+/// #1537: one entry is a whole file's recovered namespace regions, so weigh it
+/// by the regions it holds rather than counting it as one entry.
+pub(super) fn weight_orphaned_namespace_scopes(
+    _key: &ProjectFile,
+    value: &Arc<OrphanedNamespaceScopeIndex>,
 ) -> u32 {
     value.approximate_size().clamp(1, u32::MAX as usize) as u32
 }

@@ -10,7 +10,7 @@
 use std::str::FromStr;
 
 use brokk_bifrost_rql::structural::search::{
-    CodeQueryCallShapeArgument, CodeQueryResultItem, DetailedCodeQueryDomain,
+    CodeQueryCallShapeArgument, CodeQueryResultItem, DetailedCodeQueryDomain, UnitRowItem,
 };
 use brokk_bifrost_rql::structural::{CodeQueryRange, CodeQueryResultValue};
 
@@ -39,14 +39,8 @@ fn column(qualifier: &str, name: &str) -> IrColumn {
 /// One call-argument row. That domain is used throughout because it is the one
 /// registry domain carrying an identity, an integer, a nullable string and a
 /// boolean at once, which is exactly the typing surface under test.
-fn argument(
-    site: &str,
-    id: &str,
-    index: usize,
-    name: Option<&str>,
-    spread: bool,
-) -> CodeQueryResultItem {
-    CodeQueryResultItem {
+fn argument(site: &str, id: &str, index: usize, name: Option<&str>, spread: bool) -> UnitRowItem {
+    UnitRowItem::project(&CodeQueryResultItem {
         value: CodeQueryResultValue::CallArgument {
             value: Box::new(CodeQueryCallShapeArgument {
                 id: id.to_string(),
@@ -66,7 +60,7 @@ fn argument(
         },
         provenance: Vec::new(),
         provenance_truncated: false,
-    }
+    })
 }
 
 fn source(id: usize, name: &str) -> IrRelation {
@@ -185,7 +179,7 @@ fn counting_plan(cardinality: AssertCardinality) -> RelationalPlanIr {
 
 fn evaluate(
     plan: &RelationalPlanIr,
-    inputs: &[(&str, &[CodeQueryResultItem], RelationCoverage)],
+    inputs: &[(&str, &[UnitRowItem], RelationCoverage)],
 ) -> RelationalAssertionEvaluation {
     validate_plan_ir(plan).expect("the plan under test validates");
     let names = inputs
@@ -224,7 +218,7 @@ fn verdicts(evaluation: &RelationalAssertionEvaluation) -> Vec<(String, u64)> {
         .collect()
 }
 
-fn two_rows_at_one_site() -> Vec<CodeQueryResultItem> {
+fn two_rows_at_one_site() -> Vec<UnitRowItem> {
     vec![
         argument("site", "arg-0", 0, Some("name"), false),
         argument("site", "arg-1", 1, Some("greeting"), false),
@@ -295,7 +289,7 @@ fn a_clean_upper_bound_needs_exhaustive_coverage() {
 #[test]
 fn a_clean_zero_verdict_needs_exhaustive_coverage() {
     let plan = counting_plan(AssertCardinality::Exactly(0));
-    let rows: Vec<CodeQueryResultItem> = Vec::new();
+    let rows: Vec<UnitRowItem> = Vec::new();
 
     let exhaustive = evaluate(&plan, &[("arg", &rows, RelationCoverage::Exhaustive)]);
     assert!(exhaustive.unmet_obligations.is_empty());
@@ -552,7 +546,7 @@ fn nullable_join_keys_use_option_equality() {
 fn semi_and_anti_joins_select_opposite_row_sets() {
     let left = vec![argument("site", "arg-0", 0, None, false)];
     let right = vec![argument("elsewhere", "other-0", 0, None, false)];
-    let inputs: &[(&str, &[CodeQueryResultItem], RelationCoverage)] = &[
+    let inputs: &[(&str, &[UnitRowItem], RelationCoverage)] = &[
         ("arg", &left, RelationCoverage::Exhaustive),
         ("other", &right, RelationCoverage::Exhaustive),
     ];
@@ -667,7 +661,7 @@ fn an_expansion_inherits_the_coverage_of_the_rows_it_expands() {
     let assert = assertion("rows", &grouped, "rows", AssertCardinality::AtMost(0));
     let plan = plan(vec![site, selection, grouped], vec![assert]);
 
-    let empty: Vec<CodeQueryResultItem> = Vec::new();
+    let empty: Vec<UnitRowItem> = Vec::new();
     let complete = evaluate(
         &plan,
         &[
@@ -875,7 +869,7 @@ fn published_verdicts_do_not_depend_on_input_row_order() {
 // ---------------------------------------------------------------------------
 
 /// Count the rows a filter admits.
-fn filtered_count(predicates: Vec<IrPredicate>, rows: &[CodeQueryResultItem]) -> u64 {
+fn filtered_count(predicates: Vec<IrPredicate>, rows: &[UnitRowItem]) -> u64 {
     let arg = source(0, "arg");
     let filtered = filter(1, "kept", &arg, predicates);
     let grouped = group(
@@ -895,7 +889,7 @@ fn filtered_count(predicates: Vec<IrPredicate>, rows: &[CodeQueryResultItem]) ->
         .unwrap_or(0)
 }
 
-fn indexed_rows() -> Vec<CodeQueryResultItem> {
+fn indexed_rows() -> Vec<UnitRowItem> {
     vec![
         argument("site", "arg-0", 0, Some("name"), false),
         argument("site", "arg-1", 1, None, true),
@@ -1049,7 +1043,7 @@ fn a_field_to_field_comparison_reads_both_sides() {
 // Folds the syntax cannot spell yet.
 // ---------------------------------------------------------------------------
 
-fn folded(op: IrAggregateOp, value: &str, rows: &[CodeQueryResultItem]) -> u64 {
+fn folded(op: IrAggregateOp, value: &str, rows: &[UnitRowItem]) -> u64 {
     let arg = source(0, "arg");
     let grouped = group(
         1,

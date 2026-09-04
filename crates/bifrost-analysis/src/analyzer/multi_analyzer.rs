@@ -45,6 +45,9 @@ pub fn resolve_analyzer<T: Any>(analyzer: &dyn IAnalyzer) -> Option<&T> {
         .find_map(|delegate| (delegate.analyzer() as &dyn Any).downcast_ref::<T>())
 }
 
+// One delegate exists per language in a workspace, so the variants' size
+// difference (the analyzers' per-file memo caches) costs nothing worth a Box.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone)]
 pub enum AnalyzerDelegate {
     Java(JavaAnalyzer),
@@ -456,6 +459,13 @@ pub struct MultiAnalyzer {
     /// `query_contexts`, which a clone starts empty, so it is minted fresh per
     /// clone rather than shared.
     attached_read_ledgers: AtomicUsize,
+    /// One delegate's own file list is already sorted and single-language;
+    /// `analyzed_files_for_language`'s override only has to look it up, but
+    /// still re-sorted it on every call until this memoized it (bifrost#15).
+    /// Shared like `snapshot_caches`: cloned by reference across a clone of
+    /// the same snapshot, rebuilt fresh whenever the snapshot itself is.
+    analyzed_files_by_language:
+        Arc<brokk_bifrost_core::analyzer::pool_memo::KeyedPoolSafeMemo<Language, Vec<ProjectFile>>>,
 }
 
 impl Default for MultiAnalyzer {
@@ -473,6 +483,7 @@ impl Clone for MultiAnalyzer {
             derived_layer_budget_bytes: self.derived_layer_budget_bytes,
             query_contexts: Mutex::new(Vec::new()),
             attached_read_ledgers: AtomicUsize::new(0),
+            analyzed_files_by_language: Arc::clone(&self.analyzed_files_by_language),
         }
     }
 }
@@ -514,6 +525,9 @@ impl MultiAnalyzer {
             derived_layer_budget_bytes,
             query_contexts: Mutex::new(Vec::new()),
             attached_read_ledgers: AtomicUsize::new(0),
+            analyzed_files_by_language: Arc::new(
+                brokk_bifrost_core::analyzer::pool_memo::KeyedPoolSafeMemo::new(),
+            ),
         }
     }
 
@@ -560,6 +574,9 @@ impl MultiAnalyzer {
             derived_layer_budget_bytes: self.derived_layer_budget_bytes,
             query_contexts: Mutex::new(Vec::new()),
             attached_read_ledgers: AtomicUsize::new(0),
+            analyzed_files_by_language: Arc::new(
+                brokk_bifrost_core::analyzer::pool_memo::KeyedPoolSafeMemo::new(),
+            ),
         }
     }
 
@@ -1246,6 +1263,36 @@ impl CodeUnitIndex for MultiAnalyzer {
         files
     }
 
+    /// Goes straight to the delegate that owns `language` instead of the
+    /// default's fan-out-every-language-then-filter, which would otherwise
+    /// re-pay the whole-workspace, every-language scan and sort above for an
+    /// answer only this one (already single-language) delegate can give
+    /// directly (issue #1738's shape, one call site further out -- see
+    /// `CodeUnitIndex::analyzed_files_for_language`'s default).
+    ///
+    /// Memoized per language: a caller that asks this once per candidate
+    /// declaration -- once per ambiguous target's every overload, on a
+    /// workspace with heavy same-name duplication -- would otherwise still
+    /// re-sort the same (already single-language) file list from scratch on
+    /// every call. `analyzed_files_by_language` shares `snapshot_caches`'s
+    /// lifetime: valid as long as this snapshot is (bifrost#15).
+    fn analyzed_files_for_language(&self, language: Language) -> Vec<ProjectFile> {
+        if !self.delegates.contains_key(&language) {
+            return Vec::new();
+        }
+        let cell = self.analyzed_files_by_language.cell(&language);
+        let build = || {
+            let mut files = self
+                .delegates
+                .get(&language)
+                .map(|delegate| delegate.analyzer().analyzed_files())
+                .unwrap_or_default();
+            files.sort();
+            files
+        };
+        (*cell.get_or_build(build, build)).clone()
+    }
+
     fn indexed_source(&self, file: &ProjectFile) -> Option<String> {
         self.delegate_for_file(file)
             .and_then(|delegate| delegate.analyzer().indexed_source(file))
@@ -1388,6 +1435,12 @@ impl CodeUnitIndex for MultiAnalyzer {
             })
             .collect();
         Box::new(matches.into_iter())
+    }
+
+    fn prefetch_definitions(&self, fq_names: &[String]) {
+        self.delegates
+            .values()
+            .for_each(|delegate| IAnalyzer::prefetch_definitions(delegate.analyzer(), fq_names));
     }
 
     fn direct_children(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
@@ -1610,8 +1663,28 @@ impl IAnalyzer for MultiAnalyzer {
         }
     }
 
+    fn record_unattributed_read(&self) {
+        if !IAnalyzer::read_ledger_attached(self) {
+            return;
+        }
+        let contexts = self
+            .query_contexts
+            .lock()
+            .expect("multi-analyzer query context mutex poisoned")
+            .clone();
+        for context in contexts {
+            context.record_unattributed_read();
+        }
+    }
+
     fn read_ledger_attached(&self) -> bool {
         self.attached_read_ledgers.load(Ordering::Relaxed) > 0
+    }
+
+    fn prefetch_definitions(&self, fq_names: &[String]) {
+        self.delegates
+            .values()
+            .for_each(|delegate| IAnalyzer::prefetch_definitions(delegate.analyzer(), fq_names));
     }
 
     fn active_query_cancellation(&self) -> Option<crate::CancellationToken> {
@@ -1896,6 +1969,7 @@ impl IAnalyzer for MultiAnalyzer {
             derived_layer_budget_bytes: self.derived_layer_budget_bytes,
             query_contexts: Mutex::new(Vec::new()),
             attached_read_ledgers: AtomicUsize::new(0),
+            analyzed_files_by_language: Arc::clone(&self.analyzed_files_by_language),
         }
     }
 
@@ -2452,16 +2526,21 @@ impl crate::analyzer::AnalyzerTestHooks for MultiAnalyzer {
         }
     }
 
-    fn selector_continuation_semantic_cache_revivals_for_test(&self) -> u64 {
+    fn selector_continuation_semantic_cache_revival_census_for_test(
+        &self,
+    ) -> crate::analyzer::semantic::SemanticCacheRevivalCensus {
         self.delegates
             .values()
             .map(|delegate| {
                 delegate
                     .analyzer()
                     .test_hooks()
-                    .selector_continuation_semantic_cache_revivals_for_test()
+                    .selector_continuation_semantic_cache_revival_census_for_test()
             })
-            .sum()
+            .fold(
+                crate::analyzer::semantic::SemanticCacheRevivalCensus::default(),
+                crate::analyzer::semantic::SemanticCacheRevivalCensus::saturating_add,
+            )
     }
 
     fn arm_evaluation_root_continuation_semantic_cache_invalidation_for_test(&self) {
@@ -2482,16 +2561,41 @@ impl crate::analyzer::AnalyzerTestHooks for MultiAnalyzer {
         }
     }
 
-    fn evaluation_root_continuation_semantic_cache_revivals_for_test(&self) -> u64 {
+    fn evaluation_root_continuation_semantic_cache_revival_census_for_test(
+        &self,
+    ) -> crate::analyzer::semantic::SemanticCacheRevivalCensus {
         self.delegates
             .values()
             .map(|delegate| {
                 delegate
                     .analyzer()
                     .test_hooks()
-                    .evaluation_root_continuation_semantic_cache_revivals_for_test()
+                    .evaluation_root_continuation_semantic_cache_revival_census_for_test()
             })
-            .sum()
+            .fold(
+                crate::analyzer::semantic::SemanticCacheRevivalCensus::default(),
+                crate::analyzer::semantic::SemanticCacheRevivalCensus::saturating_add,
+            )
+    }
+
+    fn semantic_materialization_census_for_test(
+        &self,
+    ) -> Vec<(
+        crate::analyzer::semantic::WorkspaceRelativePath,
+        crate::analyzer::semantic::SemanticMaterializationCensus,
+    )> {
+        let mut census: Vec<_> = self
+            .delegates
+            .values()
+            .flat_map(|delegate| {
+                delegate
+                    .analyzer()
+                    .test_hooks()
+                    .semantic_materialization_census_for_test()
+            })
+            .collect();
+        census.sort_by(|left, right| left.0.cmp(&right.0));
+        census
     }
 
     fn reset_definition_candidates_query_count_for_test(&self) {
@@ -2511,6 +2615,48 @@ impl crate::analyzer::AnalyzerTestHooks for MultiAnalyzer {
                     .analyzer()
                     .test_hooks()
                     .definition_candidates_query_count_for_test()
+            })
+            .sum()
+    }
+
+    fn reset_definition_prefetch_batch_count_for_test(&self) {
+        for delegate in self.delegates.values() {
+            delegate
+                .analyzer()
+                .test_hooks()
+                .reset_definition_prefetch_batch_count_for_test();
+        }
+    }
+
+    fn definition_prefetch_batch_count_for_test(&self) -> usize {
+        self.delegates
+            .values()
+            .map(|delegate| {
+                delegate
+                    .analyzer()
+                    .test_hooks()
+                    .definition_prefetch_batch_count_for_test()
+            })
+            .sum()
+    }
+
+    fn reset_relational_definition_batch_call_count_for_test(&self) {
+        for delegate in self.delegates.values() {
+            delegate
+                .analyzer()
+                .test_hooks()
+                .reset_relational_definition_batch_call_count_for_test();
+        }
+    }
+
+    fn relational_definition_batch_call_count_for_test(&self) -> usize {
+        self.delegates
+            .values()
+            .map(|delegate| {
+                delegate
+                    .analyzer()
+                    .test_hooks()
+                    .relational_definition_batch_call_count_for_test()
             })
             .sum()
     }

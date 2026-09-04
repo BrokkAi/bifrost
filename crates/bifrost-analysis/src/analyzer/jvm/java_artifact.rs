@@ -533,6 +533,7 @@ fn finish_production(
             completeness,
             safety: request.safety.clone(),
             carried_sources: carried_source_paths(&shards),
+            cpp_portability: None,
             shards,
         }),
         completeness,
@@ -2346,7 +2347,7 @@ fn normalize_binary_type_ref(r#type: &mut TypeRef, class_file: &ClassFile) {
             }
         }
         TypeRef::Array { element }
-        | TypeRef::ByRef { element }
+        | TypeRef::ByRef { element, .. }
         | TypeRef::Pointer { element }
         | TypeRef::Slice { element }
         | TypeRef::FixedArray { element, .. }

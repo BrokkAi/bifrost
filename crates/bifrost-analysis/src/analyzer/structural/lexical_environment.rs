@@ -1486,13 +1486,95 @@ mod tests {
         );
     }
 
+    /// Scala derives its environment from the same facts as Java: the class is
+    /// the scope its members belong to, a method body block and a case clause
+    /// are scopes of their own, and a local shadowing a member is reached
+    /// where the member (excluded here, resolved at the member tiers) is not.
+    #[test]
+    fn scala_locals_and_pattern_binders_are_scoped_and_members_are_excluded() {
+        let source = concat!(
+            "object Host {\n",
+            "  val total = 1\n",
+            "  def run(seed: Option[Int]): Int = {\n",
+            "    val total = 2\n",
+            "    seed match {\n",
+            "      case Some(inner) => inner + total\n",
+            "      case None => total\n",
+            "    }\n",
+            "  }\n",
+            "}\n",
+        );
+        let fixture = Fixture::new(Language::Scala, "src/Host.scala", source);
+        let env = fixture.environment();
+        assert!(env.completeness.is_complete(), "{:?}", env.completeness);
+        assert_eq!(
+            scope_kinds(&env),
+            vec![
+                None,
+                Some(NormalizedKind::Class),
+                Some(NormalizedKind::Method),
+                Some(NormalizedKind::Block),
+                Some(NormalizedKind::Block),
+                Some(NormalizedKind::Block),
+            ],
+            "the file, the object, the method, its body and the two case clauses"
+        );
+
+        let total = binding(&env, "total");
+        assert_eq!(total.kind, BindingKind::Local);
+        assert_eq!(total.hoisting, HoistingClass::SourceOrder);
+        assert_eq!(
+            total.range.start_byte,
+            fixture.at("total = 2"),
+            "the member `val total = 1` is not a lexical binding"
+        );
+        assert_eq!(
+            reached(&env, "total", fixture.at("total\n      case None")).node,
+            total.node
+        );
+
+        let inner = binding(&env, "inner");
+        assert_eq!(inner.kind, BindingKind::PatternBinder);
+        assert_eq!(inner.hoisting, HoistingClass::DeclaredHead);
+        assert_eq!(
+            env.scope(inner.declaring_scope).anchor.kind(),
+            Some(NormalizedKind::Block),
+            "the pattern binder belongs to its case clause"
+        );
+        assert_eq!(
+            reached(&env, "inner", fixture.at("inner + total")).node,
+            inner.node
+        );
+        assert_eq!(
+            binding_of(
+                &env,
+                "inner",
+                fixture.at("None => total") + "None => ".len(),
+                None
+            ),
+            BindingOfOutcome::NoBinding,
+            "the pattern binder is out of effect in the next clause"
+        );
+
+        let seed = binding(&env, "seed");
+        assert_eq!(seed.kind, BindingKind::Parameter);
+        assert_eq!(
+            env.scope(seed.declaring_scope).anchor.kind(),
+            Some(NormalizedKind::Method)
+        );
+        assert!(env.package.syntactic, "Scala spells its package in source");
+    }
+
     /// An adapter that declares no environment support reports every axis
     /// incomplete. An empty row set from such a file must never read as "this
     /// file has no bindings".
+    ///
+    /// This guard used to point at Scala, which now derives every producer
+    /// axis (#1597); PHP still declares `NO_LEXICAL_ENVIRONMENT_SUPPORT`.
     #[test]
     fn an_adapter_without_environment_support_reports_incomplete_not_empty_complete() {
-        let source = "class Widget { def render(label: String): String = label }\n";
-        let fixture = Fixture::new(Language::Scala, "src/app.scala", source);
+        let source = "<?php\nclass Widget {\n    public function render(string $label): int {\n        return strlen($label);\n    }\n}\n";
+        let fixture = Fixture::new(Language::Php, "src/widget.php", source);
         let env = fixture.environment();
 
         assert!(env.scopes.is_empty());
@@ -1503,7 +1585,7 @@ mod tests {
             } => assert_eq!(
                 unsupported_axes.as_slice(),
                 ENVIRONMENT_PRODUCER_AXES,
-                "every producer axis is unsupported for Scala"
+                "every producer axis is unsupported for PHP"
             ),
             EnvironmentCompleteness::Complete => {
                 panic!("an adapter with no environment support must never report Complete")

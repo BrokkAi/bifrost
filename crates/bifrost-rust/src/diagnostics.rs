@@ -127,7 +127,7 @@ impl RustExternalEvidence for UnindexedRustDependencies {
 /// Scan `source` for names no surface explains, recording what each lookup
 /// proved.
 ///
-/// `rust` supplies the per-file reference context and type-alias predicate;
+/// `rust` supplies the per-file reference context;
 /// `support` is the declaration lookup survivors are confirmed against;
 /// `external` answers for crates outside the workspace. The caller produces all
 /// three -- see the analysis-side entry point of the same name.
@@ -174,7 +174,6 @@ pub fn collect_rust_semantic_diagnostics(
     let visible_uses = collect_rust_use_bindings(root, source);
     let refs = rust.reference_context_of(token, file);
     let mut collector = RustDiagnosticCollector {
-        rust,
         refs,
         support,
         external,
@@ -191,7 +190,6 @@ pub fn collect_rust_semantic_diagnostics(
 }
 
 struct RustDiagnosticCollector<'a, 'tree> {
-    rust: &'a dyn RustFactSource,
     refs: RustReferenceContext<'a>,
     support: &'a dyn BoundedDefinitionLookup,
     external: &'a dyn RustExternalEvidence,
@@ -574,7 +572,7 @@ impl RustDiagnosticCollector<'_, '_> {
 
     fn symbol_kind_matches(&self, unit: &CodeUnit, kind: SymbolKind) -> bool {
         match kind {
-            SymbolKind::Type => unit.is_class() || self.rust.is_type_alias(unit),
+            SymbolKind::Type => unit.is_class(),
             SymbolKind::Value => unit.is_function() || unit.is_field() || unit.is_module(),
         }
     }

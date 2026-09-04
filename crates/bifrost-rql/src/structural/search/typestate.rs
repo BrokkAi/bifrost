@@ -24,8 +24,8 @@ use crate::structural::analysis_context::{
     ProtocolRef, QueryAnalysisContext, QueryAnalysisContextError,
 };
 use brokk_bifrost_flow::dataflow::{
-    DataflowRequest, SemanticInputStatus, SolverBudget, SolverTermination, SummaryWitnessStepKind,
-    WitnessReconstructionLimits,
+    DataflowRequest, SemanticInputStatus, SolverBudget, SolverTermination, SummaryReadRecorder,
+    SummaryWitnessStepKind, WitnessReconstructionLimits,
 };
 use brokk_bifrost_flow::typestate::{
     CompiledProtocol, ProductionSummaryLifecycleCounters, ProductionTypestateExecutionContext,
@@ -156,8 +156,14 @@ impl TypestateQueryState {
                 let mut solver_budget = SolverBudget::new(limits.solver_work);
                 let mut request = DataflowRequest::new(&mut solver_budget, cancellation);
                 let summaries = analysis_context.summaries();
+                // The typestate step reads procedure summaries out of the
+                // workspace's shared repository; naming them keeps this
+                // funnel attributable under a read ledger exactly as the
+                // policy path's does.
+                let summary_reads = SummaryReadRecorder::new(workspace.analyzer());
                 let solved = solve_typestate_with_production_summaries(
                     summaries,
+                    &summary_reads,
                     &analysis_root,
                     &[],
                     &provider,

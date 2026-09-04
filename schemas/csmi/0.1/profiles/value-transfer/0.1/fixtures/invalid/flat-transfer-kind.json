@@ -1,0 +1,5 @@
+{
+  "kind": "transfer",
+  "transferKind": "copy",
+  "operation": { "kind": "none" }
+}

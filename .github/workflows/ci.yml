@@ -11,11 +11,7 @@ permissions:
 jobs:
   source-contract:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
-    env:
-      # Test fixtures must not parse the runner's full JDK source archive.
-      # javac and jar remain available through PATH for tests that need them.
-      JAVA_HOME: ''
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
@@ -42,16 +38,7 @@ jobs:
         run: cargo test --workspace --doc --locked
 
       - name: Run MCP contract tests
-        # Each server contract may initialize an analyzer process. Running the
-        # integration binaries serially keeps those independent cold starts
-        # inside their production request budgets on hosted runners. The MCP
-        # library tests already ran in the workspace unit-test step above.
-        run: >-
-          cargo test -p brokk-bifrost-mcp --locked
-          --test bifrost_mcp_policy_substrate_p0
-          --test bifrost_mcp_server
-          --test mcp_wire_schema
-          -- --test-threads=1
+        run: cargo test -p brokk-bifrost-mcp --locked
 
       - name: Run LSP contract tests
         run: cargo test -p brokk-bifrost-lsp --locked

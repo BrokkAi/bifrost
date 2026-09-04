@@ -14,13 +14,15 @@
 //!
 //! [`verify_read_set`]: brokk_bifrost_analysis::analyzer::verify_read_set
 
-use serde::Serialize;
+use serde::de::{self, DeserializeSeed, MapAccess, SeqAccess, Visitor};
+use serde::{Deserializer, Serialize};
 use std::cell::RefCell;
 use std::collections::HashMap;
 
 use brokk_bifrost_analysis::analyzer::invalidation::{ArtifactVerdictLog, BudgetMode};
 use brokk_bifrost_analysis::analyzer::read_ledger::read_set_digest;
-use brokk_bifrost_analysis::analyzer::semantic::ids::StableDigest;
+use brokk_bifrost_analysis::analyzer::semantic::SemanticWork;
+use brokk_bifrost_analysis::analyzer::semantic::ids::{LengthDelimitedDigest, StableDigest};
 use brokk_bifrost_analysis::analyzer::semantic_model::ActiveSemanticModelSnapshot;
 use brokk_bifrost_analysis::analyzer::store::AnalyzerStore;
 use brokk_bifrost_analysis::analyzer::store::policy_units::{
@@ -30,11 +32,18 @@ use brokk_bifrost_analysis::analyzer::{
     ChangedFacts, HeadInputs, Language, Oid, ReadKey, ReadSetDigest, WorkspaceAnalyzer,
     analysis_epoch_digest,
 };
+use brokk_bifrost_flow::dataflow::SolverWork;
 use brokk_bifrost_rql::structural::UnitExecutionResult;
+use brokk_bifrost_rql::structural::{
+    CodeQueryCompletion, CodeQueryDiagnostic, CodeQueryExecutionWork,
+};
 use std::sync::Arc;
 
+use super::budget::PolicyBudget;
 use super::definition::{PolicyAnalysisType, PolicyId};
+use super::finding::{PolicyFinding, PolicyFindingSeed, PolicyIncompleteReason};
 use super::identity::PolicySemanticHash;
+use super::projection::{TypestateProjectedFinding, TypestateProjectedFindingSeed};
 use super::resolved::LoadedPolicy;
 
 /// The digest a unit key carries when no semantic models were active.
@@ -51,14 +60,70 @@ const NO_ACTIVE_MODELS: &str = "bifrost-policy-unit:no-active-models:v1";
 /// different unit even when nothing else moved. `Whole` is the whole policy,
 /// which is what a widened evaluation publishes.
 ///
-/// The assert-file and solver-root partitions the plan describes arrive with
-/// the assertion and typestate families in later milestones.
+/// A `Binding` unit is one seed file of one row binding of a relational
+/// assertion policy. It names the binding beside the file, because one
+/// relational policy runs one query per declared binding over the same seed
+/// files: two bindings keyed by the file alone would be one key, and the
+/// second binding's rows would be served from the first binding's unit.
+///
+/// An `AssertFile` unit is one subject file of an assertion policy. It carries
+/// the digest of that file's subject rows beside the blob, because a subject
+/// selector that bound different rows in the same bytes asked a different
+/// question of the same file and must not be answered with the first
+/// question's findings.
+///
+/// A `Selector` unit is one seed file of one selector of a policy that
+/// compiles selectors: the file, the blob that path resolved to, and the
+/// selector's own document path. The path is part of the key because one
+/// policy compiles many selectors over the same seed files -- a typestate
+/// policy's subjects, events, terminals and dependencies -- and two of them
+/// keyed by the file alone would be one key, and the second selector's sites
+/// would be served from the first selector's unit.
+///
+/// A `Root` unit is one solver root of a typestate policy: the file the root
+/// procedure is declared in, the blob that path resolved to, and the root's
+/// own checkout-independent semantic locator. The locator is part of the key
+/// because one file declares many procedures and a typestate policy solves
+/// each of them separately: two roots keyed by the file alone would be one
+/// key, and the second root's findings would be served from the first root's
+/// unit. It carries the compile that produced it beside the locator -- the
+/// compiled protocol hash and binding-plan hash together -- because every
+/// projection a root solve produces is sealed to those two hashes and the
+/// projection authority drops a projection that names any other compile. A
+/// root served across a compile boundary therefore reports nothing rather
+/// than reporting something wrong, which is the one failure a store must not
+/// have (`.agents/plans/impact-sliced-diff-base.md`, Decision Log (5d)).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum UnitPartition {
     Seed {
         language: Language,
         rel_path: Box<str>,
         blob: Oid,
+    },
+    Binding {
+        binding: Box<str>,
+        language: Language,
+        rel_path: Box<str>,
+        blob: Oid,
+    },
+    AssertFile {
+        language: Language,
+        rel_path: Box<str>,
+        blob: Oid,
+        subjects: StableDigest,
+    },
+    Root {
+        language: Language,
+        rel_path: Box<str>,
+        blob: Oid,
+        locator: StableDigest,
+        compilation: StableDigest,
+    },
+    Selector {
+        language: Language,
+        rel_path: Box<str>,
+        blob: Oid,
+        selector: StableDigest,
     },
     Whole,
 }
@@ -68,6 +133,10 @@ impl UnitPartition {
     pub const fn stable_label(&self) -> &'static str {
         match self {
             Self::Seed { .. } => "seed",
+            Self::Binding { .. } => "binding",
+            Self::AssertFile { .. } => "assert_file",
+            Self::Root { .. } => "root",
+            Self::Selector { .. } => "selector",
             Self::Whole => "whole",
         }
     }
@@ -94,29 +163,463 @@ pub struct PolicyUnitKey {
 
 /// What one unit produced.
 ///
-/// Rendered rows are the only product this milestone publishes: the match
-/// family's product is the projection of its rendered rows, their evidence and
-/// the execution's counters, which is exactly what the merge and the policy
-/// adapter consume. Findings-shaped products arrive with the assertion and
-/// typestate families.
+/// A query unit's product is the projection of its rendered rows, their
+/// evidence and the execution's counters, which is exactly what the merge and
+/// the policy adapter consume. An assert unit's product is not rows at all: it
+/// is what one iteration of the assertion per-file loop produced.
 #[derive(Debug, Clone)]
-pub enum PolicyUnitProduct {
+pub(crate) enum PolicyUnitProduct {
     Rows(UnitExecutionResult),
+    AssertFile(AssertFileProduct),
+    Root(RootProduct),
+    Selector(SelectorProduct),
 }
 
 impl PolicyUnitProduct {
-    /// The rendered rows this product carries.
-    pub const fn rows(&self) -> &UnitExecutionResult {
+    /// The rendered rows this product carries, or `None` when it carries a
+    /// product of another shape.
+    ///
+    /// A caller that asked a rows-shaped question and got something else is
+    /// holding a store that answered a different question, which is a load
+    /// failure rather than an empty answer.
+    pub(crate) fn into_rows(self) -> Option<UnitExecutionResult> {
         match self {
-            Self::Rows(rows) => rows,
+            Self::Rows(rows) => Some(rows),
+            Self::AssertFile(_) | Self::Root(_) | Self::Selector(_) => None,
+        }
+    }
+
+    /// The per-file assertion product this carries, or `None` when it carries a
+    /// product of another shape.
+    pub(crate) fn into_assert_file(self) -> Option<AssertFileProduct> {
+        match self {
+            Self::AssertFile(product) => Some(product),
+            Self::Rows(_) | Self::Root(_) | Self::Selector(_) => None,
+        }
+    }
+
+    /// The per-root typestate product this carries, or `None` when it carries
+    /// a product of another shape.
+    pub(crate) fn into_root(self) -> Option<RootProduct> {
+        match self {
+            Self::Root(product) => Some(product),
+            Self::Rows(_) | Self::AssertFile(_) | Self::Selector(_) => None,
+        }
+    }
+
+    /// The per-seed selector product this carries, or `None` when it carries a
+    /// product of another shape.
+    pub(crate) fn into_selector(self) -> Option<SelectorProduct> {
+        match self {
+            Self::Selector(product) => Some(product),
+            Self::Rows(_) | Self::AssertFile(_) | Self::Root(_) => None,
         }
     }
 
     /// The stable label of this product kind.
-    pub const fn stable_label(&self) -> &'static str {
+    pub(crate) const fn stable_label(&self) -> &'static str {
         match self {
             Self::Rows(_) => "rows",
+            Self::AssertFile(_) => "assert_file",
+            Self::Root(_) => "root",
+            Self::Selector(_) => "selector",
         }
+    }
+}
+
+/// What one iteration of the assertion per-file loop produced.
+///
+/// Exactly the file's contribution to the run's accumulators, and nothing
+/// else: the findings its asserts violated, the typed reasons it could not be
+/// concluded (empty when it was), the completion of every row query it ran, the
+/// query diagnostics it raised, and what it scanned. The merge appends each of
+/// these to the run-wide accumulator in path order, and the run then finishes
+/// exactly as a whole evaluation finishes.
+///
+/// A file's iteration never returns both findings and reasons: a verdict over
+/// an incomplete row set is never a pass and never a finding, so an unconcluded
+/// file contributes no findings at all.
+#[derive(Debug, Clone, Serialize)]
+pub struct AssertFileProduct {
+    pub findings: Vec<PolicyFinding>,
+    pub unconcluded: Vec<PolicyIncompleteReason>,
+    pub row_completions: Vec<CodeQueryCompletion>,
+    pub diagnostics: Vec<CodeQueryDiagnostic>,
+    pub work: CodeQueryExecutionWork,
+}
+
+/// What one iteration of the typestate per-root loop appended.
+///
+/// Exactly the root's contribution to the run's accumulators and nothing else:
+/// the violations it projected, in the order the loop appended them; the typed
+/// reasons its own analysis was incomplete; and what it added to the run's
+/// counters, including the four request-wide finding lanes it consumed. The
+/// merge appends each of these in root order into the same accumulators a
+/// whole evaluation fills, and the run then finishes exactly as a whole
+/// evaluation finishes.
+///
+/// The projections rather than the findings they become: one iteration of the
+/// loop appends projections, and the batch that turns them into findings runs
+/// once over every root's, under the seal minted for this evaluation.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct RootProduct {
+    pub findings: Vec<TypestateProjectedFinding>,
+    pub incomplete_reasons: Vec<PolicyIncompleteReason>,
+    pub work: RootWork,
+}
+
+/// What one root's iteration added to the run's counters, and what it took out
+/// of the lanes every root of the evaluation shares.
+///
+/// The first five fields are the run's reporting counters. Everything after
+/// them is a shared allowance this root consumed: the four `finding_*` lanes
+/// of the request-wide finding budget, the solver and semantic ledgers the
+/// solve charged, the execution budget's materialized files and traversal
+/// steps, and the artifact leases the root's window committed. They are part
+/// of the product because those allowances are shared: a run that reused this
+/// root still has to charge what the root's own solve cost, or a later root
+/// would see an allowance no whole evaluation would have given it and the
+/// sliced run would reach a lane later than the whole run does
+/// (`.agents/plans/impact-sliced-diff-base.md`, Decision Log (5c)).
+#[derive(Debug, Clone, Copy, Default, Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RootWork {
+    pub reached_rows: u64,
+    pub subject_rows: u64,
+    pub terminal_rows: u64,
+    pub retained_analysis_findings: u64,
+    pub omitted_analysis_findings: u64,
+    pub finding_reached_rows: u64,
+    pub finding_candidates: u64,
+    pub finding_witness_expansions: u64,
+    pub finding_witness_bytes: u64,
+    pub solver: SolverWork,
+    pub semantic: SemanticWork,
+    pub materialized_files: u64,
+    pub traversal_steps: u64,
+    pub artifact_leases: u64,
+    pub artifact_lease_bytes: u64,
+}
+
+/// What one seed file's execution of one selector contributed to a compile.
+///
+/// Two halves, because a selector unit answers two questions. `rows` is the
+/// query's own product, exactly as a match unit publishes it: the merge sums
+/// its counters and checks them against the cumulative caps the whole
+/// execution enforces, which is what licenses claiming the merged product is
+/// the whole product. `sites` is what the compile actually consumes -- the
+/// sites this seed file selected, projected onto content-addressed identities
+/// -- because a selected site is derived from a row's own typed value and that
+/// value is not reconstructible from the row projection.
+///
+/// The three charges are what this unit took out of the session's shared
+/// semantic ledgers, so a run that reuses the unit leaves those ledgers where
+/// the execution left them and the compile's remaining budget after the last
+/// unit is the budget a whole-workspace selector execution would have left
+/// (`.agents/plans/impact-sliced-diff-base.md`, Decision Log (5c)). There is
+/// no artifact charge: a unit whose execution retained artifact allocations is
+/// never published, because the allocations are process-local and a reused
+/// unit could not hand them to the compile.
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SelectorProduct {
+    pub rows: UnitExecutionResult,
+    pub sites: Vec<SelectorProductSite>,
+    pub semantic: SemanticWork,
+    pub materialized_files: u64,
+    pub traversal_steps: u64,
+}
+
+/// One selected site, over identities a second checkout resolves the same way.
+///
+/// The workspace-relative path rather than the `ProjectFile` the compile holds
+/// (that one carries a checkout root), and the two quality verdicts spelled as
+/// their reasons: absent means the verdict was `Proven` or `Complete`, present
+/// means it was not and carries why.
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SelectorProductSite {
+    pub rel_path: Box<str>,
+    pub start: usize,
+    pub end: usize,
+    pub unproven: Option<Box<str>>,
+    pub partial: Option<Box<str>>,
+}
+
+/// Read one root unit's product back under the budget its projections' caps
+/// are stated in.
+///
+/// A seed for the reason [`AssertFileProductSeed`] is one: a projection is
+/// normalized against a budget, and the budget that matters is the reading
+/// run's.
+pub(crate) struct RootProductSeed<'a> {
+    budget: &'a PolicyBudget,
+}
+
+impl<'a> RootProductSeed<'a> {
+    pub(crate) const fn new(budget: &'a PolicyBudget) -> Self {
+        Self { budget }
+    }
+}
+
+/// The field names a root unit product carries, named once so the visitor and
+/// the error it raises for an unknown field cannot disagree.
+const ROOT_FIELDS: &[&str] = &["findings", "incomplete_reasons", "work"];
+
+impl<'de> DeserializeSeed<'de> for RootProductSeed<'_> {
+    type Value = RootProduct;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_struct(
+            "RootProduct",
+            ROOT_FIELDS,
+            RootProductVisitor {
+                budget: self.budget,
+            },
+        )
+    }
+}
+
+/// Reads a root unit product's fields, handing the budget to the projections.
+///
+/// Hand-written rather than derived for the same reason the assert unit's
+/// visitor is: a derived struct cannot carry a seed into one of its fields.
+struct RootProductVisitor<'a> {
+    budget: &'a PolicyBudget,
+}
+
+impl<'de> Visitor<'de> for RootProductVisitor<'_> {
+    type Value = RootProduct;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("one typestate root's evaluation product")
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut findings: Option<Vec<TypestateProjectedFinding>> = None;
+        let mut incomplete_reasons: Option<Vec<PolicyIncompleteReason>> = None;
+        let mut work: Option<RootWork> = None;
+        while let Some(field) = map.next_key::<String>()? {
+            let duplicate = match field.as_str() {
+                "findings" => findings
+                    .replace(map.next_value_seed(ProjectionListSeed {
+                        budget: self.budget,
+                    })?)
+                    .is_some(),
+                "incomplete_reasons" => incomplete_reasons.replace(map.next_value()?).is_some(),
+                "work" => work.replace(map.next_value()?).is_some(),
+                other => return Err(de::Error::unknown_field(other, ROOT_FIELDS)),
+            };
+            if duplicate {
+                return Err(de::Error::duplicate_field("a root unit product field"));
+            }
+        }
+        let product = RootProduct {
+            findings: findings.ok_or_else(|| de::Error::missing_field("findings"))?,
+            incomplete_reasons: incomplete_reasons
+                .ok_or_else(|| de::Error::missing_field("incomplete_reasons"))?,
+            work: work.ok_or_else(|| de::Error::missing_field("work"))?,
+        };
+        // One retained analysis finding projects to at least one violation and
+        // may project to several -- a terminal expectation with two states
+        // outside it is two -- so the counter is bounded by the list rather
+        // than equal to it, and neither can be nonzero without the other. A
+        // stored product outside those bounds would merge a work report no
+        // evaluation produced.
+        let projected = u64::try_from(product.findings.len()).unwrap_or(u64::MAX);
+        if product.work.retained_analysis_findings > projected
+            || (product.work.retained_analysis_findings == 0) != (projected == 0)
+        {
+            return Err(de::Error::custom(
+                "a stored root unit counts retained findings its own projections cannot account \
+                 for",
+            ));
+        }
+        Ok(product)
+    }
+}
+
+/// One root's projections, each read under the reading run's budget.
+struct ProjectionListSeed<'a> {
+    budget: &'a PolicyBudget,
+}
+
+impl<'de> DeserializeSeed<'de> for ProjectionListSeed<'_> {
+    type Value = Vec<TypestateProjectedFinding>;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_seq(self)
+    }
+}
+
+impl<'de> Visitor<'de> for ProjectionListSeed<'_> {
+    type Value = Vec<TypestateProjectedFinding>;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a list of projected typestate violations")
+    }
+
+    fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        let mut projections = Vec::with_capacity(seq.size_hint().unwrap_or_default());
+        while let Some(projection) =
+            seq.next_element_seed(TypestateProjectedFindingSeed::new(self.budget))?
+        {
+            projections.push(projection);
+        }
+        Ok(projections)
+    }
+}
+
+/// Read one assert unit's product back under the budget its findings' caps are
+/// stated in.
+///
+/// A seed rather than a plain `Deserialize` for the reason
+/// [`PolicyFindingSeed`] is one: a finding is validated against a budget, and
+/// the budget that matters is the reading run's.
+pub(crate) struct AssertFileProductSeed<'a> {
+    budget: &'a PolicyBudget,
+}
+
+impl<'a> AssertFileProductSeed<'a> {
+    pub(crate) const fn new(budget: &'a PolicyBudget) -> Self {
+        Self { budget }
+    }
+}
+
+impl<'de> DeserializeSeed<'de> for AssertFileProductSeed<'_> {
+    type Value = AssertFileProduct;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_struct(
+            "AssertFileProduct",
+            FIELDS,
+            AssertFileProductVisitor {
+                budget: self.budget,
+            },
+        )
+    }
+}
+
+/// Reads the product's fields, handing the budget to the findings.
+///
+/// Hand-written rather than derived because a derived struct cannot carry a
+/// seed into one of its fields, and the findings are exactly the field that
+/// needs one.
+struct AssertFileProductVisitor<'a> {
+    budget: &'a PolicyBudget,
+}
+
+impl<'de> Visitor<'de> for AssertFileProductVisitor<'_> {
+    type Value = AssertFileProduct;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("one assertion file's evaluation product")
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut findings: Option<Vec<PolicyFinding>> = None;
+        let mut unconcluded: Option<Vec<PolicyIncompleteReason>> = None;
+        let mut row_completions: Option<Vec<CodeQueryCompletion>> = None;
+        let mut diagnostics: Option<Vec<CodeQueryDiagnostic>> = None;
+        let mut work: Option<CodeQueryExecutionWork> = None;
+        while let Some(field) = map.next_key::<String>()? {
+            let duplicate = match field.as_str() {
+                "findings" => findings
+                    .replace(map.next_value_seed(FindingListSeed {
+                        budget: self.budget,
+                    })?)
+                    .is_some(),
+                "unconcluded" => unconcluded.replace(map.next_value()?).is_some(),
+                "row_completions" => row_completions.replace(map.next_value()?).is_some(),
+                "diagnostics" => diagnostics.replace(map.next_value()?).is_some(),
+                "work" => work.replace(map.next_value()?).is_some(),
+                other => return Err(de::Error::unknown_field(other, FIELDS)),
+            };
+            if duplicate {
+                return Err(de::Error::duplicate_field("an assert unit product field"));
+            }
+        }
+        let product = AssertFileProduct {
+            findings: findings.ok_or_else(|| de::Error::missing_field("findings"))?,
+            unconcluded: unconcluded.ok_or_else(|| de::Error::missing_field("unconcluded"))?,
+            row_completions: row_completions
+                .ok_or_else(|| de::Error::missing_field("row_completions"))?,
+            diagnostics: diagnostics.ok_or_else(|| de::Error::missing_field("diagnostics"))?,
+            work: work.ok_or_else(|| de::Error::missing_field("work"))?,
+        };
+        // A verdict over an incomplete row set is never a pass and never a
+        // finding, so a file that could not be concluded contributes none. A
+        // stored product that reports both would merge findings the run that
+        // produced them had already discarded.
+        if !product.findings.is_empty() && !product.unconcluded.is_empty() {
+            return Err(de::Error::custom(
+                "a stored assert unit reports findings for a file it could not conclude",
+            ));
+        }
+        Ok(product)
+    }
+}
+
+/// The field names an assert unit product carries, named once so the visitor
+/// and the error it raises for an unknown field cannot disagree.
+const FIELDS: &[&str] = &[
+    "findings",
+    "unconcluded",
+    "row_completions",
+    "diagnostics",
+    "work",
+];
+
+/// One file's findings, each read under the reading run's budget.
+struct FindingListSeed<'a> {
+    budget: &'a PolicyBudget,
+}
+
+impl<'de> DeserializeSeed<'de> for FindingListSeed<'_> {
+    type Value = Vec<PolicyFinding>;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_seq(self)
+    }
+}
+
+impl<'de> Visitor<'de> for FindingListSeed<'_> {
+    type Value = Vec<PolicyFinding>;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a list of policy findings")
+    }
+
+    fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        let mut findings = Vec::with_capacity(seq.size_hint().unwrap_or_default());
+        while let Some(finding) = seq.next_element_seed(PolicyFindingSeed::new(self.budget))? {
+            findings.push(finding);
+        }
+        Ok(findings)
     }
 }
 
@@ -137,7 +640,7 @@ pub struct PolicyUnit {
 
 impl PolicyUnit {
     /// Publish one unit's product under the reads that produced it.
-    pub fn new(
+    pub(crate) fn new(
         key: PolicyUnitKey,
         product: PolicyUnitProduct,
         reads: Vec<ReadKey>,
@@ -157,7 +660,7 @@ impl PolicyUnit {
         &self.key
     }
 
-    pub const fn product(&self) -> &PolicyUnitProduct {
+    pub(crate) const fn product(&self) -> &PolicyUnitProduct {
         &self.product
     }
 
@@ -192,7 +695,11 @@ pub trait PolicyUnitStore {
     /// published under this key". A policy whose store failed widens rather
     /// than treating a failure as an absence, because an absence is a claim
     /// about what was published and a failure is a claim about nothing.
-    fn prefetch(&mut self, _keys: &[PolicyUnitKey]) -> Result<(), PolicyUnitStoreError> {
+    fn prefetch(
+        &mut self,
+        _keys: &[PolicyUnitKey],
+        _budget: &PolicyBudget,
+    ) -> Result<(), PolicyUnitStoreError> {
         Ok(())
     }
 
@@ -315,7 +822,11 @@ impl PersistedPolicyUnitStore {
 }
 
 impl PolicyUnitStore for PersistedPolicyUnitStore {
-    fn prefetch(&mut self, keys: &[PolicyUnitKey]) -> Result<(), PolicyUnitStoreError> {
+    fn prefetch(
+        &mut self,
+        keys: &[PolicyUnitKey],
+        budget: &PolicyBudget,
+    ) -> Result<(), PolicyUnitStoreError> {
         let wanted = keys
             .iter()
             .filter(|key| !self.loaded.contains_key(key))
@@ -333,7 +844,8 @@ impl PolicyUnitStore for PersistedPolicyUnitStore {
             let Some(row) = answer else {
                 continue;
             };
-            self.loaded.insert(key.clone(), unit_of_row(key, row)?);
+            self.loaded
+                .insert(key.clone(), unit_of_row(key, row, budget)?);
         }
         Ok(())
     }
@@ -352,6 +864,15 @@ impl PolicyUnitStore for PersistedPolicyUnitStore {
 ///
 /// Digests become lowercase hex and the family becomes its stable label,
 /// because a persisted key is compared by SQL and must be one shape per value.
+/// The persisted partition digest of one solver root: its locator folded with
+/// the compile whose projections it holds.
+fn root_partition_digest(locator: StableDigest, compilation: StableDigest) -> StableDigest {
+    let mut digest = LengthDelimitedDigest::new(b"bifrost-policy-root-partition/v1");
+    digest.push(locator.as_bytes());
+    digest.push(compilation.as_bytes());
+    digest.finish()
+}
+
 pub fn row_key(key: &PolicyUnitKey) -> PolicyUnitRowKey {
     PolicyUnitRowKey {
         policy_semantic_hash: StableDigest::from_array(*key.policy.as_bytes()).to_string(),
@@ -365,6 +886,60 @@ pub fn row_key(key: &PolicyUnitKey) -> PolicyUnitRowKey {
                 rel_path: rel_path.to_string(),
                 blob: *blob,
                 language: *language,
+            },
+            UnitPartition::Binding {
+                binding,
+                language,
+                rel_path,
+                blob,
+            } => PolicyUnitPartitionRow::Binding {
+                rel_path: rel_path.to_string(),
+                blob: *blob,
+                language: *language,
+                // The name is digested rather than stored: the persisted
+                // column is one shape for every partition that carries one,
+                // and nothing reads a binding's name back out of the store --
+                // the key a lookup asks with carries it.
+                binding: StableDigest::sha256(binding.as_ref()).to_string(),
+            },
+            UnitPartition::AssertFile {
+                language,
+                rel_path,
+                blob,
+                subjects,
+            } => PolicyUnitPartitionRow::AssertFile {
+                rel_path: rel_path.to_string(),
+                blob: *blob,
+                language: *language,
+                subjects: subjects.to_string(),
+            },
+            UnitPartition::Root {
+                language,
+                rel_path,
+                blob,
+                locator,
+                compilation,
+            } => PolicyUnitPartitionRow::Root {
+                rel_path: rel_path.to_string(),
+                blob: *blob,
+                language: *language,
+                // The persisted column is one digest per partition, and both
+                // halves narrow the same question: which root, under which
+                // compile. Folding them here keeps the stored key columns as
+                // they are; nothing reads either half back out of the store,
+                // because the key a lookup asks with carries both.
+                locator: root_partition_digest(*locator, *compilation).to_string(),
+            },
+            UnitPartition::Selector {
+                language,
+                rel_path,
+                blob,
+                selector,
+            } => PolicyUnitPartitionRow::Selector {
+                rel_path: rel_path.to_string(),
+                blob: *blob,
+                language: *language,
+                selector: selector.to_string(),
             },
             UnitPartition::Whole => PolicyUnitPartitionRow::Whole,
         },
@@ -381,7 +956,13 @@ fn unit_row(unit: &PolicyUnit) -> Result<PolicyUnitRow, PolicyUnitStoreError> {
         BudgetMode::Exhaustive,
         "only an exhaustive unit is publishable, and the schema says so too"
     );
-    let product = serde_json::to_string(unit.product.rows()).map_err(|error| {
+    let product = match &unit.product {
+        PolicyUnitProduct::Rows(rows) => serde_json::to_string(rows),
+        PolicyUnitProduct::AssertFile(product) => serde_json::to_string(product),
+        PolicyUnitProduct::Root(product) => serde_json::to_string(product),
+        PolicyUnitProduct::Selector(product) => serde_json::to_string(product),
+    }
+    .map_err(|error| {
         PolicyUnitStoreError::new(format!("a unit product could not be serialized: {error}"))
     })?;
     Ok(PolicyUnitRow {
@@ -393,20 +974,39 @@ fn unit_row(unit: &PolicyUnit) -> Result<PolicyUnitRow, PolicyUnitStoreError> {
     })
 }
 
-/// The rendered rows one stored row carries.
+/// The product one stored row carries.
 ///
-/// This is all a replay of a completed evaluation needs: the products are that
-/// evaluation's own answers, merged in the order it merged them. Reusing a
-/// unit against a *different* workspace needs its read set too, which is what
-/// [`unit_of_row`] rebuilds.
-pub fn product_of_row(row: &PolicyUnitRow) -> Result<UnitExecutionResult, PolicyUnitStoreError> {
-    if row.product_kind != "rows" {
-        return Err(PolicyUnitStoreError::new(format!(
-            "a published unit carries an unknown product kind `{}`",
-            row.product_kind
-        )));
-    }
-    serde_json::from_str(&row.product).map_err(|error| {
+/// Reusing a unit against a workspace also needs its read set, which is what
+/// [`unit_of_row`] adds around this. `budget` is the reading run's, because an
+/// assert unit's product carries findings and a finding's caps are stated in a
+/// budget: a product stored under a wider budget than this run allows is a load
+/// error rather than a finding this run would never have retained.
+fn product_of_row(
+    row: &PolicyUnitRow,
+    budget: &PolicyBudget,
+) -> Result<PolicyUnitProduct, PolicyUnitStoreError> {
+    let product = match row.product_kind.as_str() {
+        "rows" => serde_json::from_str(&row.product).map(PolicyUnitProduct::Rows),
+        "assert_file" => {
+            let mut deserializer = serde_json::Deserializer::from_str(&row.product);
+            AssertFileProductSeed::new(budget)
+                .deserialize(&mut deserializer)
+                .map(PolicyUnitProduct::AssertFile)
+        }
+        "root" => {
+            let mut deserializer = serde_json::Deserializer::from_str(&row.product);
+            RootProductSeed::new(budget)
+                .deserialize(&mut deserializer)
+                .map(PolicyUnitProduct::Root)
+        }
+        "selector" => serde_json::from_str(&row.product).map(PolicyUnitProduct::Selector),
+        other => {
+            return Err(PolicyUnitStoreError::new(format!(
+                "a published unit carries an unknown product kind `{other}`"
+            )));
+        }
+    };
+    product.map_err(|error| {
         PolicyUnitStoreError::new(format!(
             "a published unit product could not be read: {error}"
         ))
@@ -422,14 +1022,10 @@ pub fn product_of_row(row: &PolicyUnitRow) -> Result<UnitExecutionResult, Policy
 pub fn unit_of_row(
     key: PolicyUnitKey,
     row: PolicyUnitRow,
+    budget: &PolicyBudget,
 ) -> Result<PolicyUnit, PolicyUnitStoreError> {
-    let rows = product_of_row(&row)?;
-    let unit = PolicyUnit::new(
-        key,
-        PolicyUnitProduct::Rows(rows),
-        row.reads,
-        BudgetMode::Exhaustive,
-    );
+    let product = product_of_row(&row, budget)?;
+    let unit = PolicyUnit::new(key, product, row.reads, BudgetMode::Exhaustive);
     if unit.read_digest.digest().as_bytes() != &row.read_set_digest {
         return Err(PolicyUnitStoreError::new(
             "a published unit's read set does not digest to the identity it was published under"
@@ -575,13 +1171,11 @@ impl<'a> PolicyIncrementalContext<'a> {
         self.runs.borrow_mut().push(run);
     }
 
-    /// Record the units one policy's product was merged from, in merge order.
+    /// Record the units one policy's product was merged from.
     ///
-    /// Recorded only when every one of them is published, because this is what
-    /// a persisted evaluation replays: a partial list would replay a partial
-    /// answer. The order is the seed order the run walked, which is the only
-    /// order in which merging those units reproduces the vector a whole
-    /// execution would have built.
+    /// Recorded only when every one of them is published, because a persisted
+    /// evaluation names these as the work behind its findings and a partial
+    /// list would name work that no policy did.
     pub fn record_units(&self, policy_id: PolicyId, keys: Vec<PolicyUnitKey>) {
         self.units.borrow_mut().push((policy_id, keys));
     }
@@ -600,13 +1194,14 @@ impl<'a> PolicyIncrementalContext<'a> {
     }
 }
 
-/// How this run obtained the base revision's units.
+/// How this run obtained the base revision's findings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IncrementalBaseState {
     /// The base revision was exported, built and evaluated by this run.
     Evaluated,
-    /// An earlier run had already evaluated this exact base, so its units and
-    /// its findings were replayed and the base was neither exported nor built.
+    /// An earlier run had already evaluated this exact base, so the identities
+    /// it concluded were read from the store and the base was neither
+    /// exported, built nor evaluated.
     Reused,
 }
 
@@ -662,11 +1257,17 @@ pub enum WidenReason {
     /// it is trying to avoid.
     VerificationBudgetExceeded,
     /// The evidence a verification needs does not exist: an incomplete
-    /// changed-fact set, or a lookup the head cannot answer.
+    /// changed-fact set, a lookup the head cannot answer, or a base
+    /// evaluation the run refused to trust and therefore compared nothing
+    /// against.
     ReverseDependencyEvidenceMissing,
-    /// A published product could not be loaded. Nothing mints this until
-    /// Milestone 3 persists products outside the process.
+    /// A published product could not be loaded.
     ProductLoadFailed,
+    /// Reuse was turned off for this run (`--no-incremental`, or
+    /// `PolicyEvaluationOptions::with_incremental(false)`). Nothing was
+    /// looked up and nothing was published; the policy was evaluated exactly
+    /// as a run with no units evaluates it.
+    IncrementalDisabled,
 }
 
 impl WidenReason {
@@ -681,6 +1282,7 @@ impl WidenReason {
             Self::VerificationBudgetExceeded => "verification_budget_exceeded",
             Self::ReverseDependencyEvidenceMissing => "reverse_dependency_evidence_missing",
             Self::ProductLoadFailed => "product_load_failed",
+            Self::IncrementalDisabled => "incremental_disabled",
         }
     }
 }
@@ -704,12 +1306,22 @@ pub struct PolicyIncrementalRun {
 }
 
 impl PolicyIncrementalRun {
-    /// One policy whose family has no per-partition product in this milestone.
+    /// One policy whose family has no per-partition product.
     ///
-    /// Taint and flow are whole by design, and the assertion and typestate
-    /// families are sliced in later milestones. All of them are evaluated
-    /// exactly as a run with no units evaluates them, and say so.
+    /// Taint and flow are whole by design: their solve is one batch over
+    /// every region at once, and no partition of it has a product. They are
+    /// evaluated exactly as a run with no units evaluates them, and say so.
     pub const fn whole_family(policy_id: PolicyId) -> Self {
+        Self::evaluated_in_full(policy_id, WidenReason::WholePolicyFamily)
+    }
+
+    /// One policy evaluated whole, for `reason`.
+    ///
+    /// The counts are zero because nothing was enumerated: a policy that
+    /// never attempted a sliced evaluation has no units to report, which is a
+    /// different statement from a sliced attempt that widened and reports what
+    /// it had enumerated when it did.
+    pub const fn evaluated_in_full(policy_id: PolicyId, reason: WidenReason) -> Self {
         Self {
             policy_id,
             mode: IncrementalMode::Full,
@@ -717,7 +1329,7 @@ impl PolicyIncrementalRun {
             units_reused: 0,
             units_recomputed: 0,
             units_unbounded: 0,
-            widen_reason: Some(WidenReason::WholePolicyFamily),
+            widen_reason: Some(reason),
         }
     }
 }
@@ -757,6 +1369,28 @@ impl Serialize for WidenReason {
 }
 
 impl PolicyIncrementalReview {
+    /// The review of a diff-base run that reused nothing, with `reason` said
+    /// once per policy that ran.
+    ///
+    /// Every `--diff-base` run carries this section, whether or not it reused
+    /// anything, because the section is charged to the report's retention
+    /// budget: one present in a reusing run and absent in the forced-full run
+    /// it must equal byte for byte would move the retention boundary between
+    /// them. A run that reused nothing evaluated its base itself, which is
+    /// what `Evaluated` says.
+    pub fn evaluated_in_full(
+        policy_ids: impl IntoIterator<Item = PolicyId>,
+        reason: WidenReason,
+    ) -> Self {
+        Self {
+            base: IncrementalBaseState::Evaluated,
+            policies: policy_ids
+                .into_iter()
+                .map(|policy_id| PolicyIncrementalRun::evaluated_in_full(policy_id, reason))
+                .collect(),
+        }
+    }
+
     pub const fn base(&self) -> IncrementalBaseState {
         self.base
     }
@@ -782,5 +1416,48 @@ impl PolicyIncrementalReview {
     /// One policy's run, by identifier.
     pub fn policy(&self, policy_id: &PolicyId) -> Option<&PolicyIncrementalRun> {
         self.policies.iter().find(|run| &run.policy_id == policy_id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::retained::RetainedSize;
+
+    /// The reuse review is charged to the report's retention budget, so its
+    /// retained size must not say how the run executed. Two reviews of one
+    /// policy set -- the one a reusing run records and the one a forced-full
+    /// run records -- therefore cost the same bytes, and every later retention
+    /// decision sees the same remaining budget in both modes.
+    #[test]
+    fn a_reusing_and_a_forced_full_review_retain_the_same_bytes() {
+        let sliced = PolicyId::new("test.dynamic-eval").expect("policy id");
+        let whole = PolicyId::new("test.taint-flow").expect("policy id");
+        let reusing = PolicyIncrementalReview {
+            base: IncrementalBaseState::Reused,
+            policies: vec![
+                PolicyIncrementalRun {
+                    policy_id: sliced.clone(),
+                    mode: IncrementalMode::Sliced,
+                    units_total: 40,
+                    units_reused: 39,
+                    units_recomputed: 1,
+                    units_unbounded: 0,
+                    widen_reason: None,
+                },
+                PolicyIncrementalRun::whole_family(whole.clone()),
+            ],
+        };
+        let forced_full = PolicyIncrementalReview::evaluated_in_full(
+            [sliced, whole],
+            WidenReason::IncrementalDisabled,
+        );
+
+        assert_eq!(
+            reusing.policies().len(),
+            forced_full.policies().len(),
+            "both modes report every policy that ran"
+        );
+        assert_eq!(reusing.retained_size(), forced_full.retained_size());
     }
 }

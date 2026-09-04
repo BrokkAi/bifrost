@@ -12,6 +12,42 @@ macro_rules! count_idents {
 /// Keeping this pair together prevents each lifecycle addition from requiring
 /// another copy in every language adapter.
 macro_rules! impl_program_semantics_provider {
+    ($analyzer:ty, |$context:ident| $lowerer:expr) => {
+        impl $crate::analyzer::semantic::ProgramSemanticsProvider for $analyzer {
+            fn current_artifact_source(
+                &self,
+                file: &$crate::analyzer::ProjectFile,
+                max_source_bytes: usize,
+            ) -> Result<
+                Option<$crate::analyzer::semantic::SemanticArtifactSourceSnapshot>,
+                $crate::analyzer::semantic::SemanticProviderError,
+            > {
+                let $context = self;
+                let lowerer = $lowerer;
+                self.inner.current_semantic_artifact_source_with_lowerer(
+                    &lowerer,
+                    file,
+                    max_source_bytes,
+                )
+            }
+
+            fn materialize(
+                &self,
+                file: &$crate::analyzer::ProjectFile,
+                request: &mut $crate::analyzer::semantic::SemanticRequest<'_>,
+            ) -> Result<
+                $crate::analyzer::semantic::SemanticOutcome<
+                    std::sync::Arc<$crate::analyzer::semantic::SemanticArtifact>,
+                >,
+                $crate::analyzer::semantic::SemanticProviderError,
+            > {
+                let $context = self;
+                let lowerer = $lowerer;
+                self.inner
+                    .materialize_semantics_with_lowerer(&lowerer, file, request)
+            }
+        }
+    };
     ($analyzer:ty, $lowerer:expr) => {
         impl $crate::analyzer::semantic::ProgramSemanticsProvider for $analyzer {
             fn current_artifact_source(
@@ -63,6 +99,7 @@ pub mod oracle;
 pub mod provider;
 pub mod render;
 pub mod service;
+pub mod type_flow;
 pub mod workspace_oracle;
 
 pub use crate::cancellation::CancellationToken;
@@ -77,4 +114,11 @@ pub use oracle::*;
 pub use provider::*;
 pub use render::*;
 pub use service::semantic_artifact_retained_bytes;
+#[cfg(any(test, feature = "test-support"))]
+pub use service::{SemanticCacheRevivalCensus, SemanticMaterializationCensus};
+pub use type_flow::{
+    ClassAtom, ClassHierarchy, ClassIdentity, ClassSeed, DynamicFieldWrite, GuardArmSide,
+    MemberAccessKind, MemberAccessQuery, MemberLookup, NarrowingVerdict, TypeFlowAdapter,
+    UnknownReason, type_flow_adapter,
+};
 pub use workspace_oracle::*;

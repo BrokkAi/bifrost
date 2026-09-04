@@ -35,7 +35,7 @@ pub const CATALOG_SCHEMA_VERSION: i64 = db::CURRENT_CATALOG_VERSION;
 ///
 /// Increment this whenever producer or compiler behavior can change the bytes
 /// or meaning of a generated pack without changing its other exact inputs.
-pub const GENERATED_PRODUCTION_CACHE_VERSION: u32 = 5;
+pub const GENERATED_PRODUCTION_CACHE_VERSION: u32 = 8;
 pub const SEMANTIC_PACK_CACHE_ROOT_ENV: &str = "BIFROST_SEMANTIC_PACK_CACHE_ROOT";
 
 /// Resolve the generated catalog used when no explicit catalog is configured.
@@ -678,6 +678,7 @@ pub struct SemanticPackCatalog {
     lookup_hits: AtomicU64,
     lookup_misses: AtomicU64,
     sql_statements: AtomicU64,
+    object_reads: AtomicU64,
     mutation_generation: AtomicU64,
     _ephemeral_root: Option<TempDir>,
 }
@@ -791,10 +792,20 @@ impl SemanticPackCatalog {
             CatalogOpenMode::ReadWrite => storage::prepare_root(root)?,
             CatalogOpenMode::ReadOnly => storage::open_read_only_root(root)?,
         };
+        // SQLite can leave every concurrent first opener in SQLITE_PROTOCOL
+        // while they independently negotiate WAL locking on Windows. Elect
+        // one initializer through schema migration and storage reconciliation;
+        // normal catalog work remains concurrent after this lock is dropped.
+        let initialization_lock = if mode == CatalogOpenMode::ReadWrite {
+            Some(storage::acquire_initialization_lock(&root)?)
+        } else {
+            None
+        };
         let mut connection = db::open(&root, mode)?;
         if mode == CatalogOpenMode::ReadWrite {
             reconcile_storage(&root, &mut connection)?;
         }
+        drop(initialization_lock);
         Ok(Self {
             root,
             mode,
@@ -806,6 +817,7 @@ impl SemanticPackCatalog {
             lookup_hits: AtomicU64::new(0),
             lookup_misses: AtomicU64::new(0),
             sql_statements: AtomicU64::new(0),
+            object_reads: AtomicU64::new(0),
             mutation_generation: AtomicU64::new(0),
             _ephemeral_root: None,
         })
@@ -841,6 +853,14 @@ impl SemanticPackCatalog {
     /// their expected difference is always zero.
     pub fn sql_statement_count(&self) -> u64 {
         self.sql_statements.load(Ordering::Relaxed)
+    }
+
+    /// Return the number of catalog object files this instance has read.
+    ///
+    /// A cached generated-pack lookup must not read shard objects (#2875).
+    /// Tests pin that with the difference between two snapshots.
+    pub fn object_read_count(&self) -> u64 {
+        self.object_reads.load(Ordering::Relaxed)
     }
 
     pub fn inventory_bounded(&self, max_packs: usize) -> Result<CatalogInventory, CatalogError> {
@@ -1211,6 +1231,17 @@ impl SemanticPackCatalog {
         })
     }
 
+    /// Look up the cached generated pack for `key`.
+    ///
+    /// This lookup is metadata only. It decodes the manifest, checks the key
+    /// and producer identity, and confirms in one query that the catalog still
+    /// holds a shard row joined to an object row for every manifest
+    /// descriptor. It does not read or decode shard bytes. The pack row's
+    /// `state = 'verified'`, written inside the install transaction after
+    /// `validate_pack` decoded every shard, is the validation record, and the
+    /// query requires it. The stored bytes are verified again by
+    /// `storage::read` when a shard is loaded, and `load` quarantines a
+    /// corrupt object there. Do not re-add a per-lookup decode pass (#2875).
     pub fn generated_production(
         &self,
         key: &GeneratedProductionKey,
@@ -1277,7 +1308,7 @@ impl SemanticPackCatalog {
                 ));
             }
             validate_generated_pack_identity(key, &manifest)?;
-            self.validate_generated_objects(&manifest_digest, &manifest)?;
+            self.validate_generated_shard_rows(&manifest_digest, &manifest)?;
             Ok(GeneratedProduction {
                 key: stored_key,
                 manifest_digest: manifest_digest.clone(),
@@ -1299,52 +1330,50 @@ impl SemanticPackCatalog {
         }
     }
 
-    fn validate_generated_objects(
+    /// Confirm that every manifest descriptor still has its shard row and
+    /// object row, in one statement and without reading any object file.
+    fn validate_generated_shard_rows(
         &self,
         manifest_digest: &str,
         manifest: &CompiledPackManifest,
     ) -> Result<(), CatalogError> {
-        for descriptor in &manifest.shards {
-            let (relative_path, stored_size) = {
-                let connection = self
-                    .connection
-                    .lock()
-                    .expect("semantic-pack catalog connection mutex poisoned");
-                connection
-                    .query_row(
-                        "SELECT o.relative_path, o.stored_size
-                         FROM catalog_pack_shards AS ps
-                         JOIN catalog_objects AS o
-                           ON o.stored_digest = ps.stored_digest
-                         WHERE ps.manifest_digest = ?1
-                           AND ps.shard_id = ?2
-                           AND ps.stored_digest = ?3",
-                        params![
-                            manifest_digest,
-                            &descriptor.shard_id,
-                            &descriptor.stored_sha256
-                        ],
-                        |row| Ok((row.get::<_, String>(0)?, row.get::<_, u64>(1)?)),
-                    )
-                    .optional()
-                    .map_err(|error| {
-                        CatalogError::sqlite("lookup generated production object", error)
-                    })?
-                    .ok_or_else(|| {
-                        CatalogError::Integrity(format!(
-                            "generated production is missing shard {}",
-                            descriptor.shard_id
-                        ))
-                    })?
-            };
-            let bytes = storage::read(
-                &self.root,
-                &relative_path,
-                &descriptor.stored_sha256,
-                stored_size,
-            )?;
-            decode_shard_for_manifest(manifest, descriptor, &bytes, &self.options.decode_limits)
-                .map_err(|error| CatalogError::Artifact(error.to_string()))?;
+        let connection = self
+            .connection
+            .lock()
+            .expect("semantic-pack catalog connection mutex poisoned");
+        let mut statement = connection
+            .prepare(
+                "SELECT ps.shard_id, ps.stored_digest
+                 FROM catalog_pack_shards AS ps
+                 JOIN catalog_objects AS o
+                   ON o.stored_digest = ps.stored_digest
+                 WHERE ps.manifest_digest = ?1",
+            )
+            .map_err(|error| CatalogError::sqlite("lookup generated production shards", error))?;
+        let rows = statement
+            .query_map([manifest_digest], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|error| CatalogError::sqlite("lookup generated production shards", error))?;
+        let mut stored = HashMap::with_capacity(manifest.shards.len());
+        for row in rows {
+            let (shard_id, stored_digest) = row.map_err(|error| {
+                CatalogError::sqlite("read generated production shard row", error)
+            })?;
+            stored.insert(shard_id, stored_digest);
+        }
+        let missing: Vec<&str> = manifest
+            .shards
+            .iter()
+            .filter(|descriptor| {
+                stored.get(&descriptor.shard_id) != Some(&descriptor.stored_sha256)
+            })
+            .map(|descriptor| descriptor.shard_id.as_str())
+            .collect();
+        if !missing.is_empty() {
+            return Err(CatalogError::Integrity(format!(
+                "generated production is missing shards {missing:?}"
+            )));
         }
         Ok(())
     }
@@ -2642,6 +2671,7 @@ impl SemanticPackCatalog {
             .ok_or(CatalogError::Unavailable)?;
         let manifest = decode_manifest(&row.0, &self.options.decode_limits)
             .map_err(|error| CatalogError::Artifact(error.to_string()))?;
+        self.object_reads.fetch_add(1, Ordering::Relaxed);
         let bytes = storage::read(
             &self.root,
             &row.1,

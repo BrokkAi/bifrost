@@ -1,6 +1,6 @@
 {
   "name": "@brokkai/dsh-plugin-bifrost",
-  "version": "0.10.9",
+  "version": "0.10.7",
   "description": "DeepSeek Harness (dsh) bundle for Bifrost: multi-language code intelligence over MCP.",
   "license": "Apache-2.0",
   "type": "module",

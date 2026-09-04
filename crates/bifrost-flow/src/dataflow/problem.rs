@@ -217,6 +217,16 @@ pub trait DistributiveDataflowProblem {
         false
     }
 
+    /// Whether a curated or policy model replaces this call's callee, so the
+    /// solver must not descend into the callee at this call site. The
+    /// caller-side continuation edges are still minted for a problem that
+    /// takes resolved call-to-return, and dispatch boundaries are still
+    /// retained for completion accounting; only the interprocedural descent
+    /// is suppressed, because the model is the call's whole behavior.
+    fn call_replaced_by_model(&self, _call: &CallSiteHandle) -> bool {
+        false
+    }
+
     /// Whether `fact` records a monitored observation on the current path
     /// rather than a value that flows onward.
     ///

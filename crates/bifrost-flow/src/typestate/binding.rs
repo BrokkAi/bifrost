@@ -2525,9 +2525,20 @@ struct CanonicalContext<'a> {
     truncated: bool,
 }
 
+/// A semantic locator as the binding plan's canonical bytes carry it.
+///
+/// Deliberately without the locator's `WorkspaceMountId`. The mount is a hash
+/// of the absolute workspace root, and the plan's hash reaches a typestate
+/// finding's identity through `binding_plan_hash`, so folding it in made every
+/// typestate finding identity depend on where the checkout happens to live: a
+/// `--diff-base` run, which analyzes the base revision at a temporary root,
+/// could never match a base finding to its head counterpart, and no evaluation
+/// unit published from one root could ever be reused at another. The path,
+/// language, declaration segments, role and anchor below already name the
+/// procedure exactly, within a plan whose every locator comes from the one
+/// workspace being analyzed.
 #[derive(Serialize)]
 struct CanonicalLocator<'a> {
-    mount: String,
     path: &'a str,
     language: &'static str,
     declaration: Vec<CanonicalDeclarationSegment<'a>>,
@@ -2687,7 +2698,6 @@ fn canonical_context_key(context: &TypestateContextKey) -> CanonicalContext<'_> 
 
 fn canonical_locator(locator: &SemanticLocator) -> CanonicalLocator<'_> {
     CanonicalLocator {
-        mount: locator.mount().to_string(),
         path: locator.path().as_str(),
         language: locator.language().stable_label(),
         declaration: locator

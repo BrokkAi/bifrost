@@ -892,6 +892,23 @@ fn catalog_entry_ids(
         )
 }
 
+/// Field ports are external-model write destinations only; every other port
+/// position refuses them so a catalog cannot smuggle one into an endpoint.
+fn reject_field_port(
+    kind: CatalogEntryKind,
+    id: &TaintEntryId,
+    port: &PolicyPort,
+) -> Result<(), CatalogRegistryError> {
+    if matches!(port, PolicyPort::FieldOf { .. }) {
+        return invalid_entry(
+            kind,
+            id,
+            "a field port is only valid as an external-model transfer write destination",
+        );
+    }
+    Ok(())
+}
+
 fn normalize_source(source: &mut TaintSourceSpec) -> Result<(), CatalogRegistryError> {
     validate_selector(&source.id, &source.selector)?;
     validate_display_name(CatalogEntryKind::Source, &source.id, &source.display_name)?;
@@ -901,6 +918,7 @@ fn normalize_source(source: &mut TaintSourceSpec) -> Result<(), CatalogRegistryE
         "categories",
         &mut source.categories,
     )?;
+    reject_field_port(CatalogEntryKind::Source, &source.id, &source.bind)?;
     validate_port(CatalogEntryKind::Source, &source.id, "bind", &source.bind)?;
     normalize_nonempty_set(
         CatalogEntryKind::Source,
@@ -930,6 +948,7 @@ fn normalize_sink(sink: &mut TaintSinkSpec) -> Result<(), CatalogRegistryError> 
         "categories",
         &mut sink.categories,
     )?;
+    reject_field_port(CatalogEntryKind::Sink, &sink.id, &sink.dangerous_operand)?;
     validate_port(
         CatalogEntryKind::Sink,
         &sink.id,
@@ -954,6 +973,12 @@ fn normalize_sink(sink: &mut TaintSinkSpec) -> Result<(), CatalogRegistryError> 
 
 fn normalize_sanitizer(sanitizer: &mut TaintSanitizerSpec) -> Result<(), CatalogRegistryError> {
     validate_selector(&sanitizer.id, &sanitizer.selector)?;
+    reject_field_port(CatalogEntryKind::Sanitizer, &sanitizer.id, &sanitizer.input)?;
+    reject_field_port(
+        CatalogEntryKind::Sanitizer,
+        &sanitizer.id,
+        &sanitizer.output,
+    )?;
     validate_port(
         CatalogEntryKind::Sanitizer,
         &sanitizer.id,
@@ -976,6 +1001,12 @@ fn normalize_sanitizer(sanitizer: &mut TaintSanitizerSpec) -> Result<(), Catalog
 
 fn normalize_transform(transform: &mut TaintTransformSpec) -> Result<(), CatalogRegistryError> {
     validate_selector(&transform.id, &transform.selector)?;
+    reject_field_port(CatalogEntryKind::Transform, &transform.id, &transform.input)?;
+    reject_field_port(
+        CatalogEntryKind::Transform,
+        &transform.id,
+        &transform.output,
+    )?;
     validate_port(
         CatalogEntryKind::Transform,
         &transform.id,
@@ -1051,6 +1082,30 @@ fn normalize_external_model(
                 CatalogEntryKind::ExternalModel,
                 &model.id,
                 "external-model transfers cannot use matched_value",
+            );
+        }
+        // A field port is a write destination: only `to` accepts it, and its
+        // base names the written object (an argument or the receiver), never
+        // another field or a call output.
+        if matches!(transfer.from, PolicyPort::FieldOf { .. }) {
+            return invalid_entry(
+                CatalogEntryKind::ExternalModel,
+                &model.id,
+                "a field port is only valid as a transfer write destination",
+            );
+        }
+        if let PolicyPort::FieldOf { base, .. } = &transfer.to
+            && !matches!(
+                base.as_ref(),
+                PolicyPort::Receiver
+                    | PolicyPort::ArgumentIndex { .. }
+                    | PolicyPort::ArgumentName { .. }
+            )
+        {
+            return invalid_entry(
+                CatalogEntryKind::ExternalModel,
+                &model.id,
+                "a field base must be an argument or the receiver",
             );
         }
         normalize_nonempty_set(
@@ -1151,10 +1206,16 @@ fn validate_port(
     field: &str,
     port: &PolicyPort,
 ) -> Result<(), CatalogRegistryError> {
-    let PolicyPort::ArgumentName { name } = port else {
-        return Ok(());
-    };
-    validate_catalog_author_text(kind, id, &format!("{field} argument name"), name)
+    match port {
+        PolicyPort::ArgumentName { name } => {
+            validate_catalog_author_text(kind, id, &format!("{field} argument name"), name)
+        }
+        PolicyPort::FieldOf { base, name } => {
+            validate_catalog_author_text(kind, id, &format!("{field} field name"), name)?;
+            validate_port(kind, id, field, base)
+        }
+        _ => Ok(()),
+    }
 }
 
 fn validate_display_name(
@@ -1345,6 +1406,7 @@ enum PortWire {
     ResultIndex { index: u32 },
     ArgumentIndex { index: u32 },
     ArgumentName { name: String },
+    Field { name: String, of: Box<PortWire> },
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -1375,6 +1437,7 @@ enum PortKindWire {
     ResultIndex,
     ArgumentIndex,
     ArgumentName,
+    Field,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1386,6 +1449,8 @@ struct TaggedPortWire {
     index: OptionalWireField<u32>,
     #[serde(default)]
     name: OptionalWireField<String>,
+    #[serde(default)]
+    of: OptionalWireField<PortWire>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1407,33 +1472,52 @@ impl<'de> Deserialize<'de> for PortWire {
 
         let tagged = TaggedPortWire::deserialize(deserializer)?;
         let invalid_shape = || D::Error::custom("port fields do not match its type");
-        match (tagged.kind, tagged.index, tagged.name) {
+        match (tagged.kind, tagged.index, tagged.name, tagged.of) {
             (
                 PortKindWire::MatchedValue,
                 OptionalWireField::Missing,
                 OptionalWireField::Missing,
+                OptionalWireField::Missing,
             ) => Ok(Self::MatchedValue),
-            (PortKindWire::Receiver, OptionalWireField::Missing, OptionalWireField::Missing) => {
-                Ok(Self::Receiver)
-            }
-            (PortKindWire::ReturnValue, OptionalWireField::Missing, OptionalWireField::Missing) => {
-                Ok(Self::ReturnValue)
-            }
+            (
+                PortKindWire::Receiver,
+                OptionalWireField::Missing,
+                OptionalWireField::Missing,
+                OptionalWireField::Missing,
+            ) => Ok(Self::Receiver),
+            (
+                PortKindWire::ReturnValue,
+                OptionalWireField::Missing,
+                OptionalWireField::Missing,
+                OptionalWireField::Missing,
+            ) => Ok(Self::ReturnValue),
             (
                 PortKindWire::ResultIndex,
                 OptionalWireField::Present(index),
+                OptionalWireField::Missing,
                 OptionalWireField::Missing,
             ) => Ok(Self::ResultIndex { index }),
             (
                 PortKindWire::ArgumentIndex,
                 OptionalWireField::Present(index),
                 OptionalWireField::Missing,
+                OptionalWireField::Missing,
             ) => Ok(Self::ArgumentIndex { index }),
             (
                 PortKindWire::ArgumentName,
                 OptionalWireField::Missing,
                 OptionalWireField::Present(name),
+                OptionalWireField::Missing,
             ) => Ok(Self::ArgumentName { name }),
+            (
+                PortKindWire::Field,
+                OptionalWireField::Missing,
+                OptionalWireField::Present(name),
+                OptionalWireField::Present(of),
+            ) => Ok(Self::Field {
+                name,
+                of: Box::new(of),
+            }),
             _ => Err(invalid_shape()),
         }
     }
@@ -1841,6 +1925,10 @@ impl From<PortWire> for PolicyPort {
             PortWire::ResultIndex { index } => Self::ResultIndex { index },
             PortWire::ArgumentIndex { index } => Self::ArgumentIndex { index },
             PortWire::ArgumentName { name } => Self::ArgumentName { name },
+            PortWire::Field { name, of } => Self::FieldOf {
+                base: Box::new(Self::from(*of)),
+                name,
+            },
         }
     }
 }
@@ -1854,6 +1942,10 @@ impl From<&PolicyPort> for PortWire {
             PolicyPort::ResultIndex { index } => Self::ResultIndex { index: *index },
             PolicyPort::ArgumentIndex { index } => Self::ArgumentIndex { index: *index },
             PolicyPort::ArgumentName { name } => Self::ArgumentName { name: name.clone() },
+            PolicyPort::FieldOf { base, name } => Self::Field {
+                name: name.clone(),
+                of: Box::new(Self::from(base.as_ref())),
+            },
         }
     }
 }
@@ -2006,6 +2098,9 @@ pub(crate) fn phase_accepts_port(phase: EndpointObservationPhase, port: &PolicyP
                     | EndpointObservationPhase::AfterExceptionalReturn
             )
         }
+        // Field ports exist only as external-model transfer destinations,
+        // which never carry an endpoint observation phase.
+        PolicyPort::FieldOf { .. } => false,
     }
 }
 

@@ -1,7 +1,10 @@
 use tree_sitter::Node;
 
 use super::rbs_artifact::RubyMemberAlias;
-use super::{extract_name_segments, parse_ruby_tree, ruby_call_arguments, ruby_symbol_name};
+use super::{
+    extract_name_segments, parse_ruby_tree, ruby_call_arguments, ruby_semantic_identifier_range,
+    ruby_symbol_name,
+};
 use crate::CancellationToken;
 use crate::analyzer::semantic_model::{
     ArtifactProducerLimits, BoundedProducerDiagnostics, HierarchyFact, HierarchyKind, Locator,
@@ -720,9 +723,11 @@ fn rbi_parameter_name(node: Node<'_>, source: &str) -> Option<String> {
     if node.kind() != "hash_key_symbol" {
         return None;
     }
-    let text = ruby_node_text(node, source).trim();
-    let name = text.strip_suffix(':').unwrap_or(text);
-    (!name.is_empty()).then(|| name.to_owned())
+    let range = ruby_semantic_identifier_range(node, source);
+    source
+        .get(range.start_byte..range.end_byte)
+        .filter(|name| !name.is_empty())
+        .map(ToOwned::to_owned)
 }
 
 fn descendant_calls(root: Node<'_>) -> Vec<Node<'_>> {

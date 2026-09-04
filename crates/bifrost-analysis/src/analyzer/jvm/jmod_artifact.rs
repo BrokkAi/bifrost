@@ -404,6 +404,7 @@ impl JdkJmodSetPackProducer {
                 completeness,
                 safety: request.safety.clone(),
                 carried_sources: Vec::new(),
+                cpp_portability: None,
                 shards,
             }),
             completeness,

@@ -446,6 +446,7 @@ struct RustHierarchyBuilder {
 
 impl RustHierarchyIndex {
     pub fn build(rust: &dyn RustFactSource, token: QueryToken<'_>) -> Self {
+        let _scope = brokk_bifrost_core::profiling::scope("RustHierarchyIndex::build");
         let mut builder = RustHierarchyBuilder {
             enumeration_complete: true,
             ..RustHierarchyBuilder::default()

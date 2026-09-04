@@ -39,7 +39,7 @@ use crate::analyzer::usages::rust_graph::resolver::{
     RustBareTokenTreeRole, RustDefinitionProvider, RustTokenPathRole, RustTokenTreeRoleCache,
     canonical_imported_impl_target, is_graph_visible_member_target, is_trait_owner,
     resolve_exact_owner_associated_item_matching, resolve_rust_path_fqn,
-    resolve_rust_token_tree_paths, rust_token_path_segment_is_qualified,
+    resolve_rust_token_tree_paths_admitting, rust_token_path_segment_is_qualified,
     rust_unique_nominal_reference_namespace, token_tree_ancestor, trait_member_for_impl_member,
 };
 use crate::analyzer::{
@@ -288,6 +288,80 @@ impl RustScanPhaseTimings {
     }
 }
 
+/// A span inside the per-candidate rayon closure. `scope_with`, not `scope`:
+/// `scope` builds its label before it consults the timing flag, and these sit
+/// on the per-file hot path.
+fn candidate_phase_scope(label: &'static str) -> crate::profiling::Scope {
+    crate::profiling::scope_with(|| label.to_string())
+}
+
+/// Visits and time for one node kind of a member AST walk. Accumulated only
+/// while timing is on (`RustScanPhaseTimings::start` returns `None` otherwise).
+#[derive(Default)]
+struct NodeKindTiming {
+    visits: u64,
+    nanos: u64,
+}
+
+impl NodeKindTiming {
+    fn record(&mut self, started: Option<Instant>) {
+        let Some(started) = started else {
+            return;
+        };
+        self.visits += 1;
+        self.nanos += u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+    }
+}
+
+impl std::fmt::Display for NodeKindTiming {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "{}x/{:.1}ms",
+            self.visits,
+            self.nanos as f64 / 1_000_000.0
+        )
+    }
+}
+
+/// Where one file's member AST walk spent its time, by the node kinds
+/// `scan_member_node` dispatches on. The walk visits every node, so a span per
+/// node would drown the trace; one note per file answers the same question.
+#[derive(Default)]
+struct MemberNodeTimings {
+    field_expression: NodeKindTiming,
+    token_tree: NodeKindTiming,
+    scoped_path: NodeKindTiming,
+    use_declaration: NodeKindTiming,
+    other: NodeKindTiming,
+}
+
+impl MemberNodeTimings {
+    fn record(&mut self, kind: &str, started: Option<Instant>) {
+        let slot = match kind {
+            "field_expression" => &mut self.field_expression,
+            "token_tree" => &mut self.token_tree,
+            "scoped_identifier" | "scoped_type_identifier" => &mut self.scoped_path,
+            "use_declaration" => &mut self.use_declaration,
+            _ => &mut self.other,
+        };
+        slot.record(started);
+    }
+
+    fn report(&self, file: &ProjectFile, bytes: usize) {
+        crate::profiling::note_with(|| {
+            format!(
+                "rust_graph member ast_scan file={file:?} bytes={bytes} field_expression={} token_tree={} scoped_path={} use_declaration={} other={}",
+                self.field_expression,
+                self.token_tree,
+                self.scoped_path,
+                self.use_declaration,
+                self.other,
+            )
+        });
+    }
+}
+
 impl UsageCapStop {
     fn new(max_usages: usize) -> Self {
         Self {
@@ -323,6 +397,7 @@ pub(super) fn scan_files_for_target(
     cancellation: Option<&CancellationToken>,
     max_usages: usize,
 ) -> BTreeSet<UsageHit> {
+    let _scope = crate::profiling::scope("rust_graph::target_scan");
     let hits = Mutex::new(BTreeSet::new());
     let cap = UsageCapStop::new(max_usages);
     let files_vec: Vec<_> = files.into_iter().collect();
@@ -346,12 +421,17 @@ pub(super) fn scan_files_for_target(
                 return;
             }
             rust.note_scanned_candidate_file();
+            let _candidate_scope = candidate_phase_scope("rust_graph::target_scan.candidate");
+            crate::profiling::note_with(|| format!("rust_graph target candidate file={file:?}"));
             let started = RustScanPhaseTimings::start();
-            let Some(prepared) = rust.prepared_syntax(token, file) else {
-                RustScanPhaseTimings::record(&timings.prepared_syntax_ns, started);
-                return;
+            let prepared = {
+                let _scope = candidate_phase_scope("rust_graph::target_scan.prepared_syntax");
+                rust.prepared_syntax(token, file)
             };
             RustScanPhaseTimings::record(&timings.prepared_syntax_ns, started);
+            let Some(prepared) = prepared else {
+                return;
+            };
             let source = prepared.source();
             let tree = prepared.tree();
             if cancellation.is_some_and(CancellationToken::is_cancelled) {
@@ -366,17 +446,24 @@ pub(super) fn scan_files_for_target(
             // repeated construction costs no repeated work.
             let include_routes = RustIncludeRoutes::new(rust, token);
             let started = RustScanPhaseTimings::start();
-            let lexical_scope = lexical_scope::rust_lexical_scope_index(tree.root_node(), source);
+            let lexical_scope = {
+                let _scope = candidate_phase_scope("rust_graph::target_scan.lexical_scope");
+                lexical_scope::rust_lexical_scope_index(tree.root_node(), source)
+            };
             RustScanPhaseTimings::record(&timings.lexical_scope_ns, started);
             if cancellation.is_some_and(CancellationToken::is_cancelled) {
                 return;
             }
             let started = RustScanPhaseTimings::start();
-            let refs = rust.reference_context_of(token, file);
+            let refs = {
+                let _scope = candidate_phase_scope("rust_graph::target_scan.reference_context");
+                rust.reference_context_of(token, file)
+            };
             RustScanPhaseTimings::record(&timings.reference_context_ns, started);
             if cancellation.is_some_and(CancellationToken::is_cancelled) {
                 return;
             }
+            let binding_names_scope = candidate_phase_scope("rust_graph::target_scan.binding_names");
             let (mut direct_names, _) = match seeds {
                 Some(seeds) => usage_binding_names(rust, token, file, seeds),
                 None => (HashSet::default(), HashSet::default()),
@@ -425,19 +512,24 @@ pub(super) fn scan_files_for_target(
             } else {
                 RustMacroMatcherCandidateGate::Names(&macro_candidate_names)
             };
+            drop(binding_names_scope);
             let mut token_tree_roles = RustTokenTreeRoleCache::default();
-            ingest_file_macro_matcher_roles(
-                &mut token_tree_roles,
-                token,
-                analyzer,
-                support,
-                file,
-                source,
-                tree,
-                macro_candidate_gate,
-                cancellation,
-            );
+            {
+                let _scope = candidate_phase_scope("rust_graph::target_scan.macro_roles");
+                ingest_file_macro_matcher_roles(
+                    &mut token_tree_roles,
+                    token,
+                    analyzer,
+                    support,
+                    file,
+                    source,
+                    tree,
+                    macro_candidate_gate,
+                    cancellation,
+                );
+            }
             let usage_walks = if seeds.is_some() {
+                let _scope = candidate_phase_scope("rust_graph::target_scan.usage_walks");
                 RustUsageWalks::new_while(rust, token, &keep_going)
             } else {
                 None
@@ -456,7 +548,7 @@ pub(super) fn scan_files_for_target(
                 support,
                 seeds,
                 target,
-                target_is_path_qualifier: target.is_class() || rust.is_type_alias(target),
+                target_is_path_qualifier: target.is_class(),
                 target_is_module: target.is_module(),
                 target_is_macro: target.is_macro(),
                 target_is_pattern_value: is_rust_const_or_static_declaration(rust, target),
@@ -475,6 +567,7 @@ pub(super) fn scan_files_for_target(
                 cancellation_checks_remaining: 0,
                 hits: &mut local_hits,
             };
+            let ast_scan_scope = candidate_phase_scope("rust_graph::target_scan.ast_scan");
             let started = RustScanPhaseTimings::start();
             scan_node(tree.root_node(), token, &mut ctx);
             let primary_scan_ms = started.map(|started| started.elapsed().as_secs_f64() * 1_000.0);
@@ -485,6 +578,7 @@ pub(super) fn scan_files_for_target(
             let qualified_scan_ms = qualified_started
                 .map(|started| started.elapsed().as_secs_f64() * 1_000.0)
                 .unwrap_or_default();
+            drop(ast_scan_scope);
             if let Some(started) = started
                 && started.elapsed().as_millis() >= 100
             {
@@ -888,7 +982,7 @@ impl ScanCtx<'_> {
             RustReferenceNamespace::PathPrefix
         } else if self.target.is_macro() {
             RustReferenceNamespace::Macro
-        } else if self.target.is_class() || self.rust.is_type_alias(self.target) {
+        } else if self.target.is_class() {
             RustReferenceNamespace::Type
         } else {
             RustReferenceNamespace::Value
@@ -897,9 +991,7 @@ impl ScanCtx<'_> {
 
     fn target_has_type_value_namespace_collision(&self) -> bool {
         let candidates = self.support.fqn(&self.target.fq_name());
-        let has_type = candidates
-            .iter()
-            .any(|candidate| candidate.is_class() || self.rust.is_type_alias(candidate));
+        let has_type = candidates.iter().any(CodeUnit::is_class);
         let has_value = candidates
             .iter()
             .any(|candidate| candidate.is_function() || candidate.is_field());
@@ -929,20 +1021,14 @@ impl ScanCtx<'_> {
             .fqn(fqn)
             .into_iter()
             .filter(|candidate| match namespace {
-                RustReferenceNamespace::Type => {
-                    candidate.is_class() || self.rust.is_type_alias(candidate)
-                }
+                RustReferenceNamespace::Type => candidate.is_class(),
                 RustReferenceNamespace::Value => {
                     candidate.is_function()
                         || candidate.is_field()
                         || has_rust_value_constructor(self.rust, candidate)
                 }
                 RustReferenceNamespace::Macro => candidate.is_macro(),
-                RustReferenceNamespace::PathPrefix => {
-                    candidate.is_module()
-                        || candidate.is_class()
-                        || self.rust.is_type_alias(candidate)
-                }
+                RustReferenceNamespace::PathPrefix => candidate.is_module() || candidate.is_class(),
                 RustReferenceNamespace::Any => true,
             })
             .collect::<Vec<_>>();
@@ -960,20 +1046,14 @@ impl ScanCtx<'_> {
         let mut declarations = candidates
             .into_iter()
             .filter(|candidate| match namespace {
-                RustReferenceNamespace::Type => {
-                    candidate.is_class() || self.rust.is_type_alias(candidate)
-                }
+                RustReferenceNamespace::Type => candidate.is_class(),
                 RustReferenceNamespace::Value => {
                     candidate.is_function()
                         || candidate.is_field()
                         || has_rust_value_constructor(self.rust, candidate)
                 }
                 RustReferenceNamespace::Macro => candidate.is_macro(),
-                RustReferenceNamespace::PathPrefix => {
-                    candidate.is_module()
-                        || candidate.is_class()
-                        || self.rust.is_type_alias(candidate)
-                }
+                RustReferenceNamespace::PathPrefix => candidate.is_module() || candidate.is_class(),
                 RustReferenceNamespace::Any => true,
             })
             .filter(|candidate| {
@@ -1492,7 +1572,7 @@ fn identifier_matches_target(
         }) {
             Some(RustReferenceNamespace::Value)
         } else {
-            rust_unique_nominal_reference_namespace(ctx.rust, ctx.support, &ctx.target.fq_name())
+            rust_unique_nominal_reference_namespace(ctx.support, &ctx.target.fq_name())
         }
     });
     let namespace = token_tree_namespace
@@ -1788,12 +1868,15 @@ pub(super) fn scan_files_for_member_target(
     cancellation: Option<&CancellationToken>,
     max_usages: usize,
 ) -> RustMemberScanResult {
+    let _scope = crate::profiling::scope("rust_graph::member_scan");
     let Some(owner) = rust
         .structural_parent_of(target)
         .or_else(|| rust.parent_of(target))
     else {
         return RustMemberScanResult::default();
     };
+    let owner_preparation_scope =
+        crate::profiling::scope("rust_graph::member_scan.owner_preparation");
     let owner = canonical_member_owner(rust, token, owner);
     let owner_roots = BTreeSet::from([owner.clone()]);
     let owner_seeds = usage_binding_seeds(rust, token, &owner_roots);
@@ -1805,6 +1888,7 @@ pub(super) fn scan_files_for_member_target(
     let constructor_returns =
         self_like_constructor_returns(rust, token, &constructor_support, &owner);
     let self_like_constructors = self_like_constructor_seeds(rust, token, &constructor_returns);
+    drop(owner_preparation_scope);
 
     let files_vec = files.into_iter().collect::<Vec<_>>();
     let timings = RustScanPhaseTimings::default();
@@ -1818,12 +1902,17 @@ pub(super) fn scan_files_for_member_target(
                 return;
             }
             rust.note_scanned_candidate_file();
+            let _candidate_scope = candidate_phase_scope("rust_graph::member_scan.candidate");
+            crate::profiling::note_with(|| format!("rust_graph member candidate file={file:?}"));
             let started = RustScanPhaseTimings::start();
-            let Some(prepared) = rust.prepared_syntax(token, file) else {
-                RustScanPhaseTimings::record(&timings.prepared_syntax_ns, started);
-                return;
+            let prepared = {
+                let _scope = candidate_phase_scope("rust_graph::member_scan.prepared_syntax");
+                rust.prepared_syntax(token, file)
             };
             RustScanPhaseTimings::record(&timings.prepared_syntax_ns, started);
+            let Some(prepared) = prepared else {
+                return;
+            };
             let source = prepared.source();
             let tree = prepared.tree();
             if cancellation.is_some_and(CancellationToken::is_cancelled) {
@@ -1831,18 +1920,24 @@ pub(super) fn scan_files_for_member_target(
             }
             let line_starts = prepared.line_starts();
             let started = RustScanPhaseTimings::start();
-            let lexical_scope_index =
-                lexical_scope::rust_lexical_scope_index(tree.root_node(), source);
+            let lexical_scope_index = {
+                let _scope = candidate_phase_scope("rust_graph::member_scan.lexical_scope");
+                lexical_scope::rust_lexical_scope_index(tree.root_node(), source)
+            };
             RustScanPhaseTimings::record(&timings.lexical_scope_ns, started);
             if cancellation.is_some_and(CancellationToken::is_cancelled) {
                 return;
             }
             let started = RustScanPhaseTimings::start();
-            let refs = rust.reference_context_of(token, file);
+            let refs = {
+                let _scope = candidate_phase_scope("rust_graph::member_scan.reference_context");
+                rust.reference_context_of(token, file)
+            };
             RustScanPhaseTimings::record(&timings.reference_context_ns, started);
             if cancellation.is_some_and(CancellationToken::is_cancelled) {
                 return;
             }
+            let owner_names_scope = candidate_phase_scope("rust_graph::member_scan.owner_names");
             let mut owner_local_names: HashSet<String> = if file == target.source() {
                 [owner.identifier().to_string()].into_iter().collect()
             } else {
@@ -1855,6 +1950,7 @@ pub(super) fn scan_files_for_member_target(
             } else {
                 owner_local_names.clone()
             };
+            drop(owner_names_scope);
             if cancellation.is_some_and(CancellationToken::is_cancelled) {
                 return;
             }
@@ -1864,6 +1960,8 @@ pub(super) fn scan_files_for_member_target(
             {
                 return;
             }
+            let receiver_names_scope =
+                candidate_phase_scope("rust_graph::member_scan.receiver_names");
             let visible_bare_constructors =
                 visible_bare_constructor_names(rust, token, file, &self_like_constructors);
             let mut receiver_names = infer_receiver_names(
@@ -1890,6 +1988,7 @@ pub(super) fn scan_files_for_member_target(
             }
             receiver_names.sort();
             receiver_names.dedup();
+            drop(receiver_names_scope);
             let static_owner_names = owner_local_names;
             // The raw-identifier escape sits between the path separator and the
             // name in source text (`Trait::r#type`), so the plain `::{member}`
@@ -1906,17 +2005,20 @@ pub(super) fn scan_files_for_member_target(
             let macro_candidate_names = [strip_raw_identifier_prefix(&member_name).to_string()]
                 .into_iter()
                 .collect::<HashSet<_>>();
-            ingest_file_macro_matcher_roles(
-                &mut token_tree_roles,
-                token,
-                analyzer,
-                support,
-                file,
-                source,
-                tree,
-                RustMacroMatcherCandidateGate::Names(&macro_candidate_names),
-                cancellation,
-            );
+            {
+                let _scope = candidate_phase_scope("rust_graph::member_scan.macro_roles");
+                ingest_file_macro_matcher_roles(
+                    &mut token_tree_roles,
+                    token,
+                    analyzer,
+                    support,
+                    file,
+                    source,
+                    tree,
+                    RustMacroMatcherCandidateGate::Names(&macro_candidate_names),
+                    cancellation,
+                );
+            }
             let mut local_hits = BTreeSet::new();
             let mut local_unproven_hits = BTreeSet::new();
             let target_is_enum_variant = requested_target.is_field()
@@ -1939,7 +2041,8 @@ pub(super) fn scan_files_for_member_target(
                 scan_target: target,
                 requested_target,
                 owner_seeds: &owner_seeds,
-                target_is_field: requested_target.is_field(),
+                target_is_non_callable: !requested_target.is_function(),
+                target_is_associated_type: requested_target.is_class(),
                 target_is_enum_variant,
                 target_is_pattern_value: target_is_enum_variant
                     || is_rust_const_or_static_declaration(rust, requested_target),
@@ -1951,12 +2054,17 @@ pub(super) fn scan_files_for_member_target(
                 token_tree_roles,
                 cancellation,
                 cancellation_checks_remaining: 0,
+                node_timings: MemberNodeTimings::default(),
                 hits: &mut local_hits,
                 unproven_hits: &mut local_unproven_hits,
             };
             let started = RustScanPhaseTimings::start();
-            scan_member_node(tree.root_node(), token, &mut ctx);
+            {
+                let _scope = candidate_phase_scope("rust_graph::member_scan.ast_scan");
+                scan_member_node(tree.root_node(), token, &mut ctx);
+            }
             RustScanPhaseTimings::record(&timings.ast_scan_ns, started);
+            ctx.node_timings.report(file, source.len());
             if cancellation.is_some_and(CancellationToken::is_cancelled) {
                 return;
             }
@@ -2007,7 +2115,16 @@ struct MemberScanCtx<'a> {
     scan_target: &'a CodeUnit,
     requested_target: &'a CodeUnit,
     owner_seeds: &'a RustBindingSeeds,
-    target_is_field: bool,
+    /// The target is a member that is not a callable: a struct field, an enum
+    /// variant, an associated const, or an associated type. Such a member is
+    /// referenced by a read (`receiver.field`, `Owner::NAME`), never as a call
+    /// callee. Since #2911 an associated type mints a class-kind CodeUnit, so
+    /// this cannot be spelled `is_field()`.
+    target_is_non_callable: bool,
+    /// The target is an associated type -- the one member kind that lives in
+    /// the type namespace, which is what an `X = T` type binding and an `impl`
+    /// block's `type X = T;` name.
+    target_is_associated_type: bool,
     target_is_enum_variant: bool,
     target_is_pattern_value: bool,
     target_owner_is_trait: bool,
@@ -2018,6 +2135,7 @@ struct MemberScanCtx<'a> {
     token_tree_roles: RustTokenTreeRoleCache,
     cancellation: Option<&'a CancellationToken>,
     cancellation_checks_remaining: usize,
+    node_timings: MemberNodeTimings,
     hits: &'a mut BTreeSet<UsageHit>,
     unproven_hits: &'a mut BTreeSet<UsageHit>,
 }
@@ -2033,9 +2151,11 @@ fn scan_member_node(root: Node<'_>, token: QueryToken<'_>, ctx: &mut MemberScanC
             ) {
                 return TreeWalkAction::Stop;
             }
+            let started = RustScanPhaseTimings::start();
             match node.kind() {
-                "use_declaration" if ctx.target_is_field => {
+                "use_declaration" if ctx.target_is_non_callable => {
                     record_member_use_import_hits(node, ctx);
+                    ctx.node_timings.record(node.kind(), started);
                     return TreeWalkAction::Skip;
                 }
                 "field_expression" => record_instance_member_hit(node, token, ctx),
@@ -2047,12 +2167,12 @@ fn scan_member_node(root: Node<'_>, token: QueryToken<'_>, ctx: &mut MemberScanC
                     record_static_member_hit(node, token, ctx)
                 }
                 "type_binding" | "associated_type_binding"
-                    if ctx.target_is_field && ctx.target_owner_is_trait =>
+                    if ctx.target_is_associated_type && ctx.target_owner_is_trait =>
                 {
                     record_associated_type_binding_hit(node, token, ctx)
                 }
                 "type_item"
-                    if ctx.target_is_field
+                    if ctx.target_is_associated_type
                         && ctx.target_owner_is_trait
                         && !is_rust_trait_impl_member_declaration(
                             ctx.rust,
@@ -2075,11 +2195,12 @@ fn scan_member_node(root: Node<'_>, token: QueryToken<'_>, ctx: &mut MemberScanC
                 "identifier" if ctx.target_is_enum_variant => {
                     record_bare_enum_variant_value_hit(node, token, ctx)
                 }
-                "struct_expression" | "struct_pattern" if ctx.target_is_field => {
+                "struct_expression" | "struct_pattern" if ctx.target_is_non_callable => {
                     record_struct_field_hits(node, ctx)
                 }
                 _ => {}
             }
+            ctx.node_timings.record(node.kind(), started);
             TreeWalkAction::Descend
         },
         |_| {},
@@ -2471,7 +2592,7 @@ fn insert_enum_variant_candidate(
 fn record_instance_member_hit(node: Node<'_>, token: QueryToken<'_>, ctx: &mut MemberScanCtx<'_>) {
     // A method target is referenced by a call (`receiver.method()`); a field target
     // is referenced by a read/write (`receiver.field`), never as the callee.
-    if ctx.target_is_field {
+    if ctx.target_is_non_callable {
         if field_expression_is_called(node) {
             return;
         }
@@ -2541,7 +2662,7 @@ fn record_instance_member_hit(node: Node<'_>, token: QueryToken<'_>, ctx: &mut M
             return;
         }
     }
-    if !ctx.target_is_field && receiver_is_self_rooted(receiver, ctx.source) {
+    if !ctx.target_is_non_callable && receiver_is_self_rooted(receiver, ctx.source) {
         push_self_receiver_member_hit(
             ctx.file,
             ctx.source,
@@ -2592,7 +2713,7 @@ fn record_token_tree_instance_member_hits(
             call_args.kind() == "token_tree"
                 && call_args.child(0).is_some_and(|open| open.kind() == "(")
         });
-        if ctx.target_is_field == is_call {
+        if ctx.target_is_non_callable == is_call {
             continue;
         }
         let receiver_name = simple_node_text(*receiver, ctx.source);
@@ -2661,7 +2782,7 @@ fn record_token_tree_instance_member_hits(
                 continue;
             }
         }
-        if !ctx.target_is_field
+        if !ctx.target_is_non_callable
             && (receiver_is_adapter_parens || receiver_is_self_rooted(*receiver, ctx.source))
         {
             push_self_receiver_member_hit(
@@ -2844,9 +2965,24 @@ fn record_token_tree_static_member_hits(
     // crate-relative fqn, and this path has no owner node to select between
     // them, so an fqn that more than one declaration answers stays unproven
     // and the structured owner scan above decides the site instead.
-    for segment in
-        resolve_rust_token_tree_paths(ctx.rust, ctx.support, ctx.refs, ctx.file, ctx.source, node)
-    {
+    //
+    // Only a segment written as the member name can pass the checks below,
+    // and resolving any other segment costs an import walk and store reads.
+    // A `Type::name` whose `name` is not a direct member falls through to the
+    // trait-candidate step, which builds the whole-workspace type hierarchy:
+    // 14 s of a 16 s member scan on this repository, waited on by every
+    // candidate file (#2622). `$crate`-rooted paths still resolve in full;
+    // the resolver needs each segment's owner for the next one.
+    let member_name = ctx.member_name;
+    for segment in resolve_rust_token_tree_paths_admitting(
+        ctx.rust,
+        ctx.support,
+        ctx.refs,
+        ctx.file,
+        ctx.source,
+        node,
+        &|name| name == member_name,
+    ) {
         if !matches!(
             segment.role,
             RustTokenPathRole::Call | RustTokenPathRole::Value
@@ -3470,8 +3606,22 @@ fn record_static_member_name_hit(name: Node<'_>, ctx: &mut MemberScanCtx<'_>) {
     );
 }
 
+/// The CodeUnit kind a scoped `Owner::name` candidate must have to be this
+/// target: a member answers a reference only from its own namespace. An
+/// associated type is class-kind since #2911, a method is function-kind, and
+/// every other member is field-kind.
+fn target_item_kind_matches(ctx: &MemberScanCtx<'_>) -> fn(&CodeUnit) -> bool {
+    if ctx.requested_target.is_function() {
+        CodeUnit::is_function
+    } else if ctx.target_is_associated_type {
+        CodeUnit::is_class
+    } else {
+        CodeUnit::is_field
+    }
+}
+
 fn static_member_role_matches_target(is_call: bool, ctx: &MemberScanCtx<'_>) -> bool {
-    ctx.target_is_enum_variant || !ctx.target_is_field || !is_call
+    ctx.target_is_enum_variant || !ctx.target_is_non_callable || !is_call
 }
 
 fn node_in_use_declaration(mut node: Node<'_>) -> bool {
@@ -3504,11 +3654,7 @@ fn structured_static_member_matches_target(
     if segments.len() == 1 && simple_node_text(segments[0], ctx.source).as_deref() == Some("Self") {
         return self_static_owner_matches_target(owner_node, token, ctx);
     }
-    let item_matches = if ctx.target_is_field {
-        CodeUnit::is_field
-    } else {
-        CodeUnit::is_function
-    };
+    let item_matches = target_item_kind_matches(ctx);
     let owner = exact_ast_owner(segments, token, ctx.owner_seeds, ctx)
         .or_else(|| exact_structured_static_owner(owner_node, token, segments, ctx))
         .or_else(|| {

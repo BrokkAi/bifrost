@@ -345,6 +345,20 @@ pub enum CodeQueryResultRef {
         protection: &'static str,
         proof: &'static str,
     },
+    ClassSetRow {
+        id: String,
+        path: String,
+        range: CodeQueryRange,
+        member: String,
+        status: &'static str,
+    },
+    AbsentMemberFinding {
+        id: String,
+        path: String,
+        range: CodeQueryRange,
+        member: String,
+        class: String,
+    },
     DetachedTaskTransfer {
         id: String,
         path: String,
@@ -610,6 +624,8 @@ impl CodeQueryResultRef {
             Self::NilnessOperation { .. } => "nilness_operation",
             Self::SwitchCoverage { .. } => "switch_coverage",
             Self::ConcurrentAccessConflict { .. } => "concurrent_access_conflict",
+            Self::ClassSetRow { .. } => "class_set_row",
+            Self::AbsentMemberFinding { .. } => "absent_member_finding",
             Self::DetachedTaskTransfer { .. } => "detached_task_transfer",
             Self::ProcedureEffect { .. } => "procedure_effect",
             Self::CallableSignature { .. } => "callable_signature",
@@ -681,6 +697,8 @@ impl CodeQueryResultRef {
             | Self::NilnessOperation { path, .. }
             | Self::SwitchCoverage { path, .. }
             | Self::ConcurrentAccessConflict { path, .. }
+            | Self::ClassSetRow { path, .. }
+            | Self::AbsentMemberFinding { path, .. }
             | Self::DetachedTaskTransfer { path, .. }
             | Self::ProcedureEffect { path, .. }
             | Self::CallableSignature { path, .. }

@@ -24,18 +24,20 @@ use crate::analyzer::{SignatureMetadata, StructuredTypeName};
 use brokk_bifrost_core::analyzer::structural::callable::ApplicabilityVerdict;
 use brokk_bifrost_core::analyzer::structural::callable::CallableRejectionReason;
 use brokk_bifrost_cpp::call_match::{
-    CppArgType, cpp_filter_candidates_by_args, cpp_forwarding_call_argument, cpp_literal_arg_type,
-    cpp_parameter_type_text, cpp_signature_param_types, cpp_signature_trailing_qualifiers,
-    cpp_type_text_pointer_depth, normalize_cpp_type_name,
+    CppArgType, CppRefQualifier, cpp_filter_candidates_by_args, cpp_forwarding_call_argument,
+    cpp_literal_arg_type, cpp_parameter_type_text, cpp_signature_param_types,
+    cpp_signature_ref_qualifier, cpp_signature_trailing_qualifiers, cpp_type_text_pointer_depth,
+    normalize_cpp_type_name,
 };
 use brokk_bifrost_cpp::graph::CppGraphSource;
+use brokk_bifrost_cpp::graph::extractor::{QualifiedReceiverBase, qualified_receiver_base};
 use brokk_bifrost_cpp::graph::resolver::{
     CppClassDeclarationStrength, OrdinaryMacroReferenceResolution,
     cpp_alias_declaration_names_function_type, cpp_alias_declaration_target_text,
     cpp_class_declaration_strength, cpp_field_declaration_names_function_type,
     cpp_member_using_declaration_scopes, cpp_qualified_name_has_scope_suffix,
     is_c_sizeof_expression_type_candidate, is_c_source_file, is_type_shaped_template_argument_name,
-    recovered_macro_decorated_declarator_type, same_logical_symbol,
+    recovered_macro_decorated_declarator_type, same_logical_symbol, same_visible_symbol,
 };
 use std::time::Instant;
 
@@ -1062,6 +1064,7 @@ impl CppBoundedProvider<'_> {
 fn cpp_bounded_canonical_type_candidates(
     provider: &CppBoundedProvider<'_>,
     file: &ProjectFile,
+    reference: Node<'_>,
     candidates: Vec<CodeUnit>,
 ) -> Vec<CodeUnit> {
     if !candidates
@@ -1081,7 +1084,12 @@ fn cpp_bounded_canonical_type_candidates(
         .into_iter()
         .filter_map(|candidate| {
             if cpp_unit_is_type_alias(provider.analyzer, &candidate) {
-                visibility.canonical_type_unit(&dispatch.source(), file, &candidate)
+                visibility.canonical_type_unit_in_context(
+                    &dispatch.source(),
+                    file,
+                    reference,
+                    &candidate,
+                )
             } else if candidate.is_class() {
                 Some(candidate)
             } else {
@@ -2059,6 +2067,7 @@ fn cpp_bounded_type_candidates(
             candidates = cpp_bounded_canonical_type_candidates(
                 provider,
                 file,
+                node,
                 provider.definitions_named(&candidate_fqn, name),
             );
             if !candidates.is_empty() {
@@ -2070,6 +2079,7 @@ fn cpp_bounded_type_candidates(
         candidates = cpp_bounded_canonical_type_candidates(
             provider,
             file,
+            node,
             provider.definitions_named(relative_fqn, name),
         );
     }
@@ -3075,7 +3085,7 @@ fn resolve_cpp_type(
                     visibility,
                     file,
                     context.bounded_support(),
-                    node.start_byte(),
+                    node,
                     unit,
                 ));
             }
@@ -3150,7 +3160,7 @@ fn resolve_cpp_type(
                                         visibility,
                                         file,
                                         context.bounded_support(),
-                                        node.start_byte(),
+                                        node,
                                         unit,
                                     ));
                                 }
@@ -3199,7 +3209,7 @@ fn resolve_cpp_type(
                     visibility,
                     file,
                     context.bounded_support(),
-                    node.start_byte(),
+                    node,
                     unit,
                 ));
             }
@@ -3277,7 +3287,7 @@ fn resolve_cpp_type(
                 .into_iter()
                 .flat_map(|unit| {
                     cpp_selected_type_definition_candidates(
-                        analyzer, visibility, file, support, unit,
+                        analyzer, visibility, file, support, node, unit,
                     )
                 })
                 .collect();
@@ -3327,6 +3337,7 @@ fn resolve_cpp_type(
                 visibility,
                 file,
                 context.bounded_support(),
+                node,
                 unit,
             ));
         }
@@ -3347,32 +3358,6 @@ fn resolve_cpp_type(
             ),
         );
     }
-    let orphaned_namespace = if recovered_declarator_type || node.kind() == "type_identifier" {
-        let mut root = node;
-        while let Some(parent) = root.parent() {
-            root = parent;
-        }
-        context
-            .cpp_orphaned_namespace_scopes(file, root, source)
-            .scope_at(node.start_byte())
-            .map(|(_, components)| components.to_vec())
-    } else {
-        None
-    };
-    if recovered_declarator_type && let Some(namespace) = orphaned_namespace.as_deref() {
-        let qualified = format!("::{}::{text}", namespace.join("::"));
-        if let Some(unit) = cpp_resolve_type_unit(analyzer, visibility, file, &qualified)
-            && visibility.external_type_candidate_visible_at(file, &unit, node.start_byte())
-        {
-            return candidates_outcome(cpp_selected_type_definition_candidates(
-                analyzer,
-                visibility,
-                file,
-                context.bounded_support(),
-                unit,
-            ));
-        }
-    }
     resolve_cpp_type_without_focused_qualifier(
         analyzer,
         token,
@@ -3383,7 +3368,6 @@ fn resolve_cpp_type(
         node,
         &text,
         class_ranges,
-        orphaned_namespace.as_deref(),
     )
 }
 
@@ -3504,7 +3488,6 @@ fn resolve_cpp_type_without_focused_qualifier(
     node: Node<'_>,
     text: &str,
     class_ranges: Option<&ClassRangeIndex>,
-    orphaned_namespace: Option<&[String]>,
 ) -> DefinitionLookupOutcome {
     let scope = AnalyzerQueryScope::new(analyzer);
     let dispatch = CppDispatch::new(analyzer, scope.token());
@@ -3662,12 +3645,7 @@ fn resolve_cpp_type_without_focused_qualifier(
                     .flat_map(|candidate| {
                         match visibility.resolve_template_arguments(file, candidate, &arguments) {
                             Ok(resolved) => cpp_type_definition_candidates(
-                                analyzer,
-                                visibility,
-                                file,
-                                support,
-                                node.start_byte(),
-                                resolved,
+                                analyzer, visibility, file, support, node, resolved,
                             ),
                             Err(error) => {
                                 specialization_failure = Some(error);
@@ -3781,14 +3759,7 @@ fn resolve_cpp_type_without_focused_qualifier(
                 None => Some(unit),
             };
             resolved.into_iter().flat_map(|unit| {
-                cpp_type_definition_candidates(
-                    analyzer,
-                    visibility,
-                    file,
-                    support,
-                    node.start_byte(),
-                    unit,
-                )
+                cpp_type_definition_candidates(analyzer, visibility, file, support, node, unit)
             })
         })
         .collect::<Vec<_>>();
@@ -3819,12 +3790,7 @@ fn resolve_cpp_type_without_focused_qualifier(
             },
         ) {
             return candidates_outcome(cpp_type_definition_candidates(
-                analyzer,
-                visibility,
-                file,
-                support,
-                node.start_byte(),
-                unit,
+                analyzer, visibility, file, support, node, unit,
             ));
         }
         // Only a genuinely-external qualified identifier reaches the include
@@ -3869,19 +3835,15 @@ fn resolve_cpp_type_without_focused_qualifier(
         );
         match lexical_resolution {
             CppLexicalTypeResolution::Resolved { unit, .. }
-                if visibility.external_type_candidate_visible_at(
+                if visibility.external_type_candidate_visible_in_context(
+                    &graph_source,
                     file,
                     &unit,
-                    node.start_byte(),
+                    node,
                 ) =>
             {
                 return candidates_outcome(cpp_type_definition_candidates(
-                    analyzer,
-                    visibility,
-                    file,
-                    support,
-                    node.start_byte(),
-                    unit,
+                    analyzer, visibility, file, support, node, unit,
                 ));
             }
             CppLexicalTypeResolution::Ambiguous => {
@@ -3892,44 +3854,6 @@ fn resolve_cpp_type_without_focused_qualifier(
                 ));
             }
             CppLexicalTypeResolution::Missing => {
-                // An error-marked namespace can end early in tree-sitter's
-                // CST while its unmatched closing brace still gives the
-                // physical scope boundary. Retry that exact recovered scope
-                // only after ordinary class/namespace lookup misses, so a
-                // real nearer declaration remains authoritative.
-                if let Some(scope) = orphaned_namespace {
-                    match visibility.resolve_type_components_lexically_for_forward(
-                        &graph_source,
-                        file,
-                        &[text.to_string()],
-                        false,
-                        scope,
-                    ) {
-                        CppLexicalTypeResolution::Resolved { unit, .. }
-                            if visibility.external_type_candidate_visible_at(
-                                file,
-                                &unit,
-                                node.start_byte(),
-                            ) =>
-                        {
-                            return candidates_outcome(cpp_type_definition_candidates(
-                                analyzer,
-                                visibility,
-                                file,
-                                support,
-                                node.start_byte(),
-                                unit,
-                            ));
-                        }
-                        CppLexicalTypeResolution::Ambiguous => {
-                            return ambiguous_without_candidates(format!(
-                                "`{text}` resolves ambiguously in its recovered C++ namespace"
-                            ));
-                        }
-                        CppLexicalTypeResolution::Resolved { .. }
-                        | CppLexicalTypeResolution::Missing => {}
-                    }
-                }
                 if cpp_active_block_tag_type_node(node, text, source).is_some() {
                     return no_definition(
                         "unresolved_local_type",
@@ -3961,12 +3885,7 @@ fn resolve_cpp_type_without_focused_qualifier(
                             ) =>
                         {
                             return candidates_outcome(cpp_type_definition_candidates(
-                                analyzer,
-                                visibility,
-                                file,
-                                support,
-                                node.start_byte(),
-                                unit,
+                                analyzer, visibility, file, support, node, unit,
                             ));
                         }
                         CppLexicalTypeResolution::Ambiguous => {
@@ -4000,24 +3919,20 @@ fn resolve_cpp_type_without_focused_qualifier(
             |unit: &CodeUnit| unit.is_class() || cpp_unit_is_type_alias(analyzer, unit);
         if let Some(unit) =
             resolve_in_enclosing_scopes(analyzer, file, text, node.start_byte(), |unit| {
-                accepts_type(unit) && visibility.is_physically_visible(file, unit)
+                accepts_type(unit)
+                    && visibility.external_type_candidate_visible_in_context(
+                        &graph_source,
+                        file,
+                        unit,
+                        node,
+                    )
             })
             .or_else(|| {
                 resolve_in_enclosing_scopes(analyzer, file, text, node.start_byte(), accepts_type)
             })
         {
-            let candidates = if cpp_unit_is_type_alias(analyzer, &unit) {
-                vec![unit]
-            } else {
-                cpp_type_definition_candidates(
-                    analyzer,
-                    visibility,
-                    file,
-                    support,
-                    node.start_byte(),
-                    unit,
-                )
-            };
+            let candidates =
+                cpp_type_definition_candidates(analyzer, visibility, file, support, node, unit);
             return candidates_outcome(candidates);
         }
     }
@@ -4033,12 +3948,7 @@ fn resolve_cpp_type_without_focused_qualifier(
             && visibility.external_type_candidate_visible_at(file, &unit, node.start_byte())
         {
             return candidates_outcome(cpp_type_definition_candidates(
-                analyzer,
-                visibility,
-                file,
-                support,
-                node.start_byte(),
-                unit,
+                analyzer, visibility, file, support, node, unit,
             ));
         }
         let namespace = cpp_lexical_namespace(node, source);
@@ -4061,14 +3971,7 @@ fn resolve_cpp_type_without_focused_qualifier(
             let candidates = candidates
                 .into_iter()
                 .flat_map(|unit| {
-                    cpp_type_definition_candidates(
-                        analyzer,
-                        visibility,
-                        file,
-                        support,
-                        node.start_byte(),
-                        unit,
-                    )
+                    cpp_type_definition_candidates(analyzer, visibility, file, support, node, unit)
                 })
                 .collect();
             return candidates_outcome(candidates);
@@ -4905,12 +4808,13 @@ fn cpp_type_definition_candidates(
     visibility: &CppVisibilityIndex,
     file: &ProjectFile,
     support: &dyn BoundedDefinitionLookup,
-    reference_byte: usize,
+    reference: Node<'_>,
     unit: CodeUnit,
 ) -> Vec<CodeUnit> {
+    let reference_byte = reference.start_byte();
     let unit =
         cpp_reachable_identical_alias(analyzer, visibility, file, support, &unit).unwrap_or(unit);
-    let target = cpp_navigation_type_target(analyzer, visibility, file, unit);
+    let target = cpp_navigation_type_target(analyzer, visibility, file, reference, unit);
     let dispatch = CppDispatch::new(analyzer, visibility.token());
     let graph_source = dispatch.source();
     let is_complete_class = |candidate: &CodeUnit| {
@@ -5100,11 +5004,12 @@ fn cpp_selected_type_definition_candidates(
     visibility: &CppVisibilityIndex,
     file: &ProjectFile,
     support: &dyn BoundedDefinitionLookup,
+    reference: Node<'_>,
     unit: CodeUnit,
 ) -> Vec<CodeUnit> {
     let unit =
         cpp_reachable_identical_alias(analyzer, visibility, file, support, &unit).unwrap_or(unit);
-    let target = cpp_navigation_type_target(analyzer, visibility, file, unit);
+    let target = cpp_navigation_type_target(analyzer, visibility, file, reference, unit);
     let indexed = support
         .fqn(&target.fq_name())
         .into_iter()
@@ -5124,6 +5029,7 @@ fn cpp_navigation_type_target(
     analyzer: &dyn IAnalyzer,
     visibility: &CppVisibilityIndex,
     file: &ProjectFile,
+    reference: Node<'_>,
     unit: CodeUnit,
 ) -> CodeUnit {
     if !cpp_unit_is_type_alias(analyzer, &unit) {
@@ -5132,7 +5038,7 @@ fn cpp_navigation_type_target(
     let scope = AnalyzerQueryScope::new(analyzer);
     let dispatch = CppDispatch::new(analyzer, scope.token());
     visibility
-        .canonical_type_unit(&dispatch.source(), file, &unit)
+        .canonical_type_unit_in_context(&dispatch.source(), file, reference, &unit)
         .unwrap_or(unit)
 }
 
@@ -5757,7 +5663,7 @@ fn cpp_bare_call_target_outcome(
                 ctx.visibility,
                 ctx.file,
                 ctx.support,
-                call.start_byte(),
+                call,
                 unit,
             );
             Some(candidates_outcome(owners))
@@ -5940,7 +5846,7 @@ fn resolve_cpp_construction_type(
                         ctx.visibility,
                         ctx.file,
                         ctx.support,
-                        type_node.start_byte(),
+                        type_node,
                         unit,
                     )),
                     Err(error) => {
@@ -5962,7 +5868,7 @@ fn resolve_cpp_construction_type(
                 ctx.visibility,
                 ctx.file,
                 ctx.support,
-                type_node.start_byte(),
+                type_node,
                 unit,
             ));
         }
@@ -5998,7 +5904,7 @@ fn resolve_cpp_construction_type(
                 ctx.visibility,
                 ctx.file,
                 ctx.support,
-                type_node.start_byte(),
+                type_node,
                 unit,
             )
         })
@@ -6024,7 +5930,6 @@ fn resolve_cpp_construction_type(
         type_node,
         &text,
         ctx.class_ranges,
-        None,
     )
 }
 
@@ -6079,7 +5984,13 @@ fn resolve_cpp_field(
     // base walk that actually came up empty (#1833). The bounded provider
     // already draws this line; use its vocabulary.
     let receiver_resolved = !owners.is_empty();
-    let candidates = cpp_member_candidates(ctx, token, owners, member, arity, arg_types);
+    let mut candidates = cpp_member_candidates(ctx, token, owners, member, arity, arg_types);
+    if cpp_receiver_is_proven_lvalue(receiver, ctx.source) {
+        candidates.retain(|candidate| {
+            candidate.signature().and_then(cpp_signature_ref_qualifier)
+                != Some(CppRefQualifier::Rvalue)
+        });
+    }
     if candidates.is_empty() {
         if let Some(owner_name) = external_owner_name
             && let Some(cpp) = resolve_analyzer::<CppAnalyzer>(ctx.analyzer)
@@ -6118,6 +6029,30 @@ fn resolve_cpp_field(
         } else {
             candidates_outcome(candidates)
         }
+    }
+}
+
+/// Whether the receiver expression is structurally guaranteed to be an
+/// lvalue. An rvalue-ref-qualified member is not viable for these receivers;
+/// expressions whose value category depends on a declaration stay unknown.
+fn cpp_receiver_is_proven_lvalue(receiver: Node<'_>, source: &str) -> bool {
+    match receiver.kind() {
+        "identifier" | "this" => true,
+        "field_expression" => {
+            cpp_field_expression_uses_arrow(receiver, source)
+                || receiver
+                    .child_by_field_name("argument")
+                    .or_else(|| receiver.named_child(0))
+                    .is_some_and(|inner| cpp_receiver_is_proven_lvalue(inner, source))
+        }
+        "parenthesized_expression" => receiver
+            .child_by_field_name("expression")
+            .or_else(|| receiver.named_child(0))
+            .is_some_and(|inner| cpp_receiver_is_proven_lvalue(inner, source)),
+        "pointer_expression" => receiver
+            .child_by_field_name("operator")
+            .is_some_and(|operator| cpp_node_text(operator, source) == "*"),
+        _ => false,
     }
 }
 
@@ -7905,10 +7840,12 @@ fn cpp_field_expression_type(
         None,
         None,
     );
-    candidates
-        .into_iter()
-        .filter(|unit| unit.is_field())
-        .find_map(|unit| cpp_field_declared_type(analyzer, visibility, file, &unit))
+    cpp_unanimous_field_type(
+        analyzer,
+        visibility,
+        file,
+        candidates.iter().filter(|unit| unit.is_field()),
+    )
 }
 
 fn cpp_field_declared_type(
@@ -8021,7 +7958,30 @@ fn cpp_receiver_type_units(
         .and_then(|cpp_type| cpp_type.unit)
         .into_iter()
         .collect(),
-        "parenthesized_expression" | "pointer_expression" => receiver
+        // `ns::value.member`: a variable named by a qualified path carries its
+        // declared type; a type path spelled as a receiver is the type itself.
+        "qualified_identifier" => {
+            match qualified_receiver_base(ctx.visibility, ctx.file, receiver, ctx.source) {
+                QualifiedReceiverBase::Variable(fields) => {
+                    cpp_unanimous_field_type(ctx.analyzer, ctx.visibility, ctx.file, fields.iter())
+                        .and_then(|cpp_type| {
+                            cpp_receiver_unit_for_access(
+                                ctx,
+                                token,
+                                cpp_type,
+                                unwrap_template_alias,
+                            )
+                        })
+                        .into_iter()
+                        .collect()
+                }
+                QualifiedReceiverBase::Type(unit) => unit.into_iter().collect(),
+                QualifiedReceiverBase::Ambiguous => Vec::new(),
+            }
+        }
+        // `items[i].member` reads the member off an element of `items`, whose
+        // declared array or pointer type names the element type.
+        "parenthesized_expression" | "pointer_expression" | "subscript_expression" => receiver
             .child_by_field_name("argument")
             .or_else(|| receiver.named_child(0))
             .map(|inner| {
@@ -8030,6 +7990,40 @@ fn cpp_receiver_type_units(
             .unwrap_or_default(),
         _ => Vec::new(),
     }
+}
+
+/// The one declared type the field declarations agree on.
+///
+/// A member name can reach several declarations: the redeclarations of one
+/// variable, or a field declared on more than one base of the receiver's
+/// class. The receiver is typed only when every declaration that resolves
+/// names the same type; otherwise any type would be a guess, and the receiver
+/// stays untyped (#2547).
+fn cpp_unanimous_field_type<'a>(
+    analyzer: &dyn IAnalyzer,
+    visibility: &CppVisibilityIndex,
+    file: &ProjectFile,
+    fields: impl Iterator<Item = &'a CodeUnit>,
+) -> Option<CppType> {
+    let mut agreed: Option<CppType> = None;
+    for field in fields {
+        let Some(cpp_type) = cpp_field_declared_type(analyzer, visibility, file, field) else {
+            continue;
+        };
+        let Some(existing) = &agreed else {
+            agreed = Some(cpp_type);
+            continue;
+        };
+        let same = match (&existing.unit, &cpp_type.unit) {
+            (Some(left), Some(right)) => same_visible_symbol(left, right),
+            (None, None) => existing.name == cpp_type.name,
+            _ => false,
+        };
+        if !same {
+            return None;
+        }
+    }
+    agreed
 }
 
 /// The type of a bare value name at `node`: the local or parameter binding when
@@ -8616,10 +8610,13 @@ fn cpp_enclosing_member_field_type(
         root,
         class_ranges: None,
     };
-    cpp_member_candidates(ctx, token, vec![owner], name, None, None)
-        .into_iter()
-        .filter(|unit| unit.is_field())
-        .find_map(|unit| cpp_field_declared_type(analyzer, visibility, file, &unit))
+    let candidates = cpp_member_candidates(ctx, token, vec![owner], name, None, None);
+    cpp_unanimous_field_type(
+        analyzer,
+        visibility,
+        file,
+        candidates.iter().filter(|unit| unit.is_field()),
+    )
 }
 
 const CPP_SCOPE_NODES: &[&str] = &[

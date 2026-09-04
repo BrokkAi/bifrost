@@ -39,7 +39,7 @@ pub(crate) fn collect_kotlin_semantic_diagnostics(
         file,
         source,
         realm,
-        &JvmOverlayModel(analyzer.semantic_model_overlay()),
+        &JvmOverlayModel::new(analyzer),
     );
     crate::analyzer::semantic_model::degrade_pack_gap_absences(analyzer, report)
 }

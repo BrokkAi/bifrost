@@ -4,28 +4,61 @@
 //! Graph construction, abrupt-completion routing, cleanup specialization, and
 //! physical adjacency storage remain owned by the shared semantic substrate.
 
+use brokk_bifrost_core::analyzer::model::StructuredTypeIdentity;
+use brokk_bifrost_core::analyzer::tree_walk::ParentIndex;
+use brokk_bifrost_cpp::call_match::cpp_literal_arg_type;
+use brokk_bifrost_cpp::declarations::{
+    cpp_callable_declaration_return_type_identity, cpp_declaration_type_identity,
+};
 use brokk_bifrost_cpp::raii::CppTemporaryFreeCallIndex;
 use tree_sitter::Node;
 
+use crate::analyzer::cpp::external::{
+    CppExternalTypeModelResolution, external_structured_type_model_resolution,
+};
 use crate::analyzer::lexical_definitions::formal_parameter_slots_for_owner;
 use crate::analyzer::semantic::cfg::{
     CompletionKind, CompletionRequest, ProcedureCfgBuilder, ScopeBinding, ScopeFrameId,
 };
 use crate::analyzer::semantic::service::{ProgramSemanticsLowerer, SemanticAdapterIdentity};
 use crate::analyzer::semantic::*;
+use crate::analyzer::semantic_model::{
+    ImplicitOperation, SemanticModelMemberTargetDisposition, TypeMoveSemantics,
+};
 use crate::analyzer::tree_sitter_analyzer::{
     PreparedSyntaxTree, WalkControl, try_walk_named_tree_preorder,
 };
-use crate::analyzer::{CppAnalyzer, Language, ProjectFile};
+use crate::analyzer::{CppAnalyzer, IAnalyzer, Language, ProjectFile};
 use crate::hash::{HashMap, HashSet};
 
-const ADAPTER_VERSION: &[u8] = b"cpp-cfg-values-v7";
+const ADAPTER_VERSION: &[u8] = b"cpp-cfg-values-v11";
 
-impl_program_semantics_provider!(CppAnalyzer, CppSemanticLowerer);
+impl_program_semantics_provider!(CppAnalyzer, |analyzer| CppSemanticLowerer::new(analyzer));
 
-struct CppSemanticLowerer;
+struct CppSemanticLowerer<'a> {
+    analyzer: &'a CppAnalyzer,
+    dependencies: DependencyFingerprint,
+}
 
-impl ProgramSemanticsLowerer for CppSemanticLowerer {
+impl<'a> CppSemanticLowerer<'a> {
+    fn new(analyzer: &'a CppAnalyzer) -> Self {
+        let dependencies = analyzer.active_semantic_model_snapshot().map_or_else(
+            || DependencyFingerprint::hash_bytes(b"no-intrafile-dependencies"),
+            |snapshot| {
+                let mut identity = b"cpp-semantic-model-set-v1\0".to_vec();
+                identity
+                    .extend_from_slice(snapshot.active_models().active_model_set_hash().as_bytes());
+                DependencyFingerprint::hash_bytes(&identity)
+            },
+        );
+        Self {
+            analyzer,
+            dependencies,
+        }
+    }
+}
+
+impl ProgramSemanticsLowerer for CppSemanticLowerer<'_> {
     fn identity(&self) -> SemanticAdapterIdentity {
         SemanticAdapterIdentity {
             adapter: AdapterSemanticsVersion::hash_bytes("cpp", ADAPTER_VERSION)
@@ -33,7 +66,7 @@ impl ProgramSemanticsLowerer for CppSemanticLowerer {
             configuration: ConfigurationFingerprint::hash_bytes(
                 b"cpp-intrafile-execution-defaults-v1",
             ),
-            dependencies: DependencyFingerprint::hash_bytes(b"no-intrafile-dependencies"),
+            dependencies: self.dependencies,
         }
     }
 
@@ -82,6 +115,8 @@ impl ProgramSemanticsLowerer for CppSemanticLowerer {
             cancellation,
             |spec, staged_budget, cancellation| {
                 lower_procedure(
+                    self.analyzer,
+                    file,
                     prepared,
                     spec,
                     &member_declarations,
@@ -1158,7 +1193,10 @@ struct GapFact {
 }
 
 struct LoweringContext<'tree, 'targets> {
+    analyzer: &'targets CppAnalyzer,
+    file: &'targets ProjectFile,
     source: &'tree str,
+    ancestry: ParentIndex<'tree>,
     session: ProcedureLoweringSession<'targets>,
     expression_values: HashMap<usize, ValueId>,
     parameters: HashMap<Box<str>, ValueId>,
@@ -1189,6 +1227,19 @@ struct LoweringContext<'tree, 'targets> {
     /// type by name. This is what lets `holder.tainted` find the `Holder`
     /// declaration that owns `tainted`.
     binding_type_names: HashMap<ValueId, Box<str>>,
+    /// Parser-derived declared type shape for each binding. Unlike the display
+    /// name above, this retains qualification, template arguments, and
+    /// pointer/reference category for resolver-backed value semantics.
+    binding_type_identities: HashMap<ValueId, StructuredTypeIdentity>,
+    /// Exact active semantic-model owner ids proved by C++ resolution for the
+    /// corresponding declared type occurrence.
+    binding_model_type_ids: HashMap<ValueId, Box<str>>,
+    /// Parameters eligible for C++'s implicit-move return rule. This set is
+    /// limited to non-const by-value parameters; named locals remain declined
+    /// because NRVO makes their selected transfer conditional.
+    implicit_move_return_parameters: HashSet<ValueId>,
+    /// Exact modeled owner of this procedure's by-value return type.
+    return_model_type_id: Option<Box<str>>,
     /// One value per distinct constant subscript spelling in this procedure.
     ///
     /// An element location is identified by its base and index *values*, so
@@ -1241,7 +1292,55 @@ struct LocalBinding {
     value: ValueId,
 }
 
+#[derive(Debug, Clone)]
+struct ExactModeledTransfer {
+    source: ValueId,
+    operation: ExactModeledOperation,
+    kind: TransferKind,
+    owner_id: Box<str>,
+    member_id: Box<str>,
+    parameter_count: u32,
+}
+
+/// The implicit value operation an exact modeled transfer lowers to.
+/// Only operations this adapter can prove exactly are admitted; the selector
+/// declines everything else into typed gaps rather than guessing between
+/// overloads, conversions, and elision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExactModeledOperation {
+    CopyConstructor,
+    MoveConstructor,
+    ValuePreservingConstructor,
+    CopyAssignment,
+}
+
+impl ExactModeledOperation {
+    fn implicit_operation(self) -> ImplicitOperation {
+        match self {
+            Self::CopyConstructor => ImplicitOperation::CopyConstructor,
+            Self::MoveConstructor => ImplicitOperation::MoveConstructor,
+            Self::ValuePreservingConstructor => ImplicitOperation::ValuePreservingConstructor,
+            Self::CopyAssignment => ImplicitOperation::CopyAssignment,
+        }
+    }
+
+    const fn transfer_kind(self) -> TransferKind {
+        match self {
+            Self::CopyConstructor | Self::CopyAssignment => TransferKind::Copy,
+            Self::MoveConstructor => TransferKind::Move {
+                invalidation: MoveInvalidation::Invalidated,
+            },
+            Self::ValuePreservingConstructor => TransferKind::Conversion {
+                preservation: ValuePreservation::Preserving,
+            },
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn lower_procedure<'tree, 'targets>(
+    analyzer: &'targets CppAnalyzer,
+    file: &'targets ProjectFile,
     prepared: &'tree PreparedSyntaxTree,
     spec: &ProcedureSpec<'tree>,
     member_declarations: &'targets MemberDeclarations,
@@ -1276,7 +1375,10 @@ fn lower_procedure<'tree, 'targets>(
         spec.noexcept == NoexceptSpecification::Unconditional,
     )?;
     let mut context = LoweringContext {
+        analyzer,
+        file,
         source: prepared.source(),
+        ancestry: ParentIndex::new(prepared.tree().root_node()),
         session,
         expression_values: HashMap::default(),
         parameters: HashMap::default(),
@@ -1289,6 +1391,10 @@ fn lower_procedure<'tree, 'targets>(
         array_bindings: HashSet::default(),
         fundamental_storage_bindings: HashSet::default(),
         binding_type_names: HashMap::default(),
+        binding_type_identities: HashMap::default(),
+        binding_model_type_ids: HashMap::default(),
+        implicit_move_return_parameters: HashSet::default(),
+        return_model_type_id: None,
         constant_index_values: HashMap::default(),
         receiver: None,
         is_c_source,
@@ -1306,6 +1412,12 @@ fn lower_procedure<'tree, 'targets>(
         raii_possible: spec.has_raii_boundaries,
         vla_possible: spec.has_vla_boundaries,
     };
+    context.return_model_type_id = cpp_callable_declaration_return_type_identity(
+        spec.callable,
+        context.source,
+        &context.ancestry,
+    )
+    .and_then(|identity| context.resolved_model_owner(&identity));
 
     context.emit_procedure_inputs(
         &mut builder,
@@ -1552,6 +1664,22 @@ fn lower_procedure<'tree, 'targets>(
 }
 
 impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
+    /// Resolve a parser-derived type occurrence through the active generated
+    /// header model. No model id is derived from rendered source text.
+    fn resolved_model_owner(&self, identity: &StructuredTypeIdentity) -> Option<Box<str>> {
+        let overlay = self.analyzer.semantic_model_overlay();
+        match external_structured_type_model_resolution(
+            self.analyzer,
+            overlay.as_deref(),
+            self.file,
+            identity,
+        ) {
+            CppExternalTypeModelResolution::Unique(owner_id) => Some(owner_id.into_boxed_str()),
+            CppExternalTypeModelResolution::Incomplete
+            | CppExternalTypeModelResolution::Conflict => None,
+        }
+    }
+
     fn emit_procedure_inputs(
         &mut self,
         builder: &mut ProcedureCfgBuilder,
@@ -1577,6 +1705,8 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             let mapping_node =
                 cpp_formal_name_node(declaration, self.source, &slot.names).unwrap_or(declaration);
             let metadata = self.value_mapping(builder, mapping_node)?;
+            let parameter_name = slot.unique_name().map(Box::<str>::from);
+            let passing_mode = slot.passing_mode;
             let value = if slot.receiver {
                 let value = self.session.add_value_with_metadata(
                     builder,
@@ -1593,6 +1723,8 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     SemanticValueKind::Parameter {
                         ordinal,
                         multiplicity: formal_multiplicity(slot.variadic),
+                        name: parameter_name,
+                        passing_mode,
                     },
                 )?;
                 ordinal = ordinal.checked_add(1).ok_or_else(|| {
@@ -1608,6 +1740,20 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     self.binding_type_names.insert(value, type_name);
                 }
                 if let Some(declarator) = declaration.child_by_field_name("declarator") {
+                    if cpp_parameter_is_nonconst_by_value(declaration, declarator, self.source) {
+                        self.implicit_move_return_parameters.insert(value);
+                    }
+                    if let Some(identity) = cpp_declaration_type_identity(
+                        declaration,
+                        declarator,
+                        self.source,
+                        &self.ancestry,
+                    ) {
+                        if let Some(owner_id) = self.resolved_model_owner(&identity) {
+                            self.binding_model_type_ids.insert(value, owner_id);
+                        }
+                        self.binding_type_identities.insert(value, identity);
+                    }
                     if cpp_declarator_contains_kind(declarator, "pointer_declarator") {
                         self.pointer_bindings.insert(value);
                     }
@@ -1739,6 +1885,14 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 if let Some(type_name) = declared_type_name(self.source, node) {
                     self.binding_type_names.insert(value, type_name);
                 }
+                if let Some(identity) =
+                    cpp_declaration_type_identity(node, declarator, self.source, &self.ancestry)
+                {
+                    if let Some(owner_id) = self.resolved_model_owner(&identity) {
+                        self.binding_model_type_ids.insert(value, owner_id);
+                    }
+                    self.binding_type_identities.insert(value, identity);
+                }
                 self.locals
                     .entry(name.into())
                     .or_default()
@@ -1782,6 +1936,14 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         }
         if let Some(type_name) = declared_type_name(self.source, parameter) {
             self.binding_type_names.insert(value, type_name);
+        }
+        if let Some(identity) =
+            cpp_declaration_type_identity(parameter, declarator, self.source, &self.ancestry)
+        {
+            if let Some(owner_id) = self.resolved_model_owner(&identity) {
+                self.binding_model_type_ids.insert(value, owner_id);
+            }
+            self.binding_type_identities.insert(value, identity);
         }
         self.locals
             .entry(name.into())
@@ -1833,6 +1995,288 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         } else {
             ValueFlowKind::Parameter
         }
+    }
+
+    /// Select an exact modeled value transfer from an identifier operand.
+    ///
+    /// This first tranche deliberately admits only an identifier lvalue. More
+    /// complex expressions need their own value-category proof; treating a
+    /// call or cast as a copy here would guess between copy, move, conversion,
+    /// and elision. The source and target must resolve to the same exact model
+    /// owner, and that owner must publish one complete operation record.
+    fn exact_modeled_transfer(
+        &self,
+        target: ValueId,
+        source_node: Node<'tree>,
+        operation: ExactModeledOperation,
+    ) -> Option<ExactModeledTransfer> {
+        if source_node.kind() != "identifier" {
+            return None;
+        }
+        let source_name = nonempty_node_text(self.source, source_node)?;
+        let source = self.binding_value(source_name, source_node.start_byte())?;
+        let owner_id = self.binding_model_type_ids.get(&target)?;
+        if self.binding_model_type_ids.get(&source) != Some(owner_id) {
+            return None;
+        }
+        self.exact_modeled_transfer_on_owner(source, owner_id, operation)
+    }
+
+    fn exact_modeled_transfer_on_owner(
+        &self,
+        source: ValueId,
+        owner_id: &str,
+        operation: ExactModeledOperation,
+    ) -> Option<ExactModeledTransfer> {
+        let overlay = self.analyzer.semantic_model_overlay()?;
+        if operation == ExactModeledOperation::MoveConstructor {
+            let owners = overlay.symbols_with_id(owner_id);
+            let [owner] = owners.records.as_slice() else {
+                return None;
+            };
+            if owner
+                .value_semantics
+                .as_ref()
+                .and_then(|semantics| semantics.move_semantics)
+                != Some(TypeMoveSemantics::Invalidating)
+            {
+                return None;
+            }
+        }
+        let matched =
+            overlay.implicit_member_target_on_owner(owner_id, &operation.implicit_operation());
+        if matched.disposition != SemanticModelMemberTargetDisposition::Unique {
+            return None;
+        }
+        let [member] = matched.records.as_slice() else {
+            return None;
+        };
+        let parameter_count =
+            u32::try_from(member.structured_signature.as_ref()?.parameters.len()).ok()?;
+        Some(ExactModeledTransfer {
+            source,
+            operation,
+            kind: operation.transfer_kind(),
+            owner_id: owner_id.into(),
+            member_id: member.id.clone().into_boxed_str(),
+            parameter_count,
+        })
+    }
+
+    /// Select the canonical one-argument character-data constructor for a
+    /// narrow C++ string literal. Literal type classification is shared with
+    /// overload resolution so encoded wide strings and unsupported literal
+    /// forms cannot acquire the `char const*` operation by AST kind alone.
+    fn exact_modeled_character_data_construction(
+        &self,
+        owner_id: &str,
+        source_node: Node<'tree>,
+        source: ValueId,
+    ) -> Option<ExactModeledTransfer> {
+        let literal = cpp_literal_arg_type(source_node, self.source)?;
+        if literal.name != "char"
+            || literal.unit.is_some()
+            || literal.indirection != 1
+            || !literal.pointee_const
+        {
+            return None;
+        }
+        self.exact_modeled_transfer_on_owner(
+            source,
+            owner_id,
+            ExactModeledOperation::ValuePreservingConstructor,
+        )
+    }
+
+    /// Select an exact modeled copy constructor for `target = initializer`.
+    fn exact_modeled_copy_initialization(
+        &self,
+        target: ValueId,
+        initializer: Node<'tree>,
+    ) -> Option<ExactModeledTransfer> {
+        self.exact_modeled_transfer(target, initializer, ExactModeledOperation::CopyConstructor)
+    }
+
+    /// Select an exact modeled copy assignment for `target = source`.
+    ///
+    /// The caller has already established that the assignment operator is the
+    /// direct `=` token and that its left operand is an identifier. Keeping the
+    /// right operand gate here makes the exact transfer impossible to reach for
+    /// a call, cast, member access, or other expression whose value category is
+    /// not proved by this adapter.
+    fn exact_modeled_copy_assignment(
+        &self,
+        target: ValueId,
+        source: Node<'tree>,
+    ) -> Option<ExactModeledTransfer> {
+        self.exact_modeled_transfer(target, source, ExactModeledOperation::CopyAssignment)
+    }
+
+    /// Select the parameter arm of C++ implicit move for an exact modeled
+    /// by-value return. Named locals are intentionally excluded because NRVO
+    /// makes their object-transfer identity conditional.
+    fn exact_modeled_parameter_return(
+        &self,
+        returned: Node<'tree>,
+    ) -> Option<ExactModeledTransfer> {
+        if returned.kind() != "identifier" {
+            return None;
+        }
+        let name = nonempty_node_text(self.source, returned)?;
+        let source = self.binding_value(name, returned.start_byte())?;
+        if !self.implicit_move_return_parameters.contains(&source) {
+            return None;
+        }
+        let return_owner = self.return_model_type_id.as_ref()?;
+        if self.binding_model_type_ids.get(&source) != Some(return_owner) {
+            return None;
+        }
+        self.exact_modeled_transfer(source, returned, ExactModeledOperation::MoveConstructor)
+    }
+
+    fn modeled_transfer_locator(
+        &self,
+        transfer: &ExactModeledTransfer,
+    ) -> Result<SemanticLocator, CppLoweringError> {
+        let position = SourcePosition::new(0, 0, 0);
+        let anchor = SourceAnchor::new(
+            SourceSpan::new(position, position)
+                .map_err(|error| CppLoweringError::Invalid(error.to_string()))?,
+            0,
+        );
+        let owner = DeclarationSegment::named(
+            DeclarationSegmentKind::Type,
+            transfer.owner_id.to_string(),
+            anchor,
+            0,
+        )
+        .map_err(|error| CppLoweringError::Invalid(error.to_string()))?;
+        let member = DeclarationSegment::named(
+            match transfer.operation {
+                ExactModeledOperation::CopyConstructor
+                | ExactModeledOperation::MoveConstructor
+                | ExactModeledOperation::ValuePreservingConstructor => {
+                    DeclarationSegmentKind::Constructor
+                }
+                ExactModeledOperation::CopyAssignment => DeclarationSegmentKind::Method,
+            },
+            transfer.member_id.to_string(),
+            anchor,
+            transfer.parameter_count,
+        )
+        .map_err(|error| CppLoweringError::Invalid(error.to_string()))?;
+        let declaration = DeclarationLocator::new(vec![owner, member])
+            .map_err(|error| CppLoweringError::Invalid(error.to_string()))?;
+        Ok(SemanticLocator::new(
+            unmaterialized_external_mount(),
+            unmaterialized_external_path(),
+            SemanticLanguage::Standard(Language::Cpp),
+            declaration,
+            SemanticRole::Procedure,
+            anchor,
+        ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn emit_exact_modeled_transfer(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        point: ProgramPointId,
+        next: EdgeTarget,
+        scope: ScopeFrameId,
+        operation_node: Node<'tree>,
+        target: ValueId,
+        assignment_result: Option<ValueId>,
+        transfer: ExactModeledTransfer,
+    ) -> Result<(), CppLoweringError> {
+        let locator = self.modeled_transfer_locator(&transfer)?;
+        let resolution = CallableTargetResolution::Proven(CallableTarget::External(locator));
+        let callee = self.source_value(builder, operation_node, SemanticValueKind::Callable)?;
+        let thrown = self.source_value(builder, operation_node, SemanticValueKind::Exception)?;
+        let exceptional = self.point(builder, operation_node, Vec::new())?;
+        let metadata = self.metadata(point)?;
+        let (callable_kind, bound_receiver) = match transfer.operation {
+            ExactModeledOperation::CopyConstructor
+            | ExactModeledOperation::MoveConstructor
+            | ExactModeledOperation::ValuePreservingConstructor => {
+                (CallableReferenceKind::Constructor, None)
+            }
+            ExactModeledOperation::CopyAssignment => {
+                (CallableReferenceKind::BoundMethod, Some(target))
+            }
+        };
+        self.append_effect(
+            builder,
+            point,
+            SemanticEffect::CallableReference {
+                result: callee,
+                callable: CallableValue {
+                    kind: callable_kind,
+                    targets: resolution.clone(),
+                    target_evidence: metadata.evidence,
+                    bound_receiver,
+                    environment: None,
+                },
+            },
+        )?;
+        let call_site = self.session.add_call_site(
+            builder,
+            CallSiteScaffold {
+                point,
+                callee,
+                receiver: Some(target),
+                arguments: vec![SemanticCallArgument::direct(
+                    transfer.source,
+                    ArgumentDomain::Positional,
+                )]
+                .into_boxed_slice(),
+                normal_results: Box::new([]),
+                result: Some(target),
+                thrown: Some(thrown),
+                declared_targets: resolution,
+                normal_continuation: next.point,
+                exceptional_continuation: exceptional,
+            },
+        )?;
+        self.append_effect(
+            builder,
+            point,
+            SemanticEffect::Assignment {
+                target,
+                value: transfer.source,
+            },
+        )?;
+        self.append_effect(
+            builder,
+            point,
+            SemanticEffect::ValueFlow {
+                kind: ValueFlowKind::Transfer(ValueTransfer {
+                    kind: transfer.kind,
+                    operation: TransferOperation::CallSite(call_site),
+                }),
+                source: transfer.source,
+                target,
+            },
+        )?;
+        if let Some(assignment_result) = assignment_result {
+            self.append_effect(
+                builder,
+                point,
+                SemanticEffect::Assignment {
+                    target: assignment_result,
+                    value: target,
+                },
+            )?;
+        }
+        self.edge(
+            builder,
+            point,
+            EdgeTarget {
+                point: exceptional,
+                kind: ControlEdgeKind::Exceptional,
+            },
+        )?;
+        self.abrupt(builder, exceptional, scope, CompletionKind::Throw, None)
     }
 
     fn expression_value(
@@ -2562,6 +3006,8 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         builder: &mut ProcedureCfgBuilder,
         declaration: Node<'tree>,
         terminal: ProgramPointId,
+        next: EdgeTarget,
+        scope: ScopeFrameId,
     ) -> Result<(), CppLoweringError> {
         for declarator in cpp_local_declarators(declaration) {
             let initializer = cpp_declarator_initializer(declaration, declarator);
@@ -2608,8 +3054,35 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 self.session
                     .add_allocation(builder, terminal, target, kind)?;
             }
-            if initializer.is_some() {
-                self.declare_initializer_transfer_gap(builder, terminal, Some(target))?;
+            if let Some(initializer) = initializer {
+                let transfer = if let Some(transfer) =
+                    self.exact_modeled_copy_initialization(target, initializer)
+                {
+                    Some(transfer)
+                } else if let Some(owner_id) = self.binding_model_type_ids.get(&target).cloned() {
+                    let source = self.source_value(
+                        builder,
+                        initializer,
+                        cpp_expression_value_kind(initializer),
+                    )?;
+                    self.exact_modeled_character_data_construction(&owner_id, initializer, source)
+                } else {
+                    None
+                };
+                if let Some(transfer) = transfer {
+                    self.emit_exact_modeled_transfer(
+                        builder,
+                        terminal,
+                        next,
+                        scope,
+                        initializer,
+                        target,
+                        None,
+                        transfer,
+                    )?;
+                } else {
+                    self.declare_initializer_transfer_gap(builder, terminal, Some(target))?;
+                }
             }
         }
         Ok(())
@@ -3067,7 +3540,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 } else {
                     let terminal = if node.kind() == "declaration" {
                         let terminal = self.point(builder, node, Vec::new())?;
-                        self.emit_declaration_identity(builder, node, terminal)?;
+                        self.emit_declaration_identity(builder, node, terminal, next, scope)?;
                         self.edge(builder, terminal, next)?;
                         Some(terminal)
                     } else {
@@ -3093,7 +3566,41 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                         cpp_expression_value_kind(value_node),
                     )?;
                     let value = self.value(builder, terminal, SemanticValueKind::Return)?;
-                    if node.kind() == "return_statement" && self.return_transfer_is_exact {
+                    let exact_return_transfer = (node.kind() == "return_statement")
+                        .then(|| self.exact_modeled_parameter_return(value_node))
+                        .flatten()
+                        .or_else(|| {
+                            let owner_id = self.return_model_type_id.as_deref()?;
+                            self.exact_modeled_character_data_construction(
+                                owner_id, value_node, source,
+                            )
+                        });
+                    let expression_continuation = if let Some(transfer) = exact_return_transfer {
+                        let transfer_point = self.point(builder, value_node, Vec::new())?;
+                        let transferred =
+                            self.value(builder, transfer_point, SemanticValueKind::Temporary)?;
+                        self.emit_exact_modeled_transfer(
+                            builder,
+                            transfer_point,
+                            EdgeTarget::normal(terminal),
+                            scope,
+                            value_node,
+                            transferred,
+                            None,
+                            transfer,
+                        )?;
+                        self.edge(builder, transfer_point, EdgeTarget::normal(terminal))?;
+                        self.append_effect(
+                            builder,
+                            terminal,
+                            SemanticEffect::ValueFlow {
+                                kind: ValueFlowKind::Return,
+                                source: transferred,
+                                target: value,
+                            },
+                        )?;
+                        transfer_point
+                    } else if node.kind() == "return_statement" && self.return_transfer_is_exact {
                         self.append_effect(
                             builder,
                             terminal,
@@ -3103,6 +3610,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                                 target: value,
                             },
                         )?;
+                        terminal
                     } else {
                         self.session.add_gap_with_impacts(
                             builder,
@@ -3117,7 +3625,8 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                                 "C++ by-value return may construct, convert, copy, or move a distinct result object"
                             },
                         )?;
-                    }
+                        terminal
+                    };
                     self.append_effect(
                         builder,
                         terminal,
@@ -3126,7 +3635,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     stack.push(Work::Expression {
                         node: value_node,
                         entry,
-                        next: EdgeTarget::normal(terminal),
+                        next: EdgeTarget::normal(expression_continuation),
                         scope,
                     });
                     terminal
@@ -4363,6 +4872,15 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 let left = required_field(node, "left")?;
                 let right = required_field(node, "right")?;
                 let assignment = self.point(builder, node, Vec::new())?;
+                let exact_modeled_assignment = (assignment_operator(node) == Some("=")
+                    && left.kind() == "identifier")
+                    .then(|| {
+                        let name = nonempty_node_text(self.source, left)?;
+                        let target = self.binding_value(name, left.start_byte())?;
+                        let transfer = self.exact_modeled_copy_assignment(target, right)?;
+                        Some((target, transfer))
+                    })
+                    .flatten();
                 let exact_target = (assignment_operator(node) == Some("=")
                     && left.kind() == "identifier")
                     .then(|| {
@@ -4373,7 +4891,18 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                             .then_some((name, target))
                     })
                     .flatten();
-                if let Some((name, target)) = exact_target {
+                if let Some((target, transfer)) = exact_modeled_assignment {
+                    self.emit_exact_modeled_transfer(
+                        builder,
+                        assignment,
+                        next,
+                        scope,
+                        node,
+                        target,
+                        Some(result),
+                        transfer,
+                    )?;
+                } else if let Some((name, target)) = exact_target {
                     let value =
                         self.expression_value(builder, right, cpp_expression_value_kind(right))?;
                     self.append_effect(
@@ -6060,6 +6589,29 @@ fn cpp_declaration_binds_fundamental_value(declaration: Node<'_>) -> bool {
         .any(|declarator| cpp_binding_is_fundamental(declaration, declarator))
 }
 
+/// Whether one formal is eligible for the parameter arm of C++ implicit move.
+///
+/// The qualifier decision comes from tree-sitter's `type_qualifier` node, not
+/// from reparsing a rendered type. Pointer, reference, array, and function
+/// declarators are deliberately excluded because this tranche models only a
+/// by-value object parameter.
+fn cpp_parameter_is_nonconst_by_value(
+    declaration: Node<'_>,
+    declarator: Node<'_>,
+    source: &str,
+) -> bool {
+    matches!(
+        declaration.kind(),
+        "parameter_declaration" | "optional_parameter_declaration"
+    ) && !cpp_declarator_contains_kind(declarator, "pointer_declarator")
+        && !cpp_declarator_contains_kind(declarator, "reference_declarator")
+        && !cpp_declarator_contains_kind(declarator, "array_declarator")
+        && !cpp_declarator_contains_kind(declarator, "function_declarator")
+        && !named_children(declaration).into_iter().any(|child| {
+            child.kind() == "type_qualifier" && node_text(source, child) == Some("const")
+        })
+}
+
 /// Whether a callable's return transfer reproduces the returned value exactly.
 ///
 /// A callable is not a storage-introducing declaration, so this asks only the
@@ -6868,7 +7420,9 @@ mod tests {
             None,
         );
         let file = ProjectFile::new(std::env::temp_dir(), "fixture.cpp");
-        let SemanticOutcome::Complete { value, .. } = CppSemanticLowerer
+        let analyzer =
+            CppAnalyzer::from_project(crate::TestProject::new(std::env::temp_dir(), Language::Cpp));
+        let SemanticOutcome::Complete { value, .. } = CppSemanticLowerer::new(&analyzer)
             .lower(
                 &file,
                 &prepared,

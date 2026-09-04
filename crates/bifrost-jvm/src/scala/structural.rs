@@ -19,8 +19,7 @@ use brokk_bifrost_core::analyzer::structural::occurrences::{
     OccurrenceRole, OccurrenceRoleSupport,
 };
 use brokk_bifrost_core::analyzer::structural::resolution::{
-    BindingActivation, BindingKind, CALLABLE_APPLICABILITY_ONLY_SUPPORT, HoistingClass,
-    LexicalEnvironmentSupport,
+    BindingActivation, BindingKind, EnvironmentAxis, HoistingClass, LexicalEnvironmentSupport,
 };
 use brokk_bifrost_core::analyzer::structural::routes::{
     IdentityRouteSupport, NO_IDENTITY_ROUTE_SUPPORT,
@@ -87,11 +86,25 @@ pub const SCALA_KIND_TABLE: &[(&str, NormalizedKind)] = &[
     ("object_definition", NormalizedKind::Class),
     ("trait_definition", NormalizedKind::Class),
     ("enum_definition", NormalizedKind::Class),
+    // A package object is an object whose members the package reaches bare.
+    // As a class-kind fact it is a scope, so its members are members rather
+    // than file-scope locals (#1597).
+    ("package_object", NormalizedKind::Class),
     // A `type` alias declares a type, so its fact is a type-namespace
     // declaration and its name inherits `Namespace::Type` through
     // `declared_fact_kind`. Absent from the table, the alias name had no
     // declaring fact at all and landed in the value namespace (#2878).
     ("type_definition", NormalizedKind::Class),
+    // The statement lists that form lexical scopes of their own (#1597). A
+    // braced `block` and a Scala 3 `indented_block` are the same construct in
+    // two spellings. A `case_clause` scopes its pattern binders: without it, a
+    // binder inside a member initializer's `match` would sit directly in the
+    // class scope and be mistaken for a member. A `template_body` is
+    // deliberately absent: what it holds are members, and the class-kind fact
+    // around it is the scope that says so.
+    ("block", NormalizedKind::Block),
+    ("indented_block", NormalizedKind::Block),
+    ("case_clause", NormalizedKind::Block),
     ("val_definition", NormalizedKind::Assignment),
     ("var_definition", NormalizedKind::Assignment),
     ("assignment_expression", NormalizedKind::Assignment),
@@ -621,7 +634,11 @@ fn scala_occurrence_role(node: Node<'_>) -> Option<OccurrenceRole> {
 ///   range does not contain the parameter list.
 /// - A `val`/`var` local is in effect from the end of its definition to the
 ///   end of its scope (`SourceOrder`), which is why a read above it reaches
-///   nothing.
+///   nothing. A `val`/`var` written directly in a template body, an enum body,
+///   a braced package or at the top level of a Scala 3 file is a member, and
+///   Scala members are visible before their definition, so it is `ScopeWide`
+///   over its scope instead. (Inside a class the environment layer then
+///   excludes it as a member; at file level it is the file's binding.)
 /// - A pattern binder is in effect from the end of the pattern to the end of
 ///   its `case` clause (`DeclaredHead`), which is a named sub-range of the
 ///   declaring scope rather than a suffix of it. The guard is inside that
@@ -641,6 +658,7 @@ fn scala_binding_activation(binder: Node<'_>, scope: Range) -> Option<BindingAct
             "parameter"
                 | "class_parameter"
                 | "binding"
+                | "context_bound"
                 | "lambda_expression"
                 | "val_definition"
                 | "var_definition"
@@ -650,7 +668,10 @@ fn scala_binding_activation(binder: Node<'_>, scope: Range) -> Option<BindingAct
         )
     })?;
     match form.kind() {
-        "parameter" | "class_parameter" | "binding" | "lambda_expression" => {
+        // A named context bound (`[T: Ord as ord]`) is a given parameter of
+        // the callable that declares the type parameter, so it binds the way
+        // a value parameter does.
+        "parameter" | "class_parameter" | "binding" | "context_bound" | "lambda_expression" => {
             Some(BindingActivation {
                 kind: BindingKind::Parameter,
                 hoisting: HoistingClass::ScopeWide,
@@ -684,18 +705,55 @@ fn scala_binding_activation(binder: Node<'_>, scope: Range) -> Option<BindingAct
                 },
             })
         }
-        _ => Some(BindingActivation {
-            kind: BindingKind::Local,
-            hoisting: HoistingClass::SourceOrder,
-            activation: Range {
-                start_byte: form.end_byte(),
-                end_byte: scope.end_byte,
-                start_line: form.end_position().row + 1,
-                end_line: scope.end_line,
-            },
-        }),
+        _ => {
+            debug_assert!(matches!(form.kind(), "val_definition" | "var_definition"));
+            if form.parent().is_some_and(is_member_body) {
+                return Some(BindingActivation {
+                    kind: BindingKind::Local,
+                    hoisting: HoistingClass::ScopeWide,
+                    activation: scope,
+                });
+            }
+            Some(BindingActivation {
+                kind: BindingKind::Local,
+                hoisting: HoistingClass::SourceOrder,
+                activation: Range {
+                    start_byte: form.end_byte(),
+                    end_byte: scope.end_byte,
+                    start_line: form.end_position().row + 1,
+                    end_line: scope.end_line,
+                },
+            })
+        }
     }
 }
+
+/// Whether a node holds members rather than statements: the body of a class,
+/// object, trait, enum, given or package object, a braced package's body, or
+/// the top level of a Scala 3 file. A definition written directly in one of
+/// these is visible throughout it, whatever its position.
+fn is_member_body(node: Node<'_>) -> bool {
+    matches!(
+        node.kind(),
+        "template_body" | "with_template_body" | "enum_body" | "compilation_unit"
+    )
+}
+
+/// Scala derives every environment axis this producer owns: its scope tree
+/// comes from the class-kind, callable, loop, catch and block facts in
+/// `SCALA_KIND_TABLE`; every binder it classifies states an interval through
+/// `scala_binding_activation`; its imports always carry a parser-derived
+/// structured path, so every import binder names its target; and it spells its
+/// package. The two candidate axes stay unsupported: the resolver records no
+/// considered set for Scala. `scala_filter_callable_units` reports per-candidate
+/// callable applicability (#1478 M3).
+static SCALA_LEXICAL_ENVIRONMENT_SUPPORT: LexicalEnvironmentSupport =
+    LexicalEnvironmentSupport::NONE
+        .supported(EnvironmentAxis::Scopes)
+        .supported(EnvironmentAxis::BindingIntervals)
+        .supported(EnvironmentAxis::ImportBinders)
+        .supported(EnvironmentAxis::PackageClause)
+        .supported(EnvironmentAxis::CallableApplicability);
 
 impl StructuralSpec for ScalaStructuralSpec {
     fn language(&self) -> Language {
@@ -798,14 +856,7 @@ impl StructuralSpec for ScalaStructuralSpec {
     }
 
     fn lexical_environment_support(&self) -> &LexicalEnvironmentSupport {
-        // Scala classifies occurrence roles and states a binding interval for
-        // every binder it emits (#1597 slice 1), but it derives no scope tree,
-        // no import binders and no package clause yet, so the axes those feed
-        // stay unsupported until slice 2 builds the environment on top of this
-        // classification. `scala_filter_callable_units` does report
-        // per-candidate callable applicability (#1478 M3). The per-axis table
-        // states exactly that rather than rounding it either way.
-        &CALLABLE_APPLICABILITY_ONLY_SUPPORT
+        &SCALA_LEXICAL_ENVIRONMENT_SUPPORT
     }
 
     fn materialization_support(&self) -> &DeclarationMaterializationSupport {
@@ -960,10 +1011,10 @@ mod tests {
     /// as `(token, kind, hoisting class, activation text)` in source order.
     ///
     /// The declaring scope passed in is the nearest enclosing callable, lambda
-    /// or template, which is the range the environment layer will hand the
-    /// adapter once Scala derives a scope tree. Until that lands the
-    /// `BindingIntervals` axis stays unsupported and this is the only caller,
-    /// so the intervals are asserted here rather than through a query.
+    /// or template. The environment layer hands the adapter the nearest
+    /// scope-forming fact instead, which can be a block inside the callable;
+    /// the intervals asserted here are the adapter's own answer for the wider
+    /// scope, and the environment tests cover the production pairing.
     fn binding_activations(source: &str) -> Vec<(&str, BindingKind, HoistingClass, &str)> {
         let mut parser = tree_sitter::Parser::new();
         parser

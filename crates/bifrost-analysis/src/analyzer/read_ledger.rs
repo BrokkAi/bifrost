@@ -395,6 +395,8 @@ impl ReadKey {
 
 /// Domain for the digest of an answer that is a set of declarations.
 const DECLARATION_SET_DOMAIN: &[u8] = b"bifrost-read-ledger:declaration-set:v1";
+/// Domain for the answer digest of a summary lookup that found nothing.
+const ABSENT_SUMMARY_DOMAIN: &[u8] = b"bifrost-read-ledger:absent-summary:v1";
 /// Domain for the digest of an answer that is a set of files.
 const FILE_SET_DOMAIN: &[u8] = b"bifrost-read-ledger:file-set:v1";
 
@@ -477,6 +479,16 @@ impl LookupQuestion {
         }
     }
 
+    /// The question "what does the workspace answer about this procedure
+    /// summary?".
+    ///
+    /// `identity` is a procedure summary identity's public fingerprint, which
+    /// names the procedure, its artifact's content, and the contract the
+    /// summary was derived under without folding the workspace mount.
+    pub const fn summary(identity: StableDigest) -> Self {
+        Self::Summary { identity }
+    }
+
     /// The label used in the canonical encoding and in diagnostics.
     pub const fn stable_label(&self) -> &'static str {
         match self {
@@ -542,6 +554,17 @@ pub fn declaration_set_digest<'a>(units: impl IntoIterator<Item = &'a CodeUnit>)
         hasher.field(&path, fq_name.as_bytes());
     }
     StableDigest::from_array(hasher.finish())
+}
+
+/// The answer digest of a procedure-summary lookup that found nothing.
+///
+/// Absence is an answer, and it is keyed the same way a hit is: a solve that
+/// read "no summary is retained under this identity" depends on the head still
+/// holding none, exactly as a solve that read a summary depends on the head
+/// holding the same one. One fixed digest is enough because the identity that
+/// was asked about is already in the question.
+pub fn absent_summary_digest() -> StableDigest {
+    StableDigest::from_array(CanonicalHasher::new(ABSENT_SUMMARY_DOMAIN).finish())
 }
 
 /// The canonical digest of an answer that is a set of files.
@@ -778,14 +801,10 @@ mod tests {
 
     #[test]
     fn an_absent_path_key_carries_no_root() {
-        let base = ProjectFile::new(
-            std::path::Path::new("/tmp/bifrost-base-export").to_path_buf(),
-            "src/a.rs",
-        );
-        let head = ProjectFile::new(
-            std::path::Path::new("/home/someone/checkout").to_path_buf(),
-            "src/a.rs",
-        );
+        let working_directory =
+            std::env::current_dir().expect("test working directory must be available");
+        let base = ProjectFile::new(working_directory.join("bifrost-base-export"), "src/a.rs");
+        let head = ProjectFile::new(working_directory.join("checkout"), "src/a.rs");
         assert_eq!(
             ReadKey::path_absent(Language::Rust, rel_path_string(&base).as_str()),
             ReadKey::path_absent(Language::Rust, rel_path_string(&head).as_str()),

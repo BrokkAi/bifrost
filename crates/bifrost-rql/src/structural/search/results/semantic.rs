@@ -414,6 +414,41 @@ pub struct CodeQueryFlowWitness {
     pub retention_truncated: bool,
 }
 
+/// One class atom that reached one member-access receiver when class-set
+/// propagation ran from the query's input procedure. `origin` is `workspace`
+/// for a workspace class, `external` for a semantic-pack class, or
+/// `unknown:<reason>` for a value the engine could not classify; an unknown
+/// origin carries no `class`, and a row whose `status` is not `known` carries
+/// no proof.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CodeQueryClassSetRow {
+    pub id: String,
+    pub file: String,
+    pub range: CodeQueryRange,
+    pub member: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub class: Option<String>,
+    pub origin: String,
+    pub status: &'static str,
+}
+
+/// A member access whose receiver class set is fully known and contains a
+/// class that does not declare the member. `origin_file`/`origin_range` name
+/// the site that introduced the class; `caller` is the root procedure the
+/// propagation ran from; `witness_steps` counts the retained path steps.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CodeQueryAbsentMemberFinding {
+    pub id: String,
+    pub file: String,
+    pub range: CodeQueryRange,
+    pub member: String,
+    pub class: String,
+    pub origin_file: String,
+    pub origin_range: CodeQueryRange,
+    pub caller: String,
+    pub witness_steps: usize,
+}
+
 /// One bounded source occurrence contributing to an aggregated taint sink.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CodeQueryTaintOrigin {
@@ -618,8 +653,8 @@ pub struct CodeQueryGuard {
     /// The guard's own display anchor: the condition's decision point.
     pub range: CodeQueryRange,
     pub point: CodeQueryProgramPointRef,
-    /// `constant_boolean`, `null_comparison`, `constant_equality`, or
-    /// `opaque`.
+    /// `constant_boolean`, `null_comparison`, `constant_equality`,
+    /// `instance_of`, `has_member`, or `opaque`.
     pub predicate: &'static str,
     /// For a constant condition, the value it always takes.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -639,6 +674,15 @@ pub struct CodeQueryGuard {
     /// The procedure-local value ID of the constant in a constant comparison.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub constant_value: Option<u64>,
+    /// The procedure-local value constrained by an instance/member predicate.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub guarded_value: Option<u64>,
+    /// The procedure-local value denoting the class operand of `instance_of`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub classes_value: Option<u64>,
+    /// The procedure-local value denoting the member operand of `has_member`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub member_value: Option<u64>,
     /// The stable structured-syntax digest for an opaque predicate.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub opaque_digest: Option<u64>,

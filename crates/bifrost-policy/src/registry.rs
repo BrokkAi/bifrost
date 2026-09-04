@@ -666,6 +666,8 @@ impl PolicyRegistry {
                 .len()
                 .checked_add(spec.transforms.len())
                 .and_then(|count| count.checked_add(spec.external_models.len()))
+                .and_then(|count| count.checked_add(spec.store_writes.len()))
+                .and_then(|count| count.checked_add(spec.store_reads.len()))
                 .ok_or(PolicyRegistryError::EndpointCountOverflow)?
         } else {
             0
@@ -780,6 +782,49 @@ impl PolicyRegistry {
             insert_selector(dependency_selectors, selector)?;
             dependencies.push(dependency);
         }
+        // A framework entry point (#2692) is a source-role endpoint: its
+        // selector names procedure declarations and its binding names the
+        // formal parameter tainted on entry. Minting a full endpoint
+        // dependency here gives it the same identity, hashes, and report
+        // model as any other source, so findings that originate at the
+        // synthesized root project without a special case.
+        for entry_point in &spec.entry_points.entries {
+            let base = format!(
+                "/analysis/{}/entries/{}",
+                segments.entry_points,
+                pointer_segment(entry_point.id.as_str())
+            );
+            let path = selector_path(format!("{base}/selector"))?;
+            let selector =
+                self.resolve_selector(parsed, path, &entry_point.selector, retained_bytes)?;
+            let identity = ResolvedEndpointIdentity::Local {
+                policy_id: definition.metadata.id.clone(),
+                entry_id: entry_point.id.clone(),
+            };
+            let dependency = ResolvedEndpointDependency::from_composed_model(
+                identity,
+                EndpointDefinitionSchemaResolution::PolicyDocument {
+                    resolution: parsed.schema_resolution(),
+                },
+                &selector,
+                ResolvedEndpointModel::new(
+                    EndpointRole::Source,
+                    entry_point.id.as_str().to_owned(),
+                    Vec::new(),
+                    port_to_endpoint_binding(&entry_point.parameter),
+                    Some(EndpointTaintSemantics::Source {
+                        labels: entry_point.labels.clone(),
+                        evidence: None,
+                    }),
+                    Vec::new(),
+                ),
+                vec![EndpointOrigin::PolicyLocal {
+                    path: dependency_path(base)?,
+                }],
+            )?;
+            insert_selector(dependency_selectors, selector)?;
+            dependencies.push(dependency);
+        }
         self.resolve_local_auxiliary_selectors(
             parsed,
             segments.sanitizers,
@@ -805,6 +850,27 @@ impl PolicyRegistry {
             segments.external_models,
             spec.external_models
                 .entries
+                .iter()
+                .map(|entry| (&entry.id, &entry.selector)),
+            fixed_selectors,
+            retained_bytes,
+        )?;
+        // Store writes and reads share the one `stores` authoring segment;
+        // their entry IDs share the local taint namespace, so the combined
+        // selector paths cannot collide.
+        self.resolve_local_auxiliary_selectors(
+            parsed,
+            segments.stores,
+            spec.store_writes
+                .iter()
+                .map(|entry| (&entry.id, &entry.selector)),
+            fixed_selectors,
+            retained_bytes,
+        )?;
+        self.resolve_local_auxiliary_selectors(
+            parsed,
+            segments.stores,
+            spec.store_reads
                 .iter()
                 .map(|entry| (&entry.id, &entry.selector)),
             fixed_selectors,
@@ -851,6 +917,7 @@ impl PolicyRegistry {
             .iter()
             .chain(&spec.sinks.include_sets)
             .chain(&spec.sanitizers.include_sets)
+            .chain(&spec.entry_points.include_sets)
             .chain(&spec.transforms.include_sets)
             .chain(&spec.external_models.include_sets)
         {
@@ -1691,6 +1758,11 @@ fn port_to_endpoint_binding(port: &PolicyPort) -> PolicyEndpointBinding {
         }
         PolicyPort::ArgumentName { name } => {
             PolicyEndpointBinding::ArgumentName { name: name.clone() }
+        }
+        // Field ports exist only as external-model transfer destinations and
+        // never reach an endpoint binding.
+        PolicyPort::FieldOf { .. } => {
+            unreachable!("field ports are only valid as external-model transfer destinations")
         }
     }
 }

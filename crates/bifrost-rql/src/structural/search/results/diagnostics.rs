@@ -588,6 +588,8 @@ pub struct CodeQuerySemanticWork {
     pub typestate: CodeQueryTypestateWork,
     #[serde(skip_serializing_if = "CodeQueryValueFlowWork::is_empty")]
     pub value_flow: CodeQueryValueFlowWork,
+    #[serde(skip_serializing_if = "CodeQueryTypeFlowWork::is_empty")]
+    pub type_flow: CodeQueryTypeFlowWork,
 }
 
 impl CodeQuerySemanticWork {
@@ -622,6 +624,7 @@ impl CodeQuerySemanticWork {
             budget_exhausted: self.budget_exhausted || other.budget_exhausted,
             typestate: self.typestate.saturating_add(other.typestate),
             value_flow: self.value_flow.saturating_add(other.value_flow),
+            type_flow: self.type_flow.saturating_add(other.type_flow),
         }
     }
 
@@ -658,6 +661,7 @@ impl CodeQuerySemanticWork {
             budget_exhausted: self.budget_exhausted && !earlier.budget_exhausted,
             typestate: self.typestate.saturating_sub(earlier.typestate),
             value_flow: self.value_flow.saturating_sub(earlier.value_flow),
+            type_flow: self.type_flow.saturating_sub(earlier.type_flow),
         }
     }
 }
@@ -894,6 +898,62 @@ impl CodeQueryValueFlowWork {
             failed_solves: self.failed_solves.saturating_add(other.failed_solves),
             endpoint_truncated: self.endpoint_truncated || other.endpoint_truncated,
             witness_truncated: self.witness_truncated || other.witness_truncated,
+        }
+    }
+}
+
+/// Work the class-set type-flow executor charged to one query: one solver run
+/// per distinct input procedure at most, with the rows each step projected.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CodeQueryTypeFlowWork {
+    pub field_slot_builds: u64,
+    pub solves: u64,
+    pub cache_hits: u64,
+    pub class_set_rows: u64,
+    pub finding_rows: u64,
+    pub incomplete_roots: u64,
+    pub failed_solves: u64,
+}
+
+impl CodeQueryTypeFlowWork {
+    pub const fn is_empty(&self) -> bool {
+        self.field_slot_builds == 0
+            && self.solves == 0
+            && self.cache_hits == 0
+            && self.class_set_rows == 0
+            && self.finding_rows == 0
+            && self.incomplete_roots == 0
+            && self.failed_solves == 0
+    }
+
+    pub(crate) const fn saturating_sub(self, earlier: Self) -> Self {
+        Self {
+            field_slot_builds: self
+                .field_slot_builds
+                .saturating_sub(earlier.field_slot_builds),
+            solves: self.solves.saturating_sub(earlier.solves),
+            cache_hits: self.cache_hits.saturating_sub(earlier.cache_hits),
+            class_set_rows: self.class_set_rows.saturating_sub(earlier.class_set_rows),
+            finding_rows: self.finding_rows.saturating_sub(earlier.finding_rows),
+            incomplete_roots: self
+                .incomplete_roots
+                .saturating_sub(earlier.incomplete_roots),
+            failed_solves: self.failed_solves.saturating_sub(earlier.failed_solves),
+        }
+    }
+
+    pub(crate) const fn saturating_add(self, other: Self) -> Self {
+        Self {
+            field_slot_builds: self
+                .field_slot_builds
+                .saturating_add(other.field_slot_builds),
+            solves: self.solves.saturating_add(other.solves),
+            cache_hits: self.cache_hits.saturating_add(other.cache_hits),
+            class_set_rows: self.class_set_rows.saturating_add(other.class_set_rows),
+            finding_rows: self.finding_rows.saturating_add(other.finding_rows),
+            incomplete_roots: self.incomplete_roots.saturating_add(other.incomplete_roots),
+            failed_solves: self.failed_solves.saturating_add(other.failed_solves),
         }
     }
 }

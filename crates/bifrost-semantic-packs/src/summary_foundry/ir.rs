@@ -425,7 +425,8 @@ pub struct FoundryDerivation {
     /// Transfers the solver reported without proven, complete evidence. They
     /// still ship: a partial summary can add a flow but can never deny one.
     pub unproven_transfers: u32,
-    /// Procedures the interprocedural closure entered, including the target.
+    /// Procedures the interprocedural closure visited, including the target,
+    /// whether or not their relations materialized.
     pub closure_procedures: u32,
     pub boundaries: Vec<FoundryDerivationBoundary>,
     /// Every derived flow at full granularity. The entry's `transfers` are the
@@ -922,6 +923,7 @@ mod tests {
             input: AuthoredSummaryInput::Parameter { ordinal: 2 },
             exit_kind: AuthoredSummaryExitKind::Normal,
             output: AuthoredSummaryOutput::NormalReturn {},
+            value_transfer: None,
         });
 
         let entry = builder.finish(

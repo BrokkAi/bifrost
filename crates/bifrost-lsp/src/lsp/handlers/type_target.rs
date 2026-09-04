@@ -120,6 +120,23 @@ impl TypeTargetEligibility {
     }
 }
 
+/// A type alias another type owns: a Rust `trait`/`impl` associated type, and
+/// the nested-alias shapes Scala and Kotlin spell the same way.
+///
+/// Such a declaration is class-kind like every other type declaration (#2911),
+/// but it is a member of its owner's contract rather than a hierarchy root, so
+/// the implementation and type questions belong to
+/// [`selected_implementation_member_declaration`]. A nested class -- Java's
+/// `Outer.Inner`, say -- is not a type alias and stays a type target.
+fn is_owned_type_alias(analyzer: &dyn IAnalyzer, unit: &CodeUnit) -> bool {
+    analyzer
+        .type_alias_provider()
+        .is_some_and(|provider| provider.is_type_alias(unit))
+        && analyzer
+            .parent_of(unit)
+            .is_some_and(|owner| owner.is_class())
+}
+
 fn selected_type_declaration(
     analyzer: &dyn IAnalyzer,
     file: &crate::analyzer::ProjectFile,
@@ -127,7 +144,7 @@ fn selected_type_declaration(
     cursor_range: &ByteRange,
 ) -> Option<CodeUnit> {
     selected_code_unit_declaration_at_cursor(analyzer, file, content, cursor_range, |code_unit| {
-        code_unit.is_class()
+        code_unit.is_class() && !is_owned_type_alias(analyzer, code_unit)
     })
 }
 
@@ -139,7 +156,7 @@ fn selected_implementation_member_declaration(
 ) -> Option<TypeTarget> {
     let member =
         selected_code_unit_declaration_at_cursor(analyzer, file, content, cursor_range, |unit| {
-            unit.is_function() || unit.is_field()
+            unit.is_function() || unit.is_field() || is_owned_type_alias(analyzer, unit)
         })?;
     let owner = analyzer.parent_of(&member)?;
     let kind = if member.is_function() {

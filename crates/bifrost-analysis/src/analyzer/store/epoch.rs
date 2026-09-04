@@ -384,11 +384,15 @@ lang_epoch!(
 // `sycl/info/aspects.def`) is now an include claim. Warm rows omit them, so the
 // include graph misses those edges and `.inc` fragments they claim stay
 // unadopted.
+// Salt bumped again (#2557): a recovered function-like export-macro class is
+// now named by its position in the class head instead of by spelling, so a
+// class named in capitals (`X509_CA`) and a class behind an object-like macro
+// (`OTHER_MACRO Name`) are persisted. Warm rows hold no declaration for them.
 lang_epoch!(
     Cpp,
     "cpp",
     "treesitter/cpp/",
-    "synthetic-file-scope-code-units-2026-07;recovered-designator-declarations-2026-07;fielded-declarator-routing-2026-07;bare-exported-class-declarators-2026-07;function-like-exported-class-declarators-2026-07;malformed-multiple-base-exported-class-declarators-2026-07;template-alias-declarations-2026-07;structured-return-type-metadata-2026-07;class-owned-alias-identity-2026-07;templated-out-of-line-owner-identity-2026-07;macro-exported-class-field-owner-2026-07;cpp-partial-specialization-ownership-dispatch-2026-07;abstract-parameter-declarator-signatures-2026-07;cpp-template-alias-specialization-dispatch-2026-07;single-base-exported-class-identity-2026-07;callable-linkage-metadata-2026-07;callable-declaration-role-metadata-2026-07;cpp-parameter-type-qualifiers-2026-07;macro-sentinel-region-reparse-2026-07;fragmented-export-class-member-recovery-2026-07;using-directive-owner-namespace-recovery-2026-07;bare-call-global-namespace-lookup-2026-07;nested-class-out-of-line-owner-identity-2026-07;fq-interned-segments-2026-07;recovered-typedef-base-alias-identity-2026-07;inline-classlike-and-macro-prefix-declarations-2026-08;template-parameter-pack-binding-and-qualified-base-initializers-2026-08;recovered-partial-specialization-member-ownership-2026-08;macro-field-terminator-scope-2026-08;complete-sentinel-class-tail-2026-08;sentinel-class-before-member-callable-2026-08;fragmented-class-signature-error-members-2026-08;plain-fragmented-class-constraint-constructor-2026-08;plain-fragmented-class-sibling-ownership-2026-08;fragmented-export-constructor-initializer-2026-08;fragmented-export-constructor-structured-sibling-boundary-2026-08;fragmented-export-sibling-class-parent-scope-2026-08;macro-decorated-template-class-scope-2026-08;conditional-alias-physical-ranges-2026-08;macro-argument-typedef-declarator-2026-08;enum-enumerator-child-ownership-2026-08;sentinel-error-envelope-sibling-recovery-2026-08;cpp-query-assets-in-brokk-bifrost-cpp-2026-08;structural-declarator-qualifier-suffix-and-top-level-parameter-cv-2026-08;macro-fragmented-plain-class-member-signatures-2026-08;namespaced-plain-fragment-boundary-2026-08;templated-plain-fragment-prefix-and-sibling-ownership-2026-08;macro-displaced-scalar-return-callable-name-2026-08;explicit-object-callable-arity-2026-08;structured-callable-parameter-types-2026-08;macro-template-return-free-function-ownership-2026-08;abstract-reference-declarator-identity-2026-08;c-tag-scope-2026-08;c-header-projection-2026-08;temporal-macro-definition-identity-2026-08;nested-include-claims-2026-08"
+    "synthetic-file-scope-code-units-2026-07;recovered-designator-declarations-2026-07;fielded-declarator-routing-2026-07;bare-exported-class-declarators-2026-07;function-like-exported-class-declarators-2026-07;malformed-multiple-base-exported-class-declarators-2026-07;template-alias-declarations-2026-07;structured-return-type-metadata-2026-07;class-owned-alias-identity-2026-07;templated-out-of-line-owner-identity-2026-07;macro-exported-class-field-owner-2026-07;cpp-partial-specialization-ownership-dispatch-2026-07;abstract-parameter-declarator-signatures-2026-07;cpp-template-alias-specialization-dispatch-2026-07;single-base-exported-class-identity-2026-07;callable-linkage-metadata-2026-07;callable-declaration-role-metadata-2026-07;cpp-parameter-type-qualifiers-2026-07;macro-sentinel-region-reparse-2026-07;fragmented-export-class-member-recovery-2026-07;using-directive-owner-namespace-recovery-2026-07;bare-call-global-namespace-lookup-2026-07;nested-class-out-of-line-owner-identity-2026-07;fq-interned-segments-2026-07;recovered-typedef-base-alias-identity-2026-07;inline-classlike-and-macro-prefix-declarations-2026-08;template-parameter-pack-binding-and-qualified-base-initializers-2026-08;recovered-partial-specialization-member-ownership-2026-08;macro-field-terminator-scope-2026-08;complete-sentinel-class-tail-2026-08;sentinel-class-before-member-callable-2026-08;fragmented-class-signature-error-members-2026-08;plain-fragmented-class-constraint-constructor-2026-08;plain-fragmented-class-sibling-ownership-2026-08;fragmented-export-constructor-initializer-2026-08;fragmented-export-constructor-structured-sibling-boundary-2026-08;fragmented-export-sibling-class-parent-scope-2026-08;macro-decorated-template-class-scope-2026-08;conditional-alias-physical-ranges-2026-08;macro-argument-typedef-declarator-2026-08;enum-enumerator-child-ownership-2026-08;sentinel-error-envelope-sibling-recovery-2026-08;cpp-query-assets-in-brokk-bifrost-cpp-2026-08;structural-declarator-qualifier-suffix-and-top-level-parameter-cv-2026-08;macro-fragmented-plain-class-member-signatures-2026-08;namespaced-plain-fragment-boundary-2026-08;templated-plain-fragment-prefix-and-sibling-ownership-2026-08;macro-displaced-scalar-return-callable-name-2026-08;explicit-object-callable-arity-2026-08;structured-callable-parameter-types-2026-08;macro-template-return-free-function-ownership-2026-08;abstract-reference-declarator-identity-2026-08;c-tag-scope-2026-08;c-header-projection-2026-08;temporal-macro-definition-identity-2026-08;nested-include-claims-2026-08;recovered-named-class-member-linkage-2026-09;positional-export-macro-class-names-2026-09"
 );
 
 /// The salt as it stood immediately before `bump` was appended.
@@ -690,12 +694,25 @@ pub(super) fn javascript_epoch_before_private_name_assignment_declarations() -> 
 // file fact shared by both adapters.
 // Salt bumped again with JavaScript: the structured DSL and Node runner
 // classifier changes the same persisted file fact for both adapters.
+// Salt bumped again (#2911): a `type` alias now mints a `Class` code unit whose
+// own segment is a `Type` segment, the same identity rule a class, an interface
+// and an enum use. `declaration_id` hashes segment kinds, so every warm row
+// holds the old `Field`/`Member` identity for every TypeScript type alias --
+// and, where an alias and a module-scope `const` share one name, holds only one
+// of the two declarations. Only TypeScript's salt moves: the JavaScript grammar
+// spells no `type_alias_declaration`.
 lang_epoch!(
     TypeScript,
     "typescript",
     "treesitter/typescript/",
-    "synthetic-file-scope-code-units-2026-07;anonymous-default-export-units-2026-07;fq-interned-segments-2026-07;js-ts-drift-parity-2026-07;js-ts-query-assets-in-brokk-bifrost-js-ts-2026-08;ts-overload-declaration-only-metadata-2026-08;program-scope-plain-value-identities-2026-08;ts-inline-return-type-members-2026-08;js-ts-callable-modifier-metadata-2026-08;structured-rule-tester-test-detection-2026-08;structured-js-ts-test-classification-2026-08"
+    "synthetic-file-scope-code-units-2026-07;anonymous-default-export-units-2026-07;fq-interned-segments-2026-07;js-ts-drift-parity-2026-07;js-ts-query-assets-in-brokk-bifrost-js-ts-2026-08;ts-overload-declaration-only-metadata-2026-08;program-scope-plain-value-identities-2026-08;ts-inline-return-type-members-2026-08;js-ts-callable-modifier-metadata-2026-08;structured-rule-tester-test-detection-2026-08;structured-js-ts-test-classification-2026-08;ts-type-alias-type-identity-2026-09"
 );
+
+#[cfg(test)]
+pub(super) fn typescript_epoch_before_type_alias_type_identity() -> String {
+    let prior = salt_before_bump(TypeScript::SALT, "ts-type-alias-type-identity-2026-09");
+    compute_epoch::<TypeScript>(&tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(), prior)
+}
 
 #[cfg(test)]
 pub(super) fn typescript_epoch_before_structured_test_classification() -> String {
@@ -788,12 +805,25 @@ lang_epoch!(
 // `canonical_identity_of` projects as the identity's generic arity. A warm row
 // carries no such record, so a cached declaration would compare unequal to the
 // same declaration reparsed from unchanged source.
+// Salt bumped again (#2911): a `type` alias and a trait or impl
+// `associated_type` now mint a `Class` code unit whose own segment is a `Type`
+// segment, the same identity rule a `struct`, an `enum`, a `union`, and a
+// `trait` use. `declaration_id` hashes segment kinds, so every warm row holds
+// the old `Field`/`Member` identity for every Rust type alias -- and, where an
+// alias and a `const` share one owner and one name, holds only one of the two
+// declarations.
 lang_epoch!(
     Rust,
     "rust",
     "treesitter/rust/",
-    "synthetic-file-scope-code-units-2026-07;embedded-macro-rules-code-units-2026-07;ast-test-detection-2026-07;canonical-impl-owner-identities-2026-07;macro-invocation-item-reparse-2026-07;proven-macro-definition-replay-2026-07;per-declaration-test-taint-2026-07;raw-identifier-normalization-2026-07;inline-module-const-static-type-items-2026-07;fq-interned-segments-2026-07;structural-macro-invocation-arguments-2026-08;structural-attributes-and-fields-2026-08;anchored-fq-encoding-2026-08;crate-aware-packages-2026-08;rust-query-assets-in-brokk-bifrost-rust-2026-08;renamed-import-impl-owner-route-2026-08;per-file-usage-facts-2026-08;cargo-route-facts-2026-08;include-edge-facts-2026-08;import-cfg-and-extern-crate-2026-08;enum-variant-named-fields-2026-08;callable-parameter-type-spellings-2026-08;raw-identifier-cargo-module-routes-2026-08;bounded-declaration-labels-2026-08;nested-and-extern-crate-import-facts-2026-08;declaration-type-parameter-arity-2026-09"
+    "synthetic-file-scope-code-units-2026-07;embedded-macro-rules-code-units-2026-07;ast-test-detection-2026-07;canonical-impl-owner-identities-2026-07;macro-invocation-item-reparse-2026-07;proven-macro-definition-replay-2026-07;per-declaration-test-taint-2026-07;raw-identifier-normalization-2026-07;inline-module-const-static-type-items-2026-07;fq-interned-segments-2026-07;structural-macro-invocation-arguments-2026-08;structural-attributes-and-fields-2026-08;anchored-fq-encoding-2026-08;crate-aware-packages-2026-08;rust-query-assets-in-brokk-bifrost-rust-2026-08;renamed-import-impl-owner-route-2026-08;per-file-usage-facts-2026-08;cargo-route-facts-2026-08;include-edge-facts-2026-08;import-cfg-and-extern-crate-2026-08;enum-variant-named-fields-2026-08;callable-parameter-type-spellings-2026-08;raw-identifier-cargo-module-routes-2026-08;bounded-declaration-labels-2026-08;nested-and-extern-crate-import-facts-2026-08;declaration-type-parameter-arity-2026-09;rust-type-alias-type-identity-2026-09"
 );
+
+#[cfg(test)]
+pub(super) fn rust_epoch_before_type_alias_type_identity() -> String {
+    let prior = salt_before_bump(Rust::SALT, "rust-type-alias-type-identity-2026-09");
+    compute_epoch::<Rust>(&tree_sitter_rust::LANGUAGE.into(), prior)
+}
 
 #[cfg(test)]
 pub(super) fn rust_epoch_before_nested_and_extern_crate_import_facts() -> String {
@@ -817,11 +847,17 @@ pub(super) fn rust_epoch_before_anchored_fq_encoding() -> String {
 // Salt bumped again: callable and property signature metadata now carries the
 // parser-derived, namespace- and alias-resolved nominal return identity. Warm
 // rows contain only display text and cannot serve the relational second phase.
+// Salt bumped again (#2912): the PHP declaration walk now records callable
+// modifier metadata -- static, and the fact that the adapter read the modifier
+// nodes at all. Rows persisted before it deserialize as "nobody read the
+// modifiers", so `receiver_contract_of` reports no contract and every PHP
+// procedure summary stays inert on a warm workspace with no error raised
+// anywhere.
 lang_epoch!(
     Php,
     "php",
     "treesitter/php/",
-    "synthetic-file-scope-code-units-2026-07;ast-test-detection-2026-07;fq-interned-segments-2026-07;conditional-free-function-declarations-2026-07;php-query-assets-in-brokk-bifrost-php-2026-08;structured-declared-return-identities-2026-08"
+    "synthetic-file-scope-code-units-2026-07;ast-test-detection-2026-07;fq-interned-segments-2026-07;conditional-free-function-declarations-2026-07;php-query-assets-in-brokk-bifrost-php-2026-08;structured-declared-return-identities-2026-08;php-callable-modifier-metadata-2026-09"
 );
 
 /// The PHP epoch as it stood before the #1420 conditional-free-function bump.
@@ -946,11 +982,17 @@ pub(super) fn csharp_epoch_before_structured_runnable_test_classification() -> S
 // this crate's `resources/treesitter/ruby/` into `brokk-bifrost-ruby`, so the
 // salted content now comes from a different crate's `include_str!`. The bytes
 // are unchanged, which is exactly why the salt has to carry the relocation.
+// Salt bumped again (#2912): the Ruby declaration walk now records callable
+// modifier metadata for every `def` -- singleton (static) or instance, and the
+// fact that the adapter read the declaration shape at all. Rows persisted
+// before it deserialize as "nobody read the modifiers", so
+// `receiver_contract_of` reports no contract and every Ruby procedure summary
+// stays inert on a warm workspace with no error raised anywhere.
 lang_epoch!(
     Ruby,
     "ruby",
     "treesitter/ruby/",
-    "synthetic-file-scope-code-units-2026-07;attr-macro-accessor-identities-2026-07;fq-interned-segments-2026-07;ruby-query-assets-in-brokk-bifrost-ruby-2026-08"
+    "synthetic-file-scope-code-units-2026-07;attr-macro-accessor-identities-2026-07;fq-interned-segments-2026-07;ruby-query-assets-in-brokk-bifrost-ruby-2026-08;ruby-callable-modifier-metadata-2026-09"
 );
 // The live grammar fingerprint does not include parser tables. Keep the exact
 // Kotlin crate release in the salt so parser-only grammar changes cannot reuse

@@ -12,7 +12,8 @@ use super::{
     MemberFact, MemberKind, ReceiverFact, RelationFact, RelationKind, ResolvedActiveSemanticModels,
     RuleEmission, RuleTrigger, SemanticModelActivationStatus, SemanticModelMatchDisposition,
     Signature, StructuredTypeExpression, TemplateExpression, TemplateSignature, TemplateTypeRef,
-    TypeFact, TypeKind, TypeParameterConstraint, TypeRef, TypeValueSemantics, Visibility,
+    TypeFact, TypeKind, TypeParameterConstraint, TypeRef, TypeRefReferenceKind, TypeValueSemantics,
+    Visibility,
 };
 use crate::analyzer::semantic::LengthDelimitedDigest;
 use crate::analyzer::structural::{FileFacts, NormalizedKind, Role};
@@ -377,6 +378,9 @@ impl<'a> SemanticModelCallableMatch<'a> {
 /// partial, ambiguous, cross-pack, or merely same-named records.
 pub fn semantic_model_callable_family_id(records: &[&SemanticModelSymbol]) -> Option<String> {
     let first = *records.first()?;
+    if !member_is_callable(first) {
+        return None;
+    }
     if records.len() == 1 {
         return (!first.provenance.ambiguous
             && (first.provenance.completeness == SemanticModelCompleteness::Complete
@@ -962,6 +966,112 @@ impl SemanticModelOverlay {
             } else {
                 SemanticModelMemberTargetDisposition::Incomplete
             },
+        }
+    }
+
+    /// Whether one exact modeled owner surface proves that a member exists.
+    ///
+    /// A unique complete record proves presence directly. Multiple records do
+    /// so only when they form one complete callable family; competing fields,
+    /// partial overloads, and incomplete owner surfaces remain unknown.
+    pub fn member_present_on_owner(&self, owner_id: &str, member_name: &str) -> bool {
+        let matched = self.member_target_on_owner(owner_id, member_name);
+        match matched.disposition {
+            SemanticModelMemberTargetDisposition::Unique => true,
+            SemanticModelMemberTargetDisposition::Conflict => {
+                semantic_model_callable_family_id(&matched.records).is_some()
+            }
+            SemanticModelMemberTargetDisposition::Absent
+            | SemanticModelMemberTargetDisposition::Incomplete => false,
+        }
+    }
+
+    /// Resolve one implicit special member through one exact modeled owner
+    /// identity and one exact operation role.
+    ///
+    /// An operation role is not an absence claim: a complete owner with no
+    /// matching role still returns `Incomplete`, because the active model may
+    /// simply omit the role. The returned records remain the model's exact
+    /// member records so callers can retain their declaration identity and
+    /// provenance while treating partial or competing evidence as unusable.
+    /// This lookup is deliberately direct-owner-only; implicit operations do
+    /// not inherit through the owner's member surface.
+    pub fn implicit_member_target_on_owner(
+        &self,
+        owner_id: &str,
+        operation: &ImplicitOperation,
+    ) -> SemanticModelMemberTargetMatch<'_> {
+        let owners = self.symbols_with_id(owner_id);
+        if owners.disposition == SemanticModelOverlayDisposition::Conflict
+            || owners.records.len() > 1
+        {
+            return SemanticModelMemberTargetMatch {
+                records: Vec::new(),
+                disposition: SemanticModelMemberTargetDisposition::Conflict,
+            };
+        }
+        let [owner] = owners.records.as_slice() else {
+            return SemanticModelMemberTargetMatch {
+                records: Vec::new(),
+                disposition: SemanticModelMemberTargetDisposition::Incomplete,
+            };
+        };
+        if owner.owner_id.is_some() {
+            return SemanticModelMemberTargetMatch {
+                records: Vec::new(),
+                disposition: SemanticModelMemberTargetDisposition::Incomplete,
+            };
+        }
+
+        let members = self.members_of(owner_id);
+        // `members_of` reports `Conflict` for a multi-member posting, even
+        // when each member has a distinct role. Only carry that disposition
+        // into this role-specific lookup when it also reflects an explicitly
+        // ambiguous member; the operation filter below is what decides whether
+        // this exact role has competing records.
+        let member_surface_has_ambiguous_record = members.disposition
+            == SemanticModelOverlayDisposition::Conflict
+            && members
+                .records
+                .iter()
+                .any(|member| member.provenance.ambiguous);
+        let mut records = members
+            .records
+            .into_iter()
+            .filter(|member| {
+                member.owner_id.as_deref() == Some(owner_id)
+                    && member.implicit_operation.as_ref() == Some(operation)
+            })
+            .collect::<Vec<_>>();
+        records.sort_by(|left, right| left.id.cmp(&right.id));
+
+        if records.is_empty() {
+            return SemanticModelMemberTargetMatch {
+                records,
+                disposition: SemanticModelMemberTargetDisposition::Incomplete,
+            };
+        }
+        if records.len() > 1
+            || member_surface_has_ambiguous_record
+            || records.iter().any(|member| member.provenance.ambiguous)
+        {
+            return SemanticModelMemberTargetMatch {
+                records,
+                disposition: SemanticModelMemberTargetDisposition::Conflict,
+            };
+        }
+        if owner.provenance.completeness != SemanticModelCompleteness::Complete
+            || records[0].provenance.completeness != SemanticModelCompleteness::Complete
+        {
+            return SemanticModelMemberTargetMatch {
+                records,
+                disposition: SemanticModelMemberTargetDisposition::Incomplete,
+            };
+        }
+
+        SemanticModelMemberTargetMatch {
+            records,
+            disposition: SemanticModelMemberTargetDisposition::Unique,
         }
     }
 
@@ -4145,6 +4255,7 @@ fn evaluate_template_type(
         }),
         TemplateTypeRef::ByRef { element } => Some(TypeRef::ByRef {
             element: Box::new(evaluate_template_type(element, captures)?),
+            reference_kind: TypeRefReferenceKind::Lvalue,
         }),
     }
 }
@@ -4744,7 +4855,7 @@ fn render_type_ref(reference: &TypeRef) -> String {
         } => render_named_type(id, arguments, *nullable),
         TypeRef::TypeParameter { name } => name.clone(),
         TypeRef::Array { element } => format!("{}[]", render_type_ref(element)),
-        TypeRef::ByRef { element } => format!("ref {}", render_type_ref(element)),
+        TypeRef::ByRef { element, .. } => format!("ref {}", render_type_ref(element)),
         TypeRef::Pointer { element } => format!("*{}", render_type_ref(element)),
         TypeRef::Slice { element } => format!("[]{}", render_type_ref(element)),
         TypeRef::FixedArray { element, length } => {
@@ -6285,6 +6396,230 @@ mod tests {
             SemanticModelMemberTargetDisposition::Incomplete,
             "an unpublished owner is not an absence proof"
         );
+    }
+
+    #[test]
+    fn exact_owner_member_presence_accepts_only_complete_callable_families() {
+        let owner = class("pkg.Owner", "python");
+        let first = method(
+            &owner,
+            "member.owner.run.first",
+            "run",
+            Some(signature(&[Some("value")], false)),
+        );
+        let second = method(
+            &owner,
+            "member.owner.run.second",
+            "run",
+            Some(signature(&[Some("value"), Some("mode")], false)),
+        );
+        let direct = overlay(
+            vec![owner.clone(), first.clone(), second.clone()],
+            Vec::new(),
+        );
+        assert!(direct.member_present_on_owner(&owner.id, "run"));
+
+        let child = class("pkg.Child", "python");
+        let inherited = overlay(
+            vec![child.clone(), owner.clone(), first, second],
+            vec![extends(&child, "pkg.Owner")],
+        );
+        assert!(inherited.member_present_on_owner(&child.id, "run"));
+
+        let fields = overlay(
+            vec![
+                owner.clone(),
+                field(&owner, "member.owner.value.first", "value"),
+                field(&owner, "member.owner.value.second", "value"),
+            ],
+            Vec::new(),
+        );
+        assert!(!fields.member_present_on_owner(&owner.id, "value"));
+
+        let mut ambiguous_first = method(
+            &owner,
+            "member.owner.ambiguous.first",
+            "ambiguous",
+            Some(signature(&[Some("value")], false)),
+        );
+        ambiguous_first.provenance.ambiguous = true;
+        let ambiguous_second = method(
+            &owner,
+            "member.owner.ambiguous.second",
+            "ambiguous",
+            Some(signature(&[Some("value"), Some("mode")], false)),
+        );
+        let ambiguous = overlay(
+            vec![owner.clone(), ambiguous_first, ambiguous_second],
+            Vec::new(),
+        );
+        assert!(!ambiguous.member_present_on_owner(&owner.id, "ambiguous"));
+
+        let different_pack_first = method(
+            &owner,
+            "member.owner.mixed.first",
+            "mixed",
+            Some(signature(&[Some("value")], false)),
+        );
+        let mut different_pack_second = method(
+            &owner,
+            "member.owner.mixed.second",
+            "mixed",
+            Some(signature(&[Some("value"), Some("mode")], false)),
+        );
+        different_pack_second.provenance.pack_id = "other.pack".to_string();
+        different_pack_second.provenance.pack_digest = "other.digest".to_string();
+        let different_pack = overlay(
+            vec![owner.clone(), different_pack_first, different_pack_second],
+            Vec::new(),
+        );
+        assert!(!different_pack.member_present_on_owner(&owner.id, "mixed"));
+
+        let mut partial = method(
+            &owner,
+            "member.owner.partial.first",
+            "partial",
+            Some(signature(&[Some("value")], false)),
+        );
+        partial.provenance.completeness = SemanticModelCompleteness::Partial;
+        let incomplete = overlay(vec![owner.clone(), partial], Vec::new());
+        assert!(!incomplete.member_present_on_owner(&owner.id, "partial"));
+        assert!(!incomplete.member_present_on_owner(&owner.id, "missing"));
+    }
+
+    #[test]
+    fn exact_owner_implicit_operation_lookup_uses_owner_id_and_role() {
+        let owner = class("std.basic_string", "cpp");
+        let other_owner = class("other.basic_string", "cpp");
+        let mut copy = method(&owner, "member.copy_assignment", "operator=", None);
+        copy.implicit_operation = Some(ImplicitOperation::CopyAssignment);
+        let mut move_member = method(&owner, "member.move_assignment", "operator=", None);
+        move_member.implicit_operation = Some(ImplicitOperation::MoveAssignment);
+        let mut same_name_other_owner = method(
+            &other_owner,
+            "member.other.copy_assignment",
+            "operator=",
+            None,
+        );
+        same_name_other_owner.implicit_operation = Some(ImplicitOperation::CopyAssignment);
+        let overlay = overlay(
+            vec![
+                owner.clone(),
+                copy.clone(),
+                move_member.clone(),
+                other_owner,
+                same_name_other_owner,
+            ],
+            Vec::new(),
+        );
+        assert_eq!(
+            overlay.members_of(&owner.id).disposition,
+            SemanticModelOverlayDisposition::Conflict,
+            "the broad member posting contains both operation roles"
+        );
+
+        let copy_match =
+            overlay.implicit_member_target_on_owner(&owner.id, &ImplicitOperation::CopyAssignment);
+        assert_eq!(
+            copy_match.disposition,
+            SemanticModelMemberTargetDisposition::Unique
+        );
+        assert_eq!(copy_match.records.len(), 1);
+        assert_eq!(copy_match.records[0].id, copy.id);
+        assert_eq!(
+            copy_match.records[0].provenance.pack_id, "test.pack",
+            "the selected operation keeps its model provenance"
+        );
+
+        let move_match =
+            overlay.implicit_member_target_on_owner(&owner.id, &ImplicitOperation::MoveAssignment);
+        assert_eq!(
+            move_match.disposition,
+            SemanticModelMemberTargetDisposition::Unique
+        );
+        assert_eq!(move_match.records[0].id, move_member.id);
+
+        let missing_role =
+            overlay.implicit_member_target_on_owner(&owner.id, &ImplicitOperation::CopyConstructor);
+        assert_eq!(
+            missing_role.disposition,
+            SemanticModelMemberTargetDisposition::Incomplete,
+            "a zero operation match is not a proved absence"
+        );
+
+        let missing_owner = overlay
+            .implicit_member_target_on_owner("type.missing", &ImplicitOperation::CopyAssignment);
+        assert_eq!(
+            missing_owner.disposition,
+            SemanticModelMemberTargetDisposition::Incomplete
+        );
+    }
+
+    #[test]
+    fn exact_owner_implicit_operation_lookup_preserves_conflicts_and_incompleteness() {
+        let owner = class("std.basic_string", "cpp");
+        let mut first = method(&owner, "member.copy_assignment.first", "operator=", None);
+        first.implicit_operation = Some(ImplicitOperation::CopyAssignment);
+        let mut second = method(&owner, "member.copy_assignment.second", "operator=", None);
+        second.implicit_operation = Some(ImplicitOperation::CopyAssignment);
+        let conflict = overlay(vec![owner.clone(), first, second], Vec::new());
+        let conflict_match =
+            conflict.implicit_member_target_on_owner(&owner.id, &ImplicitOperation::CopyAssignment);
+        assert_eq!(
+            conflict_match.disposition,
+            SemanticModelMemberTargetDisposition::Conflict
+        );
+        assert_eq!(conflict_match.records.len(), 2);
+
+        let mut duplicate_id = method(&owner, "member.copy_assignment", "operator=", None);
+        duplicate_id.implicit_operation = Some(ImplicitOperation::CopyAssignment);
+        let duplicate_id_overlay = overlay(
+            vec![owner.clone(), duplicate_id.clone(), duplicate_id],
+            Vec::new(),
+        );
+        let duplicate_id_match = duplicate_id_overlay
+            .implicit_member_target_on_owner(&owner.id, &ImplicitOperation::CopyAssignment);
+        assert_eq!(
+            duplicate_id_match.disposition,
+            SemanticModelMemberTargetDisposition::Conflict,
+            "duplicate records with one stable id are still competing evidence"
+        );
+
+        let mut partial = method(&owner, "member.copy_assignment.partial", "operator=", None);
+        partial.implicit_operation = Some(ImplicitOperation::CopyAssignment);
+        partial.provenance.completeness = SemanticModelCompleteness::Partial;
+        let incomplete = overlay(vec![owner.clone(), partial], Vec::new());
+        let incomplete_match = incomplete
+            .implicit_member_target_on_owner(&owner.id, &ImplicitOperation::CopyAssignment);
+        assert_eq!(
+            incomplete_match.disposition,
+            SemanticModelMemberTargetDisposition::Incomplete
+        );
+        assert_eq!(incomplete_match.records.len(), 1);
+        assert_eq!(
+            incomplete_match.records[0].provenance.completeness,
+            SemanticModelCompleteness::Partial,
+            "partial operation provenance remains visible to the caller"
+        );
+
+        let mut ambiguous = method(
+            &owner,
+            "member.copy_assignment.ambiguous",
+            "operator=",
+            None,
+        );
+        ambiguous.implicit_operation = Some(ImplicitOperation::CopyAssignment);
+        ambiguous.provenance.ambiguous = true;
+        let ambiguous_overlay = overlay(vec![owner, ambiguous], Vec::new());
+        let ambiguous_match = ambiguous_overlay.implicit_member_target_on_owner(
+            "type.std.basic_string",
+            &ImplicitOperation::CopyAssignment,
+        );
+        assert_eq!(
+            ambiguous_match.disposition,
+            SemanticModelMemberTargetDisposition::Conflict
+        );
+        assert_eq!(ambiguous_match.records.len(), 1);
     }
 
     #[test]

@@ -1,0 +1,16 @@
+{
+  "kind": "resolution-context",
+  "language": "c++",
+  "translationUnit": "src/value_transfer.cpp",
+  "compileArgumentsDigest": "2222222222222222222222222222222222222222222222222222222222222222",
+  "directHeaders": [
+    {
+      "includeName": "string",
+      "artifact": {
+        "purl": "pkg:generic/cpp-reference-headers",
+        "digests": []
+      }
+    }
+  ],
+  "headerClosure": "complete"
+}

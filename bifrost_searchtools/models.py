@@ -1412,6 +1412,87 @@ class CodeQueryFlowWitness:
         )
 
 
+class CodeQueryClassSetStatus(StrEnum):
+    KNOWN = "known"
+    PARTIAL = "partial"
+    NO_INFORMATION = "no_information"
+    INCONCLUSIVE = "inconclusive"
+
+
+@dataclass(frozen=True)
+class CodeQueryClassSetRow:
+    id: str
+    file: str
+    range: CodeQueryRange
+    member: str
+    class_name: str | None
+    origin: str
+    status: CodeQueryClassSetStatus
+    provenance: list[CodeQueryProvenance] = field(default_factory=list)
+    provenance_truncated: bool = False
+
+    @classmethod
+    def from_dict(cls, data: dict) -> CodeQueryClassSetRow:
+        return cls(
+            id=data["id"],
+            file=data["file"],
+            range=CodeQueryRange.from_dict(data["range"]),
+            member=data["member"],
+            class_name=data.get("class"),
+            origin=data["origin"],
+            status=CodeQueryClassSetStatus(data["status"]),
+            provenance=_query_provenance(data),
+            provenance_truncated=bool(data.get("provenance_truncated", False)),
+        )
+
+    def render_text(self) -> str:
+        source = self.class_name if self.class_name is not None else self.origin
+        return (
+            f"{self.file}:{self.range.start_line}:{self.range.start_column} "
+            f"[class set; {self.status}] {self.member} <- {source}"
+        )
+
+
+@dataclass(frozen=True)
+class CodeQueryAbsentMemberFinding:
+    id: str
+    file: str
+    range: CodeQueryRange
+    member: str
+    class_name: str
+    origin_file: str
+    origin_range: CodeQueryRange
+    caller: str
+    witness_steps: int
+    provenance: list[CodeQueryProvenance] = field(default_factory=list)
+    provenance_truncated: bool = False
+
+    @classmethod
+    def from_dict(cls, data: dict) -> CodeQueryAbsentMemberFinding:
+        return cls(
+            id=data["id"],
+            file=data["file"],
+            range=CodeQueryRange.from_dict(data["range"]),
+            member=data["member"],
+            class_name=data["class"],
+            origin_file=data["origin_file"],
+            origin_range=CodeQueryRange.from_dict(data["origin_range"]),
+            caller=data["caller"],
+            witness_steps=_strict_nonnegative_int(data, "witness_steps"),
+            provenance=_query_provenance(data),
+            provenance_truncated=bool(data.get("provenance_truncated", False)),
+        )
+
+    def render_text(self) -> str:
+        return (
+            f"{self.file}:{self.range.start_line}:{self.range.start_column} "
+            f"[absent member] {self.class_name} has no member `{self.member}` "
+            f"(from {self.origin_file}:{self.origin_range.start_line}:"
+            f"{self.origin_range.start_column}; caller {self.caller}; "
+            f"witness {self.witness_steps} steps)"
+        )
+
+
 @dataclass(frozen=True)
 class CodeQueryTaintOrigin:
     id: str
@@ -5197,6 +5278,8 @@ CodeQueryResultItem = (
     | CodeQueryTypestateWitness
     | CodeQueryFlowEndpoint
     | CodeQueryFlowWitness
+    | CodeQueryClassSetRow
+    | CodeQueryAbsentMemberFinding
     | CodeQueryTaintFinding
     | CodeQueryFile
     | CodeQueryReferenceSite
@@ -5263,6 +5346,8 @@ _CODE_QUERY_RESULT_ITEM_TYPES = {
     "typestate_witness": CodeQueryTypestateWitness,
     "flow_endpoint": CodeQueryFlowEndpoint,
     "flow_witness": CodeQueryFlowWitness,
+    "class_set_row": CodeQueryClassSetRow,
+    "absent_member_finding": CodeQueryAbsentMemberFinding,
     "taint_finding": CodeQueryTaintFinding,
     "file": CodeQueryFile,
     "reference_site": CodeQueryReferenceSite,

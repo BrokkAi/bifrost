@@ -145,12 +145,23 @@ impl ProcedureCfgBuilder {
             .expect("value count is bounded by the u32 semantic budget");
         assert_eq!(value.id, id, "values must use dense builder IDs");
         let owned_text_bytes = match &value.kind {
-            super::SemanticValueKind::LanguageDefined(name)
-            | super::SemanticValueKind::Parameter {
-                multiplicity:
-                    super::FormalMultiplicity::Rest(super::ArgumentDomain::LanguageDefined(name)),
-                ..
-            } => name.len(),
+            super::SemanticValueKind::LanguageDefined(name) => name.len(),
+            super::SemanticValueKind::Parameter {
+                multiplicity, name, ..
+            } => name
+                .as_deref()
+                .map_or(0, str::len)
+                .saturating_add(match multiplicity {
+                    super::FormalMultiplicity::Rest(super::ArgumentDomain::LanguageDefined(
+                        name,
+                    )) => name.len(),
+                    super::FormalMultiplicity::One
+                    | super::FormalMultiplicity::Rest(
+                        super::ArgumentDomain::Positional
+                        | super::ArgumentDomain::Keyword
+                        | super::ArgumentDomain::PositionalOrKeyword,
+                    ) => 0,
+                }),
             _ => 0,
         };
         self.reserve(SemanticWork {
@@ -251,14 +262,20 @@ impl ProcedureCfgBuilder {
         let owned_text_bytes = call_site
             .arguments
             .iter()
-            .filter_map(|argument| match argument.expansion.domain() {
-                Some(super::ArgumentDomain::LanguageDefined(name)) => Some(name.len()),
-                Some(
-                    super::ArgumentDomain::Positional
-                    | super::ArgumentDomain::Keyword
-                    | super::ArgumentDomain::PositionalOrKeyword,
-                )
-                | None => None,
+            .map(|argument| {
+                argument
+                    .keyword
+                    .as_deref()
+                    .map_or(0, str::len)
+                    .saturating_add(match argument.expansion.domain() {
+                        Some(super::ArgumentDomain::LanguageDefined(name)) => name.len(),
+                        Some(
+                            super::ArgumentDomain::Positional
+                            | super::ArgumentDomain::Keyword
+                            | super::ArgumentDomain::PositionalOrKeyword,
+                        )
+                        | None => 0,
+                    })
             })
             .fold(0usize, usize::saturating_add);
         self.reserve(SemanticWork {
@@ -1072,10 +1089,10 @@ mod tests {
     use crate::analyzer::semantic::{
         ArgumentDomain, CallArgumentExpansion, CallSiteId, CallableTargetResolution,
         ControlContinuation, DeclarationLocator, DeclarationSegment, DeclarationSegmentKind,
-        FormalMultiplicity, ProcedureId, ProcedureKind, SemanticBudgetDimension,
-        SemanticCallArgument, SemanticEffect, SemanticLanguage, SemanticLocator, SemanticRole,
-        SemanticValueKind, SourceAnchor, SourcePosition, SourceSpan, ValueId, WorkspaceMountId,
-        WorkspaceRelativePath,
+        FormalMultiplicity, FormalParameterPassingMode, ProcedureId, ProcedureKind,
+        SemanticBudgetDimension, SemanticCallArgument, SemanticEffect, SemanticLanguage,
+        SemanticLocator, SemanticRole, SemanticValueKind, SourceAnchor, SourcePosition, SourceSpan,
+        ValueId, WorkspaceMountId, WorkspaceRelativePath,
     };
 
     fn builder_with_budget(budget: &SemanticBudget) -> ProcedureCfgBuilder {
@@ -1171,8 +1188,19 @@ mod tests {
                     multiplicity: FormalMultiplicity::Rest(ArgumentDomain::LanguageDefined(
                         "language-rest".into(),
                     )),
+                    name: None,
+                    passing_mode: FormalParameterPassingMode::PositionalOrNamed,
                 },
                 "language-rest".len(),
+            ),
+            (
+                SemanticValueKind::Parameter {
+                    ordinal: 0,
+                    multiplicity: FormalMultiplicity::One,
+                    name: Some("parameter-name".into()),
+                    passing_mode: FormalParameterPassingMode::NamedOnly,
+                },
+                "parameter-name".len(),
             ),
         ] {
             let limit = baseline + text_bytes - 1;
@@ -1197,18 +1225,25 @@ mod tests {
     #[test]
     fn builder_budget_charges_owned_direct_and_spread_argument_domain_text() {
         let baseline = builder().prospective_work().owned_text_bytes;
-        for (expansion, text_bytes) in [
+        for (expansion, keyword, text_bytes) in [
             (
                 CallArgumentExpansion::Direct(ArgumentDomain::LanguageDefined(
                     "direct-domain".into(),
                 )),
+                None,
                 "direct-domain".len(),
             ),
             (
                 CallArgumentExpansion::Spread(ArgumentDomain::LanguageDefined(
                     "spread-domain".into(),
                 )),
+                None,
                 "spread-domain".len(),
+            ),
+            (
+                CallArgumentExpansion::Direct(ArgumentDomain::Keyword),
+                Some(Box::<str>::from("keyword-name")),
+                "keyword-name".len(),
             ),
         ] {
             let limit = baseline + text_bytes - 1;
@@ -1225,6 +1260,7 @@ mod tests {
                     arguments: Box::new([SemanticCallArgument {
                         value: ValueId::new(1),
                         expansion,
+                        keyword,
                     }]),
                     normal_results: Box::new([]),
                     result: None,

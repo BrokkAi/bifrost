@@ -7,6 +7,7 @@
 use crate::declarations::{
     CppVisitor, collect_cpp_identifiers, collect_cpp_includes, recover_quoted_includes,
 };
+use crate::graph::resolver::OrphanedNamespaceScopeIndex;
 use brokk_bifrost_core::analyzer::ProjectFile;
 use brokk_bifrost_core::analyzer::cognitive_complexity;
 use brokk_bifrost_core::analyzer::model::{Language, LanguageDialect};
@@ -191,6 +192,7 @@ fn walk_cpp_declarations<'tree>(
         c_tag_semantics: dialect == LanguageDialect::CppC,
         recovered_class_sibling_scopes: HashMap::default(),
         consumed_fragment_regions: Vec::new(),
+        orphaned_namespaces: OrphanedNamespaceScopeIndex::build(root, source),
         namespace_forward_scans: HashMap::default(),
         field_owners: None,
         recovery_captures: Vec::new(),

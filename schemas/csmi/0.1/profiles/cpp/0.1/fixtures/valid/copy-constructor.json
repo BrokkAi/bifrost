@@ -1,0 +1,73 @@
+{
+  "kind": "special-member",
+  "language": "c++",
+  "owner": "basic-string-primary",
+  "member": "basic-string-copy-constructor",
+  "operation": "copy-constructor",
+  "signature": {
+    "callableKind": "constructor",
+    "owner": {
+      "artifactSelectors": [
+        {
+          "purl": "pkg:generic/cpp-reference-headers@1.0.0",
+          "digests": [
+            {
+              "algorithm": "sha-256",
+              "coverage": "canonical-header-tree",
+              "value": "1111111111111111111111111111111111111111111111111111111111111111"
+            }
+          ]
+        }
+      ],
+      "scheme": "csmi.cpp.declaration",
+      "schemeVersion": "0.1.0",
+      "stability": "portable",
+      "descriptors": [
+        { "role": "namespace", "name": "std", "disambiguator": "namespace" },
+        { "role": "type", "name": "basic_string", "disambiguator": "template-primary:3" }
+      ]
+    },
+    "parameters": [
+      {
+        "kind": "reference",
+        "referenceKind": "lvalue",
+        "referent": {
+          "kind": "qualified",
+          "qualifiers": ["const"],
+          "type": {
+            "kind": "declared",
+            "symbol": {
+              "artifactSelectors": [
+                {
+                  "purl": "pkg:generic/cpp-reference-headers@1.0.0",
+                  "digests": [
+                    {
+                      "algorithm": "sha-256",
+                      "coverage": "canonical-header-tree",
+                      "value": "1111111111111111111111111111111111111111111111111111111111111111"
+                    }
+                  ]
+                }
+              ],
+              "scheme": "csmi.cpp.declaration",
+              "schemeVersion": "0.1.0",
+              "stability": "portable",
+              "descriptors": [
+                { "role": "namespace", "name": "std", "disambiguator": "namespace" },
+                { "role": "type", "name": "basic_string", "disambiguator": "template-primary:3" }
+              ]
+            }
+          }
+        }
+      }
+    ]
+  },
+  "memberDisambiguator": "cppsig-0.1:670e0719b1b6b5ae53e61b7e9b5d04dffd8beb7fbe6514a93b2a6b6d276b0bbb",
+  "resolutionContext": {
+    "vocabulary": "csmi.c-cpp-resolution",
+    "version": "0.1.0",
+    "contextDigest": "0c0d1ea7b503dfbd5197a6541b64553359cf9e62841c49741ddd86ad4cd72b3f",
+    "language": "c++",
+    "headerClosure": "complete"
+  }
+}

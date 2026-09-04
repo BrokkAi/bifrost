@@ -460,10 +460,42 @@ impl<'a> ReferenceEngine<'a> {
         max_usages: usize,
         max_source_bytes: Option<usize>,
     ) -> ReferenceRun {
-        let query = self.query_with_provider_and_source_budget(
+        self.references_to_edges_with_provider(
             analyzer,
             targets,
             None,
+            max_files,
+            max_usages,
+            max_source_bytes,
+        )
+    }
+
+    /// [`Self::references_to_edges`], but lets the caller pick the candidate
+    /// file provider.
+    ///
+    /// `find_default_candidates_within` (the `None` case) chooses the
+    /// interruptible, per-candidate importer scan specifically so a caller
+    /// with a real deadline can bail out mid-scan instead of being forced
+    /// through one uninterruptible workspace-wide reverse-import-index
+    /// build. A caller whose cancellation token can never actually fire
+    /// (e.g. a batch scan with no deadline) pays that scan's full cost on
+    /// every call for a protection it will never use. Passing
+    /// `Some(&ImportGraphCandidateProvider::new())` opts into the same
+    /// import-graph candidates through the cached reverse-import-index path
+    /// instead (bifrost#15).
+    pub fn references_to_edges_with_provider(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        targets: &[CodeUnit],
+        explicit_provider: Option<&dyn crate::analyzer::usages::CandidateFileProvider>,
+        max_files: usize,
+        max_usages: usize,
+        max_source_bytes: Option<usize>,
+    ) -> ReferenceRun {
+        let query = self.query_with_provider_and_source_budget(
+            analyzer,
+            targets,
+            explicit_provider,
             max_files,
             max_usages,
             max_source_bytes,

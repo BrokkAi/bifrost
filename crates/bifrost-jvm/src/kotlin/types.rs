@@ -438,14 +438,16 @@ pub fn kotlin_realm_type_exists<S: KotlinSource + ?Sized>(
 }
 
 /// The scope owners visible inside `owner`: the declaration itself, each of its
-/// lexical owners, and the nested-type scopes each of those inherits.
+/// lexical owners, and the nested-type scopes each of those inherits, across
+/// the whole JVM realm when a realm view is supplied.
 pub fn kotlin_scope_owners_for<S: KotlinSource + ?Sized>(
     source: &S,
     token: QueryToken<'_>,
     owner: &CodeUnit,
+    realm: Option<&JvmSourceRealm<'_>>,
 ) -> Vec<String> {
-    kotlin_scope_owners_for_with(source, token, owner, &mut |fqn| {
-        kotlin_source_type_by_fqn(source, token, fqn)
+    kotlin_scope_owners_for_with(source, token, owner, realm, &mut |fqn| {
+        kotlin_realm_type_by_fqn(source, token, fqn, realm)
     })
 }
 
@@ -459,6 +461,7 @@ pub(crate) fn kotlin_scope_owners_for_with<S: KotlinSource + ?Sized>(
     source: &S,
     token: QueryToken<'_>,
     owner: &CodeUnit,
+    realm: Option<&JvmSourceRealm<'_>>,
     type_by_fqn: &mut dyn FnMut(&str) -> Option<CodeUnit>,
 ) -> Vec<String> {
     let mut owners = Vec::new();
@@ -469,7 +472,8 @@ pub(crate) fn kotlin_scope_owners_for_with<S: KotlinSource + ?Sized>(
     }
 
     // Inherited nested types: a class can name a type its superclass declares.
-    // Resolving those supertypes uses the lexical scope only, so this cannot
+    // Resolving a Kotlin supertype here uses the lexical scope only, and a
+    // peer's supertypes come from the owning analyzer's memo, so this cannot
     // re-enter itself; the depth cap bounds a chain that a malformed or cyclic
     // hierarchy could otherwise make unbounded.
     let lexical = owners.clone();
@@ -477,7 +481,9 @@ pub(crate) fn kotlin_scope_owners_for_with<S: KotlinSource + ?Sized>(
     for _ in 0..MAX_INHERITED_SCOPE_DEPTH {
         let mut next = Vec::new();
         for fqn in &frontier {
-            for ancestor in kotlin_lexical_direct_ancestor_fqns(source, token, fqn, type_by_fqn) {
+            for ancestor in
+                kotlin_lexical_direct_ancestor_fqns(source, token, fqn, realm, type_by_fqn)
+            {
                 if !owners.contains(&ancestor) {
                     owners.push(ancestor.clone());
                     next.push(ancestor);
@@ -492,17 +498,34 @@ pub(crate) fn kotlin_scope_owners_for_with<S: KotlinSource + ?Sized>(
     owners
 }
 
-/// Direct supertype fully-qualified names of `fqn`, resolved with lexical scope
-/// only so inherited-scope discovery cannot recurse into itself.
+/// Direct supertype fully-qualified names of `fqn`.
+///
+/// A Kotlin declaration's supertypes are resolved with lexical scope only, so
+/// inherited-scope discovery cannot recurse into itself. A declaration another
+/// realm member owns is that member's to resolve (#2918): this analyzer holds
+/// neither the peer file's imports nor its spelled supertypes -- both reads
+/// refuse a foreign file -- so resolving the peer's `extends` clause here
+/// would apply Kotlin's ladder to an empty import list. The realm asks the
+/// owning analyzer for its own answer instead.
 pub fn kotlin_lexical_direct_ancestor_fqns<S: KotlinSource + ?Sized>(
     source: &S,
     token: QueryToken<'_>,
     fqn: &str,
+    realm: Option<&JvmSourceRealm<'_>>,
     type_by_fqn: &mut dyn FnMut(&str) -> Option<CodeUnit>,
 ) -> Vec<String> {
     let Some(owner) = type_by_fqn(fqn) else {
         return Vec::new();
     };
+    if owner.source().language() != Language::Kotlin {
+        // `type_by_fqn` yields Kotlin's own declarations or peers the realm
+        // returned, so a non-Kotlin owner always has a realm and an owning
+        // member behind it.
+        let realm = realm.expect("a non-Kotlin type can only have come from the JVM realm");
+        return realm
+            .peer_direct_ancestor_fqns(&owner, Language::Kotlin)
+            .expect("a type the JVM realm returned is owned by one of its members");
+    }
     let mut lexical_owners = Vec::new();
     let mut current = Some(owner.clone());
     while let Some(unit) = current {

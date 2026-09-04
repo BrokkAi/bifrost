@@ -80,6 +80,23 @@ pub(super) fn open_generated_production_lock(
         .map_err(|error| CatalogError::io("open generated-production lock", error))
 }
 
+pub(super) fn acquire_initialization_lock(root: &Path) -> Result<File, CatalogError> {
+    let lock_root = root.join("locks");
+    reject_symlink(&lock_root, "catalog lock directory")?;
+    let lock_path = lock_root.join("catalog-initialization.lock");
+    reject_symlink(&lock_path, "catalog initialization lock")?;
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(lock_path)
+        .map_err(|error| CatalogError::io("open catalog initialization lock", error))?;
+    file.lock()
+        .map_err(|error| CatalogError::io("acquire catalog initialization lock", error))?;
+    Ok(file)
+}
+
 pub(super) fn publish(
     root: &Path,
     digest: &str,

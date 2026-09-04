@@ -8,14 +8,16 @@
 
 use std::fmt;
 use std::mem::{size_of, size_of_val};
+use std::ops::Range;
+use std::sync::Mutex;
 
 use crate::analyzer::invalidation::{
     ArtifactVerdict, DerivedArtifactId, InvalidationReason, RetentionReason,
 };
 use crate::analyzer::semantic::{
     DeclarationLocator, DeclarationSegment, DeclarationSegmentKind, DependencyFingerprint,
-    EvidenceCompleteness, ProofStatus, SemanticArtifactKey, SemanticLocator, SemanticRole,
-    StableDigest, WorkspaceMountId, WorkspaceRelativePath,
+    EvidenceCompleteness, ExecutionTiming, LengthDelimitedDigest, ProofStatus, SemanticArtifactKey,
+    SemanticLocator, SemanticRole, StableDigest, WorkspaceMountId, WorkspaceRelativePath,
     is_unmaterialized_external_artifact_locator,
 };
 use crate::analyzer::semantic_model::UnmaterializedExternalSummaryCallShapeBinding;
@@ -85,20 +87,77 @@ define_summary_digest!(
     /// Context and access-path abstraction selected for one summary family.
     SummaryContextKey
 );
-define_summary_digest!(
-    /// Exceptional, escape, external-call, and unresolved-call behavior.
-    SummaryBehaviorKey
-);
+/// Exceptional, escape, external-call, and unresolved-call behavior.
+///
+/// Two digests over the same inputs. The first is the cache identity: a
+/// summary derived under one behavior must never be served to a request under
+/// another, so it folds everything, including the whole workspace's content
+/// identity through the ICFG provider's dispatch universe. The second leaves
+/// that content identity out, for a read ledger's summary key: a recorded read
+/// has to be verifiable against a workspace whose files moved, and a key that
+/// rotated on every edit anywhere could never be
+/// (`.agents/plans/impact-sliced-diff-base.md`, Decision Log (5b)).
+///
+/// Hand-written rather than one of the macro's single-digest keys for exactly
+/// that second field. Every constructor but [`Self::from_parts`] sets the two
+/// halves equal, because a behavior that folds no workspace content has
+/// nothing to leave out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SummaryBehaviorKey {
+    digest: StableDigest,
+    read: StableDigest,
+}
 
 impl SummaryBehaviorKey {
+    pub const fn from_digest(digest: StableDigest) -> Self {
+        Self {
+            digest,
+            read: digest,
+        }
+    }
+
+    pub fn hash_bytes(bytes: impl AsRef<[u8]>) -> Self {
+        Self::from_digest(StableDigest::sha256(bytes))
+    }
+
+    /// One behavior whose read half names less than its cache half.
+    pub const fn from_parts(digest: StableDigest, read: StableDigest) -> Self {
+        Self { digest, read }
+    }
+
+    pub const fn digest(self) -> StableDigest {
+        self.digest
+    }
+
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        self.digest.as_bytes()
+    }
+
+    /// This behavior without the workspace's content identity.
+    pub const fn read_bytes(&self) -> &[u8; 32] {
+        self.read.as_bytes()
+    }
+
     /// Derive a behavior identity that includes the configured fallback for
     /// call arms without an executable body or applicable model.
     pub fn with_unmodeled_call_behavior(self, behavior: UnmodeledCallBehavior) -> Self {
-        let mut bytes = Vec::with_capacity(80);
-        bytes.extend_from_slice(b"bifrost-summary-behavior/unmodeled-call/v1\0");
-        bytes.extend_from_slice(self.as_bytes());
-        bytes.extend_from_slice(behavior.label().as_bytes());
-        Self::hash_bytes(bytes)
+        let derive = |digest: &StableDigest| {
+            let mut bytes = Vec::with_capacity(80);
+            bytes.extend_from_slice(b"bifrost-summary-behavior/unmodeled-call/v1\0");
+            bytes.extend_from_slice(digest.as_bytes());
+            bytes.extend_from_slice(behavior.label().as_bytes());
+            StableDigest::sha256(bytes)
+        };
+        Self {
+            digest: derive(&self.digest),
+            read: derive(&self.read),
+        }
+    }
+}
+
+impl fmt::Display for SummaryBehaviorKey {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.digest.fmt(formatter)
     }
 }
 
@@ -106,10 +165,36 @@ define_summary_digest!(
     /// Stable identity of one summary-visible semantic event.
     SummaryEventKey
 );
+
+impl SummaryEventKey {
+    /// Derive the stable key shared by production projection and live replay
+    /// for one source-backed concurrency event.
+    pub fn from_concurrency_source(locator: &SemanticLocator, ordinal: usize) -> Self {
+        let mut digest = LengthDelimitedDigest::new(b"bifrost-production-concurrency-effect-v2");
+        locator.push_stable_identity(&mut digest);
+        digest.push(&ordinal.to_le_bytes());
+        Self::from_digest(digest.finish())
+    }
+}
 define_summary_digest!(
     /// Stable identity of a capture or supported heap/access-path boundary.
     SummaryLocationKey
 );
+
+impl SummaryLocationKey {
+    pub fn from_locator(locator: &SemanticLocator) -> Self {
+        let mut digest = LengthDelimitedDigest::new(b"bifrost-production-concurrency-location-v2");
+        // A field declaration is shared by accesses from different methods.
+        // The locator's enclosing declaration chain names the use site, so it
+        // must not enter the storage selector. Path, language, semantic role,
+        // and the source anchor identify the declaration-backed location.
+        digest.push(locator.path().as_str().as_bytes());
+        digest.push(locator.language().stable_label().as_bytes());
+        digest.push(locator.role().stable_label().as_bytes());
+        digest.push_anchor(locator.anchor());
+        Self::from_digest(digest.finish())
+    }
+}
 define_summary_digest!(
     /// Content identity of one externally supplied semantic model.
     ExternalSummaryContentHash
@@ -382,8 +467,42 @@ impl ProcedureSummaryIdentity {
     /// context and behavior keys, so it still separates two summaries of the
     /// same procedure derived under different contracts.
     pub fn public_fingerprint(&self) -> StableDigest {
+        self.checkout_independent_fingerprint(
+            b"bifrost-procedure-summary-public-identity-v1",
+            self.behavior.as_bytes(),
+        )
+    }
+
+    /// The identity a read ledger names this summary by.
+    ///
+    /// [`Self::public_fingerprint`] folds the behavior key, and the behavior
+    /// key folds the whole workspace's content identity, so a summary named by
+    /// it rotates on any edit anywhere -- and a root unit whose read set named
+    /// summaries that way could never survive an unrelated edit. This folds the
+    /// behavior's read half instead: the same engine (the active model set, the
+    /// overlay, the dispatch expansion, the external dispatch surface) without
+    /// the workspace's file set, which is what a read set's own `File` and
+    /// `Artifact` keys state exactly and far more precisely
+    /// (`.agents/plans/impact-sliced-diff-base.md`, Decision Log (5b)).
+    ///
+    /// Two summaries of one procedure derived under two workspaces therefore
+    /// share this identity. That is the intent, and it is sound in both
+    /// directions: the reader that asks with it is answered `None` when more
+    /// than one summary is retained under it with different content, and the
+    /// artifacts of the summary's dependency closure, recorded beside it, are
+    /// what state the content the solve actually read.
+    pub fn read_fingerprint(&self) -> StableDigest {
+        self.checkout_independent_fingerprint(
+            b"bifrost-procedure-summary-read-identity-v1",
+            self.behavior.read_bytes(),
+        )
+    }
+
+    /// The two checkout-independent fingerprints above, which differ only in
+    /// their domain and in which half of the behavior key they fold.
+    fn checkout_independent_fingerprint(&self, domain: &[u8], behavior: &[u8; 32]) -> StableDigest {
         let mut bytes = Vec::new();
-        push_digest_part(&mut bytes, b"bifrost-procedure-summary-public-identity-v1");
+        push_digest_part(&mut bytes, domain);
         push_digest_part(&mut bytes, self.artifact.public_fingerprint().as_bytes());
         for segment in self.declaration.segments() {
             push_digest_part(&mut bytes, segment.kind().stable_label().as_bytes());
@@ -399,7 +518,7 @@ impl ProcedureSummaryIdentity {
         push_digest_part(&mut bytes, &self.schema.get().to_le_bytes());
         push_digest_part(&mut bytes, self.semantics.as_bytes());
         push_digest_part(&mut bytes, self.context.as_bytes());
-        push_digest_part(&mut bytes, self.behavior.as_bytes());
+        push_digest_part(&mut bytes, behavior);
         match &self.origin {
             SummaryOrigin::Inferred => push_digest_part(&mut bytes, b"inferred"),
             SummaryOrigin::External(origin) => {
@@ -416,6 +535,109 @@ impl ProcedureSummaryIdentity {
     /// Conservative retained size of this owned identity and its heap fields.
     pub fn retained_bytes(&self) -> usize {
         size_of::<Self>().saturating_add(identity_heap_bytes(self))
+    }
+}
+
+/// Announced on every procedure-summary lookup a repository answers.
+///
+/// The summary repository lives in this crate, which has no analyzer and no
+/// request boundary, so it cannot record a read itself. A consumer that does
+/// hold one -- the policy crate's ICFG provider -- implements this and turns
+/// each announcement into a `Lookup { kind: ProcedureSummary }` read key
+/// (issue: impact-sliced `--diff-base`, Milestone 5).
+///
+/// Both halves of an answer are announced. A miss is an answer about absence
+/// and is keyed the same way a hit is: a solve that read "nothing is retained
+/// under this identity" depends on the head still holding nothing there.
+///
+/// The method has a no-op body so a consumer that only wants some of the
+/// announcements, and every test fake, can implement this with an empty block.
+pub trait SummaryReadObserver {
+    /// One lookup answered: `identity` names the procedure summary that was
+    /// asked for, `content` is
+    /// [`SemanticProcedureSummary::public_content_digest`] of what was
+    /// retained, or the caller's absent digest when nothing was, and
+    /// `dependencies` is the retained summary's own dependency closure, empty
+    /// when nothing was retained.
+    ///
+    /// The closure is part of the same announcement rather than a second one
+    /// because it is part of the same read: the answer this lookup returned is
+    /// a summary composed through every one of those callees, so a recorder
+    /// that named the summary alone would have named an answer without naming
+    /// what it was derived from.
+    fn summary_read(
+        &self,
+        _identity: &ProcedureSummaryIdentity,
+        _content: StableDigest,
+        _dependencies: &[SummaryDependencyKey],
+    ) {
+    }
+}
+
+/// The observer for a lookup nobody is recording.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoSummaryReadObserver;
+
+impl SummaryReadObserver for NoSummaryReadObserver {}
+
+/// Records every announced summary read on one analyzer's open read ledgers.
+///
+/// This lives here rather than in each consumer because the recipe is one
+/// recipe: the question is the summary identity's public fingerprint, and the
+/// answer is the retained summary's public content digest. Two consumers
+/// spelling it separately could disagree, and a recording that disagrees with
+/// the verification that replays it is worse than no recording at all.
+pub struct SummaryReadRecorder<'a> {
+    analyzer: &'a dyn crate::analyzer::IAnalyzer,
+}
+
+impl<'a> SummaryReadRecorder<'a> {
+    pub const fn new(analyzer: &'a dyn crate::analyzer::IAnalyzer) -> Self {
+        Self { analyzer }
+    }
+}
+
+impl SummaryReadObserver for SummaryReadRecorder<'_> {
+    fn summary_read(
+        &self,
+        identity: &ProcedureSummaryIdentity,
+        content: StableDigest,
+        dependencies: &[SummaryDependencyKey],
+    ) {
+        if !self.analyzer.read_ledger_attached() {
+            return;
+        }
+        self.analyzer
+            .record_read(crate::analyzer::read_ledger::ReadKey::lookup(
+                crate::analyzer::read_ledger::LookupKind::ProcedureSummary,
+                crate::analyzer::read_ledger::LookupQuestion::summary(identity.read_fingerprint()),
+                content,
+            ));
+        // The summary key alone cannot carry the dependency, because a head
+        // that has solved nothing retains no summary to compare against and
+        // answers absence for every one of them. What the head can always
+        // answer is what it would derive from a file, so the closure is
+        // recorded as artifacts: one per member, by public fingerprint and
+        // workspace-relative path, exactly the shape `materialize_with_lowerer`
+        // records. Those are what verification re-derives and compares
+        // (`.agents/plans/impact-sliced-diff-base.md`, Decision Log (5b)).
+        self.record_artifact(identity.artifact());
+        for dependency in dependencies {
+            self.record_artifact(dependency.identity().artifact());
+        }
+    }
+}
+
+impl SummaryReadRecorder<'_> {
+    /// One artifact of a summary's dependency closure, as a read key.
+    fn record_artifact(&self, artifact: &SemanticArtifactKey) {
+        self.analyzer
+            .record_read(crate::analyzer::read_ledger::ReadKey::artifact(
+                crate::analyzer::invalidation::DerivedArtifactId::semantic_artifact(
+                    artifact.public_fingerprint(),
+                ),
+                Some(artifact.path().as_str()),
+            ));
     }
 }
 
@@ -934,6 +1156,284 @@ impl SummaryTransfer {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum SummaryConcurrencyAccessMode {
+    Read,
+    Write,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum SummaryConcurrencyLockOperation {
+    Acquire,
+    Release,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum SummaryConcurrencyLockMode {
+    Shared,
+    Exclusive,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum SummaryConcurrencySynchronizationOperation {
+    Acquire,
+    Release,
+    AcquireRelease,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum SummaryConcurrencyAtomicOperation {
+    Load,
+    Store,
+    ReadModifyWrite,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum SummaryConcurrencyAccessSelector {
+    Field(SummaryLocationKey),
+    Aggregate,
+    ConstantIndex(i128),
+    Index(SummaryPort),
+    AnyIndex,
+}
+
+/// A stable access path rooted at a procedure boundary port.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SummaryConcurrencyAccessPath {
+    root: SummaryPort,
+    selectors: Box<[SummaryConcurrencyAccessSelector]>,
+}
+
+impl SummaryConcurrencyAccessPath {
+    pub fn new(root: SummaryPort, selectors: Vec<SummaryConcurrencyAccessSelector>) -> Self {
+        Self {
+            root,
+            selectors: selectors.into_boxed_slice(),
+        }
+    }
+
+    pub fn port(root: SummaryPort) -> Self {
+        Self::new(root, Vec::new())
+    }
+
+    pub const fn root(&self) -> &SummaryPort {
+        &self.root
+    }
+
+    pub const fn selectors(&self) -> &[SummaryConcurrencyAccessSelector] {
+        &self.selectors
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SummaryConcurrencyLockRequirement {
+    lock: SummaryConcurrencyAccessPath,
+    mode: SummaryConcurrencyLockMode,
+}
+
+impl SummaryConcurrencyLockRequirement {
+    pub fn new(lock: SummaryConcurrencyAccessPath, mode: SummaryConcurrencyLockMode) -> Self {
+        Self { lock, mode }
+    }
+
+    pub const fn lock(&self) -> &SummaryConcurrencyAccessPath {
+        &self.lock
+    }
+
+    pub const fn mode(&self) -> SummaryConcurrencyLockMode {
+        self.mode
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum SummaryConcurrencyExecutionCardinality {
+    ExactlyOnce,
+    ZeroOrOne,
+    OneOrMore,
+    ZeroOrMore,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SummaryConcurrencyExecution {
+    timing: ExecutionTiming,
+    cardinality: SummaryConcurrencyExecutionCardinality,
+}
+
+impl SummaryConcurrencyExecution {
+    pub const fn new(
+        timing: ExecutionTiming,
+        cardinality: SummaryConcurrencyExecutionCardinality,
+    ) -> Self {
+        Self {
+            timing,
+            cardinality,
+        }
+    }
+
+    pub const fn immediate_once() -> Self {
+        Self::new(
+            ExecutionTiming::SameEvaluation,
+            SummaryConcurrencyExecutionCardinality::ExactlyOnce,
+        )
+    }
+
+    pub const fn timing(self) -> ExecutionTiming {
+        self.timing
+    }
+
+    pub const fn cardinality(self) -> SummaryConcurrencyExecutionCardinality {
+        self.cardinality
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum SummaryConcurrencyTargetCoverage {
+    Exhaustive,
+    Possible,
+    Unknown,
+}
+
+/// A bounded source witness within the procedure artifact named by the
+/// surrounding summary identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SummaryConcurrencySourceWitness {
+    start_byte: u32,
+    end_byte: u32,
+}
+
+impl SummaryConcurrencySourceWitness {
+    pub fn new(start_byte: u32, end_byte: u32) -> Self {
+        assert!(start_byte <= end_byte, "summary witness range is ordered");
+        Self {
+            start_byte,
+            end_byte,
+        }
+    }
+
+    pub const fn start_byte(self) -> u32 {
+        self.start_byte
+    }
+
+    pub const fn end_byte(self) -> u32 {
+        self.end_byte
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum SummaryConcurrencyEffectKind {
+    Unsupported {
+        protocol: Box<str>,
+    },
+    Access {
+        location: SummaryConcurrencyAccessPath,
+        mode: SummaryConcurrencyAccessMode,
+        must_hold: Box<[SummaryConcurrencyLockRequirement]>,
+    },
+    Allocation {
+        location: SummaryConcurrencyAccessPath,
+    },
+    Alias {
+        source: SummaryConcurrencyAccessPath,
+        target: SummaryConcurrencyAccessPath,
+    },
+    TaskSpawn {
+        callable: SummaryPort,
+        target_coverage: SummaryConcurrencyTargetCoverage,
+        group: Option<SummaryConcurrencyAccessPath>,
+    },
+    TaskJoin {
+        group: SummaryConcurrencyAccessPath,
+    },
+    Lock {
+        lock: SummaryConcurrencyAccessPath,
+        operation: SummaryConcurrencyLockOperation,
+        mode: SummaryConcurrencyLockMode,
+    },
+    Synchronize {
+        subject: SummaryConcurrencyAccessPath,
+        operation: SummaryConcurrencySynchronizationOperation,
+    },
+    WaitGroupAdd {
+        group: SummaryConcurrencyAccessPath,
+        delta: SummaryPort,
+    },
+    WaitGroupDone {
+        group: SummaryConcurrencyAccessPath,
+    },
+    WaitGroupWait {
+        group: SummaryConcurrencyAccessPath,
+    },
+    Atomic {
+        location: SummaryConcurrencyAccessPath,
+        operation: SummaryConcurrencyAtomicOperation,
+    },
+    Publish {
+        value: SummaryConcurrencyAccessPath,
+    },
+    Escape {
+        value: SummaryConcurrencyAccessPath,
+    },
+    OwnershipTransfer {
+        value: SummaryConcurrencyAccessPath,
+        destination: SummaryConcurrencyAccessPath,
+    },
+}
+
+/// Stable concurrency behavior projected at a procedure boundary.
+///
+/// Every subject is rooted at a [`SummaryPort`] and every occurrence is a
+/// [`SummaryEventKey`]. Analyzer-local values, program points, tasks, and
+/// memory-location IDs therefore cannot enter reusable or persisted content.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SummaryConcurrencyEffect {
+    event: SummaryEventKey,
+    kind: SummaryConcurrencyEffectKind,
+    execution: SummaryConcurrencyExecution,
+    witness: Option<SummaryConcurrencySourceWitness>,
+}
+
+impl SummaryConcurrencyEffect {
+    pub fn new(
+        event: SummaryEventKey,
+        kind: SummaryConcurrencyEffectKind,
+        execution: SummaryConcurrencyExecution,
+        witness: Option<SummaryConcurrencySourceWitness>,
+    ) -> Self {
+        Self {
+            event,
+            kind,
+            execution,
+            witness,
+        }
+    }
+
+    pub fn modeled(event: SummaryEventKey, kind: SummaryConcurrencyEffectKind) -> Self {
+        Self::new(
+            event,
+            kind,
+            SummaryConcurrencyExecution::immediate_once(),
+            None,
+        )
+    }
+
+    pub const fn event(&self) -> SummaryEventKey {
+        self.event
+    }
+
+    pub const fn kind(&self) -> &SummaryConcurrencyEffectKind {
+        &self.kind
+    }
+
+    pub const fn execution(&self) -> SummaryConcurrencyExecution {
+        self.execution
+    }
+
+    pub const fn witness(&self) -> Option<SummaryConcurrencySourceWitness> {
+        self.witness
+    }
+}
+
 /// Stable identity of one summary-visible semantic effect.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum SummaryEffectKey {
@@ -956,7 +1456,9 @@ pub enum SummaryEffectKey {
     /// A source-backed dispatch boundary whose affected input cannot be
     /// represented as a stable procedure port. Its evidence retains the
     /// boundary's proof and completeness without fabricating a heap location.
-    UnknownCallBoundary { event: SummaryEventKey },
+    UnknownCallBoundary {
+        event: SummaryEventKey,
+    },
     AmbiguousCall {
         event: SummaryEventKey,
         input: SummaryPort,
@@ -972,6 +1474,7 @@ pub enum SummaryEffectKey {
         output: SummaryPort,
         removed: Box<[Box<str>]>,
     },
+    Concurrency(SummaryConcurrencyEffect),
 }
 
 impl SummaryEffectKey {
@@ -1051,6 +1554,21 @@ pub enum SummaryIncompleteReason {
 }
 
 impl SummaryIncompleteReason {
+    /// The label this reason contributes to a checkout-independent digest.
+    ///
+    /// The reason payloads are deliberately excluded: the two string arms are
+    /// rendered diagnostics, and `DependencyIncomplete` carries a dependency
+    /// fingerprint folded from mount-bearing identities.
+    pub const fn stable_label(&self) -> &'static str {
+        match self {
+            Self::Cancelled => "cancelled",
+            Self::BudgetExceeded(_) => "budget_exceeded",
+            Self::SemanticGap(_) => "semantic_gap",
+            Self::DependencyIncomplete(_) => "dependency_incomplete",
+            Self::ExternalModelIncomplete(_) => "external_model_incomplete",
+        }
+    }
+
     fn validate(&self) -> Result<(), SummaryValidationError> {
         match self {
             Self::BudgetExceeded(reason) | Self::SemanticGap(reason) => validate_reason(reason),
@@ -1336,6 +1854,80 @@ impl SemanticProcedureSummary {
         self.transfers == other.transfers
             && self.effects == other.effects
             && self.completeness == other.completeness
+    }
+
+    /// A checkout-independent digest of what this summary answers, for a read
+    /// ledger (issue: impact-sliced `--diff-base`, Milestone 5).
+    ///
+    /// Deliberately not a hash of the transfer and effect rows. Every effect
+    /// carries a [`SummaryEventKey`], and the typestate projection mints those
+    /// from the owning artifact's mount-bearing
+    /// `SemanticArtifactKey::fingerprint` (`typestate::production`), so a
+    /// digest over the rows would differ between two checkouts of the same
+    /// content and no read a base recorded could ever verify against a head.
+    ///
+    /// What is folded instead is exact enough because of what the identity
+    /// already binds. [`ProcedureSummaryIdentity::read_fingerprint`] folds the
+    /// procedure's artifact content, its declaration, the schema and semantics
+    /// versions, the context key and the engine the summary was derived by.
+    /// Two summaries retained under equal read identities were therefore
+    /// derived from equal content by equal engines, so they answer the same
+    /// question. This digest adds the rest of the key that is mount-free and
+    /// workspace-content-free -- the dependency closure by read identity, the
+    /// recursive group's size, whether the summary is composed -- together
+    /// with the completeness and the row counts, so a repository that answered
+    /// with a different revision under one identity still shows a different
+    /// answer.
+    ///
+    /// Read identities rather than public fingerprints throughout, because
+    /// this digest is the *answer* half of a recorded read and the question
+    /// half is a read identity: a content digest that folded the whole
+    /// workspace's content identity would differ between the run that recorded
+    /// it and the run that verifies it however little moved, and every
+    /// verification would report a change that is not one.
+    pub fn public_content_digest(&self) -> StableDigest {
+        let mut bytes = Vec::new();
+        push_digest_part(&mut bytes, b"bifrost-procedure-summary-public-content-v2");
+        push_digest_part(&mut bytes, self.key.identity.read_fingerprint().as_bytes());
+        push_digest_part(&mut bytes, &(self.dependencies.len() as u64).to_le_bytes());
+        for dependency in &self.dependencies {
+            match dependency {
+                SummaryDependencyKey::Complete(_) => push_digest_part(&mut bytes, b"complete"),
+                SummaryDependencyKey::Recursive(_) => push_digest_part(&mut bytes, b"recursive"),
+            }
+            push_digest_part(
+                &mut bytes,
+                dependency.identity().read_fingerprint().as_bytes(),
+            );
+        }
+        match self.key.recursive_group {
+            Some(group) => {
+                push_digest_part(&mut bytes, b"recursive-group");
+                push_digest_part(&mut bytes, &group.member_count.to_le_bytes());
+            }
+            None => push_digest_part(&mut bytes, b"nonrecursive"),
+        }
+        push_digest_part(
+            &mut bytes,
+            if self.key == self.composition_root {
+                b"base".as_slice()
+            } else {
+                b"composed".as_slice()
+            },
+        );
+        push_digest_part(&mut bytes, &(self.transfers.len() as u64).to_le_bytes());
+        push_digest_part(&mut bytes, &(self.effects.len() as u64).to_le_bytes());
+        match &self.completeness {
+            SummaryCompleteness::Complete => push_digest_part(&mut bytes, b"complete"),
+            SummaryCompleteness::Partial(reasons) => {
+                push_digest_part(&mut bytes, b"partial");
+                push_digest_part(&mut bytes, &(reasons.len() as u64).to_le_bytes());
+                for reason in reasons {
+                    push_digest_part(&mut bytes, reason.stable_label().as_bytes());
+                }
+            }
+        }
+        StableDigest::sha256(bytes)
     }
 
     /// Join alternative effects for the same exact summary identity.
@@ -1859,6 +2451,7 @@ pub struct CuratedCallModel {
     content: ExternalSummaryContentHash,
     fingerprint: CuratedCallModelFingerprint,
     transfers: Box<[SummaryTransfer]>,
+    effects: Box<[SummaryEffect]>,
 }
 
 impl CuratedCallModel {
@@ -1866,6 +2459,21 @@ impl CuratedCallModel {
         model: ExternalSummaryModelId,
         content: ExternalSummaryContentHash,
         transfers: Vec<SummaryTransfer>,
+    ) -> Result<Self, SummaryValidationError> {
+        Self::try_new_with_effects(model, content, transfers, Vec::new())
+    }
+
+    /// Build a curated model that also carries transfer-seam effects, such as
+    /// the `Sanitize` label removals a policy-declared external model uses for
+    /// label-selective propagation and explicit no-flow declarations. The
+    /// `content` hash is the producer's commitment to the complete semantic
+    /// content, effects included; two models with different effects must not
+    /// share one content hash.
+    pub fn try_new_with_effects(
+        model: ExternalSummaryModelId,
+        content: ExternalSummaryContentHash,
+        transfers: Vec<SummaryTransfer>,
+        effects: Vec<SummaryEffect>,
     ) -> Result<Self, SummaryValidationError> {
         if transfers.len() > MAX_SUMMARY_TRANSFERS {
             return Err(SummaryValidationError::TooManyTransfers {
@@ -1883,6 +2491,7 @@ impl CuratedCallModel {
             content,
             fingerprint: CuratedCallModelFingerprint::hash_bytes(bytes),
             transfers,
+            effects: effects.into_boxed_slice(),
         })
     }
 
@@ -1902,16 +2511,28 @@ impl CuratedCallModel {
         &self.transfers
     }
 
+    pub fn effects(&self) -> &[SummaryEffect] {
+        &self.effects
+    }
+
     /// Conservative retained heap estimate for the model identifier and
     /// transfer evidence owned by this model.
     pub(crate) fn retained_heap_bytes(&self) -> usize {
         self.model.as_str().len().saturating_add(
-            size_of_val(self.transfers()).saturating_add(
-                self.transfers
-                    .iter()
-                    .map(|transfer| evidence_heap_bytes(transfer.evidence()))
-                    .fold(0_usize, usize::saturating_add),
-            ),
+            size_of_val(self.transfers())
+                .saturating_add(
+                    self.transfers
+                        .iter()
+                        .map(|transfer| evidence_heap_bytes(transfer.evidence()))
+                        .fold(0_usize, usize::saturating_add),
+                )
+                .saturating_add(size_of_val(self.effects()))
+                .saturating_add(
+                    self.effects
+                        .iter()
+                        .map(|effect| evidence_heap_bytes(effect.evidence()))
+                        .fold(0_usize, usize::saturating_add),
+                ),
         )
     }
 }
@@ -2234,6 +2855,131 @@ pub struct CompleteSummaryRepository {
     limits: SummaryRepositoryLimits,
 }
 
+/// Workspace-owned synchronization around complete semantic summaries.
+///
+/// The inner repository deliberately remains the validator for dependency
+/// closure and atomic recursive-component publication. This wrapper changes
+/// only ownership: typestate, concurrency, and later flow clients can share
+/// the same content-keyed rows without exposing a lock guard or duplicating a
+/// cache per analysis family.
+#[derive(Debug)]
+pub struct ProductionSemanticSummaryRepository {
+    state: Mutex<CompleteSummaryRepository>,
+}
+
+impl Default for ProductionSemanticSummaryRepository {
+    fn default() -> Self {
+        Self::with_limits(SummaryRepositoryLimits::default())
+    }
+}
+
+impl ProductionSemanticSummaryRepository {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_limits(limits: SummaryRepositoryLimits) -> Self {
+        Self {
+            state: Mutex::new(CompleteSummaryRepository::with_limits(limits)),
+        }
+    }
+
+    pub fn get(&self, key: &ProcedureSummaryKey) -> Option<SemanticProcedureSummary> {
+        self.state().get(key).cloned()
+    }
+
+    /// [`Self::get`], announced to `observer` through the shared repository.
+    pub fn get_observed(
+        &self,
+        key: &ProcedureSummaryKey,
+        observer: &dyn SummaryReadObserver,
+    ) -> Option<SemanticProcedureSummary> {
+        self.state().get_observed(key, observer).cloned()
+    }
+
+    /// The public content retained for one recorded summary identity.
+    pub fn public_content_for_identity(
+        &self,
+        identity: crate::analyzer::semantic::ids::StableDigest,
+    ) -> Option<crate::analyzer::semantic::ids::StableDigest> {
+        self.state().public_content_for_identity(identity)
+    }
+
+    pub fn contains_all(&self, summaries: &[SemanticProcedureSummary]) -> bool {
+        let state = self.state();
+        summaries
+            .iter()
+            .all(|summary| state.get(summary.key()) == Some(summary))
+    }
+
+    /// Publish bottom-up summary components, keeping every recursive group
+    /// atomic. Component ranges must partition `summaries` in publication
+    /// order; malformed producer output is an internal contract violation.
+    pub fn publish_components(
+        &self,
+        summaries: &[SemanticProcedureSummary],
+        components: &[Range<usize>],
+    ) -> Result<SummaryPublicationOutcome, SummaryPublicationError> {
+        let mut expected_start = 0usize;
+        let mut inserted = false;
+        let mut state = self.state();
+        for component in components {
+            assert_eq!(
+                component.start, expected_start,
+                "summary component ranges form one ordered partition"
+            );
+            assert!(
+                component.start < component.end && component.end <= summaries.len(),
+                "summary component range is non-empty and in bounds"
+            );
+            let rows = summaries[component.clone()].to_vec();
+            let outcome = if rows.len() == 1 && rows[0].recursive_group().is_none() {
+                state.publish(
+                    rows.into_iter()
+                        .next()
+                        .expect("one-row component retains one summary"),
+                )
+            } else {
+                state.publish_scc(rows)
+            }?;
+            inserted |= outcome == SummaryPublicationOutcome::Inserted;
+            expected_start = component.end;
+        }
+        assert_eq!(
+            expected_start,
+            summaries.len(),
+            "summary component ranges cover every summary"
+        );
+        Ok(if inserted {
+            SummaryPublicationOutcome::Inserted
+        } else {
+            SummaryPublicationOutcome::AlreadyPresent
+        })
+    }
+
+    pub fn len(&self) -> usize {
+        self.state().len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.state().is_empty()
+    }
+
+    pub fn retained_bytes(&self) -> usize {
+        self.state().retained_bytes()
+    }
+
+    pub fn limits(&self) -> SummaryRepositoryLimits {
+        self.state().limits()
+    }
+
+    fn state(&self) -> std::sync::MutexGuard<'_, CompleteSummaryRepository> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
 impl Default for CompleteSummaryRepository {
     fn default() -> Self {
         Self::with_limits(SummaryRepositoryLimits::default())
@@ -2256,6 +3002,62 @@ impl CompleteSummaryRepository {
 
     pub fn get(&self, key: &ProcedureSummaryKey) -> Option<&SemanticProcedureSummary> {
         self.entries.get(key)
+    }
+
+    /// [`Self::get`], announced to `observer`.
+    ///
+    /// Every lookup that answers is announced, hit or miss, because both are
+    /// answers a caller acted on: a hit is the summary it consumed, a miss is
+    /// the absence it recomputed from. Absence is announced with the read
+    /// ledger's own fixed absent digest so a recording and the verification
+    /// that replays it cannot disagree about what "nothing" hashes to.
+    pub fn get_observed(
+        &self,
+        key: &ProcedureSummaryKey,
+        observer: &dyn SummaryReadObserver,
+    ) -> Option<&SemanticProcedureSummary> {
+        let retained = self.entries.get(key);
+        observer.summary_read(
+            key.identity(),
+            retained.map_or_else(
+                crate::analyzer::read_ledger::absent_summary_digest,
+                SemanticProcedureSummary::public_content_digest,
+            ),
+            retained.map_or(&[], |summary| summary.dependencies()),
+        );
+        retained
+    }
+
+    /// The content digest retained under `identity`'s public fingerprint, for
+    /// verifying a recorded summary read against another workspace.
+    ///
+    /// This is the same lookup [`Self::get_observed`] announces, asked the
+    /// other way round: a recording named a summary by its identity's read
+    /// fingerprint, and verification has only that fingerprint to ask with,
+    /// because a read fingerprint folds an identity into 32 bytes and nothing
+    /// can be read back out. Absence answers the ledger's absent digest, which
+    /// is what the recording used for the same case.
+    ///
+    /// `None` means the question cannot be answered here: more than one
+    /// summary is retained under one identity with different content, so no
+    /// single digest describes what this repository would have served.
+    pub fn public_content_for_identity(
+        &self,
+        identity: crate::analyzer::semantic::ids::StableDigest,
+    ) -> Option<crate::analyzer::semantic::ids::StableDigest> {
+        let mut answer = None;
+        for (key, summary) in &self.entries {
+            if key.identity().read_fingerprint() != identity {
+                continue;
+            }
+            let content = summary.public_content_digest();
+            match answer {
+                None => answer = Some(content),
+                Some(retained) if retained == content => {}
+                Some(_) => return None,
+            }
+        }
+        Some(answer.unwrap_or_else(crate::analyzer::read_ledger::absent_summary_digest))
     }
 
     /// The inverted dependency closure of everything published here (#2449).
@@ -2844,6 +3646,16 @@ fn canonicalize_effects(
             }
             *candidates = normalized.into_boxed_slice();
         }
+        if let SummaryEffectKey::Concurrency(SummaryConcurrencyEffect {
+            kind: SummaryConcurrencyEffectKind::Access { must_hold, .. },
+            ..
+        }) = &mut effect.key
+        {
+            let mut normalized = must_hold.to_vec();
+            normalized.sort_unstable();
+            normalized.dedup();
+            *must_hold = normalized.into_boxed_slice();
+        }
     }
     effects.sort_unstable_by(|left, right| left.key.cmp(&right.key));
     let mut canonical: Vec<SummaryEffect> = Vec::with_capacity(effects.len());
@@ -2938,7 +3750,8 @@ fn validate_effect_dependencies(
             | SummaryEffectKey::Escape { .. }
             | SummaryEffectKey::UnknownCall { .. }
             | SummaryEffectKey::UnknownCallBoundary { .. }
-            | SummaryEffectKey::Sanitize { .. } => {}
+            | SummaryEffectKey::Sanitize { .. }
+            | SummaryEffectKey::Concurrency(_) => {}
         }
     }
     referenced.sort_unstable();
@@ -3041,7 +3854,8 @@ fn effect_reference_count(effect: &SummaryEffectKey) -> usize {
         | SummaryEffectKey::Escape { .. }
         | SummaryEffectKey::UnknownCall { .. }
         | SummaryEffectKey::UnknownCallBoundary { .. }
-        | SummaryEffectKey::Sanitize { .. } => 0,
+        | SummaryEffectKey::Sanitize { .. }
+        | SummaryEffectKey::Concurrency(_) => 0,
     }
 }
 
@@ -3139,12 +3953,54 @@ fn effect_heap_bytes(effect: &SummaryEffect) -> usize {
                 .map(|label| label.len())
                 .fold(0_usize, usize::saturating_add),
         ),
+        SummaryEffectKey::Concurrency(effect) => concurrency_effect_heap_bytes(effect),
         SummaryEffectKey::Allocation { .. }
         | SummaryEffectKey::Escape { .. }
         | SummaryEffectKey::UnknownCall { .. }
         | SummaryEffectKey::UnknownCallBoundary { .. } => 0,
     };
     key_bytes.saturating_add(evidence_heap_bytes(effect.evidence()))
+}
+
+fn concurrency_effect_heap_bytes(effect: &SummaryConcurrencyEffect) -> usize {
+    fn path_bytes(path: &SummaryConcurrencyAccessPath) -> usize {
+        size_of_val(path.selectors())
+    }
+
+    match effect.kind() {
+        SummaryConcurrencyEffectKind::Unsupported { protocol } => protocol.len(),
+        SummaryConcurrencyEffectKind::Access {
+            location,
+            must_hold,
+            ..
+        } => path_bytes(location)
+            .saturating_add(size_of_val(must_hold.as_ref()))
+            .saturating_add(
+                must_hold
+                    .iter()
+                    .map(|requirement| path_bytes(requirement.lock()))
+                    .fold(0_usize, usize::saturating_add),
+            ),
+        SummaryConcurrencyEffectKind::Allocation { location }
+        | SummaryConcurrencyEffectKind::Atomic { location, .. } => path_bytes(location),
+        SummaryConcurrencyEffectKind::Alias { source, target } => {
+            path_bytes(source).saturating_add(path_bytes(target))
+        }
+        SummaryConcurrencyEffectKind::TaskSpawn { group, .. } => {
+            group.as_ref().map_or(0, path_bytes)
+        }
+        SummaryConcurrencyEffectKind::TaskJoin { group }
+        | SummaryConcurrencyEffectKind::WaitGroupAdd { group, .. }
+        | SummaryConcurrencyEffectKind::WaitGroupDone { group }
+        | SummaryConcurrencyEffectKind::WaitGroupWait { group } => path_bytes(group),
+        SummaryConcurrencyEffectKind::Lock { lock, .. } => path_bytes(lock),
+        SummaryConcurrencyEffectKind::Synchronize { subject, .. } => path_bytes(subject),
+        SummaryConcurrencyEffectKind::Publish { value }
+        | SummaryConcurrencyEffectKind::Escape { value } => path_bytes(value),
+        SummaryConcurrencyEffectKind::OwnershipTransfer { value, destination } => {
+            path_bytes(value).saturating_add(path_bytes(destination))
+        }
+    }
 }
 
 fn completeness_heap_bytes(completeness: &SummaryCompleteness) -> usize {

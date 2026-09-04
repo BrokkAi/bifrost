@@ -3,6 +3,48 @@ use brokk_bifrost_core::cancellation::CancellationToken;
 use brokk_bifrost_core::hash::HashSet;
 use tree_sitter::{Node, Tree};
 
+/// The text one plain string literal denotes.
+///
+/// Prefixed strings, interpolations, escapes, implicit concatenations, and
+/// malformed shapes return `None`. The returned slice is always the exact
+/// `string_content` AST span, never text recovered by delimiter parsing.
+pub fn python_plain_string_literal<'source>(
+    node: Node<'_>,
+    source: &'source str,
+) -> Option<&'source str> {
+    if node.kind() != "string"
+        || node
+            .parent()
+            .is_some_and(|parent| parent.kind() == "concatenated_string")
+    {
+        return None;
+    }
+    let mut content = None;
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        match child.kind() {
+            "string_start" | "string_end" => {
+                let delimiter = child.utf8_text(source.as_bytes()).ok()?;
+                if delimiter
+                    .chars()
+                    .any(|character| character != '"' && character != '\'')
+                {
+                    return None;
+                }
+            }
+            "string_content" if child.named_child_count() == 0 && content.is_none() => {
+                content = Some(child);
+            }
+            _ => return None,
+        }
+    }
+    Some(content.map_or("", |child| {
+        child
+            .utf8_text(source.as_bytes())
+            .expect("a tree-sitter node range is valid UTF-8 source")
+    }))
+}
+
 #[derive(Debug, Default)]
 pub struct PythonOverloadDecoratorBindings {
     direct: HashSet<String>,

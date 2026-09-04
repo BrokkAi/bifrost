@@ -1,10 +1,11 @@
 use crate::{
-    SearchToolsService, SearchToolsServiceError, SearchToolsServiceErrorCode,
+    Language, SearchToolsService, SearchToolsServiceError, SearchToolsServiceErrorCode,
     mcp_common::McpRenderOptions, mcp_registry::resolve_server_spec_for_render_options,
     scoped_project::create_scoped_service, searchtools_render::RenderOptions,
 };
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 #[pyclass(name = "SearchToolsNativeSession")]
@@ -142,10 +143,37 @@ fn code_query_variant_inventory_json() -> PyResult<String> {
     serde_json::to_string(&inventory).map_err(|err| PyRuntimeError::new_err(err.to_string()))
 }
 
+/// Every file extension (including reference-only siblings, e.g. TS/JS's `.vue`/`.svelte`) for the
+/// language(s) present among `paths`, derived from bifrost's own [`Language`] table rather than a
+/// caller-maintained copy of it. Pure and does not open a workspace: a caller can scope a
+/// [`SearchToolsNativeSession`]'s `sources` to a diff's own language(s) before paying the cost of
+/// indexing anything -- e.g. skip a large unrelated frontend when a diff only touches backend code.
+#[pyfunction]
+fn extensions_for_paths(paths: Vec<String>) -> Vec<String> {
+    let mut extensions = BTreeSet::new();
+    for path in &paths {
+        let Some(extension) = std::path::Path::new(path)
+            .extension()
+            .and_then(|value| value.to_str())
+        else {
+            continue;
+        };
+        let language = Language::from_extension(extension);
+        if language == Language::None {
+            continue;
+        }
+        extensions.extend(language.extensions().iter().copied());
+        extensions.extend(language.reference_only_sibling_extensions().iter().copied());
+    }
+    extensions.into_iter().map(String::from).collect()
+}
+
 #[pymodule]
 fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
+    crate::ensure_global_rayon_pool();
     module.add_class::<SearchToolsNativeSession>()?;
     module.add_function(wrap_pyfunction!(tool_descriptors_json, module)?)?;
     module.add_function(wrap_pyfunction!(code_query_variant_inventory_json, module)?)?;
+    module.add_function(wrap_pyfunction!(extensions_for_paths, module)?)?;
     Ok(())
 }

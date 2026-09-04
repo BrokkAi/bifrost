@@ -118,6 +118,8 @@ pub(super) fn apply_plan_step(
                     | PipelineValue::NilnessOperation(_)
                     | PipelineValue::SwitchCoverage(_)
                     | PipelineValue::ConcurrentAccessConflict(_)
+                    | PipelineValue::ClassSetRow(_)
+                    | PipelineValue::AbsentMemberFinding(_)
                     | PipelineValue::DetachedTaskTransfer(_)
                     | PipelineValue::ProcedureEffect(_)
                     | PipelineValue::CallableSignature(_)
@@ -209,6 +211,8 @@ pub(super) fn apply_plan_step(
                                 | PipelineValue::NilnessOperation(_)
                                 | PipelineValue::SwitchCoverage(_)
                                 | PipelineValue::ConcurrentAccessConflict(_)
+                                | PipelineValue::ClassSetRow(_)
+                                | PipelineValue::AbsentMemberFinding(_)
                                 | PipelineValue::DetachedTaskTransfer(_)
                                 | PipelineValue::ProcedureEffect(_)
                                 | PipelineValue::CallableSignature(_)
@@ -312,6 +316,8 @@ pub(super) fn apply_plan_step(
                         | PipelineValue::NilnessOperation(_)
                         | PipelineValue::SwitchCoverage(_)
                         | PipelineValue::ConcurrentAccessConflict(_)
+                        | PipelineValue::ClassSetRow(_)
+                        | PipelineValue::AbsentMemberFinding(_)
                         | PipelineValue::DetachedTaskTransfer(_)
                         | PipelineValue::ProcedureEffect(_)
                         | PipelineValue::CallableSignature(_)
@@ -769,11 +775,12 @@ pub(super) fn query_plan_requires_typestate(plan: &CodeQueryPlan) -> bool {
 pub(super) fn query_plan_requires_value_flow(plan: &CodeQueryPlan) -> bool {
     let mut pending = vec![plan];
     while let Some(plan) = pending.pop() {
-        if plan
-            .steps
-            .iter()
-            .any(|step| matches!(step, QueryStep::ValueFlow(_)))
-        {
+        if plan.steps.iter().any(|step| {
+            matches!(
+                step,
+                QueryStep::ValueFlow(_) | QueryStep::ClassSet | QueryStep::AbsentMember
+            )
+        }) {
             return true;
         }
         if let CodeQueryPlanSource::Set { branches, .. } = &plan.source {
@@ -1341,6 +1348,30 @@ pub(super) fn apply_pipeline_step(
                 .into_iter()
                 .map(Box::new)
                 .map(PipelineValue::ConcurrentAccessConflict)
+                .map(pipeline_expansion)
+                .collect(),
+            (
+                PipelineValue::Semantic(SemanticPipelineValue::Procedure(procedure)),
+                QueryStep::ClassSet,
+            ) => semantic
+                .as_mut()
+                .expect("class-set query service exists for semantic steps")
+                .class_set_rows(procedure)
+                .into_iter()
+                .map(Box::new)
+                .map(PipelineValue::ClassSetRow)
+                .map(pipeline_expansion)
+                .collect(),
+            (
+                PipelineValue::Semantic(SemanticPipelineValue::Procedure(procedure)),
+                QueryStep::AbsentMember,
+            ) => semantic
+                .as_mut()
+                .expect("absent-member query service exists for semantic steps")
+                .absent_member_findings(procedure)
+                .into_iter()
+                .map(Box::new)
+                .map(PipelineValue::AbsentMemberFinding)
                 .map(pipeline_expansion)
                 .collect(),
             (

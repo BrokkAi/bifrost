@@ -2300,22 +2300,14 @@ fn go_model_package_call_outcome(
     Some(outcome)
 }
 
-fn go_model_concrete_receiver_outcome(
-    support: &dyn GoDefinitionProvider,
+fn go_model_receiver_target_outcome(
     site: &ResolvedReferenceSite,
-    owner_fqn: &str,
-    member: &str,
-    pointer_receivers: bool,
+    target: String,
     parameter_count: usize,
     call_evidence: &mut GoCallEvidence,
-) -> Option<DefinitionLookupOutcome> {
-    let target = support.external_concrete_receiver_member(
-        owner_fqn,
-        member,
-        pointer_receivers,
-        parameter_count,
-    )?;
-    let parameter_count = u32::try_from(parameter_count).ok()?;
+) -> DefinitionLookupOutcome {
+    let parameter_count = u32::try_from(parameter_count)
+        .expect("validated Go call argument count fits the semantic model schema");
     call_evidence.record_exact_external_call(ExactExternalCallProof::go_concrete_receiver(
         target.clone(),
         parameter_count,
@@ -2328,7 +2320,117 @@ fn go_model_concrete_receiver_outcome(
     let mut reference = site.clone();
     reference.text = target;
     outcome.reference = Some(reference);
-    Some(outcome)
+    outcome
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GoModeledReceiverMember {
+    owner_fqn: String,
+    target: String,
+}
+
+enum GoModeledReceiverLookup {
+    Missing,
+    Unique(GoModeledReceiverMember),
+    Ambiguous,
+}
+
+fn go_modeled_receiver_lookup_with_promotion(
+    analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
+    support: &dyn GoDefinitionProvider,
+    owner_fqn: &str,
+    member: &str,
+    pointer_receivers: bool,
+    parameter_count: usize,
+) -> GoModeledReceiverLookup {
+    struct PromotionPath {
+        owner: String,
+        pointer_receivers: bool,
+        parent: Option<usize>,
+    }
+
+    let mut paths = vec![PromotionPath {
+        owner: owner_fqn.to_string(),
+        pointer_receivers,
+        parent: None,
+    }];
+    let mut frontier = vec![0];
+    while !frontier.is_empty() {
+        let mut candidates = Vec::new();
+        for &path_index in &frontier {
+            let path = &paths[path_index];
+            // The selector-chain caller already charged the concrete receiver
+            // lookup. Only promoted receiver hops add more scope work here.
+            if path.parent.is_some() && !support.scope_step() {
+                return GoModeledReceiverLookup::Missing;
+            }
+            if let Some(target) = support.external_concrete_receiver_member(
+                &path.owner,
+                member,
+                path.pointer_receivers,
+                parameter_count,
+            ) {
+                candidates.push(GoModeledReceiverMember {
+                    owner_fqn: path.owner.clone(),
+                    target,
+                });
+            }
+        }
+        match candidates.len() {
+            0 => {}
+            1 => {
+                return GoModeledReceiverLookup::Unique(
+                    candidates
+                        .pop()
+                        .expect("single modeled Go member candidate was checked"),
+                );
+            }
+            _ => return GoModeledReceiverLookup::Ambiguous,
+        }
+
+        let mut next = Vec::new();
+        for path_index in frontier {
+            if !support.summary_step() {
+                return GoModeledReceiverLookup::Missing;
+            }
+            let path = &paths[path_index];
+            let embedded = go_embedded_method_set_types(
+                analyzer,
+                token,
+                support,
+                &path.owner,
+                path.pointer_receivers,
+            );
+            for (embedded_owner, embedded_pointer_receivers) in embedded {
+                let mut ancestor = Some(path_index);
+                let mut cycle = false;
+                while let Some(ancestor_index) = ancestor {
+                    if !support.scope_step() {
+                        return GoModeledReceiverLookup::Missing;
+                    }
+                    let ancestor_path = &paths[ancestor_index];
+                    if ancestor_path.owner == embedded_owner {
+                        cycle = true;
+                        break;
+                    }
+                    ancestor = ancestor_path.parent;
+                }
+                if cycle {
+                    continue;
+                }
+                let embedded_index = paths.len();
+                paths.push(PromotionPath {
+                    owner: embedded_owner,
+                    pointer_receivers: embedded_pointer_receivers,
+                    parent: Some(path_index),
+                });
+                next.push(embedded_index);
+            }
+        }
+        frontier = next;
+    }
+    GoModeledReceiverLookup::Missing
 }
 
 fn go_dot_import_paths(
@@ -2461,22 +2563,37 @@ fn resolve_go_local_selector_chain(
                 }
                 GoDefinitionMemberLookup::Ambiguous(_) => unreachable!("handled above"),
                 GoDefinitionMemberLookup::Missing => {
-                    if external_concrete_receiver_candidate
-                        && let Some(owner) = owner_inferred.as_ref()
+                    if let Some(owner) = owner_inferred.as_ref()
                         && let Some(parameter_count) = go_selector_modeled_call_argument_count(
                             support, token, go, file, source, selector,
                         )
-                        && let Some(outcome) = go_model_concrete_receiver_outcome(
+                    {
+                        match go_modeled_receiver_lookup_with_promotion(
+                            analyzer,
+                            token,
                             support,
-                            site,
                             &owner_fqn,
                             member,
                             owner.admits_pointer_receivers(),
                             parameter_count,
-                            call_evidence,
-                        )
-                    {
-                        return Some(outcome);
+                        ) {
+                            GoModeledReceiverLookup::Unique(candidate) => {
+                                return Some(go_model_receiver_target_outcome(
+                                    site,
+                                    candidate.target,
+                                    parameter_count,
+                                    call_evidence,
+                                ));
+                            }
+                            GoModeledReceiverLookup::Ambiguous => {
+                                // no candidates: modeled external declarations have canonical
+                                // names but no workspace `CodeUnit` to attach to this outcome.
+                                return Some(ambiguous_without_candidates(format!(
+                                    "`{member}` resolves to multiple modeled Go embedded members at the nearest promotion depth"
+                                )));
+                            }
+                            GoModeledReceiverLookup::Missing => {}
+                        }
                     }
                     Some(no_definition(
                         "no_indexed_definition",
@@ -3490,18 +3607,24 @@ fn go_expression_inferred_type(
                         )
                     }
                     GoDefinitionMemberLookup::Missing => {
-                        let modeled = owner.modeled_nominal()?;
-                        let _target = support.external_concrete_receiver_member(
-                            &modeled.qualified_name,
-                            &method,
-                            owner.admits_pointer_receivers(),
-                            parameter_count,
-                        )?;
+                        let GoModeledReceiverLookup::Unique(modeled) =
+                            go_modeled_receiver_lookup_with_promotion(
+                                analyzer,
+                                token,
+                                support,
+                                &owner_fqn,
+                                &method,
+                                owner.admits_pointer_receivers(),
+                                parameter_count,
+                            )
+                        else {
+                            return None;
+                        };
                         go_modeled_callable_result_inferred_type(
                             support,
                             &owner.file,
                             &owner.package,
-                            &modeled.qualified_name,
+                            &modeled.owner_fqn,
                             &method,
                             true,
                             parameter_count,
@@ -4528,7 +4651,16 @@ fn go_embedded_method_set_types(
                 owner.source(),
                 owner.package_name(),
                 &identity,
-            ) {
+            )
+            .or_else(|| {
+                go_imported_nominal_receiver_candidate_fqn(
+                    support,
+                    token,
+                    go,
+                    owner.source(),
+                    &identity,
+                )
+            }) {
                 embedded.push((fqn, pointer_receivers));
             }
         }
@@ -4891,6 +5023,22 @@ mod bounded_tests {
             self.inner.workspace_declaration_identities_authoritative()
         }
 
+        fn signature_metadata(
+            &self,
+            analyzer: &dyn IAnalyzer,
+            unit: &CodeUnit,
+        ) -> Vec<SignatureMetadata> {
+            self.inner.signature_metadata(analyzer, unit)
+        }
+
+        fn raw_supertypes(&self, go: &GoAnalyzer, unit: &CodeUnit) -> Vec<String> {
+            self.inner.raw_supertypes(go, unit)
+        }
+
+        fn external_visible_symbol(&self, qualified_name: &str) -> Option<String> {
+            (qualified_name == "sync.RWMutex").then(|| qualified_name.to_owned())
+        }
+
         fn external_concrete_receiver_member(
             &self,
             owner_fqn: &str,
@@ -4902,6 +5050,7 @@ mod bounded_tests {
                 ("testing.T", "Fatal", true, 1) => Some("testing.T.Fatal".to_owned()),
                 ("testing.T", "Stat", true, 0) => Some("testing.T.Stat".to_owned()),
                 ("testing.F", "Fatal", true, 1) => Some("testing.F.Fatal".to_owned()),
+                ("sync.RWMutex", "Lock", true, 0) => Some("sync.RWMutex.Lock".to_owned()),
                 _ => None,
             }
         }
@@ -6150,6 +6299,99 @@ var (
                 ),
             }
         }
+    }
+
+    #[test]
+    fn structured_local_embedding_resolves_one_promoted_external_receiver_method() {
+        let source = r#"package main
+
+import "sync"
+
+type CacheTable struct {
+    sync.RWMutex
+}
+
+func use(table *CacheTable) {
+    table.Lock()
+}
+"#;
+        let fixture = AnalyzerFixture::new_for_language(
+            Language::Go,
+            &[("go.mod", "module example.com/app\n"), ("main.go", source)],
+        );
+        let file = ProjectFile::new(fixture.project_root(), "main.go");
+        let tree = parse_go_tree(source).expect("Go tree");
+        let site = site_for(&file, source, "table.Lock()", "Lock");
+
+        let resolution =
+            resolve_with_concrete_testing_receiver(&fixture, &file, source, &tree, &site);
+
+        assert_eq!(
+            resolution.outcome.status,
+            DefinitionLookupStatus::UnresolvableImportBoundary,
+            "{:#?}",
+            resolution.outcome
+        );
+        assert_eq!(
+            resolution
+                .outcome
+                .reference
+                .as_ref()
+                .map(|reference| reference.text.as_str()),
+            Some("sync.RWMutex.Lock"),
+            "{:#?}",
+            resolution.outcome
+        );
+        let proof = resolution.exact_external_call.as_ref().unwrap_or_else(|| {
+            panic!(
+                "the promoted receiver target must retain one exact proof: {:#?}",
+                resolution.outcome
+            )
+        });
+        assert_eq!(proof.canonical_callee(), "sync.RWMutex.Lock");
+        assert_eq!(proof.call_application(), CallApplicationKind::BoundReceiver);
+        assert_eq!(proof.parameter_count(), 0);
+    }
+
+    #[test]
+    fn equally_near_modeled_promotions_remain_ambiguous() {
+        let source = r#"package main
+
+import "sync"
+
+type left struct { sync.RWMutex }
+type right struct { sync.RWMutex }
+type both struct {
+    left
+    right
+}
+
+func use(value *both) {
+    value.Lock()
+}
+"#;
+        let fixture = AnalyzerFixture::new_for_language(
+            Language::Go,
+            &[("go.mod", "module example.com/app\n"), ("main.go", source)],
+        );
+        let file = ProjectFile::new(fixture.project_root(), "main.go");
+        let tree = parse_go_tree(source).expect("Go tree");
+        let site = site_for(&file, source, "value.Lock()", "Lock");
+
+        let resolution =
+            resolve_with_concrete_testing_receiver(&fixture, &file, source, &tree, &site);
+
+        assert_eq!(
+            resolution.outcome.status,
+            DefinitionLookupStatus::Ambiguous,
+            "{:#?}",
+            resolution.outcome
+        );
+        assert!(
+            resolution.exact_external_call.is_none(),
+            "ambiguous promotions must not retain an exact call proof: {:#?}",
+            resolution.outcome
+        );
     }
 
     #[test]

@@ -8,7 +8,7 @@
 use brokk_bifrost_ruby::local_bindings::{LocalBindingBudget, LocalBindingTimeline};
 use tree_sitter::Node;
 
-use super::{is_runtime_node, ruby_symbol_name};
+use super::{is_runtime_node, ruby_semantic_identifier_range, ruby_symbol_name};
 use crate::analyzer::lexical_definitions::formal_parameter_slots_for_owner;
 use crate::analyzer::semantic::cfg::{
     CleanupRegionId, CompletionKind, CompletionRequest, CompletionRoute, ProcedureCfgBuilder,
@@ -1106,7 +1106,7 @@ struct RubyControlFrame {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum RubyLocalStorage {
     Class(Box<str>),
-    Indexable,
+    Indexable { element_class: Option<Box<str>> },
 }
 
 struct LoweringContext<'tree, 'targets> {
@@ -1421,12 +1421,16 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 .find_map(|name| ruby_binding_name_node(declaration, self.source, name))
                 .unwrap_or(declaration);
             let metadata = self.value_mapping(builder, mapping_node)?;
+            let parameter_name = slot.unique_name().map(Box::<str>::from);
+            let passing_mode = slot.passing_mode;
             let value = self.session.add_value_with_metadata(
                 builder,
                 metadata,
                 SemanticValueKind::Parameter {
                     ordinal,
                     multiplicity: formal_multiplicity(slot.variadic),
+                    name: parameter_name,
+                    passing_mode,
                 },
             )?;
             ordinal = ordinal
@@ -1528,6 +1532,27 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         left: Node<'tree>,
         right: Node<'tree>,
     ) {
+        if left.kind() == "element_reference" {
+            let replacement_class = self.constructor_class(right);
+            let Some((object, _)) = self.element_parts(left) else {
+                return;
+            };
+            let Some(name) = node_text(self.source, object) else {
+                return;
+            };
+            let Some((object, _)) = self.binding_value(name) else {
+                return;
+            };
+            let Some(RubyLocalStorage::Indexable { element_class }) =
+                self.local_storage.get_mut(&object)
+            else {
+                return;
+            };
+            if replacement_class.as_deref() != element_class.as_deref() {
+                *element_class = None;
+            }
+            return;
+        }
         if left.kind() != "identifier" {
             return;
         }
@@ -1540,7 +1565,12 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let storage = self
             .assignment_is_direct_in_body(assignment)
             .then(|| match right.kind() {
-                "array" | "hash" => Some(RubyLocalStorage::Indexable),
+                "array" => Some(RubyLocalStorage::Indexable {
+                    element_class: self.homogeneous_array_element_class(right),
+                }),
+                "hash" => Some(RubyLocalStorage::Indexable {
+                    element_class: None,
+                }),
                 "identifier" => node_text(self.source, right)
                     .and_then(|source| self.binding_value(source))
                     .and_then(|(source, _)| self.local_storage.get(&source).cloned()),
@@ -1559,16 +1589,56 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         }
     }
 
+    fn homogeneous_array_element_class(&self, array: Node<'tree>) -> Option<Box<str>> {
+        debug_assert_eq!(array.kind(), "array");
+        let mut elements = named_children(array).into_iter();
+        let class = self.constructor_class(elements.next()?)?;
+        elements
+            .all(|element| self.constructor_class(element).as_deref() == Some(class.as_ref()))
+            .then_some(class)
+    }
+
+    fn constructor_class(&self, call: Node<'tree>) -> Option<Box<str>> {
+        ruby_constructor_call(call, self.source)
+            .then(|| call.child_by_field_name("receiver"))
+            .flatten()
+            .filter(|receiver| receiver.kind() == "constant")
+            .and_then(|receiver| node_text(self.source, receiver))
+            .map(Into::into)
+    }
+
+    fn receiver_class(&self, receiver: Node<'tree>) -> Option<&str> {
+        match receiver.kind() {
+            "identifier" => {
+                let name = node_text(self.source, receiver)?;
+                let (receiver, _) = self.binding_value(name)?;
+                let RubyLocalStorage::Class(class) = self.local_storage.get(&receiver)? else {
+                    return None;
+                };
+                Some(class)
+            }
+            "element_reference" => {
+                let (object, _) = self.element_parts(receiver)?;
+                let name = node_text(self.source, object)?;
+                let (object, _) = self.binding_value(name)?;
+                let RubyLocalStorage::Indexable {
+                    element_class: Some(class),
+                } = self.local_storage.get(&object)?
+                else {
+                    return None;
+                };
+                Some(class)
+            }
+            _ => None,
+        }
+    }
+
     fn property_member_locator(
         &self,
         receiver: Node<'tree>,
         property: Node<'tree>,
     ) -> Option<SemanticLocator> {
-        let receiver = node_text(self.source, receiver)?;
-        let (receiver, _) = self.binding_value(receiver)?;
-        let RubyLocalStorage::Class(class) = self.local_storage.get(&receiver)? else {
-            return None;
-        };
+        let class = self.receiver_class(receiver)?;
         let property_name = node_text(self.source, property)?;
         let anchor = self.properties.complete_accessor(class, property_name)?;
         let procedure = self.session.locator();
@@ -1599,7 +1669,10 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let object = node.child_by_field_name("object")?;
         let name = node_text(self.source, object)?;
         let (object_value, _) = self.binding_value(name)?;
-        if self.local_storage.get(&object_value) != Some(&RubyLocalStorage::Indexable) {
+        if !matches!(
+            self.local_storage.get(&object_value),
+            Some(RubyLocalStorage::Indexable { .. })
+        ) {
             return None;
         }
         let mut indices = named_children(node).into_iter().filter(|child| {
@@ -1690,7 +1763,25 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         };
         let value =
             self.expression_value(builder, value_node, expression_value_kind(value_node))?;
-        Ok(SemanticCallArgument { value, expansion })
+        let keyword = if argument.kind() == "pair" {
+            argument.child_by_field_name("key").and_then(|key| {
+                if !matches!(key.kind(), "simple_symbol" | "hash_key_symbol") {
+                    return None;
+                }
+                let range = ruby_semantic_identifier_range(key, self.source);
+                self.source
+                    .get(range.start_byte..range.end_byte)
+                    .filter(|name| !name.is_empty())
+                    .map(Box::<str>::from)
+            })
+        } else {
+            None
+        };
+        Ok(SemanticCallArgument {
+            value,
+            expansion,
+            keyword,
+        })
     }
 
     fn emit_lexical_input_flow(

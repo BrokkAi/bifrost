@@ -12,6 +12,8 @@ impl CodeQueryResult {
                 | CodeQueryResultValue::ControlEdge { .. }
                 | CodeQueryResultValue::TypestateFinding { .. }
                 | CodeQueryResultValue::ConcurrentAccessConflict { .. }
+                | CodeQueryResultValue::ClassSetRow { .. }
+                | CodeQueryResultValue::AbsentMemberFinding { .. }
                 | CodeQueryResultValue::TypestateWitness { .. }
                 | CodeQueryResultValue::FlowEndpoint { .. }
                 | CodeQueryResultValue::FlowWitness { .. }
@@ -609,6 +611,32 @@ impl CodeQueryResult {
                             value.protection,
                             value.proof,
                             value.location_kind,
+                        ));
+                    }
+                    CodeQueryResultValue::ClassSetRow { value } => {
+                        out.push_str(&format!(
+                            "{}:{}:{} [class set; {}] {} <- {}\n",
+                            value.file,
+                            value.range.start_line,
+                            value.range.start_column,
+                            value.status,
+                            value.member,
+                            value.class.as_deref().unwrap_or(&value.origin),
+                        ));
+                    }
+                    CodeQueryResultValue::AbsentMemberFinding { value } => {
+                        out.push_str(&format!(
+                            "{}:{}:{} [absent member] {} has no member `{}` (from {}:{}:{}; caller {}; witness {} steps)\n",
+                            value.file,
+                            value.range.start_line,
+                            value.range.start_column,
+                            value.class,
+                            value.member,
+                            value.origin_file,
+                            value.origin_range.start_line,
+                            value.origin_range.start_column,
+                            value.caller,
+                            value.witness_steps,
                         ));
                     }
                     CodeQueryResultValue::DetachedTaskTransfer { value } => {

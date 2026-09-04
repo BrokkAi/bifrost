@@ -79,7 +79,7 @@ pub trait KotlinSource: CodeUnitIndex + ImportAnalysisProvider {
         owner: &CodeUnit,
         raw_supertypes: &[String],
         imports: &[ImportInfo],
-        _realm: Option<&JvmSourceRealm<'_>>,
+        realm: Option<&JvmSourceRealm<'_>>,
         type_by_fqn: &mut dyn FnMut(&str) -> Option<CodeUnit>,
     ) -> Vec<CodeUnit> {
         crate::kotlin::hierarchy::kotlin_resolve_ancestors_from_facts(
@@ -88,6 +88,7 @@ pub trait KotlinSource: CodeUnitIndex + ImportAnalysisProvider {
             owner,
             raw_supertypes,
             imports,
+            realm,
             type_by_fqn,
         )
     }

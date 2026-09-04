@@ -76,13 +76,7 @@ pub(crate) fn analyzed_files_for_language(
     analyzer: &dyn CodeUnitIndex,
     language: Language,
 ) -> Vec<ProjectFile> {
-    let mut files: Vec<ProjectFile> = analyzer
-        .analyzed_files()
-        .into_iter()
-        .filter(|file| language_for_file(file) == language)
-        .collect();
-    files.sort();
-    files
+    analyzer.analyzed_files_for_language(language)
 }
 
 pub(crate) use brokk_bifrost_core::analyzer::usages::common::enclosing_owner_chain;

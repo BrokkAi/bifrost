@@ -25,6 +25,7 @@ pub struct DispatchCandidate {
     pub(crate) proof: ProofStatus,
     pub(crate) completeness: EvidenceCompleteness,
     pub(crate) provenance: Box<[OracleRelationHandle]>,
+    pub(crate) excluded_targets: Box<[ProcedureHandle]>,
     sealed: bool,
 }
 
@@ -46,6 +47,7 @@ impl DispatchCandidate {
             proof,
             completeness,
             provenance: collect_candidate_provenance(provenance, limits)?,
+            excluded_targets: Box::new([]),
             sealed: false,
         })
     }
@@ -64,6 +66,12 @@ impl DispatchCandidate {
 
     pub fn provenance(&self) -> &[OracleRelationHandle] {
         &self.provenance
+    }
+
+    /// Resolver candidates that a candidate-specific exact receiver proof
+    /// excludes from this call.
+    pub fn excluded_targets(&self) -> &[ProcedureHandle] {
+        &self.excluded_targets
     }
 
     fn seal(&mut self) {
@@ -102,6 +110,14 @@ impl DispatchCandidate {
                 .supports_quality(&self.proof, &self.completeness)
         }) {
             return Err(OracleContractError::InvalidRelationQuality);
+        }
+        let mut excluded = std::collections::HashSet::new();
+        if self.excluded_targets.iter().any(|target| {
+            target == &self.target
+                || target.artifact().key() != self.target.artifact().key()
+                || !excluded.insert(target.durable_key())
+        }) {
+            return Err(OracleContractError::InvalidRelationIdentity);
         }
         Ok(())
     }

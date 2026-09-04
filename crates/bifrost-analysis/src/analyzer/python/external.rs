@@ -26,6 +26,7 @@ use crate::analyzer::semantic_model::{
 };
 use crate::analyzer::topology::DependencyScope;
 use crate::analyzer::{Project, PythonAnalyzerConfig, PythonEnvironmentConfig};
+use brokk_bifrost_python::syntax::python_plain_string_literal;
 use tree_sitter::Node;
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -155,6 +156,7 @@ impl DependencyPackAdapter for PythonDependencyPackAdapter {
                 completeness,
                 safety: request.safety,
                 carried_sources: Vec::new(),
+                cpp_portability: None,
                 shards: vec![AuthoredShard {
                     id: "declarations.external".to_owned(),
                     activation,
@@ -330,6 +332,7 @@ impl PythonArtifactPackProducer {
                 completeness,
                 safety: request.safety.clone(),
                 carried_sources: Vec::new(),
+                cpp_portability: None,
                 shards: vec![AuthoredShard {
                     id: "declarations.external".to_owned(),
                     activation,
@@ -471,6 +474,7 @@ impl PythonArtifactPackProducer {
                 completeness,
                 safety: request.safety.clone(),
                 carried_sources: Vec::new(),
+                cpp_portability: None,
                 shards: vec![AuthoredShard {
                     id: "declarations.external".to_owned(),
                     activation,
@@ -661,6 +665,16 @@ struct PythonApiCollector<'a, 'd> {
 struct HierarchyBinding {
     target: Option<String>,
     guard: Option<usize>,
+    local_type: bool,
+}
+
+/// One hierarchy name resolved to the exact source binding it references.
+/// `target` is absent for a known non-type binding such as typeshed's
+/// `typing.Protocol: _SpecialForm`; `bound_name` still preserves the exact
+/// module-owned identity for the typing-marker decision.
+struct ResolvedHierarchyBinding {
+    target: Option<String>,
+    bound_name: String,
     local_type: bool,
 }
 
@@ -911,6 +925,7 @@ impl<'a, 'd> PythonApiCollector<'a, 'd> {
                 .child_by_field_name("superclasses")
                 .map(|bases| {
                     named_children(bases)
+                        .filter(|base| !self.is_typing_marker_base(*base, &owner, guard))
                         .map(|base| HierarchyFact {
                             hierarchy_kind: crate::analyzer::semantic_model::HierarchyKind::Extends,
                             target: self.hierarchy_type_ref(base, &owner, guard),
@@ -1129,33 +1144,12 @@ impl<'a, 'd> PythonApiCollector<'a, 'd> {
 
     fn hierarchy_type_ref(&self, node: Node<'_>, owner: &str, guard: Option<usize>) -> TypeRef {
         let parsed = type_ref(node, self.source, self.limits.max_signature_depth);
-        let Some(segments) = type_name_segments(node, self.source) else {
+        let Some(binding) = self.resolved_hierarchy_binding(node, owner, guard) else {
             return parsed;
         };
-        let Some((local, suffix)) = segments.split_first() else {
+        let Some(target) = binding.target else {
             return parsed;
         };
-        let mut scope = Some(owner);
-        let mut target = None;
-        let mut local_type = false;
-        while let Some(current) = scope {
-            let key = format!("{current}.{local}");
-            if let Some(binding) = self.hierarchy_bindings.get(&key) {
-                if binding.guard.is_none() || binding.guard == guard {
-                    target = binding.target.clone();
-                    local_type = binding.local_type;
-                }
-                break;
-            }
-            scope = current.rsplit_once('.').map(|(parent, _)| parent);
-        }
-        let Some(mut target) = target else {
-            return parsed;
-        };
-        if !suffix.is_empty() {
-            target.push('.');
-            target.push_str(&suffix.join("."));
-        }
         let TypeRef::Named {
             arguments,
             nullable,
@@ -1164,7 +1158,7 @@ impl<'a, 'd> PythonApiCollector<'a, 'd> {
         else {
             return parsed;
         };
-        if !local_type {
+        if !binding.local_type {
             return TypeRef::Named {
                 name: target,
                 arguments,
@@ -1179,6 +1173,62 @@ impl<'a, 'd> PythonApiCollector<'a, 'd> {
             arguments,
             nullable,
         }
+    }
+
+    /// Resolve the AST name of a hierarchy expression through the bindings
+    /// already collected from imports and local type declarations.
+    fn resolved_hierarchy_binding(
+        &self,
+        node: Node<'_>,
+        owner: &str,
+        guard: Option<usize>,
+    ) -> Option<ResolvedHierarchyBinding> {
+        let segments = type_name_segments(node, self.source)?;
+        let (local, suffix) = segments.split_first()?;
+        let mut scope = Some(owner);
+        while let Some(current) = scope {
+            let key = format!("{current}.{local}");
+            if let Some(binding) = self.hierarchy_bindings.get(&key) {
+                if binding.guard.is_some() && binding.guard != guard {
+                    return None;
+                }
+                let mut target = binding.target.clone();
+                let mut bound_name = key;
+                if !suffix.is_empty() {
+                    let suffix = suffix.join(".");
+                    if let Some(target) = &mut target {
+                        target.push('.');
+                        target.push_str(&suffix);
+                    }
+                    bound_name.push('.');
+                    bound_name.push_str(&suffix);
+                }
+                return Some(ResolvedHierarchyBinding {
+                    target,
+                    bound_name,
+                    local_type: binding.local_type,
+                });
+            }
+            scope = current.rsplit_once('.').map(|(parent, _)| parent);
+        }
+        None
+    }
+
+    /// `Protocol` and `Generic` are typing-only class construction markers,
+    /// not runtime inheritance surfaces. Omit them only when the structured
+    /// binding graph proves their exact standard typing identity.
+    fn is_typing_marker_base(&self, node: Node<'_>, owner: &str, guard: Option<usize>) -> bool {
+        self.resolved_hierarchy_binding(node, owner, guard)
+            .is_some_and(|binding| {
+                !binding.local_type
+                    && matches!(
+                        binding.target.as_deref().unwrap_or(&binding.bound_name),
+                        "typing.Protocol"
+                            | "typing.Generic"
+                            | "typing_extensions.Protocol"
+                            | "typing_extensions.Generic"
+                    )
+            })
     }
 
     /// A PEP 695 `type Alias[T] = ...` statement spells its declared name in
@@ -1528,33 +1578,7 @@ fn version_tuple(node: Node<'_>, source: &str) -> Option<GuardVersion> {
 /// an escape all mean the text is not the value, so each one reads as no
 /// literal at all.
 fn string_literal(node: Node<'_>, source: &str) -> Option<String> {
-    if node.kind() != "string" {
-        return None;
-    }
-    let mut content = None;
-    for child in named_children(node) {
-        match child.kind() {
-            "string_start" | "string_end" => {
-                let delimiter = child.utf8_text(source.as_bytes()).ok()?;
-                if delimiter
-                    .chars()
-                    .any(|character| character != '"' && character != '\'')
-                {
-                    return None;
-                }
-            }
-            "string_content" if child.named_child_count() == 0 => {
-                if content
-                    .replace(child.utf8_text(source.as_bytes()).ok()?.to_owned())
-                    .is_some()
-                {
-                    return None;
-                }
-            }
-            _ => return None,
-        }
-    }
-    content
+    python_plain_string_literal(node, source).map(ToOwned::to_owned)
 }
 
 /// The texts one literal sequence of plain strings spells.

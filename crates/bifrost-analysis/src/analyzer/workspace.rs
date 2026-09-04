@@ -908,14 +908,24 @@ impl WorkspaceAnalyzer {
     /// analyzer-generation transaction. Diagnostic requests only read the
     /// published result and never call this host-owned method.
     ///
-    /// Failure is per ecosystem (#2442). An ecosystem whose discovery is
-    /// incomplete, or whose preparation is, contributes no evidence and leaves
-    /// the whole outcome incomplete, but its siblings still activate: a
-    /// workspace with an unreadable `Cargo.lock` used to lose its npm packs
-    /// too, which is the same false-green shape as reporting a clean run from
-    /// evidence that was never read. Only cancellation stops the transaction,
-    /// because a cancelled token says the caller is gone rather than that one
-    /// ecosystem is unreadable.
+    /// Failure is per ecosystem (#2442). An ecosystem whose preparation is
+    /// incomplete contributes no evidence and leaves the whole outcome
+    /// incomplete, but its siblings still activate: a workspace with an
+    /// unreadable `Cargo.lock` used to lose its npm packs too, which is the
+    /// same false-green shape as reporting a clean run from evidence that was
+    /// never read. Only cancellation stops the transaction, because a
+    /// cancelled token says the caller is gone rather than that one ecosystem
+    /// is unreadable.
+    ///
+    /// Discovery completeness is a fact about the dependency set, not a gate
+    /// on preparing it (#2887). An incomplete discovery still prepares and
+    /// activates the dependencies it did resolve with exact evidence, so one
+    /// Maven coordinate missing from `~/.m2` no longer withholds the JDK
+    /// standard-library pack whose toolchain evidence resolved exactly. The
+    /// unresolved coordinates stay unindexed and the incompleteness travels
+    /// on the outcome and on the published `DependencyDiscoveryEvidence`,
+    /// whose `truncated` flag is what keeps a name an unresolved dependency
+    /// would have answered unproven rather than proved absent.
     ///
     /// Publication still requires something to publish: when every requested
     /// ecosystem failed, nothing is acquired and no host is asked to refresh.
@@ -959,14 +969,6 @@ impl WorkspaceAnalyzer {
                     preparation: None,
                 });
                 break;
-            }
-            if !discovery.complete {
-                outcomes.push(DependencyPackEcosystemOutcome {
-                    ecosystem,
-                    discovery,
-                    preparation: None,
-                });
-                continue;
             }
             let preparation = {
                 let _scope = crate::profiling::scope_with(|| {
@@ -1301,6 +1303,19 @@ impl WorkspaceAnalyzer {
         config: AnalyzerConfig,
     ) -> Result<Self, StoreError> {
         Self::build_persisted_inner(project, config, None, false, None)
+    }
+
+    /// Build a progress-reporting persisted analyzer whose cache is collected
+    /// only when the host explicitly requests it.
+    pub fn build_persisted_without_automatic_gc_with_progress<F>(
+        project: Arc<dyn Project>,
+        config: AnalyzerConfig,
+        progress: F,
+    ) -> Result<Self, StoreError>
+    where
+        F: Fn(crate::analyzer::BuildProgressEvent) + Send + Sync + 'static,
+    {
+        Self::build_persisted_inner(project, config, Some(Arc::new(progress)), false, None)
     }
 
     /// Persisted counterpart of [`Self::build_ephemeral_with_tier_access_footgun`].
@@ -1993,7 +2008,15 @@ mod tests {
         assert!(!outcome.complete());
         assert!(outcome.diagnostic_refresh_required);
         assert!(!outcome.ecosystems[0].discovery.complete);
-        assert!(outcome.ecosystems[0].preparation.is_none());
+        // #2887: an incomplete discovery still prepares the dependencies it
+        // did resolve. Go discovery resolved none here, so preparation has
+        // nothing to select and contributes no evidence of its own.
+        let preparation = outcome.ecosystems[0]
+            .preparation
+            .as_ref()
+            .expect("incomplete discovery must still prepare its resolved set");
+        assert!(preparation.complete, "{preparation:#?}");
+        assert!(preparation.evidence.is_empty(), "{preparation:#?}");
         let SemanticModelRuntimeOutcome::Ready { active, .. } = outcome
             .runtime
             .expect("intrinsic activation must still run")

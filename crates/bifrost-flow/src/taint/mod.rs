@@ -26,7 +26,8 @@ pub use model::{
 pub use plan::{
     TaintAnalysisPlan, TaintBatch, TaintBatchCompatibilityKey, TaintBatchPlanner, TaintPlanError,
     TaintPolicyPlan, TaintPolicyProjection, TaintPropagationSemanticsId, TaintSanitizerBinding,
-    TaintSinkBinding, TaintSourceBinding, TaintTransformBinding,
+    TaintSinkBinding, TaintSourceBinding, TaintStoreChannel, TaintStoreDimension,
+    TaintStoreReadBinding, TaintStoreWriteBinding, TaintTransformBinding,
 };
 pub use planned::{
     TaintCanonicalFinding, TaintPlannedEvidence, TaintPlannedResult, TaintPlannedSolveError,

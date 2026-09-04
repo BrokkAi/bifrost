@@ -51,6 +51,7 @@ use crate::analyzer::structural::facts::{
     PersistedCallSite, PersistedOccurrenceRole, PersistedSpan, PersistedStructuralFacts,
     PersistedStructuralNode, PersistedStructuralRole,
 };
+use crate::analyzer::structural::kinds::{NormalizedKind, Role};
 use crate::analyzer::structural::materialization::{
     MaterializationRecord, MaterializationRecordPayload,
 };
@@ -3021,6 +3022,15 @@ impl AnalyzerStore {
                      )",
                 )?;
                 for node in &facts.nodes {
+                    // The schema no longer enumerates labels (migration 0040);
+                    // the registry is the only authority, and hydration resolves
+                    // every label through it, so a label it does not know must
+                    // fail here rather than persist as an unreadable row.
+                    debug_assert!(
+                        NormalizedKind::from_label(&node.kind).is_some(),
+                        "structural node kind {:?} is not a registry label",
+                        node.kind
+                    );
                     insert.execute(params![
                         blob_id,
                         node.node_id,
@@ -3054,6 +3064,11 @@ impl AnalyzerStore {
                      )",
                 )?;
                 for role in &facts.roles {
+                    debug_assert!(
+                        Role::from_label(&role.role).is_some(),
+                        "structural role {:?} is not a registry label",
+                        role.role
+                    );
                     insert.execute(params![
                         blob_id,
                         role.source_node_id,
@@ -9503,9 +9518,26 @@ fn summary_file_projection_conn<A: LanguageAdapter>(
         return Ok(None);
     }
     let mut by_key = HashMap::default();
+    let mut declarations = Vec::new();
     for row in rows {
+        if row.in_declarations {
+            // `should_persist_code_unit` keeps file scopes out of storage and
+            // only `FileState` hydration synthesizes them back, so the
+            // persisted inventory is exactly the non-file-scope declaration
+            // set that `all_declarations_with_primary_ranges` reports.
+            debug_assert!(
+                !row.unit.is_file_scope(),
+                "persisted declaration rows must not carry a file scope: {:?}",
+                row.unit
+            );
+            declarations.push(row.unit.clone());
+        }
         by_key.insert(row.key, row);
     }
+    // Storage order follows `unit_key`, which the writer assigns from a
+    // rendering-oriented order. Publish the inventory in `CodeUnit` order so
+    // every reader of this field sees one canonical enumeration.
+    declarations.sort();
 
     let mut top_level: Vec<_> = by_key
         .values()
@@ -9528,6 +9560,7 @@ fn summary_file_projection_conn<A: LanguageAdapter>(
 
     let mut projection = SummaryFileProjection {
         top_level_declarations: top_level.into_iter().map(|(_, unit)| unit).collect(),
+        declarations,
         signatures,
         ranges,
         children,
@@ -15590,6 +15623,116 @@ mod tests {
     }
 
     #[test]
+    fn rust_type_alias_identity_epoch_invalidates_prior_parsed_blobs() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let file = write_file(
+            temp.path(),
+            "tags.rs",
+            "pub mod tags {\n    pub type MaxVal = u32;\n    pub const MaxVal: u32 = 1;\n}\n",
+        );
+        let state = Arc::new(parse_state(&RustAdapter, &file));
+        let alias = state
+            .declarations
+            .iter()
+            .find(|unit| unit.short_name() == "tags.MaxVal" && unit.is_class())
+            .expect("the current walk mints the alias as a type declaration");
+        assert!(
+            state
+                .declarations
+                .iter()
+                .any(|unit| unit.short_name() == "tags.MaxVal" && unit.is_field()),
+            "the const keeps its own field declaration beside {alias:?}: {:?}",
+            state.declarations
+        );
+        let oid = oid_for(state.source.as_bytes());
+        let store = AnalyzerStore::open_ephemeral().unwrap();
+        let prior_epoch = epoch::rust_epoch_before_type_alias_type_identity();
+        let prior_generation = store
+            .ensure_language_epoch_value("rust", &prior_epoch)
+            .unwrap();
+        store
+            .write_parsed_blob_at_generation(
+                oid,
+                "rust",
+                prior_generation,
+                &RustAdapter,
+                state.as_ref(),
+            )
+            .unwrap();
+        assert!(store.contains_parsed_blob(oid, "rust").unwrap());
+
+        let current_generation = store
+            .ensure_language_epoch(Language::Rust, &tree_sitter_rust::LANGUAGE.into())
+            .unwrap();
+
+        assert_ne!(current_generation, prior_generation);
+        assert!(!store.contains_parsed_blob(oid, "rust").unwrap());
+        assert_eq!(
+            store
+                .missing_parsed_blob_keys(&[(oid, "rust".to_string())])
+                .unwrap(),
+            vec![(oid, "rust".to_string())]
+        );
+    }
+
+    /// The TypeScript half of the same #2911 bump.
+    #[test]
+    fn ts_type_alias_identity_epoch_invalidates_prior_parsed_blobs() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let file = write_file(
+            temp.path(),
+            "tags.ts",
+            "export type MaxVal = number;\n\nexport const MaxVal = 1;\n",
+        );
+        let state = Arc::new(parse_state(&TypescriptAdapter, &file));
+        let alias = state
+            .declarations
+            .iter()
+            .find(|unit| unit.fq_name() == "tags.ts.MaxVal" && unit.is_class())
+            .expect("the current walk mints the alias as a type declaration");
+        assert!(
+            state
+                .declarations
+                .iter()
+                .any(|unit| unit.fq_name() == "tags.ts.MaxVal" && unit.is_field()),
+            "the const keeps its own field declaration beside {alias:?}: {:?}",
+            state.declarations
+        );
+        let oid = oid_for(state.source.as_bytes());
+        let store = AnalyzerStore::open_ephemeral().unwrap();
+        let prior_epoch = epoch::typescript_epoch_before_type_alias_type_identity();
+        let prior_generation = store
+            .ensure_language_epoch_value("typescript", &prior_epoch)
+            .unwrap();
+        store
+            .write_parsed_blob_at_generation(
+                oid,
+                "typescript",
+                prior_generation,
+                &TypescriptAdapter,
+                state.as_ref(),
+            )
+            .unwrap();
+        assert!(store.contains_parsed_blob(oid, "typescript").unwrap());
+
+        let current_generation = store
+            .ensure_language_epoch(
+                Language::TypeScript,
+                &tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+            )
+            .unwrap();
+
+        assert_ne!(current_generation, prior_generation);
+        assert!(!store.contains_parsed_blob(oid, "typescript").unwrap());
+        assert_eq!(
+            store
+                .missing_parsed_blob_keys(&[(oid, "typescript".to_string())])
+                .unwrap(),
+            vec![(oid, "typescript".to_string())]
+        );
+    }
+
+    #[test]
     fn kotlin_type_alias_identity_epoch_invalidates_prior_parsed_blobs() {
         let temp = tempfile::TempDir::new().unwrap();
         let file = write_file(
@@ -15803,6 +15946,114 @@ mod tests {
                 role: "value_reference".to_owned(),
             }],
         }
+    }
+
+    /// Every registry label persists and hydrates. Migration 0034 copied the
+    /// label lists into CHECK constraints and the copies lagged the registry,
+    /// so every file carrying `module`, `concurrent_spawn`, or `operator`
+    /// failed its insert and was re-extracted on every warm run (#2922). The
+    /// registry is the only authority on labels now; this pins that every
+    /// label it declares round-trips through the store and back into facts.
+    #[test]
+    fn every_registry_label_persists_and_hydrates() {
+        use crate::analyzer::structural::FileFacts;
+        use crate::analyzer::structural::kinds::{ALL_KINDS, ALL_ROLES};
+        use crate::analyzer::structural::occurrences::ALL_OCCURRENCE_ROLES;
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let file = write_file(temp.path(), "Model.java", "class Model { int value; }\n");
+        let state = Arc::new(parse_state(&JavaAdapter, &file));
+        let oid = oid_for(state.source.as_bytes());
+        let store = AnalyzerStore::open_ephemeral().unwrap();
+        let generation = store
+            .ensure_language_epoch_value("java", "registry-labels-v1")
+            .unwrap();
+        store
+            .write_parsed_blob_at_generation(oid, "java", generation, &JavaAdapter, state.as_ref())
+            .unwrap();
+
+        // One root node per kind, each spanning one byte of a source exactly
+        // as long as the node list, so hydration's span checks hold. Every
+        // role and occurrence role hangs off node 0.
+        let source = "x".repeat(ALL_KINDS.len());
+        let nodes = ALL_KINDS
+            .iter()
+            .enumerate()
+            .map(|(id, kind)| PersistedStructuralNode {
+                node_id: id as u32,
+                kind: kind.label().to_owned(),
+                boolean_value: None,
+                construct: None,
+                span: PersistedSpan {
+                    start: id as u32,
+                    end: id as u32 + 1,
+                },
+                parent: None,
+                name: None,
+                subtree_end: id as u32 + 1,
+                call_site: None,
+            })
+            .collect::<Vec<_>>();
+        let roles = ALL_ROLES
+            .iter()
+            .enumerate()
+            .map(|(ordinal, role)| PersistedStructuralRole {
+                source_node_id: 0,
+                ordinal: ordinal as u32,
+                role: role.label().to_owned(),
+                spread: false,
+                keyword: None,
+                node: None,
+                span: PersistedSpan { start: 0, end: 1 },
+                name: None,
+            })
+            .collect::<Vec<_>>();
+        let occurrence_roles = ALL_OCCURRENCE_ROLES
+            .iter()
+            .enumerate()
+            .map(|(ordinal, role)| PersistedOccurrenceRole {
+                node_id: 0,
+                ordinal: ordinal as u32,
+                role: role.label().to_owned(),
+            })
+            .collect::<Vec<_>>();
+        let facts = PersistedStructuralFacts {
+            source_bytes: source.len() as u32,
+            nodes,
+            roles,
+            occurrence_roles,
+        };
+
+        assert!(
+            store
+                .upsert_structural_facts_rows(oid, "java", generation, 1, facts.clone())
+                .unwrap(),
+            "the parsed blob is complete, so every registry label must insert"
+        );
+        let loaded = store
+            .load_structural_facts_rows(oid, "java", generation, 1)
+            .unwrap()
+            .expect("persisted facts load back");
+        assert_eq!(loaded, facts);
+        let hydrated = FileFacts::from_persisted_rows(source, loaded)
+            .expect("every persisted label resolves through the registry");
+        assert_eq!(
+            hydrated
+                .nodes()
+                .iter()
+                .map(|node| node.kind)
+                .collect::<Vec<_>>(),
+            ALL_KINDS
+        );
+        assert_eq!(
+            hydrated
+                .roles(0)
+                .iter()
+                .map(|target| target.role)
+                .collect::<Vec<_>>(),
+            ALL_ROLES
+        );
+        assert_eq!(hydrated.occurrence_roles(0), ALL_OCCURRENCE_ROLES);
     }
 
     #[test]
@@ -21736,6 +21987,8 @@ mod tests {
         assert_eq!(
             analyzer_db_path(&repo_root),
             repo.workdir()
+                .unwrap()
+                .canonicalize()
                 .unwrap()
                 .join(crate::gitblob::PROJECT_DIR_NAME)
                 .join(crate::gitblob::CACHE_SUBDIR_NAME)

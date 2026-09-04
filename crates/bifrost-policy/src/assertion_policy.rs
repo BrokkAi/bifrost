@@ -60,7 +60,7 @@ mod tests {
 
     use brokk_bifrost_analysis::schema_version::{SchemaVersionOrigin, SchemaVersionResolution};
     use brokk_bifrost_rql::structural::search::{
-        CodeQueryOccurrence, CodeQueryOccurrenceTarget, CodeQueryResultItem,
+        CodeQueryOccurrence, CodeQueryOccurrenceTarget, CodeQueryResultItem, UnitRowItem,
     };
     use brokk_bifrost_rql::structural::{
         CodeQuery, CodeQueryRange, CodeQueryResultValue, CodeQueryRowScalarType,
@@ -133,15 +133,18 @@ mod tests {
         }
     }
 
-    fn item(value: CodeQueryResultValue) -> CodeQueryResultItem {
-        CodeQueryResultItem {
+    /// One rendered row as every evaluation path carries it: projected, which
+    /// is what the plan evaluation reads on both the whole and the sliced
+    /// path.
+    fn item(value: CodeQueryResultValue) -> UnitRowItem {
+        UnitRowItem::project(&CodeQueryResultItem {
             value,
             provenance: Vec::new(),
             provenance_truncated: false,
-        }
+        })
     }
 
-    fn occurrence(id: &str, ast_id: &str) -> CodeQueryResultItem {
+    fn occurrence(id: &str, ast_id: &str) -> UnitRowItem {
         item(CodeQueryResultValue::Occurrence {
             value: Box::new(CodeQueryOccurrence {
                 id: id.to_string(),
@@ -523,7 +526,7 @@ mod tests {
         );
     }
 
-    fn call_argument(site: &str, index: usize, name: &str) -> CodeQueryResultItem {
+    fn call_argument(site: &str, index: usize, name: &str) -> UnitRowItem {
         item(CodeQueryResultValue::CallArgument {
             value: Box::new(
                 brokk_bifrost_rql::structural::search::CodeQueryCallShapeArgument {
@@ -540,7 +543,7 @@ mod tests {
         })
     }
 
-    fn signature_parameter(signature: &str, index: usize, label: &str) -> CodeQueryResultItem {
+    fn signature_parameter(signature: &str, index: usize, label: &str) -> UnitRowItem {
         item(CodeQueryResultValue::SignatureParameter {
             value: Box::new(
                 brokk_bifrost_rql::structural::search::CodeQuerySignatureParameter {

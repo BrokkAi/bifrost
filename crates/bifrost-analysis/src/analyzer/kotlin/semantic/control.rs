@@ -2095,6 +2095,10 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 .map(|value| SemanticCallArgument {
                     value,
                     expansion: argument.expansion(),
+                    keyword: argument
+                        .keyword
+                        .and_then(|keyword| node_text(self.prepared.source(), keyword))
+                        .map(Box::<str>::from),
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;

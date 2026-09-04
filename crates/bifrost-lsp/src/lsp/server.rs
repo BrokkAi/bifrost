@@ -1776,6 +1776,8 @@ fn run_rql_query_result(
                     CodeQueryResultValue::ControlEdge { value } => &value.path,
                     CodeQueryResultValue::TypestateFinding { value } => &value.path,
                     CodeQueryResultValue::ConcurrentAccessConflict { value } => &value.path,
+                    CodeQueryResultValue::ClassSetRow { value } => &value.file,
+                    CodeQueryResultValue::AbsentMemberFinding { value } => &value.file,
                     CodeQueryResultValue::TypestateWitness { value } => &value.path,
                     CodeQueryResultValue::FlowEndpoint { value } => &value.path,
                     CodeQueryResultValue::FlowWitness { value } => &value.path,

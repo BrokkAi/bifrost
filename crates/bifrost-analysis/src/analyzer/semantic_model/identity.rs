@@ -84,6 +84,7 @@ pub fn member_declaration_id(identity: MemberIdentity<'_>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::analyzer::semantic_model::TypeRefReferenceKind;
 
     fn named(name: &str) -> TypeRef {
         TypeRef::Named {
@@ -132,6 +133,52 @@ mod tests {
         assert_ne!(
             member_declaration_id(identity(&owner_id, &one)),
             member_declaration_id(identity(&owner_id, &reversed))
+        );
+    }
+
+    #[test]
+    fn member_identity_distinguishes_lvalue_and_rvalue_references() {
+        let owner_id = "type.cpp.example.Widget";
+        let named_type = named("example.Widget");
+        let lvalue = [TypeRef::ByRef {
+            element: Box::new(named_type.clone()),
+            reference_kind: TypeRefReferenceKind::Lvalue,
+        }];
+        let rvalue = [TypeRef::ByRef {
+            element: Box::new(named_type),
+            reference_kind: TypeRefReferenceKind::Rvalue,
+        }];
+        fn member_identity<'a>(
+            owner_id: &'a str,
+            parameter_types: &'a [TypeRef],
+        ) -> MemberIdentity<'a> {
+            MemberIdentity {
+                owner_id,
+                kind: MemberKind::Constructor,
+                is_static: false,
+                parameter_arity: parameter_types.len(),
+                name: "Widget",
+                generic_arity: 0,
+                parameter_types,
+                parameter_variadics: &[],
+                return_type: None,
+            }
+        }
+
+        let lvalue_id = member_declaration_id(member_identity(owner_id, &lvalue));
+        let rvalue_id = member_declaration_id(member_identity(owner_id, &rvalue));
+        assert_eq!(
+            lvalue_id,
+            member_declaration_id(member_identity(owner_id, &lvalue))
+        );
+        assert_eq!(
+            rvalue_id,
+            member_declaration_id(member_identity(owner_id, &rvalue))
+        );
+        assert_ne!(lvalue_id, rvalue_id);
+        assert_ne!(
+            serde_json::to_value(&lvalue[0]).expect("lvalue JSON"),
+            serde_json::to_value(&rvalue[0]).expect("rvalue JSON")
         );
     }
 }

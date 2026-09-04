@@ -1,0 +1,242 @@
+{
+  "records": [
+    {
+      "case": "copy-constructor",
+      "canonicalInput": {
+        "callableKind": "constructor",
+        "owner": {
+          "artifactSelectors": [
+            {
+              "purl": "pkg:generic/cpp-reference-headers@1.0.0",
+              "digests": [
+                {
+                  "algorithm": "sha-256",
+                  "coverage": "canonical-header-tree",
+                  "value": "1111111111111111111111111111111111111111111111111111111111111111"
+                }
+              ]
+            }
+          ],
+          "scheme": "csmi.cpp.declaration",
+          "schemeVersion": "0.1.0",
+          "stability": "portable",
+          "descriptors": [
+            { "role": "namespace", "name": "std", "disambiguator": "namespace" },
+            { "role": "type", "name": "basic_string", "disambiguator": "template-primary:3" }
+          ]
+        },
+        "parameters": [
+          {
+            "kind": "reference",
+            "referenceKind": "lvalue",
+            "referent": {
+              "kind": "qualified",
+              "qualifiers": ["const"],
+              "type": {
+                "kind": "declared",
+                "symbol": {
+                  "artifactSelectors": [
+                    {
+                      "purl": "pkg:generic/cpp-reference-headers@1.0.0",
+                      "digests": [
+                        {
+                          "algorithm": "sha-256",
+                          "coverage": "canonical-header-tree",
+                          "value": "1111111111111111111111111111111111111111111111111111111111111111"
+                        }
+                      ]
+                    }
+                  ],
+                  "scheme": "csmi.cpp.declaration",
+                  "schemeVersion": "0.1.0",
+                  "stability": "portable",
+                  "descriptors": [
+                    { "role": "namespace", "name": "std", "disambiguator": "namespace" },
+                    { "role": "type", "name": "basic_string", "disambiguator": "template-primary:3" }
+                  ]
+                }
+              }
+            }
+          }
+        ]
+      },
+      "expectedDisambiguator": "cppsig-0.1:670e0719b1b6b5ae53e61b7e9b5d04dffd8beb7fbe6514a93b2a6b6d276b0bbb"
+    },
+    {
+      "case": "copy-assignment",
+      "canonicalInput": {
+        "callableKind": "method",
+        "owner": {
+          "artifactSelectors": [
+            {
+              "purl": "pkg:generic/cpp-reference-headers@1.0.0",
+              "digests": [
+                {
+                  "algorithm": "sha-256",
+                  "coverage": "canonical-header-tree",
+                  "value": "1111111111111111111111111111111111111111111111111111111111111111"
+                }
+              ]
+            }
+          ],
+          "scheme": "csmi.cpp.declaration",
+          "schemeVersion": "0.1.0",
+          "stability": "portable",
+          "descriptors": [
+            { "role": "namespace", "name": "std", "disambiguator": "namespace" },
+            { "role": "type", "name": "basic_string", "disambiguator": "template-primary:3" }
+          ]
+        },
+        "receiver": {
+          "kind": "reference",
+          "referenceKind": "lvalue",
+          "referent": {
+            "kind": "declared",
+            "symbol": {
+              "artifactSelectors": [
+                {
+                  "purl": "pkg:generic/cpp-reference-headers@1.0.0",
+                  "digests": [
+                    {
+                      "algorithm": "sha-256",
+                      "coverage": "canonical-header-tree",
+                      "value": "1111111111111111111111111111111111111111111111111111111111111111"
+                    }
+                  ]
+                }
+              ],
+              "scheme": "csmi.cpp.declaration",
+              "schemeVersion": "0.1.0",
+              "stability": "portable",
+              "descriptors": [
+                { "role": "namespace", "name": "std", "disambiguator": "namespace" },
+                { "role": "type", "name": "basic_string", "disambiguator": "template-primary:3" }
+              ]
+            }
+          }
+        },
+        "parameters": [
+          {
+            "kind": "reference",
+            "referenceKind": "lvalue",
+            "referent": {
+              "kind": "qualified",
+              "qualifiers": ["const"],
+              "type": {
+                "kind": "declared",
+                "symbol": {
+                  "artifactSelectors": [
+                    {
+                      "purl": "pkg:generic/cpp-reference-headers@1.0.0",
+                      "digests": [
+                        {
+                          "algorithm": "sha-256",
+                          "coverage": "canonical-header-tree",
+                          "value": "1111111111111111111111111111111111111111111111111111111111111111"
+                        }
+                      ]
+                    }
+                  ],
+                  "scheme": "csmi.cpp.declaration",
+                  "schemeVersion": "0.1.0",
+                  "stability": "portable",
+                  "descriptors": [
+                    { "role": "namespace", "name": "std", "disambiguator": "namespace" },
+                    { "role": "type", "name": "basic_string", "disambiguator": "template-primary:3" }
+                  ]
+                }
+              }
+            }
+          }
+        ],
+        "result": {
+          "kind": "reference",
+          "referenceKind": "lvalue",
+          "referent": {
+            "kind": "declared",
+            "symbol": {
+              "artifactSelectors": [
+                {
+                  "purl": "pkg:generic/cpp-reference-headers@1.0.0",
+                  "digests": [
+                    {
+                      "algorithm": "sha-256",
+                      "coverage": "canonical-header-tree",
+                      "value": "1111111111111111111111111111111111111111111111111111111111111111"
+                    }
+                  ]
+                }
+              ],
+              "scheme": "csmi.cpp.declaration",
+              "schemeVersion": "0.1.0",
+              "stability": "portable",
+              "descriptors": [
+                { "role": "namespace", "name": "std", "disambiguator": "namespace" },
+                { "role": "type", "name": "basic_string", "disambiguator": "template-primary:3" }
+              ]
+            }
+          }
+        }
+      },
+      "expectedDisambiguator": "cppsig-0.1:80dbf89c9fcc4eab476d0b53351a4e24a489d0d9e139585e8971ecf47a1f7b47"
+    },
+    {
+      "case": "move-constructor",
+      "canonicalInput": {
+        "callableKind": "constructor",
+        "owner": {
+          "artifactSelectors": [
+            {
+              "purl": "pkg:generic/cpp-reference-headers@1.0.0",
+              "digests": [
+                {
+                  "algorithm": "sha-256",
+                  "coverage": "canonical-header-tree",
+                  "value": "1111111111111111111111111111111111111111111111111111111111111111"
+                }
+              ]
+            }
+          ],
+          "scheme": "csmi.cpp.declaration",
+          "schemeVersion": "0.1.0",
+          "stability": "portable",
+          "descriptors": [
+            { "role": "namespace", "name": "std", "disambiguator": "namespace" },
+            { "role": "type", "name": "basic_string", "disambiguator": "template-primary:3" }
+          ]
+        },
+        "parameters": [
+          {
+            "kind": "reference",
+            "referenceKind": "rvalue",
+            "referent": {
+              "kind": "declared",
+              "symbol": {
+                "artifactSelectors": [
+                  {
+                    "purl": "pkg:generic/cpp-reference-headers@1.0.0",
+                    "digests": [
+                      {
+                        "algorithm": "sha-256",
+                        "coverage": "canonical-header-tree",
+                        "value": "1111111111111111111111111111111111111111111111111111111111111111"
+                      }
+                    ]
+                  }
+                ],
+                "scheme": "csmi.cpp.declaration",
+                "schemeVersion": "0.1.0",
+                "stability": "portable",
+                "descriptors": [
+                  { "role": "namespace", "name": "std", "disambiguator": "namespace" },
+                  { "role": "type", "name": "basic_string", "disambiguator": "template-primary:3" }
+                ]
+              }
+            }
+          }
+        ]
+      },
+      "expectedDisambiguator": "cppsig-0.1:9166270ce47bbbc9269d2a3919f53f8e40f8c34e2ba46c2e3f113f00292c7493"
+    }
+  ]
+}

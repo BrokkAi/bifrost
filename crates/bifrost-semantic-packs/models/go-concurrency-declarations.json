@@ -7,7 +7,7 @@
   "ecosystem": "go",
   "compatibility": { "bifrost": ">=0.10.7, <1.0.0", "toolchains": [] },
   "provenance": {
-    "source": "https://go.dev/src/context/, https://go.dev/src/sync/, and https://pkg.go.dev/golang.org/x/sync/errgroup",
+    "source": "https://go.dev/src/context/, https://go.dev/src/sync/, https://go.dev/src/time/, and https://pkg.go.dev/golang.org/x/sync/errgroup",
     "revision": "go1.26.0;x-sync-v0.15.0"
   },
   "license": "BSD-3-Clause",
@@ -562,6 +562,63 @@
             "receiver": { "pointer": true },
             "aliases": [],
             "locator": { "kind": "artifact", "path": "errgroup/errgroup.go", "symbol": "golang.org/x/sync/errgroup.Group.Wait" }
+          }
+        ],
+        "relations": []
+      }
+    },
+    {
+      "id": "go.concurrency.time.declarations",
+      "activation": [{}],
+      "payload": {
+        "kind": "declaration_facts",
+        "types": [
+          {
+            "id": "type.0e5eb8274d8a136652db26087e21a5a350ee36c3b7d9c47f2ffca11ec56d98e0",
+            "name": "time",
+            "type_kind": "module",
+            "visibility": "package",
+            "is_abstract": false,
+            "is_sealed": false,
+            "has_explicit_type_terms": false,
+            "type_parameters": [],
+            "type_parameter_constraints": [],
+            "embedded_types": [],
+            "hierarchy": [],
+            "aliases": ["time"],
+            "extension_surfaces": [],
+            "locator": { "kind": "artifact", "path": "src/time/sleep.go", "symbol": "time" }
+          }
+        ],
+        "members": [
+          {
+            "id": "member.ff779d96f039a87327fdb64619965187cecb969d543640e37fbb90d40b8ff06b",
+            "owner": "type.0e5eb8274d8a136652db26087e21a5a350ee36c3b7d9c47f2ffca11ec56d98e0",
+            "name": "AfterFunc",
+            "member_kind": "function",
+            "visibility": "public",
+            "is_static": true,
+            "is_abstract": false,
+            "is_virtual": false,
+            "signature": {
+              "type_parameters": [],
+              "parameters": [
+                {
+                  "name": "d",
+                  "type": { "kind": "named", "name": "time.Duration", "arguments": [], "nullable": false },
+                  "optional": false,
+                  "variadic": false
+                },
+                {
+                  "name": "f",
+                  "type": { "kind": "named", "name": "func()", "arguments": [], "nullable": false },
+                  "optional": false,
+                  "variadic": false
+                }
+              ]
+            },
+            "aliases": [],
+            "locator": { "kind": "artifact", "path": "src/time/sleep.go", "symbol": "time.AfterFunc" }
           }
         ],
         "relations": []

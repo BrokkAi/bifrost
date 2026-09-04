@@ -1162,6 +1162,43 @@ fn render_code_query_repl_output(output: &CodeQueryResult, use_color: bool) -> S
                         if value.truncated { "; truncated" } else { "" },
                     ));
                 }
+                CodeQueryResultValue::ClassSetRow { value } => {
+                    let path = sanitize_terminal_text(&value.file);
+                    let member = sanitize_terminal_text(&value.member);
+                    out.push_str(&format!(
+                        "{}:{}:{}\n  {} {} <- {} ({})\n",
+                        paint(Style::new().fg(Color::Cyan).bold(), &path, use_color),
+                        value.range.start_line,
+                        value.range.start_column,
+                        paint(Style::new().fg(Color::Blue), "class set:", use_color),
+                        paint(Style::new().bold(), &member, use_color),
+                        value.class.as_deref().unwrap_or(&value.origin),
+                        value.status,
+                    ));
+                }
+                CodeQueryResultValue::AbsentMemberFinding { value } => {
+                    let path = sanitize_terminal_text(&value.file);
+                    let class = sanitize_terminal_text(&value.class);
+                    let member = sanitize_terminal_text(&value.member);
+                    out.push_str(&format!(
+                        "{}:{}:{}\n  {} {} has no member `{}` (from {}:{}; caller {}; witness {} step{})\n",
+                        paint(Style::new().fg(Color::Cyan).bold(), &path, use_color),
+                        value.range.start_line,
+                        value.range.start_column,
+                        paint(
+                            Style::new().fg(Color::Blue),
+                            "absent member:",
+                            use_color
+                        ),
+                        paint(Style::new().bold(), &class, use_color),
+                        member,
+                        value.origin_file,
+                        value.origin_range.start_line,
+                        value.caller,
+                        value.witness_steps,
+                        if value.witness_steps == 1 { "" } else { "s" },
+                    ));
+                }
                 CodeQueryResultValue::FlowEndpoint { value } => {
                     let path = sanitize_terminal_text(&value.path);
                     let id = sanitize_terminal_text(&value.id);

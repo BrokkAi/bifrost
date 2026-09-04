@@ -48,9 +48,16 @@ use crate::resolved::{
 use crate::selector_compiler::{
     PolicySemanticPeaks, ReceiverBindingApplicability, parameter_names_match,
 };
+use crate::unit_execution::{UnitAttempt, UnitReuse};
+use crate::units::{
+    PolicyIncrementalContext, PolicyUnitKey, PolicyUnitProduct, RootProduct, RootWork,
+    UnitPartition, WidenReason,
+};
 use brokk_bifrost_analysis::CancellationToken;
 use brokk_bifrost_analysis::analyzer::common::language_for_file;
 use brokk_bifrost_analysis::analyzer::lexical_definitions::formal_parameter_slots;
+use brokk_bifrost_analysis::analyzer::read_ledger::ReadLedger;
+use brokk_bifrost_analysis::analyzer::semantic::ids::StableDigest;
 use brokk_bifrost_analysis::analyzer::semantic::workspace_oracle::{
     ProcedureRangeLookupStatus, procedures_in_artifact,
 };
@@ -72,9 +79,10 @@ use brokk_bifrost_analysis::analyzer::semantic_model::{
     Completeness,
 };
 use brokk_bifrost_analysis::analyzer::usages::get_definition::parse_tree_for_language;
-use brokk_bifrost_analysis::analyzer::{ProjectFile, Range, WorkspaceAnalyzer};
+use brokk_bifrost_analysis::analyzer::{AnalyzerQueryScope, ProjectFile, Range, WorkspaceAnalyzer};
+use brokk_bifrost_analysis::path_utils::rel_path_string;
 use brokk_bifrost_flow::dataflow::{
-    DataflowRequest, SolverBudget, SolverTermination, SummaryWitnessStepKind,
+    DataflowRequest, SolverBudget, SolverTermination, SummaryReadRecorder, SummaryWitnessStepKind,
     WitnessReconstructionLimits,
 };
 use brokk_bifrost_flow::typestate::{
@@ -90,10 +98,12 @@ use brokk_bifrost_flow::typestate::{
     TypestateCallNonInterferenceSpec, TypestateEventBindingId, TypestateEventBindingSpec,
     TypestateFinding, TypestateFindingCertainty, TypestateFindingKind, TypestateFindingLimits,
     TypestateFlowProblemError, TypestateInitialSeedSpec, TypestateObjectKey, TypestateObjectRole,
-    TypestateObservationSite, TypestateSubjectClassKey, TypestateSubjectKey,
-    TypestateTerminalBindingId, TypestateTerminalBindingSpec, TypestateUncertainty,
-    collect_summary_findings_with_limits, solve_typestate_with_production_summaries,
+    TypestateObservationSite, TypestateProductionCacheStatus, TypestateSubjectClassKey,
+    TypestateSubjectKey, TypestateTerminalBindingId, TypestateTerminalBindingSpec,
+    TypestateUncertainty, collect_summary_findings_with_limits,
+    solve_typestate_with_production_summaries,
 };
+use brokk_bifrost_rql::structural::search::CodeQueryExecutionScope;
 use brokk_bifrost_rql::structural::{
     CodeQueryCompletion, CodeQueryDiagnosticCode, CodeQueryExecutionLimits, CodeQueryExecutionWork,
 };
@@ -133,11 +143,27 @@ pub(crate) enum TypestatePolicyCompileError {
     EndpointDominanceUndecidable(String),
     UnsupportedBinding(String),
     BindingPlan(brokk_bifrost_flow::typestate::TypestateBindingPlanError),
+    /// The sliced selector compile cannot claim to have produced what a whole
+    /// compile would have produced. Not a compilation failure: the caller
+    /// compiles the policy again with no units and reports the reason beside
+    /// the run.
+    Widen(WidenReason),
 }
 
 pub(crate) struct TypestatePolicyCompileFailure {
     error: TypestatePolicyCompileError,
     work: PolicyWorkReport,
+}
+
+impl TypestatePolicyCompileFailure {
+    /// The reason a sliced compile asked to be compiled again, when that is
+    /// what this failure is.
+    pub(crate) const fn widen(&self) -> Option<WidenReason> {
+        match self.error {
+            TypestatePolicyCompileError::Widen(reason) => Some(reason),
+            _ => None,
+        }
+    }
 }
 
 impl fmt::Display for TypestatePolicyCompileError {
@@ -185,6 +211,11 @@ impl fmt::Display for TypestatePolicyCompileError {
                     "typestate binding-plan compilation failed: {error}"
                 )
             }
+            Self::Widen(reason) => write!(
+                formatter,
+                "the sliced typestate compile widened: {}",
+                reason.stable_label()
+            ),
         }
     }
 }
@@ -201,7 +232,8 @@ impl std::error::Error for TypestatePolicyCompileError {
             | Self::SemanticUnavailable(_)
             | Self::AmbiguousSemanticSite(_)
             | Self::EndpointDominanceUndecidable(_)
-            | Self::UnsupportedBinding(_) => None,
+            | Self::UnsupportedBinding(_)
+            | Self::Widen(_) => None,
         }
     }
 }
@@ -388,6 +420,14 @@ impl IcfgProvider for PolicyIcfgProvider<'_> {
 
 pub(crate) struct ProductionTypestatePolicyEvaluator {
     prepared: RefCell<Option<CompiledTypestatePolicy>>,
+    /// What the selector half of this evaluation's sliced attempt did. The
+    /// compile and the root solve are two halves of one attempt, so the counts
+    /// are carried from the first to the second rather than reported twice.
+    selector_units: RefCell<Option<super::selector_compiler::SelectorUnitOutcome>>,
+    /// What the sliced attempt did, left here for the caller that records the
+    /// reuse review. Compilation and evaluation are one transaction, and the
+    /// selector compile and the root solve are two halves of the same attempt.
+    attempt: RefCell<Option<(UnitAttempt, Option<WidenReason>)>>,
     /// Coordinator-captured activation shared with the other policy engines.
     active_semantic_model_snapshot: Option<Arc<ActiveSemanticModelSnapshot>>,
 }
@@ -404,7 +444,57 @@ impl ProductionTypestatePolicyEvaluator {
     ) -> Self {
         Self {
             prepared: RefCell::new(None),
+            selector_units: RefCell::new(None),
+            attempt: RefCell::new(None),
             active_semantic_model_snapshot,
+        }
+    }
+
+    /// Compile one typestate policy over the workspace this evaluation holds.
+    ///
+    /// Shared by the compilation seam and by the widening path, which needs a
+    /// second compile rather than a second pass: the solver, semantic and
+    /// execution budgets a compile hands to the evaluation are shared handles
+    /// that a partial sliced pass has already drawn on, and a whole evaluation
+    /// run against those would see an allowance no whole evaluation ever has.
+    fn compile(
+        policy: &LoadedPolicy,
+        spec: &ResolvedTypestatePolicySpec,
+        workspace: &WorkspaceAnalyzer,
+        context: &PolicyEvaluationContext<'_>,
+        budget: &PolicyBudget,
+    ) -> Result<CompiledTypestatePolicy, TypestateCompilationFailure> {
+        Self::compile_with_units(policy, spec, workspace, context, budget, None)
+            .0
+            .map_err(|failure| compile_failure(*failure))
+    }
+
+    /// The compile, optionally sliced into per-seed selector units, and what
+    /// those units did.
+    fn compile_with_units(
+        policy: &LoadedPolicy,
+        spec: &ResolvedTypestatePolicySpec,
+        workspace: &WorkspaceAnalyzer,
+        context: &PolicyEvaluationContext<'_>,
+        budget: &PolicyBudget,
+        incremental: Option<&PolicyIncrementalContext<'_>>,
+    ) -> (
+        Result<CompiledTypestatePolicy, Box<TypestatePolicyCompileFailure>>,
+        Option<super::selector_compiler::SelectorUnitOutcome>,
+    ) {
+        let uncancelled = CancellationToken::default();
+        let cancellation = context.cancellation.unwrap_or(&uncancelled);
+        let compiler = TypestatePolicyCompiler::new(
+            workspace,
+            budget.query_limits(),
+            budget.max_selector_results(),
+            cancellation,
+        );
+        match incremental {
+            Some(incremental) => compiler
+                .with_units(policy, incremental, budget)
+                .compile_with_units(policy, spec),
+            None => compiler.compile_with_units(policy, spec),
         }
     }
 }
@@ -425,20 +515,44 @@ impl TypestatePolicyEvaluator for ProductionTypestatePolicyEvaluator {
                 TypestatePolicyCompileError::MissingWorkspace.to_string(),
             )
         })?;
-        let uncancelled = CancellationToken::default();
-        let cancellation = context.cancellation.unwrap_or(&uncancelled);
-        let compiled = TypestatePolicyCompiler::new(
+        let (compiled, units) = Self::compile_with_units(
+            policy,
+            spec,
             workspace,
-            budget.query_limits(),
-            budget.max_selector_results(),
-            cancellation,
-        )
-        .compile(policy, spec)
-        .map_err(|failure| compile_failure(*failure))?;
+            context,
+            budget,
+            context.incremental,
+        );
+        let (compiled, units) = match compiled {
+            Ok(compiled) => (compiled, units),
+            Err(failure) => {
+                let Some(reason) = failure.widen() else {
+                    return Err(compile_failure(*failure));
+                };
+                // The sliced compile cannot be merged into the compile a whole
+                // run would have produced, so the answer is that compile. A
+                // second compiler is built rather than a second pass, because
+                // the first handed its selectors budget handles the partial
+                // sliced compile has already drawn on.
+                let mut units = units.unwrap_or_default();
+                units.widen = Some(reason);
+                let (recompiled, _) =
+                    Self::compile_with_units(policy, spec, workspace, context, budget, None);
+                (
+                    recompiled.map_err(|failure| compile_failure(*failure))?,
+                    Some(units),
+                )
+            }
+        };
         let hashes =
             TypestateCompilationHashes::new(compiled.protocol.hash(), compiled.bindings.hash());
         self.prepared.replace(Some(compiled));
+        self.selector_units.replace(units);
         Ok(hashes)
+    }
+
+    fn take_unit_attempt(&self) -> Option<(UnitAttempt, Option<WidenReason>)> {
+        self.attempt.borrow_mut().take()
     }
 
     fn evaluate_typestate(
@@ -465,7 +579,35 @@ impl TypestatePolicyEvaluator for ProductionTypestatePolicyEvaluator {
         // and the other way around. This evaluator used to construct its own
         // and lease a hardcoded generation, which shared nothing with anything.
         let summaries = context.flow_state.typestate_summaries();
-        match evaluate_compiled_typestate(
+        let selectors = self.selector_units.borrow_mut().take().unwrap_or_default();
+        // An evaluation that holds an incremental context has root units to
+        // reuse and a workspace to verify them against; one that does not
+        // solves every root exactly as it always has.
+        let Some(incremental) = context.incremental else {
+            return self.whole_pass(
+                authority, policy, spec, workspace, context, budget, &compiled, &summaries, None,
+            );
+        };
+        // The selector compile and the root solve are two halves of one
+        // attempt. A compile that widened has already been recompiled whole,
+        // and its roots are the roots of a whole compile, so nothing about
+        // them may be reused either.
+        if let Some(reason) = selectors.widen {
+            self.attempt
+                .replace(Some((selectors.attempt, Some(reason))));
+            return self.whole_pass(
+                authority, policy, spec, workspace, context, budget, &compiled, &summaries, None,
+            );
+        }
+        let mut units = RootUnits::new(
+            policy,
+            incremental,
+            budget,
+            workspace,
+            selectors,
+            TypestateCompilationHashes::new(compiled.protocol.hash(), compiled.bindings.hash()),
+        );
+        let sliced = evaluate_compiled_typestate(
             authority,
             policy,
             spec,
@@ -475,9 +617,90 @@ impl TypestatePolicyEvaluator for ProductionTypestatePolicyEvaluator {
             &compiled,
             &summaries,
             self.active_semantic_model_snapshot.clone(),
+            Some(&mut units),
+        );
+        let (keys, attempt) = units.into_parts();
+        match sliced {
+            RootsPass::Complete(payload) => {
+                // Every root of this policy is published and merged, so this
+                // list is what another run replays to reproduce the product
+                // without solving anything. It is empty when any root was not
+                // published, and an empty list names nothing.
+                if !keys.is_empty() {
+                    incremental.record_units(policy.definition().metadata.id.clone(), keys);
+                }
+                self.attempt.replace(Some((attempt, None)));
+                payload
+            }
+            RootsPass::Failed(failure) => {
+                self.attempt.replace(Some((attempt, None)));
+                failed_projection_payload(&failure.message, failure.work)
+            }
+            RootsPass::Widen(reason) => {
+                self.attempt.replace(Some((attempt, Some(reason))));
+                let recompiled = match Self::compile(policy, spec, workspace, context, budget) {
+                    Ok(recompiled) => recompiled,
+                    Err(_) => {
+                        return failed_projection_payload(
+                            "a widened typestate policy could not be compiled a second time",
+                            compiled_typestate_work_report(&compiled),
+                        );
+                    }
+                };
+                assert_eq!(
+                    (recompiled.protocol.hash(), recompiled.bindings.hash()),
+                    (compiled.protocol.hash(), compiled.bindings.hash()),
+                    "two compiles of one policy over one workspace are the same compile, and the \
+                     projection authority is sealed to the first one's hashes"
+                );
+                self.whole_pass(
+                    authority,
+                    policy,
+                    spec,
+                    workspace,
+                    context,
+                    budget,
+                    &recompiled,
+                    &summaries,
+                    None,
+                )
+            }
+        }
+    }
+}
+
+impl ProductionTypestatePolicyEvaluator {
+    /// Solve every root of `compiled`, reusing nothing.
+    #[allow(clippy::too_many_arguments)]
+    fn whole_pass(
+        &self,
+        authority: &TypestateProjectionAuthority,
+        policy: &LoadedPolicy,
+        spec: &ResolvedTypestatePolicySpec,
+        workspace: &WorkspaceAnalyzer,
+        context: &PolicyEvaluationContext<'_>,
+        budget: &PolicyBudget,
+        compiled: &CompiledTypestatePolicy,
+        summaries: &ProductionTypestateSummaryRepository,
+        units: Option<&mut RootUnits<'_>>,
+    ) -> TypestateProjectionPayload {
+        match evaluate_compiled_typestate(
+            authority,
+            policy,
+            spec,
+            workspace,
+            context.cancellation,
+            budget,
+            compiled,
+            summaries,
+            self.active_semantic_model_snapshot.clone(),
+            units,
         ) {
-            Ok(payload) => payload,
-            Err(failure) => failed_projection_payload(&failure.message, failure.work),
+            RootsPass::Complete(payload) => payload,
+            RootsPass::Failed(failure) => failed_projection_payload(&failure.message, failure.work),
+            RootsPass::Widen(_) => unreachable!(
+                "a pass with no units has nothing to reuse and never asks to be widened"
+            ),
         }
     }
 }
@@ -649,6 +872,13 @@ fn typestate_work_report(
             PolicyWorkUnit::Rows,
             count(measured.semantic_evaluation_work.control_edges),
         ),
+        // Physical materialization work charged during evaluation, not a
+        // retained-row census. A revived artifact's rows are reused, but a
+        // repeat lowering charges the lowering's transient control-flow work,
+        // which the retained nested-entry census does not represent. This
+        // metric is therefore exact within one cache state and bounded by the
+        // repeated physical materializations across states (#2926), the same
+        // way `evaluation_semantic_source_bytes` above is.
         typestate_work_metric(
             "typestate.evaluation_semantic_nested_entries",
             PolicyWorkUnit::Rows,
@@ -739,6 +969,273 @@ fn compiled_typestate_work_report(compiled: &CompiledTypestatePolicy) -> PolicyW
     )
 }
 
+/// What one pass over a compiled policy's roots produced.
+///
+/// Three outcomes rather than a `Result`, because widening is neither success
+/// nor failure: it is the statement that this pass cannot be merged into the
+/// bytes a whole evaluation would have produced, and the caller answers it by
+/// evaluating the policy in full.
+enum RootsPass {
+    Complete(TypestateProjectionPayload),
+    Widen(WidenReason),
+    Failed(TypestateEvaluationFailure),
+}
+
+/// The per-root units of one typestate evaluation.
+///
+/// One of these is built per evaluation that holds an incremental context. It
+/// owns the shared reuse decision, the key of every root the compile produced,
+/// and the count of what the attempt did with them.
+struct RootUnits<'a> {
+    reuse: UnitReuse<'a>,
+    policy: &'a LoadedPolicy,
+    incremental: &'a PolicyIncrementalContext<'a>,
+    files_by_rel: HashMap<String, ProjectFile>,
+    /// The keys of this evaluation's roots, in root order, so a root's own key
+    /// is the one its index names.
+    keys: Vec<PolicyUnitKey>,
+    /// The keys the same evaluation's compile decided about, carried through
+    /// so the run's unit list names both halves.
+    selector_keys: Vec<PolicyUnitKey>,
+    /// The compile whose roots these are, folded into every root's key: a
+    /// root's projections are sealed to it, and the projection authority drops
+    /// a projection minted under any other compile.
+    compilation: StableDigest,
+    attempt: UnitAttempt,
+    /// Whether every root this attempt decided about is in the store, either
+    /// because it was reused from there or because its solve was published to
+    /// it. A run's unit list is what another run replays instead of evaluating
+    /// the policy, so a list naming a root that was never published would name
+    /// work no run did.
+    all_published: bool,
+}
+
+impl<'a> RootUnits<'a> {
+    /// `selectors` is what the same evaluation's compile did with its own
+    /// units: the two halves share one attempt and one unit list, because a
+    /// run replays a policy's compile and its solve together or not at all.
+    fn new(
+        policy: &'a LoadedPolicy,
+        incremental: &'a PolicyIncrementalContext<'a>,
+        budget: &'a PolicyBudget,
+        workspace: &WorkspaceAnalyzer,
+        selectors: super::selector_compiler::SelectorUnitOutcome,
+        compilation: TypestateCompilationHashes,
+    ) -> Self {
+        let files_by_rel = workspace
+            .analyzer()
+            .analyzed_files()
+            .into_iter()
+            .map(|file| (rel_path_string(&file), file))
+            .collect();
+        Self {
+            reuse: UnitReuse::new(policy, incremental, budget),
+            policy,
+            incremental,
+            files_by_rel,
+            keys: Vec::new(),
+            selector_keys: selectors.keys,
+            compilation: compilation.unit_digest(),
+            attempt: selectors.attempt,
+            all_published: selectors.all_published,
+        }
+    }
+
+    /// Key every root the compile produced, and load them all in one batch.
+    ///
+    /// A root whose file the head does not analyze, or whose path resolves to
+    /// no blob, has no content identity to key a unit by, which is missing
+    /// evidence rather than evidence of sameness.
+    fn enumerate(&mut self, roots: &[ProcedureHandle]) -> Result<(), WidenReason> {
+        self.attempt.enumerated(roots.len());
+        self.keys.reserve(roots.len());
+        for root in roots {
+            let locator = root.semantics().locator();
+            let rel_path = locator.path().as_str().to_string();
+            let Some(file) = self.files_by_rel.get(&rel_path) else {
+                return Err(WidenReason::ReverseDependencyEvidenceMissing);
+            };
+            let language = language_for_file(file);
+            let Some(blob) = self.incremental.changed().head_blob(language, &rel_path) else {
+                return Err(WidenReason::ReverseDependencyEvidenceMissing);
+            };
+            self.keys.push(self.incremental.inputs().unit_key(
+                self.policy,
+                UnitPartition::Root {
+                    language,
+                    rel_path: rel_path.into_boxed_str(),
+                    blob,
+                    // The root's own mount-free semantic identity, which is
+                    // also the scenario id every finding this root produces
+                    // carries: one file declares many procedures, and each is
+                    // solved separately.
+                    locator: StableDigest::sha256(super::semantic_identity::semantic_root_key(
+                        root,
+                    )),
+                    compilation: self.compilation,
+                },
+            ));
+        }
+        self.reuse.prefetch(&self.keys)
+    }
+
+    /// The published product for one root, when the head still reads what its
+    /// solve read.
+    fn published(&mut self, root_index: usize) -> Result<Option<RootProduct>, WidenReason> {
+        let key = self.keys[root_index].clone();
+        match self.reuse.published(&key)? {
+            Some(product) => {
+                self.attempt.reused();
+                let Some(product) = product.into_root() else {
+                    // One key names one product shape; anything else is a
+                    // store that answered a different question.
+                    return Err(WidenReason::ProductLoadFailed);
+                };
+                Ok(Some(product))
+            }
+            None => {
+                self.attempt.recomputed();
+                Ok(None)
+            }
+        }
+    }
+
+    /// The keys this attempt asked about and what it did with them, with the
+    /// keys empty when any root is missing from the store.
+    fn into_parts(mut self) -> (Vec<PolicyUnitKey>, UnitAttempt) {
+        if self.all_published {
+            self.selector_keys.append(&mut self.keys);
+            (self.selector_keys, self.attempt)
+        } else {
+            (Vec::new(), self.attempt)
+        }
+    }
+
+    /// Publish one solved root under the reads that produced it.
+    ///
+    /// A solve answered from the production result cache is not published: it
+    /// returned before the ICFG provider and the summary funnel were touched,
+    /// so its ledger names none of the inputs its result depends on and a unit
+    /// published under it would verify against a head that changed everything
+    /// it read.
+    fn publish(
+        &mut self,
+        root_index: usize,
+        product: RootProduct,
+        ledger: &ReadLedger,
+        cache_status: TypestateProductionCacheStatus,
+    ) {
+        if cache_status == TypestateProductionCacheStatus::Hit {
+            self.all_published = false;
+            let policy_id = &self.policy.definition().metadata.id;
+            brokk_bifrost_analysis::profiling::note_with(|| {
+                format!(
+                    "policy.units policy={policy_id} partition=root unpublished=result_cache_hit"
+                )
+            });
+            return;
+        }
+        if !ledger.is_bounded() {
+            self.all_published = false;
+            self.attempt.unbounded();
+            return;
+        }
+        self.reuse.publish(
+            self.keys[root_index].clone(),
+            PolicyUnitProduct::Root(product),
+            ledger.keys(),
+        );
+    }
+}
+
+/// Append one root's product to the run's accumulators, exactly as the loop
+/// appends the same values when it solves the root itself.
+#[allow(clippy::too_many_arguments)]
+fn merge_root_product(
+    product: &RootProduct,
+    projections: &mut Vec<TypestateProjectedFinding>,
+    incomplete_reasons: &mut Vec<PolicyIncompleteReason>,
+    reached_rows: &mut u64,
+    subject_rows: &mut u64,
+    terminal_rows: &mut u64,
+    retained_analysis_findings: &mut u64,
+    omitted_analysis_findings: &mut u64,
+    remaining_finding_reached_rows: &mut usize,
+    remaining_finding_candidates: &mut usize,
+    remaining_finding_witness_expansions: &mut usize,
+    remaining_finding_witness_bytes: &mut usize,
+) {
+    let work = product.work;
+    let lane = |value: u64| usize::try_from(value).unwrap_or(usize::MAX);
+    *reached_rows = reached_rows.saturating_add(work.reached_rows);
+    *subject_rows = subject_rows.saturating_add(work.subject_rows);
+    *terminal_rows = terminal_rows.saturating_add(work.terminal_rows);
+    *retained_analysis_findings =
+        retained_analysis_findings.saturating_add(work.retained_analysis_findings);
+    *omitted_analysis_findings =
+        omitted_analysis_findings.saturating_add(work.omitted_analysis_findings);
+    // The request-wide finding budget is charged what this root's findings
+    // cost, because the budget is shared: a later root that saw an allowance
+    // no whole evaluation would have given it could report a finding the whole
+    // evaluation omitted.
+    *remaining_finding_reached_rows =
+        remaining_finding_reached_rows.saturating_sub(lane(work.finding_reached_rows));
+    *remaining_finding_candidates =
+        remaining_finding_candidates.saturating_sub(lane(work.finding_candidates));
+    *remaining_finding_witness_expansions =
+        remaining_finding_witness_expansions.saturating_sub(lane(work.finding_witness_expansions));
+    *remaining_finding_witness_bytes =
+        remaining_finding_witness_bytes.saturating_sub(lane(work.finding_witness_bytes));
+    incomplete_reasons.extend(product.incomplete_reasons.iter().copied());
+    projections.extend(product.findings.iter().cloned());
+}
+
+/// Charge every shared ledger one reused root's own solve drew on.
+///
+/// `merge_root_product` charges the four request-wide finding lanes, which the
+/// loop carries as remaining counters. These four are ledgers the solve itself
+/// holds, so they are charged into the ledger: the solver budget a later root
+/// solves under, the semantic budget it materializes under, the execution
+/// budget's materialized files and traversal steps, and the artifact-lease
+/// capacity its window opens against. A reused root therefore leaves each of
+/// them exactly where its own solve left them, which is what makes the sliced
+/// pass reach a lane at the same root the whole run reaches it at.
+///
+/// A charge that does not fit means the whole evaluation reaches that lane
+/// here, so the caller evaluates the policy in full rather than reporting a
+/// completion no whole run would have reported.
+///
+/// The semantic budget's paid-artifact identities are not replayed: they are
+/// process-local digests a stored product never carried, so a later root may
+/// pay a census this root already paid. That over-charges the semantic lane
+/// and can only widen more often, never less.
+fn charge_reused_root_lanes(
+    work: &RootWork,
+    solver_budget: &mut SolverBudget,
+    semantic_budget: Option<&mut SemanticBudget>,
+    execution_budget: &SemanticExecutionBudget,
+    replayed_artifact_leases: &mut usize,
+    replayed_artifact_lease_bytes: &mut usize,
+) -> Result<(), WidenReason> {
+    let lane = |value: u64| usize::try_from(value).unwrap_or(usize::MAX);
+    if solver_budget.charge(work.solver).is_err() {
+        return Err(WidenReason::MergedLimitReached);
+    }
+    let semantic_budget = semantic_budget.expect("a root to reuse is a root the compile produced");
+    if semantic_budget.charge(work.semantic).is_err() {
+        return Err(WidenReason::MergedLimitReached);
+    }
+    if !execution_budget
+        .charge_external_query_work(lane(work.materialized_files), lane(work.traversal_steps))
+    {
+        return Err(WidenReason::MergedLimitReached);
+    }
+    *replayed_artifact_leases = replayed_artifact_leases.saturating_add(lane(work.artifact_leases));
+    *replayed_artifact_lease_bytes =
+        replayed_artifact_lease_bytes.saturating_add(lane(work.artifact_lease_bytes));
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn evaluate_compiled_typestate(
     authority: &TypestateProjectionAuthority<'_>,
@@ -750,7 +1247,8 @@ fn evaluate_compiled_typestate(
     compiled: &CompiledTypestatePolicy,
     summaries: &ProductionTypestateSummaryRepository,
     active_semantic_model_snapshot: Option<Arc<ActiveSemanticModelSnapshot>>,
-) -> Result<TypestateProjectionPayload, TypestateEvaluationFailure> {
+    mut units: Option<&mut RootUnits<'_>>,
+) -> RootsPass {
     let mut cache_work = ProductionSummaryLifecycleCounters::default();
     let uncancelled = CancellationToken::default();
     let cancellation = cancellation.unwrap_or(&uncancelled);
@@ -772,6 +1270,14 @@ fn evaluate_compiled_typestate(
         .restrict_to(budget.query_limits().semantic.max_retained_bytes)
         .into_child();
     let mut evaluation_artifact_retained_peak = evaluation_artifact_leases.retained_bytes();
+    // What reused roots took out of the shared artifact-lease capacity. The
+    // allocations themselves cannot be reproduced -- they are process-local
+    // artifacts a stored product never carried -- so they are replayed as
+    // anonymous live bytes against the same capacity, exactly as the execution
+    // budget replays a query's materializations as anonymous slots. A later
+    // root therefore sees the headroom a whole evaluation would have left it.
+    let mut replayed_artifact_leases = 0_usize;
+    let mut replayed_artifact_lease_bytes = 0_usize;
     let mut projections = Vec::new();
     let mut incomplete_reasons = Vec::new();
     let mut reached_rows = 0_u64;
@@ -785,8 +1291,89 @@ fn evaluate_compiled_typestate(
     let mut remaining_finding_witness_bytes = limits.max_witness_bytes;
 
     let mut evaluation_error = None;
-    'roots: for root in &compiled.roots {
-        let artifact_window = evaluation_artifact_leases.begin_window(0);
+    // A lane every root shares. Reusing a root consumes none of it, so a
+    // sliced pass that reached one cannot claim to have produced what a whole
+    // evaluation would have produced, and the caller evaluates the policy in
+    // full instead (`.agents/plans/impact-sliced-diff-base.md`, Decision Log
+    // (5b)).
+    let mut shared_lane_reached = false;
+    if let Some(units) = units.as_deref_mut()
+        && let Err(reason) = units.enumerate(&compiled.roots)
+    {
+        return RootsPass::Widen(reason);
+    }
+    'roots: for (root_index, root) in compiled.roots.iter().enumerate() {
+        let mut root_work = RootWork::default();
+        let mut root_reasons = Vec::new();
+        if let Some(units) = units.as_deref_mut() {
+            // Exactly the check the solved path makes before it projects: a
+            // run whose request-wide finding budget is spent stops here, and a
+            // reused root must not be appended past a stop a whole evaluation
+            // would have made.
+            if remaining_finding_reached_rows == 0
+                || remaining_finding_candidates == 0
+                || remaining_finding_witness_expansions == 0
+                || remaining_finding_witness_bytes == 0
+            {
+                shared_lane_reached = true;
+                incomplete_reasons.push(PolicyIncompleteReason::PartialDiscovery);
+                omitted_analysis_findings = omitted_analysis_findings.saturating_add(1);
+                break;
+            }
+            match units.published(root_index) {
+                Err(reason) => return RootsPass::Widen(reason),
+                Ok(Some(product)) => {
+                    // Every lane this root's own solve moved, moved again, so
+                    // the sliced pass reaches each of them exactly where the
+                    // whole run reaches it.
+                    if let Err(reason) = charge_reused_root_lanes(
+                        &product.work,
+                        &mut solver_budget,
+                        semantic_budget.as_mut(),
+                        &evaluation_execution_budget,
+                        &mut replayed_artifact_leases,
+                        &mut replayed_artifact_lease_bytes,
+                    ) {
+                        return RootsPass::Widen(reason);
+                    }
+                    merge_root_product(
+                        &product,
+                        &mut projections,
+                        &mut incomplete_reasons,
+                        &mut reached_rows,
+                        &mut subject_rows,
+                        &mut terminal_rows,
+                        &mut retained_analysis_findings,
+                        &mut omitted_analysis_findings,
+                        &mut remaining_finding_reached_rows,
+                        &mut remaining_finding_candidates,
+                        &mut remaining_finding_witness_expansions,
+                        &mut remaining_finding_witness_bytes,
+                    );
+                    continue;
+                }
+                Ok(None) => {}
+            }
+        }
+        // What this root's own solve takes out of the shared lanes, measured
+        // here so the reuse path above can replay exactly it.
+        let solver_before = solver_budget.used();
+        let semantic_before = semantic_budget
+            .as_ref()
+            .map_or_else(SemanticWork::default, SemanticBudget::used);
+        let execution_before = evaluation_execution_budget.work();
+        let leases_before = evaluation_artifact_leases.len();
+        let lease_bytes_before = evaluation_artifact_leases.retained_bytes();
+        // Every read this root's solve makes, named, so another workspace can
+        // be asked whether it still reads the same thing. The ledger is what
+        // licenses publishing the product below; with no units it is absent
+        // and the solve runs exactly as it always has.
+        let root_ledger = units.is_some().then(|| Arc::new(ReadLedger::new()));
+        let _root_reads = root_ledger.as_ref().map(|ledger| {
+            AnalyzerQueryScope::with_read_ledger(workspace.analyzer(), Arc::clone(ledger))
+        });
+        let artifact_window =
+            evaluation_artifact_leases.begin_window(replayed_artifact_lease_bytes);
         let artifact_collector = artifact_window.collector();
         let icfg_provider = PolicyIcfgProvider::new(
             workspace,
@@ -795,8 +1382,14 @@ fn evaluate_compiled_typestate(
             active_semantic_model_snapshot.clone(),
         );
         let mut request = DataflowRequest::new(&mut solver_budget, cancellation);
+        // The summary funnel this root crosses records through the analyzer's
+        // open read ledgers, exactly as the ICFG provider's artifact and
+        // dispatch reads do; with no ledger attached it costs one relaxed load
+        // per lookup.
+        let summary_reads = SummaryReadRecorder::new(workspace.analyzer());
         let production = solve_typestate_with_production_summaries(
             summaries,
+            &summary_reads,
             root,
             &[],
             &icfg_provider,
@@ -812,7 +1405,9 @@ fn evaluate_compiled_typestate(
         let window_retained_peak = match artifact_window.overflow() {
             Some(SemanticArtifactLeaseError::Capacity(exceeded)) => exceeded.attempted(),
             Some(SemanticArtifactLeaseError::RetainedBytesOverflow) => usize::MAX,
-            Some(_) | None => artifact_window.retained_bytes(),
+            Some(_) | None => artifact_window
+                .retained_bytes()
+                .saturating_add(replayed_artifact_lease_bytes),
         };
         evaluation_artifact_retained_peak =
             evaluation_artifact_retained_peak.max(window_retained_peak);
@@ -828,20 +1423,26 @@ fn evaluate_compiled_typestate(
                 break 'roots;
             }
         };
+        // A result-cache hit returns before the ICFG provider and the summary
+        // funnel are touched and records nothing, so its ledger names none of
+        // the inputs the result depends on and the root is not publishable.
+        let cache_status = production.cache_status();
         let solved = production.result();
         let fixed_point = match solved.result().termination() {
             SolverTermination::FixedPoint => true,
             SolverTermination::Cancelled => {
+                shared_lane_reached = true;
                 incomplete_reasons.push(PolicyIncompleteReason::Cancelled);
                 false
             }
             SolverTermination::ExceededBudget(_) => {
+                shared_lane_reached = true;
                 incomplete_reasons.push(PolicyIncompleteReason::PartialDiscovery);
                 false
             }
         };
-        reached_rows = reached_rows
-            .saturating_add(u64::try_from(solved.result().reached().len()).unwrap_or(u64::MAX));
+        root_work.reached_rows = u64::try_from(solved.result().reached().len()).unwrap_or(u64::MAX);
+        reached_rows = reached_rows.saturating_add(root_work.reached_rows);
         for reached in solved.result().reached() {
             let Some(fact) = solved.result().fact(reached.fact()) else {
                 evaluation_error = Some("typestate solve retained an invalid fact row".to_owned());
@@ -849,9 +1450,11 @@ fn evaluate_compiled_typestate(
             };
             if fact.subject().is_some() {
                 subject_rows = subject_rows.saturating_add(1);
+                root_work.subject_rows = root_work.subject_rows.saturating_add(1);
             }
             if fact.terminal_observation().is_some() {
                 terminal_rows = terminal_rows.saturating_add(1);
+                root_work.terminal_rows = root_work.terminal_rows.saturating_add(1);
             }
         }
         if !fixed_point {
@@ -865,6 +1468,7 @@ fn evaluate_compiled_typestate(
             || remaining_finding_witness_expansions == 0
             || remaining_finding_witness_bytes == 0
         {
+            shared_lane_reached = true;
             incomplete_reasons.push(PolicyIncompleteReason::PartialDiscovery);
             omitted_analysis_findings = omitted_analysis_findings.saturating_add(1);
             drop(production);
@@ -906,6 +1510,7 @@ fn evaluate_compiled_typestate(
         ) {
             Ok(findings) => findings,
             Err(TypestateFlowProblemError::FindingCancelled) => {
+                shared_lane_reached = true;
                 incomplete_reasons.push(PolicyIncompleteReason::Cancelled);
                 drop(production);
                 drop(icfg_provider);
@@ -913,6 +1518,7 @@ fn evaluate_compiled_typestate(
                 break;
             }
             Err(TypestateFlowProblemError::FindingBudgetExceeded) => {
+                shared_lane_reached = true;
                 incomplete_reasons.push(PolicyIncompleteReason::PartialDiscovery);
                 omitted_analysis_findings = omitted_analysis_findings.saturating_add(1);
                 drop(production);
@@ -931,9 +1537,20 @@ fn evaluate_compiled_typestate(
         let mut root_projections = Vec::new();
         let mut root_retained_analysis_findings = 0_u64;
         if !findings.analysis_complete() || findings.omitted() > 0 {
+            // The per-root finding limits are the shared remaining lanes
+            // narrowed to this root, so an omission here is not a property of
+            // the root alone: a run that reused an earlier root would have had
+            // more allowance left and might have omitted nothing.
+            shared_lane_reached = true;
+            root_reasons.push(PolicyIncompleteReason::PartialDiscovery);
             incomplete_reasons.push(PolicyIncompleteReason::PartialDiscovery);
         }
         let finding_work = findings.work();
+        let count = |value: usize| u64::try_from(value).unwrap_or(u64::MAX);
+        root_work.finding_reached_rows = count(finding_work.reached_rows());
+        root_work.finding_candidates = count(finding_work.candidates());
+        root_work.finding_witness_expansions = count(finding_work.witness_expansions());
+        root_work.finding_witness_bytes = count(finding_work.witness_bytes());
         remaining_finding_reached_rows =
             remaining_finding_reached_rows.saturating_sub(finding_work.reached_rows());
         remaining_finding_candidates =
@@ -942,8 +1559,9 @@ fn evaluate_compiled_typestate(
             remaining_finding_witness_expansions.saturating_sub(finding_work.witness_expansions());
         remaining_finding_witness_bytes =
             remaining_finding_witness_bytes.saturating_sub(finding_work.witness_bytes());
-        omitted_analysis_findings = omitted_analysis_findings
-            .saturating_add(u64::try_from(findings.omitted()).unwrap_or(u64::MAX));
+        root_work.omitted_analysis_findings = u64::try_from(findings.omitted()).unwrap_or(u64::MAX);
+        omitted_analysis_findings =
+            omitted_analysis_findings.saturating_add(root_work.omitted_analysis_findings);
         for finding in findings.findings() {
             let Some(subject) = compiled.bindings.subject(finding.subject()) else {
                 evaluation_error =
@@ -969,8 +1587,47 @@ fn evaluate_compiled_typestate(
         drop(icfg_provider);
         match artifact_window.commit(&mut evaluation_artifact_leases) {
             Ok(()) => {
+                let execution_after = evaluation_execution_budget.work();
+                root_work.solver = solver_budget.used().saturating_sub(solver_before);
+                root_work.semantic = semantic_budget
+                    .as_ref()
+                    .map_or_else(SemanticWork::default, SemanticBudget::used)
+                    .saturating_sub(semantic_before);
+                root_work.materialized_files = count(
+                    execution_after
+                        .materialized_files
+                        .saturating_sub(execution_before.materialized_files),
+                );
+                root_work.traversal_steps = count(
+                    execution_after
+                        .traversal_steps
+                        .saturating_sub(execution_before.traversal_steps),
+                );
+                root_work.artifact_leases = count(
+                    evaluation_artifact_leases
+                        .len()
+                        .saturating_sub(leases_before),
+                );
+                root_work.artifact_lease_bytes = count(
+                    evaluation_artifact_leases
+                        .retained_bytes()
+                        .saturating_sub(lease_bytes_before),
+                );
+                root_work.retained_analysis_findings = root_retained_analysis_findings;
                 retained_analysis_findings =
                     retained_analysis_findings.saturating_add(root_retained_analysis_findings);
+                if let Some(units) = units.as_deref_mut() {
+                    units.publish(
+                        root_index,
+                        RootProduct {
+                            findings: root_projections.clone(),
+                            incomplete_reasons: root_reasons,
+                            work: root_work,
+                        },
+                        root_ledger.as_ref().expect("a unit run records its reads"),
+                        cache_status,
+                    );
+                }
                 projections.extend(root_projections);
                 #[cfg(any(test, feature = "test-support"))]
                 workspace
@@ -982,6 +1639,7 @@ fn evaluate_compiled_typestate(
                 SemanticArtifactLeaseError::Capacity(_)
                 | SemanticArtifactLeaseError::RetainedBytesOverflow,
             ) => {
+                shared_lane_reached = true;
                 incomplete_reasons.push(PolicyIncompleteReason::PartialDiscovery);
                 omitted_analysis_findings = omitted_analysis_findings
                     .saturating_add(root_retained_analysis_findings.max(1));
@@ -1028,8 +1686,12 @@ fn evaluate_compiled_typestate(
             final_execution_work: final_evaluation_execution_work,
             evaluation_materialized_files,
             evaluation_traversal_steps,
-            semantic_artifact_leases: evaluation_artifact_leases.len(),
-            evaluation_semantic_artifact_leases: evaluation_artifact_leases.additions_len(),
+            semantic_artifact_leases: evaluation_artifact_leases
+                .len()
+                .saturating_add(replayed_artifact_leases),
+            evaluation_semantic_artifact_leases: evaluation_artifact_leases
+                .additions_len()
+                .saturating_add(replayed_artifact_leases),
             reached_rows,
             subject_rows,
             terminal_rows,
@@ -1043,7 +1705,10 @@ fn evaluate_compiled_typestate(
         },
     );
     if let Some(message) = evaluation_error {
-        return Err(TypestateEvaluationFailure { message, work });
+        return RootsPass::Failed(TypestateEvaluationFailure { message, work });
+    }
+    if units.is_some() && (shared_lane_reached || final_evaluation_execution_work.exhausted) {
+        return RootsPass::Widen(WidenReason::MergedLimitReached);
     }
     incomplete_reasons.sort();
     incomplete_reasons.dedup();
@@ -1071,12 +1736,17 @@ fn evaluate_compiled_typestate(
             )
             .map_err(|error| error.to_string())
         })
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|message| TypestateEvaluationFailure {
-            message,
-            work: work.clone(),
-        })?;
-    Ok(TypestateProjectionPayload {
+        .collect::<Result<Vec<_>, _>>();
+    let diagnostics = match diagnostics {
+        Ok(diagnostics) => diagnostics,
+        Err(message) => {
+            return RootsPass::Failed(TypestateEvaluationFailure {
+                message,
+                work: work.clone(),
+            });
+        }
+    };
+    RootsPass::Complete(TypestateProjectionPayload {
         projections,
         completion,
         diagnostics,
@@ -1611,14 +2281,16 @@ fn compile_failure(failure: TypestatePolicyCompileFailure) -> TypestateCompilati
                 work,
             )
         }
+        // A widening compile is answered by compiling again, never by this
+        // projection: the caller checks `TypestatePolicyCompileFailure::widen`
+        // before it converts a failure at all.
         TypestatePolicyCompileError::MissingWorkspace
-        | TypestatePolicyCompileError::SemanticProvider(_) => {
-            TypestateCompilationFailure::failed_with_work(
-                PolicyFailureReason::InternalInvariant,
-                message,
-                work,
-            )
-        }
+        | TypestatePolicyCompileError::SemanticProvider(_)
+        | TypestatePolicyCompileError::Widen(_) => TypestateCompilationFailure::failed_with_work(
+            PolicyFailureReason::InternalInvariant,
+            message,
+            work,
+        ),
         TypestatePolicyCompileError::QueryIncomplete {
             completion: CodeQueryCompletion::Complete,
             ..
@@ -1652,6 +2324,9 @@ fn typestate_selector_error(
         }
         super::selector_compiler::PolicySelectorSessionError::Provider(detail) => {
             TypestatePolicyCompileError::SemanticProvider(SemanticProviderError::internal(detail))
+        }
+        super::selector_compiler::PolicySelectorSessionError::Widen(reason) => {
+            TypestatePolicyCompileError::Widen(reason)
         }
     }
 }
@@ -1691,6 +2366,11 @@ impl<'a> TypestatePolicyCompiler<'a> {
                 query_limits,
                 max_selector_results,
                 cancellation,
+                // The seed scope every selector of this compile enumerates
+                // over. A compile that holds units narrows it per unit
+                // instead; a compile that does not runs one whole-workspace
+                // scan per selector, exactly as it always has.
+                CodeQueryExecutionScope::whole_workspace(),
             ),
             syntax_trees: HashMap::new(),
             formal_names: HashMap::new(),
@@ -1699,18 +2379,40 @@ impl<'a> TypestatePolicyCompiler<'a> {
         }
     }
 
-    pub(crate) fn compile(
+    /// Compile each of this policy's selectors one seed file at a time,
+    /// reusing what a previous run published.
+    pub(crate) fn with_units(
+        mut self,
+        policy: &'a LoadedPolicy,
+        incremental: &'a PolicyIncrementalContext<'a>,
+        budget: &'a PolicyBudget,
+    ) -> Self {
+        self.selectors.with_units(policy, incremental, budget);
+        self
+    }
+
+    /// The compile, and what its selector units did.
+    ///
+    /// The units come out even when the compile failed, because a compile that
+    /// asked to be widened still reports the attempt that asked.
+    pub(crate) fn compile_with_units(
         mut self,
         policy: &LoadedPolicy,
         spec: &ResolvedTypestatePolicySpec,
-    ) -> Result<CompiledTypestatePolicy, Box<TypestatePolicyCompileFailure>> {
-        match self.compile_inner(policy, spec) {
+    ) -> (
+        Result<CompiledTypestatePolicy, Box<TypestatePolicyCompileFailure>>,
+        Option<super::selector_compiler::SelectorUnitOutcome>,
+    ) {
+        let compiled = self.compile_inner(policy, spec);
+        let units = self.selectors.take_units();
+        let compiled = match compiled {
             Ok(compiled) => Ok(compiled),
             Err(error) => Err(Box::new(TypestatePolicyCompileFailure {
                 error,
                 work: self.selectors.work_report("typestate"),
             })),
-        }
+        };
+        (compiled, units)
     }
 
     fn compile_inner(
@@ -4542,6 +5244,301 @@ mod tests {
     use brokk_bifrost_analysis::analyzer::{AnalyzerConfig, Language};
     use brokk_bifrost_flow::dataflow::UnmodeledCallBehavior;
 
+    /// A sliced compile mints the compile a whole compile mints.
+    ///
+    /// The four things a later stage of the evaluation reads out of a compile:
+    /// the protocol and binding-plan hashes, which every finding identity
+    /// folds; the semantic budget the root solves inherit; and the artifact
+    /// leases the evaluation's windows open against. A sliced compile that
+    /// moved any of them differently would hand the solve a different
+    /// evaluation, not the same one computed a cheaper way
+    /// (`.agents/plans/impact-sliced-diff-base.md`, Decision Log (5c)).
+    #[test]
+    fn a_sliced_selector_compile_produces_the_compile_a_whole_one_produces() {
+        const POLICY_PATH: &str = "policies/sliced-lifecycle.rqlp";
+        // Two selectors over the same seed files -- the subject's and the
+        // close event's -- because one selector could not show that two
+        // selectors of one policy get separate units.
+        const POLICY: &str = r#"(policy
+  :schema-version 1
+  :id "bifrost.test.sliced-lifecycle"
+  :name "Sliced resource lifecycle"
+  :message "resource was not closed"
+  :severity warning
+  :analysis
+    (analysis
+      :type typestate
+      :mode may
+      :subjects
+        (subject-set
+          :entries [
+            (subject :id res
+              :selector (rql :schema-version 1
+                (language go (call :callee (name "OpenRes"))))
+              :subject return-value)])
+      :uncertainty (uncertainty :escape inconclusive)
+      :automaton
+        (automaton
+          :states [open closed violated]
+          :initial open
+          :accepting-states [closed]
+          :error-states [violated]
+          :events [
+            (event :id close
+              :calls (calls
+                :selector (rql :schema-version 1
+                  (language go (call :callee (name "CloseRes"))))
+                :subject (argument :index 0)
+                :phase after-normal-return))]
+          :transitions [
+            (transition :from open :on close :to closed)
+            (transition :from closed :on close :to violated)]
+          :terminal-expectations [
+            (terminal-expectation :id normal-exit
+              :on (normal-procedure-exit :scope analysis-root)
+              :expected-states [closed])])))"#;
+        let project = InlineTestProject::with_language(Language::Go)
+            .file("go.mod", "module example.com/sliced-lifecycle\n")
+            .file(
+                "res.go",
+                "package lifecycle\n\ntype Res struct{}\n\nfunc OpenRes() *Res { return &Res{} }\n\nfunc CloseRes(r *Res) {}\n",
+            )
+            .file(
+                "app.go",
+                "package lifecycle\n\nfunc Run() {\n\tr := OpenRes()\n\tCloseRes(r)\n}\n",
+            )
+            .file(POLICY_PATH, POLICY)
+            .build();
+        let workspace = project.workspace_analyzer(AnalyzerConfig {
+            parallelism: Some(1),
+            ..AnalyzerConfig::default()
+        });
+        let catalogs = Arc::new(TaintCatalogRegistry::new_without_workspace(
+            CatalogRegistryLimits::default(),
+        ));
+        let mut registry = PolicyRegistry::new_for_workspace(
+            project.root().to_path_buf(),
+            catalogs,
+            PolicyRegistryLimits::default(),
+        )
+        .expect("absolute inline workspace opens for policy loading");
+        let policy = registry
+            .load_policy_path(POLICY_PATH)
+            .expect("fixture typestate policy loads");
+        let spec = policy
+            .resolved_typestate()
+            .expect("fixture policy resolves typestate authoring");
+        let cancellation = CancellationToken::default();
+        let budget = PolicyBudget::default();
+        let compile = |units: Option<&PolicyIncrementalContext<'_>>| {
+            let compiler = TypestatePolicyCompiler::new(
+                &workspace,
+                budget.query_limits(),
+                budget.max_selector_results(),
+                &cancellation,
+            );
+            let (compiled, outcome) = match units {
+                Some(incremental) => compiler
+                    .with_units(policy, incremental, &budget)
+                    .compile_with_units(policy, spec),
+                None => compiler.compile_with_units(policy, spec),
+            };
+            let compiled = compiled
+                .unwrap_or_else(|failure| panic!("fixture policy compiles: {}", failure.error));
+            (compiled, outcome)
+        };
+
+        // One compile ahead of the two that are compared. The workspace's
+        // content-keyed semantic caches are warmed by whichever compile runs
+        // first, and a cold compile charges its own materializations while a
+        // warm one does not, so two compiles are comparable only from the same
+        // cache state. This one puts both of them in it.
+        let _warm = compile(None);
+
+        // The store starts empty, so every unit is executed here and
+        // published: this is the compile a base evaluation performs.
+        let store = RefCell::new(crate::units::InMemoryPolicyUnitStore::new());
+        let store: &RefCell<dyn crate::units::PolicyUnitStore> = &store;
+        let changed =
+            brokk_bifrost_analysis::analyzer::ChangedFacts::between(&workspace, &workspace);
+        let incremental = PolicyIncrementalContext::new(
+            store,
+            &workspace,
+            &changed,
+            crate::units::WorkspaceUnitInputs::of(
+                &workspace,
+                workspace
+                    .analyzer()
+                    .active_semantic_model_snapshot()
+                    .as_deref(),
+            ),
+            crate::units::IncrementalBaseState::Evaluated,
+        );
+        let (sliced, sliced_units) = compile(Some(&incremental));
+        let sliced_units = sliced_units.expect("a compile with units reports what they did");
+        assert_eq!(
+            sliced_units.widen, None,
+            "this policy's selectors are partitionable by seed file"
+        );
+        assert!(
+            sliced_units.attempt.total() > 0,
+            "the sliced compile decided about at least one unit: {sliced_units:#?}"
+        );
+
+        let (whole, whole_units) = compile(None);
+        assert!(
+            whole_units.is_none(),
+            "a compile with no incremental context decides about no unit"
+        );
+
+        assert_eq!(
+            (sliced.protocol.hash(), sliced.bindings.hash()),
+            (whole.protocol.hash(), whole.bindings.hash()),
+            "two compiles of one policy over one workspace are the same compile"
+        );
+        assert_eq!(
+            sliced.semantic_remaining, whole.semantic_remaining,
+            "a sliced compile leaves the root solves the semantic budget a whole compile leaves"
+        );
+        assert_eq!(
+            (
+                sliced.artifact_leases.len(),
+                sliced.artifact_leases.retained_bytes()
+            ),
+            (
+                whole.artifact_leases.len(),
+                whole.artifact_leases.retained_bytes()
+            ),
+            "a sliced compile retains the artifact allocations a whole compile retains"
+        );
+    }
+
+    /// A selector whose plan is not partitionable by seed asks to be compiled
+    /// again rather than being sliced anyway.
+    ///
+    /// A set node gives each branch a fair share of the live budget and
+    /// re-runs a starved branch, so a branch's rows depend on what earlier
+    /// branches consumed and no per-seed execution reproduces them
+    /// (`PlanPartitioning::classify`). The compile says so with the typed
+    /// reason instead of publishing units that do not partition anything.
+    #[test]
+    fn a_selector_whose_plan_crosses_seeds_widens_the_compile() {
+        const POLICY_PATH: &str = "policies/set-source-lifecycle.rqlp";
+        const POLICY: &str = r#"(policy
+  :schema-version 1
+  :id "bifrost.test.set-source-lifecycle"
+  :name "Set-source resource lifecycle"
+  :message "resource was not closed"
+  :severity warning
+  :analysis
+    (analysis
+      :type typestate
+      :mode may
+      :subjects
+        (subject-set
+          :entries [
+            (subject :id res
+              :selector (rql :schema-version 1
+                (union
+                  (language go (call :callee (name "OpenRes")))
+                  (language go (call :callee (name "OpenOther")))))
+              :subject return-value)])
+      :uncertainty (uncertainty :escape inconclusive)
+      :automaton
+        (automaton
+          :states [open closed violated]
+          :initial open
+          :accepting-states [closed]
+          :error-states [violated]
+          :events [
+            (event :id close
+              :calls (calls
+                :selector (rql :schema-version 1
+                  (language go (call :callee (name "CloseRes"))))
+                :subject (argument :index 0)
+                :phase after-normal-return))]
+          :transitions [
+            (transition :from open :on close :to closed)
+            (transition :from closed :on close :to violated)]
+          :terminal-expectations [
+            (terminal-expectation :id normal-exit
+              :on (normal-procedure-exit :scope analysis-root)
+              :expected-states [closed])])))"#;
+        let project = InlineTestProject::with_language(Language::Go)
+            .file("go.mod", "module example.com/set-source-lifecycle\n")
+            .file(
+                "res.go",
+                "package lifecycle\n\ntype Res struct{}\n\nfunc OpenRes() *Res { return &Res{} }\n\nfunc OpenOther() *Res { return &Res{} }\n\nfunc CloseRes(r *Res) {}\n",
+            )
+            .file(
+                "app.go",
+                "package lifecycle\n\nfunc Run() {\n\tr := OpenRes()\n\tCloseRes(r)\n}\n",
+            )
+            .file(POLICY_PATH, POLICY)
+            .build();
+        let workspace = project.workspace_analyzer(AnalyzerConfig {
+            parallelism: Some(1),
+            ..AnalyzerConfig::default()
+        });
+        let catalogs = Arc::new(TaintCatalogRegistry::new_without_workspace(
+            CatalogRegistryLimits::default(),
+        ));
+        let mut registry = PolicyRegistry::new_for_workspace(
+            project.root().to_path_buf(),
+            catalogs,
+            PolicyRegistryLimits::default(),
+        )
+        .expect("absolute inline workspace opens for policy loading");
+        let policy = registry
+            .load_policy_path(POLICY_PATH)
+            .expect("fixture typestate policy loads");
+        let spec = policy
+            .resolved_typestate()
+            .expect("fixture policy resolves typestate authoring");
+        let cancellation = CancellationToken::default();
+        let budget = PolicyBudget::default();
+        let store = RefCell::new(crate::units::InMemoryPolicyUnitStore::new());
+        let store: &RefCell<dyn crate::units::PolicyUnitStore> = &store;
+        let changed =
+            brokk_bifrost_analysis::analyzer::ChangedFacts::between(&workspace, &workspace);
+        let incremental = PolicyIncrementalContext::new(
+            store,
+            &workspace,
+            &changed,
+            crate::units::WorkspaceUnitInputs::of(
+                &workspace,
+                workspace
+                    .analyzer()
+                    .active_semantic_model_snapshot()
+                    .as_deref(),
+            ),
+            crate::units::IncrementalBaseState::Evaluated,
+        );
+        let (compiled, units) = TypestatePolicyCompiler::new(
+            &workspace,
+            budget.query_limits(),
+            budget.max_selector_results(),
+            &cancellation,
+        )
+        .with_units(policy, &incremental, &budget)
+        .compile_with_units(policy, spec);
+        let failure =
+            compiled.expect_err("a compile that cannot be sliced does not return a sliced compile");
+        assert_eq!(
+            failure.widen(),
+            Some(WidenReason::PlanCrossesSeeds),
+            "a set-source selector is not partitionable by seed file: {}",
+            failure.error
+        );
+        assert_eq!(
+            units
+                .expect("a compile with units reports what they did")
+                .widen,
+            Some(WidenReason::PlanCrossesSeeds),
+            "the attempt reports the reason it stopped"
+        );
+    }
+
     fn scoped_root_fixture(source: &str) -> (Arc<SemanticArtifact>, ScopedSemanticLocator) {
         let path = WorkspaceRelativePath::new("scope.go").expect("portable fixture path");
         let key = SemanticArtifactKey::new(
@@ -4774,7 +5771,8 @@ func AmbiguousNearMiss(flag bool) {
             budget.max_selector_results(),
             &cancellation,
         )
-        .compile(policy, spec)
+        .compile_with_units(policy, spec)
+        .0
         .unwrap_or_else(|failure| panic!("fixture policy compiles: {}", failure.error));
 
         let escapes = compiled
@@ -4912,7 +5910,8 @@ func MissingClose() {
             budget.max_selector_results(),
             &cancellation,
         )
-        .compile(policy, spec)
+        .compile_with_units(policy, spec)
+        .0
         .unwrap_or_else(|failure| panic!("fixture policy compiles: {}", failure.error));
         let authority = TypestateProjectionAuthority::from_loaded_compilation(
             policy,
@@ -4933,9 +5932,12 @@ func MissingClose() {
             &compiled,
             &ProductionTypestateSummaryRepository::new(),
             None,
+            None,
         ) {
-            Ok(_) => panic!("projection must reject a subject absent from the supplied spec"),
-            Err(failure) => failure,
+            RootsPass::Failed(failure) => failure,
+            RootsPass::Complete(_) | RootsPass::Widen(_) => {
+                panic!("projection must reject a subject absent from the supplied spec")
+            }
         };
         assert_eq!(
             failure.message,

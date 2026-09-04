@@ -5883,6 +5883,8 @@ fn normalized_success_guard_edges(
                     | CompiledResultPredicate::False,
                     GuardPredicate::ConstantBoolean { .. }
                     | GuardPredicate::ConstantEquality { .. }
+                    | GuardPredicate::InstanceOf { .. }
+                    | GuardPredicate::HasMember { .. }
                     | GuardPredicate::NullComparison { .. }
                     | GuardPredicate::Opaque { .. },
                 ) => return None,
@@ -6041,6 +6043,7 @@ fn exact_conditional_wrapper_shape(
             SemanticValueKind::Parameter {
                 ordinal,
                 multiplicity,
+                ..
             } if *multiplicity == crate::analyzer::semantic::FormalMultiplicity::One => {
                 Some((*ordinal, value.id))
             }

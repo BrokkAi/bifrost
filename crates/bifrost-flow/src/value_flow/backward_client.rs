@@ -757,6 +757,9 @@ where
     if root != plan.root() {
         return Err(BackwardValueFlowSolveError::RootMismatch);
     }
+    if plan.has_edge_kills() {
+        return Err(BackwardValueFlowSolveError::EdgeKillsUnsupported);
+    }
     let problem = BackwardValueFlowProblem::new(plan);
     let result = crate::dataflow::solve_backward_with_snapshot(
         root,
@@ -775,6 +778,9 @@ pub(crate) fn solve_value_flow_backward_on_input(
     semantic_work: crate::analyzer::semantic::SemanticWork,
     request: &mut DataflowRequest<'_>,
 ) -> Result<BackwardValueFlowResult, BackwardValueFlowSolveError> {
+    if plan.has_edge_kills() {
+        return Err(BackwardValueFlowSolveError::EdgeKillsUnsupported);
+    }
     let problem = BackwardValueFlowProblem::new(plan);
     let result = crate::dataflow::solve_backward_demands_on_snapshot(
         input,
@@ -788,6 +794,7 @@ pub(crate) fn solve_value_flow_backward_on_input(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BackwardValueFlowSolveError {
     RootMismatch,
+    EdgeKillsUnsupported,
     InvalidResult,
     Snapshot(BackwardSnapshotDataflowError),
 }
@@ -796,6 +803,8 @@ impl fmt::Display for BackwardValueFlowSolveError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::RootMismatch => formatter.write_str("value-flow root does not match the plan"),
+            Self::EdgeKillsUnsupported => formatter
+                .write_str("backward value flow does not support source-selective edge kills"),
             Self::InvalidResult => formatter.write_str("backward value-flow result is invalid"),
             Self::Snapshot(error) => error.fmt(formatter),
         }
@@ -806,7 +815,7 @@ impl Error for BackwardValueFlowSolveError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Snapshot(error) => Some(error),
-            Self::RootMismatch | Self::InvalidResult => None,
+            Self::RootMismatch | Self::EdgeKillsUnsupported | Self::InvalidResult => None,
         }
     }
 }

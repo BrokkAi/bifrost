@@ -420,10 +420,7 @@ fn js_ts_capabilities() -> SemanticCapabilities {
     ] {
         builder = builder.partial(capability);
     }
-    // Explicitly unsupported: this adapter normalizes no branch conditions, so
-    // an empty `guard_facts` table means "this language publishes no guard
-    // facts" rather than "this procedure has no decision" (#2443).
-    builder = builder.unsupported(SemanticCapability::GuardFacts);
+    builder = builder.partial(SemanticCapability::GuardFacts);
     builder.build()
 }
 

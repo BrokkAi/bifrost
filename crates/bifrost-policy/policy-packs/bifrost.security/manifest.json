@@ -8,7 +8,7 @@
     {
       "path": "policies/jvm/servlet-parameter-to-jdbc.rqlp",
       "id": "bifrost.security.java.servlet-parameter-to-jdbc",
-      "semantic_hash": "3b62d7d3dbc90110cc078e8d19a0a3a892c0b90c8ee6322e96d9e510517aeb4c",
+      "semantic_hash": "ccd4d5b839802003d42373d7232c65894998f8d640ee50083ba96d629fdb35c5",
       "category": "security",
       "supported_languages": [
         "java"

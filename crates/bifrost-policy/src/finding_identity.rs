@@ -3,8 +3,9 @@
 use std::fmt;
 use std::str::FromStr;
 
+use serde::de;
 use serde::ser::SerializeStruct;
-use serde::{Serialize, Serializer};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sha2::{Digest, Sha256};
 
 use brokk_bifrost_analysis::analyzer::semantic::WorkspaceRelativePath;
@@ -18,14 +19,14 @@ const MAX_ADAPTER_NAMESPACE_BYTES: usize = 128;
 const MAX_OPAQUE_ID_BYTES: usize = 256;
 const MAX_SEMANTIC_KEY_BYTES: usize = 256;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FindingIdentityStability {
     Strong,
     Weak,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MatchResultDomain {
     StructuralMatch,
@@ -77,7 +78,7 @@ impl MatchResultDomain {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StableIdentityDerivation {
     AnalyzerDeclarationId,
@@ -221,6 +222,32 @@ impl StableSemanticIdentity {
 
     pub fn semantic_key(&self) -> &str {
         &self.semantic_key
+    }
+}
+
+/// The wire shape of a stable semantic identity.
+///
+/// Deserialization goes back through [`StableSemanticIdentity::try_new`], so a
+/// stored identity whose namespace, semantic key or derivation shape no longer
+/// validates is a load error rather than an identity nothing minted.
+impl<'de> Deserialize<'de> for StableSemanticIdentity {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Wire {
+            namespace: String,
+            path: String,
+            derivation: StableIdentityDerivation,
+            semantic_key: String,
+        }
+
+        let wire = Wire::deserialize(deserializer)?;
+        let path = WorkspaceRelativePath::new(&wire.path).map_err(de::Error::custom)?;
+        Self::try_new(wire.namespace, path, wire.derivation, wire.semantic_key)
+            .map_err(de::Error::custom)
     }
 }
 
@@ -568,6 +595,17 @@ fn namespaced_opaque_id(
     Ok(format!("{namespace}:{value}").into_boxed_str())
 }
 
+/// Split one serialized opaque id back into the namespace and value it was
+/// built from.
+///
+/// The wire spelling is `namespace:value` and a namespace is lower alphanumeric
+/// with `.`, `-` and `_` (see `validate_namespace`), so the first colon is the
+/// separator and no other reading of the string is possible. The two halves go
+/// straight back through `try_new`, which is what re-checks them.
+fn split_namespaced_opaque_id(wire: &str) -> Option<(&str, &str)> {
+    wire.split_once(':')
+}
+
 macro_rules! define_adapter_opaque_id {
     ($name:ident) => {
         #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -598,6 +636,18 @@ macro_rules! define_adapter_opaque_id {
                 S: Serializer,
             {
                 serializer.serialize_str(self.as_str())
+            }
+        }
+
+        impl<'de> Deserialize<'de> for $name {
+            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+            where
+                D: Deserializer<'de>,
+            {
+                let wire = String::deserialize(deserializer)?;
+                let (namespace, value) = split_namespaced_opaque_id(&wire)
+                    .ok_or_else(|| de::Error::custom(AdapterOpaqueIdError::EmptyValue))?;
+                Self::try_new(namespace, value).map_err(de::Error::custom)
             }
         }
 
@@ -643,6 +693,18 @@ impl Serialize for SourceSliceHash {
         S: Serializer,
     {
         serializer.collect_str(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for SourceSliceHash {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = String::deserialize(deserializer)?;
+        super::definition::parse_lower_sha256(&wire)
+            .map(Self)
+            .map_err(de::Error::custom)
     }
 }
 
@@ -1004,6 +1066,17 @@ impl PolicyFindingId {
     pub const fn as_bytes(&self) -> &[u8; 32] {
         &self.0
     }
+
+    /// The identity these bytes spell.
+    ///
+    /// The inverse of [`Self::as_bytes`], for the one caller that reads an
+    /// identity back out of the analyzer cache: a persisted base evaluation
+    /// records the identities it concluded, and the run that reuses it joins
+    /// against them. It mints nothing -- an identity is minted from an anchor
+    /// by the constructors above, and this rebuilds one that was.
+    pub const fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
 }
 
 impl FromStr for PolicyFindingId {
@@ -1073,6 +1146,102 @@ impl Serialize for PolicyFindingId {
         S: Serializer,
     {
         serializer.collect_str(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for PolicyFindingId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = String::deserialize(deserializer)?;
+        wire.parse().map_err(de::Error::custom)
+    }
+}
+
+/// The wire shape of a match anchor, which is the one [`MatchFindingAnchor`]'s
+/// own `Serialize` writes.
+///
+/// Both arms go back through the validating constructors, so a strong anchor
+/// that lost its selected source hash, or whose semantic owner names another
+/// file, is a load error rather than an anchor that would digest to an identity
+/// no run could have minted.
+impl<'de> Deserialize<'de> for MatchFindingAnchor {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+        enum Wire {
+            Strong {
+                result_domain: MatchResultDomain,
+                path: String,
+                semantic_owner: Option<StableSemanticIdentity>,
+                selected_source_sha256: Option<SourceSliceHash>,
+                occurrence_ordinal: u32,
+            },
+            Weak {
+                result_domain: MatchResultDomain,
+                path: String,
+                typed_key: OpaqueFindingKey,
+            },
+        }
+
+        match Wire::deserialize(deserializer)? {
+            Wire::Strong {
+                result_domain,
+                path,
+                semantic_owner,
+                selected_source_sha256,
+                occurrence_ordinal,
+            } => Self::strong(
+                result_domain,
+                WorkspaceRelativePath::new(&path).map_err(de::Error::custom)?,
+                semantic_owner,
+                selected_source_sha256,
+                occurrence_ordinal,
+            )
+            .map_err(de::Error::custom),
+            Wire::Weak {
+                result_domain,
+                path,
+                typed_key,
+            } => Ok(Self::weak(
+                result_domain,
+                WorkspaceRelativePath::new(&path).map_err(de::Error::custom)?,
+                typed_key,
+            )),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for AssertionFindingAnchor {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+        enum Wire {
+            /// An assertion anchor is always strong, and says so on the wire.
+            Strong {
+                path: String,
+                subject_ast_id: String,
+                assert_id: String,
+            },
+        }
+
+        let Wire::Strong {
+            path,
+            subject_ast_id,
+            assert_id,
+        } = Wire::deserialize(deserializer)?;
+        Ok(Self::new(
+            WorkspaceRelativePath::new(&path).map_err(de::Error::custom)?,
+            subject_ast_id,
+            assert_id,
+        ))
     }
 }
 

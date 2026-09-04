@@ -554,6 +554,12 @@ pub fn analyze_diff_at_root(
 /// a private bare repository whose lifetime must cover subsequent exports.
 pub(crate) struct PreparedDiff {
     repository: DiffRepository,
+    /// Mixed immutable/worktree comparisons need the live repository for
+    /// worktree metadata, but immutable endpoint materialization must use the
+    /// same isolated object database as an immutable/immutable comparison.
+    /// Keeping both handles avoids making libgit2's live-checkout ODB identity
+    /// part of revision-image analysis on Windows.
+    immutable_repository: Option<DiffRepository>,
     /// The repository's persisted analyzer cache, opened once for this request
     /// when either endpoint is immutable. `None` means only that both endpoints
     /// are mutable, so this request builds no revision image and needs no
@@ -580,6 +586,11 @@ impl PreparedDiff {
             resolution_repo
         };
         let (file_changes, changed_lines) = diff_metadata(&repository.repo, base, target)?;
+        let immutable_repository = if base.is_immutable() != target.is_immutable() {
+            Some(open_repository(root, options, true)?)
+        } else {
+            None
+        };
         // Resolve the cache from the caller's root, never from an export
         // directory: `cache_dir_path` walks up to the primary repository, and a
         // temp export has no repository to walk up to.
@@ -590,6 +601,7 @@ impl PreparedDiff {
         };
         Ok(Self {
             repository,
+            immutable_repository,
             shared_cache,
             base,
             target,
@@ -603,6 +615,16 @@ impl PreparedDiff {
         self.shared_cache.as_ref()
     }
 
+    fn repository_for(&self, snapshot: Snapshot) -> &DiffRepository {
+        if snapshot.is_immutable() {
+            self.immutable_repository
+                .as_ref()
+                .unwrap_or(&self.repository)
+        } else {
+            &self.repository
+        }
+    }
+
     /// Build an analyzer over the *whole* target revision.
     ///
     /// An analyzed diff's own target endpoint carries only the diff's files
@@ -614,11 +636,12 @@ impl PreparedDiff {
     /// immutable target reads the request's shared content-addressed cache, so
     /// it parses only the blobs no earlier request already published.
     pub(crate) fn whole_target_analysis(&self) -> Result<EndpointAnalysis, String> {
+        let repository = self.repository_for(self.target);
         let image = RevisionImage::materialize(
-            &self.repository.repo,
+            &repository.repo,
             self.target,
             None,
-            &self.repository.alternate_object_dirs,
+            &repository.alternate_object_dirs,
             self.shared_cache(),
         )?;
         let analyzer = build_revision_analyzer(&image, self.shared_cache())?;
@@ -639,11 +662,12 @@ impl PreparedDiff {
         snapshot: Snapshot,
         languages: &BTreeSet<Language>,
     ) -> Result<RevisionImage, String> {
+        let repository = self.repository_for(snapshot);
         RevisionImage::materialize_file_dependencies(
-            &self.repository.repo,
+            &repository.repo,
             snapshot,
             languages,
-            &self.repository.alternate_object_dirs,
+            &repository.alternate_object_dirs,
         )
     }
 }
@@ -688,23 +712,24 @@ pub(crate) fn analyze_prepared_symbol_changes(
     include_tests: bool,
 ) -> Result<PreparedSymbolChanges, String> {
     let (changed_paths, base_paths, target_paths) = symbol_change_paths(prepared);
-    let repo = &prepared.repository.repo;
+    let base_repository = prepared.repository_for(prepared.base);
+    let target_repository = prepared.repository_for(prepared.target);
     let base_image = {
         let _scope = profiling::scope("diff_symbols.materialize_base");
         RevisionImage::materialize_symbols(
-            repo,
+            &base_repository.repo,
             prepared.base,
             &base_paths,
-            &prepared.repository.alternate_object_dirs,
+            &base_repository.alternate_object_dirs,
         )?
     };
     let target_image = {
         let _scope = profiling::scope("diff_symbols.materialize_target");
         RevisionImage::materialize_symbols(
-            repo,
+            &target_repository.repo,
             prepared.target,
             &target_paths,
-            &prepared.repository.alternate_object_dirs,
+            &target_repository.alternate_object_dirs,
         )?
     };
     analyze_prepared_symbol_changes_from_images(
@@ -922,24 +947,25 @@ pub(crate) fn analyze_prepared_diff_with_endpoints(
     include_tests: bool,
 ) -> Result<AnalyzedDiff, String> {
     let (changed_paths, base_paths, target_paths) = symbol_change_paths(prepared);
-    let repo = &prepared.repository.repo;
+    let base_repository = prepared.repository_for(prepared.base);
+    let target_repository = prepared.repository_for(prepared.target);
     let base_image = {
         let _scope = profiling::scope("diff_exact.materialize_base");
         RevisionImage::materialize(
-            repo,
+            &base_repository.repo,
             prepared.base,
             Some(&base_paths),
-            &prepared.repository.alternate_object_dirs,
+            &base_repository.alternate_object_dirs,
             prepared.shared_cache(),
         )?
     };
     let target_image = {
         let _scope = profiling::scope("diff_exact.materialize_target");
         RevisionImage::materialize(
-            repo,
+            &target_repository.repo,
             prepared.target,
             Some(&target_paths),
-            &prepared.repository.alternate_object_dirs,
+            &target_repository.alternate_object_dirs,
             prepared.shared_cache(),
         )?
     };

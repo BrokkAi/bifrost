@@ -793,6 +793,75 @@ mod tests {
         );
     }
 
+    /// Issue #2622: a member scan resolves the paths inside every macro token
+    /// tree of every candidate file. Resolving a `Type::name` whose `name` is
+    /// not a direct member falls through to the trait-candidate step, which
+    /// builds the whole-workspace type hierarchy; on this repository that
+    /// build was 14 s of a 16 s scan, waited on by every candidate file. Only
+    /// a segment spelled as the member name can ever be a hit, so nothing
+    /// else is resolved and the hierarchy stays cold. The member-named macro
+    /// path is still a hit.
+    #[test]
+    fn member_scan_resolves_only_member_named_macro_paths() {
+        let files = vec![
+            (
+                "Cargo.toml".to_string(),
+                "[package]\nname = \"macro_paths\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"
+                    .to_string(),
+            ),
+            (
+                "src/lib.rs".to_string(),
+                "pub mod owner;\npub mod other;\npub mod caller;\n".to_string(),
+            ),
+            (
+                "src/owner.rs".to_string(),
+                "pub struct Owner;\nimpl Owner {\n    pub fn target(&self) -> usize {\n        1\n    }\n}\n"
+                    .to_string(),
+            ),
+            ("src/other.rs".to_string(), "pub struct Other;\n".to_string()),
+            (
+                "src/caller.rs".to_string(),
+                concat!(
+                    "use crate::other::Other;\n",
+                    "use crate::owner::Owner;\n",
+                    "pub fn run(owner: &Owner) -> usize {\n",
+                    "    println!(\"{}\", Other::missing());\n",
+                    "    println!(\"{}\", Owner::target(owner));\n",
+                    "    owner.target()\n",
+                    "}\n",
+                )
+                .to_string(),
+            ),
+        ];
+        let fixture = fixture_for(&files);
+        let analyzer = RustAnalyzer::from_project(fixture.test_project().clone());
+        let root = fixture.project_root();
+        let owner_file = ProjectFile::new(root.clone(), "src/owner.rs");
+        let caller = ProjectFile::new(root.clone(), "src/caller.rs");
+        let target = declaration_named(&analyzer, &owner_file, "target");
+        let candidates: HashSet<_> = [caller].into_iter().collect();
+        let scope = UsageScanScope::new(&candidates);
+
+        let outcome = RustExportUsageGraphStrategy::new()
+            .find_graph_usages(&analyzer, std::slice::from_ref(&target), &scope, 1000)
+            .into_fuzzy_result();
+
+        let hit_lines: Vec<_> = outcome
+            .all_hits_including_imports()
+            .iter()
+            .map(|hit| hit.line)
+            .collect();
+        assert_eq!(
+            hit_lines,
+            vec![5, 6],
+            "the macro path Owner::target and the call owner.target() are the hits"
+        );
+        assert!(
+            !analyzer.hierarchy_index_built_for_test(),
+            "resolving Other::missing inside a macro must not build the type hierarchy"
+        );
+    }
+
     #[test]
     fn cancelled_usage_scan_stops_before_walking_an_export_surface() {
         let files = wide_export_surface_fixture();

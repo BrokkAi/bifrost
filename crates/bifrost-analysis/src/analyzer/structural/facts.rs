@@ -63,7 +63,15 @@ use std::fmt;
 /// occurrence role. The role was decided by a `name` AST field this grammar
 /// never spells, so version 16 reported every Kotlin class, object and function
 /// name as a plain value reference (#2892).
-pub(crate) const STRUCTURAL_FACTS_VERSION: i64 = 17;
+/// Version 18 finishes the set for Rust and TypeScript: a `type_item` and a
+/// `type_alias_declaration` are class-kind facts, so an alias name reports the
+/// type namespace instead of the value namespace it reported while the alias
+/// normalized as a bare `declaration` (#2911).
+/// Version 19 gives Scala a scope tree: `block`, `indented_block` and
+/// `case_clause` are block-kind facts and `package_object` is a class-kind
+/// fact, so Scala facts carry scope-forming nodes that version 18 did not
+/// (#1597).
+pub(crate) const STRUCTURAL_FACTS_VERSION: i64 = 19;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StructuralFactsPersistenceError(String);
@@ -862,7 +870,7 @@ mod tests {
 
     #[test]
     fn relational_round_trip_reconstructs_identical_hot_facts() {
-        assert_eq!(STRUCTURAL_FACTS_VERSION, 17);
+        assert_eq!(STRUCTURAL_FACTS_VERSION, 19);
         let original = relational_fixture();
         let rows = original.persisted_rows().unwrap();
         assert_eq!(rows.source_bytes, original.source().len() as u32);

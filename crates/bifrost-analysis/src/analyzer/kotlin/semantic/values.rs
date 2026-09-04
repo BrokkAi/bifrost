@@ -198,6 +198,8 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 )
                 .unwrap_or(callable);
             let metadata = self.value_mapping(builder, node)?;
+            let parameter_name = slot.unique_name().map(Box::<str>::from);
+            let passing_mode = slot.passing_mode;
             let value = if slot.receiver {
                 let value = self.session.add_value_with_metadata(
                     builder,
@@ -214,6 +216,8 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     SemanticValueKind::Parameter {
                         ordinal,
                         multiplicity,
+                        name: parameter_name,
+                        passing_mode,
                     },
                 )?;
                 ordinal = ordinal.checked_add(1).ok_or_else(|| {

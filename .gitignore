@@ -6,6 +6,7 @@
 **/node_modules/
 /benchmark/.cache/
 /benchmark/benchmark-output/
+/benchmark/go-data-races/benchmark-output/
 /benchmark/interactive-latency-output/
 __pycache__/
 .codex

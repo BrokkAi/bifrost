@@ -440,6 +440,7 @@ impl JdkSourceArchivePackProducer {
                 // Every Source locator in these shards names a src.zip entry
                 // this producer parsed, so the pack carries them all.
                 carried_sources: carried_source_paths(&shards),
+                cpp_portability: None,
                 shards,
             }),
             completeness,

@@ -69,6 +69,7 @@ pub fn kotlin_resolve_direct_ancestors(
         code_unit,
         &raw_supertypes,
         &imports,
+        realm,
         &mut |fqn| kotlin_realm_type_by_fqn(source, token, fqn, realm),
     )
 }
@@ -210,6 +211,7 @@ pub fn kotlin_resolve_ancestors_from_facts<S: KotlinSource + ?Sized>(
     owner: &CodeUnit,
     raw_supertypes: &[String],
     imports: &[ImportInfo],
+    realm: Option<&JvmSourceRealm<'_>>,
     type_by_fqn: &mut dyn FnMut(&str) -> Option<CodeUnit>,
 ) -> Vec<CodeUnit> {
     if raw_supertypes.is_empty() {
@@ -218,7 +220,7 @@ pub fn kotlin_resolve_ancestors_from_facts<S: KotlinSource + ?Sized>(
     let scope = KotlinNameScope {
         package_name: owner.package_name(),
         imports,
-        scope_owners: kotlin_scope_owners_for_with(source, token, owner, type_by_fqn),
+        scope_owners: kotlin_scope_owners_for_with(source, token, owner, realm, type_by_fqn),
     };
     let mut ancestors = Vec::new();
     let mut seen = HashSet::default();

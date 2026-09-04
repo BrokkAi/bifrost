@@ -366,6 +366,7 @@ mod tests {
             } else {
                 AuthoredSummaryOutput::Receiver {}
             },
+            value_transfer: None,
         });
         builder.finish(corpus, target(member, types), Some(types.len() as u32))
     }

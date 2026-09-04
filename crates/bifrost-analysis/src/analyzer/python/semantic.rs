@@ -22,7 +22,7 @@ use brokk_bifrost_python::bindings::{
     python_direct_scope_bindings_bounded,
 };
 
-const ADAPTER_VERSION: &[u8] = b"python-value-semantics-v9";
+const ADAPTER_VERSION: &[u8] = b"python-value-semantics-v11";
 
 impl_program_semantics_provider!(PythonAnalyzer, PythonSemanticLowerer);
 
@@ -54,9 +54,12 @@ impl ProgramSemanticsLowerer for PythonSemanticLowerer {
         let (
             specs,
             class_names,
+            class_constructors,
             range_builtin_proof,
             exception_builtin_proof,
             str_builtin_proof,
+            isinstance_builtin_proof,
+            hasattr_builtin_proof,
             initial_work,
         ) = match enumerate_procedures(file, prepared, budget, cancellation)? {
             ProcedureEnumeration::Complete {
@@ -66,9 +69,12 @@ impl ProgramSemanticsLowerer for PythonSemanticLowerer {
             } => (
                 value.specs,
                 value.class_names,
+                value.class_constructors,
                 value.range_builtin_proof,
                 value.exception_builtin_proof,
                 value.str_builtin_proof,
+                value.isinstance_builtin_proof,
+                value.hasattr_builtin_proof,
                 initial_work,
             ),
             ProcedureEnumeration::ExceededBudget { exceeded, work } => {
@@ -96,9 +102,12 @@ impl ProgramSemanticsLowerer for PythonSemanticLowerer {
                     prepared,
                     spec,
                     &class_names,
+                    &class_constructors,
                     range_builtin_proof,
                     exception_builtin_proof,
                     str_builtin_proof,
+                    isinstance_builtin_proof,
+                    hasattr_builtin_proof,
                     staged_budget,
                     cancellation,
                 )
@@ -145,10 +154,7 @@ fn python_capabilities() -> SemanticCapabilities {
     ] {
         builder = builder.partial(capability);
     }
-    // Explicitly unsupported: this adapter normalizes no branch conditions, so
-    // an empty `guard_facts` table means "this language publishes no guard
-    // facts" rather than "this procedure has no decision" (#2443).
-    builder = builder.unsupported(SemanticCapability::GuardFacts);
+    builder = builder.partial(SemanticCapability::GuardFacts);
     builder.build()
 }
 
@@ -166,9 +172,12 @@ struct ProcedureSpec<'tree> {
 struct PythonProcedureInventory<'tree> {
     specs: Vec<ProcedureSpec<'tree>>,
     class_names: HashSet<Box<str>>,
+    class_constructors: HashMap<Box<str>, ProcedureId>,
     range_builtin_proof: bool,
     exception_builtin_proof: bool,
     str_builtin_proof: bool,
+    isinstance_builtin_proof: bool,
+    hasattr_builtin_proof: bool,
 }
 
 type ProcedureEnumeration<'tree> = ProcedureInventoryOutcome<PythonProcedureInventory<'tree>>;
@@ -341,18 +350,41 @@ fn enumerate_procedures<'tree>(
     let exception_builtin_proof =
         !module_bindings.contains_key("Exception") && !module_wildcard_import;
     let str_builtin_proof = !module_bindings.contains_key("str") && !module_wildcard_import;
+    let isinstance_builtin_proof =
+        !module_bindings.contains_key("isinstance") && !module_wildcard_import;
+    let hasattr_builtin_proof = !module_bindings.contains_key("hasattr") && !module_wildcard_import;
     let class_names = module_bindings
         .into_iter()
         .filter_map(|(name, kind)| {
             (kind == PythonDirectScopeBindingKind::ClassDeclaration).then_some(name)
         })
         .collect();
+    let class_constructors = specs
+        .iter()
+        .filter(|spec| spec.kind == ProcedureKind::Constructor)
+        .filter_map(|spec| {
+            let class = enclosing_class_definition(spec.callable)?;
+            if !class
+                .parent()
+                .is_some_and(|parent| parent.kind() == "module")
+            {
+                return None;
+            }
+            let name = class
+                .child_by_field_name("name")
+                .and_then(|name| node_text(prepared.source(), name))?;
+            Some((name.into(), spec.id))
+        })
+        .collect();
     Ok(inventory.complete(PythonProcedureInventory {
         specs,
         class_names,
+        class_constructors,
         range_builtin_proof,
         exception_builtin_proof,
         str_builtin_proof,
+        isinstance_builtin_proof,
+        hasattr_builtin_proof,
     }))
 }
 
@@ -409,8 +441,21 @@ fn callable_shape<'tree>(
     let (kind, segment_kind, body) = match node.kind() {
         "function_definition" => {
             let kind = python_function_kind(node, lexical_parent);
+            // `__init__` is Python's constructor: a class call `A(...)`
+            // dispatches to it, and the dispatch oracle matches a class
+            // definition only against Constructor-kind procedures
+            // (`procedure_matches_definition`). The method-kind gate keeps a
+            // module-level `def __init__` an ordinary function.
+            let kind = if kind == ProcedureKind::Method
+                && callable_name(source, node).as_deref() == Some("__init__")
+            {
+                ProcedureKind::Constructor
+            } else {
+                kind
+            };
             let segment = match kind {
                 ProcedureKind::Method => DeclarationSegmentKind::Method,
+                ProcedureKind::Constructor => DeclarationSegmentKind::Constructor,
                 ProcedureKind::LocalFunction => DeclarationSegmentKind::LocalFunction,
                 _ => DeclarationSegmentKind::Function,
             };
@@ -433,13 +478,14 @@ fn callable_shape<'tree>(
     // carries the same declaration is closed for the same reason (#2495).
     // Everything else stays `Open`, the correct default for a language whose
     // classes are extensible unless they say otherwise.
-    let dispatch_extensibility = if kind == ProcedureKind::Method
-        && (has_final_decorator(source, node) || enclosing_class_is_final(source, node))
-    {
-        DispatchExtensibility::Closed
-    } else {
-        DispatchExtensibility::Open
-    };
+    let dispatch_extensibility =
+        if matches!(kind, ProcedureKind::Method | ProcedureKind::Constructor)
+            && (has_final_decorator(source, node) || enclosing_class_is_final(source, node))
+        {
+            DispatchExtensibility::Closed
+        } else {
+            DispatchExtensibility::Open
+        };
     Some((
         kind,
         segment_kind,
@@ -498,15 +544,25 @@ fn has_final_decorator(source: &str, definition: Node<'_>) -> bool {
 /// rather than that class's method, so the class's declaration says nothing
 /// about it.
 fn enclosing_class_is_final(source: &str, node: Node<'_>) -> bool {
+    enclosing_class_definition(node).is_some_and(|class| has_final_decorator(source, class))
+}
+
+fn enclosing_class_definition(node: Node<'_>) -> Option<Node<'_>> {
     let mut parent = node.parent();
     while let Some(candidate) = parent {
         match candidate.kind() {
-            "class_definition" => return has_final_decorator(source, candidate),
-            "function_definition" | "lambda" => return false,
+            "class_definition" => return Some(candidate),
+            "function_definition" | "lambda" => return None,
             _ => parent = candidate.parent(),
         }
     }
-    false
+    None
+}
+
+fn enclosing_class_name<'source>(source: &'source str, node: Node<'_>) -> Option<&'source str> {
+    enclosing_class_definition(node)
+        .and_then(|class| class.child_by_field_name("name"))
+        .and_then(|name| node_text(source, name))
 }
 
 fn python_function_kind(node: Node<'_>, lexical_parent: Option<ProcedureId>) -> ProcedureKind {
@@ -624,9 +680,13 @@ struct LoweringContext<'tree, 'targets> {
     parameters: HashMap<Box<str>, ValueId>,
     locals: HashMap<Box<str>, ValueId>,
     receiver: Option<ValueId>,
+    enclosing_class: Option<Box<str>>,
     class_names: &'targets HashSet<Box<str>>,
+    class_constructors: &'targets HashMap<Box<str>, ProcedureId>,
     range_builtin_proof: bool,
     str_builtin_proof: bool,
+    isinstance_builtin_proof: bool,
+    hasattr_builtin_proof: bool,
     bindings: PythonLexicalScopeInventory<'tree>,
     cleanups: Vec<CleanupRegion<'tree>>,
 }
@@ -636,9 +696,12 @@ fn lower_procedure<'tree, 'targets>(
     prepared: &'tree PreparedSyntaxTree,
     spec: &ProcedureSpec<'tree>,
     class_names: &'targets HashSet<Box<str>>,
+    class_constructors: &'targets HashMap<Box<str>, ProcedureId>,
     range_builtin_proof: bool,
     exception_builtin_proof: bool,
     str_builtin_proof: bool,
+    isinstance_builtin_proof: bool,
+    hasattr_builtin_proof: bool,
     budget: &SemanticBudget,
     cancellation: &'targets CancellationToken,
 ) -> Result<(ProcedureSemanticsParts, SemanticWork), PythonLoweringError> {
@@ -682,9 +745,13 @@ fn lower_procedure<'tree, 'targets>(
         parameters: HashMap::default(),
         locals: HashMap::default(),
         receiver: None,
+        enclosing_class: enclosing_class_name(prepared.source(), spec.callable).map(Into::into),
         class_names,
+        class_constructors,
         range_builtin_proof,
         str_builtin_proof,
+        isinstance_builtin_proof,
+        hasattr_builtin_proof,
         bindings,
         cleanups: Vec::new(),
     };
@@ -1640,8 +1707,11 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             self.prepared.source(),
         )
         .unwrap_or_default();
-        let first_slot_is_receiver = spec.kind == ProcedureKind::Method
-            && !matches!(layout.python_binding, Some(PythonMethodBinding::Static));
+        let first_slot_is_receiver =
+            matches!(
+                spec.kind,
+                ProcedureKind::Method | ProcedureKind::Constructor
+            ) && !matches!(layout.python_binding, Some(PythonMethodBinding::Static));
         let mut ordinal = 0_u32;
         for (slot_index, slot) in layout.slots.into_iter().enumerate() {
             if self.session.cancellation().is_cancelled() {
@@ -1664,6 +1734,8 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 })
                 .unwrap_or(declaration);
             let metadata = self.value_mapping(builder, mapping_node)?;
+            let parameter_name = slot.unique_name().map(Box::<str>::from);
+            let passing_mode = slot.passing_mode;
             let receiver = first_slot_is_receiver && slot_index == 0;
             let value = if receiver {
                 let value = self.session.add_value_with_metadata(
@@ -1680,6 +1752,8 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     SemanticValueKind::Parameter {
                         ordinal,
                         multiplicity: formal_multiplicity(slot.variadic),
+                        name: parameter_name,
+                        passing_mode,
                     },
                 )?;
                 ordinal = ordinal.checked_add(1).ok_or_else(|| {
@@ -1839,6 +1913,22 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let Some(attribute_name) = node_text(self.prepared.source(), attribute) else {
             return false;
         };
+        // `class_field_proof` admits a class only when direct initializer
+        // stores cannot invoke a base-class, decorator, or dynamic attribute
+        // hook. Reuse that structured proof for the store through the
+        // constructor receiver itself. Ordinary instance proofs require the
+        // constructor to have completed, so they cannot establish the stores
+        // that create those fields in the first place.
+        if access.kind() == "assignment"
+            && self.binding_value(object_name) == self.receiver
+            && self.enclosing_class.as_deref().is_some_and(|class_name| {
+                self.proven_instance_fields
+                    .get(class_name)
+                    .is_some_and(|fields| fields.contains(attribute_name))
+            })
+        {
+            return true;
+        }
         let Some(class_name) = self.known_instance_bindings.get(object_name) else {
             return false;
         };
@@ -2001,7 +2091,23 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         stack: &mut Vec<Work<'tree>>,
     ) -> Result<(), PythonLoweringError> {
         if let Some(value) = boolean_literal_condition(node) {
-            return self.edge(builder, entry, if value { when_true } else { when_false });
+            let taken = if value { when_true } else { when_false };
+            self.edge(builder, entry, taken)?;
+            self.session.add_guard_fact(
+                builder,
+                entry,
+                GuardPredicate::ConstantBoolean { value },
+                None,
+                value.then_some(GuardArm {
+                    target_point: when_true.point,
+                    kind: when_true.kind,
+                }),
+                (!value).then_some(GuardArm {
+                    target_point: when_false.point,
+                    kind: when_false.kind,
+                }),
+            )?;
+            return Ok(());
         }
         match (node.kind(), boolean_operator_kind(node)) {
             ("boolean_operator", Some("and")) => {
@@ -2129,6 +2235,21 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 )?;
                 self.edge(builder, decision, when_true)?;
                 self.edge(builder, decision, when_false)?;
+                let (predicate, subject) = self.normalize_guard(builder, node)?;
+                self.session.add_guard_fact(
+                    builder,
+                    decision,
+                    predicate,
+                    subject,
+                    Some(GuardArm {
+                        target_point: when_true.point,
+                        kind: when_true.kind,
+                    }),
+                    Some(GuardArm {
+                        target_point: when_false.point,
+                        kind: when_false.kind,
+                    }),
+                )?;
                 stack.push(Work::Expression {
                     node,
                     entry,
@@ -2138,6 +2259,45 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 Ok(())
             }
         }
+    }
+
+    fn normalize_guard(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+    ) -> Result<(GuardPredicate, Option<ValueId>), PythonLoweringError> {
+        let arguments = call_arguments(node);
+        if arguments.len() == 2
+            && self.proven_builtin_call(node, "isinstance", self.isinstance_builtin_proof)
+        {
+            let value_node = python_argument_value_node(arguments[0]);
+            let classes_node = python_argument_value_node(arguments[1]);
+            let value =
+                self.expression_value(builder, value_node, expression_value_kind(value_node))?;
+            let classes =
+                self.expression_value(builder, classes_node, expression_value_kind(classes_node))?;
+            let subject = self.expression_value(builder, node, expression_value_kind(node))?;
+            return Ok((GuardPredicate::InstanceOf { value, classes }, Some(subject)));
+        }
+        if arguments.len() == 2
+            && self.proven_builtin_call(node, "hasattr", self.hasattr_builtin_proof)
+        {
+            let value_node = python_argument_value_node(arguments[0]);
+            let member_node = python_argument_value_node(arguments[1]);
+            let value =
+                self.expression_value(builder, value_node, expression_value_kind(value_node))?;
+            let member =
+                self.expression_value(builder, member_node, expression_value_kind(member_node))?;
+            let subject = self.expression_value(builder, node, expression_value_kind(node))?;
+            return Ok((GuardPredicate::HasMember { value, member }, Some(subject)));
+        }
+        let subject = self.expression_value(builder, node, expression_value_kind(node))?;
+        Ok((
+            GuardPredicate::Opaque {
+                digest: GuardConditionDigest::from_syntax_kind(node.kind()),
+            },
+            Some(subject),
+        ))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3155,6 +3315,62 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 .unwrap_or(when_true);
             self.edge(builder, *decision, true_target)?;
             self.edge(builder, *decision, when_false)?;
+            let (predicate, subject) = match (
+                operator.kind(),
+                operands[index].kind(),
+                operands[index + 1].kind(),
+            ) {
+                ("is" | "is not", "none", right) if right != "none" => {
+                    let subject = self.expression_value(
+                        builder,
+                        operands[index + 1],
+                        expression_value_kind(operands[index + 1]),
+                    )?;
+                    (
+                        GuardPredicate::NullComparison {
+                            null_on_true: operator.kind() == "is",
+                        },
+                        Some(subject),
+                    )
+                }
+                ("is" | "is not", left, "none") if left != "none" => {
+                    let subject = self.expression_value(
+                        builder,
+                        operands[index],
+                        expression_value_kind(operands[index]),
+                    )?;
+                    (
+                        GuardPredicate::NullComparison {
+                            null_on_true: operator.kind() == "is",
+                        },
+                        Some(subject),
+                    )
+                }
+                _ => {
+                    let subject =
+                        self.expression_value(builder, node, expression_value_kind(node))?;
+                    (
+                        GuardPredicate::Opaque {
+                            digest: GuardConditionDigest::from_syntax_kind(node.kind()),
+                        },
+                        Some(subject),
+                    )
+                }
+            };
+            self.session.add_guard_fact(
+                builder,
+                *decision,
+                predicate,
+                subject,
+                Some(GuardArm {
+                    target_point: true_target.point,
+                    kind: true_target.kind,
+                }),
+                Some(GuardArm {
+                    target_point: when_false.point,
+                    kind: when_false.kind,
+                }),
+            )?;
         }
 
         self.edge(builder, entry, EdgeTarget::normal(operand_entries[0]))?;
@@ -3591,18 +3807,22 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
     }
 
     fn proven_builtin_range_call(&self, call: Node<'tree>) -> bool {
-        if !self.range_builtin_proof || call.kind() != "call" {
+        self.proven_builtin_call(call, "range", self.range_builtin_proof)
+            && python_range_literal_values(self.prepared.source(), call)
+                .is_some_and(|values| !matches!(values.as_slice(), [_, _, step] if *step == 0))
+    }
+
+    fn proven_builtin_call(&self, call: Node<'tree>, name: &str, module_proof: bool) -> bool {
+        if !module_proof || call.kind() != "call" {
             return false;
         }
         let function = match call.child_by_field_name("function") {
             Some(function) if function.kind() == "identifier" => function,
             _ => return false,
         };
-        node_text(self.prepared.source(), function) == Some("range")
-            && self.bindings.name_resolution_at("range", function)
+        node_text(self.prepared.source(), function) == Some(name)
+            && self.bindings.name_resolution_at(name, function)
                 == PythonLexicalNameResolution::Unbound
-            && python_range_literal_values(self.prepared.source(), call)
-                .is_some_and(|values| !matches!(values.as_slice(), [_, _, step] if *step == 0))
     }
 
     /// Whether a call provably denotes the builtin `str`: the module does not
@@ -3610,16 +3830,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
     /// lexically unbound. This is the same proof shape as
     /// [`Self::proven_builtin_range_call`].
     fn proven_builtin_str_call(&self, call: Node<'tree>) -> bool {
-        if !self.str_builtin_proof || call.kind() != "call" {
-            return false;
-        }
-        let function = match call.child_by_field_name("function") {
-            Some(function) if function.kind() == "identifier" => function,
-            _ => return false,
-        };
-        node_text(self.prepared.source(), function) == Some("str")
-            && self.bindings.name_resolution_at("str", function)
-                == PythonLexicalNameResolution::Unbound
+        self.proven_builtin_call(call, "str", self.str_builtin_proof)
     }
 
     /// Lower a proven builtin `str(...)` call as a modeled boundary instead of
@@ -4104,7 +4315,20 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         } else {
             CallableReferenceKind::Function
         };
-        let resolution = CallableTargetResolution::Unknown;
+        let module_class = if function.kind() == "identifier"
+            && self.module_class_fallback_allowed(builder, function)?
+        {
+            node_text(self.prepared.source(), function)
+        } else {
+            None
+        };
+        let constructor = module_class
+            .filter(|name| self.proven_instance_fields.contains_key(*name))
+            .and_then(|name| self.class_constructors.get(name))
+            .copied();
+        let resolution = constructor
+            .map(|target| CallableTargetResolution::Proven(CallableTarget::Local(target)))
+            .unwrap_or(CallableTargetResolution::Unknown);
         let metadata = self.metadata(invoke)?;
         self.append_effect(
             builder,
@@ -4142,13 +4366,27 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                         }
                         _ => CallArgumentExpansion::Direct(ArgumentDomain::Positional),
                     };
-                    Ok(SemanticCallArgument { value, expansion })
+                    if argument.kind() == "keyword_argument" {
+                        let name = argument
+                            .child_by_field_name("name")
+                            .and_then(|name| node_text(self.prepared.source(), name))
+                            .ok_or_else(|| {
+                                PythonLoweringError::Invalid(
+                                    "Python keyword argument is missing its structured name".into(),
+                                )
+                            })?;
+                        Ok(SemanticCallArgument::keyword(value, name))
+                    } else {
+                        Ok(SemanticCallArgument {
+                            value,
+                            expansion,
+                            keyword: None,
+                        })
+                    }
                 },
             )
             .collect::<Result<Vec<_>, _>>()?;
-        if function.kind() == "identifier"
-            && self.module_class_fallback_allowed(builder, function)?
-        {
+        if module_class.is_some() {
             self.session
                 .add_allocation(builder, invoke, result, AllocationKind::Object)?;
         }
@@ -5520,6 +5758,40 @@ mod tests {
     }
 
     #[test]
+    fn proven_initializer_receiver_store_has_no_dynamic_attribute_gap() {
+        let source = "class Holder:\n    def __init__(self):\n        self.value = 0\n";
+        let parts = lower_fixture_named(source, Some("__init__"));
+
+        assert_eq!(parts.kind, ProcedureKind::Constructor);
+        assert!(!parts.gaps.iter().any(|gap| {
+            gap.detail
+                .contains("descriptor or special-method invocation")
+                || (gap.capability == SemanticCapability::ExceptionalControlFlow
+                    && gap.detail.contains("assignment"))
+        }));
+    }
+
+    #[test]
+    fn proven_module_class_call_names_its_local_constructor() {
+        let source = "class Holder:\n    def __init__(self):\n        self.value = 0\n\ndef run():\n    Holder()\n";
+        let parts = lower_fixture_named(source, Some("run"));
+        let [call] = parts.call_sites.as_slice() else {
+            panic!("run must contain exactly one constructor call")
+        };
+
+        assert!(matches!(
+            call.declared_targets,
+            CallableTargetResolution::Proven(CallableTarget::Local(_))
+        ));
+        assert!(
+            parts
+                .allocations
+                .iter()
+                .any(|allocation| allocation.result == call.result.expect("constructor result"))
+        );
+    }
+
+    #[test]
     fn exception_subclass_requires_inert_class_body() {
         let supported = "class FlowException(Exception):\n    # inert\n    pass\n";
         let supported_tree = parse(supported);
@@ -5688,6 +5960,8 @@ def run(source):
             SemanticValueKind::Parameter {
                 ordinal: 0,
                 multiplicity: FormalMultiplicity::One,
+                name: Some("source".into()),
+                passing_mode: FormalParameterPassingMode::PositionalOrNamed,
             },
         );
         let flow_value = value_for_node(&parts, flow_binding, SemanticValueKind::Local);
@@ -5798,6 +6072,8 @@ def run(source):
             SemanticValueKind::Parameter {
                 ordinal: 0,
                 multiplicity: FormalMultiplicity::One,
+                name: Some("source".into()),
+                passing_mode: FormalParameterPassingMode::PositionalOrNamed,
             },
         );
         let unrelated_value = value_for_node(&parts, unrelated_binding, SemanticValueKind::Local);

@@ -151,7 +151,7 @@ pub fn rust_declaration_facts(
             };
             (owner, None)
         };
-        let Some(namespace) = RustSymbolNamespace::of(analyzer, declaration) else {
+        let Some(namespace) = RustSymbolNamespace::of(declaration) else {
             continue;
         };
         let identity = RustSymbolIdentity {

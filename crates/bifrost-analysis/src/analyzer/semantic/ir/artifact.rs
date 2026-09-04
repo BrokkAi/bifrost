@@ -1135,6 +1135,8 @@ mod value_identity_tests {
                 SemanticValueKind::Parameter {
                     ordinal: 7,
                     multiplicity: FormalMultiplicity::One,
+                    name: None,
+                    passing_mode: FormalParameterPassingMode::PositionalOrNamed,
                 },
             ),
         ];
@@ -1215,6 +1217,10 @@ pub struct SemanticArtifact {
     work: SemanticWork,
     procedures: Box<[ProcedureSemantics]>,
     procedures_by_locator: HashMap<SemanticLocator, ProcedureId>,
+    /// Procedures lexically enclosed by each procedure, built once from the
+    /// validated parent links so a closure walk never rescans the procedure
+    /// table per visited procedure (#2640, #2951).
+    lexical_children: HashMap<ProcedureId, Box<[ProcedureId]>>,
 }
 
 impl SemanticArtifact {
@@ -1264,6 +1270,16 @@ impl SemanticArtifact {
         }
 
         let procedures = procedures.into_boxed_slice();
+        let mut lexical_children: HashMap<ProcedureId, Vec<ProcedureId>> = HashMap::default();
+        for child in &procedures {
+            if let Some(parent) = child.lexical_parent() {
+                lexical_children.entry(parent).or_default().push(child.id());
+            }
+        }
+        let lexical_children = lexical_children
+            .into_iter()
+            .map(|(parent, children)| (parent, children.into_boxed_slice()))
+            .collect();
         let materialization_id =
             compute_artifact_materialization_id(&key, &capabilities, &procedures);
         let artifact = Self {
@@ -1273,6 +1289,7 @@ impl SemanticArtifact {
             work,
             procedures,
             procedures_by_locator,
+            lexical_children,
         };
         *budget = charged_budget;
         Ok(artifact)
@@ -1304,6 +1321,22 @@ impl SemanticArtifact {
 
     pub fn procedure_id(&self, locator: &SemanticLocator) -> Option<ProcedureId> {
         self.procedures_by_locator.get(locator).copied()
+    }
+
+    /// Procedures lexically enclosed by `procedure`, in procedure-table
+    /// order. The index is built once at construction from the validated
+    /// parent links; a childless procedure returns an empty slice.
+    pub fn lexical_children(&self, procedure: ProcedureId) -> &[ProcedureId] {
+        self.lexical_children
+            .get(&procedure)
+            .map_or(&[][..], Box::as_ref)
+    }
+
+    /// Conservative heap storage retained by the derived lexical-child
+    /// index. The complete-artifact cache includes this alongside the
+    /// procedure-local derived indexes.
+    pub(crate) fn lexical_children_index_retained_bytes(&self) -> u64 {
+        boxed_slice_index_retained_bytes(&self.lexical_children)
     }
 
     pub fn procedure_by_locator(&self, locator: &SemanticLocator) -> Option<&ProcedureSemantics> {

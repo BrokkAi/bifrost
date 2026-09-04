@@ -170,7 +170,20 @@ fn find_import_graph_candidates(
         && !language_importers_own_candidates
         && let Some(import_provider) = analyzer.import_analysis_provider()
     {
-        let importer_files = usage_ecosystem_files(analyzer.analyzed_files(), target_language);
+        // `analyzer.analyzed_files()` fans out and sorts across every
+        // language the workspace has, then `usage_ecosystem_files` throws
+        // most of that away by ecosystem -- going straight to the languages
+        // that actually share this one avoids paying for every other
+        // language's files on every candidate query (issue #1738's shape,
+        // same as `CodeUnitIndex::analyzed_files_for_language`'s default).
+        let target_ecosystem = UsageEcosystem::of(target_language);
+        let ecosystem_files: Vec<ProjectFile> = analyzer
+            .languages()
+            .into_iter()
+            .filter(|&language| UsageEcosystem::of(language) == target_ecosystem)
+            .flat_map(|language| analyzer.analyzed_files_for_language(language))
+            .collect();
+        let importer_files = usage_ecosystem_files(ecosystem_files, target_language);
         if let Some(cancellation) = cancellation {
             let importers = if target_language == Language::Ruby {
                 find_transitive_importers_with_cancellation(
@@ -530,16 +543,10 @@ fn find_text_candidates(
     // not exist in a source-only workspace. Candidate discovery therefore spans
     // both languages; the graph still decides whether each AST hit is proven.
     let files = if matches!(language, Language::JavaScript | Language::TypeScript) {
-        analyzer
-            .analyzed_files()
-            .into_iter()
-            .filter(|file| {
-                matches!(
-                    language_for_file(file),
-                    Language::JavaScript | Language::TypeScript
-                )
-            })
-            .collect()
+        let mut files = analyzed_files_for_language(analyzer, Language::JavaScript);
+        files.extend(analyzed_files_for_language(analyzer, Language::TypeScript));
+        files.sort();
+        files
     } else {
         analyzed_files_for_language(analyzer, language)
     };

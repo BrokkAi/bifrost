@@ -22,7 +22,8 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 
-use brokk_bifrost_rql::structural::{CodeQueryResultValue, CodeQueryRowRef};
+use brokk_bifrost_rql::structural::CodeQueryRowRef;
+use brokk_bifrost_rql::structural::search::UnitRowItem;
 
 use crate::definition::{
     AssertCardinality, PolicyAssertId, RowBindingName, RowGroupName, RowLiteral,
@@ -811,7 +812,7 @@ fn load_rows(
     for (row, item) in input.rows[..count].iter().enumerate() {
         let mut values = Vec::with_capacity(layout.len());
         for column in &layout {
-            values.push(row_field(&item.value, binding, &column.name)?);
+            values.push(row_field(item, binding, &column.name)?);
         }
         tuples.push(EvalTuple {
             values,
@@ -1359,12 +1360,11 @@ fn scalar_matches_literal(actual: &RowScalar, expected: &RowLiteral) -> bool {
 }
 
 fn row_field(
-    row: &CodeQueryResultValue,
+    row: &UnitRowItem,
     binding: &RowBindingName,
     field: &str,
 ) -> EvalResult<Option<RowScalar>> {
-    row.row()
-        .field(field)
+    row.field(field)
         .map(|value| value.map(RowScalar::from))
         .map_err(|_| RelationalAssertionEvaluationError::RowField {
             binding: binding.as_str().to_string(),

@@ -59,6 +59,51 @@ pub enum PolicyUnitPartitionRow {
         blob: Oid,
         language: Language,
     },
+    /// One seed file of one row binding of a relational assertion policy: the
+    /// file, the blob that path resolved to, and the digest of the binding's
+    /// name. The binding is part of the key because one policy runs one query
+    /// per binding over the same seed files, and two of them keyed by the file
+    /// alone would answer each other's question.
+    Binding {
+        rel_path: String,
+        blob: Oid,
+        language: Language,
+        binding: String,
+    },
+    /// One subject file of an assertion policy: the file, the blob that path
+    /// resolved to, and the digest of the subject rows this unit asserted over.
+    /// The digest is part of the key because two runs whose subject selector
+    /// bound different rows in the same bytes asked different questions.
+    AssertFile {
+        rel_path: String,
+        blob: Oid,
+        language: Language,
+        subjects: String,
+    },
+    /// One solver root of a typestate policy: the file the root procedure is
+    /// declared in, the blob that path resolved to, and the root's own
+    /// checkout-independent semantic locator. The locator is part of the key
+    /// because one file declares many procedures and a typestate policy solves
+    /// each of them separately: two roots keyed by the file alone would be one
+    /// key, and the second root's findings would be served from the first
+    /// root's unit.
+    Root {
+        rel_path: String,
+        blob: Oid,
+        language: Language,
+        locator: String,
+    },
+    /// One seed file of one selector of a policy that compiles selectors: the
+    /// file, the blob that path resolved to, and the digest of the selector's
+    /// document path. The selector is part of the key because one policy
+    /// compiles many selectors over the same seed files, and two of them keyed
+    /// by the file alone would answer each other's question.
+    Selector {
+        rel_path: String,
+        blob: Oid,
+        language: Language,
+        selector: String,
+    },
     /// The whole policy, which is what a widened evaluation publishes.
     Whole,
 }
@@ -67,18 +112,61 @@ impl PolicyUnitPartitionRow {
     const fn kind(&self) -> &'static str {
         match self {
             Self::Seed { .. } => "seed",
+            Self::Binding { .. } => "binding",
+            Self::AssertFile { .. } => "assert_file",
+            Self::Root { .. } => "root",
+            Self::Selector { .. } => "selector",
             Self::Whole => "whole",
         }
     }
 
-    /// The two key columns, with the empty string where a whole-policy unit
-    /// has no seed. An absent seed is spelled as a value rather than as NULL
-    /// because SQLite treats NULLs in a unique index as distinct, which would
-    /// let one policy publish an unbounded number of whole units.
-    fn key_columns(&self) -> (String, String) {
+    /// The three key columns, with the empty string where a partition has no
+    /// seed or no narrowing digest. An absent component is spelled as a value
+    /// rather than as NULL because SQLite treats NULLs in a unique index as
+    /// distinct, which would let one policy publish an unbounded number of
+    /// whole units.
+    fn key_columns(&self) -> (String, String, String) {
         match self {
-            Self::Seed { rel_path, blob, .. } => (rel_path.clone(), blob.to_string()),
-            Self::Whole => (String::new(), String::new()),
+            Self::Seed { rel_path, blob, .. } => {
+                (rel_path.clone(), blob.to_string(), String::new())
+            }
+            Self::Binding {
+                rel_path,
+                blob,
+                binding,
+                ..
+            } => (rel_path.clone(), blob.to_string(), binding.clone()),
+            Self::AssertFile {
+                rel_path,
+                blob,
+                subjects,
+                ..
+            } => (rel_path.clone(), blob.to_string(), subjects.clone()),
+            Self::Root {
+                rel_path,
+                blob,
+                locator,
+                ..
+            } => (rel_path.clone(), blob.to_string(), locator.clone()),
+            Self::Selector {
+                rel_path,
+                blob,
+                selector,
+                ..
+            } => (rel_path.clone(), blob.to_string(), selector.clone()),
+            Self::Whole => (String::new(), String::new(), String::new()),
+        }
+    }
+
+    /// The blob this partition hangs off, when it covers one file.
+    const fn blob(&self) -> Option<(&Oid, &Language)> {
+        match self {
+            Self::Seed { blob, language, .. }
+            | Self::Binding { blob, language, .. }
+            | Self::AssertFile { blob, language, .. }
+            | Self::Root { blob, language, .. }
+            | Self::Selector { blob, language, .. } => Some((blob, language)),
+            Self::Whole => None,
         }
     }
 }
@@ -126,53 +214,43 @@ pub struct PolicyEvaluationRowKey {
     pub engine_epoch: String,
 }
 
-/// One completed base evaluation, with the units it published per policy in
-/// the order it merged them.
+/// One completed base evaluation: what it concluded, and what it published.
+///
+/// The identities are the evaluation's answer -- the strong finding identities
+/// a later run joins its head findings against -- and they are recorded for
+/// every policy that ran, whatever its family. The units are the per-partition
+/// work that produced some of those findings; a policy that has no units
+/// contributes none, which costs the head reuse and costs the evaluation
+/// nothing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PolicyEvaluationRow {
     pub key: PolicyEvaluationRowKey,
     /// The commit the requested revision resolved to, as lowercase hex.
     pub resolved_commit: String,
-    /// The analyzed source volume that scaled the base's per-policy budget.
-    pub analyzed_source_bytes: u64,
-    pub analyzed_file_count: u64,
-    /// The units, per policy, in merge order.
+    /// The strong finding identities this evaluation produced, per policy.
+    pub identities: Vec<(String, Vec<[u8; 32]>)>,
+    /// The units this evaluation published, per policy.
     pub units: Vec<(String, Vec<PolicyUnitRowKey>)>,
 }
 
 /// One loaded base evaluation.
 ///
-/// `recorded_unit_count` is what the evaluation published and `units` is what
-/// survives; a caller that finds them unequal has an evaluation whose units
-/// followed their blobs out of the cache, which is a partial answer rather
-/// than a cheaper one.
+/// The identities are the whole answer: a run that finds this row skips the
+/// export, the build and the evaluation of the base entirely and joins against
+/// these. The units it published are found by their own keys when the head
+/// asks about them, so they are not loaded here.
 #[derive(Debug, Clone)]
 pub struct LoadedPolicyEvaluation {
     pub resolved_commit: String,
-    pub analyzed_source_bytes: u64,
-    pub analyzed_file_count: u64,
-    pub recorded_unit_count: u64,
-    pub units: Vec<(String, Vec<PolicyUnitRow>)>,
-}
-
-impl LoadedPolicyEvaluation {
-    /// How many unit rows this evaluation still has.
-    pub fn loaded_unit_count(&self) -> u64 {
-        self.units.iter().map(|(_, units)| units.len() as u64).sum()
-    }
-
-    /// Whether every unit this evaluation published is still present.
-    pub fn is_complete(&self) -> bool {
-        self.loaded_unit_count() == self.recorded_unit_count
-    }
+    pub identities: Vec<(String, Vec<[u8; 32]>)>,
 }
 
 /// The columns of `policy_units` a load needs, in one place so the reader and
 /// the row decoder cannot disagree about their order.
 const UNIT_COLUMNS: &str = "units.unit_id, units.policy_semantic_hash, units.family, \
-     units.partition_kind, units.seed_rel_path, units.seed_blob_oid, units.lang, \
-     units.configuration_fingerprint, units.active_model_set_hash, units.engine_epoch, \
-     units.product_kind, units.product, units.read_set_digest";
+     units.partition_kind, units.seed_rel_path, units.seed_blob_oid, units.partition_digest, \
+     units.lang, units.configuration_fingerprint, units.active_model_set_hash, \
+     units.engine_epoch, units.product_kind, units.product, units.read_set_digest";
 
 impl AnalyzerStore {
     /// Publish `units`, replacing any row already published under the same key.
@@ -223,7 +301,7 @@ impl AnalyzerStore {
         // The key columns every unit of one lookup shares are equality-tested
         // and the partitions are a row-value list, so the unique index answers
         // the whole batch with one seek per partition.
-        let mut parameters: Vec<String> = Vec::with_capacity(5 + keys.len() * 3);
+        let mut parameters: Vec<String> = Vec::with_capacity(5 + keys.len() * 4);
         let head = &keys[0];
         parameters.push(head.policy_semantic_hash.clone());
         parameters.push(head.family.clone());
@@ -249,14 +327,15 @@ impl AnalyzerStore {
                 ),
                 "one unit lookup asks about one policy under one engine"
             );
-            let (rel_path, blob_oid) = key.partition.key_columns();
+            let (rel_path, blob_oid, partition_digest) = key.partition.key_columns();
             parameters.push(key.partition.kind().to_string());
             parameters.push(rel_path);
             parameters.push(blob_oid);
+            parameters.push(partition_digest);
             if index > 0 {
                 values.push(',');
             }
-            values.push_str("(?,?,?)");
+            values.push_str("(?,?,?,?)");
         }
         let sql = policy_unit_batch_sql(&values);
         let mut statement = conn.prepare_cached(&sql)?;
@@ -275,25 +354,27 @@ impl AnalyzerStore {
         Ok(keys.iter().map(|key| found.remove(key)).collect())
     }
 
-    /// Record that one policy set evaluated completely over one committed
-    /// subtree, and which units that evaluation published.
+    /// Record what one policy set concluded over one committed subtree, and
+    /// which units that evaluation published.
     ///
-    /// The units must already be published: this links them by key, so a unit
-    /// whose row is missing makes the evaluation partial and no row is written
-    /// at all. Publishing also sweeps, because a base evaluation is keyed by a
-    /// tree id and has no blob to follow out of the cache.
-    pub fn publish_policy_evaluation(&self, evaluation: PolicyEvaluationRow) -> Result<bool> {
+    /// The identities are the record: they are written whether or not any
+    /// policy published a unit, because they are what a later run replaces the
+    /// base evaluation with. A membership whose unit row is gone -- its blob
+    /// was re-parsed between the flush and this write -- is dropped rather
+    /// than refusing the evaluation, since a unit is an optimization for the
+    /// head and never part of the answer. Publishing also sweeps, because a
+    /// base evaluation is keyed by a tree id and has no blob to follow out of
+    /// the cache.
+    pub fn publish_policy_evaluation(&self, evaluation: PolicyEvaluationRow) -> Result<()> {
         let published_at = now_secs();
         self.conn.execute(move |conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let mut memberships: Vec<(String, i64, i64)> = Vec::new();
+            let mut memberships: Vec<(String, i64)> = Vec::new();
             for (policy_id, keys) in &evaluation.units {
-                for (ordinal, key) in keys.iter().enumerate() {
-                    let Some(unit_id) = unit_id_for_key(&tx, key)? else {
-                        tx.commit()?;
-                        return Ok(false);
-                    };
-                    memberships.push((policy_id.clone(), ordinal as i64, unit_id));
+                for key in keys {
+                    if let Some(unit_id) = unit_id_for_key(&tx, key)? {
+                        memberships.push((policy_id.clone(), unit_id));
+                    }
                 }
             }
             let key = &evaluation.key;
@@ -315,9 +396,8 @@ impl AnalyzerStore {
                 "INSERT INTO policy_evaluations(
                    base_tree_oid, policy_set_digest, options_digest,
                    configuration_fingerprint, active_model_set_hash, engine_epoch,
-                   resolved_commit, analyzed_source_bytes, analyzed_file_count,
-                   unit_count, published_at
-                 ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                   resolved_commit, published_at
+                 ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 params![
                     key.base_tree_oid,
                     key.policy_set_digest,
@@ -326,30 +406,42 @@ impl AnalyzerStore {
                     key.active_model_set_hash,
                     key.engine_epoch,
                     evaluation.resolved_commit,
-                    evaluation.analyzed_source_bytes as i64,
-                    evaluation.analyzed_file_count as i64,
-                    memberships.len() as i64,
                     published_at,
                 ],
             )?;
             let evaluation_id = tx.last_insert_rowid();
             {
                 let mut insert = tx.prepare_cached(
-                    "INSERT INTO policy_evaluation_units(
-                       evaluation_id, policy_id, ordinal, unit_id
-                     ) VALUES(?1, ?2, ?3, ?4)",
+                    "INSERT INTO policy_evaluation_identities(
+                       evaluation_id, policy_id, finding_id
+                     ) VALUES(?1, ?2, ?3)
+                     ON CONFLICT(evaluation_id, policy_id, finding_id) DO NOTHING",
                 )?;
-                for (policy_id, ordinal, unit_id) in &memberships {
-                    insert.execute(params![evaluation_id, policy_id, ordinal, unit_id])?;
+                for (policy_id, findings) in &evaluation.identities {
+                    for finding_id in findings {
+                        insert.execute(params![evaluation_id, policy_id, finding_id.as_slice()])?;
+                    }
+                }
+            }
+            {
+                let mut insert = tx.prepare_cached(
+                    "INSERT INTO policy_evaluation_units(
+                       evaluation_id, policy_id, unit_id
+                     ) VALUES(?1, ?2, ?3)
+                     ON CONFLICT(evaluation_id, policy_id, unit_id) DO NOTHING",
+                )?;
+                for (policy_id, unit_id) in &memberships {
+                    insert.execute(params![evaluation_id, policy_id, unit_id])?;
                 }
             }
             sweep_policy_rows(&tx, published_at)?;
             tx.commit()?;
-            Ok(true)
+            Ok(())
         })
     }
 
-    /// The base evaluation published under `key`, with its units.
+    /// The base evaluation published under `key`, with the identities it
+    /// concluded.
     pub fn policy_evaluation_for_key(
         &self,
         key: &PolicyEvaluationRowKey,
@@ -366,46 +458,34 @@ impl AnalyzerStore {
                     key.active_model_set_hash,
                     key.engine_epoch,
                 ],
-                |row| {
-                    Ok((
-                        row.get::<_, i64>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, i64>(2)?,
-                        row.get::<_, i64>(3)?,
-                        row.get::<_, i64>(4)?,
-                    ))
-                },
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
             )
             .optional()?;
-        let Some((evaluation_id, resolved_commit, source_bytes, file_count, unit_count)) = row
-        else {
+        let Some((evaluation_id, resolved_commit)) = row else {
             return Ok(None);
         };
-        let mut per_policy: Vec<(String, Vec<PolicyUnitRow>)> = Vec::new();
-        let mut statement = conn.prepare_cached(&format!(
-            "SELECT membership.policy_id, {UNIT_COLUMNS}
-             FROM policy_evaluation_units AS membership
-             JOIN policy_units AS units ON units.unit_id = membership.unit_id
-             WHERE membership.evaluation_id = ?1
-             ORDER BY membership.policy_id, membership.ordinal"
-        ))?;
+        // The primary key clusters the rows by policy, so consecutive rows
+        // group without a sort and without a second pass over the answer.
+        let mut per_policy: Vec<(String, Vec<[u8; 32]>)> = Vec::new();
+        let mut statement = conn.prepare_cached(POLICY_EVALUATION_IDENTITY_SQL)?;
         let mut rows = statement.query(params![evaluation_id])?;
         while let Some(row) = rows.next()? {
             let policy_id = row.get::<_, String>(0)?;
-            let (unit_id, unit) = decode_unit_row_at(row, 1)?;
-            let reads = load_unit_reads(&conn, unit_id)?;
-            let unit = PolicyUnitRow { reads, ..unit };
+            let finding_id = row.get::<_, Vec<u8>>(1)?;
+            let finding_id = <[u8; 32]>::try_from(finding_id.as_slice()).map_err(|_| {
+                StoreError::new(format!(
+                    "policy evaluation {evaluation_id} records a finding identity of {} bytes",
+                    finding_id.len()
+                ))
+            })?;
             match per_policy.last_mut() {
-                Some((last, units)) if *last == policy_id => units.push(unit),
-                _ => per_policy.push((policy_id, vec![unit])),
+                Some((last, findings)) if *last == policy_id => findings.push(finding_id),
+                _ => per_policy.push((policy_id, vec![finding_id])),
             }
         }
         Ok(Some(LoadedPolicyEvaluation {
             resolved_commit,
-            analyzed_source_bytes: source_bytes as u64,
-            analyzed_file_count: file_count as u64,
-            recorded_unit_count: unit_count as u64,
-            units: per_policy,
+            identities: per_policy,
         }))
     }
 }
@@ -421,17 +501,25 @@ pub(crate) fn policy_unit_batch_sql(values: &str) -> String {
          WHERE policy_semantic_hash = ?1 AND family = ?2
            AND configuration_fingerprint = ?3 AND active_model_set_hash = ?4
            AND engine_epoch = ?5
-           AND (partition_kind, seed_rel_path, seed_blob_oid) IN (VALUES {values})"
+           AND (partition_kind, seed_rel_path, seed_blob_oid, partition_digest)
+               IN (VALUES {values})"
     )
 }
 
 /// The evaluation lookup, shared with its query-plan pin.
-pub(crate) const POLICY_EVALUATION_LOOKUP_SQL: &str =
-    "SELECT evaluation_id, resolved_commit, analyzed_source_bytes, analyzed_file_count, unit_count
+pub(crate) const POLICY_EVALUATION_LOOKUP_SQL: &str = "SELECT evaluation_id, resolved_commit
      FROM policy_evaluations
      WHERE base_tree_oid = ?1 AND policy_set_digest = ?2 AND options_digest = ?3
        AND configuration_fingerprint = ?4 AND active_model_set_hash = ?5
        AND engine_epoch = ?6";
+
+/// The identity read, shared with its query-plan pin.
+///
+/// One seek on the leading column of a `WITHOUT ROWID` primary key, which
+/// returns the rows already grouped by policy.
+pub(crate) const POLICY_EVALUATION_IDENTITY_SQL: &str =
+    "SELECT policy_id, finding_id FROM policy_evaluation_identities
+     WHERE evaluation_id = ?1";
 
 fn now_secs() -> i64 {
     SystemTime::now()
@@ -444,13 +532,13 @@ fn unit_id_for_key(
     conn: &rusqlite::Connection,
     key: &PolicyUnitRowKey,
 ) -> rusqlite::Result<Option<i64>> {
-    let (rel_path, blob_oid) = key.partition.key_columns();
+    let (rel_path, blob_oid, partition_digest) = key.partition.key_columns();
     conn.query_row(
         "SELECT unit_id FROM policy_units
          WHERE policy_semantic_hash = ?1 AND family = ?2
            AND configuration_fingerprint = ?3 AND active_model_set_hash = ?4
            AND engine_epoch = ?5 AND partition_kind = ?6
-           AND seed_rel_path = ?7 AND seed_blob_oid = ?8",
+           AND seed_rel_path = ?7 AND seed_blob_oid = ?8 AND partition_digest = ?9",
         params![
             key.policy_semantic_hash,
             key.family,
@@ -460,6 +548,7 @@ fn unit_id_for_key(
             key.partition.kind(),
             rel_path,
             blob_oid,
+            partition_digest,
         ],
         |row| row.get::<_, i64>(0),
     )
@@ -473,9 +562,9 @@ fn write_unit(
     published_at: i64,
 ) -> rusqlite::Result<()> {
     let key = &unit.key;
-    let (rel_path, blob_oid) = key.partition.key_columns();
-    let (blob_id, lang) = match &key.partition {
-        PolicyUnitPartitionRow::Seed { blob, language, .. } => {
+    let (rel_path, blob_oid, partition_digest) = key.partition.key_columns();
+    let (blob_id, lang) = match key.partition.blob() {
+        Some((blob, language)) => {
             let lang = language.config_label();
             // Resolved under the complete-blob condition the fact tables use:
             // a unit hangs off its seed blob so that re-parsing that blob
@@ -497,14 +586,14 @@ fn write_unit(
                 None => (None, None),
             }
         }
-        PolicyUnitPartitionRow::Whole => (None, None),
+        None => (None, None),
     };
     conn.execute(
         "DELETE FROM policy_units
          WHERE policy_semantic_hash = ?1 AND family = ?2
            AND configuration_fingerprint = ?3 AND active_model_set_hash = ?4
            AND engine_epoch = ?5 AND partition_kind = ?6
-           AND seed_rel_path = ?7 AND seed_blob_oid = ?8",
+           AND seed_rel_path = ?7 AND seed_blob_oid = ?8 AND partition_digest = ?9",
         params![
             key.policy_semantic_hash,
             key.family,
@@ -514,17 +603,19 @@ fn write_unit(
             key.partition.kind(),
             rel_path,
             blob_oid,
+            partition_digest,
         ],
     )?;
     conn.execute(
         "INSERT INTO policy_units(
            policy_semantic_hash, family, partition_kind, seed_rel_path,
-           seed_blob_oid, seed_blob_id, lang, configuration_fingerprint,
-           active_model_set_hash, engine_epoch, completion, budget_mode,
-           product_kind, product, read_set_digest, published_at
+           seed_blob_oid, partition_digest, seed_blob_id, lang,
+           configuration_fingerprint, active_model_set_hash, engine_epoch,
+           completion, budget_mode, product_kind, product, read_set_digest,
+           published_at
          ) VALUES(
-           ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'complete', 'exhaustive',
-           ?11, ?12, ?13, ?14
+           ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'complete',
+           'exhaustive', ?12, ?13, ?14, ?15
          )",
         params![
             key.policy_semantic_hash,
@@ -532,6 +623,7 @@ fn write_unit(
             key.partition.kind(),
             rel_path,
             blob_oid,
+            partition_digest,
             blob_id,
             lang,
             key.configuration_fingerprint,
@@ -619,27 +711,24 @@ fn sweep_policy_rows(conn: &rusqlite::Connection, now: i64) -> rusqlite::Result<
     Ok(())
 }
 
-/// One unit row, without its reads.
+/// One unit row, without its reads. The columns are [`UNIT_COLUMNS`], in order.
 fn decode_unit_row(row: &rusqlite::Row<'_>) -> Result<(i64, PolicyUnitRow)> {
-    decode_unit_row_at(row, 0)
-}
-
-fn decode_unit_row_at(row: &rusqlite::Row<'_>, offset: usize) -> Result<(i64, PolicyUnitRow)> {
-    let unit_id = row.get::<_, i64>(offset)?;
-    let policy_semantic_hash = row.get::<_, String>(offset + 1)?;
-    let family = row.get::<_, String>(offset + 2)?;
-    let partition_kind = row.get::<_, String>(offset + 3)?;
-    let seed_rel_path = row.get::<_, String>(offset + 4)?;
-    let seed_blob_oid = row.get::<_, String>(offset + 5)?;
-    let lang = row.get::<_, Option<String>>(offset + 6)?;
-    let configuration_fingerprint = row.get::<_, String>(offset + 7)?;
-    let active_model_set_hash = row.get::<_, String>(offset + 8)?;
-    let engine_epoch = row.get::<_, String>(offset + 9)?;
-    let product_kind = row.get::<_, String>(offset + 10)?;
-    let product = row.get::<_, String>(offset + 11)?;
-    let read_set_digest = row.get::<_, Vec<u8>>(offset + 12)?;
+    let unit_id = row.get::<_, i64>(0)?;
+    let policy_semantic_hash = row.get::<_, String>(1)?;
+    let family = row.get::<_, String>(2)?;
+    let partition_kind = row.get::<_, String>(3)?;
+    let seed_rel_path = row.get::<_, String>(4)?;
+    let seed_blob_oid = row.get::<_, String>(5)?;
+    let partition_digest = row.get::<_, String>(6)?;
+    let lang = row.get::<_, Option<String>>(7)?;
+    let configuration_fingerprint = row.get::<_, String>(8)?;
+    let active_model_set_hash = row.get::<_, String>(9)?;
+    let engine_epoch = row.get::<_, String>(10)?;
+    let product_kind = row.get::<_, String>(11)?;
+    let product = row.get::<_, String>(12)?;
+    let read_set_digest = row.get::<_, Vec<u8>>(13)?;
     let partition = match partition_kind.as_str() {
-        "seed" => {
+        "seed" | "binding" | "assert_file" | "root" | "selector" => {
             let blob = Oid::from_str(&seed_blob_oid).map_err(|error| {
                 StoreError::new(format!(
                     "policy unit {unit_id} names an unreadable seed blob `{seed_blob_oid}`: {error}"
@@ -652,10 +741,36 @@ fn decode_unit_row_at(row: &rusqlite::Row<'_>, offset: usize) -> Result<(i64, Po
                 .as_deref()
                 .and_then(Language::from_config_label)
                 .unwrap_or_else(|| language_of_rel_path(&seed_rel_path));
-            PolicyUnitPartitionRow::Seed {
-                rel_path: seed_rel_path,
-                blob,
-                language,
+            match partition_kind.as_str() {
+                "seed" => PolicyUnitPartitionRow::Seed {
+                    rel_path: seed_rel_path,
+                    blob,
+                    language,
+                },
+                "binding" => PolicyUnitPartitionRow::Binding {
+                    rel_path: seed_rel_path,
+                    blob,
+                    language,
+                    binding: partition_digest,
+                },
+                "assert_file" => PolicyUnitPartitionRow::AssertFile {
+                    rel_path: seed_rel_path,
+                    blob,
+                    language,
+                    subjects: partition_digest,
+                },
+                "root" => PolicyUnitPartitionRow::Root {
+                    rel_path: seed_rel_path,
+                    blob,
+                    language,
+                    locator: partition_digest,
+                },
+                _ => PolicyUnitPartitionRow::Selector {
+                    rel_path: seed_rel_path,
+                    blob,
+                    language,
+                    selector: partition_digest,
+                },
             }
         }
         "whole" => PolicyUnitPartitionRow::Whole,
@@ -1062,8 +1177,26 @@ mod tests {
     const MODELS: &str = "cc11bb22cc33dd44ee55ff66007788990011223344556677889900aabbccddee";
     const EPOCH: &str = "dd11bb22cc33dd44ee55ff66007788990011223344556677889900aabbccddee";
     const BLOB: &str = "1111111111111111111111111111111111111111";
+    const SUBJECTS: &str = "ee11bb22cc33dd44ee55ff66007788990011223344556677889900aabbccddee";
     const TREE: &str = "2222222222222222222222222222222222222222";
     const COMMIT: &str = "3333333333333333333333333333333333333333";
+
+    /// One assertion policy's assert unit over `rel_path`.
+    fn assert_file_key(rel_path: &str) -> PolicyUnitRowKey {
+        PolicyUnitRowKey {
+            policy_semantic_hash: POLICY_HASH.to_string(),
+            family: "assertion".to_string(),
+            partition: PolicyUnitPartitionRow::AssertFile {
+                rel_path: rel_path.to_string(),
+                blob: Oid::from_str(BLOB).unwrap(),
+                language: Language::Java,
+                subjects: SUBJECTS.to_string(),
+            },
+            configuration_fingerprint: CONFIGURATION.to_string(),
+            active_model_set_hash: MODELS.to_string(),
+            engine_epoch: EPOCH.to_string(),
+        }
+    }
 
     fn seed_key(rel_path: &str) -> PolicyUnitRowKey {
         PolicyUnitRowKey {
@@ -1165,6 +1298,58 @@ mod tests {
         }
     }
 
+    /// An assert unit and a seed unit over the same file and blob are two
+    /// units, because the assert unit's key carries the digest of the subject
+    /// rows it asserted over and the seed unit's does not. Without that column
+    /// one would overwrite the other and a run would answer an assertion with a
+    /// query's rows.
+    #[test]
+    fn an_assert_file_unit_and_a_seed_unit_over_one_file_are_two_rows() {
+        let store = AnalyzerStore::open_ephemeral().unwrap();
+        let reads = vec![ReadKey::Epoch(StableDigest::sha256(b"epoch"))];
+        let seed = unit_row("src/Main.java", reads.clone());
+        let asserted = PolicyUnitRow {
+            key: assert_file_key("src/Main.java"),
+            product_kind: "assert_file".to_string(),
+            product: "{\"findings\":[]}".to_string(),
+            read_set_digest: *read_set_digest(&reads).digest().as_bytes(),
+            reads,
+        };
+
+        let written = store
+            .publish_policy_units(vec![seed, asserted])
+            .expect("both units publish");
+
+        assert_eq!(written, 2);
+        let answers = store
+            .policy_units_for_keys(&[assert_file_key("src/Main.java")])
+            .expect("the assert unit is looked up by its own key");
+        let [Some(loaded)] = answers.as_slice() else {
+            panic!("one key, one answer: {answers:#?}");
+        };
+        assert_eq!(loaded.product_kind, "assert_file");
+        assert_eq!(loaded.key, assert_file_key("src/Main.java"));
+    }
+
+    /// A unit whose product kind does not match its partition is refused by the
+    /// schema rather than loaded and rejected later.
+    #[test]
+    fn an_assert_partition_carrying_query_rows_is_refused() {
+        let store = AnalyzerStore::open_ephemeral().unwrap();
+        let reads = vec![ReadKey::Epoch(StableDigest::sha256(b"epoch"))];
+        let mismatched = PolicyUnitRow {
+            key: assert_file_key("src/Main.java"),
+            product_kind: "rows".to_string(),
+            product: "{\"rows\":[]}".to_string(),
+            read_set_digest: *read_set_digest(&reads).digest().as_bytes(),
+            reads,
+        };
+
+        store
+            .publish_policy_units(vec![mismatched])
+            .expect_err("a file's findings are an assert's product, not a query's");
+    }
+
     #[test]
     fn a_published_unit_round_trips_with_every_read_key_shape() {
         let store = AnalyzerStore::open_ephemeral().unwrap();
@@ -1254,88 +1439,136 @@ mod tests {
         assert!(error.to_string().contains("did not rebuild"), "{error}");
     }
 
-    #[test]
-    fn an_evaluation_links_its_units_in_merge_order() {
-        let store = AnalyzerStore::open_ephemeral().unwrap();
-        let units = vec![
-            unit_row("src/B.java", vec![]),
-            unit_row("src/A.java", vec![]),
-        ];
-        store.publish_policy_units(units).unwrap();
-        let key = PolicyEvaluationRowKey {
+    fn evaluation_key() -> PolicyEvaluationRowKey {
+        PolicyEvaluationRowKey {
             base_tree_oid: TREE.to_string(),
             policy_set_digest: POLICY_HASH.to_string(),
             options_digest: CONFIGURATION.to_string(),
             configuration_fingerprint: CONFIGURATION.to_string(),
             active_model_set_hash: MODELS.to_string(),
             engine_epoch: EPOCH.to_string(),
-        };
-        assert!(
-            store
-                .publish_policy_evaluation(PolicyEvaluationRow {
-                    key: key.clone(),
-                    resolved_commit: COMMIT.to_string(),
-                    analyzed_source_bytes: 42,
-                    analyzed_file_count: 2,
-                    units: vec![(
-                        "test.policy".to_string(),
-                        vec![seed_key("src/B.java"), seed_key("src/A.java")],
-                    )],
-                })
-                .unwrap()
-        );
+        }
+    }
+
+    fn finding_id(seed: &str) -> [u8; 32] {
+        *StableDigest::sha256(seed.as_bytes()).as_bytes()
+    }
+
+    #[test]
+    fn an_evaluation_records_the_identities_every_policy_concluded() {
+        let store = AnalyzerStore::open_ephemeral().unwrap();
+        store
+            .publish_policy_units(vec![unit_row("src/A.java", vec![])])
+            .unwrap();
+        let key = evaluation_key();
+        store
+            .publish_policy_evaluation(PolicyEvaluationRow {
+                key: key.clone(),
+                resolved_commit: COMMIT.to_string(),
+                identities: vec![
+                    (
+                        "test.match".to_string(),
+                        vec![finding_id("first"), finding_id("second")],
+                    ),
+                    // A whole-family policy publishes no unit and still
+                    // records what it found, which is the whole point of the
+                    // identities table.
+                    ("test.taint".to_string(), vec![finding_id("taint")]),
+                ],
+                units: vec![("test.match".to_string(), vec![seed_key("src/A.java")])],
+            })
+            .unwrap();
 
         let loaded = store
             .policy_evaluation_for_key(&key)
             .unwrap()
             .expect("the evaluation is found by its key");
-        assert!(loaded.is_complete());
         assert_eq!(loaded.resolved_commit, COMMIT);
-        assert_eq!(loaded.analyzed_source_bytes, 42);
-        let [(policy_id, units)] = loaded.units.as_slice() else {
-            panic!("one policy: {:#?}", loaded.units);
-        };
-        assert_eq!(policy_id, "test.policy");
+        let mut identities = loaded.identities;
+        for (_, findings) in &mut identities {
+            findings.sort_unstable();
+        }
+        let mut expected = vec![
+            (
+                "test.match".to_string(),
+                vec![finding_id("first"), finding_id("second")],
+            ),
+            ("test.taint".to_string(), vec![finding_id("taint")]),
+        ];
+        for (_, findings) in &mut expected {
+            findings.sort_unstable();
+        }
+        identities.sort_by(|left, right| left.0.cmp(&right.0));
+        expected.sort_by(|left, right| left.0.cmp(&right.0));
+        assert_eq!(identities, expected);
+    }
+
+    #[test]
+    fn an_evaluation_whose_unit_is_missing_still_records_its_identities() {
+        let store = AnalyzerStore::open_ephemeral().unwrap();
+        let key = evaluation_key();
+        store
+            .publish_policy_evaluation(PolicyEvaluationRow {
+                key: key.clone(),
+                resolved_commit: COMMIT.to_string(),
+                identities: vec![("test.policy".to_string(), vec![finding_id("only")])],
+                units: vec![("test.policy".to_string(), vec![seed_key("src/Gone.java")])],
+            })
+            .unwrap();
+
+        let loaded = store
+            .policy_evaluation_for_key(&key)
+            .unwrap()
+            .expect("an evaluation is its identities, not its units");
         assert_eq!(
-            units
-                .iter()
-                .map(|unit| unit.key.partition.key_columns().0)
-                .collect::<Vec<_>>(),
-            vec!["src/B.java".to_string(), "src/A.java".to_string()],
-            "the merge order the base walked is the order it is replayed in"
+            loaded.identities,
+            vec![("test.policy".to_string(), vec![finding_id("only")])]
+        );
+        let conn = store.conn.lock().expect("store mutex");
+        let memberships: i64 = conn
+            .query_row("SELECT COUNT(*) FROM policy_evaluation_units", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            memberships, 0,
+            "a unit that left the cache leaves no membership behind"
         );
     }
 
     #[test]
-    fn an_evaluation_whose_unit_is_missing_is_not_published() {
+    fn an_evaluation_republished_under_one_key_keeps_one_set_of_identities() {
         let store = AnalyzerStore::open_ephemeral().unwrap();
-        let published = store
-            .publish_policy_evaluation(PolicyEvaluationRow {
-                key: PolicyEvaluationRowKey {
-                    base_tree_oid: TREE.to_string(),
-                    policy_set_digest: POLICY_HASH.to_string(),
-                    options_digest: CONFIGURATION.to_string(),
-                    configuration_fingerprint: CONFIGURATION.to_string(),
-                    active_model_set_hash: MODELS.to_string(),
-                    engine_epoch: EPOCH.to_string(),
-                },
-                resolved_commit: COMMIT.to_string(),
-                analyzed_source_bytes: 0,
-                analyzed_file_count: 0,
-                units: vec![("test.policy".to_string(), vec![seed_key("src/Gone.java")])],
-            })
-            .unwrap();
-        assert!(
-            !published,
-            "an evaluation that cannot name all of its units is not an evaluation a run may reuse"
+        let key = evaluation_key();
+        for seed in ["first", "second"] {
+            store
+                .publish_policy_evaluation(PolicyEvaluationRow {
+                    key: key.clone(),
+                    resolved_commit: COMMIT.to_string(),
+                    identities: vec![("test.policy".to_string(), vec![finding_id(seed)])],
+                    units: Vec::new(),
+                })
+                .unwrap();
+        }
+
+        let loaded = store
+            .policy_evaluation_for_key(&key)
+            .unwrap()
+            .expect("the evaluation is found by its key");
+        assert_eq!(
+            loaded.identities,
+            vec![("test.policy".to_string(), vec![finding_id("second")])],
+            "the second evaluation replaced the first, cascade and all"
         );
         let conn = store.conn.lock().expect("store mutex");
         let rows: i64 = conn
-            .query_row("SELECT COUNT(*) FROM policy_evaluations", [], |row| {
-                row.get(0)
-            })
+            .query_row(
+                "SELECT COUNT(*) FROM policy_evaluation_identities",
+                [],
+                |row| row.get(0),
+            )
             .unwrap();
-        assert_eq!(rows, 0);
+        assert_eq!(rows, 1);
     }
 
     /// The batched unit lookup must seek the unit key once per requested
@@ -1347,7 +1580,7 @@ mod tests {
         let conn = store.conn.lock().expect("store mutex");
         let sql = format!(
             "EXPLAIN QUERY PLAN {}",
-            policy_unit_batch_sql("(?,?,?),(?,?,?)")
+            policy_unit_batch_sql("(?,?,?,?),(?,?,?,?)")
         );
         let mut statement = conn.prepare(&sql).unwrap();
         let plan = statement
@@ -1361,9 +1594,11 @@ mod tests {
                     "seed",
                     "src/A.java",
                     BLOB,
-                    "seed",
+                    "",
+                    "assert_file",
                     "src/B.java",
-                    BLOB
+                    BLOB,
+                    SUBJECTS
                 ],
                 |row| row.get::<_, String>(3),
             )
@@ -1417,6 +1652,36 @@ mod tests {
         assert!(
             plan.iter()
                 .all(|detail| !detail.contains("SCAN policy_evaluations")),
+            "{plan:#?}"
+        );
+    }
+
+    /// The identities of one evaluation are one seek on the primary key,
+    /// which is what makes the warm path a point read rather than a scan of
+    /// every evaluation this store retains.
+    #[test]
+    fn the_identity_read_seeks_the_evaluation_primary_key() {
+        let store = AnalyzerStore::open_ephemeral().unwrap();
+        let conn = store.conn.lock().expect("store mutex");
+        let mut statement = conn
+            .prepare(&format!(
+                "EXPLAIN QUERY PLAN {POLICY_EVALUATION_IDENTITY_SQL}"
+            ))
+            .unwrap();
+        let plan = statement
+            .query_map(params![1_i64], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(
+            plan.iter()
+                .any(|detail| detail
+                    .contains("SEARCH policy_evaluation_identities USING PRIMARY KEY")),
+            "{plan:#?}"
+        );
+        assert!(
+            plan.iter()
+                .all(|detail| !detail.contains("SCAN policy_evaluation_identities")),
             "{plan:#?}"
         );
     }

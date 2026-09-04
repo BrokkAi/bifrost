@@ -61,7 +61,7 @@ mod tests {
         let scope = AnalyzerQueryScope::new(&analyzer);
         let walks = RustUsageWalks::new(&analyzer, scope.token());
         let seeds = walks
-            .binding_seeds_while(&analyzer, &roots, &|| true)
+            .binding_seeds_while(&roots, &|| true)
             .expect("an uncancelled walk answers");
         let resolution = RustReferenceResolution::Exact(RustSymbolIdentity {
             file: source,

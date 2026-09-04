@@ -1235,6 +1235,13 @@ impl IdeDataflowProblem for TaintFlowProblem<'_> {
         true
     }
 
+    fn call_replaced_by_model(&self, call: &crate::analyzer::semantic::CallSiteHandle) -> bool {
+        self.plan
+            .value_flow()
+            .curated_model_for_call(call)
+            .is_some()
+    }
+
     fn zero_value(&self) -> Self::Value {
         self.plan.universe().empty_set()
     }
@@ -2295,7 +2302,10 @@ impl TaintSummaryResult {
         // the plan-time value-flow flag here asked it a second time and more
         // strictly, which withheld both tiers from every run a boundary model
         // exists to close (#2342).
-        let sanitizers_resolved = plan.sanitizers_resolved();
+        // Store bindings share the sanitizer contract: a persistence end whose
+        // carrier resolution stayed partial may still flow (the join is the
+        // sound direction) but must keep the run from a complete verdict.
+        let sanitizers_resolved = plan.sanitizers_resolved() && plan.stores_resolved();
         let derived_complete = value_flow.execution_result_complete(facts);
         let discovery_complete = derived_complete && sanitizers_resolved;
         // The run is proven only by authored models when every open boundary is

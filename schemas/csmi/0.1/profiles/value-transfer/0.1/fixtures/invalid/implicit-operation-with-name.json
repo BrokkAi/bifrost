@@ -1,0 +1,7 @@
+{
+  "kind": "implicit-operation",
+  "symbol": "copyConstructor",
+  "owner": "basicString",
+  "operation": "copy-constructor",
+  "name": "basic_string"
+}

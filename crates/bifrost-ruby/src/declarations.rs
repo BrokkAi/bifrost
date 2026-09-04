@@ -8,6 +8,7 @@ use brokk_bifrost_core::analyzer::parsed_file::ParsedFile;
 use brokk_bifrost_core::analyzer::structural::materialization::{
     GenerationKind, MaterializationRecord,
 };
+use brokk_bifrost_core::analyzer::structural::resolution::DeclaredVisibility;
 use brokk_bifrost_core::analyzer::tree_walk::{WalkControl, node_range, walk_named_tree_preorder};
 use brokk_bifrost_core::analyzer::{CodeUnit, ProjectFile};
 use brokk_bifrost_core::hash::HashSet;
@@ -885,20 +886,41 @@ fn first_line(node: Node<'_>, source: &str) -> String {
         .to_string()
 }
 
+/// The one place Ruby builds callable signature metadata for a `def`, so no
+/// declaration path can record parameter labels and forget the modifier facts
+/// that make the callable keyable for procedure-summary binding (#2912):
+/// `receiver_contract_of` refuses to answer for a callable whose adapter never
+/// inspected modifiers.
+///
+/// A `singleton_method` (`def self.name`) and a `method` inside a
+/// `class << self` body bind no instance receiver, which is what the receiver
+/// contract calls static; [`method_is_singleton_context`] reads exactly those
+/// two shapes. An ordinary `method` in a class or module body takes `self`. A
+/// `def` at file scope is an instance method of `Object`, so it is not static
+/// either; it has no type owner, and the contract falls out of that. Ruby has
+/// no constructor declaration shape (`initialize` is an ordinary instance
+/// method) and spells visibility as a method call rather than a modifier node,
+/// so those two facts stay `false` and `Unknown`.
 fn ruby_signature_metadata(signature: String, node: Node<'_>, source: &str) -> SignatureMetadata {
-    let Some(parameters_node) = node.child_by_field_name("parameters") else {
-        return SignatureMetadata::new(signature, Vec::new())
-            .with_dispatch_extensibility(DispatchExtensibility::Open);
+    let labels = match node.child_by_field_name("parameters") {
+        Some(parameters_node) => {
+            let mut cursor = parameters_node.walk();
+            parameters_node
+                .named_children(&mut cursor)
+                .filter_map(|child| ruby_parameter_label_node(child))
+                .map(|label_node| ruby_node_text(label_node, source).trim().to_string())
+                .filter(|label| !label.is_empty())
+                .collect()
+        }
+        None => Vec::new(),
     };
-    let mut cursor = parameters_node.walk();
-    let labels = parameters_node
-        .named_children(&mut cursor)
-        .filter_map(|child| ruby_parameter_label_node(child))
-        .map(|label_node| ruby_node_text(label_node, source).trim().to_string())
-        .filter(|label| !label.is_empty())
-        .collect();
     SignatureMetadata::with_parameter_labels(signature, labels)
         .with_dispatch_extensibility(DispatchExtensibility::Open)
+        .with_callable_modifiers(
+            method_is_singleton_context(node),
+            false,
+            DeclaredVisibility::Unknown,
+        )
 }
 
 fn ruby_parameter_label_node(node: Node<'_>) -> Option<Node<'_>> {
@@ -970,4 +992,57 @@ pub fn collect_ruby_identifiers(node: Node<'_>, source: &str, identifiers: &mut 
         }
         WalkControl::Continue
     });
+}
+
+#[cfg(test)]
+mod callable_modifier_tests {
+    use super::*;
+    use crate::adapter::parse_ruby_file;
+
+    /// The Ruby half of #2912. `def self.name` and a `def` inside
+    /// `class << self` bind no instance receiver; an ordinary `def` in a class
+    /// or module body, `initialize` included, binds one; a `def` at file scope
+    /// is an instance method of `Object` and is not static either. Every `def`
+    /// states that the walk read its declaration shape.
+    #[test]
+    fn callable_metadata_records_ruby_singleton_structurally() {
+        let source = "def top_level(value)\n  value\nend\n\nclass Widget\n  def initialize(spec)\n    @spec = spec\n  end\n\n  def self.build(spec)\n    new(spec)\n  end\n\n  def render(target)\n    target\n  end\n\n  class << self\n    def measure(target)\n      target\n    end\n  end\nend\n\nmodule Helpers\n  def helper\n  end\nend\n";
+        let file = ProjectFile::new(std::env::temp_dir(), "widget.rb");
+        let tree = parse_ruby_tree(source).expect("parse Ruby fixture");
+        let parsed = parse_ruby_file(&file, source, &tree);
+
+        let modifiers = |fq_name: &str| {
+            let metadata = parsed
+                .signature_metadata
+                .iter()
+                .find(|(unit, _)| unit.fq_name() == fq_name)
+                .and_then(|(_, metadata)| metadata.first())
+                .unwrap_or_else(|| {
+                    panic!(
+                        "missing Ruby callable {fq_name}; recorded {:?}",
+                        parsed
+                            .signature_metadata
+                            .keys()
+                            .map(CodeUnit::fq_name)
+                            .collect::<Vec<_>>()
+                    )
+                });
+            assert!(
+                metadata.callable_modifiers_recorded(),
+                "{fq_name} must record that the walk read its declaration shape"
+            );
+            (
+                metadata.callable_is_static(),
+                metadata.callable_is_constructor(),
+                metadata.parameters().len(),
+            )
+        };
+
+        assert_eq!(modifiers("top_level"), (false, false, 1));
+        assert_eq!(modifiers("Widget.initialize"), (false, false, 1));
+        assert_eq!(modifiers("Widget.build"), (true, false, 1));
+        assert_eq!(modifiers("Widget.render"), (false, false, 1));
+        assert_eq!(modifiers("Widget.measure"), (true, false, 1));
+        assert_eq!(modifiers("Helpers.helper"), (false, false, 0));
+    }
 }

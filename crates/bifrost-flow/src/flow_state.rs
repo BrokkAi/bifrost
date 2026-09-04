@@ -85,6 +85,24 @@ pub use brokk_bifrost_core::analyzer::structural::flow_state::{
     FlowSubjectKind, StateEventClass,
 };
 
+/// Stable content-scoped identity for one semantic procedure.
+///
+/// Mount-free by construction: the artifact contributes its public
+/// fingerprint, never the `SemanticArtifactKey` that folds the workspace
+/// mount, so the same content analyzed at two roots -- a head workspace and a
+/// base revision exported to a temporary directory -- yields the same id. This
+/// is the identity every rendered semantic row publishes, and it lives here,
+/// below the RQL crate, because the concurrency engine names procedures in the
+/// canonical locations it publishes and cannot reach a wire id defined above
+/// it.
+pub fn procedure_wire_id(handle: &ProcedureHandle) -> String {
+    let mut digest = LengthDelimitedDigest::new(b"bifrost-code-query-semantic-wire-id-v2");
+    digest.push(handle.artifact().key().public_fingerprint().as_bytes());
+    digest.push(b"procedure");
+    push_locator(&mut digest, handle.semantics().locator());
+    digest.finish().to_string()
+}
+
 /// Stable content-scoped identity for one semantic program point.
 pub fn program_point_wire_id(handle: &ProgramPointHandle) -> String {
     let procedure = handle.procedure();

@@ -259,6 +259,19 @@ pub fn file_scoped_field_fq(file: &ProjectFile, name: &str) -> FqName {
         .with_pushed(js_ts_segment(name, SegmentKind::Member))
 }
 
+/// The structured identity of a file-scoped *type* declaration: the same
+/// file-name `Path` prefix [`file_scoped_field_fq`] uses, followed by the
+/// declaration's own [`SegmentKind::Type`] segment.
+///
+/// A `type` alias renders exactly like a same-named module-scope `const`
+/// (`Type` and `Member` both join with `.`), so only the segment kind keeps the
+/// two identities apart -- which is the whole of #2911.
+pub fn file_scoped_type_fq(file: &ProjectFile, name: &str) -> FqName {
+    FqName::new()
+        .with_pushed(file_name_path_segment(file))
+        .with_pushed(js_ts_segment(name, SegmentKind::Type))
+}
+
 pub type TopLevelFieldIdentity = fn(&ProjectFile, &str) -> (String, FqName);
 
 pub fn file_scoped_field_identity(file: &ProjectFile, name: &str) -> (String, FqName) {

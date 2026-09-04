@@ -6,7 +6,7 @@ use crate::analyzer::semantic::{
 use crate::dataflow::UnmodeledCallBehavior;
 use crate::value_flow::{
     ValueFlowCarrierId, ValueFlowEventKind, ValueFlowObservationPhase, ValueFlowPlan,
-    ValueFlowSinkId, ValueFlowSourceId,
+    ValueFlowSinkId, ValueFlowSinkSpec, ValueFlowSourceId, ValueFlowSourceSpec,
 };
 
 use super::{SourceEventKey, TaintClassSet, TaintEdgeFunction, TaintUniverse, TaintUniverseHash};
@@ -245,6 +245,151 @@ impl TaintTransformBinding {
     }
 }
 
+/// The resolution of one optional store discrimination dimension (the key a
+/// value is stored under, or the store instance it is stored in).
+///
+/// A dimension separates two ends of a persistence boundary only when both
+/// ends carry a proven identity and the identities differ. Everything else
+/// joins: an undeclared dimension expresses "the whole store" and an unproven
+/// one must not manufacture a separation the analysis cannot defend. Joining
+/// is the sound direction for a may-analysis.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum TaintStoreDimension {
+    /// The policy did not declare this dimension on the entry.
+    Undeclared,
+    /// Declared, but the compiler could not prove a stable identity for the
+    /// selected call's dimension port.
+    Unproven,
+    /// Declared and resolved to a stable identity digest minted by the
+    /// policy compiler (a constant key token, or a store-instance location).
+    Proven(StableDigest),
+}
+
+impl TaintStoreDimension {
+    fn separates(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Proven(left), Self::Proven(right)) => left != right,
+            _ => false,
+        }
+    }
+}
+
+/// The runtime store identity one write or read binding participates in: the
+/// declared store name plus the resolved discrimination dimensions.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct TaintStoreChannel {
+    store: Box<str>,
+    instance: TaintStoreDimension,
+    key: TaintStoreDimension,
+}
+
+impl TaintStoreChannel {
+    pub fn new(
+        store: impl Into<Box<str>>,
+        instance: TaintStoreDimension,
+        key: TaintStoreDimension,
+    ) -> Self {
+        let store = store.into();
+        assert!(
+            !store.is_empty(),
+            "a store channel requires a declared store name"
+        );
+        Self {
+            store,
+            instance,
+            key,
+        }
+    }
+
+    pub fn store(&self) -> &str {
+        &self.store
+    }
+
+    pub const fn instance(&self) -> &TaintStoreDimension {
+        &self.instance
+    }
+
+    pub const fn key(&self) -> &TaintStoreDimension {
+        &self.key
+    }
+
+    /// Whether a write on this channel may reach a read on `other`.
+    ///
+    /// Store names must match exactly; each discrimination dimension then
+    /// separates the pair only when both ends prove distinct identities.
+    pub fn may_alias(&self, other: &Self) -> bool {
+        self.store == other.store
+            && !self.instance.separates(&other.instance)
+            && !self.key.separates(&other.key)
+    }
+}
+
+/// One declared store write: the internal value-flow sink observing the
+/// written carrier, and the channel identity the write publishes into.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaintStoreWriteBinding {
+    sink: ValueFlowSinkId,
+    channel: TaintStoreChannel,
+    complete: bool,
+}
+
+impl TaintStoreWriteBinding {
+    pub const fn new(sink: ValueFlowSinkId, channel: TaintStoreChannel, complete: bool) -> Self {
+        Self {
+            sink,
+            channel,
+            complete,
+        }
+    }
+
+    pub const fn sink(&self) -> ValueFlowSinkId {
+        self.sink
+    }
+
+    pub const fn channel(&self) -> &TaintStoreChannel {
+        &self.channel
+    }
+
+    pub const fn is_complete(&self) -> bool {
+        self.complete
+    }
+}
+
+/// One declared store read: the internal value-flow source establishing the
+/// returned carrier, and the channel identity the read consumes from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaintStoreReadBinding {
+    source: ValueFlowSourceId,
+    channel: TaintStoreChannel,
+    complete: bool,
+}
+
+impl TaintStoreReadBinding {
+    pub const fn new(
+        source: ValueFlowSourceId,
+        channel: TaintStoreChannel,
+        complete: bool,
+    ) -> Self {
+        Self {
+            source,
+            channel,
+            complete,
+        }
+    }
+
+    pub const fn source(&self) -> ValueFlowSourceId {
+        self.source
+    }
+
+    pub const fn channel(&self) -> &TaintStoreChannel {
+        &self.channel
+    }
+
+    pub const fn is_complete(&self) -> bool {
+        self.complete
+    }
+}
+
 /// One already-resolved, policy-neutral taint fixed-point input.
 #[derive(Debug, Clone)]
 pub struct TaintAnalysisPlan {
@@ -254,6 +399,8 @@ pub struct TaintAnalysisPlan {
     sinks: Box<[TaintSinkBinding]>,
     sanitizers: Box<[TaintSanitizerBinding]>,
     transforms: Box<[TaintTransformBinding]>,
+    store_writes: Box<[TaintStoreWriteBinding]>,
+    store_reads: Box<[TaintStoreReadBinding]>,
     identity: TaintEdgeFunction,
     phase_transfers: Box<[ResolvedTaintTransfer]>,
     sanitizers_resolved: bool,
@@ -453,11 +600,148 @@ impl TaintAnalysisPlan {
             sinks: sinks.into_boxed_slice(),
             sanitizers: sanitizers.into_boxed_slice(),
             transforms: transforms.into_boxed_slice(),
+            store_writes: Box::default(),
+            store_reads: Box::default(),
             identity,
             phase_transfers: phase_transfers.into_boxed_slice(),
             sanitizers_resolved,
             owner: Arc::new(()),
         })
+    }
+
+    /// Attach persistence-boundary bindings to this plan.
+    ///
+    /// Every write must name a value-flow sink of this plan and every read a
+    /// value-flow source, each at most once. The driver seeds each read's
+    /// taint source binding with the classes observed at the writes whose
+    /// channel may alias the read's channel; the plan itself only carries the
+    /// linkage identity.
+    pub fn with_stores(
+        mut self,
+        mut store_writes: Vec<TaintStoreWriteBinding>,
+        mut store_reads: Vec<TaintStoreReadBinding>,
+    ) -> Result<Self, TaintPlanError> {
+        store_writes.sort_by(|left, right| {
+            left.sink
+                .cmp(&right.sink)
+                .then_with(|| left.channel.cmp(&right.channel))
+        });
+        store_reads.sort_by(|left, right| {
+            left.source
+                .cmp(&right.source)
+                .then_with(|| left.channel.cmp(&right.channel))
+        });
+        if store_writes
+            .windows(2)
+            .any(|pair| pair[0].sink == pair[1].sink)
+            || store_reads
+                .windows(2)
+                .any(|pair| pair[0].source == pair[1].source)
+        {
+            return Err(TaintPlanError::DuplicateBinding);
+        }
+        for write in &store_writes {
+            if self.value_flow.sink(write.sink).is_none() {
+                return Err(TaintPlanError::InvalidSink);
+            }
+        }
+        for read in &store_reads {
+            if self.value_flow.source(read.source).is_none() {
+                return Err(TaintPlanError::InvalidSource);
+            }
+        }
+        self.store_writes = store_writes.into_boxed_slice();
+        self.store_reads = store_reads.into_boxed_slice();
+        Ok(self)
+    }
+
+    /// Derive the plan the store-seeding driver solves to observe which
+    /// classes reach each declared store write: the same plan with every
+    /// write's value-flow sink bound to accept the full universe. The caller
+    /// discards the resulting findings after reading the per-sink classes;
+    /// this variant never projects policy findings.
+    pub fn with_store_write_observations(&self) -> Result<Self, TaintPlanError> {
+        let full = self
+            .universe
+            .class_set(self.universe.classes().iter())
+            .expect("a universe accepts its own classes");
+        let mut sinks = self.sinks.to_vec();
+        for write in &self.store_writes {
+            if sinks.iter().any(|sink| sink.sink() == write.sink) {
+                return Err(TaintPlanError::DuplicateBinding);
+            }
+            sinks.push(TaintSinkBinding::new(write.sink, full.clone()));
+        }
+        let rebuilt = Self::new(
+            self.value_flow.clone(),
+            self.universe.clone(),
+            self.sources.to_vec(),
+            sinks,
+            self.sanitizers.to_vec(),
+            self.transforms.to_vec(),
+        )?;
+        rebuilt.with_stores(self.store_writes.to_vec(), self.store_reads.to_vec())
+    }
+
+    /// Derive the plan with the given store reads seeded as taint sources.
+    /// Each seed names one of this plan's store-read sources and the classes
+    /// the linked writes were observed to receive; the origin key is the
+    /// read's own source event. A read with no seed stays inert.
+    pub fn with_seeded_store_reads(
+        &self,
+        seeds: &[(ValueFlowSourceId, TaintClassSet)],
+    ) -> Result<Self, TaintPlanError> {
+        let mut sources = self.sources.to_vec();
+        for (source, classes) in seeds {
+            if classes.is_empty() {
+                continue;
+            }
+            if !self.store_reads.iter().any(|read| read.source == *source) {
+                return Err(TaintPlanError::InvalidSource);
+            }
+            if sources.iter().any(|binding| binding.source() == *source) {
+                return Err(TaintPlanError::DuplicateBinding);
+            }
+            let spec = self
+                .value_flow
+                .source(*source)
+                .ok_or(TaintPlanError::InvalidSource)?;
+            sources.push(TaintSourceBinding::new(
+                *source,
+                classes.clone(),
+                SourceEventKey::new(spec.key().clone()),
+            ));
+        }
+        let rebuilt = Self::new(
+            self.value_flow.clone(),
+            self.universe.clone(),
+            sources,
+            self.sinks.to_vec(),
+            self.sanitizers.to_vec(),
+            self.transforms.to_vec(),
+        )?;
+        rebuilt.with_stores(self.store_writes.to_vec(), self.store_reads.to_vec())
+    }
+
+    pub fn store_writes(&self) -> &[TaintStoreWriteBinding] {
+        &self.store_writes
+    }
+
+    pub fn store_reads(&self) -> &[TaintStoreReadBinding] {
+        &self.store_reads
+    }
+
+    /// Whether every store binding this plan compiled resolved completely.
+    /// Mirrors [`Self::sanitizers_resolved`]: an incomplete store binding must
+    /// keep the run from reporting a complete verdict.
+    pub fn stores_resolved(&self) -> bool {
+        self.store_writes
+            .iter()
+            .all(TaintStoreWriteBinding::is_complete)
+            && self
+                .store_reads
+                .iter()
+                .all(TaintStoreReadBinding::is_complete)
     }
 
     pub const fn value_flow(&self) -> &ValueFlowPlan {
@@ -491,6 +775,8 @@ impl TaintAnalysisPlan {
             .saturating_add(self.sinks.len())
             .saturating_add(self.sanitizers.len())
             .saturating_add(self.transforms.len())
+            .saturating_add(self.store_writes.len())
+            .saturating_add(self.store_reads.len())
     }
 
     /// Whether every sanitizer this plan compiled resolved to a model.
@@ -534,6 +820,8 @@ impl TaintAnalysisPlan {
             .saturating_add(size_of_val(&*self.sinks))
             .saturating_add(size_of_val(&*self.sanitizers))
             .saturating_add(size_of_val(&*self.transforms))
+            .saturating_add(size_of_val(&*self.store_writes))
+            .saturating_add(size_of_val(&*self.store_reads))
             .saturating_add(size_of_val(&*self.phase_transfers))
             .saturating_add(
                 self.sources
@@ -724,8 +1012,9 @@ const TAINT_PROPAGATION_SEMANTICS_DOMAIN: &[u8] = b"bifrost.taint.propagation-se
 
 /// The identity of every ingredient that decides propagation results for one
 /// solve: the workspace snapshot the plan was built from, the analysis root,
-/// the value flow's own propagation semantics, and the sanitizers that remove
-/// taint along the way.
+/// the value flow's own propagation semantics, the sanitizers that remove
+/// taint along the way, and the persistence-store bindings that seed taint
+/// across region boundaries.
 ///
 /// This is a domain-separated SHA-256 over stable encodings, never a rendered
 /// string. `Debug` output is not a stability contract, and a Debug-formatted
@@ -745,12 +1034,14 @@ impl TaintPropagationSemanticsId {
         root: &SemanticLocator,
         value_flow_propagation_hash: u64,
         sanitizer_hash: u64,
+        store_hash: u64,
     ) -> Self {
         let mut digest = LengthDelimitedDigest::new(TAINT_PROPAGATION_SEMANTICS_DOMAIN);
         digest.push(workspace_snapshot.as_bytes());
         root.push_stable_identity(&mut digest);
         digest.push(&value_flow_propagation_hash.to_le_bytes());
         digest.push(&sanitizer_hash.to_le_bytes());
+        digest.push(&store_hash.to_le_bytes());
         Self(digest.finish())
     }
 
@@ -873,6 +1164,21 @@ impl TaintPolicyProjection {
 }
 
 impl TaintBatch {
+    /// Derive the batch whose analysis has the given store-read seeds bound
+    /// as taint sources. Seeding changes bindings, never propagation
+    /// semantics, so the compatibility key and per-policy projections carry
+    /// over unchanged.
+    pub fn with_seeded_store_reads(
+        &self,
+        seeds: &[(ValueFlowSourceId, TaintClassSet)],
+    ) -> Result<Self, TaintPlanError> {
+        Ok(Self {
+            compatibility: self.compatibility,
+            projections: self.projections.clone(),
+            analysis: self.analysis.with_seeded_store_reads(seeds)?,
+        })
+    }
+
     pub const fn compatibility(&self) -> &TaintBatchCompatibilityKey {
         &self.compatibility
     }
@@ -947,6 +1253,10 @@ impl TaintBatchPlanner {
                     sinks,
                     remap_sanitizers(&first.analysis, &value_flow)?,
                     remap_transforms(&first.analysis, &value_flow)?,
+                )?
+                .with_stores(
+                    remap_store_writes(&first.analysis, &value_flow)?,
+                    remap_store_reads(&first.analysis, &value_flow)?,
                 )?;
                 Ok(TaintBatch {
                     compatibility,
@@ -968,6 +1278,7 @@ fn ensure_same_semantics(
             .has_same_propagation_semantics(&right.value_flow)
         || !same_sanitizers(left, right)
         || !same_transforms(left, right)
+        || !same_stores(left, right)
     {
         return Err(TaintPlanError::IncompatibleBatchMember);
     }
@@ -1111,6 +1422,91 @@ fn same_sanitizers(left: &TaintAnalysisPlan, right: &TaintAnalysisPlan) -> bool 
             })
 }
 
+fn remap_store_writes(
+    analysis: &TaintAnalysisPlan,
+    value_flow: &ValueFlowPlan,
+) -> Result<Vec<TaintStoreWriteBinding>, TaintPlanError> {
+    analysis
+        .store_writes
+        .iter()
+        .map(|binding| {
+            let spec = analysis
+                .value_flow
+                .sink(binding.sink)
+                .ok_or(TaintPlanError::InvalidSink)?;
+            let remapped = value_flow
+                .sink_id_for_key(spec.key())
+                .ok_or(TaintPlanError::InvalidSink)?;
+            Ok(TaintStoreWriteBinding::new(
+                remapped,
+                binding.channel.clone(),
+                binding.complete,
+            ))
+        })
+        .collect()
+}
+
+fn remap_store_reads(
+    analysis: &TaintAnalysisPlan,
+    value_flow: &ValueFlowPlan,
+) -> Result<Vec<TaintStoreReadBinding>, TaintPlanError> {
+    analysis
+        .store_reads
+        .iter()
+        .map(|binding| {
+            let spec = analysis
+                .value_flow
+                .source(binding.source)
+                .ok_or(TaintPlanError::InvalidSource)?;
+            let remapped = value_flow
+                .source_id_for_key(spec.key())
+                .ok_or(TaintPlanError::InvalidSource)?;
+            Ok(TaintStoreReadBinding::new(
+                remapped,
+                binding.channel.clone(),
+                binding.complete,
+            ))
+        })
+        .collect()
+}
+
+fn same_stores(left: &TaintAnalysisPlan, right: &TaintAnalysisPlan) -> bool {
+    left.store_writes.len() == right.store_writes.len()
+        && left.store_reads.len() == right.store_reads.len()
+        && left
+            .store_writes
+            .iter()
+            .zip(&right.store_writes)
+            .all(|(left_binding, right_binding)| {
+                left_binding.channel == right_binding.channel
+                    && left_binding.complete == right_binding.complete
+                    && left
+                        .value_flow
+                        .sink(left_binding.sink)
+                        .map(ValueFlowSinkSpec::key)
+                        == right
+                            .value_flow
+                            .sink(right_binding.sink)
+                            .map(ValueFlowSinkSpec::key)
+            })
+        && left
+            .store_reads
+            .iter()
+            .zip(&right.store_reads)
+            .all(|(left_binding, right_binding)| {
+                left_binding.channel == right_binding.channel
+                    && left_binding.complete == right_binding.complete
+                    && left
+                        .value_flow
+                        .source(left_binding.source)
+                        .map(ValueFlowSourceSpec::key)
+                        == right
+                            .value_flow
+                            .source(right_binding.source)
+                            .map(ValueFlowSourceSpec::key)
+            })
+}
+
 fn same_transforms(left: &TaintAnalysisPlan, right: &TaintAnalysisPlan) -> bool {
     left.transforms.len() == right.transforms.len()
         && left
@@ -1231,19 +1627,25 @@ mod tests {
     #[test]
     fn propagation_semantics_separates_every_ingredient_that_changes_results() {
         let base =
-            TaintPropagationSemanticsId::new(&snapshot(1), &locator("src/A.java", "run"), 7, 9);
+            TaintPropagationSemanticsId::new(&snapshot(1), &locator("src/A.java", "run"), 7, 9, 11);
 
         assert_eq!(
             base,
-            TaintPropagationSemanticsId::new(&snapshot(1), &locator("src/A.java", "run"), 7, 9),
+            TaintPropagationSemanticsId::new(&snapshot(1), &locator("src/A.java", "run"), 7, 9, 11),
             "equal ingredients must produce one batch compatibility class"
         );
         for changed in [
-            TaintPropagationSemanticsId::new(&snapshot(2), &locator("src/A.java", "run"), 7, 9),
-            TaintPropagationSemanticsId::new(&snapshot(1), &locator("src/B.java", "run"), 7, 9),
-            TaintPropagationSemanticsId::new(&snapshot(1), &locator("src/A.java", "other"), 7, 9),
-            TaintPropagationSemanticsId::new(&snapshot(1), &locator("src/A.java", "run"), 8, 9),
-            TaintPropagationSemanticsId::new(&snapshot(1), &locator("src/A.java", "run"), 7, 8),
+            TaintPropagationSemanticsId::new(&snapshot(2), &locator("src/A.java", "run"), 7, 9, 11),
+            TaintPropagationSemanticsId::new(&snapshot(1), &locator("src/B.java", "run"), 7, 9, 11),
+            TaintPropagationSemanticsId::new(
+                &snapshot(1),
+                &locator("src/A.java", "other"),
+                7,
+                9,
+                11,
+            ),
+            TaintPropagationSemanticsId::new(&snapshot(1), &locator("src/A.java", "run"), 8, 9, 11),
+            TaintPropagationSemanticsId::new(&snapshot(1), &locator("src/A.java", "run"), 7, 8, 11),
         ] {
             assert_ne!(
                 base, changed,
@@ -1267,17 +1669,74 @@ mod tests {
         root.push_stable_identity(&mut expected);
         expected.push(&7_u64.to_le_bytes());
         expected.push(&9_u64.to_le_bytes());
+        expected.push(&11_u64.to_le_bytes());
 
         assert_eq!(
-            TaintPropagationSemanticsId::new(&snapshot(1), &root, 7, 9).as_bytes(),
+            TaintPropagationSemanticsId::new(&snapshot(1), &root, 7, 9, 11).as_bytes(),
             expected.finish().as_bytes()
+        );
+    }
+
+    #[test]
+    fn store_channels_separate_only_on_proven_distinct_dimensions() {
+        let proven_a = TaintStoreDimension::Proven(snapshot(10));
+        let proven_b = TaintStoreDimension::Proven(snapshot(11));
+        let primary = |instance: TaintStoreDimension, key: TaintStoreDimension| {
+            TaintStoreChannel::new("primary", instance, key)
+        };
+
+        // Equal store name and no separating dimension: aliases.
+        assert!(
+            primary(TaintStoreDimension::Undeclared, proven_a.clone())
+                .may_alias(&primary(TaintStoreDimension::Undeclared, proven_a.clone())),
+            "equal proven keys on one store must alias"
+        );
+        // A proven-distinct key separates.
+        assert!(
+            !primary(TaintStoreDimension::Undeclared, proven_a.clone())
+                .may_alias(&primary(TaintStoreDimension::Undeclared, proven_b.clone())),
+            "proven distinct keys must separate"
+        );
+        // A proven-distinct instance separates.
+        assert!(
+            !primary(proven_a.clone(), TaintStoreDimension::Undeclared)
+                .may_alias(&primary(proven_b.clone(), TaintStoreDimension::Undeclared)),
+            "proven distinct instances must separate"
+        );
+        // Any unproven or undeclared side joins: the analysis cannot defend a
+        // separation it did not prove.
+        assert!(
+            primary(TaintStoreDimension::Unproven, proven_a.clone())
+                .may_alias(&primary(proven_b.clone(), proven_a.clone())),
+            "an unproven instance must join"
+        );
+        assert!(
+            primary(
+                TaintStoreDimension::Undeclared,
+                TaintStoreDimension::Unproven
+            )
+            .may_alias(&primary(TaintStoreDimension::Undeclared, proven_b)),
+            "an unproven key must join"
+        );
+        // Different store names never alias, whatever the dimensions say.
+        assert!(
+            !primary(
+                TaintStoreDimension::Undeclared,
+                TaintStoreDimension::Undeclared
+            )
+            .may_alias(&TaintStoreChannel::new(
+                "secondary",
+                TaintStoreDimension::Undeclared,
+                TaintStoreDimension::Undeclared,
+            )),
+            "distinct store names must separate"
         );
     }
 
     #[test]
     fn compatibility_keys_separate_call_behavior_from_propagation_semantics() {
         let semantics =
-            TaintPropagationSemanticsId::new(&snapshot(1), &locator("src/A.java", "run"), 7, 9);
+            TaintPropagationSemanticsId::new(&snapshot(1), &locator("src/A.java", "run"), 7, 9, 11);
         let universe =
             TaintUniverse::new(vec![SourceClassId::new("input.user-controlled").unwrap()])
                 .unwrap()

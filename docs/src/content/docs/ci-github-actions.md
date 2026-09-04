@@ -97,7 +97,9 @@ jobs:
 
 The checkout must contain the base revision: `fetch-depth: 0` is the simple form, or fetch the base SHA explicitly. If the base revision does not resolve, the run exits `2` (unreliable) rather than silently gating on everything. If the base revision resolves but its evaluation cannot prove its own completeness, the run degrades to full gating and reports a `diff-base-unreliable` diagnostic, so a broken base can never hide new findings.
 
-Two identity limitations are accepted: a pure file rename re-keys every finding in the file (one `fixed` plus one `new`), and inserting an identical duplicate of an existing source slice above it under the same owner can shift the ordinal that distinguishes the duplicates and misclassify one pair.
+With `cache` on, which is the default, the run stores what each policy concluded over the base revision and what every part of that evaluation read. A later run against the same base restores that cache, skips the base export and build, and recomputes only the parts of the pull request's tree whose inputs changed, so a pull-request run pays for its own change rather than for the whole base. `cache: 'false'` keeps nothing between runs, so every run evaluates both revisions in full. The report is the same either way: findings, identities, `baselineState` values, diagnostics, and the exit code do not depend on what the cache holds. Only the report's `incremental` section, which records what the run reused, and the run's own work counters differ.
+
+Three identity limitations are accepted: a pure file rename re-keys every finding in the file (one `fixed` plus one `new`), inserting an identical duplicate of an existing source slice above it under the same owner can shift the ordinal that distinguishes the duplicates and misclassify one pair, and an edit that changes which declarations a typestate policy binds re-keys every finding that policy reports.
 
 ## Onboard a legacy repository with a committed baseline
 

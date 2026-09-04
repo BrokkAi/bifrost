@@ -154,6 +154,13 @@ impl KotlinAnalyzer {
 }
 
 impl ImportAnalysisProvider for KotlinAnalyzer {
+    fn import_infos_for_files(
+        &self,
+        files: &[ProjectFile],
+    ) -> Option<crate::hash::HashMap<ProjectFile, Vec<crate::analyzer::ImportInfo>>> {
+        Some(self.inner.bulk_import_infos(files.iter().cloned()))
+    }
+
     fn file_dependency_facts_for_files(
         &self,
         files: &[ProjectFile],
@@ -373,8 +380,8 @@ mod tests {
                 .map(|unit| unit.fq_name())
                 .collect::<Vec<_>>(),
             vec!["api.Registry".to_string()],
-            "the single-line object must resolve: its misparse is recovered \
-             by the declaration walk"
+            "the single-line object must resolve: the pinned grammar parses \
+             it as a real object_declaration"
         );
 
         let _scope = AnalyzerQueryScope::new(&analyzer);

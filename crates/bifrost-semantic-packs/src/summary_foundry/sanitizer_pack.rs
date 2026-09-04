@@ -579,6 +579,7 @@ fn build_summary(
         input: input.clone(),
         exit_kind: AuthoredSummaryExitKind::Normal,
         output: output.clone(),
+        value_transfer: None,
     };
     let effect = AuthoredSummaryEffect::Sanitize {
         input,
@@ -762,6 +763,7 @@ impl PackIdentity {
                 review_required: true,
             },
             carried_sources: Vec::new(),
+            cpp_portability: None,
             shards: vec![AuthoredShard {
                 id: format!("sanitizers.{}", self.ecosystem),
                 activation: vec![self.activation.clone()],

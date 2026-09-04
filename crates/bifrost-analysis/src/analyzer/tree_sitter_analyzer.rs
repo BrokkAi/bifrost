@@ -1994,6 +1994,76 @@ impl<K: Eq + std::hash::Hash + Clone, V: Clone + ByteBounded> ByteBoundedStore<K
     }
 }
 
+/// How many files' blob identities [`SourceBlobOidMemo`] retains. One entry is
+/// a `ProjectFile`, a length, a 64-bit source hash, a 20-byte oid, and moka's
+/// bookkeeping, so the cap bounds the memo to a few megabytes on the largest
+/// workspaces; it is a bound rather than a target.
+const SOURCE_BLOB_OID_MEMO_ENTRIES: u64 = 32_768;
+
+/// The blob oid of the exact source string last hashed for one file, with the
+/// cheap identity (length and FxHash) that lets a later call recognize the
+/// same bytes without re-running SHA-1.
+#[derive(Clone, Copy)]
+struct SourceBlobIdentity {
+    len: usize,
+    source_hash: u64,
+    oid: Oid,
+}
+
+/// Per-file memo of "the blob oid of these exact source bytes" (#2917).
+///
+/// Every query path that persists or looks up facts under a file's content key
+/// used to recompute that key with libgit2's collision-detecting SHA-1 over the
+/// whole source, per file per query: about 10% of a warm C++ inverse scan. The
+/// answer is a pure function of the bytes, so it is memoized per file and
+/// validated by the source's length and FxHash -- the identity the structural
+/// facts cache already trusts -- and shared across analyzer clones like the
+/// other content-keyed memos. A file whose bytes change (a dirty edit, a new
+/// overlay revision) misses on the identity and is hashed once more.
+struct SourceBlobOidMemo {
+    entries: moka::sync::Cache<ProjectFile, SourceBlobIdentity>,
+    /// SHA-1 computations performed, for the #2917 cost pin.
+    #[cfg(any(test, feature = "test-support"))]
+    hashes: AtomicUsize,
+}
+
+impl Default for SourceBlobOidMemo {
+    fn default() -> Self {
+        Self {
+            entries: moka::sync::Cache::builder()
+                .max_capacity(SOURCE_BLOB_OID_MEMO_ENTRIES)
+                .build(),
+            #[cfg(any(test, feature = "test-support"))]
+            hashes: AtomicUsize::new(0),
+        }
+    }
+}
+
+impl SourceBlobOidMemo {
+    fn oid_of(&self, file: &ProjectFile, source: &str) -> Oid {
+        let source_hash = crate::analyzer::structural::provider::hash_source(source);
+        if let Some(known) = self.entries.get(file)
+            && known.len == source.len()
+            && known.source_hash == source_hash
+        {
+            return known.oid;
+        }
+        #[cfg(any(test, feature = "test-support"))]
+        self.hashes.fetch_add(1, Ordering::Relaxed);
+        let oid = Oid::hash_object(ObjectType::Blob, source.as_bytes())
+            .expect("hashing in-memory bytes as a blob cannot fail");
+        self.entries.insert(
+            file.clone(),
+            SourceBlobIdentity {
+                len: source.len(),
+                source_hash,
+                oid,
+            },
+        );
+        oid
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct ResolvedLiveSource {
     oid: Oid,
@@ -2812,6 +2882,10 @@ pub struct TreeSitterAnalyzer<A> {
     /// blob identity of the exact source the digest was taken from, so an
     /// entry is a pure function of content and can never go stale.
     semantic_source_digests: crate::analyzer::semantic::service::SourceContentIdentityMemo,
+    /// Blob oids already derived for a file's exact source bytes, so a query
+    /// path that keys facts by content does not re-hash an unchanged file.
+    /// See [`Self::blob_oid_of`].
+    blob_oids: Arc<SourceBlobOidMemo>,
     store_context: AnalyzerStoreContext,
     /// Immutable path-to-blob identities for the source generation that built
     /// this analyzer. Queries may refresh `store_context.live_paths` as they
@@ -2890,6 +2964,7 @@ pub struct TreeSitterAnalyzer<A> {
     sql_definitions_query_count: Arc<AtomicUsize>,
     definition_candidates_query_count: Arc<AtomicUsize>,
     definition_prefetch_batch_count: Arc<AtomicUsize>,
+    relational_definition_batch_call_count: Arc<AtomicUsize>,
     definition_candidate_row_read_count: Arc<AtomicUsize>,
     /// Candidate spellings dropped by `definition_candidate_short_names`
     /// because the persisted `short_name` vocabulary for this adapter's
@@ -2929,6 +3004,7 @@ impl<A> Clone for TreeSitterAnalyzer<A> {
             content_identity_base: self.content_identity_base,
             semantic_cache: self.semantic_cache.clone(),
             semantic_source_digests: self.semantic_source_digests.clone(),
+            blob_oids: Arc::clone(&self.blob_oids),
             store_context: self.store_context.clone(),
             indexed_live_snapshot: Arc::clone(&self.indexed_live_snapshot),
             relational_workspace_snapshots: Arc::clone(&self.relational_workspace_snapshots),
@@ -2953,6 +3029,9 @@ impl<A> Clone for TreeSitterAnalyzer<A> {
             sql_definitions_query_count: Arc::clone(&self.sql_definitions_query_count),
             definition_candidates_query_count: Arc::clone(&self.definition_candidates_query_count),
             definition_prefetch_batch_count: Arc::clone(&self.definition_prefetch_batch_count),
+            relational_definition_batch_call_count: Arc::clone(
+                &self.relational_definition_batch_call_count,
+            ),
             definition_candidate_row_read_count: Arc::clone(
                 &self.definition_candidate_row_read_count,
             ),
@@ -3161,6 +3240,7 @@ where
             semantic_cache,
             semantic_source_digests:
                 crate::analyzer::semantic::service::SourceContentIdentityMemo::default(),
+            blob_oids: Arc::new(SourceBlobOidMemo::default()),
             store_context,
             indexed_live_snapshot,
             relational_workspace_snapshots: Arc::new(arc_swap::ArcSwap::from(
@@ -3199,6 +3279,7 @@ where
             sql_definitions_query_count: Arc::new(AtomicUsize::new(0)),
             definition_candidates_query_count: Arc::new(AtomicUsize::new(0)),
             definition_prefetch_batch_count: Arc::new(AtomicUsize::new(0)),
+            relational_definition_batch_call_count: Arc::new(AtomicUsize::new(0)),
             definition_candidate_row_read_count: Arc::new(AtomicUsize::new(0)),
             structural_miss_spelling_count: Arc::new(AtomicUsize::new(0)),
             enclosing_code_unit_query_count: Arc::new(AtomicUsize::new(0)),
@@ -3393,8 +3474,36 @@ where
         )
     }
 
+    /// The Git blob oid of `source`, the exact bytes a caller is about to key
+    /// facts by, for `file`.
+    ///
+    /// This is the one place a query path turns a source string into the
+    /// store's content key (#2917). The identity is a property of the bytes,
+    /// not of the snapshot: a concurrent disk or overlay change hands the
+    /// caller different bytes and so a different oid, never a stale one. The
+    /// SHA-1 runs once per (file, bytes) and is memoized against the source's
+    /// length and FxHash, so a repeat query over an unchanged file pays a
+    /// hash-map probe and one FxHash pass instead of libgit2's
+    /// collision-detecting SHA-1 over the whole file.
+    pub(crate) fn blob_oid_of(&self, file: &ProjectFile, source: &str) -> Oid {
+        self.blob_oids.oid_of(file, source)
+    }
+
+    /// SHA-1 blob hashes [`Self::blob_oid_of`] computed since the last reset.
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn blob_hash_count_for_test(&self) -> usize {
+        self.blob_oids.hashes.load(Ordering::Relaxed)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn reset_blob_hash_count_for_test(&self) {
+        self.blob_oids.hashes.store(0, Ordering::Relaxed);
+    }
+
     /// Resolve a persistence identity for the exact source string being
-    /// normalized. Hashing the supplied bytes prevents a concurrent file or
+    /// normalized. Keying by the supplied bytes prevents a concurrent file or
     /// overlay change from associating facts with a different live OID.
     pub(crate) fn structural_snapshot_key(
         &self,
@@ -3404,7 +3513,7 @@ where
         if self.store_context.store.is_ephemeral() {
             return None;
         }
-        let oid = Oid::hash_object(ObjectType::Blob, source.as_bytes()).ok()?;
+        let oid = self.blob_oid_of(file, source);
         let lang = self.adapter.storage_language_key_for_file(file);
         let generation = self.store_context.generations.get(lang).copied()?;
         Some(StructuralSnapshotKey {
@@ -3571,6 +3680,7 @@ where
             semantic_cache,
             semantic_source_digests:
                 crate::analyzer::semantic::service::SourceContentIdentityMemo::default(),
+            blob_oids: Arc::new(SourceBlobOidMemo::default()),
             store_context,
             indexed_live_snapshot,
             relational_workspace_snapshots: Arc::new(arc_swap::ArcSwap::from(
@@ -3609,6 +3719,7 @@ where
             sql_definitions_query_count: Arc::new(AtomicUsize::new(0)),
             definition_candidates_query_count: Arc::new(AtomicUsize::new(0)),
             definition_prefetch_batch_count: Arc::new(AtomicUsize::new(0)),
+            relational_definition_batch_call_count: Arc::new(AtomicUsize::new(0)),
             definition_candidate_row_read_count: Arc::new(AtomicUsize::new(0)),
             structural_miss_spelling_count: Arc::new(AtomicUsize::new(0)),
             enclosing_code_unit_query_count: Arc::new(AtomicUsize::new(0)),
@@ -6197,7 +6308,7 @@ where
         file: &ProjectFile,
         source: String,
     ) -> Option<Arc<FileState>> {
-        let oid = Oid::hash_object(ObjectType::Blob, source.as_bytes()).ok()?;
+        let oid = self.blob_oid_of(file, &source);
         let key = Self::transient_cache_key(oid, file);
         self.fetch_file_state_for_key_with_source(file, &key, Some(&source))
     }
@@ -6711,6 +6822,19 @@ where
         self.record_reads(move |sink| sink.push(key));
     }
 
+    /// Record one crossing this analyzer could not name, on every ledger open
+    /// around it. Broadcast exactly as [`Self::record_reads`] is, and just as
+    /// free when no ledger is attached.
+    pub(crate) fn record_unattributed_read(&self) {
+        if !self.read_ledger_attached() {
+            return;
+        }
+        let contexts = self.query_read_cache_lock().contexts.clone();
+        for context in contexts {
+            context.record_unattributed_read();
+        }
+    }
+
     /// The [`ReadKey::File`] naming `file`'s blob as this adapter reads it.
     pub(crate) fn file_read_key(
         &self,
@@ -6727,16 +6851,12 @@ where
     /// The [`ReadKey::File`] naming the exact source string a funnel is about
     /// to read facts from, whose blob identity is the hash of those bytes --
     /// the same identity [`Self::structural_snapshot_key`] persists under.
-    ///
-    /// `None` only when the bytes cannot be hashed, which is the one case
-    /// where the caller has no identity to record either.
     pub(crate) fn source_file_read_key(
         &self,
         file: &ProjectFile,
         source: &str,
-    ) -> Option<crate::analyzer::read_ledger::ReadKey> {
-        let oid = Oid::hash_object(ObjectType::Blob, source.as_bytes()).ok()?;
-        Some(self.file_read_key(file, oid))
+    ) -> crate::analyzer::read_ledger::ReadKey {
+        self.file_read_key(file, self.blob_oid_of(file, source))
     }
 
     /// The [`ReadKey::Scope`] naming this analyzer's whole analyzed file set,
@@ -7303,10 +7423,9 @@ where
             }
             None => self.project.read_source_snapshot(file).ok(),
         };
-        let resolved = snapshot.and_then(|snapshot| {
-            Oid::hash_object(ObjectType::Blob, snapshot.source().as_bytes())
-                .ok()
-                .map(|oid| ResolvedPreparedSource { oid, snapshot })
+        let resolved = snapshot.map(|snapshot| ResolvedPreparedSource {
+            oid: self.blob_oid_of(file, snapshot.source()),
+            snapshot,
         });
 
         if let Some(prepared_sources) = prepared_sources.as_ref() {
@@ -7349,9 +7468,9 @@ where
         }
         let source = if self.project.has_overlay(file) {
             let source = self.project.read_source(file).ok()?;
-            Oid::hash_object(ObjectType::Blob, source.as_bytes())
-                .ok()
-                .map(|oid| ResolvedLiveSource { oid })
+            Some(ResolvedLiveSource {
+                oid: self.blob_oid_of(file, &source),
+            })
         } else if let Some(oid) = self
             .store_context
             .live_paths
@@ -7412,7 +7531,7 @@ where
 
     fn source_for_oid(&self, file: &ProjectFile, oid: Oid) -> Option<String> {
         if let Ok(source) = self.project.read_source(file)
-            && Oid::hash_object(ObjectType::Blob, source.as_bytes()).ok() == Some(oid)
+            && self.blob_oid_of(file, &source) == oid
         {
             return Some(source);
         }
@@ -7727,9 +7846,7 @@ where
                     self.project
                         .read_source(&project_file)
                         .ok()
-                        .and_then(|source| {
-                            Oid::hash_object(ObjectType::Blob, source.as_bytes()).ok()
-                        })
+                        .map(|source| self.blob_oid_of(&project_file, &source))
                 } else {
                     None
                 }
@@ -8639,6 +8756,22 @@ where
         self.definition_prefetch_batch_count.load(Ordering::Relaxed)
     }
 
+    /// Relational-store round trips issued by `RelationalDefinitionLookup::batch`,
+    /// one per call regardless of how many requests it carried. A caller that
+    /// resolves many distinct names one at a time drives this as high as the
+    /// name count; a caller that batches them first keeps it flat (bifrost#15).
+    #[doc(hidden)]
+    pub fn reset_relational_definition_batch_call_count_for_test(&self) {
+        self.relational_definition_batch_call_count
+            .store(0, Ordering::Relaxed);
+    }
+
+    #[doc(hidden)]
+    pub fn relational_definition_batch_call_count_for_test(&self) -> usize {
+        self.relational_definition_batch_call_count
+            .load(Ordering::Relaxed)
+    }
+
     /// Persisted candidate-row reads that actually reached the store, one per
     /// (short name, ordering) the request has not already read. Paired with
     /// `definition_candidates_query_count_for_test` it separates "one read for
@@ -8928,7 +9061,7 @@ where
             return None;
         }
         let source = self.project.read_source(file).ok()?;
-        let oid = Oid::hash_object(ObjectType::Blob, source.as_bytes()).ok()?;
+        let oid = self.blob_oid_of(file, &source);
         let live_entry = self.live_entry_for_source(file, oid);
         let mut parser = Self::build_parser(self.adapter.parser_language());
         let state = Self::analyze_source(&mut parser, self.adapter.as_ref(), file, source)?;
@@ -11023,6 +11156,24 @@ where
             return retained.to_vec();
         }
         let storage_key = self.adapter.storage_language_key_for_file(file);
+        // A file outside this adapter's own languages has no imports here, for
+        // the same reason `fetch_file_state_for_key_with_source`,
+        // `summary_file_projection` and the bounded
+        // `import_info_for_oid_limited` refuse it: fan-outs legitimately ask
+        // every provider about an arbitrary file, and this analyzer holds no
+        // rows -- and no captured generation -- for a language it never built.
+        // Without the refusal the foreign key reached `require_generation_map`,
+        // whose `missing captured analyzer generation for <lang>` failure was
+        // recorded on the request context and ended the whole tool call after
+        // the scan had already produced its answer. On envoy the Kotlin
+        // realm's descendant index resolves a Java peer's ancestors through
+        // `kotlin_lexical_direct_ancestor_fqns`, which asks the Kotlin
+        // analyzer for that Java file's imports, so a C++ scan returned no
+        // JSON at all (#2913). The value was already empty on that path; only
+        // the recorded failure is new.
+        if !self.owns_storage_language_key(storage_key) {
+            return Vec::new();
+        }
         self.record_file_tier_access(InformationTier::Imports, file);
         let Some(imports) = self
             .store_query_or_record(
@@ -12249,6 +12400,8 @@ where
         let values = if unique.is_empty() {
             Vec::new()
         } else {
+            self.relational_definition_batch_call_count
+                .fetch_add(1, Ordering::Relaxed);
             let current = self.store_context.store.relational_definition_values(
                 self.adapter.as_ref(),
                 self.project.root(),
@@ -12524,7 +12677,7 @@ where
         let Some(indexed_oid) = self.indexed_live_snapshot.oid_for_path(file) else {
             return false;
         };
-        Oid::hash_object(ObjectType::Blob, source.as_bytes()).ok() == Some(indexed_oid)
+        self.blob_oid_of(file, source) == indexed_oid
     }
 
     fn is_analyzed(&self, file: &ProjectFile) -> bool {
@@ -12703,6 +12856,10 @@ where
             }
         };
         Box::new(definitions.into_iter())
+    }
+
+    fn prefetch_definitions(&self, fq_names: &[String]) {
+        TreeSitterAnalyzer::prefetch_definitions(self, fq_names);
     }
 
     /// Seek the terminal identifier, then compare whole names.
@@ -12976,12 +13133,20 @@ where
         TreeSitterAnalyzer::record_read_key(self, key);
     }
 
+    fn record_unattributed_read(&self) {
+        TreeSitterAnalyzer::record_unattributed_read(self);
+    }
+
     fn read_ledger_attached(&self) -> bool {
         TreeSitterAnalyzer::read_ledger_attached(self)
     }
 
     fn active_query_cancellation(&self) -> Option<CancellationToken> {
         TreeSitterAnalyzer::active_query_cancellation(self)
+    }
+
+    fn prefetch_definitions(&self, fq_names: &[String]) {
+        TreeSitterAnalyzer::prefetch_definitions(self, fq_names);
     }
 
     fn active_query_semantic_model_overlay(
@@ -13427,9 +13592,11 @@ where
             .invalidate_selector_continuation_if_armed_for_test();
     }
 
-    fn selector_continuation_semantic_cache_revivals_for_test(&self) -> u64 {
+    fn selector_continuation_semantic_cache_revival_census_for_test(
+        &self,
+    ) -> crate::analyzer::semantic::SemanticCacheRevivalCensus {
         self.semantic_cache
-            .selector_continuation_revivals_for_test()
+            .selector_continuation_revival_census_for_test()
     }
 
     fn arm_evaluation_root_continuation_semantic_cache_invalidation_for_test(&self) {
@@ -13442,9 +13609,20 @@ where
             .invalidate_evaluation_root_continuation_if_armed_for_test();
     }
 
-    fn evaluation_root_continuation_semantic_cache_revivals_for_test(&self) -> u64 {
+    fn evaluation_root_continuation_semantic_cache_revival_census_for_test(
+        &self,
+    ) -> crate::analyzer::semantic::SemanticCacheRevivalCensus {
         self.semantic_cache
-            .evaluation_root_continuation_revivals_for_test()
+            .evaluation_root_continuation_revival_census_for_test()
+    }
+
+    fn semantic_materialization_census_for_test(
+        &self,
+    ) -> Vec<(
+        crate::analyzer::semantic::WorkspaceRelativePath,
+        crate::analyzer::semantic::SemanticMaterializationCensus,
+    )> {
+        self.semantic_cache.materialization_census_for_test()
     }
 
     fn reset_definition_candidates_query_count_for_test(&self) {
@@ -13457,6 +13635,14 @@ where
 
     fn definition_prefetch_batch_count_for_test(&self) -> usize {
         TreeSitterAnalyzer::definition_prefetch_batch_count_for_test(self)
+    }
+
+    fn reset_relational_definition_batch_call_count_for_test(&self) {
+        TreeSitterAnalyzer::reset_relational_definition_batch_call_count_for_test(self);
+    }
+
+    fn relational_definition_batch_call_count_for_test(&self) -> usize {
+        TreeSitterAnalyzer::relational_definition_batch_call_count_for_test(self)
     }
 
     fn reset_definition_candidate_row_read_count_for_test(&self) {
@@ -13532,6 +13718,14 @@ where
 
     fn workspace_path_scan_count_for_test(&self) -> usize {
         TreeSitterAnalyzer::workspace_path_scan_count_for_test(self)
+    }
+
+    fn reset_blob_hash_count_for_test(&self) {
+        TreeSitterAnalyzer::reset_blob_hash_count_for_test(self);
+    }
+
+    fn blob_hash_count_for_test(&self) -> usize {
+        TreeSitterAnalyzer::blob_hash_count_for_test(self)
     }
 }
 
@@ -18194,6 +18388,76 @@ mod tests {
         );
     }
 
+    /// #2917: the memoized blob identity is the answer `git hash-object` gives
+    /// for the bytes in hand -- for the indexed disk source, for a dirty
+    /// rewrite of the same file, and for an unsaved overlay -- and a repeat
+    /// question about unchanged bytes does not run SHA-1 again.
+    #[test]
+    fn blob_oid_of_matches_git_hash_object_and_hashes_each_source_once() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        let file = temp_file(&root, "src/main.rs");
+        std::fs::create_dir_all(file.abs_path().parent().expect("source parent"))
+            .expect("source directory");
+        let disk_source = "fn disk() {}\n";
+        file.write(disk_source).expect("disk source");
+        let base: Arc<dyn Project> = Arc::new(TestProject::new(root.clone(), Language::Rust));
+        let analyzer = TreeSitterAnalyzer::new(Arc::clone(&base), RustAdapter);
+        let expected =
+            |source: &str| Oid::hash_object(ObjectType::Blob, source.as_bytes()).expect("blob oid");
+
+        analyzer.reset_blob_hash_count_for_test();
+        assert_eq!(
+            analyzer.blob_oid_of(&file, disk_source),
+            expected(disk_source)
+        );
+        assert_eq!(analyzer.blob_hash_count_for_test(), 1);
+        let reread = base.read_source(&file).expect("disk read");
+        assert_eq!(analyzer.blob_oid_of(&file, &reread), expected(disk_source));
+        assert_eq!(
+            analyzer.blob_hash_count_for_test(),
+            1,
+            "the same bytes from a fresh read must be recognized without SHA-1"
+        );
+
+        let dirty_source = "fn disk() {}\nfn dirty() {}\n";
+        file.write(dirty_source).expect("dirty source");
+        assert_eq!(
+            analyzer.blob_oid_of(&file, dirty_source),
+            expected(dirty_source)
+        );
+        assert_eq!(
+            analyzer.blob_hash_count_for_test(),
+            2,
+            "a dirty rewrite must miss the memo and get its own identity"
+        );
+        assert_eq!(
+            analyzer.blob_oid_of(&file, dirty_source),
+            expected(dirty_source)
+        );
+        assert_eq!(analyzer.blob_hash_count_for_test(), 2);
+
+        let overlay_source = "fn unsaved() {}\n";
+        let overlay = Arc::new(OverlayProject::new(Arc::clone(&base)));
+        assert!(overlay.set(file.abs_path(), overlay_source.to_owned()));
+        let frozen: Arc<dyn Project> = Arc::new(overlay.snapshot());
+        let request = analyzer.clone_with_project(frozen);
+        assert_eq!(
+            request.resolve_live_oid_for_file(&file),
+            Some(expected(overlay_source)),
+            "an overlay's live identity is the hash of its unsaved bytes"
+        );
+        assert_eq!(
+            request.blob_oid_of(&file, overlay_source),
+            expected(overlay_source)
+        );
+        assert_eq!(
+            analyzer.blob_hash_count_for_test(),
+            3,
+            "the overlay is hashed once, through the memo the request clone shares"
+        );
+    }
+
     #[test]
     fn clone_with_project_has_an_independent_query_read_cache() {
         let temp = tempfile::tempdir().expect("temp dir");
@@ -18322,6 +18586,52 @@ mod tests {
         let analyzer = JavaAnalyzer::new(project);
 
         assert!(analyzer.summary_file_projection(&foreign_file).is_none());
+    }
+
+    /// #2913: the import tier obeys the same refusal every other per-file store
+    /// read here does. `ImportAnalysisProvider` fan-outs legitimately ask every
+    /// provider about an arbitrary file, and a foreign file's storage key has
+    /// no entry in this analyzer's own generation map, so hydrating it recorded
+    /// `missing captured analyzer generation for <lang>` on the request context
+    /// -- which ends the whole tool call, after the work it was asked for
+    /// already succeeded.
+    #[test]
+    fn import_hydration_refuses_files_owned_by_another_language_analyzer() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        std::fs::write(
+            root.join("Demo.java"),
+            "package demo;\n\nimport java.util.List;\n\nclass Demo {}\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("demo.rs"), "use std::fmt;\n\npub fn work() {}\n").unwrap();
+        let project: Arc<dyn Project> = Arc::new(TestProject::new(root.clone(), Language::Java));
+        let analyzer = TreeSitterAnalyzer::new(project, JavaAdapter);
+        let own_file = ProjectFile::new(root.clone(), "Demo.java");
+        let foreign_file = ProjectFile::new(root, "demo.rs");
+
+        let scope = AnalyzerQueryScope::new(&analyzer);
+        let token = scope.token();
+
+        assert!(
+            analyzer.resolve_live_oid_for_file(&foreign_file).is_some(),
+            "the shared live-path map must reach the foreign file, or the read \
+             this pins would never be attempted and the test would pass vacuously"
+        );
+        assert_eq!(
+            1,
+            analyzer.import_info_of(token, &own_file).len(),
+            "the analyzer must still answer for a file it owns"
+        );
+        assert!(
+            analyzer.import_info_of(token, &foreign_file).is_empty(),
+            "a file this analyzer never analyzed has no imports here"
+        );
+        assert!(
+            scope.store_error().is_none(),
+            "refusing a foreign file must not record a store failure: {:?}",
+            scope.store_error()
+        );
     }
 
     #[test]

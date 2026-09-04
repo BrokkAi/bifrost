@@ -33,6 +33,7 @@ use std::hash::Hash;
 use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock};
 use std::time::Duration;
 
+use crate::analyzer::config::default_parallelism;
 use crate::hash::HashMap;
 
 const CANCELLABLE_WAIT_INTERVAL: Duration = Duration::from_millis(10);
@@ -60,7 +61,7 @@ fn dedicated_build_pool() -> &'static rayon::ThreadPool {
     static POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
     POOL.get_or_init(|| {
         rayon::ThreadPoolBuilder::new()
-            .num_threads(crate::analyzer::config::AnalyzerConfig::default().parallelism())
+            .num_threads(default_parallelism())
             .thread_name(|index| format!("bifrost-index-build-{index}"))
             .start_handler(|_| ON_DEDICATED_BUILD_POOL.with(|flag| flag.set(true)))
             .build()

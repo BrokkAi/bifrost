@@ -694,6 +694,8 @@ fn validate_wrapper(
         | RqlForm::NilnessOperations
         | RqlForm::SwitchCoverage
         | RqlForm::ConcurrentAccessConflicts
+        | RqlForm::ClassSet
+        | RqlForm::AbsentMember
         | RqlForm::DetachedTaskTransfers
         | RqlForm::ProcedureEffects
         | RqlForm::CallableSignature

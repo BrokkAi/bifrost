@@ -511,6 +511,160 @@ removal. If the selected sanitizer is unresolved or ambiguous, the policy
 run must remain non-conclusive (or retain the finding); an empty finding set
 alone is never evidence that an uncertain sanitizer made the value safe.
 
+### External models: declare a procedure's transfer semantics
+
+A taint policy can declare, under `:external-models`, that the calls its
+selector identifies have exactly the declared transfer semantics. The
+declaration is opaque: for a modeled call the analyzed body -- if one is even
+present in the workspace -- is ignored, the declared transfers run on the
+caller side, and only the listed labels move. This is the standalone-CLI form
+of an external procedure summary; it needs no semantic-pack catalog, and it
+is the surface that satisfies `(call-modeling :unmodeled require-model)` for
+a call the analysis must not enter.
+
+Each `(external-model ...)` entry names a selector and a duplicate-free set
+of transfers. A transfer moves its `:labels` from the `:from` input port
+(an argument or the receiver) to the `:to` output port. The output can be a
+call port -- `return-value`, `(result :index N)`, `receiver`, or an argument
+-- or one named field of an argument or the receiver, written as
+`(field :name "payload" :of (argument :index 1))`. The field form is a
+store-through summary with field precision: only the named field of the
+written object is tainted, and a sibling field of the same object stays
+clean. An `:effect` of `propagate` moves the labels unchanged, and
+`(sanitize :removes [...])` removes labels at the seam; a transfer whose
+sanitize effect removes everything it moves is an explicit no-flow
+declaration, which is how a summary states "this procedure's result carries
+nothing from this input" over a body that would say otherwise.
+
+```lisp
+:external-models
+  (endpoint-set :entries [
+    (external-model :id bridge-pass
+      :selector (rql :schema-version 1
+        (language java
+          (call-sites-to :proof proven
+            (enclosing-decl
+              (inside-decl
+                (class :name "Bridge")
+                (method :name "pass"))))))
+      :transfers [
+        (transfer :from (argument :index 0) :to return-value
+          :labels [input.user-controlled] :effect propagate)])
+    (external-model :id bridge-deposit
+      :selector (rql :schema-version 1
+        (language java
+          (call-sites-to :proof proven
+            (enclosing-decl
+              (inside-decl
+                (class :name "Bridge")
+                (method :name "deposit"))))))
+      :transfers [
+        (transfer :from (argument :index 0)
+          :to (field :name "payload" :of (argument :index 1))
+          :labels [input.user-controlled] :effect propagate)])])
+```
+
+The declaration is load-bearing, and its failure modes stay honest. A
+selector that matches nothing leaves the calls unmodeled, so under
+`require-model` the run stays typed-incomplete rather than silently clean.
+An unproven or partial selection applies the declared semantics but keeps
+the run from concluding. A field destination binds only when exactly one
+observable location for that field of the written object exists in the
+solve; a field nothing can read makes the write a complete no-op, and an
+ambiguous destination leaves the run non-conclusive instead of writing a
+guessed location. Shipped semantic-pack summaries still take precedence at
+a call they cover, and `:transforms` (label-rewriting propagators) remain a
+typed compile refusal.
+
+### Framework entry points: synthesize a root for an uncalled handler
+
+Real framework code is entered through handlers no analyzed caller invokes:
+the framework calls `onRequest` with attacker-controlled arguments, and the
+workspace contains no call site for it. A taint policy declares such a
+procedure under `:entry-points`; the analysis then roots the selected
+declaration itself, and the bound formal parameter carries the declared
+labels on entry, so the handler-internal flow is decided rather than
+silently unreachable.
+
+```lisp
+:entry-points
+  (endpoint-set :entries [
+    (entry-point :id request-handler
+      :selector (rql :schema-version 1
+        (language java
+          (method (name "onRequest"))))
+      :parameter (argument :index 0)
+      :labels [input.user-controlled])])
+```
+
+The selector names procedure *declarations* (RQL `method` / `function`
+kinds), so the binding is entity identity, not name shape: a lookalike
+handler the policy does not select stays un-rooted and reports no flow. The
+`:parameter` port is an argument record only — `(argument :index N)` or
+`(argument :name "name")` — naming the formal of the selected declaration; a
+declared parameter the procedure does not have fails the run instead of
+reporting a vacuous clean. An entry point behaves as a source-role endpoint
+in reports and finding origins; under `(call-modeling :unmodeled
+require-model)` the declaration is load-bearing: removing it returns the
+handler to the honest un-rooted outcome.
+
+### Persistence stores: link a write to a read across opaque code
+
+A taint policy can declare a persistence boundary under `:stores`: one
+procedure writes its tainted argument into a named store, another reads from
+the same store and returns it, and taint flows write-to-read even when the
+store's own implementation is opaque to the analysis (an empty body, an
+external service, a framework cache). A boundary is a pair of entries sharing
+one `:store` name:
+
+```lisp
+:stores
+  (endpoint-set :entries [
+    (store-write :id put-primary
+      :selector (rql :schema-version 1
+        (language java (call :callee (name "put"))))
+      :store primary
+      :key (argument :index 0)
+      :instance receiver
+      :input (argument :index 1))
+    (store-read :id get-primary
+      :selector (rql :schema-version 1
+        (language java (call :callee (name "get"))))
+      :store primary
+      :key (argument :index 0)
+      :instance receiver
+      :output return-value)])
+```
+
+The write's `:input` port names the value that enters the store and the
+read's `:output` port the value that leaves it. The declaration is
+load-bearing: without both halves there is no flow across the boundary, and
+an undeclared write/read pair contributes nothing.
+
+`:key` and `:instance` are optional discrimination dimensions, each an
+ordinary value-flow port of the selected call. A write reaches a read only
+when the store names are equal and neither dimension separates the pair:
+
+- A key identity is proven only for a plain, escape-free string-literal
+  argument; the literal's content is the identity, so `put("a", x)` does not
+  reach `get("b")`, while `'k'` and `"k"` agree.
+- An instance identity is proven only when the port's operand resolves to
+  exactly one declaration (for example a static field or module binding), so
+  `alpha.put(...)` does not reach `beta.get(...)`.
+- Every other case joins: an undeclared dimension means the whole store, and
+  a dimension the analysis cannot prove (a variable key, an unresolvable
+  receiver) must not manufacture a separation. Joining can only add flows,
+  which is the sound direction for a may-analysis.
+
+A store declaration also models its selected call outright: nothing flows
+through the call directly, and taint crosses only via the declared boundary.
+A store call whose own dispatch the analysis cannot resolve therefore stops
+blocking a complete verdict -- the declaration is the model. Completion
+stays honest in the other direction: when the write side of a boundary could
+not be analyzed completely, no store-fed verdict is reported complete, and a
+partially evidenced store binding keeps the run non-conclusive exactly as an
+uncertain sanitizer does.
+
 ### Assertion: what the parser must say about a token
 
 An assertion policy is a conformance rule about the analyzer's own output. The
@@ -2130,15 +2284,64 @@ records `degraded: true`, and a `diff-base-unreliable` report diagnostic
 states why, so a broken base can never hide new findings and can never be
 mistaken for a clean diff run.
 
-Two identity limitations are accepted rather than solved. A pure file rename
+Three identity limitations are accepted rather than solved. A pure file rename
 re-keys every finding in the file (the path is part of the identity), so a
 rename reports one `fixed` plus one `new` pair. Identical source slices under
 one owner are distinguished by an ordinal, so inserting an exact duplicate
-above an existing one can shift the ordinals and misclassify one pair.
+above an existing one can shift the ordinals and misclassify one pair. A
+typestate finding's identity contains the policy's compiled binding plan, so
+an edit that changes which declarations that policy binds re-keys every
+finding it reports, and each one is listed as `fixed` plus `new`.
 
-The base evaluation is a full second in-memory analysis of the base tree; it
-shares no analyzer cache in this version. For the GitHub Actions recipe that
-passes the pull request's base SHA, see
+### What a second run reuses
+
+The base revision is exported and analyzed through the repository's shared
+analyzer cache, the same cache every other Bifrost run reads and writes. Each
+policy's result over the base is stored per evaluation unit -- a seed file, a
+subject file, a row binding, or a solver root -- together with what that unit
+read. A later run against the same base reuses the recorded base findings
+without exporting or building the base again. It evaluates the working tree by
+recomputing only the units whose recorded inputs changed. Every other unit is
+reused after the run verifies that its recorded inputs still hold in the
+working tree.
+
+When a unit cannot be bounded, the policy that owns it is evaluated in full and
+the report says why. Nothing is skipped silently. The report is identical to a
+full evaluation except for the run's own measurements: the `work` counters and
+the `incremental` section. Pass `--no-incremental` to force the full dual
+evaluation, which is how to compare the two when you diagnose a difference.
+
+The `incremental` section reports what the run reused. `base` is `reused` when
+the run served the base findings from a stored base evaluation, and `evaluated`
+when the run evaluated the base itself. `policies` holds one entry per policy
+that ran, with the policy's `mode` (`sliced` when it ran unit by unit, `full`
+when it was evaluated whole) and four counts: `units_total`, `units_reused`,
+`units_recomputed`, and `units_unbounded`.
+
+A policy evaluated in full also carries `widen_reason`, one of these typed
+reasons:
+
+- `whole_policy_family`: the family has no per-unit result. Taint and flow
+  policies are always evaluated whole in this version.
+- `plan_crosses_seeds`: the query's rows are not the concatenation of its
+  per-seed-file rows, so no per-file result exists.
+- `unit_unbounded`: a unit read something the run could not name, so its
+  inputs cannot be verified later.
+- `unit_not_exhaustive`: a unit ran under a bounded budget or was truncated,
+  so its result is not a complete answer for its own part.
+- `unit_diagnostics`: a unit reported a query diagnostic, and a diagnostic does
+  not combine across units.
+- `merged_limit_reached`: the merged result reached a cap that a whole
+  evaluation applies globally, so the whole evaluation might have truncated
+  somewhere else.
+- `verification_budget_exceeded`: verifying the recorded inputs would have cost
+  more than the evaluation it avoids.
+- `reverse_dependency_evidence_missing`: the evidence needed to verify a
+  recorded input is not available in this run.
+- `product_load_failed`: a stored result could not be read back.
+- `incremental_disabled`: the run was given `--no-incremental`.
+
+For the GitHub Actions recipe that passes the pull request's base SHA, see
 [CI Gating with GitHub Actions](/ci-github-actions/).
 
 ## Accept Today's Findings, Gate Tomorrow's

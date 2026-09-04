@@ -7,7 +7,8 @@
 use std::fmt;
 use std::mem::size_of;
 
-use serde::{Serialize, Serializer};
+use serde::de;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use brokk_bifrost_analysis::analyzer::semantic::WorkspaceRelativePath;
 use brokk_bifrost_rql::structural::CodeQueryDiagnosticCode;
@@ -153,7 +154,7 @@ impl PolicyRunCompletion {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum PolicyCapability {
     TaintEvaluation,
@@ -184,7 +185,7 @@ impl PolicyCapability {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum FindingCertainty {
     Definite,
@@ -235,7 +236,7 @@ impl FindingCertainty {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum FindingCompleteness {
     Complete,
@@ -336,7 +337,7 @@ fn normalize_nonempty<T: Ord>(values: &mut Vec<T>) -> Result<(), CompletionReaso
     Ok(())
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum CertaintyReason {
     AmbiguousReceiver,
@@ -374,7 +375,7 @@ impl CertaintyReason {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PolicyIncompleteReason {
     Cancelled,
@@ -425,7 +426,7 @@ impl PolicyIncompleteReason {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FindingIncompleteReason {
     QueryProvenanceTruncated,
@@ -458,7 +459,7 @@ impl FindingIncompleteReason {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PolicyFailureReason {
     InvalidExecutionPlan,
@@ -1044,7 +1045,7 @@ impl RetainedSize for PolicyQueryProvenanceStep {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum PolicyQueryResultRef {
     StructuralMatch {
@@ -1059,7 +1060,10 @@ pub enum PolicyQueryResultRef {
         identity: Option<StableSemanticIdentity>,
     },
     File {
-        #[serde(serialize_with = "serialize_workspace_path")]
+        #[serde(
+            serialize_with = "serialize_workspace_path",
+            deserialize_with = "deserialize_workspace_path"
+        )]
         path: WorkspaceRelativePath,
     },
     ReferenceSite {
@@ -1501,6 +1505,19 @@ where
     serializer.serialize_str(path.as_str())
 }
 
+/// Read one workspace-relative path back through its own validating parser.
+///
+/// A stored path that is absolute, carries a platform prefix, or names a
+/// component no workspace path may name is a load error: the finding it belongs
+/// to would locate itself somewhere the workspace does not reach.
+fn deserialize_workspace_path<'de, D>(deserializer: D) -> Result<WorkspaceRelativePath, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let wire = String::deserialize(deserializer)?;
+    WorkspaceRelativePath::new(&wire).map_err(de::Error::custom)
+}
+
 fn require_span_bearing(location: &PolicySourceLocation) -> Result<(), ReportValueError> {
     if location.is_artifact_only() {
         return Err(ReportValueError::ResultLocationMustHaveSpan);
@@ -1518,7 +1535,7 @@ fn validate_identity_path(
     Ok(())
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PolicyQueryProof {
     Exact,
@@ -1664,7 +1681,7 @@ impl RetainedSize for ProofMetadata {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProofState {
     Proven,
@@ -1683,7 +1700,7 @@ impl ProofState {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ProofReason {
     DirectStructuralMatch,
@@ -1813,7 +1830,7 @@ impl RetainedSize for RelatedPolicyLocation {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PolicyLocationRelationship {
     Source,
@@ -1998,7 +2015,7 @@ impl RetainedSize for WitnessStep {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WitnessStepKind {
     Source,
@@ -2321,6 +2338,31 @@ impl PolicyWorkReport {
         &self.metrics
     }
 
+    /// Add one metric to a constructed report, keeping the name order and the
+    /// uniqueness that `try_new` established.
+    pub(crate) fn try_push_metric(
+        &mut self,
+        metric: PolicyWorkMetric,
+    ) -> Result<(), ReportValueError> {
+        if self.metrics.len() >= MAX_WORK_METRICS {
+            return Err(ReportValueError::TooManyItems {
+                field: "work_metrics",
+                max_items: MAX_WORK_METRICS,
+            });
+        }
+        match self
+            .metrics
+            .binary_search_by(|existing| existing.name.cmp(&metric.name))
+        {
+            Ok(_) => Err(ReportValueError::DuplicateWorkMetric),
+            Err(index) => {
+                self.metrics.insert(index, metric);
+                tighten_vec(&mut self.metrics);
+                Ok(())
+            }
+        }
+    }
+
     pub(crate) fn set_retention(
         &mut self,
         retained_findings: u64,
@@ -2375,6 +2417,7 @@ pub enum PolicyWorkUnit {
     Count,
     Bytes,
     Rows,
+    Milliseconds,
 }
 
 /// Whether a head finding's identity also existed at the diff base revision.
@@ -3314,6 +3357,10 @@ impl PolicyRun {
 
     pub(crate) fn findings_mut(&mut self) -> &mut [PolicyFinding] {
         &mut self.findings
+    }
+
+    pub(crate) fn work_mut(&mut self) -> &mut PolicyWorkReport {
+        &mut self.work
     }
 
     pub(crate) fn take_findings(&mut self) -> Vec<PolicyFinding> {
@@ -4410,6 +4457,532 @@ impl Serialize for PolicySemanticHash {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Reading a finding back
+// ---------------------------------------------------------------------------
+//
+// A persisted policy evaluation unit carries the findings one file's asserts
+// produced (`.agents/plans/impact-sliced-diff-base.md`, Milestone 4), so a
+// later run has to read a finding back out of the analyzer cache. Every value
+// below goes back through the constructor that minted it: a stored value that
+// no longer validates is a deserialization error and the caller widens, never a
+// malformed finding that reaches a report.
+//
+// Seven of `PolicyFinding`'s fields are required to be absent, because a unit
+// product is what one policy evaluation produced and nothing attaches them
+// until after that: `cvss` and `organizational_risk` are overlay reductions the
+// coordinator applies, `display_path` is a taint rendering cache, and
+// `suppression`, `scope`, `diff` and `baseline` are attached by the batch once
+// every policy has run. A stored finding carrying one is refused rather than
+// dropped: it did not come from an evaluation unit, and reading it as if it had
+// would silently discard what it says.
+
+impl<'de> Deserialize<'de> for PolicyAnalysisType {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = String::deserialize(deserializer)?;
+        match wire.as_str() {
+            "match" => Ok(Self::Match),
+            "taint" => Ok(Self::Taint),
+            "typestate" => Ok(Self::Typestate),
+            "assertion" => Ok(Self::Assertion),
+            "flow" => Ok(Self::Flow),
+            other => Err(de::Error::custom(format!(
+                "`{other}` is not a policy analysis type"
+            ))),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for FindingSeverity {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = String::deserialize(deserializer)?;
+        match wire.as_str() {
+            "unrated" => Ok(Self::Unrated),
+            "note" => Ok(Self::Note),
+            "warning" => Ok(Self::Warning),
+            "error" => Ok(Self::Error),
+            other => Err(de::Error::custom(format!(
+                "`{other}` is not a finding severity"
+            ))),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for PolicyId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = String::deserialize(deserializer)?;
+        Self::new(wire).map_err(de::Error::custom)
+    }
+}
+
+impl<'de> Deserialize<'de> for PolicySemanticHash {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = String::deserialize(deserializer)?;
+        Self::from_lower_hex(&wire).map_err(de::Error::custom)
+    }
+}
+
+impl<'de> Deserialize<'de> for PolicyRunCompletion {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(tag = "type", rename_all = "snake_case")]
+        enum Wire {
+            Complete,
+            ProvenSubset {
+                codes: Vec<CodeQueryDiagnosticCode>,
+            },
+            ProvenBySummary,
+            Inconclusive {
+                reasons: Vec<PolicyIncompleteReason>,
+            },
+            Unsupported {
+                capability: PolicyCapability,
+            },
+            Failed {
+                reasons: Vec<PolicyFailureReason>,
+            },
+        }
+
+        let completion = match Wire::deserialize(deserializer)? {
+            Wire::Complete => Self::Complete,
+            Wire::ProvenSubset { codes } => Self::ProvenSubset { codes },
+            Wire::ProvenBySummary => Self::ProvenBySummary,
+            Wire::Inconclusive { reasons } => Self::Inconclusive { reasons },
+            Wire::Unsupported { capability } => Self::Unsupported { capability },
+            Wire::Failed { reasons } => Self::Failed { reasons },
+        };
+        completion.validate().map_err(de::Error::custom)?;
+        Ok(completion)
+    }
+}
+
+impl<'de> Deserialize<'de> for PolicyByteSpan {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Wire {
+            start: u64,
+            end: u64,
+        }
+
+        let wire = Wire::deserialize(deserializer)?;
+        Self::new(wire.start, wire.end).map_err(de::Error::custom)
+    }
+}
+
+impl<'de> Deserialize<'de> for PolicyDisplayRegion {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Wire {
+            start_line: u64,
+            start_column: u64,
+            end_line: u64,
+            end_column: u64,
+        }
+
+        let wire = Wire::deserialize(deserializer)?;
+        Self::new(
+            wire.start_line,
+            wire.start_column,
+            wire.end_line,
+            wire.end_column,
+        )
+        .map_err(de::Error::custom)
+    }
+}
+
+impl<'de> Deserialize<'de> for PolicySourceLocation {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Wire {
+            path: String,
+            byte_span: Option<PolicyByteSpan>,
+            region: Option<PolicyDisplayRegion>,
+        }
+
+        let wire = Wire::deserialize(deserializer)?;
+        let path = WorkspaceRelativePath::new(&wire.path).map_err(de::Error::custom)?;
+        Self::try_new(path, wire.byte_span, wire.region).map_err(de::Error::custom)
+    }
+}
+
+impl<'de> Deserialize<'de> for RelatedPolicyLocation {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Wire {
+            relationship: PolicyLocationRelationship,
+            location: PolicySourceLocation,
+            evidence_refs: Vec<EvidenceRef>,
+        }
+
+        let wire = Wire::deserialize(deserializer)?;
+        Self::try_new(wire.relationship, wire.location, wire.evidence_refs)
+            .map_err(de::Error::custom)
+    }
+}
+
+impl<'de> Deserialize<'de> for ProofMetadata {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Wire {
+            state: ProofState,
+            reasons: Vec<ProofReason>,
+            evidence_refs: Vec<EvidenceRef>,
+        }
+
+        let wire = Wire::deserialize(deserializer)?;
+        Self::try_new(wire.state, wire.reasons, wire.evidence_refs).map_err(de::Error::custom)
+    }
+}
+
+impl<'de> Deserialize<'de> for WitnessStep {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Wire {
+            kind: WitnessStepKind,
+            location: Option<PolicySourceLocation>,
+            label: String,
+            evidence_refs: Vec<EvidenceRef>,
+        }
+
+        let wire = Wire::deserialize(deserializer)?;
+        Self::try_new(wire.kind, wire.location, wire.label, wire.evidence_refs)
+            .map_err(de::Error::custom)
+    }
+}
+
+impl<'de> Deserialize<'de> for BoundedWitness {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        // `retained_bytes` is recomputed by the constructor rather than trusted,
+        // so a row that claimed a smaller size than its steps occupy cannot buy
+        // itself past the witness byte cap.
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Wire {
+            id: WitnessId,
+            steps: Vec<WitnessStep>,
+            truncated: bool,
+            omitted_steps_lower_bound: u64,
+            retained_bytes: u64,
+        }
+
+        let wire = Wire::deserialize(deserializer)?;
+        let witness = Self::try_new(
+            wire.id,
+            wire.steps,
+            wire.truncated,
+            wire.omitted_steps_lower_bound,
+        )
+        .map_err(de::Error::custom)?;
+        if witness.retained_bytes() != wire.retained_bytes {
+            return Err(de::Error::custom(
+                "a stored witness declares a retained size its steps do not occupy",
+            ));
+        }
+        Ok(witness)
+    }
+}
+
+impl<'de> Deserialize<'de> for PolicyQueryProvenanceStep {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Wire {
+            operation: String,
+            result: PolicyQueryResultRef,
+            via: Option<PolicyQueryResultRef>,
+        }
+
+        let wire = Wire::deserialize(deserializer)?;
+        Self::try_new(wire.operation, wire.result, wire.via).map_err(de::Error::custom)
+    }
+}
+
+impl<'de> Deserialize<'de> for PolicyQueryProvenance {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Wire {
+            branch: Vec<u32>,
+            seed: PolicyQueryResultRef,
+            steps: Vec<PolicyQueryProvenanceStep>,
+        }
+
+        let wire = Wire::deserialize(deserializer)?;
+        Self::try_new(wire.branch, wire.seed, wire.steps).map_err(de::Error::custom)
+    }
+}
+
+impl<'de> Deserialize<'de> for MatchFindingEvidence {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Wire {
+            result_domain: MatchResultDomain,
+            anchor: MatchFindingAnchor,
+            terminal: PolicyQueryResultRef,
+            provenance: Vec<PolicyQueryProvenance>,
+            provenance_truncated: bool,
+        }
+
+        let wire = Wire::deserialize(deserializer)?;
+        Self::try_new(
+            wire.result_domain,
+            wire.anchor,
+            wire.terminal,
+            wire.provenance,
+            wire.provenance_truncated,
+        )
+        .map_err(de::Error::custom)
+    }
+}
+
+impl<'de> Deserialize<'de> for AssertionFindingEvidence {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Wire {
+            anchor: super::finding_identity::AssertionFindingAnchor,
+            assert_kind: String,
+            asserted_role: String,
+            expected_class: String,
+            expectation: String,
+            #[serde(default)]
+            observed: Option<String>,
+            actual_count: u64,
+            capability: Vec<PolicyCapability>,
+        }
+
+        let wire = Wire::deserialize(deserializer)?;
+        Self::try_new(
+            wire.anchor,
+            wire.assert_kind,
+            wire.asserted_role,
+            wire.expected_class,
+            wire.expectation,
+            wire.observed,
+            wire.actual_count,
+            wire.capability,
+        )
+        .map_err(de::Error::custom)
+    }
+}
+
+impl<'de> Deserialize<'de> for PolicyFindingEvidence {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        // Only the two families whose work is partitioned into evaluation units
+        // are read back. Taint, flow and typestate evidence has no
+        // deserialization at all -- their families are evaluated whole, so no
+        // stored product ever carries one, and an evidence tree nothing can
+        // produce is not a shape to accept.
+        #[derive(Deserialize)]
+        #[serde(tag = "type", rename_all = "snake_case")]
+        enum Wire {
+            Match {
+                evidence: Box<MatchFindingEvidence>,
+            },
+            Assertion {
+                evidence: Box<AssertionFindingEvidence>,
+            },
+        }
+
+        Ok(match Wire::deserialize(deserializer)? {
+            Wire::Match { evidence } => Self::Match {
+                evidence: *evidence,
+            },
+            Wire::Assertion { evidence } => Self::Assertion {
+                evidence: *evidence,
+            },
+        })
+    }
+}
+
+/// Read one finding back under the budget its caps are stated in.
+///
+/// `PolicyFinding::try_new` enforces the per-finding related-location, witness
+/// and byte caps from a `PolicyBudget`, so reading a finding back needs one
+/// too; a seed is how serde carries a value into a deserialization. The budget
+/// is the reader's, not the writer's, which is the point: a finding stored
+/// under a larger budget than this run allows is refused rather than admitted
+/// because someone else once allowed it.
+pub(crate) struct PolicyFindingSeed<'a> {
+    budget: &'a PolicyBudget,
+}
+
+impl<'a> PolicyFindingSeed<'a> {
+    pub(crate) const fn new(budget: &'a PolicyBudget) -> Self {
+        Self { budget }
+    }
+}
+
+impl<'de> de::DeserializeSeed<'de> for PolicyFindingSeed<'_> {
+    type Value = PolicyFinding;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Wire {
+            id: PolicyFindingId,
+            identity_stability: FindingIdentityStability,
+            policy_id: PolicyId,
+            policy_hash: PolicySemanticHash,
+            analysis_type: PolicyAnalysisType,
+            severity: FindingSeverity,
+            message: String,
+            classification: FindingClassification,
+            certainty: FindingCertainty,
+            completeness: FindingCompleteness,
+            primary: PolicySourceLocation,
+            related: Vec<RelatedPolicyLocation>,
+            related_truncated: bool,
+            omitted_related_locations_lower_bound: u64,
+            evidence: PolicyFindingEvidence,
+            evidence_refs_truncated: bool,
+            omitted_evidence_refs_lower_bound: u64,
+            cvss: Option<de::IgnoredAny>,
+            organizational_risk: Option<de::IgnoredAny>,
+            proof: ProofMetadata,
+            witnesses: Vec<BoundedWitness>,
+            witnesses_truncated: bool,
+            omitted_witnesses_lower_bound: u64,
+            #[serde(default)]
+            display_path: Option<de::IgnoredAny>,
+            suppression: Option<de::IgnoredAny>,
+            scope: Option<de::IgnoredAny>,
+            #[serde(default)]
+            diff: Option<de::IgnoredAny>,
+            #[serde(default)]
+            baseline: Option<de::IgnoredAny>,
+        }
+
+        let wire = Wire::deserialize(deserializer)?;
+        for (field, present) in [
+            ("cvss", wire.cvss.is_some()),
+            ("organizational_risk", wire.organizational_risk.is_some()),
+            ("display_path", wire.display_path.is_some()),
+            ("suppression", wire.suppression.is_some()),
+            ("scope", wire.scope.is_some()),
+            ("diff", wire.diff.is_some()),
+            ("baseline", wire.baseline.is_some()),
+        ] {
+            if present {
+                return Err(de::Error::custom(format!(
+                    "a stored finding carries `{field}`, which is attached to a finding after the \
+                     evaluation that produced it and is never part of what an evaluation unit \
+                     published"
+                )));
+            }
+        }
+
+        let finding = PolicyFinding::try_new(
+            wire.policy_id,
+            wire.policy_hash,
+            wire.severity,
+            wire.message,
+            wire.classification,
+            wire.certainty,
+            wire.completeness,
+            wire.primary,
+            wire.related,
+            wire.related_truncated,
+            wire.omitted_related_locations_lower_bound,
+            wire.evidence,
+            wire.evidence_refs_truncated,
+            wire.omitted_evidence_refs_lower_bound,
+            None,
+            None,
+            wire.proof,
+            wire.witnesses,
+            wire.witnesses_truncated,
+            wire.omitted_witnesses_lower_bound,
+            self.budget,
+        )
+        .map_err(de::Error::custom)?;
+
+        // The identity, the analysis type and the identity stability are
+        // derived from the evidence rather than read, so a stored finding whose
+        // recorded identity disagrees with the one its own content mints is a
+        // load error. Nothing downstream could tell such a finding from a real
+        // one: the identity is what a diff joins on.
+        if finding.id() != wire.id {
+            return Err(de::Error::custom(
+                "a stored finding's identity is not the identity its evidence mints",
+            ));
+        }
+        if finding.analysis_type() != wire.analysis_type {
+            return Err(de::Error::custom(
+                "a stored finding's analysis type is not the one its evidence names",
+            ));
+        }
+        if finding.identity_stability() != wire.identity_stability {
+            return Err(de::Error::custom(
+                "a stored finding's identity stability is not the one its anchor states",
+            ));
+        }
+
+        Ok(finding)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4714,6 +5287,302 @@ mod tests {
             0,
             budget,
         )
+    }
+
+    /// A finding read back out of its own canonical bytes is the finding that
+    /// was written.
+    ///
+    /// This is the contract a persisted evaluation unit depends on: an assert
+    /// unit's product is the findings one file produced, and a later run merges
+    /// them into a report that must be byte-identical to the one a full
+    /// evaluation produces. Every value on the way back goes through the
+    /// constructor that minted it, so the equality proved here is equality of
+    /// validated values, not of two parses of the same text.
+    fn round_trip(finding: &PolicyFinding, budget: &PolicyBudget) -> PolicyFinding {
+        let json = serde_json::to_string(finding).expect("a finding renders canonically");
+        let mut deserializer = serde_json::Deserializer::from_str(&json);
+        serde::de::DeserializeSeed::deserialize(PolicyFindingSeed::new(budget), &mut deserializer)
+            .unwrap_or_else(|error| panic!("a finding reads back: {error}\n{json}"))
+    }
+
+    fn assertion_evidence() -> PolicyFindingEvidence {
+        PolicyFindingEvidence::Assertion {
+            evidence: AssertionFindingEvidence::try_new(
+                super::super::finding_identity::AssertionFindingAnchor::new(
+                    path(),
+                    "ast:7",
+                    "no_reads",
+                ),
+                "occurrence",
+                "value_reference",
+                "cardinality",
+                "none",
+                Some("one value reference".to_string()),
+                1,
+                vec![PolicyCapability::query_feature("rust", "occurrences").unwrap()],
+            )
+            .unwrap(),
+        }
+    }
+
+    #[test]
+    fn an_assertion_finding_reads_back_as_the_finding_that_was_written() {
+        let budget = PolicyBudget::default();
+        let loaded = loaded_match_policy();
+        let finding =
+            finding_with(&loaded, assertion_evidence(), Vec::new(), None, &budget).unwrap();
+
+        assert_eq!(round_trip(&finding, &budget), finding);
+    }
+
+    #[test]
+    fn a_match_finding_reads_back_as_the_finding_that_was_written() {
+        let budget = PolicyBudget::default();
+        let loaded = loaded_match_policy();
+        let finding = finding_with(&loaded, match_evidence(), Vec::new(), None, &budget).unwrap();
+
+        assert_eq!(round_trip(&finding, &budget), finding);
+    }
+
+    /// A finding whose related locations, witnesses, classification and
+    /// provenance are all populated round-trips too, so the equality above is
+    /// not an equality of two nearly empty values.
+    #[test]
+    fn a_fully_populated_finding_reads_back_as_the_finding_that_was_written() {
+        let budget = PolicyBudget::default();
+        let loaded = loaded_match_policy();
+        let anchor = MatchFindingAnchor::strong(
+            MatchResultDomain::CallSite,
+            path(),
+            Some(
+                StableSemanticIdentity::try_new(
+                    "bifrost.test",
+                    path(),
+                    super::super::finding_identity::StableIdentityDerivation::CatalogEntry,
+                    "crate::callee",
+                )
+                .unwrap(),
+            ),
+            Some(SourceSliceHash::from_bytes([9; 32])),
+            3,
+        )
+        .unwrap();
+        let evidence = PolicyFindingEvidence::Match {
+            evidence: MatchFindingEvidence::try_new(
+                MatchResultDomain::CallSite,
+                anchor,
+                call_terminal(),
+                vec![
+                    PolicyQueryProvenance::try_new(
+                        vec![0, 1],
+                        PolicyQueryResultRef::file(path()),
+                        vec![
+                            PolicyQueryProvenanceStep::try_new(
+                                "callers",
+                                call_terminal(),
+                                Some(PolicyQueryResultRef::file(path())),
+                            )
+                            .unwrap(),
+                        ],
+                    )
+                    .unwrap(),
+                ],
+                true,
+            )
+            .unwrap(),
+        };
+        let witness = BoundedWitness::try_new(
+            super::super::finding_identity::WitnessId::try_new("bifrost.test", "w1").unwrap(),
+            vec![
+                WitnessStep::try_new(
+                    WitnessStepKind::Call,
+                    Some(location()),
+                    "the caller reaches the callee",
+                    vec![EvidenceRef::try_new("bifrost.test", "e1").unwrap()],
+                )
+                .unwrap(),
+            ],
+            true,
+            4,
+        )
+        .unwrap();
+        let finding = PolicyFinding::try_new(
+            loaded.definition().metadata.id.clone(),
+            loaded.semantic_hash(),
+            FindingSeverity::Error,
+            "finding".to_string(),
+            FindingClassification::classified(
+                super::super::classification::TaxonomyClassification::try_new(
+                    "cwe",
+                    "94",
+                    Some("Code Injection".to_string()),
+                    ClassificationProvenance::PolicyFallback,
+                )
+                .unwrap(),
+                vec![
+                    super::super::classification::TaxonomyClassification::try_new(
+                        "owasp",
+                        "A03",
+                        None,
+                        ClassificationProvenance::policy_refinement(1).unwrap(),
+                    )
+                    .unwrap(),
+                ],
+            )
+            .unwrap(),
+            FindingCertainty::possible(vec![
+                CertaintyReason::AmbiguousDispatch,
+                CertaintyReason::analyzer_ambiguity("dispatch_open").unwrap(),
+            ])
+            .unwrap(),
+            FindingCompleteness::partial(vec![
+                FindingIncompleteReason::WitnessTruncated,
+                FindingIncompleteReason::QueryProvenanceTruncated,
+                FindingIncompleteReason::EvidenceTruncated,
+                FindingIncompleteReason::ProofPartial,
+            ])
+            .unwrap(),
+            location(),
+            vec![
+                RelatedPolicyLocation::try_new(
+                    PolicyLocationRelationship::CallTarget,
+                    location(),
+                    vec![EvidenceRef::try_new("bifrost.test", "e2").unwrap()],
+                )
+                .unwrap(),
+            ],
+            false,
+            0,
+            evidence,
+            true,
+            2,
+            None,
+            None,
+            ProofMetadata::try_new(
+                ProofState::Ambiguous,
+                vec![
+                    ProofReason::AmbiguousTarget,
+                    ProofReason::analyzer_evidence("cha_open").unwrap(),
+                ],
+                vec![EvidenceRef::try_new("bifrost.test", "e3").unwrap()],
+            )
+            .unwrap(),
+            vec![witness],
+            true,
+            5,
+            &budget,
+        )
+        .unwrap();
+
+        assert_eq!(round_trip(&finding, &budget), finding);
+    }
+
+    /// A stored identity that its own evidence does not mint is a load error.
+    ///
+    /// The identity is what a diff joins on, so a finding admitted under an
+    /// identity nothing derives would classify against the wrong base finding
+    /// and nothing downstream could tell.
+    #[test]
+    fn a_finding_whose_stored_identity_is_not_its_own_is_a_load_error() {
+        let budget = PolicyBudget::default();
+        let loaded = loaded_match_policy();
+        let finding =
+            finding_with(&loaded, assertion_evidence(), Vec::new(), None, &budget).unwrap();
+        let mut document: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&finding).unwrap()).unwrap();
+        document["id"] = serde_json::Value::from(
+            "0000000000000000000000000000000000000000000000000000000000000000",
+        );
+
+        let json = document.to_string();
+        let mut deserializer = serde_json::Deserializer::from_str(&json);
+        let error = serde::de::DeserializeSeed::deserialize(
+            PolicyFindingSeed::new(&budget),
+            &mut deserializer,
+        )
+        .expect_err("a tampered identity must not load");
+
+        assert!(
+            error.to_string().contains("identity its evidence mints"),
+            "{error}"
+        );
+    }
+
+    /// A finding that carries a value nothing attaches until after evaluation
+    /// is not a finding an evaluation unit published.
+    #[test]
+    fn a_finding_carrying_a_post_evaluation_attachment_is_a_load_error() {
+        let budget = PolicyBudget::default();
+        let loaded = loaded_match_policy();
+        let finding =
+            finding_with(&loaded, assertion_evidence(), Vec::new(), None, &budget).unwrap();
+        let mut document: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&finding).unwrap()).unwrap();
+        document["diff"] = serde_json::json!({"disposition": "new", "in_base": false});
+
+        let json = document.to_string();
+        let mut deserializer = serde_json::Deserializer::from_str(&json);
+        let error = serde::de::DeserializeSeed::deserialize(
+            PolicyFindingSeed::new(&budget),
+            &mut deserializer,
+        )
+        .expect_err("a post-evaluation attachment must not load");
+
+        assert!(error.to_string().contains("`diff`"), "{error}");
+    }
+
+    /// The budget the reader holds is what the caps are checked against, not
+    /// whatever budget the writer had.
+    #[test]
+    fn a_finding_that_exceeds_the_readers_budget_is_a_load_error() {
+        let writer = PolicyBudget::default();
+        let loaded = loaded_match_policy();
+        let finding = PolicyFinding::try_new(
+            loaded.definition().metadata.id.clone(),
+            loaded.semantic_hash(),
+            FindingSeverity::Warning,
+            "finding".to_string(),
+            FindingClassification::Unclassified,
+            FindingCertainty::Definite,
+            FindingCompleteness::Complete,
+            location(),
+            vec![
+                RelatedPolicyLocation::try_new(
+                    PolicyLocationRelationship::Subject,
+                    location(),
+                    Vec::new(),
+                )
+                .unwrap(),
+            ],
+            false,
+            0,
+            assertion_evidence(),
+            false,
+            0,
+            None,
+            None,
+            ProofMetadata::try_new(
+                ProofState::Proven,
+                vec![ProofReason::DirectStructuralMatch],
+                Vec::new(),
+            )
+            .unwrap(),
+            Vec::new(),
+            false,
+            0,
+            &writer,
+        )
+        .unwrap();
+
+        let reader = PolicyBudget::builder()
+            .with_max_related_locations_per_finding(0)
+            .expect("zero related locations is a valid budget")
+            .build()
+            .expect("a lowered per-finding cap is a valid budget");
+        let json = serde_json::to_string(&finding).unwrap();
+        let mut deserializer = serde_json::Deserializer::from_str(&json);
+        serde::de::DeserializeSeed::deserialize(PolicyFindingSeed::new(&reader), &mut deserializer)
+            .expect_err("a finding wider than the reader's budget must not load");
     }
 
     #[test]

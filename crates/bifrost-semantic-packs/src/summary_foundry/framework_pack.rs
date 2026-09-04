@@ -535,6 +535,7 @@ impl PackIdentity {
                 review_required: true,
             },
             carried_sources: Vec::new(),
+            cpp_portability: None,
             shards: vec![AuthoredShard {
                 id: format!("declarations.{}", self.ecosystem),
                 activation: vec![self.activation.clone()],

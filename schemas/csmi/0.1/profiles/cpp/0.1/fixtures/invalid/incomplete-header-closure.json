@@ -1,0 +1,22 @@
+{
+  "kind": "resolution-context",
+  "language": "c++",
+  "translationUnit": "src/value_transfer.cpp",
+  "compileArgumentsDigest": "2222222222222222222222222222222222222222222222222222222222222222",
+  "directHeaders": [
+    {
+      "includeName": "string",
+      "artifact": {
+        "purl": "pkg:generic/cpp-reference-headers@1.0.0",
+        "digests": [
+          {
+            "algorithm": "sha-256",
+            "coverage": "canonical-header-tree",
+            "value": "1111111111111111111111111111111111111111111111111111111111111111"
+          }
+        ]
+      }
+    }
+  ],
+  "headerClosure": "partial"
+}

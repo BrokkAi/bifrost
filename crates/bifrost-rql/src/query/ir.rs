@@ -82,6 +82,8 @@ pub enum QueryValueKind {
     TypestateWitness,
     FlowEndpoint,
     FlowWitness,
+    ClassSetRow,
+    AbsentMemberFinding,
     TaintFinding,
     ReferenceSite,
     CallSite,
@@ -156,6 +158,8 @@ impl QueryValueKind {
             Self::TypestateWitness => "typestate_witness",
             Self::FlowEndpoint => "flow_endpoint",
             Self::FlowWitness => "flow_witness",
+            Self::ClassSetRow => "class_set_row",
+            Self::AbsentMemberFinding => "absent_member_finding",
             Self::TaintFinding => "taint_finding",
             Self::ReferenceSite => "reference_site",
             Self::CallSite => "call_site",
@@ -517,6 +521,8 @@ pub enum QueryStep {
     Typestate(TypestateTraversal),
     ConcurrentAccessConflicts,
     ValueFlow(ValueFlowTraversal),
+    ClassSet,
+    AbsentMember,
     Taint(TaintTraversal),
     Witness(WitnessTraversal),
     FileOf,
@@ -1050,6 +1056,8 @@ impl QueryStep {
             Self::Typestate(_) => QueryStepOp::Typestate,
             Self::ConcurrentAccessConflicts => QueryStepOp::ConcurrentAccessConflicts,
             Self::ValueFlow(_) => QueryStepOp::ValueFlow,
+            Self::ClassSet => QueryStepOp::ClassSet,
+            Self::AbsentMember => QueryStepOp::AbsentMember,
             Self::Taint(_) => QueryStepOp::Taint,
             Self::Witness(_) => QueryStepOp::Witness,
             Self::FileOf => QueryStepOp::FileOf,
@@ -1149,6 +1157,8 @@ impl QueryStep {
             | QueryStepOp::Taint
             | QueryStepOp::Witness => None,
             QueryStepOp::ConcurrentAccessConflicts => Some(Self::ConcurrentAccessConflicts),
+            QueryStepOp::ClassSet => Some(Self::ClassSet),
+            QueryStepOp::AbsentMember => Some(Self::AbsentMember),
             QueryStepOp::FileOf => Some(Self::FileOf),
             QueryStepOp::ImportsOf => Some(Self::ImportsOf),
             QueryStepOp::ImportersOf => Some(Self::ImportersOf),
@@ -1277,6 +1287,10 @@ impl QueryStep {
                 Some(QueryValueKind::ConcurrentAccessConflict)
             }
             (Self::ValueFlow(_), QueryValueKind::Procedure) => Some(QueryValueKind::FlowEndpoint),
+            (Self::ClassSet, QueryValueKind::Procedure) => Some(QueryValueKind::ClassSetRow),
+            (Self::AbsentMember, QueryValueKind::Procedure) => {
+                Some(QueryValueKind::AbsentMemberFinding)
+            }
             (Self::Taint(_), QueryValueKind::Procedure) => Some(QueryValueKind::TaintFinding),
             (Self::Witness(_), QueryValueKind::TypestateFinding) => {
                 Some(QueryValueKind::TypestateWitness)
@@ -1586,6 +1600,7 @@ pub(super) fn validate_query_steps(
             QueryStep::Typestate(_) => "procedure",
             QueryStep::ConcurrentAccessConflicts => "procedure",
             QueryStep::ValueFlow(_) => "procedure",
+            QueryStep::ClassSet | QueryStep::AbsentMember => "procedure",
             QueryStep::Taint(_) => "procedure",
             QueryStep::Witness(_) => "typestate_finding or flow_endpoint",
             QueryStep::FileOf => {

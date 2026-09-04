@@ -14,7 +14,7 @@
 //!   is present only because nothing was found to remove it, so it is not
 //!   witness-sound and can never support a finding.
 
-use brokk_bifrost_rql::structural::search::CodeQueryResultItem;
+use brokk_bifrost_rql::structural::search::UnitRowItem;
 
 use crate::definition::{PolicyAssertId, RowBindingName, RowGroupName};
 use crate::finding::{PolicyCapability, PolicyIncompleteReason};
@@ -22,10 +22,16 @@ use crate::finding::{PolicyCapability, PolicyIncompleteReason};
 use super::ir::RowScalar;
 
 /// One bound relation's executed rows and what they prove.
+///
+/// The rows are the projected form every policy path carries: a whole
+/// execution projects its rendered rows into it before evaluating, and a
+/// sliced execution merges its units' products, which are already that
+/// projection. One shape means the evaluation cannot depend on which path
+/// produced its rows.
 #[derive(Debug, Clone)]
 pub struct RelationalInput<'a> {
     pub binding: &'a RowBindingName,
-    pub rows: &'a [CodeQueryResultItem],
+    pub rows: &'a [UnitRowItem],
     pub coverage: RelationCoverage,
 }
 

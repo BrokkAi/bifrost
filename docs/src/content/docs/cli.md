@@ -238,7 +238,7 @@ run. `--require-explicit-schema-versions` rejects compatible inference for the
 root and every loaded endpoint or RQL dependency. Omitted versions otherwise
 select only the newest compiled-in compatible lineage.
 
-### Gate only on new findings (`--diff-base`)
+### Gate only on new findings (`--diff-base`, `--no-incremental`)
 
 `--diff-base REV` evaluates the same policies twice: once against the committed
 content of `REV` (any revision `git rev-parse` accepts, peeled to a commit) and
@@ -264,6 +264,20 @@ its evaluation is unreliable, the run degrades to full gating with a
 findings. See [Static-Analysis Policies](/static-analysis-policies/) for the
 join semantics and [CI Gating with GitHub Actions](/ci-github-actions/) for
 the pull-request recipe.
+
+`--diff-base` reads and writes the repository's analyzer cache under
+`.bifrost/cache`. It stores what each policy concluded over the base revision
+and what every part of that evaluation read, so a later run against the same
+base skips the base export and build, and recomputes only the parts of the
+working tree whose inputs changed. Findings, identities, diagnostics,
+completion tiers, and the exit status do not depend on what the cache holds.
+
+`--no-incremental` turns that reuse off for one run: every policy is evaluated
+in full on both revisions, and nothing is looked up or stored. Reuse is on by
+default and produces the same report, so use this switch only to compare a
+run against the full dual evaluation when you are diagnosing a difference.
+The report's `incremental` section then reports every policy as evaluated in
+full with the reason `incremental_disabled`.
 
 ### Accept every existing finding (`--accept-current`, `--baseline-file`)
 

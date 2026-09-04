@@ -14,7 +14,6 @@
 //! tasks may wait here.
 
 use std::hash::Hash;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::time::{Duration, Instant};
 
@@ -38,6 +37,56 @@ const LIVE_REGISTRY_SWEEP_KEYS: usize = 8_192;
 pub struct CompleteValueWait {
     pub waits: u64,
     pub wait_ns: u64,
+}
+
+/// Test-only account of successful live-value revivals.
+///
+/// `operations` counts ready-cache misses served by the live registry.
+/// `distinct_values` counts exact `(key, allocation)` pairs, so reinserting
+/// the same oversize allocation more than once changes only `operations`.
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CompleteValueRevivalCensus {
+    pub operations: u64,
+    pub distinct_values: u64,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+struct CompleteValueRevivalTracker<K, V> {
+    census: CompleteValueRevivalCensus,
+    values_by_key: HashMap<K, Vec<Weak<V>>>,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl<K, V> Default for CompleteValueRevivalTracker<K, V> {
+    fn default() -> Self {
+        Self {
+            census: CompleteValueRevivalCensus::default(),
+            values_by_key: HashMap::default(),
+        }
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl<K, V> CompleteValueRevivalTracker<K, V>
+where
+    K: Eq + Hash,
+{
+    fn record(&mut self, key: K, value: &Arc<V>) {
+        self.census.operations = self.census.operations.saturating_add(1);
+        let revived = Arc::downgrade(value);
+        let values = self.values_by_key.entry(key).or_default();
+        if values.iter().any(|seen| Weak::ptr_eq(seen, &revived)) {
+            return;
+        }
+        values.push(revived);
+        self.census.distinct_values = self.census.distinct_values.saturating_add(1);
+    }
+
+    fn reset(&mut self) {
+        self.census = CompleteValueRevivalCensus::default();
+        self.values_by_key.clear();
+    }
 }
 
 impl CompleteValueWait {
@@ -85,7 +134,8 @@ where
     entries: Cache<K, Arc<V>>,
     in_flight: Arc<Mutex<HashMap<K, Arc<InFlightMaterialization<V>>>>>,
     live: Arc<Mutex<HashMap<K, Weak<V>>>>,
-    revivals: Arc<AtomicU64>,
+    #[cfg(any(test, feature = "test-support"))]
+    revival_tracker: Arc<Mutex<CompleteValueRevivalTracker<K, V>>>,
 }
 
 impl<K, V> Clone for CompleteValueCache<K, V>
@@ -97,7 +147,8 @@ where
             entries: self.entries.clone(),
             in_flight: Arc::clone(&self.in_flight),
             live: Arc::clone(&self.live),
-            revivals: Arc::clone(&self.revivals),
+            #[cfg(any(test, feature = "test-support"))]
+            revival_tracker: Arc::clone(&self.revival_tracker),
         }
     }
 }
@@ -118,7 +169,8 @@ where
                 .build(),
             in_flight: Arc::new(Mutex::new(HashMap::default())),
             live: Arc::new(Mutex::new(HashMap::default())),
-            revivals: Arc::new(AtomicU64::new(0)),
+            #[cfg(any(test, feature = "test-support"))]
+            revival_tracker: Arc::new(Mutex::new(CompleteValueRevivalTracker::default())),
         }
     }
 
@@ -151,7 +203,11 @@ where
             .get(key)
             .and_then(Weak::upgrade)?;
         self.entries.insert(key.clone(), Arc::clone(&value));
-        self.revivals.fetch_add(1, Ordering::Relaxed);
+        #[cfg(any(test, feature = "test-support"))]
+        self.revival_tracker
+            .lock()
+            .expect("complete-value revival tracker mutex poisoned")
+            .record(key.clone(), &value);
         Some(value)
     }
 
@@ -259,17 +315,22 @@ where
             .contains_key(key)
     }
 
-    /// Ready-cache misses that a still-live instance answered instead of a
-    /// rebuild. Non-zero means the weight bound is evicting values the process
-    /// is still using.
+    /// Ready-cache misses served by still-live instances, split into raw
+    /// operations and exact key/allocation identities.
     #[cfg(any(test, feature = "test-support"))]
-    pub fn revivals_for_test(&self) -> u64 {
-        self.revivals.load(Ordering::Relaxed)
+    pub fn revival_census_for_test(&self) -> CompleteValueRevivalCensus {
+        self.revival_tracker
+            .lock()
+            .expect("complete-value revival tracker mutex poisoned")
+            .census
     }
 
     #[cfg(any(test, feature = "test-support"))]
-    pub fn reset_revivals_for_test(&self) {
-        self.revivals.store(0, Ordering::Relaxed);
+    pub fn reset_revival_census_for_test(&self) {
+        self.revival_tracker
+            .lock()
+            .expect("complete-value revival tracker mutex poisoned")
+            .reset();
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -737,7 +798,7 @@ mod tests {
             Arc::ptr_eq(&held, &value),
             "one validity key must denote one live instance"
         );
-        assert_eq!(cache.revivals_for_test(), 1);
+        assert_eq!(cache.revival_census_for_test().operations, 1);
     }
 
     #[test]
@@ -759,16 +820,77 @@ mod tests {
             panic!("the first logical eviction must revive the held value")
         };
         assert!(Arc::ptr_eq(&held, &value));
-        assert_eq!(cache.revivals_for_test(), 1);
+        assert_eq!(cache.revival_census_for_test().operations, 1);
 
-        cache.reset_revivals_for_test();
+        cache.reset_revival_census_for_test();
         cache.invalidate_all_for_test();
         let (CompleteValueAcquisition::Cached { value }, _) = cache.acquire(&key, &cancellation)
         else {
             panic!("bulk invalidation must force a miss that revives the held value")
         };
         assert!(Arc::ptr_eq(&held, &value));
-        assert_eq!(cache.revivals_for_test(), 1);
+        assert_eq!(cache.revival_census_for_test().operations, 1);
+    }
+
+    #[test]
+    fn revival_census_distinguishes_operations_from_key_allocation_identity() {
+        let cache = cache(1, 1);
+        let cancellation = CancellationToken::default();
+        let first_key = "first".to_string();
+
+        let (CompleteValueAcquisition::Leader { permit }, _) =
+            cache.acquire(&first_key, &cancellation)
+        else {
+            panic!("a new key must lead")
+        };
+        let first = Arc::new(23);
+        permit.publish_complete(Arc::clone(&first));
+
+        for _ in 0..2 {
+            cache.evict_for_test(&first_key);
+            let (CompleteValueAcquisition::Cached { value }, _) =
+                cache.acquire(&first_key, &cancellation)
+            else {
+                panic!("the held first value must be revived")
+            };
+            assert!(Arc::ptr_eq(&first, &value));
+        }
+        assert_eq!(
+            cache.revival_census_for_test(),
+            CompleteValueRevivalCensus {
+                operations: 2,
+                distinct_values: 1,
+            }
+        );
+
+        let second_key = "second".to_string();
+        let (CompleteValueAcquisition::Leader { permit }, _) =
+            cache.acquire(&second_key, &cancellation)
+        else {
+            panic!("a second new key must lead")
+        };
+        let second = Arc::new(29);
+        permit.publish_complete(Arc::clone(&second));
+        cache.evict_for_test(&second_key);
+        let (CompleteValueAcquisition::Cached { value }, _) =
+            cache.acquire(&second_key, &cancellation)
+        else {
+            panic!("the held second value must be revived")
+        };
+        assert!(Arc::ptr_eq(&second, &value));
+        assert_eq!(
+            cache.revival_census_for_test(),
+            CompleteValueRevivalCensus {
+                operations: 3,
+                distinct_values: 2,
+            }
+        );
+
+        cache.reset_revival_census_for_test();
+        assert_eq!(
+            cache.revival_census_for_test(),
+            CompleteValueRevivalCensus::default()
+        );
     }
 
     /// The registry holds weak references only: after the last holder drops the
@@ -798,7 +920,7 @@ mod tests {
             ),
             "a value nobody holds must be rebuilt, not resurrected"
         );
-        assert_eq!(cache.revivals_for_test(), 0);
+        assert_eq!(cache.revival_census_for_test().operations, 0);
     }
 
     #[test]

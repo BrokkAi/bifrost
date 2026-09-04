@@ -132,6 +132,12 @@ pub(super) fn render_pipeline_item(
                 value: Box::new(render_concurrent_access_conflict(analyzer, &value, cache)),
             }
         }
+        PipelineValue::ClassSetRow(value) => CodeQueryResultValue::ClassSetRow {
+            value: Box::new(render_class_set_row(analyzer, &value, cache)),
+        },
+        PipelineValue::AbsentMemberFinding(value) => CodeQueryResultValue::AbsentMemberFinding {
+            value: Box::new(render_absent_member_finding(analyzer, &value, cache)),
+        },
         PipelineValue::DetachedTaskTransfer(value) => CodeQueryResultValue::DetachedTaskTransfer {
             value: Box::new(render_detached_task_transfer(analyzer, &value, cache)),
         },
@@ -421,6 +427,26 @@ pub(super) fn render_provenance(
                             ordering: rendered.ordering,
                             protection: rendered.protection,
                             proof: rendered.proof,
+                        }
+                    }
+                    PipelineTraceValue::ClassSetRow(value) => {
+                        let rendered = render_class_set_row(analyzer, value, cache);
+                        CodeQueryResultRef::ClassSetRow {
+                            id: rendered.id,
+                            path: rendered.file,
+                            range: rendered.range,
+                            member: rendered.member,
+                            status: rendered.status,
+                        }
+                    }
+                    PipelineTraceValue::AbsentMemberFinding(value) => {
+                        let rendered = render_absent_member_finding(analyzer, value, cache);
+                        CodeQueryResultRef::AbsentMemberFinding {
+                            id: rendered.id,
+                            path: rendered.file,
+                            range: rendered.range,
+                            member: rendered.member,
+                            class: rendered.class,
                         }
                     }
                     PipelineTraceValue::DetachedTaskTransfer(value) => {
@@ -2808,6 +2834,8 @@ pub(super) fn render_concurrent_access_conflict(
         ConcurrencyOpenReason::UnresolvedTarget => "unresolved_target".to_owned(),
         ConcurrencyOpenReason::AmbiguousTarget => "ambiguous_target".to_owned(),
         ConcurrencyOpenReason::UnknownLocation => "unknown_location".to_owned(),
+        ConcurrencyOpenReason::AliasSetTruncated => "alias_set_truncated".to_owned(),
+        ConcurrencyOpenReason::UnknownOwnership => "unknown_ownership".to_owned(),
         ConcurrencyOpenReason::AmbiguousSynchronization => "ambiguous_synchronization".to_owned(),
         ConcurrencyOpenReason::UnsupportedSynchronization(protocol) => {
             format!("unsupported_synchronization:{protocol}")
@@ -2824,14 +2852,14 @@ pub(super) fn render_concurrent_access_conflict(
         range: render_source_range(analyzer, &value.file, &value.range, cache),
         location_id: value.conflict.location.identity.to_string(),
         location_kind: value.conflict.location.kind.to_string(),
-        first_procedure_id: format!("{:?}", value.conflict.first.procedure.durable_key()),
+        first_procedure_id: super::semantic::procedure_wire_id(&value.conflict.first.procedure),
         first_point_id: value.conflict.first.point.get(),
         first_access: access(value.conflict.first.mode),
         first_path: rel_path_string(&value.first_file),
         first_range: render_source_range(analyzer, &value.first_file, &value.first_range, cache),
         first_start_byte: value.first_range.start_byte,
         first_end_byte: value.first_range.end_byte,
-        second_procedure_id: format!("{:?}", value.conflict.second.procedure.durable_key()),
+        second_procedure_id: super::semantic::procedure_wire_id(&value.conflict.second.procedure),
         second_point_id: value.conflict.second.point.get(),
         second_access: access(value.conflict.second.mode),
         second_path: rel_path_string(&value.second_file),
@@ -2841,7 +2869,16 @@ pub(super) fn render_concurrent_access_conflict(
         task_relation: relation,
         ordering,
         protection,
-        verdict: "conflict",
+        verdict: if value.conflict.ordering == ConcurrentOrdering::HappensBefore {
+            "ordered"
+        } else if matches!(
+            value.conflict.protection,
+            ConcurrentProtection::CompatibleLock | ConcurrentProtection::AtomicOnly
+        ) {
+            "protected"
+        } else {
+            "conflict"
+        },
         proof: if value.conflict.proven {
             "proven"
         } else {
@@ -2853,6 +2890,40 @@ pub(super) fn render_concurrent_access_conflict(
             "open"
         },
         reasons: value.conflict.reasons.iter().map(reason).collect(),
+    }
+}
+
+pub(super) fn render_class_set_row(
+    analyzer: &dyn IAnalyzer,
+    value: &type_flow::ClassSetRowValue,
+    cache: &mut PipelineRenderCache,
+) -> CodeQueryClassSetRow {
+    CodeQueryClassSetRow {
+        id: value.id.clone(),
+        file: rel_path_string(&value.file),
+        range: render_source_range(analyzer, &value.file, &value.range, cache),
+        member: value.member.clone(),
+        class: value.class.clone(),
+        origin: value.origin.clone(),
+        status: value.status,
+    }
+}
+
+pub(super) fn render_absent_member_finding(
+    analyzer: &dyn IAnalyzer,
+    value: &type_flow::AbsentMemberFindingValue,
+    cache: &mut PipelineRenderCache,
+) -> CodeQueryAbsentMemberFinding {
+    CodeQueryAbsentMemberFinding {
+        id: value.id.clone(),
+        file: rel_path_string(&value.file),
+        range: render_source_range(analyzer, &value.file, &value.range, cache),
+        member: value.member.clone(),
+        class: value.class.clone(),
+        origin_file: rel_path_string(&value.origin_file),
+        origin_range: render_source_range(analyzer, &value.origin_file, &value.origin_range, cache),
+        caller: value.caller.clone(),
+        witness_steps: value.witness_steps,
     }
 }
 

@@ -23,6 +23,7 @@ use crate::source::PolicySourceIdentity;
 use crate::{CvssMetricValueToken, EvidenceRef};
 use brokk_bifrost_analysis::analyzer::Language;
 use brokk_bifrost_analysis::analyzer::{ProjectFile, TestProject, TypescriptAnalyzer};
+use brokk_bifrost_rql::structural::search::DetailedCodeQueryEvidence;
 use brokk_bifrost_rql::structural::search::{
     CodeQueryStableOwnerCandidate, DetailedCodeQueryIdentityCandidate,
     DetailedCodeQueryProvenanceEvidence, DetailedCodeQueryProvenanceIdentities,
@@ -1439,7 +1440,10 @@ fn direct_call_terminal_downgrades_proven_proof_when_caller_identity_is_unavaila
                 callee_range: call_range,
                 caller: declaration("<anonymous>", None),
                 callee: declaration("target", Some("function:target")),
-                call_kind: "direct",
+                // One of `call_site.call_kind`'s registered values: the row
+                // projection reads every field the domain declares, so a
+                // hand-built row must spell them as a real execution does.
+                call_kind: "function",
                 proof: "proven",
                 receiver: None,
                 arguments: Vec::new(),

@@ -1,32 +1,64 @@
 {
   "schema_version": 1,
   "pack_id": "bifrost.python-stdlib",
-  "pack_version": "2026.8.31",
+  "pack_version": "2026.9.4",
   "ecosystem": "python",
   "kind": {
     "artifact_kind": "python_stub",
     "stubs": [
       "_collections_abc.pyi",
+      "abc.pyi",
       "builtins.pyi",
+      "codecs.pyi",
       "collections/__init__.pyi",
       "collections/abc.pyi",
+      "contextlib.pyi",
+      "ctypes/__init__.pyi",
+      "ctypes/wintypes.pyi",
+      "enum.pyi",
+      "errno.pyi",
+      "functools.pyi",
+      "gettext.pyi",
+      "importlib/__init__.pyi",
+      "importlib/metadata/__init__.pyi",
+      "inspect.pyi",
+      "io.pyi",
+      "itertools.pyi",
       "json/__init__.pyi",
       "json/decoder.pyi",
       "json/encoder.pyi",
       "json/scanner.pyi",
       "json/tool.pyi",
+      "logging/__init__.pyi",
+      "math/__init__.pyi",
       "ntpath.pyi",
+      "operator.pyi",
       "os/__init__.pyi",
       "os/path.pyi",
+      "pathlib/__init__.pyi",
+      "platform.pyi",
       "posixpath.pyi",
+      "random.pyi",
       "re.pyi",
+      "shlex.pyi",
+      "shutil.pyi",
+      "stat.pyi",
+      "struct.pyi",
       "subprocess.pyi",
-      "typing.pyi"
+      "sys/__init__.pyi",
+      "tempfile.pyi",
+      "textwrap.pyi",
+      "threading.pyi",
+      "time.pyi",
+      "types.pyi",
+      "typing.pyi",
+      "warnings.pyi",
+      "weakref.pyi"
     ]
   },
   "artifact": {
     "file_name": "typeshed-stdlib-1620e2254765",
-    "sha256": "93304b488dc873715670296aa9c0b7b91db049db8e342287bcb859a58b79e87d",
+    "sha256": "20eea20790b760218459cbe324dc03bb5551ac04b30350049761802cfeba37ba",
     "url": "https://github.com/python/typeshed/archive/1620e225476597f34177351ef913dc8390dade30.tar.gz",
     "container": null
   },
@@ -73,6 +105,20 @@
     {
       "kind": "type",
       "name": "builtins.str"
+    },
+    {
+      "kind": "type",
+      "name": "types.NoneType"
+    },
+    {
+      "kind": "member",
+      "owner": "builtins.str",
+      "name": "join"
+    },
+    {
+      "kind": "member",
+      "owner": "types.NoneType",
+      "name": "__bool__"
     },
     {
       "kind": "member",

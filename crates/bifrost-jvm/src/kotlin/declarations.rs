@@ -226,7 +226,6 @@ impl<'a> KotlinVisitor<'a> {
             "secondary_constructor" => self.visit_secondary_constructor(node, parent),
             "type_alias" => self.visit_type_alias(node, parent),
             "enum_entry" => self.visit_enum_entry(node, parent, stack),
-            "infix_expression" => self.visit_misparsed_object(node, parent, stack),
             "ERROR" => stack.push(KotlinWork {
                 node,
                 parent: parent.cloned(),
@@ -352,65 +351,6 @@ impl<'a> KotlinVisitor<'a> {
         if let Some(body) = first_named_child(node, "class_body") {
             stack.push(KotlinWork {
                 node: body,
-                parent: Some(code_unit),
-            });
-        }
-    }
-
-    /// Recover `object Name { members }` written with the body on one line.
-    ///
-    /// The pinned grammar misparses that spelling as an infix expression: a
-    /// bare `object_literal` operand, the declared name as the infix operator,
-    /// and the body as a `lambda_literal`. The shape is unambiguous evidence
-    /// of the misparse, in scripts too: `object` with neither a body nor a
-    /// delegation is not a Kotlin expression, so a childless `object_literal`
-    /// in operand position can only be a swallowed `object_declaration`
-    /// header. Recovered here so the object and its members keep their
-    /// declared identities; the real fix belongs in the grammar
-    /// (BrokkAi/tree-sitter-kotlin).
-    fn visit_misparsed_object<'tree>(
-        &mut self,
-        node: Node<'tree>,
-        parent: Option<&CodeUnit>,
-        stack: &mut Vec<KotlinWork<'tree>>,
-    ) {
-        let children = named_children_of(node);
-        let [literal, name_node, body] = children[..] else {
-            return;
-        };
-        if literal.kind() != "object_literal"
-            || literal.named_child_count() != 0
-            || name_node.kind() != "simple_identifier"
-            || body.kind() != "lambda_literal"
-        {
-            return;
-        }
-        let name = kotlin_identifier_text(name_node, self.source);
-        if name.is_empty() {
-            return;
-        }
-
-        let code_unit = self.declare(CodeUnitType::Class, SegmentKind::Type, name, node, parent);
-        // The header slice mirrors `kotlin_class_signature`, with the
-        // misparsed `lambda_literal` standing in for the class body.
-        let header = collapse_whitespace(
-            self.source
-                .get(node.start_byte()..body.start_byte())
-                .unwrap_or_default(),
-        );
-        self.parsed.add_signature_with_metadata(
-            code_unit.clone(),
-            SignatureMetadata::new(format!("{header} {{"), Vec::new())
-                .with_recorded_type_parameters(kotlin_declared_type_parameter_names(
-                    node,
-                    self.source,
-                )),
-        );
-        // A delegated header (`object Name : Base { ... }`) parses as a real
-        // `object_declaration`, so this shape never carries supertypes.
-        if let Some(statements) = first_named_child(body, "statements") {
-            stack.push(KotlinWork {
-                node: statements,
                 parent: Some(code_unit),
             });
         }
@@ -1027,12 +967,14 @@ mod tests {
         names
     }
 
-    /// The grammar misparses a single-line `object Name { members }` as an
-    /// infix expression (a bare `object_literal`, the name, a
-    /// `lambda_literal`); the visitor recovers the declaration from that
-    /// shape. Statement-position infix expressions must stay untouched.
+    /// A single-line `object Name { members }` used to misparse as an infix
+    /// expression under the pre-0.4.4 grammar and needed a visitor-side
+    /// recovery (BrokkAi/tree-sitter-kotlin#14/#15, fixed by PRs #16/#19).
+    /// The pinned grammar now yields a real `object_declaration`, so the
+    /// declaration walk must index it directly. Statement-position infix
+    /// expressions must stay untouched.
     #[test]
-    fn recovers_single_line_object_declarations_from_the_infix_misparse() {
+    fn indexes_single_line_object_declarations_directly() {
         let source = "package api\n\nobject Registry { fun register() {} }\n";
         let (_, parsed) = parse(source);
         assert_eq!(
@@ -1046,7 +988,7 @@ mod tests {
             .declarations()
             .iter()
             .find(|unit| unit.fq_name() == "api.Registry")
-            .expect("recovered object declaration")
+            .expect("directly parsed object declaration")
             .clone();
         assert!(registry.is_class());
         assert_eq!(
@@ -1054,8 +996,8 @@ mod tests {
             Some(vec!["object Registry {".to_string()])
         );
 
-        // A real infix expression in a script stays an expression: its left
-        // operand is not a childless `object_literal`.
+        // A real infix expression in a script stays an expression and
+        // declares nothing.
         let (_, script) = parse("val p = 1 to 2\n");
         assert_eq!(fq_names(&script), vec!["p".to_string()]);
     }

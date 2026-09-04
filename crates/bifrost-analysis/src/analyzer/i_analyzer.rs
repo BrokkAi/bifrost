@@ -1028,6 +1028,16 @@ pub trait IAnalyzer: CodeUnitIndex + Send + Sync + Any {
     /// every request that is open around it.
     fn record_read(&self, _key: crate::analyzer::read_ledger::ReadKey) {}
 
+    /// Records one funnel crossing this analyzer could not name, on every read
+    /// ledger open around it.
+    ///
+    /// This is the contract for a funnel that reaches a derived value it has
+    /// no identity for: it says so instead of staying silent, and the ledger's
+    /// unattributed count makes every unit produced under it `Unbounded`. A
+    /// silent crossing would leave the read set looking complete while an
+    /// input it never named could move.
+    fn record_unattributed_read(&self) {}
+
     /// Whether any open request boundary carries a read ledger.
     ///
     /// A funnel consults this before it builds a key: with no ledger attached
@@ -1036,6 +1046,16 @@ pub trait IAnalyzer: CodeUnitIndex + Send + Sync + Any {
     fn read_ledger_attached(&self) -> bool {
         false
     }
+
+    /// Best-effort batch-warm the request-scoped `definitions()` memo for
+    /// many names at once. A caller that already knows a name superset (for
+    /// instance every declaration a whole-workspace scan already enumerated)
+    /// can call this once so later individual `definitions()` lookups against
+    /// those same names -- inside `get_definition`'s per-occurrence
+    /// resolution, for instance -- hit a warm memo instead of paying one
+    /// relational round trip each. A no-op with no open query boundary, and
+    /// for analyzers without a `definitions()` memo to warm.
+    fn prefetch_definitions(&self, _fq_names: &[String]) {}
 
     /// The cancellation token carried by the innermost active query boundary.
     ///
@@ -1888,6 +1908,18 @@ pub trait AnalyzerTestHooks {
         0
     }
 
+    /// Relational-store round trips issued by `RelationalDefinitionLookup::batch`,
+    /// one per call regardless of how many requests it carried. Paired with
+    /// a test that also counts the distinct names it resolved, to show "one
+    /// batched call for many names" instead of "one call per name" (bifrost#15).
+    #[doc(hidden)]
+    fn reset_relational_definition_batch_call_count_for_test(&self) {}
+
+    #[doc(hidden)]
+    fn relational_definition_batch_call_count_for_test(&self) -> usize {
+        0
+    }
+
     /// Store round trips the definition-candidate row read actually issued,
     /// as distinct from the calls that were served by the request's
     /// single-flight memo.
@@ -1964,6 +1996,17 @@ pub trait AnalyzerTestHooks {
         0
     }
 
+    /// SHA-1 blob hashes the analyzer ran to key facts by a file's exact
+    /// source (#2917). A query over N unchanged files performs at most N; a
+    /// repeat query over the same files performs zero.
+    #[doc(hidden)]
+    fn reset_blob_hash_count_for_test(&self) {}
+
+    #[doc(hidden)]
+    fn blob_hash_count_for_test(&self) -> usize {
+        0
+    }
+
     #[doc(hidden)]
     fn reset_scala_project_types_build_count_for_test(&self) {}
 
@@ -1995,8 +2038,10 @@ pub trait AnalyzerTestHooks {
     fn invalidate_selector_continuation_semantic_cache_if_armed_for_test(&self) {}
 
     #[doc(hidden)]
-    fn selector_continuation_semantic_cache_revivals_for_test(&self) -> u64 {
-        0
+    fn selector_continuation_semantic_cache_revival_census_for_test(
+        &self,
+    ) -> crate::analyzer::semantic::SemanticCacheRevivalCensus {
+        crate::analyzer::semantic::SemanticCacheRevivalCensus::default()
     }
 
     /// Arm one deterministic semantic-cache invalidation after a successful
@@ -2009,8 +2054,27 @@ pub trait AnalyzerTestHooks {
     fn invalidate_evaluation_root_continuation_semantic_cache_if_armed_for_test(&self) {}
 
     #[doc(hidden)]
-    fn evaluation_root_continuation_semantic_cache_revivals_for_test(&self) -> u64 {
-        0
+    fn evaluation_root_continuation_semantic_cache_revival_census_for_test(
+        &self,
+    ) -> crate::analyzer::semantic::SemanticCacheRevivalCensus {
+        crate::analyzer::semantic::SemanticCacheRevivalCensus::default()
+    }
+
+    /// How this analyzer produced each file's semantics, per file, split into
+    /// physical lowerings and the two kinds of complete-artifact cache hit.
+    ///
+    /// This is the physical unit behind semantic work accounting across a
+    /// cache eviction: whether one touch of a file lowers it again or is
+    /// served from the complete cache is what the cache's ready state
+    /// decides, and only a lowering repeats that file's materialization work.
+    #[doc(hidden)]
+    fn semantic_materialization_census_for_test(
+        &self,
+    ) -> Vec<(
+        crate::analyzer::semantic::WorkspaceRelativePath,
+        crate::analyzer::semantic::SemanticMaterializationCensus,
+    )> {
+        Vec::new()
     }
 }
 

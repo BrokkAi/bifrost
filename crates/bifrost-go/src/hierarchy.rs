@@ -257,6 +257,7 @@ impl<'a> GoHierarchyBuilder<'a> {
 
     fn collect(&mut self) {
         self.parse_files();
+        self.prefetch_declared_type_definitions();
         self.collect_types();
         self.collect_type_details();
         self.collect_methods();
@@ -264,6 +265,34 @@ impl<'a> GoHierarchyBuilder<'a> {
         self.propagate_type_terms();
         self.promote_embedded_methods();
         self.resolve_member_units();
+    }
+
+    /// Every persisted definition the hierarchy will ask for is named by a
+    /// parsed type declaration. Resolve those exact names as one request batch
+    /// before [`Self::type_unit`] and [`Self::collect_aliases`] issue their
+    /// ordinary lookups. The ordinary path remains authoritative and retains
+    /// its per-file declaration fallback when a definition is not materialized.
+    fn prefetch_declared_type_definitions(&self) {
+        let mut fq_names = Vec::new();
+        for file in &self.files {
+            let mut stack = vec![file.root.root_node()];
+            while let Some(node) = stack.pop() {
+                if matches!(node.kind(), "type_spec" | "type_alias") {
+                    if let Some(name_node) = node.child_by_field_name("name") {
+                        let name = go_node_text(name_node, &file.source).trim();
+                        if !name.is_empty() {
+                            fq_names.push(format!("{}.{name}", file.package_name));
+                        }
+                    }
+                    continue;
+                }
+                let mut cursor = node.walk();
+                stack.extend(node.named_children(&mut cursor));
+            }
+        }
+        fq_names.sort();
+        fq_names.dedup();
+        self.index.prefetch_definitions(&fq_names);
     }
 
     fn finish(self) -> GoHierarchyIndex {

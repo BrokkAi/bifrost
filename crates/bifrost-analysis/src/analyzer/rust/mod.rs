@@ -112,11 +112,10 @@ pub(crate) use brokk_bifrost_rust::usage::{
 };
 
 pub fn rust_declaration_matches_reference_namespace(
-    rust: &RustAnalyzer,
     declaration: &CodeUnit,
     reference: RustReferenceNamespace,
 ) -> bool {
-    RustSymbolNamespace::of(rust, declaration)
+    RustSymbolNamespace::of(declaration)
         .is_some_and(|symbol_namespace| symbol_namespace.accepts(reference))
 }
 
@@ -1114,6 +1113,10 @@ impl IAnalyzer for RustAnalyzer {
         self.inner.end_query(context);
     }
 
+    fn prefetch_definitions(&self, fq_names: &[String]) {
+        self.inner.prefetch_definitions(fq_names);
+    }
+
     fn record_query_failure(&self, error: crate::analyzer::store::StoreError) {
         self.inner.record_query_failure(error);
     }
@@ -1381,6 +1384,18 @@ impl crate::analyzer::AnalyzerTestHooks for RustAnalyzer {
         self.inner
             .test_hooks()
             .definition_candidates_query_count_for_test()
+    }
+
+    fn reset_relational_definition_batch_call_count_for_test(&self) {
+        self.inner
+            .test_hooks()
+            .reset_relational_definition_batch_call_count_for_test();
+    }
+
+    fn relational_definition_batch_call_count_for_test(&self) -> usize {
+        self.inner
+            .test_hooks()
+            .relational_definition_batch_call_count_for_test()
     }
 
     fn reset_full_declaration_scan_count_for_test(&self) {
@@ -1659,12 +1674,15 @@ impl DeadCodeBulkProof for RustDeadCodeBulk {
             candidate,
             ..
         } = routing;
-        if !(candidate.is_function() || candidate.is_field()) {
-            return false;
-        }
         let Some(rust) = resolve_analyzer::<RustAnalyzer>(analyzer) else {
             return false;
         };
+        // A type alias is class-kind since #2911, so the member kinds a precise
+        // scan owns are named through the alias marker rather than by excluding
+        // every class.
+        if !(candidate.is_function() || candidate.is_field() || rust.is_type_alias(candidate)) {
+            return false;
+        }
         rust.parent_of(candidate).is_some()
     }
 

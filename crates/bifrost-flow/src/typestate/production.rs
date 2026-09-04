@@ -40,18 +40,25 @@ use crate::analyzer::semantic::cfg_algorithms::{
     strongly_connected_components,
 };
 use crate::analyzer::semantic::{
-    CallBoundary, IcfgProvider, IcfgProviderBehaviorIdentity, ProcedureHandle, SemanticCallSite,
-    SemanticExecutionBudget, SemanticExecutionBudgetCharge, SemanticExecutionBudgetSnapshot,
-    SemanticOutcome, SemanticProviderError, SemanticRequest, SemanticWork,
+    CallBoundary, CallSiteId, IcfgProvider, IcfgProviderBehaviorIdentity, IndexedLocationIdentity,
+    LengthDelimitedDigest, MemoryLocationId, MemoryLocationKind, ProcedureHandle, SemanticCallSite,
+    SemanticEffect, SemanticExecutionBudget, SemanticExecutionBudgetCharge,
+    SemanticExecutionBudgetSnapshot, SemanticGapImpact, SemanticOutcome, SemanticProviderError,
+    SemanticRequest, SemanticValueKind, SemanticWork, SynchronizationOperation, ValueFlowKind,
+    ValueId,
 };
 use crate::dataflow::{
-    CompleteSummaryRepository, DataflowRequest, ProcedureSummaryIdentity, ProcedureSummaryKey,
-    SemanticInputStatus, SemanticProcedureSummary, SolverWork, SummaryBehaviorKey,
-    SummaryBoundaryKind, SummaryCompleteness, SummaryContextKey, SummaryDependencyKey,
-    SummaryEffect, SummaryEffectKey, SummaryEventKey, SummaryEvidence, SummaryOrigin,
-    SummaryPublicationError, SummaryPublicationOutcome, SummaryRecursiveEdge,
-    SummaryRecursiveGroupKey, SummaryRepositoryLimits, SummarySchemaVersion,
-    SummarySemanticsVersion, SummaryValidationError,
+    DataflowRequest, ProcedureSummaryIdentity, ProcedureSummaryKey,
+    ProductionSemanticSummaryRepository, SemanticInputStatus, SemanticProcedureSummary, SolverWork,
+    SummaryBehaviorKey, SummaryBoundaryKind, SummaryCompleteness, SummaryConcurrencyAccessMode,
+    SummaryConcurrencyAccessPath, SummaryConcurrencyAccessSelector, SummaryConcurrencyEffect,
+    SummaryConcurrencyEffectKind, SummaryConcurrencyExecution,
+    SummaryConcurrencyExecutionCardinality, SummaryConcurrencySourceWitness,
+    SummaryConcurrencySynchronizationOperation, SummaryContextKey, SummaryDependencyKey,
+    SummaryEffect, SummaryEffectKey, SummaryEventKey, SummaryEvidence, SummaryLocationKey,
+    SummaryOrigin, SummaryPort, SummaryPublicationError, SummaryPublicationOutcome,
+    SummaryReadObserver, SummaryRecursiveEdge, SummaryRecursiveGroupKey, SummaryRepositoryLimits,
+    SummarySchemaVersion, SummarySemanticsVersion, SummaryValidationError,
 };
 use crate::hash::HashMap;
 
@@ -63,7 +70,7 @@ use super::{
     solve_typestate_with_reusable_summaries, solve_typestate_with_summaries,
 };
 
-const PRODUCTION_SUMMARY_SEMANTICS: &[u8] = b"bifrost-production-typestate-summary-v1";
+const PRODUCTION_SUMMARY_SEMANTICS: &[u8] = b"bifrost-production-semantic-summary-v4";
 const EMPTY_CALL_CONTEXT: &[u8] = b"bifrost-production-empty-call-context-v1";
 const PRODUCTION_ICFG_BEHAVIOR_DOMAIN: &[u8] = b"bifrost-production-icfg-behavior-v2";
 const PROVIDER_INDEPENDENT_LEAF_BEHAVIOR: &[u8] =
@@ -196,6 +203,7 @@ impl ProductionSummaryLifecycleCounters {
 #[derive(Debug)]
 pub struct ProductionTypestateSummaryRepository {
     state: Mutex<ProductionTypestateSummaryRepositoryState>,
+    semantic_summaries: Arc<ProductionSemanticSummaryRepository>,
     /// Counters live behind their own lock rather than inside `state` so a
     /// rejection can be recorded after the state guard is dropped.
     counters: Mutex<ProductionSummaryLifecycleCounters>,
@@ -204,13 +212,24 @@ pub struct ProductionTypestateSummaryRepository {
 
 #[derive(Debug)]
 struct ProductionTypestateSummaryRepositoryState {
-    semantic: CompleteSummaryRepository,
     protocol: CompleteProtocolSummaryRepository,
     results: HashMap<ProductionSummaryResultKey, CachedTypestateSummaryResult>,
     retained_result_bytes: usize,
     next_result_sequence: u64,
     max_result_entries: usize,
     max_result_bytes: usize,
+}
+
+/// Verification's side of the summary read funnel: what this repository would
+/// answer for a summary identity a base run recorded.
+impl crate::analyzer::SummaryAnswers for ProductionTypestateSummaryRepository {
+    fn summary_content(
+        &self,
+        identity: crate::analyzer::semantic::ids::StableDigest,
+    ) -> Option<crate::analyzer::semantic::ids::StableDigest> {
+        self.semantic_summaries
+            .public_content_for_identity(identity)
+    }
 }
 
 impl Default for ProductionTypestateSummaryRepository {
@@ -225,9 +244,20 @@ impl ProductionTypestateSummaryRepository {
     }
 
     pub fn with_limits(limits: TypestateSummaryRepositoryLimits) -> Self {
+        Self::with_shared_semantic_summaries(
+            limits,
+            Arc::new(ProductionSemanticSummaryRepository::with_limits(
+                limits.semantic,
+            )),
+        )
+    }
+
+    pub fn with_shared_semantic_summaries(
+        limits: TypestateSummaryRepositoryLimits,
+        semantic_summaries: Arc<ProductionSemanticSummaryRepository>,
+    ) -> Self {
         Self {
             state: Mutex::new(ProductionTypestateSummaryRepositoryState {
-                semantic: CompleteSummaryRepository::with_limits(limits.semantic),
                 protocol: CompleteProtocolSummaryRepository::with_limits(limits.protocol),
                 results: HashMap::default(),
                 retained_result_bytes: 0,
@@ -235,6 +265,7 @@ impl ProductionTypestateSummaryRepository {
                 max_result_entries: limits.max_result_entries,
                 max_result_bytes: limits.max_result_bytes,
             }),
+            semantic_summaries,
             counters: Mutex::new(ProductionSummaryLifecycleCounters::default()),
             flights: Mutex::new(HashMap::default()),
         }
@@ -258,7 +289,7 @@ impl ProductionTypestateSummaryRepository {
     /// Retained semantic procedure summaries, the identities shared by every
     /// surface that analyzes this workspace.
     pub fn retained_semantic_count(&self) -> usize {
-        self.state().semantic.len()
+        self.semantic_summaries.len()
     }
 
     /// Retained protocol summaries.
@@ -266,55 +297,43 @@ impl ProductionTypestateSummaryRepository {
         self.state().protocol.len()
     }
 
+    /// Announce to `observer` what this repository holds for every summary in
+    /// `summaries` (issue: impact-sliced `--diff-base`, Milestone 5).
+    ///
+    /// This is the semantic summary funnel one root solve crosses. The solve
+    /// projects the summary set its root's call closure needs and then asks
+    /// this repository about each one; both halves of that answer -- the
+    /// summary it retained, or the absence it did not -- are inputs the solve
+    /// acted on, so both are announced. The lookups run under one state guard
+    /// because the answers must describe one repository state.
+    pub fn observe_semantic_reads(
+        &self,
+        summaries: &ProductionSemanticSummarySet,
+        observer: &dyn SummaryReadObserver,
+    ) {
+        for summary in &summaries.summaries {
+            self.semantic_summaries
+                .get_observed(summary.key(), observer);
+        }
+    }
+
     /// Whether every summary in `summaries` is already retained verbatim.
     pub fn contains_semantic_set(&self, summaries: &ProductionSemanticSummarySet) -> bool {
-        let state = self.state();
-        summaries
-            .summaries
-            .iter()
-            .all(|summary| state.semantic.get(summary.key()) == Some(summary))
+        self.semantic_summaries.contains_all(&summaries.summaries)
     }
 
     pub fn publish_semantic_set(
         &self,
         summaries: &ProductionSemanticSummarySet,
     ) -> Result<SummaryPublicationOutcome, ProductionTypestateSolveError> {
-        let mut state = self.state();
-        self.publish_semantic_set_locked(&mut state, summaries)
+        self.semantic_summaries
+            .publish_components(&summaries.summaries, &summaries.components)
+            .inspect_err(|_| self.record_rejection())
             .map_err(Into::into)
     }
 
-    fn publish_semantic_set_locked(
-        &self,
-        state: &mut ProductionTypestateSummaryRepositoryState,
-        summaries: &ProductionSemanticSummarySet,
-    ) -> Result<SummaryPublicationOutcome, SummaryPublicationError> {
-        let mut inserted = false;
-        for component in &summaries.components {
-            let rows = summaries.summaries[component.clone()].to_vec();
-            let outcome = if rows.len() == 1 && rows[0].recursive_group().is_none() {
-                state.semantic.publish(
-                    rows.into_iter()
-                        .next()
-                        .expect("one-row component retains one summary"),
-                )
-            } else {
-                state.semantic.publish_scc(rows)
-            };
-            match outcome {
-                Ok(SummaryPublicationOutcome::Inserted) => inserted = true,
-                Ok(SummaryPublicationOutcome::AlreadyPresent) => {}
-                Err(error) => {
-                    self.record_rejection();
-                    return Err(error);
-                }
-            }
-        }
-        Ok(if inserted {
-            SummaryPublicationOutcome::Inserted
-        } else {
-            SummaryPublicationOutcome::AlreadyPresent
-        })
+    pub fn semantic_summaries(&self) -> Arc<ProductionSemanticSummaryRepository> {
+        Arc::clone(&self.semantic_summaries)
     }
 
     pub fn record_rejection(&self) {
@@ -664,6 +683,7 @@ impl From<SummaryPublicationError> for ProductionTypestateSolveError {
 #[allow(clippy::too_many_arguments)]
 pub fn solve_typestate_with_production_summaries<Provider, ProjectionProvider>(
     repository: &ProductionTypestateSummaryRepository,
+    observer: &dyn SummaryReadObserver,
     root: &ProcedureHandle,
     entry_facts: &[TypestateFact],
     provider: &Provider,
@@ -701,6 +721,7 @@ where
                 flight.wait();
                 return solve_typestate_with_production_summaries(
                     repository,
+                    observer,
                     root,
                     entry_facts,
                     provider,
@@ -812,6 +833,13 @@ where
         }
         Err(error) => return Err(error),
     };
+    // The summary funnel this root solve crossed: for every procedure in the
+    // root's call closure, what this repository serves under that procedure's
+    // summary identity. Asked after publication, so the answer is the summary
+    // the solve actually composed through rather than whatever the cache
+    // happened to be warmed with, and so a rejected publication honestly
+    // answers absence.
+    repository.observe_semantic_reads(&semantic_summaries, observer);
     let semantic_set = semantic_summaries
         .protocol_summaries()
         .map_err(ProductionTypestateSolveError::ProtocolKey)?;
@@ -963,12 +991,17 @@ fn publish_exact_result(
 pub struct ProductionSemanticSummarySet {
     summaries: Vec<SemanticProcedureSummary>,
     components: Vec<std::ops::Range<usize>>,
+    complete_call_targets: HashMap<(ProcedureHandle, CallSiteId), Box<[ProcedureHandle]>>,
     behavior: SummaryBehaviorKey,
 }
 
 impl ProductionSemanticSummarySet {
     pub fn summaries(&self) -> &[SemanticProcedureSummary] {
         &self.summaries
+    }
+
+    pub fn components(&self) -> &[std::ops::Range<usize>] {
+        &self.components
     }
 
     pub fn len(&self) -> usize {
@@ -984,6 +1017,23 @@ impl ProductionSemanticSummarySet {
         self.summaries
             .iter()
             .find(|summary| summary.key().identity() == &identity)
+    }
+
+    /// Exact materialized targets retained from the same projection that
+    /// produced this complete summary set.
+    ///
+    /// The stable summary stores durable dependency identities. This
+    /// generation-local companion reconnects one source call occurrence to
+    /// its materialized handles without asking the dispatch provider a second
+    /// time. Calls with an open boundary are deliberately absent.
+    pub fn complete_call_targets(
+        &self,
+        procedure: &ProcedureHandle,
+        call: CallSiteId,
+    ) -> Option<&[ProcedureHandle]> {
+        self.complete_call_targets
+            .get(&(procedure.clone(), call))
+            .map(Box::as_ref)
     }
 
     pub fn protocol_summaries(
@@ -1082,9 +1132,14 @@ where
         .map(|(index, procedure)| (procedure, index))
         .collect::<HashMap<_, _>>();
     let mut direct_dependencies = vec![Vec::<ProcedureHandle>::new(); procedures.len()];
+    let mut complete_call_targets =
+        vec![HashMap::<CallSiteId, Box<[ProcedureHandle]>>::default(); procedures.len()];
     let mut direct_dependency_evidence =
         vec![HashMap::<ProcedureSummaryIdentity, SummaryEvidence>::default(); procedures.len()];
-    let mut direct_boundary_effects = vec![Vec::<SummaryEffect>::new(); procedures.len()];
+    let mut direct_effects = procedures
+        .iter()
+        .map(project_direct_concurrency_effects)
+        .collect::<Vec<_>>();
     let mut cursor = 0usize;
 
     while cursor < procedures.len() {
@@ -1092,38 +1147,60 @@ where
         let mut dependencies = Vec::new();
         for call in procedure.semantics().call_sites() {
             let outcome = provider.call_transfers(&procedure, call.id, request)?;
-            let (value, outcome_evidence) = match outcome {
+            let (value, outcome_evidence, dispatch_complete) = match outcome {
                 SemanticOutcome::Complete { value, .. } => {
-                    (value, SummaryEvidence::proven_complete())
+                    (value, SummaryEvidence::proven_complete(), true)
                 }
                 SemanticOutcome::Ambiguous { .. } => {
-                    return Err(ProductionSummaryProjectionError::IncompleteCallTransfers {
-                        procedure: Box::new(summary_identity(&procedure, behavior)),
-                    });
+                    direct_effects[cursor].push(project_open_call_effect(
+                        &procedure,
+                        call,
+                        "call dispatch was ambiguous",
+                    )?);
+                    continue;
                 }
-                SemanticOutcome::Unproven { partial, .. } => (
-                    partial,
-                    SummaryEvidence::try_new(
-                        vec!["call dispatch was not proven".to_owned()],
-                        Vec::new(),
-                    )?,
-                ),
-                SemanticOutcome::Unknown { .. }
-                | SemanticOutcome::Unsupported { .. }
-                | SemanticOutcome::ExceededBudget { .. }
-                | SemanticOutcome::Cancelled { .. } => {
+                SemanticOutcome::Unproven { partial, .. } => {
+                    direct_effects[cursor].push(project_open_call_effect(
+                        &procedure,
+                        call,
+                        "call dispatch was not proven",
+                    )?);
+                    // The explicit open boundary accounts for targets omitted
+                    // from the partial answer. Each retained transfer is still
+                    // a real may-call dependency and must not inherit the
+                    // aggregate dispatch incompleteness a second time.
+                    (partial, SummaryEvidence::proven_complete(), false)
+                }
+                SemanticOutcome::Unknown { .. } | SemanticOutcome::Unsupported { .. } => {
+                    direct_effects[cursor].push(project_open_call_effect(
+                        &procedure,
+                        call,
+                        "call transfer was unavailable",
+                    )?);
+                    continue;
+                }
+                SemanticOutcome::ExceededBudget { .. } | SemanticOutcome::Cancelled { .. } => {
                     return Err(ProductionSummaryProjectionError::IncompleteCallTransfers {
                         procedure: Box::new(summary_identity(&procedure, behavior)),
                     });
                 }
             };
             for (boundary_index, boundary) in value.boundaries.iter().enumerate() {
-                direct_boundary_effects[cursor].push(project_boundary_effect(
+                direct_effects[cursor].push(project_boundary_effect(
                     &procedure,
                     call,
                     boundary,
                     boundary_index,
                 )?);
+            }
+            if dispatch_complete && value.boundaries.is_empty() && !value.transfers.is_empty() {
+                let mut targets = value
+                    .transfers
+                    .iter()
+                    .map(|transfer| transfer.callee.clone())
+                    .collect::<Vec<_>>();
+                canonicalize_procedures(&mut targets, behavior);
+                complete_call_targets[cursor].insert(call.id, targets.into_boxed_slice());
             }
             for transfer in value.transfers {
                 let dependency = summary_identity(&transfer.callee, behavior);
@@ -1144,8 +1221,9 @@ where
                 let index = procedures.len();
                 procedures.push(dependency.clone());
                 direct_dependencies.push(Vec::new());
+                complete_call_targets.push(HashMap::default());
                 direct_dependency_evidence.push(HashMap::default());
-                direct_boundary_effects.push(Vec::new());
+                direct_effects.push(project_direct_concurrency_effects(dependency));
                 index_by_handle.insert(dependency.clone(), index);
             }
         }
@@ -1182,9 +1260,13 @@ where
         .iter()
         .map(|&old| direct_dependency_evidence[old].clone())
         .collect::<Vec<_>>();
-    let canonical_boundary_effects = canonical_order
+    let canonical_effects = canonical_order
         .iter()
-        .map(|&old| direct_boundary_effects[old].clone())
+        .map(|&old| direct_effects[old].clone())
+        .collect::<Vec<_>>();
+    let canonical_call_targets = canonical_order
+        .iter()
+        .map(|&old| complete_call_targets[old].clone())
         .collect::<Vec<_>>();
     let graph = ProcedureDependencyGraph::new(canonical_edges);
     let mut graph_budget = CfgAlgorithmBudget::default();
@@ -1202,12 +1284,322 @@ where
 
     build_summary_set(
         &canonical_procedures,
-        &canonical_evidence,
-        &canonical_boundary_effects,
+        DirectSummaryProjection {
+            dependency_evidence: &canonical_evidence,
+            effects: &canonical_effects,
+            call_targets: &canonical_call_targets,
+        },
         &graph,
         &sccs.components,
         behavior,
         request.cancellation,
+    )
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum DirectPathCursor {
+    Value(ValueId),
+    Location(MemoryLocationId),
+}
+
+enum DirectConcurrencyPath {
+    Boundary(SummaryConcurrencyAccessPath),
+    Local,
+    Open,
+}
+
+/// Lower source-backed effects that can be stated entirely at a procedure
+/// boundary. Local cells and proven fresh allocations do not escape the
+/// procedure and are omitted. Every other unrepresentable heap access emits
+/// an explicit unsupported effect, so a consumer cannot mistake a partial
+/// projection for complete coverage.
+fn project_direct_concurrency_effects(procedure: &ProcedureHandle) -> Vec<SummaryEffect> {
+    let semantics = procedure.semantics();
+    let mut effects = Vec::new();
+    let mut ordinal = 0usize;
+    for point in semantics.points() {
+        for event in &point.events {
+            let kind = match &event.effect {
+                SemanticEffect::MemoryLoad { location, .. } => {
+                    direct_concurrency_path(procedure, *location).map_boundary(|location| {
+                        SummaryConcurrencyEffectKind::Access {
+                            location,
+                            mode: SummaryConcurrencyAccessMode::Read,
+                            must_hold: Box::default(),
+                        }
+                    })
+                }
+                SemanticEffect::MemoryStore { location, .. } => {
+                    direct_concurrency_path(procedure, *location).map_boundary(|location| {
+                        SummaryConcurrencyEffectKind::Access {
+                            location,
+                            mode: SummaryConcurrencyAccessMode::Write,
+                            must_hold: Box::default(),
+                        }
+                    })
+                }
+                SemanticEffect::Synchronization { operation, subject } => {
+                    direct_concurrency_value_path(procedure, *subject).map_boundary(|subject| {
+                        SummaryConcurrencyEffectKind::Synchronize {
+                            subject,
+                            operation: match operation {
+                                SynchronizationOperation::ChannelSend
+                                | SynchronizationOperation::ChannelClose => {
+                                    SummaryConcurrencySynchronizationOperation::Release
+                                }
+                                SynchronizationOperation::ChannelReceive => {
+                                    SummaryConcurrencySynchronizationOperation::Acquire
+                                }
+                            },
+                        }
+                    })
+                }
+                _ => None,
+            };
+            if let Some(kind) = kind {
+                effects.push(direct_concurrency_effect(
+                    procedure,
+                    event.source,
+                    ordinal,
+                    kind,
+                ));
+            }
+            ordinal = ordinal.saturating_add(1);
+        }
+    }
+    for gap in semantics.gaps().iter().filter(|gap| {
+        gap.impacts.contains(SemanticGapImpact::HeapRead)
+            || gap.impacts.contains(SemanticGapImpact::HeapWrite)
+            || gap.impacts.contains(SemanticGapImpact::Aliasing)
+    }) {
+        effects.push(direct_concurrency_effect(
+            procedure,
+            gap.source,
+            ordinal,
+            SummaryConcurrencyEffectKind::Unsupported {
+                protocol: format!("semantic-gap:{}", gap.capability.label()).into_boxed_str(),
+            },
+        ));
+        ordinal = ordinal.saturating_add(1);
+    }
+    effects
+}
+
+impl DirectConcurrencyPath {
+    fn map_boundary(
+        self,
+        map: impl FnOnce(SummaryConcurrencyAccessPath) -> SummaryConcurrencyEffectKind,
+    ) -> Option<SummaryConcurrencyEffectKind> {
+        match self {
+            Self::Boundary(path) => Some(map(path)),
+            Self::Local => None,
+            Self::Open => Some(SummaryConcurrencyEffectKind::Unsupported {
+                protocol: "unrepresentable-boundary-access".into(),
+            }),
+        }
+    }
+}
+
+fn direct_concurrency_path(
+    procedure: &ProcedureHandle,
+    location: MemoryLocationId,
+) -> DirectConcurrencyPath {
+    direct_concurrency_path_from(procedure, DirectPathCursor::Location(location))
+}
+
+fn direct_concurrency_value_path(
+    procedure: &ProcedureHandle,
+    value: ValueId,
+) -> DirectConcurrencyPath {
+    direct_concurrency_path_from(procedure, DirectPathCursor::Value(value))
+}
+
+fn direct_concurrency_path_from(
+    procedure: &ProcedureHandle,
+    mut cursor: DirectPathCursor,
+) -> DirectConcurrencyPath {
+    let semantics = procedure.semantics();
+    let mut selectors = Vec::new();
+    let mut visited = crate::hash::HashSet::default();
+    loop {
+        if !visited.insert(cursor.clone()) {
+            return DirectConcurrencyPath::Open;
+        }
+        match cursor {
+            DirectPathCursor::Location(location) => {
+                let location = semantics
+                    .memory_location(location)
+                    .expect("validated concurrency location exists");
+                match &location.kind {
+                    MemoryLocationKind::Field { base, member } => {
+                        selectors.push(SummaryConcurrencyAccessSelector::Field(
+                            concurrency_location_key(member),
+                        ));
+                        cursor = DirectPathCursor::Value(*base);
+                    }
+                    MemoryLocationKind::Index {
+                        base,
+                        index,
+                        constant_index,
+                        identity,
+                    } => {
+                        selectors.push(if *identity == IndexedLocationIdentity::Aggregate {
+                            SummaryConcurrencyAccessSelector::Aggregate
+                        } else {
+                            match constant_index.and_then(|value| i128::try_from(value).ok()) {
+                                Some(value) => {
+                                    SummaryConcurrencyAccessSelector::ConstantIndex(value)
+                                }
+                                None => index
+                                    .and_then(|value| direct_summary_port(semantics, value))
+                                    .map_or(
+                                        SummaryConcurrencyAccessSelector::AnyIndex,
+                                        SummaryConcurrencyAccessSelector::Index,
+                                    ),
+                            }
+                        });
+                        cursor = DirectPathCursor::Value(*base);
+                    }
+                    MemoryLocationKind::Static { member } => {
+                        selectors.reverse();
+                        return DirectConcurrencyPath::Boundary(SummaryConcurrencyAccessPath::new(
+                            SummaryPort::Heap(concurrency_location_key(member)),
+                            selectors,
+                        ));
+                    }
+                    MemoryLocationKind::Capture { .. } => {
+                        let mapping = semantics
+                            .source_mapping(location.source)
+                            .expect("validated capture location retains a source mapping");
+                        selectors.reverse();
+                        return DirectConcurrencyPath::Boundary(SummaryConcurrencyAccessPath::new(
+                            SummaryPort::Capture(concurrency_location_key(&mapping.locator)),
+                            selectors,
+                        ));
+                    }
+                    MemoryLocationKind::LexicalCell { binding } => {
+                        if !selectors.iter().any(|selector| {
+                            matches!(selector, SummaryConcurrencyAccessSelector::Aggregate)
+                        }) {
+                            return DirectConcurrencyPath::Local;
+                        }
+                        let mut stored_values = Vec::new();
+                        for point in semantics.points() {
+                            for event in &point.events {
+                                if let SemanticEffect::MemoryStore {
+                                    location: stored_location,
+                                    value,
+                                    ..
+                                } = event.effect
+                                    && stored_location == location.id
+                                    && !stored_values.contains(&value)
+                                {
+                                    stored_values.push(value);
+                                }
+                            }
+                        }
+                        cursor = match stored_values.as_slice() {
+                            [] => DirectPathCursor::Value(*binding),
+                            [stored] => DirectPathCursor::Value(*stored),
+                            _ => return DirectConcurrencyPath::Open,
+                        };
+                    }
+                }
+            }
+            DirectPathCursor::Value(value) => {
+                if let Some(root) = direct_summary_port(semantics, value) {
+                    selectors.reverse();
+                    return DirectConcurrencyPath::Boundary(SummaryConcurrencyAccessPath::new(
+                        root, selectors,
+                    ));
+                }
+                if semantics
+                    .allocations()
+                    .iter()
+                    .any(|allocation| allocation.result == value)
+                {
+                    return DirectConcurrencyPath::Local;
+                }
+                let mut predecessors = Vec::new();
+                for point in semantics.points() {
+                    for event in &point.events {
+                        let predecessor = match event.effect {
+                            SemanticEffect::MemoryLoad {
+                                location, result, ..
+                            } if result == value => Some(DirectPathCursor::Location(location)),
+                            SemanticEffect::ValueFlow {
+                                source,
+                                target,
+                                kind:
+                                    ValueFlowKind::Local
+                                    | ValueFlowKind::Parameter
+                                    | ValueFlowKind::Receiver
+                                    | ValueFlowKind::BackingStore { .. },
+                            } if target == value => Some(DirectPathCursor::Value(source)),
+                            SemanticEffect::Assignment {
+                                target,
+                                value: source,
+                            } if target == value => Some(DirectPathCursor::Value(source)),
+                            _ => None,
+                        };
+                        if let Some(predecessor) = predecessor
+                            && !predecessors.contains(&predecessor)
+                        {
+                            predecessors.push(predecessor);
+                        }
+                    }
+                }
+                let [predecessor] = predecessors.as_slice() else {
+                    return DirectConcurrencyPath::Open;
+                };
+                cursor = predecessor.clone();
+            }
+        }
+    }
+}
+
+fn direct_summary_port(
+    semantics: &crate::analyzer::semantic::ProcedureSemantics,
+    value: ValueId,
+) -> Option<SummaryPort> {
+    match semantics.value(value)?.kind {
+        SemanticValueKind::Parameter { ordinal, .. } => Some(SummaryPort::Parameter(ordinal)),
+        SemanticValueKind::Receiver { .. } => Some(SummaryPort::Receiver),
+        _ => None,
+    }
+}
+
+fn concurrency_location_key(
+    locator: &crate::analyzer::semantic::SemanticLocator,
+) -> SummaryLocationKey {
+    SummaryLocationKey::from_locator(locator)
+}
+
+fn direct_concurrency_effect(
+    procedure: &ProcedureHandle,
+    source: crate::analyzer::semantic::SourceMappingId,
+    ordinal: usize,
+    kind: SummaryConcurrencyEffectKind,
+) -> SummaryEffect {
+    let mapping = procedure
+        .semantics()
+        .source_mapping(source)
+        .expect("validated concurrency effect retains a source mapping");
+    let span = mapping.locator.anchor().span();
+    SummaryEffect::new(
+        SummaryEffectKey::Concurrency(SummaryConcurrencyEffect::new(
+            SummaryEventKey::from_concurrency_source(&mapping.locator, ordinal),
+            kind,
+            SummaryConcurrencyExecution::new(
+                crate::analyzer::semantic::ExecutionTiming::SameEvaluation,
+                SummaryConcurrencyExecutionCardinality::Unknown,
+            ),
+            Some(SummaryConcurrencySourceWitness::new(
+                span.start_byte(),
+                span.end_byte(),
+            )),
+        )),
+        SummaryEvidence::proven_complete(),
     )
 }
 
@@ -1243,15 +1635,46 @@ fn project_boundary_effect(
     ))
 }
 
+fn project_open_call_effect(
+    procedure: &ProcedureHandle,
+    call: &SemanticCallSite,
+    reason: &str,
+) -> Result<SummaryEffect, SummaryValidationError> {
+    let mapping = procedure
+        .semantics()
+        .source_mapping(call.source)
+        .expect("validated semantic call retains a source mapping");
+    let mut digest = LengthDelimitedDigest::new(CALL_EFFECT_DOMAIN);
+    digest.push(procedure.artifact().key().public_fingerprint().as_bytes());
+    mapping.locator.push_stable_identity(&mut digest);
+    digest.push(reason.as_bytes());
+    Ok(SummaryEffect::new(
+        SummaryEffectKey::UnknownCallBoundary {
+            event: SummaryEventKey::from_digest(digest.finish()),
+        },
+        SummaryEvidence::try_new(vec![reason.to_owned()], vec![reason.to_owned()])?,
+    ))
+}
+
+struct DirectSummaryProjection<'a> {
+    dependency_evidence: &'a [HashMap<ProcedureSummaryIdentity, SummaryEvidence>],
+    effects: &'a [Vec<SummaryEffect>],
+    call_targets: &'a [HashMap<CallSiteId, Box<[ProcedureHandle]>>],
+}
+
 fn build_summary_set(
     procedures: &[ProcedureHandle],
-    direct_dependency_evidence: &[HashMap<ProcedureSummaryIdentity, SummaryEvidence>],
-    direct_boundary_effects: &[Vec<SummaryEffect>],
+    direct: DirectSummaryProjection<'_>,
     graph: &ProcedureDependencyGraph,
     components: &[Box<[usize]>],
     behavior: SummaryBehaviorKey,
     cancellation: &crate::cancellation::CancellationToken,
 ) -> Result<ProductionSemanticSummarySet, ProductionSummaryProjectionError> {
+    let DirectSummaryProjection {
+        dependency_evidence: direct_dependency_evidence,
+        effects: direct_effects,
+        call_targets: direct_call_targets,
+    } = direct;
     let identities = procedures
         .iter()
         .map(|procedure| summary_identity(procedure, behavior))
@@ -1393,7 +1816,7 @@ fn build_summary_set(
                     )
                 })
                 .collect::<Vec<_>>();
-            effects.extend_from_slice(&direct_boundary_effects[member]);
+            effects.extend_from_slice(&direct_effects[member]);
             let summary = SemanticProcedureSummary::try_new(
                 key.clone(),
                 Vec::new(),
@@ -1419,22 +1842,43 @@ fn build_summary_set(
         return Err(ProductionSummaryProjectionError::InvalidDependencyGraph);
     }
 
+    let complete_call_targets = procedures
+        .iter()
+        .zip(direct_call_targets)
+        .flat_map(|(procedure, calls)| {
+            calls
+                .iter()
+                .map(|(&call, targets)| ((procedure.clone(), call), targets.clone()))
+        })
+        .collect();
+
     Ok(ProductionSemanticSummarySet {
         summaries,
         components: summary_components,
+        complete_call_targets,
         behavior,
     })
 }
 
+/// The summary behavior one ICFG provider induces, in both halves.
+///
+/// The cache half folds the provider's full identity; the read half folds the
+/// provider's own read half, which is the same engine without the workspace's
+/// content identity. Derived from the same domain because they name the same
+/// thing at two precisions, and the provider's two digests already live under
+/// two domains of their own.
 fn production_icfg_behavior(provider: IcfgProviderBehaviorIdentity) -> SummaryBehaviorKey {
-    let mut bytes = Vec::with_capacity(
-        PRODUCTION_ICFG_BEHAVIOR_DOMAIN
-            .len()
-            .saturating_add(provider.as_bytes().len()),
-    );
-    bytes.extend_from_slice(PRODUCTION_ICFG_BEHAVIOR_DOMAIN);
-    bytes.extend_from_slice(provider.as_bytes());
-    SummaryBehaviorKey::hash_bytes(bytes)
+    let derive = |identity: &[u8; 32]| {
+        let mut bytes = Vec::with_capacity(
+            PRODUCTION_ICFG_BEHAVIOR_DOMAIN
+                .len()
+                .saturating_add(identity.len()),
+        );
+        bytes.extend_from_slice(PRODUCTION_ICFG_BEHAVIOR_DOMAIN);
+        bytes.extend_from_slice(identity);
+        crate::analyzer::semantic::ids::StableDigest::sha256(bytes)
+    };
+    SummaryBehaviorKey::from_parts(derive(provider.as_bytes()), derive(provider.read_bytes()))
 }
 
 fn provider_independent_leaf_behavior() -> SummaryBehaviorKey {

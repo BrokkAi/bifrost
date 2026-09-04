@@ -140,7 +140,7 @@ pub fn type_expression_name(
             "{}[]",
             type_expression_name(element, type_names_by_id)?
         )),
-        TypeRef::ByRef { element } => Ok(format!(
+        TypeRef::ByRef { element, .. } => Ok(format!(
             "{}&",
             type_expression_name(element, type_names_by_id)?
         )),
@@ -192,7 +192,7 @@ pub fn type_expression(
                 ),
             },
         )),
-        TypeRef::ByRef { element } => Ok(CsmiTypeExpression::Intrinsic(
+        TypeRef::ByRef { element, .. } => Ok(CsmiTypeExpression::Intrinsic(
             super::model::CsmiIntrinsicType {
                 kind: super::model::CsmiIntrinsicTypeKind::Intrinsic,
                 vocabulary: JVM_IDENTITY_SCHEME.to_owned(),

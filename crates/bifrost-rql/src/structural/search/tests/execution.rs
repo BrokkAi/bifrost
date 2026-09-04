@@ -4143,6 +4143,56 @@ func spawn(w *worker, value int, flag bool) {
     );
 }
 
+fn assert_exact_safe_concurrent_relations(result: &CodeQueryResult, verdict: &str) {
+    assert!(
+        !result.results.is_empty(),
+        "expected at least one exact {verdict} concurrent relation: {result:#?}"
+    );
+    let mut found_expected_verdict = false;
+    for item in &result.results {
+        let CodeQueryResultValue::ConcurrentAccessConflict { value } = &item.value else {
+            panic!("concurrent_access_conflicts returns its typed row: {item:#?}");
+        };
+        found_expected_verdict |= value.verdict == verdict;
+        assert_eq!(
+            (value.proof, value.coverage),
+            ("proven", "exhaustive"),
+            "{result:#?}"
+        );
+        assert_ne!(value.verdict, "conflict", "{result:#?}");
+        assert!(value.reasons.is_empty(), "{result:#?}");
+    }
+    assert!(
+        found_expected_verdict,
+        "expected an exact {verdict} concurrent relation: {result:#?}"
+    );
+}
+
+fn assert_no_concurrent_conflicts(result: &CodeQueryResult) {
+    for item in &result.results {
+        let CodeQueryResultValue::ConcurrentAccessConflict { value } = &item.value else {
+            panic!("concurrent_access_conflicts returns its typed row: {item:#?}");
+        };
+        assert_ne!(value.verdict, "conflict", "{result:#?}");
+    }
+}
+
+fn find_concurrent_relation(
+    result: &CodeQueryResult,
+    predicate: impl Fn(&CodeQueryConcurrentAccessConflict) -> bool,
+) -> &CodeQueryConcurrentAccessConflict {
+    result
+        .results
+        .iter()
+        .find_map(|item| {
+            let CodeQueryResultValue::ConcurrentAccessConflict { value } = &item.value else {
+                panic!("concurrent_access_conflicts returns its typed row: {item:#?}");
+            };
+            predicate(value).then_some(value.as_ref())
+        })
+        .unwrap_or_else(|| panic!("expected concurrent relation was absent: {result:#?}"))
+}
+
 #[test]
 fn go_concurrent_access_conflicts_project_exact_capture_races() {
     let project = InlineTestProject::with_language(Language::Go)
@@ -4442,13 +4492,22 @@ func unknownObjectsDistinctFields() int {
         .collect::<Vec<_>>();
     assert_eq!(
         rows,
-        [(
-            "parent_child",
-            "unordered",
-            "unprotected",
-            "proven",
-            "exhaustive"
-        )],
+        [
+            (
+                "parent_child",
+                "happens_before",
+                "unprotected",
+                "proven",
+                "exhaustive"
+            ),
+            (
+                "parent_child",
+                "unordered",
+                "unprotected",
+                "proven",
+                "exhaustive"
+            )
+        ],
         "{result:#?}"
     );
 
@@ -4472,7 +4531,7 @@ func unknownObjectsDistinctFields() int {
         CodeQueryCompletion::Complete,
         "{joined:#?}"
     );
-    assert!(joined.results.is_empty(), "{joined:#?}");
+    assert_exact_safe_concurrent_relations(&joined, "ordered");
 
     let ambiguous_query = CodeQuery::from_json(&json!({
         "languages": ["go"],
@@ -4494,9 +4553,17 @@ func unknownObjectsDistinctFields() int {
         CodeQueryCompletion::Complete,
         "{ambiguous:#?}"
     );
-    let [item] = ambiguous.results.as_slice() else {
-        panic!("one open ambiguous synchronization row: {ambiguous:#?}");
-    };
+    let item = ambiguous
+        .results
+        .iter()
+        .find(|item| {
+            matches!(
+                &item.value,
+                CodeQueryResultValue::ConcurrentAccessConflict { value }
+                    if value.verdict == "conflict" && value.proof == "open"
+            )
+        })
+        .unwrap_or_else(|| panic!("an open ambiguous synchronization row: {ambiguous:#?}"));
     let CodeQueryResultValue::ConcurrentAccessConflict { value } = &item.value else {
         panic!("ambiguous synchronization retains its typed row: {item:#?}");
     };
@@ -4527,12 +4594,7 @@ func unknownObjectsDistinctFields() int {
         CodeQueryCompletion::Complete,
         "{named:#?}"
     );
-    let [item] = named.results.as_slice() else {
-        panic!("one named cross-procedure conflict: {named:#?}");
-    };
-    let CodeQueryResultValue::ConcurrentAccessConflict { value } = &item.value else {
-        panic!("named helper query returns its typed row: {item:#?}");
-    };
+    let value = find_concurrent_relation(&named, |value| value.verdict == "conflict");
     assert_eq!(
         (
             value.task_relation,
@@ -4605,9 +4667,17 @@ func unknownObjectsDistinctFields() int {
             CodeQueryCompletion::Complete,
             "{name}: {result:#?}"
         );
-        let [item] = result.results.as_slice() else {
-            panic!("{name} has one exact collection conflict: {result:#?}");
-        };
+        let item = result
+            .results
+            .iter()
+            .find(|item| {
+                matches!(
+                    &item.value,
+                    CodeQueryResultValue::ConcurrentAccessConflict { value }
+                        if value.verdict == "conflict"
+                )
+            })
+            .unwrap_or_else(|| panic!("{name} has an exact collection conflict: {result:#?}"));
         let CodeQueryResultValue::ConcurrentAccessConflict { value } = &item.value else {
             panic!("{name} returns its typed conflict: {item:#?}");
         };
@@ -4622,10 +4692,7 @@ func unknownObjectsDistinctFields() int {
         "distinctSliceElements",
         "copiedScalarArgument",
         "childOnlyWrite",
-        "accessBeforeSpawn",
         "distinctFields",
-        "joinedByAllSelectArms",
-        "selectCancellationShadowsResult",
         "unknownIndicesOnDistinctSlices",
         "unknownObjectsDistinctFields",
         "perTaskAllocationsAreDistinct",
@@ -4636,7 +4703,20 @@ func unknownObjectsDistinctFields() int {
             CodeQueryCompletion::Complete,
             "{name}: {result:#?}"
         );
-        assert!(result.results.is_empty(), "{name}: {result:#?}");
+        assert_no_concurrent_conflicts(&result);
+    }
+    for name in [
+        "accessBeforeSpawn",
+        "joinedByAllSelectArms",
+        "selectCancellationShadowsResult",
+    ] {
+        let result = conflicts_for(name);
+        assert_eq!(
+            result.completion(),
+            CodeQueryCompletion::Complete,
+            "{name}: {result:#?}"
+        );
+        assert_exact_safe_concurrent_relations(&result, "ordered");
     }
     let cancellation_race = conflicts_for("namedResultCancellationRace");
     assert_eq!(
@@ -4644,14 +4724,9 @@ func unknownObjectsDistinctFields() int {
         CodeQueryCompletion::Complete,
         "{cancellation_race:#?}"
     );
-    let [item] = cancellation_race.results.as_slice() else {
-        panic!(
-            "the cancellation return races with the named result capture: {cancellation_race:#?}"
-        );
-    };
-    let CodeQueryResultValue::ConcurrentAccessConflict { value } = &item.value else {
-        panic!("named result cancellation returns its typed conflict: {item:#?}");
-    };
+    let value = find_concurrent_relation(&cancellation_race, |value| {
+        value.verdict == "conflict" && value.proof == "proven"
+    });
     assert_eq!(
         (
             value.first_access,
@@ -4686,12 +4761,7 @@ func unknownObjectsDistinctFields() int {
         CodeQueryCompletion::Complete,
         "{unknown_index:#?}"
     );
-    let [item] = unknown_index.results.as_slice() else {
-        panic!("one open dynamic-index candidate: {unknown_index:#?}");
-    };
-    let CodeQueryResultValue::ConcurrentAccessConflict { value } = &item.value else {
-        panic!("dynamic-index query returns its typed row: {item:#?}");
-    };
+    let value = find_concurrent_relation(&unknown_index, |value| value.proof == "open");
     assert_eq!(
         (value.ordering, value.proof, value.coverage),
         ("unordered", "open", "open"),
@@ -4705,18 +4775,17 @@ func unknownObjectsDistinctFields() int {
         CodeQueryCompletion::Complete,
         "{unknown_alias:#?}"
     );
-    let [item] = unknown_alias.results.as_slice() else {
-        panic!("one open unknown-object alias candidate: {unknown_alias:#?}");
-    };
-    let CodeQueryResultValue::ConcurrentAccessConflict { value } = &item.value else {
-        panic!("unknown-object query returns its typed row: {item:#?}");
-    };
+    let value = find_concurrent_relation(&unknown_alias, |value| value.proof == "open");
     assert_eq!(
         (value.ordering, value.proof, value.coverage),
         ("unordered", "open", "open"),
         "{unknown_alias:#?}"
     );
-    assert_eq!(value.reasons, ["unknown_location"], "{unknown_alias:#?}");
+    assert_eq!(
+        value.reasons,
+        ["unknown_location", "alias_set_truncated"],
+        "{unknown_alias:#?}"
+    );
 
     let copied_struct = conflicts_for("copiedStructArguments");
     assert_eq!(
@@ -4724,18 +4793,17 @@ func unknownObjectsDistinctFields() int {
         CodeQueryCompletion::Complete,
         "{copied_struct:#?}"
     );
-    let [item] = copied_struct.results.as_slice() else {
-        panic!("one open copied-aggregate candidate: {copied_struct:#?}");
-    };
-    let CodeQueryResultValue::ConcurrentAccessConflict { value } = &item.value else {
-        panic!("copied-aggregate query returns its typed row: {item:#?}");
-    };
+    let value = find_concurrent_relation(&copied_struct, |value| value.proof == "open");
     assert_eq!(
         (value.ordering, value.proof, value.coverage),
         ("unordered", "open", "open"),
         "{copied_struct:#?}"
     );
-    assert_eq!(value.reasons, ["unknown_location"], "{copied_struct:#?}");
+    assert_eq!(
+        value.reasons,
+        ["unknown_location", "alias_set_truncated"],
+        "{copied_struct:#?}"
+    );
 
     let select_default = conflicts_for("selectWithDefaultIsUnjoined");
     assert_eq!(
@@ -4743,12 +4811,7 @@ func unknownObjectsDistinctFields() int {
         CodeQueryCompletion::Complete,
         "{select_default:#?}"
     );
-    let [item] = select_default.results.as_slice() else {
-        panic!("one conflict through a select default arm: {select_default:#?}");
-    };
-    let CodeQueryResultValue::ConcurrentAccessConflict { value } = &item.value else {
-        panic!("select-default query returns its typed row: {item:#?}");
-    };
+    let value = find_concurrent_relation(&select_default, |value| value.verdict == "conflict");
     assert_eq!(
         (value.ordering, value.proof, value.coverage),
         ("unordered", "proven", "exhaustive"),
@@ -4757,7 +4820,7 @@ func unknownObjectsDistinctFields() int {
 }
 
 #[test]
-fn go_concurrent_access_conflicts_report_incomplete_recursive_slices() {
+fn go_concurrent_access_conflicts_close_summarized_recursive_slices() {
     let project = InlineTestProject::with_language(Language::Go)
         .file(
             "main.go",
@@ -4787,16 +4850,11 @@ func recursive() {
     );
     assert_eq!(
         result.completion(),
-        CodeQueryCompletion::Incomplete {
-            codes: vec![CodeQueryDiagnosticCode::SemanticAnalysisPartial]
-        },
+        CodeQueryCompletion::Complete,
         "{result:#?}"
     );
     assert!(result.results.is_empty(), "{result:#?}");
-    assert!(result.diagnostics.iter().any(|diagnostic| {
-        diagnostic.code == CodeQueryDiagnosticCode::SemanticAnalysisPartial
-            && diagnostic.message.contains("RecursiveExpansion")
-    }));
+    assert!(result.diagnostics.is_empty(), "{result:#?}");
 }
 
 #[test]
@@ -4854,9 +4912,17 @@ func cgoBoundary() int {
             &brokk_bifrost_flow::FlowWorkspaceState::new(),
             &query,
         );
-        let [item] = result.results.as_slice() else {
-            panic!("{name} retains one binding-scoped open row: {result:#?}");
-        };
+        let item = result
+            .results
+            .iter()
+            .find(|item| {
+                matches!(
+                    &item.value,
+                    CodeQueryResultValue::ConcurrentAccessConflict { value }
+                        if value.verdict == "conflict"
+                )
+            })
+            .unwrap_or_else(|| panic!("{name} retains its exact conflict row: {result:#?}"));
         let CodeQueryResultValue::ConcurrentAccessConflict { value } = &item.value else {
             panic!("{name} returns its typed conflict row: {item:#?}");
         };
@@ -4904,6 +4970,49 @@ func locked() int {
     result := value
     mutex.Unlock()
     return result
+}
+
+type promotedMutex struct { sync.Mutex }
+
+func promotedLock() int {
+    guard := &promotedMutex{}
+    value := 0
+    go func() {
+        guard.Lock()
+        value = 1
+        guard.Unlock()
+    }()
+    guard.Lock()
+    result := value
+    guard.Unlock()
+    return result
+}
+
+type promotedTable struct {
+    sync.Mutex
+    items map[int]int
+}
+
+func (table *promotedTable) scan() {
+    table.Lock()
+    for range table.items {}
+    table.Unlock()
+}
+
+func (table *promotedTable) addInternal() {
+    table.items[0] = 1
+    table.Unlock()
+}
+
+func (table *promotedTable) add() {
+    table.Lock()
+    table.addInternal()
+}
+
+func promotedInterproceduralLock() {
+    table := &promotedTable{items: map[int]int{}}
+    go table.scan()
+    table.add()
 }
 
 func grouped() int {
@@ -5378,7 +5487,51 @@ func unsupportedOnce() int {
         CodeQueryCompletion::Complete,
         "{result:#?}"
     );
-    assert!(result.results.is_empty(), "{result:#?}");
+    assert_exact_safe_concurrent_relations(&result, "protected");
+
+    let query = CodeQuery::from_json(&json!({
+        "languages": ["go"],
+        "match": { "kind": "function", "name": "promotedInterproceduralLock" },
+        "steps": [
+            { "op": "procedure_of" },
+            { "op": "concurrent_access_conflicts" }
+        ],
+        "result_detail": "full"
+    }))
+    .expect("promoted interprocedural mutex-protected concurrent access query");
+    let result = execute_workspace(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &query,
+    );
+    assert_eq!(
+        result.completion(),
+        CodeQueryCompletion::Complete,
+        "{result:#?}"
+    );
+    assert_exact_safe_concurrent_relations(&result, "protected");
+
+    let query = CodeQuery::from_json(&json!({
+        "languages": ["go"],
+        "match": { "kind": "function", "name": "promotedLock" },
+        "steps": [
+            { "op": "procedure_of" },
+            { "op": "concurrent_access_conflicts" }
+        ],
+        "result_detail": "full"
+    }))
+    .expect("promoted mutex-protected concurrent access query");
+    let result = execute_workspace(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &query,
+    );
+    assert_eq!(
+        result.completion(),
+        CodeQueryCompletion::Complete,
+        "{result:#?}"
+    );
+    assert_exact_safe_concurrent_relations(&result, "protected");
 
     let query = CodeQuery::from_json(&json!({
         "languages": ["go"],
@@ -5400,7 +5553,7 @@ func unsupportedOnce() int {
         CodeQueryCompletion::Complete,
         "{result:#?}"
     );
-    assert!(result.results.is_empty(), "{result:#?}");
+    assert_exact_safe_concurrent_relations(&result, "ordered");
 
     let query = CodeQuery::from_json(&json!({
         "languages": ["go"],
@@ -5422,7 +5575,7 @@ func unsupportedOnce() int {
         CodeQueryCompletion::Complete,
         "{result:#?}"
     );
-    assert!(result.results.is_empty(), "{result:#?}");
+    assert_exact_safe_concurrent_relations(&result, "ordered");
 
     let query = CodeQuery::from_json(&json!({
         "languages": ["go"],
@@ -5444,7 +5597,7 @@ func unsupportedOnce() int {
         CodeQueryCompletion::Complete,
         "{result:#?}"
     );
-    assert!(result.results.is_empty(), "{result:#?}");
+    assert_exact_safe_concurrent_relations(&result, "protected");
 
     let query = CodeQuery::from_json(&json!({
         "languages": ["go"],
@@ -5466,9 +5619,17 @@ func unsupportedOnce() int {
         CodeQueryCompletion::Complete,
         "{result:#?}"
     );
-    let [item] = result.results.as_slice() else {
-        panic!("one mixed atomic/ordinary conflict: {result:#?}");
-    };
+    let item = result
+        .results
+        .iter()
+        .find(|item| {
+            matches!(
+                &item.value,
+                CodeQueryResultValue::ConcurrentAccessConflict { value }
+                    if value.verdict == "conflict"
+            )
+        })
+        .unwrap_or_else(|| panic!("one mixed atomic/ordinary conflict: {result:#?}"));
     let CodeQueryResultValue::ConcurrentAccessConflict { value } = &item.value else {
         panic!("mixed atomic/ordinary access returns its typed row: {item:#?}");
     };
@@ -5505,9 +5666,17 @@ func unsupportedOnce() int {
         },
         "{result:#?}"
     );
-    let [item] = result.results.as_slice() else {
-        panic!("one binding-scoped unsupported Once row: {result:#?}");
-    };
+    let item = result
+        .results
+        .iter()
+        .find(|item| {
+            matches!(
+                &item.value,
+                CodeQueryResultValue::ConcurrentAccessConflict { value }
+                    if value.verdict == "conflict" && value.proof == "open"
+            )
+        })
+        .unwrap_or_else(|| panic!("one binding-scoped unsupported Once row: {result:#?}"));
     let CodeQueryResultValue::ConcurrentAccessConflict { value } = &item.value else {
         panic!("unsupported Once retains its typed row: {item:#?}");
     };
@@ -5542,12 +5711,9 @@ func unsupportedOnce() int {
         CodeQueryCompletion::Complete,
         "{result:#?}"
     );
-    let [item] = result.results.as_slice() else {
-        panic!("one open mutex identity conflict: {result:#?}");
-    };
-    let CodeQueryResultValue::ConcurrentAccessConflict { value } = &item.value else {
-        panic!("ambiguous mutex identity returns its typed row: {item:#?}");
-    };
+    let value = find_concurrent_relation(&result, |value| {
+        value.verdict == "conflict" && value.proof == "open"
+    });
     assert_eq!(
         (
             value.ordering,
@@ -5580,12 +5746,7 @@ func unsupportedOnce() int {
         CodeQueryCompletion::Complete,
         "{result:#?}"
     );
-    let [item] = result.results.as_slice() else {
-        panic!("one one-sided mutex conflict: {result:#?}");
-    };
-    let CodeQueryResultValue::ConcurrentAccessConflict { value } = &item.value else {
-        panic!("one-sided mutex returns its typed row: {item:#?}");
-    };
+    let value = find_concurrent_relation(&result, |value| value.verdict == "conflict");
     assert_eq!(
         (
             value.ordering,
@@ -5617,12 +5778,9 @@ func unsupportedOnce() int {
         CodeQueryCompletion::Complete,
         "{result:#?}"
     );
-    let [item] = result.results.as_slice() else {
-        panic!("one open WaitGroup count row: {result:#?}");
-    };
-    let CodeQueryResultValue::ConcurrentAccessConflict { value } = &item.value else {
-        panic!("unknown WaitGroup count retains its typed row: {item:#?}");
-    };
+    let value = find_concurrent_relation(&result, |value| {
+        value.verdict == "conflict" && value.proof == "open"
+    });
     assert_eq!(
         (value.ordering, value.proof, value.coverage),
         ("open", "open", "open"),
@@ -5650,7 +5808,7 @@ func unsupportedOnce() int {
         CodeQueryCompletion::Complete,
         "{result:#?}"
     );
-    assert!(result.results.is_empty(), "{result:#?}");
+    assert_exact_safe_concurrent_relations(&result, "ordered");
 
     let query = CodeQuery::from_json(&json!({
         "languages": ["go"],
@@ -5672,7 +5830,7 @@ func unsupportedOnce() int {
         CodeQueryCompletion::Complete,
         "{result:#?}"
     );
-    assert!(result.results.is_empty(), "{result:#?}");
+    assert_exact_safe_concurrent_relations(&result, "ordered");
 }
 
 #[test]
@@ -5947,14 +6105,14 @@ func errgroupJoined() int {
             &query,
         )
     };
-    for name in ["rwExclusive", "errgroupJoined"] {
+    for (name, verdict) in [("rwExclusive", "protected"), ("errgroupJoined", "ordered")] {
         let result = conflicts_for(name);
         assert_eq!(
             result.completion(),
             CodeQueryCompletion::Complete,
             "{name}: {result:#?}"
         );
-        assert!(result.results.is_empty(), "{name}: {result:#?}");
+        assert_exact_safe_concurrent_relations(&result, verdict);
     }
     let shared = conflicts_for("rwSharedWrite");
     assert_eq!(
@@ -5962,9 +6120,17 @@ func errgroupJoined() int {
         CodeQueryCompletion::Complete,
         "{shared:#?}"
     );
-    let [item] = shared.results.as_slice() else {
-        panic!("shared read locks do not protect a write: {shared:#?}");
-    };
+    let item = shared
+        .results
+        .iter()
+        .find(|item| {
+            matches!(
+                &item.value,
+                CodeQueryResultValue::ConcurrentAccessConflict { value }
+                    if value.verdict == "conflict"
+            )
+        })
+        .unwrap_or_else(|| panic!("shared read locks do not protect a write: {shared:#?}"));
     let CodeQueryResultValue::ConcurrentAccessConflict { value } = &item.value else {
         panic!("RWMutex query returns its typed row: {item:#?}");
     };
@@ -5977,6 +6143,187 @@ func errgroupJoined() int {
         ),
         ("unordered", "unprotected", "proven", "exhaustive"),
         "{shared:#?}"
+    );
+}
+
+/// A conflict whose spawn root and whose written procedure are in two files of
+/// one package.
+///
+/// Every other concurrency fixture is one file (the survey behind Milestone 4
+/// of `.agents/plans/impact-sliced-diff-base.md` found none that crossed a file
+/// boundary), and the `--diff-base` case the plan is about is exactly the
+/// cross-file one: the edit is in the spawn root and the finding is anchored at
+/// the write, in a file the edit never touched.
+///
+/// The same content in one file produces exactly one proven, exhaustive
+/// conflict (`go_concurrent_access_conflict_identities_are_the_same_at_two_workspace_roots`
+/// asserts it). Split across two files of one package it produces no row at
+/// all -- and, worse, no open reason and no diagnostic, so a policy over it
+/// reports a clean, complete, exhaustive verdict about a race that exists. The
+/// same happens with the type in the spawn root's own file and only the
+/// spawned procedure elsewhere, so what does not cross the boundary is the
+/// spawn target's dispatch rather than the shared type. Fixing the concurrency
+/// engine's cross-file expansion is not this milestone's work, so the case is
+/// pinned here and reported.
+#[test]
+#[ignore = "finds real bug: a spawned callee in another file of the same Go package yields no task slice and no open reason"]
+fn go_concurrent_access_conflicts_cross_a_file_boundary_in_one_package() {
+    let project = InlineTestProject::with_language(Language::Go)
+        .file(
+            "a.go",
+            r#"package fixture
+
+func run() int {
+    c := &cell{}
+    go write(c)
+    return c.value
+}
+"#,
+        )
+        .file(
+            "b.go",
+            r#"package fixture
+
+type cell struct { value int }
+
+func write(c *cell) { c.value = 1 }
+"#,
+        )
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let query = CodeQuery::from_json(&json!({
+        "languages": ["go"],
+        "match": { "kind": "function", "name": "run" },
+        "steps": [
+            { "op": "procedure_of" },
+            { "op": "concurrent_access_conflicts" }
+        ],
+        "result_detail": "full"
+    }))
+    .expect("cross-file conflict query");
+    let result = execute_workspace(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &query,
+    );
+    assert_eq!(
+        result.completion(),
+        CodeQueryCompletion::Complete,
+        "{result:#?}"
+    );
+    let [item] = result.results.as_slice() else {
+        panic!("one cross-file conflict: {result:#?}");
+    };
+    let CodeQueryResultValue::ConcurrentAccessConflict { value } = &item.value else {
+        panic!("the cross-file query returns its typed row: {item:#?}");
+    };
+    assert_eq!(
+        (
+            value.task_relation,
+            value.ordering,
+            value.protection,
+            value.proof,
+            value.coverage
+        ),
+        (
+            "parent_child",
+            "unordered",
+            "unprotected",
+            "proven",
+            "exhaustive"
+        ),
+        "{result:#?}"
+    );
+    assert_eq!(
+        (value.first_path.as_str(), value.second_path.as_str()),
+        ("b.go", "a.go"),
+        "the write and the read are in two files: {result:#?}"
+    );
+}
+
+/// Every identity a conflict row publishes is mount-free.
+///
+/// A `--diff-base` run analyzes the base revision at a temporary root and the
+/// head at the repository root, then joins the two by finding identity. The
+/// data-race policy's finding identity is its group key, which is the rendered
+/// `location_id`, and a reader diagnoses a conflict by its `id` and the three
+/// procedure ids. If any of them folded the workspace mount -- which
+/// `SemanticArtifactKey` does, through a hash of the absolute root -- every
+/// data-race finding would be reported as new on every run.
+///
+/// Two analyses of byte-identical content at two different temporary roots are
+/// exactly that comparison.
+#[test]
+fn go_concurrent_access_conflict_identities_are_the_same_at_two_workspace_roots() {
+    const SOURCE: &str = r#"package main
+
+type shared struct { value int }
+
+func write(cell *shared) { cell.value = 1 }
+
+func race() int {
+    cell := &shared{}
+    go write(cell)
+    return cell.value
+}
+"#;
+
+    let identities = |()| {
+        let project = InlineTestProject::with_language(Language::Go)
+            .file("main.go", SOURCE)
+            .build();
+        let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+        let query = CodeQuery::from_json(&json!({
+            "languages": ["go"],
+            "match": { "kind": "function", "name": "race" },
+            "steps": [
+                { "op": "procedure_of" },
+                { "op": "concurrent_access_conflicts" }
+            ],
+            "result_detail": "full"
+        }))
+        .expect("cross-procedure conflict query");
+        let result = execute_workspace(
+            &workspace,
+            &brokk_bifrost_flow::FlowWorkspaceState::new(),
+            &query,
+        );
+        assert_eq!(
+            result.completion(),
+            CodeQueryCompletion::Complete,
+            "{result:#?}"
+        );
+        let [item] = result.results.as_slice() else {
+            panic!("one cross-procedure conflict: {result:#?}");
+        };
+        let CodeQueryResultValue::ConcurrentAccessConflict { value } = &item.value else {
+            panic!("the conflict query returns its typed row: {item:#?}");
+        };
+        (
+            value.id.clone(),
+            value.location_id.clone(),
+            value.root_procedure_id.clone(),
+            value.first_procedure_id.clone(),
+            value.second_procedure_id.clone(),
+        )
+    };
+
+    let first = identities(());
+    let second = identities(());
+    assert_eq!(
+        first, second,
+        "a conflict row names procedures and locations by content, never by workspace root"
+    );
+    let (id, location_id, root, first_site, second_site) = first;
+    assert!(
+        [&id, &location_id, &root, &first_site, &second_site]
+            .iter()
+            .all(|identity| !identity.is_empty()),
+        "every published identity is a value, not an empty string"
+    );
+    assert_ne!(
+        first_site, second_site,
+        "the two access sites of a cross-procedure race are two procedures"
     );
 }
 
@@ -7846,5 +8193,582 @@ fn a_truncated_query_reports_identical_diagnostics_on_every_run() {
         serde_json::to_value(&first).expect("serialize first run"),
         serde_json::to_value(&second).expect("serialize second run"),
         "two runs of one truncating query over an unchanged workspace must agree",
+    );
+}
+
+/// A `builtins` subset in the schema the pack generator emits: `object` with
+/// the members every class inherits, `int` with no members of its own, and
+/// `str` with `strip`. The class-set steps need an active pack to classify
+/// literals as `builtins.*`; the shipped typeshed pack is a generator spec, so
+/// the tests compile this fixture pack the way `python_dependency_pack.rs`
+/// does.
+const TYPE_FLOW_BUILTINS_PACK: &str = r#"{
+  "schema_version": 2,
+  "pack_id": "fixture.type-flow-builtins",
+  "version": "2026.9.2",
+  "producer": { "name": "bifrost-fixture", "version": "1.0.0" },
+  "language": "python",
+  "ecosystem": "python",
+  "compatibility": {
+    "bifrost": ">=0.8.0, <1.0.0",
+    "toolchains": [{ "name": "cpython", "requirement": ">=3.10.0, <3.15.0" }]
+  },
+  "provenance": { "source": "checked-in test source", "revision": "fixture-v1" },
+  "license": "Apache-2.0",
+  "completeness": "complete",
+  "safety": { "generated_code_only": false, "review_required": false },
+  "shards": [{
+    "id": "python.builtins",
+    "activation": [{
+      "toolchain": { "name": "cpython", "version": ">=3.10.0, <3.15.0" },
+      "targets": []
+    }],
+    "payload": {
+      "kind": "declaration_facts",
+      "types": [{
+        "id": "type.builtins-object",
+        "name": "builtins.object",
+        "type_kind": "class",
+        "visibility": "public",
+        "type_parameters": [],
+        "hierarchy": [],
+        "aliases": [],
+        "extension_surfaces": [],
+        "locator": { "kind": "artifact", "path": "builtins.pyi", "symbol": "builtins.object" }
+      }, {
+        "id": "type.builtins-int",
+        "name": "builtins.int",
+        "type_kind": "class",
+        "visibility": "public",
+        "type_parameters": [],
+        "hierarchy": [{ "hierarchy_kind": "extends", "target": { "kind": "named", "name": "builtins.object" } }],
+        "aliases": [],
+        "extension_surfaces": [],
+        "locator": { "kind": "artifact", "path": "builtins.pyi", "symbol": "builtins.int" }
+      }, {
+        "id": "type.builtins-str",
+        "name": "builtins.str",
+        "type_kind": "class",
+        "visibility": "public",
+        "type_parameters": [],
+        "hierarchy": [{ "hierarchy_kind": "extends", "target": { "kind": "named", "name": "builtins.object" } }],
+        "aliases": [],
+        "extension_surfaces": [],
+        "locator": { "kind": "artifact", "path": "builtins.pyi", "symbol": "builtins.str" }
+      }],
+      "members": [{
+        "id": "member.builtins-object.class",
+        "owner": "type.builtins-object",
+        "name": "__class__",
+        "member_kind": "property",
+        "visibility": "public",
+        "is_static": false,
+        "locator": { "kind": "artifact", "path": "builtins.pyi", "symbol": "builtins.object.__class__" }
+      }, {
+        "id": "member.builtins-object.eq",
+        "owner": "type.builtins-object",
+        "name": "__eq__",
+        "member_kind": "method",
+        "visibility": "public",
+        "is_static": false,
+        "locator": { "kind": "artifact", "path": "builtins.pyi", "symbol": "builtins.object.__eq__" }
+      }, {
+        "id": "member.builtins-str.strip",
+        "owner": "type.builtins-str",
+        "name": "strip",
+        "member_kind": "method",
+        "visibility": "public",
+        "is_static": false,
+        "locator": { "kind": "artifact", "path": "builtins.pyi", "symbol": "builtins.str.strip" }
+      }],
+      "relations": []
+    }
+  }]
+}"#;
+
+/// The plan's Purpose example: `read_config` passes an `int` into a parameter
+/// whose body calls `strip`, a member `builtins.int` does not declare.
+const TYPE_FLOW_PURPOSE_FIXTURE: &str =
+    "def normalize(x):\n    return x.strip()\n\ndef read_config():\n    return normalize(123)\n";
+
+fn type_flow_workspace() -> (inline_project::BuiltInlineTestProject, WorkspaceAnalyzer) {
+    type_flow_workspace_with_source(TYPE_FLOW_PURPOSE_FIXTURE)
+}
+
+fn type_flow_workspace_with_source(
+    source: &str,
+) -> (inline_project::BuiltInlineTestProject, WorkspaceAnalyzer) {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file("app.py", source)
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let pack = compile_source(
+        SourceFormat::Json,
+        TYPE_FLOW_BUILTINS_PACK.as_bytes(),
+        &CompilerOptions::default(),
+    )
+    .unwrap_or_else(|diagnostics| panic!("builtins fixture pack compiles: {diagnostics:#?}"));
+    let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default())
+        .expect("ephemeral semantic-pack catalog");
+    catalog
+        .register_session_pack(
+            &pack,
+            &SessionPackSource {
+                kind: SessionPackSourceKind::Embedded,
+                source_id: "test:rql-type-flow.builtins".to_owned(),
+            },
+        )
+        .expect("register builtins fixture pack");
+    let activation = acquire_active_semantic_models(
+        workspace.analyzer(),
+        &catalog,
+        None,
+        &SemanticModelActivationRequest {
+            bifrost_version: Version::parse(env!("CARGO_PKG_VERSION")).expect("crate version"),
+            evidence: vec![SemanticModelActivationEvidence {
+                language: "python".to_owned(),
+                ecosystem: "python".to_owned(),
+                package: None,
+                module: None,
+                toolchain: Some(crate::analyzer::semantic_model::CatalogCoordinate {
+                    name: "cpython".to_owned(),
+                    version: Some(Version::parse("3.12.0").expect("toolchain version parses")),
+                }),
+                target: None,
+                configuration: None,
+                artifact_sha256: None,
+            }],
+            controls: Vec::new(),
+            limits: SemanticModelRuntimeLimits::default(),
+        },
+        &CancellationToken::default(),
+    );
+    assert!(
+        matches!(activation, SemanticModelRuntimeOutcome::Ready { .. }),
+        "builtins fixture pack activates: {activation:#?}"
+    );
+    (project, workspace)
+}
+
+fn type_flow_query(root: &str, op: &str) -> serde_json::Value {
+    json!({
+        "languages": ["python"],
+        "match": { "kind": "function", "name": root },
+        "steps": [
+            { "op": "procedure_of" },
+            { "op": op }
+        ],
+        "result_detail": "full"
+    })
+}
+
+/// The class-set step reports, for the caller's parameter binding, the one
+/// class that reaches `x.strip()` -- `builtins.int`, introduced by the literal
+/// `123` -- and, for the isolated root, the honest unknown instead of a guess.
+#[test]
+fn python_class_set_rows_report_receiver_classes_and_unknown_origins() {
+    let (_project, workspace) = type_flow_workspace();
+
+    let query = CodeQuery::from_json(&type_flow_query("read_config", "class_set"))
+        .expect("class_set query");
+    let result = execute_workspace(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &query,
+    );
+    let rows = result
+        .results
+        .iter()
+        .map(|item| {
+            let CodeQueryResultValue::ClassSetRow { value } = &item.value else {
+                panic!("class_set returns its typed row: {item:#?}");
+            };
+            (
+                value.file.as_str(),
+                value.range.start_line,
+                value.member.as_str(),
+                value.class.as_deref(),
+                value.origin.as_str(),
+                value.status,
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        rows,
+        [(
+            "app.py",
+            2,
+            "strip",
+            Some("builtins.int"),
+            "external",
+            "known"
+        )],
+        "{result:#?}"
+    );
+
+    let query =
+        CodeQuery::from_json(&type_flow_query("normalize", "class_set")).expect("class_set query");
+    let result = execute_workspace(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &query,
+    );
+    let rows = result
+        .results
+        .iter()
+        .map(|item| {
+            let CodeQueryResultValue::ClassSetRow { value } = &item.value else {
+                panic!("class_set returns its typed row: {item:#?}");
+            };
+            (
+                value.member.as_str(),
+                value.class.as_deref(),
+                value.origin.as_str(),
+                value.status,
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        rows,
+        [("strip", None, "unknown:root_parameter", "partial")],
+        "an unclassified receiver states its reason and carries no class: {result:#?}"
+    );
+}
+
+/// The absent-member step reports the finding: the member, the class that
+/// lacks it, the member-access range, the origin site that introduced the
+/// class, the root it ran from, and the retained witness size.
+#[test]
+fn python_absent_member_rows_report_the_finding_and_its_origin() {
+    let (_project, workspace) = type_flow_workspace();
+
+    let query = CodeQuery::from_json(&type_flow_query("read_config", "absent_member"))
+        .expect("absent_member query");
+    let result = execute_workspace(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &query,
+    );
+    let [item] = result.results.as_slice() else {
+        panic!("exactly one absent-member finding: {result:#?}");
+    };
+    let CodeQueryResultValue::AbsentMemberFinding { value } = &item.value else {
+        panic!("absent_member returns its typed row: {item:#?}");
+    };
+    assert_eq!(value.file, "app.py");
+    assert_eq!(
+        value.range.start_line, 2,
+        "the `x.strip()` access: {value:#?}"
+    );
+    assert_eq!(value.member, "strip");
+    assert_eq!(value.class, "builtins.int");
+    assert_eq!(value.origin_file, "app.py");
+    assert_eq!(
+        value.origin_range.start_line, 5,
+        "the `normalize(123)` call that introduced the class: {value:#?}"
+    );
+    assert_eq!(value.caller, "read_config");
+    assert!(value.witness_steps >= 1, "{value:#?}");
+
+    // The isolated root classifies nothing, and an unproven receiver is no
+    // finding at all.
+    let query = CodeQuery::from_json(&type_flow_query("normalize", "absent_member"))
+        .expect("absent_member query");
+    let result = execute_workspace(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &query,
+    );
+    assert!(
+        result.results.is_empty(),
+        "a partial class set produces no finding: {result:#?}"
+    );
+}
+
+/// The query cost pin: one class-set solve per input procedure per query. Two
+/// branches consuming the same procedure in one query share the cached solve.
+#[test]
+fn class_set_and_absent_member_share_one_solve_per_input_procedure() {
+    let (_project, workspace) = type_flow_workspace();
+
+    let branch = json!({
+        "languages": ["python"],
+        "match": { "kind": "function", "name": "read_config" },
+        "steps": [
+            { "op": "procedure_of" },
+            { "op": "class_set" }
+        ]
+    });
+    let query = CodeQuery::from_json(&json!({
+        "execution_mode": "profile",
+        "union": [branch.clone(), branch]
+    }))
+    .expect("union profile query");
+    let response = execute_workspace_request(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &query,
+    );
+    let CodeQueryResponse::Profile(profile) = response else {
+        panic!("a profile-mode query returns its profile: {response:#?}");
+    };
+    let type_flow = profile.work.semantic.type_flow;
+    assert_eq!(type_flow.field_slot_builds, 1, "{type_flow:#?}");
+    assert_eq!(type_flow.solves, 1, "{type_flow:#?}");
+    assert_eq!(type_flow.cache_hits, 1, "{type_flow:#?}");
+    assert_eq!(type_flow.class_set_rows, 2, "{type_flow:#?}");
+    assert_eq!(type_flow.failed_solves, 0, "{type_flow:#?}");
+
+    // The finding step shares the same accounting: one solve per input
+    // procedure even when several roots go in.
+    let query = CodeQuery::from_json(&json!({
+        "execution_mode": "profile",
+        "languages": ["python"],
+        "match": { "kind": "function" },
+        "steps": [
+            { "op": "procedure_of" },
+            { "op": "absent_member" }
+        ]
+    }))
+    .expect("absent_member profile query");
+    let response = execute_workspace_request(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &query,
+    );
+    let CodeQueryResponse::Profile(profile) = response else {
+        panic!("a profile-mode query returns its profile: {response:#?}");
+    };
+    let type_flow = profile.work.semantic.type_flow;
+    assert_eq!(type_flow.field_slot_builds, 1, "{type_flow:#?}");
+    assert_eq!(type_flow.solves, 2, "{type_flow:#?}");
+    assert_eq!(type_flow.cache_hits, 0, "{type_flow:#?}");
+    assert_eq!(type_flow.finding_rows, 1, "{type_flow:#?}");
+    assert_eq!(type_flow.failed_solves, 0, "{type_flow:#?}");
+}
+
+/// A language with no registered adapter is an explicit unsupported
+/// diagnostic, never an empty answer that reads as "no classes".
+#[test]
+fn class_set_reports_unsupported_languages() {
+    let project = InlineTestProject::with_language(Language::Go)
+        .file(
+            "main.go",
+            "package main\n\nfunc read_config() int { return 1 }\n",
+        )
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let query = CodeQuery::from_json(&json!({
+        "languages": ["go"],
+        "match": { "kind": "function", "name": "read_config" },
+        "steps": [
+            { "op": "procedure_of" },
+            { "op": "class_set" }
+        ]
+    }))
+    .expect("class_set query");
+    let result = execute_workspace(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &query,
+    );
+    assert!(result.results.is_empty(), "{result:#?}");
+    assert!(
+        result.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == CodeQueryDiagnosticCode::SemanticCapabilityUnsupported
+        }),
+        "{result:#?}"
+    );
+}
+
+/// #2956: a receiver no call in the closure produced, under a root kept
+/// boundary-open by an unrelated external call, is an honest
+/// `unknown:incomplete_root` row -- the pre-split vocabulary reported the
+/// unexplained loss as `budget`.
+#[test]
+fn python_class_set_rows_name_incomplete_root_for_an_uncoverable_receiver() {
+    let fixture = "import os\n\ndef root():\n    os.system(\"echo hi\")\n    def inner(x):\n        return x.foo()\n    return 1\n";
+    let (_project, workspace) = type_flow_workspace_with_source(fixture);
+    let query =
+        CodeQuery::from_json(&type_flow_query("root", "class_set")).expect("class_set query");
+    let result = execute_workspace(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &query,
+    );
+    let rows = result
+        .results
+        .iter()
+        .map(|item| {
+            let CodeQueryResultValue::ClassSetRow { value } = &item.value else {
+                panic!("class_set returns its typed row: {item:#?}");
+            };
+            (
+                value.range.start_line,
+                value.member.as_str(),
+                value.class.as_deref(),
+                value.origin.as_str(),
+                value.status,
+            )
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        rows.contains(&(6, "foo", None, "unknown:incomplete_root", "inconclusive")),
+        "the never-called nested function's receiver states why it is unreached: {rows:?}"
+    );
+    assert!(
+        rows.iter()
+            .all(|(_, _, _, origin, _)| *origin != "unknown:budget"),
+        "the retired label is gone: {rows:?}"
+    );
+}
+
+/// #2956: each root of one query solves against its own child of the query's
+/// semantic budget. The cap below sits between one root's spend and the
+/// cumulative spend of both roots (96 versus 246 program points measured
+/// with the default limits): a shared ledger exhausts during the second
+/// root, but per-root children let both roots classify. The query-wide
+/// aggregate may still saturate the parent ledger's accounting -- that
+/// ceiling must not touch the rows.
+#[test]
+fn class_set_roots_do_not_inherit_each_others_semantic_spend() {
+    let (_project, workspace) = type_flow_workspace();
+    let query = CodeQuery::from_json(&json!({
+        "execution_mode": "profile",
+        "languages": ["python"],
+        "match": { "kind": "function" },
+        "steps": [
+            { "op": "procedure_of" },
+            { "op": "class_set" }
+        ],
+        "result_detail": "full"
+    }))
+    .expect("profile query");
+    let limits = |cap: usize| CodeQueryExecutionLimits {
+        semantic: CodeQuerySemanticLimits {
+            rows_per_dimension: Some(CodeQuerySemanticRowLimits::from_rows(|dimension| {
+                if dimension == SemanticBudgetDimension::ProgramPoints {
+                    cap
+                } else {
+                    1 << 20
+                }
+            })),
+            ..CodeQuerySemanticLimits::default()
+        },
+        ..CodeQueryExecutionLimits::default()
+    };
+    let response = execute_workspace_request_with_limits(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &query,
+        limits(96),
+    );
+    let CodeQueryResponse::Profile(profile) = response else {
+        panic!("a profile-mode query returns its profile: {response:#?}");
+    };
+    let mut origins: Vec<(String, Option<String>, String, String)> = profile
+        .result
+        .results
+        .iter()
+        .map(|item| {
+            let CodeQueryResultValue::ClassSetRow { value } = &item.value else {
+                panic!("class_set returns its typed row: {item:#?}");
+            };
+            (
+                value.member.clone(),
+                value.class.clone(),
+                value.origin.clone(),
+                value.status.to_string(),
+            )
+        })
+        .collect();
+    origins.sort();
+    assert_eq!(
+        origins,
+        vec![
+            (
+                "strip".to_string(),
+                None,
+                "unknown:root_parameter".to_string(),
+                "partial".to_string(),
+            ),
+            (
+                "strip".to_string(),
+                Some("builtins.int".to_string()),
+                "external".to_string(),
+                "known".to_string(),
+            ),
+        ],
+        "both roots classify exactly as with unconstrained limits: {profile:#?}",
+    );
+    let type_flow = profile.work.semantic.type_flow;
+    assert_eq!(type_flow.solves, 2, "{type_flow:#?}");
+    assert_eq!(type_flow.failed_solves, 0, "{type_flow:#?}");
+}
+
+/// #2956: a root whose own child ledger cannot fund its solve reports the
+/// exhaustion twice over, honestly: the unreached sink carries the
+/// `semantic_budget` reason, and the executor raises the
+/// `SemanticBudgetExhausted` diagnostic the value-flow and typestate
+/// executors already raise.
+#[test]
+fn semantic_budget_exhaustion_is_a_reason_label_and_a_diagnostic() {
+    let (_project, workspace) = type_flow_workspace();
+    let query = CodeQuery::from_json(&json!({
+        "execution_mode": "profile",
+        "languages": ["python"],
+        "match": { "kind": "function", "name": "normalize" },
+        "steps": [
+            { "op": "procedure_of" },
+            { "op": "class_set" }
+        ],
+        "result_detail": "full"
+    }))
+    .expect("profile query");
+    let response = execute_workspace_request_with_limits(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &query,
+        CodeQueryExecutionLimits {
+            semantic: CodeQuerySemanticLimits {
+                rows_per_dimension: Some(CodeQuerySemanticRowLimits::from_rows(|dimension| {
+                    if dimension == SemanticBudgetDimension::ProgramPoints {
+                        24
+                    } else {
+                        1 << 20
+                    }
+                })),
+                ..CodeQuerySemanticLimits::default()
+            },
+            ..CodeQueryExecutionLimits::default()
+        },
+    );
+    let CodeQueryResponse::Profile(profile) = response else {
+        panic!("a profile-mode query returns its profile: {response:#?}");
+    };
+    assert!(
+        profile.work.semantic.budget_exhausted,
+        "the executor surfaces the exhaustion: {profile:#?}"
+    );
+    assert!(
+        profile
+            .result
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == CodeQueryDiagnosticCode::SemanticBudgetExhausted),
+        "the diagnostic is raised: {profile:#?}"
+    );
+    let origins: Vec<&str> = profile
+        .result
+        .results
+        .iter()
+        .filter_map(|item| match &item.value {
+            CodeQueryResultValue::ClassSetRow { value } => Some(value.origin.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        origins.contains(&"unknown:semantic_budget"),
+        "the unreached sink names the semantic budget: {origins:?}"
     );
 }

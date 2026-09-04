@@ -369,6 +369,14 @@ pub enum CodeQueryResultValue {
         #[serde(flatten)]
         value: Box<CodeQueryFlowWitness>,
     },
+    ClassSetRow {
+        #[serde(flatten)]
+        value: Box<CodeQueryClassSetRow>,
+    },
+    AbsentMemberFinding {
+        #[serde(flatten)]
+        value: Box<CodeQueryAbsentMemberFinding>,
+    },
     TaintFinding {
         #[serde(flatten)]
         value: Box<CodeQueryTaintFinding>,

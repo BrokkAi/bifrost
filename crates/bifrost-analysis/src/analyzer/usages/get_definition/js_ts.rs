@@ -1469,7 +1469,12 @@ fn jsts_candidate_is_bare_declaration(
     let Some(file_name) = file.rel_path().file_name().and_then(|name| name.to_str()) else {
         return false;
     };
-    candidate.is_field() && candidate.short_name() == format!("{file_name}.{reference}")
+    // A module-scope binding carries a file-qualified short name: a `const` or
+    // `let` mints a field and a `type` alias mints a class (#2911), and both
+    // spell `<file>.<name>`. Every other declaration has the bare short name
+    // the first branch already answered.
+    (candidate.is_field() || candidate.is_class())
+        && candidate.short_name() == format!("{file_name}.{reference}")
 }
 
 fn jsts_exact_browser_global_bare_candidates(

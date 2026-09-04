@@ -67,6 +67,7 @@ pub(crate) fn compose_taint_policy(
             removes: entry.removes.clone(),
         },
     )?;
+    let entry_points = select_entry_points(policy_id, &spec.entry_points, &universe, limits)?;
     let transforms = compose_auxiliary_set(
         policy_id,
         &spec.transforms,
@@ -94,6 +95,32 @@ pub(crate) fn compose_taint_policy(
             transfers: entry.transfers.clone(),
         },
     )?;
+    // Persistence stores are policy-local only: catalogs carry no store
+    // entries, so there is no catalog composition arm.
+    let store_writes = compose_local_store_entries(
+        policy_id,
+        &spec.store_writes,
+        segments.stores,
+        "store-write",
+        |entry| ResolvedTaintStoreWriteDefinition {
+            store: entry.store.clone(),
+            key: entry.key.clone(),
+            instance: entry.instance.clone(),
+            input: entry.input.clone(),
+        },
+    )?;
+    let store_reads = compose_local_store_entries(
+        policy_id,
+        &spec.store_reads,
+        segments.stores,
+        "store-read",
+        |entry| ResolvedTaintStoreReadDefinition {
+            store: entry.store.clone(),
+            key: entry.key.clone(),
+            instance: entry.instance.clone(),
+            output: entry.output.clone(),
+        },
+    )?;
 
     let source_identities: Vec<_> = sources
         .endpoints
@@ -117,6 +144,11 @@ pub(crate) fn compose_taint_policy(
 
     let mut selected_identities = source_identities;
     selected_identities.extend(sink_identities);
+    selected_identities.extend(
+        entry_points
+            .iter()
+            .map(|endpoint| endpoint.identity.clone()),
+    );
     selected_identities.sort();
     selected_identities.dedup();
     let (_, mut precedence_edges) = validate_endpoint_precedence(&selected_identities, &universe)?;
@@ -131,8 +163,11 @@ pub(crate) fn compose_taint_policy(
         sources.endpoints,
         sinks.endpoints,
         sanitizers,
+        entry_points,
         transforms,
         external_models,
+        store_writes,
+        store_reads,
         resolved_catalogs,
         match_manifests,
         combinations.combinations,
@@ -495,8 +530,92 @@ where
     Ok(result)
 }
 
+/// Compose policy-local persistence-store entries. Unlike the other auxiliary
+/// sets, stores have no catalog arm: the schema registry already rejects
+/// `:include-sets` and `:include-matches` in the store context, so the input
+/// is a plain local entry vector.
+fn compose_local_store_entries<T, D>(
+    policy_id: &PolicyId,
+    entries: &[T],
+    set_name: &str,
+    kind: &'static str,
+    definition: impl Fn(&T) -> D,
+) -> Result<Vec<ResolvedTaintAuxiliary<D>>, CompositionError>
+where
+    T: TaintEntry,
+{
+    let mut result = Vec::with_capacity(entries.len());
+    let mut identities = HashSet::new();
+    for entry in entries {
+        let identity = ResolvedEndpointIdentity::Local {
+            policy_id: policy_id.clone(),
+            entry_id: entry.entry_id().clone(),
+        };
+        if !identities.insert(identity.clone()) {
+            return Err(CompositionError::DuplicateComposedEntry {
+                kind,
+                id: entry.entry_id().clone(),
+            });
+        }
+        let base = format!(
+            "/analysis/{set_name}/entries/{}",
+            json_pointer_segment(entry.entry_id().as_str())
+        );
+        result.push(ResolvedTaintAuxiliary::new(
+            identity,
+            PolicySelectorPath::new(format!("{base}/selector"))
+                .map_err(|error| CompositionError::LoadedModel(error.to_string()))?,
+            definition(entry),
+            vec![EndpointOrigin::PolicyLocal {
+                path: PolicyDependencyPath::new(base)
+                    .map_err(|error| CompositionError::LoadedModel(error.to_string()))?,
+            }],
+        ));
+    }
+    result.sort_by(|left, right| left.identity.cmp(&right.identity));
+    Ok(result)
+}
+
 fn json_pointer_segment(value: &str) -> String {
     value.replace('~', "~0").replace('/', "~1")
+}
+
+/// Entry points (#2692) are policy-local source-role endpoints. No registered
+/// catalog or match set carries an entry-point vocabulary, so only local
+/// entries compose; their dependencies were minted alongside the local source
+/// and sink dependencies and resolve through the same universe.
+fn select_entry_points(
+    policy_id: &PolicyId,
+    set: &TaintEndpointSet<TaintEntryPointSpec>,
+    universe: &EndpointUniverse,
+    limits: CompositionLimits,
+) -> Result<Vec<ResolvedTaintEndpoint<ResolvedTaintSourceDefinition>>, CompositionError> {
+    if !set.include_matches.is_empty() || !set.include_sets.is_empty() {
+        return Err(CompositionError::UnsupportedMatchComposition { set: "entry point" });
+    }
+    if set.entries.len() > limits.max_endpoints_per_role() {
+        return Err(CompositionError::EndpointLimit {
+            role: EndpointRole::Source,
+            found: set.entries.len(),
+            maximum: limits.max_endpoints_per_role(),
+        });
+    }
+    set.entries
+        .iter()
+        .map(|entry| {
+            let identity = ResolvedEndpointIdentity::Local {
+                policy_id: policy_id.clone(),
+                entry_id: entry.id.clone(),
+            };
+            let dependency = universe.get(&identity).ok_or_else(|| {
+                CompositionError::MissingLocalEndpointDependency {
+                    identity: identity.clone(),
+                }
+            })?;
+            universe.validate_role_and_taint(&identity, EndpointRole::Source, true)?;
+            resolved_source_from_dependency(dependency)
+        })
+        .collect()
 }
 
 trait TaintEntry {
@@ -518,7 +637,9 @@ macro_rules! impl_taint_entry {
 impl_taint_entry!(
     TaintSanitizerSpec,
     TaintTransformSpec,
-    TaintExternalModelSpec
+    TaintExternalModelSpec,
+    TaintStoreWriteSpec,
+    TaintStoreReadSpec,
 );
 
 #[derive(Debug)]
@@ -885,8 +1006,11 @@ mod tests {
                 entries: std::mem::take(&mut sinks),
             },
             sanitizers: empty_set(),
+            entry_points: empty_set(),
             transforms: empty_set(),
             external_models: empty_set(),
+            store_writes: vec![],
+            store_reads: vec![],
             finding_combinations: vec![],
         };
         let catalogs = TaintCatalogRegistry::new_without_workspace(Default::default());
@@ -968,8 +1092,11 @@ mod tests {
                 include_matches: vec![],
                 entries: vec![],
             },
+            entry_points: empty_set(),
             transforms: empty_set(),
             external_models: empty_set(),
+            store_writes: vec![],
+            store_reads: vec![],
             finding_combinations: vec![],
         };
 
@@ -1032,8 +1159,11 @@ mod tests {
                 entries: vec![sink.clone()],
             },
             sanitizers: empty_set(),
+            entry_points: empty_set(),
             transforms: empty_set(),
             external_models: empty_set(),
+            store_writes: vec![],
+            store_reads: vec![],
             finding_combinations: combinations,
         };
         let catalogs = TaintCatalogRegistry::new_without_workspace(Default::default());

@@ -57,9 +57,10 @@ pub enum ImplicitArgumentKind {
     LanguageDefined,
 }
 
-/// One member contributed by a syntactic call argument. Direct arguments
-/// contribute one `Whole` member; spread arguments contribute structured
-/// positional, keyword, or language-defined members.
+/// One member contributed by a syntactic call argument. Direct positional and
+/// unnamed keyword arguments contribute `Whole`; named direct arguments and
+/// spreads can contribute structured positional, keyword, or language-defined
+/// members.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum CallArgumentMember {
     Whole,
@@ -333,6 +334,10 @@ fn member_matches_expansion(
     match (expansion, member) {
         (CallArgumentExpansion::Direct(_), CallArgumentMember::Whole) => true,
         (
+            CallArgumentExpansion::Direct(ArgumentDomain::Keyword),
+            CallArgumentMember::Keyword(_),
+        ) => true,
+        (
             CallArgumentExpansion::Spread(ArgumentDomain::Positional),
             CallArgumentMember::Positional(_),
         )
@@ -372,6 +377,10 @@ fn rest_domain_accepts_mapping(
         (CallArgumentExpansion::Direct(ArgumentDomain::Keyword), CallArgumentMember::Whole) => {
             accepts_keyword
         }
+        (
+            CallArgumentExpansion::Direct(ArgumentDomain::Keyword),
+            CallArgumentMember::Keyword(_),
+        ) => accepts_keyword,
         (
             CallArgumentExpansion::Direct(ArgumentDomain::PositionalOrKeyword),
             CallArgumentMember::Whole,
@@ -775,6 +784,7 @@ impl CallBindings {
                     SemanticValueKind::Parameter {
                         ordinal,
                         multiplicity: FormalMultiplicity::One,
+                        ..
                     } => Some(*ordinal),
                     _ => None,
                 })

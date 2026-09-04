@@ -7,11 +7,13 @@ use crate::analyzer::semantic_model::{
     CatalogOptions, CompilerOptions, Completeness, ImplicitOperation, Locator, MemberKind,
     ProcedureSummaryTargetKey, SemanticModelActivationEvidence, SemanticModelActivationRequest,
     SemanticModelResolutionOutcome, SemanticPackCatalog, SessionPackSource, SessionPackSourceKind,
+    SummaryValueTransfer, SummaryValueTransferKind, SummaryValueTransferOperation,
     TypeCopySemantics, TypeFact, TypeKind, TypeValueSemantics, Visibility, compile_pack,
     resolve_active_semantic_models,
 };
 use semver::Version;
 use serde_json::{Value, json};
+use std::path::Path;
 
 const VALID_PROCEDURE_SUMMARY: &[u8] =
     include_bytes!("../../../../../../schemas/csmi/0.1/fixtures/valid/procedure-summary.json");
@@ -28,6 +30,12 @@ const VALID_JAVA_JVM_MAPPING: &[u8] =
     include_bytes!("../../../../../../schemas/csmi/0.1/fixtures/valid/java-jvm-mapping.json");
 const VALID_INDETERMINATE_JAVA_JVM_MAPPING: &[u8] = include_bytes!(
     "../../../../../../schemas/csmi/0.1/profiles/java-jvm/0.1/fixtures/valid/mapping-indeterminate-relocation.json"
+);
+const VALID_CPP_BASIC_STRING_COPY: &[u8] = include_bytes!(
+    "../../../../../../schemas/csmi/0.1/profiles/value-transfer/0.1/fixtures/valid/basic-string-copy.json"
+);
+const VALID_CPP_COPY_CONSTRUCTOR: &[u8] = include_bytes!(
+    "../../../../../../schemas/csmi/0.1/profiles/cpp/0.1/fixtures/valid/copy-constructor.json"
 );
 const DECLARATIONS_JSON: &[u8] =
     include_bytes!("../../../../testdata/semantic-model-packs/declarations-v1.json");
@@ -70,6 +78,20 @@ fn embedded_profile_schemas_match_the_provenanced_assets_byte_for_byte() {
                 .as_slice(),
         ),
         (
+            "value-transfer",
+            include_bytes!("profiles/value-transfer.schema.json").as_slice(),
+            include_bytes!(
+                "../../../../../../schemas/csmi/0.1/profiles/value-transfer/0.1/schema.json"
+            )
+            .as_slice(),
+        ),
+        (
+            "cpp",
+            include_bytes!("profiles/cpp.schema.json").as_slice(),
+            include_bytes!("../../../../../../schemas/csmi/0.1/profiles/cpp/0.1/schema.json")
+                .as_slice(),
+        ),
+        (
             "java-source-identity",
             include_bytes!("profiles/java-source-identity.schema.json").as_slice(),
             include_bytes!("../../../../../../schemas/csmi/0.1/profiles/java-jvm/0.1/java-source-identity.schema.json").as_slice(),
@@ -91,6 +113,77 @@ fn embedded_profile_schemas_match_the_provenanced_assets_byte_for_byte() {
         ),
     ] {
         assert_eq!(embedded, provenanced, "embedded {name} schema drifted");
+    }
+}
+
+#[test]
+fn pinned_profile_fixture_matrix_matches_structural_schemas() {
+    let repository_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let profile_directories = [
+        (
+            include_str!("profiles/value-transfer.schema.json"),
+            "schemas/csmi/0.1/profiles/value-transfer/0.1/fixtures",
+        ),
+        (
+            include_str!("profiles/cpp.schema.json"),
+            "schemas/csmi/0.1/profiles/cpp/0.1/fixtures",
+        ),
+    ];
+
+    for (schema, fixture_root) in profile_directories {
+        let schema: Value = serde_json::from_str(schema).expect("profile schema is valid JSON");
+        let validator =
+            jsonschema::draft202012::new(&schema).expect("profile schema is valid Draft 2020-12");
+        for group in ["valid", "invalid"] {
+            let directory = repository_root.join(fixture_root).join(group);
+            for entry in std::fs::read_dir(&directory).expect("fixture directory is readable") {
+                let path = entry.expect("fixture entry is readable").path();
+                if path.extension().is_none_or(|extension| extension != "json") {
+                    continue;
+                }
+                let value: Value = serde_json::from_str(
+                    &std::fs::read_to_string(&path).expect("fixture is readable UTF-8"),
+                )
+                .expect("fixture is valid JSON");
+                if value.get("documentType").is_some() {
+                    let validation = validate_csmi_document(
+                        &serde_json::to_vec(&value).expect("document serializes"),
+                        &CsmiVocabularySupport::new(vec![
+                            CsmiSupportedVocabulary {
+                                identifier: CSMI_VALUE_TRANSFER_PROFILE_ID.to_owned(),
+                                version: CSMI_VALUE_TRANSFER_PROFILE_VERSION.to_owned(),
+                                schema: CSMI_VALUE_TRANSFER_PROFILE_SCHEMA.to_owned(),
+                            },
+                            CsmiSupportedVocabulary {
+                                identifier: CSMI_C_CPP_RESOLUTION_PROFILE_ID.to_owned(),
+                                version: CSMI_CPP_PROFILE_VERSION.to_owned(),
+                                schema: CSMI_CPP_PROFILE_SCHEMA.to_owned(),
+                            },
+                            CsmiSupportedVocabulary {
+                                identifier: CSMI_CPP_PROFILE_ID.to_owned(),
+                                version: CSMI_CPP_PROFILE_VERSION.to_owned(),
+                                schema: CSMI_CPP_PROFILE_SCHEMA.to_owned(),
+                            },
+                        ]),
+                    );
+                    assert_eq!(
+                        validation.valid(),
+                        group == "valid",
+                        "unexpected document outcome for {}: {:?}",
+                        path.display(),
+                        validation.diagnostics
+                    );
+                    continue;
+                }
+                let valid = validator.is_valid(&value);
+                assert_eq!(
+                    valid,
+                    group == "valid",
+                    "unexpected outcome for {}",
+                    path.display()
+                );
+            }
+        }
     }
 }
 
@@ -325,6 +418,106 @@ fn logical_fixture_pack() -> CsmiLogicalPack {
         derived_from: Vec::new(),
     };
     CsmiLogicalPack::new(manifest, resources)
+}
+
+fn logical_pack_from_semantic(bytes: &[u8]) -> CsmiLogicalPack {
+    let semantic_bytes = canonical_json_bytes(bytes).expect("semantic fixture canonicalizes");
+    let path = "models/profile.csmi.json".to_owned();
+    let resources = InMemoryCsmiResourceResolver::new([(path.clone(), semantic_bytes.clone())])
+        .expect("fixture resource path is valid");
+    CsmiLogicalPack::new(
+        CsmiPackManifest {
+            document_type: "pack-manifest".to_owned(),
+            schema: CSMI_SCHEMA_URI.to_owned(),
+            pack_format_version: CSMI_PACK_FORMAT_VERSION.to_owned(),
+            assembler: CsmiProducerIdentity {
+                identifier: "https://example.org/tools/csmi-pack".to_owned(),
+                version: "1.0.0".to_owned(),
+            },
+            license: "Apache-2.0".to_owned(),
+            created_at: None,
+            resources: vec![CsmiResourceDescriptor {
+                path,
+                role: CsmiResourceRole::SemanticDocument,
+                media_type: CSMI_SEMANTIC_DOCUMENT_MEDIA_TYPE.to_owned(),
+                size: semantic_bytes.len() as u64,
+                digest: CsmiContentDigest {
+                    algorithm: CsmiContentDigestAlgorithm::Sha256,
+                    value: sha256_hex(&semantic_bytes),
+                },
+                license: None,
+                schema_identifier: None,
+                license_reference: None,
+            }],
+            derived_from: Vec::new(),
+        },
+        resources,
+    )
+}
+
+fn cpp_profile_support() -> CsmiVocabularySupport {
+    CsmiVocabularySupport::new(vec![
+        CsmiSupportedVocabulary {
+            identifier: CSMI_VALUE_TRANSFER_PROFILE_ID.to_owned(),
+            version: CSMI_VALUE_TRANSFER_PROFILE_VERSION.to_owned(),
+            schema: CSMI_VALUE_TRANSFER_PROFILE_SCHEMA.to_owned(),
+        },
+        CsmiSupportedVocabulary {
+            identifier: CSMI_C_CPP_RESOLUTION_PROFILE_ID.to_owned(),
+            version: CSMI_C_CPP_RESOLUTION_PROFILE_VERSION.to_owned(),
+            schema: CSMI_CPP_PROFILE_SCHEMA.to_owned(),
+        },
+        CsmiSupportedVocabulary {
+            identifier: CSMI_CPP_PROFILE_ID.to_owned(),
+            version: CSMI_CPP_PROFILE_VERSION.to_owned(),
+            schema: CSMI_CPP_PROFILE_SCHEMA.to_owned(),
+        },
+    ])
+}
+
+fn cpp_fixture_with_special_member() -> Value {
+    let mut fixture: Value =
+        serde_json::from_slice(VALID_CPP_BASIC_STRING_COPY).expect("C++ fixture is JSON");
+    fixture["semanticModels"][0]["completenessStatements"]
+        .as_array_mut()
+        .expect("completeness statements are an array")
+        .push(json!({
+            "family": "declaration-records",
+            "scope": {
+                "scheme": CSMI_CPP_DECLARATION_IDENTITY_SCHEME,
+                "schemeVersion": CSMI_CPP_DECLARATION_IDENTITY_SCHEME_VERSION
+            },
+            "status": "complete"
+        }));
+    let mut special: Value =
+        serde_json::from_slice(VALID_CPP_COPY_CONSTRUCTOR).expect("special-member fixture is JSON");
+    special["owner"] = json!("basicString");
+    special["member"] = json!("copyConstructor");
+    fixture["semanticModels"][0]["extensionFacts"]
+        .as_array_mut()
+        .expect("extension facts are an array")
+        .push(json!({
+            "vocabulary": CSMI_CPP_PROFILE_ID,
+            "version": CSMI_CPP_PROFILE_VERSION,
+            "family": "special-member",
+            "scope": {
+                "owner": "basicString",
+                "operation": "copy-constructor"
+            },
+            "payload": special
+        }));
+    fixture["semanticModels"][0]["vocabularyUses"][2]["affects"]
+        .as_array_mut()
+        .expect("C++ affects are an array")
+        .push(json!({
+            "kind": "fact-family",
+            "family": "special-member",
+            "scope": {
+                "owner": "basicString",
+                "operation": "copy-constructor"
+            }
+        }));
+    fixture
 }
 
 fn semantic_resource_index(pack: &CsmiLogicalPack) -> usize {
@@ -697,6 +890,7 @@ fn authored_exact_pack() -> AuthoredSemanticModelPack {
                     input: AuthoredSummaryInput::Parameter { ordinal: 0 },
                     exit_kind: AuthoredSummaryExitKind::Normal,
                     output: AuthoredSummaryOutput::NormalReturn {},
+                    value_transfer: None,
                 }],
                 effects: Vec::new(),
                 concurrency_effects: Vec::new(),
@@ -893,6 +1087,461 @@ fn complete_empty_summary_exports_without_licensing_partial_or_missing_evidence(
 }
 
 #[test]
+fn value_transfer_profile_round_trips_through_native_pack() {
+    let mut authored = authored_exact_pack();
+    let (type_id, member_id) = {
+        let AuthoredPayload::DeclarationFacts { types, members, .. } =
+            &mut authored.shards[0].payload
+        else {
+            panic!("declaration shard has the wrong payload");
+        };
+        members[0].member_kind = MemberKind::Constructor;
+        members[0].implicit_operation = Some(ImplicitOperation::CopyConstructor);
+        let type_id = types[0].id.clone();
+        let member_id = members[0].id.clone();
+        types[0].value_semantics = Some(TypeValueSemantics {
+            copy: Some(TypeCopySemantics::ViaMember {
+                member: member_id.clone(),
+            }),
+            move_semantics: None,
+        });
+        (type_id, member_id)
+    };
+    let AuthoredPayload::ProcedureSummaries { summaries } = &mut authored.shards[1].payload else {
+        panic!("summary shard has the wrong payload");
+    };
+    summaries[0].transfers[0].value_transfer = Some(SummaryValueTransfer {
+        kind: SummaryValueTransferKind::Copy {},
+        operation: SummaryValueTransferOperation::Implicit {
+            member: member_id.clone(),
+        },
+    });
+
+    let artifact = CsmiArtifactEvidence::new("pkg:maven/com.acme/widget@1.2.0", artifact_digest());
+    let options = CsmiExportOptions::default();
+    let exported = export_authored_csmi_pack(&authored, &artifact, &options).unwrap();
+    let support = CsmiVocabularySupport::support(
+        CSMI_VALUE_TRANSFER_PROFILE_ID,
+        CSMI_VALUE_TRANSFER_PROFILE_VERSION,
+        CSMI_VALUE_TRANSFER_PROFILE_SCHEMA,
+    );
+    let imported = import_logical_csmi_pack(&exported, &support, &CompilerOptions::default())
+        .expect("value-transfer profile imports");
+    let AuthoredPayload::DeclarationFacts { types, members, .. } = &imported.pack.shards[0].payload
+    else {
+        panic!("imported declaration shard has the wrong payload");
+    };
+    assert!(types.iter().any(|fact| matches!(
+        &fact.value_semantics,
+        Some(TypeValueSemantics { copy: Some(TypeCopySemantics::ViaMember { member }), .. })
+            if members.iter().any(|candidate| candidate.id == *member
+                && candidate.implicit_operation == Some(ImplicitOperation::CopyConstructor))
+    )));
+    let AuthoredPayload::ProcedureSummaries { summaries } = &imported.pack.shards[1].payload else {
+        panic!("imported summary shard has the wrong payload");
+    };
+    assert!(matches!(
+        &summaries[0].transfers[0].value_transfer,
+        Some(SummaryValueTransfer {
+            kind: SummaryValueTransferKind::Copy {},
+            operation: SummaryValueTransferOperation::Implicit { member },
+        }) if members.iter().any(|candidate| candidate.id == *member)
+    ));
+    let recompiled = imported.compile(&CompilerOptions::default()).unwrap();
+    let reexported = export_csmi_pack(&recompiled, &artifact, &options).unwrap();
+    assert_eq!(
+        exported
+            .resource_bytes(&exported.manifest.resources[0])
+            .unwrap(),
+        reexported
+            .resource_bytes(&reexported.manifest.resources[0])
+            .unwrap()
+    );
+    assert!(!type_id.is_empty());
+}
+
+#[test]
+fn cpp_profile_round_trips_through_typed_native_portability_evidence() {
+    let fixture_value = cpp_fixture_with_special_member();
+    let fixture = logical_pack_from_semantic(
+        &serde_json::to_vec(&fixture_value).expect("C++ fixture serializes"),
+    );
+    let imported = import_logical_csmi_pack(
+        &fixture,
+        &cpp_profile_support(),
+        &CompilerOptions::default(),
+    )
+    .expect("portable C++ profile imports");
+    let evidence = imported
+        .pack
+        .cpp_portability
+        .as_ref()
+        .expect("C++ evidence is retained");
+    assert_eq!(1, evidence.resolution_contexts.len());
+    assert_eq!(2, evidence.symbols.len());
+    assert_eq!(1, evidence.special_members.len());
+    assert!(evidence.symbols.iter().any(|record| {
+        record.key.descriptors.last().is_some_and(|descriptor| {
+            descriptor.disambiguator
+                == "cppsig-0.1:670e0719b1b6b5ae53e61b7e9b5d04dffd8beb7fbe6514a93b2a6b6d276b0bbb"
+        })
+    }));
+    let compiled = imported.compile(&CompilerOptions::default()).unwrap();
+    let artifact = CsmiArtifactEvidence::new(
+        "pkg:generic/cpp-reference-headers@1.0.0",
+        "1111111111111111111111111111111111111111111111111111111111111111",
+    )
+    .with_coverage("canonical-header-tree");
+    let exported = export_csmi_pack(&compiled, &artifact, &CsmiExportOptions::default())
+        .expect("portable C++ profile exports");
+    let reimported = import_logical_csmi_pack(
+        &exported,
+        &cpp_profile_support(),
+        &CompilerOptions::default(),
+    )
+    .expect("re-exported C++ profile imports");
+    assert_eq!(
+        imported.pack.cpp_portability,
+        reimported.pack.cpp_portability
+    );
+    let recompiled = reimported.compile(&CompilerOptions::default()).unwrap();
+    let reexported = export_csmi_pack(&recompiled, &artifact, &CsmiExportOptions::default())
+        .expect("reimported C++ profile re-exports");
+    assert_eq!(
+        exported
+            .resource_bytes(&exported.manifest.resources[0])
+            .unwrap(),
+        reexported
+            .resource_bytes(&reexported.manifest.resources[0])
+            .unwrap(),
+        "portable C++ export/import/export must be byte deterministic"
+    );
+}
+
+#[test]
+fn cpp_special_member_rejects_a_mismatched_structured_disambiguator() {
+    let mut fixture = cpp_fixture_with_special_member();
+    let facts = fixture["semanticModels"][0]["extensionFacts"]
+        .as_array_mut()
+        .expect("extension facts are an array");
+    let special = facts
+        .iter_mut()
+        .find(|fact| fact["family"] == "special-member")
+        .expect("special-member fact exists");
+    special["payload"]["memberDisambiguator"] =
+        json!("cppsig-0.1:0000000000000000000000000000000000000000000000000000000000000000");
+    let bytes = canonical_json_value(&fixture).expect("mutated C++ fixture canonicalizes");
+    let result = validate_csmi_document(&bytes, &cpp_profile_support());
+    assert!(
+        result.structural_valid,
+        "diagnostics: {:#?}",
+        result.diagnostics
+    );
+    assert!(!result.semantic_valid);
+    assert!(diagnostics_contain(
+        &result.diagnostics,
+        "semantic.cpp_signature_digest"
+    ));
+}
+
+#[test]
+fn cpp_special_member_family_scope_must_match_the_payload_key() {
+    let mut fixture = cpp_fixture_with_special_member();
+    let facts = fixture["semanticModels"][0]["extensionFacts"]
+        .as_array_mut()
+        .expect("extension facts are an array");
+    let special = facts
+        .iter_mut()
+        .find(|fact| fact["family"] == "special-member")
+        .expect("special-member fact exists");
+    special["scope"]["owner"] = json!("copyConstructor");
+    let bytes = canonical_json_value(&fixture).expect("mutated C++ fixture canonicalizes");
+    let result = validate_csmi_document(&bytes, &cpp_profile_support());
+    assert!(
+        result.structural_valid,
+        "diagnostics: {:#?}",
+        result.diagnostics
+    );
+    assert!(!result.semantic_valid);
+    assert!(diagnostics_contain(
+        &result.diagnostics,
+        "semantic.cpp_special_member_family_scope"
+    ));
+}
+
+#[test]
+fn cpp_fact_cannot_bind_a_digest_for_a_c_resolution_context() {
+    let mut fixture = cpp_fixture_with_special_member();
+    let context_value = &mut fixture["semanticModels"][0]["compatibilityConstraints"][0]["value"];
+    context_value["language"] = json!("c");
+    let context: CsmiResolutionContext =
+        serde_json::from_value(context_value.clone()).expect("C context remains structural");
+    let digest = canonical_digest(&context).expect("C context canonicalizes");
+    let facts = fixture["semanticModels"][0]["extensionFacts"]
+        .as_array_mut()
+        .expect("extension facts are an array");
+    let special = facts
+        .iter_mut()
+        .find(|fact| fact["family"] == "special-member")
+        .expect("special-member fact exists");
+    special["payload"]["resolutionContext"]["contextDigest"] = json!(digest);
+    let bytes = canonical_json_value(&fixture).expect("mutated C++ fixture canonicalizes");
+    let result = validate_csmi_document(&bytes, &cpp_profile_support());
+    assert!(
+        result.structural_valid,
+        "diagnostics: {:#?}",
+        result.diagnostics
+    );
+    assert!(!result.semantic_valid);
+    assert!(diagnostics_contain(
+        &result.diagnostics,
+        "semantic.cpp_context_reference"
+    ));
+}
+
+#[test]
+fn complete_type_value_scope_rejects_conflicting_facts() {
+    let mut fixture: Value =
+        serde_json::from_slice(VALID_CPP_BASIC_STRING_COPY).expect("C++ fixture is JSON");
+    fixture["semanticModels"][0]["extensionFacts"]
+        .as_array_mut()
+        .expect("extension facts are an array")
+        .push(json!({
+            "vocabulary": CSMI_VALUE_TRANSFER_PROFILE_ID,
+            "version": CSMI_VALUE_TRANSFER_PROFILE_VERSION,
+            "family": "type-value-semantics",
+            "scope": {"type": "basicString", "aspect": "copy"},
+            "payload": {
+                "kind": "type-value-semantics",
+                "type": "basicString",
+                "aspect": "copy",
+                "semantics": {"kind": "trivial"}
+            }
+        }));
+    let bytes =
+        canonical_json_value(&fixture).expect("mutated value-transfer fixture canonicalizes");
+    let result = validate_csmi_document(&bytes, &cpp_profile_support());
+    assert!(
+        result.structural_valid,
+        "diagnostics: {:#?}",
+        result.diagnostics
+    );
+    assert!(!result.semantic_valid);
+    assert!(diagnostics_contain(
+        &result.diagnostics,
+        "semantic.value_transfer_complete_conflict"
+    ));
+}
+
+#[test]
+fn native_cpp_evidence_recomputes_context_signature_and_operation_shape() {
+    let fixture = cpp_fixture_with_special_member();
+    let logical =
+        logical_pack_from_semantic(&serde_json::to_vec(&fixture).expect("C++ fixture serializes"));
+    let imported = import_logical_csmi_pack(
+        &logical,
+        &cpp_profile_support(),
+        &CompilerOptions::default(),
+    )
+    .expect("portable C++ profile imports");
+
+    let mut forged_signature = imported.clone();
+    let evidence = forged_signature.pack.cpp_portability.as_mut().unwrap();
+    evidence.special_members[0].member_disambiguator = format!("cppsig-0.1:{}", "0".repeat(64));
+    let error = forged_signature
+        .compile(&CompilerOptions::default())
+        .expect_err("forged cppsig must fail");
+    assert!(
+        error
+            .to_string()
+            .contains("cpp_portability.member_disambiguator")
+    );
+
+    let mut wrong_shape = imported.clone();
+    let evidence = wrong_shape.pack.cpp_portability.as_mut().unwrap();
+    evidence.special_members[0].signature.callable_kind =
+        crate::analyzer::semantic_model::CppCallableKind::Method;
+    let error = wrong_shape
+        .compile(&CompilerOptions::default())
+        .expect_err("operation-incompatible signature must fail");
+    assert!(
+        error
+            .to_string()
+            .contains("cpp_portability.signature_shape")
+    );
+
+    let mut forged_context = imported;
+    let evidence = forged_context.pack.cpp_portability.as_mut().unwrap();
+    evidence.resolution_contexts[0].translation_unit = "src/other.cpp".to_owned();
+    let error = forged_context
+        .compile(&CompilerOptions::default())
+        .expect_err("forged context digest must fail");
+    assert!(
+        error
+            .to_string()
+            .contains("cpp_portability.context_digest_mismatch")
+    );
+}
+
+#[test]
+fn cpp_alias_exports_core_alias_target_and_exact_profile_fact() {
+    let mut fixture_value: Value =
+        serde_json::from_slice(VALID_CPP_BASIC_STRING_COPY).expect("C++ fixture is JSON");
+    fixture_value["semanticModels"][0]["completenessStatements"]
+        .as_array_mut()
+        .expect("completeness statements are an array")
+        .push(json!({
+            "family": "declaration-records",
+            "scope": {
+                "scheme": CSMI_CPP_DECLARATION_IDENTITY_SCHEME,
+                "schemeVersion": CSMI_CPP_DECLARATION_IDENTITY_SCHEME_VERSION
+            },
+            "status": "complete"
+        }));
+    let fixture = logical_pack_from_semantic(
+        &serde_json::to_vec(&fixture_value).expect("C++ fixture serializes"),
+    );
+    let mut imported = import_logical_csmi_pack(
+        &fixture,
+        &cpp_profile_support(),
+        &CompilerOptions::default(),
+    )
+    .expect("portable C++ profile imports");
+    let evidence = imported
+        .pack
+        .cpp_portability
+        .as_mut()
+        .expect("C++ evidence is retained");
+    let target_symbol = evidence
+        .symbols
+        .iter()
+        .find(|symbol| {
+            symbol.key.descriptors.last().is_some_and(|descriptor| {
+                descriptor.role == crate::analyzer::semantic_model::CppDescriptorRole::Type
+            })
+        })
+        .expect("C++ fixture has a type symbol");
+    let target = target_symbol.native_id.clone();
+    let mut alias_key = target_symbol.key.clone();
+    let alias_descriptor = alias_key
+        .descriptors
+        .last_mut()
+        .expect("type key has a descriptor");
+    alias_descriptor.name = "string".to_owned();
+    alias_descriptor.disambiguator = "type-alias".to_owned();
+    let alias = "cpp.std.string.alias".to_owned();
+    evidence
+        .symbols
+        .push(crate::analyzer::semantic_model::CppPortableSymbolRecord {
+            native_id: alias.clone(),
+            key: alias_key,
+        });
+    let context = &evidence.resolution_contexts[0];
+    evidence
+        .type_aliases
+        .push(crate::analyzer::semantic_model::CppTypeAliasEvidence {
+            alias: alias.clone(),
+            target: crate::analyzer::semantic_model::CppCanonicalType::Declared { symbol: target },
+            resolution_context: crate::analyzer::semantic_model::CppResolutionContextRef {
+                vocabulary: CSMI_C_CPP_RESOLUTION_PROFILE_ID.to_owned(),
+                version: CSMI_C_CPP_RESOLUTION_PROFILE_VERSION.to_owned(),
+                context_digest: context.context_digest.clone(),
+                language: context.language,
+                header_closure: context.header_closure,
+            },
+        });
+    let AuthoredPayload::DeclarationFacts { types, .. } = &mut imported.pack.shards[0].payload
+    else {
+        panic!("imported declaration shard has the wrong payload");
+    };
+    let mut alias_type = types[0].clone();
+    alias_type.id = alias;
+    alias_type.name = "string".to_owned();
+    alias_type.type_kind = TypeKind::TypeAlias;
+    alias_type.value_semantics = None;
+    types.push(alias_type);
+
+    let artifact = CsmiArtifactEvidence::new(
+        "pkg:generic/cpp-reference-headers@1.0.0",
+        "1111111111111111111111111111111111111111111111111111111111111111",
+    )
+    .with_coverage("canonical-header-tree");
+    let exported = export_csmi_pack(
+        &imported.compile(&CompilerOptions::default()).unwrap(),
+        &artifact,
+        &CsmiExportOptions::default(),
+    )
+    .expect("C++ alias exports");
+    let document: CsmiSemanticDocument = serde_json::from_slice(
+        exported
+            .resources
+            .get(DEFAULT_SEMANTIC_RESOURCE_PATH)
+            .unwrap(),
+    )
+    .unwrap();
+    let model = &document.semantic_models[0];
+    let alias_declaration = model
+        .declarations
+        .iter()
+        .find(|declaration| declaration.category == CsmiDeclarationCategory::TypeAlias)
+        .expect("core type-alias declaration is emitted");
+    assert!(matches!(
+        alias_declaration.alias_target,
+        Some(CsmiTypeExpression::Reference(_))
+    ));
+    assert!(
+        model
+            .extension_facts
+            .iter()
+            .any(|fact| { fact.vocabulary == CSMI_CPP_PROFILE_ID && fact.family == "type-alias" })
+    );
+    let reimported = import_logical_csmi_pack(
+        &exported,
+        &cpp_profile_support(),
+        &CompilerOptions::default(),
+    )
+    .expect("exported C++ alias reimports");
+    assert_eq!(
+        reimported
+            .pack
+            .cpp_portability
+            .as_ref()
+            .unwrap()
+            .type_aliases
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn cpp_identity_rejects_non_sha256_core_digest_instead_of_relabeling_it() {
+    let mut fixture_value: Value =
+        serde_json::from_slice(VALID_CPP_BASIC_STRING_COPY).expect("C++ fixture is JSON");
+    fixture_value["semanticModels"][0]["artifactSelectors"][0]["digests"]
+        .as_array_mut()
+        .expect("digests are an array")
+        .push(json!({
+            "algorithm": "sha-512",
+            "coverage": "canonical-header-tree",
+            "value": "22".repeat(64)
+        }));
+    let fixture = logical_pack_from_semantic(
+        &serde_json::to_vec(&fixture_value).expect("C++ fixture serializes"),
+    );
+    let error = import_logical_csmi_pack(
+        &fixture,
+        &cpp_profile_support(),
+        &CompilerOptions::default(),
+    )
+    .expect_err("C++ identity cannot losslessly retain sha-512");
+    assert!(matches!(
+        error,
+        CsmiImportError::Unsupported { path, .. }
+            if path == "symbols.artifactSelectors.digests.algorithm"
+    ));
+}
+
+#[test]
 fn importer_pack_completeness_uses_declaration_records_only() {
     let pack = exported_import_fixture();
     let imported = import_logical_csmi_pack(
@@ -985,7 +1634,7 @@ fn maven_digest_near_miss_remains_an_exact_distinct_selector() {
 }
 
 #[test]
-fn unsupported_effects_and_generator_rules_fail_closed_on_export() {
+fn unsupported_effects_fail_closed_and_value_transfer_facts_export() {
     let artifact = CsmiArtifactEvidence::new("pkg:maven/com.acme/widget@1.2.0", artifact_digest());
     let options = CsmiExportOptions::default();
 
@@ -1035,12 +1684,19 @@ fn unsupported_effects_and_generator_rules_fail_closed_on_export() {
             move_semantics: None,
         });
     }
-    let value_semantics_error = export_authored_csmi_pack(&value_semantics, &artifact, &options)
-        .expect_err("CSMI 0.1 must not silently discard type-wide value semantics");
-    assert!(matches!(
-        value_semantics_error,
-        CsmiExportError::Unsupported { path, .. } if path.contains("valueSemantics")
-    ));
+    let exported = export_authored_csmi_pack(&value_semantics, &artifact, &options)
+        .expect("standardized type-wide value semantics export");
+    let document: CsmiSemanticDocument = serde_json::from_slice(
+        exported
+            .resources
+            .get(DEFAULT_SEMANTIC_RESOURCE_PATH)
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        document.semantic_models[0].extension_facts[0].family,
+        "type-value-semantics"
+    );
 
     {
         let AuthoredPayload::DeclarationFacts { types, members, .. } =
@@ -1052,12 +1708,19 @@ fn unsupported_effects_and_generator_rules_fail_closed_on_export() {
         members[0].member_kind = MemberKind::Constructor;
         members[0].implicit_operation = Some(ImplicitOperation::CopyConstructor);
     }
-    let implicit_operation_error = export_authored_csmi_pack(&value_semantics, &artifact, &options)
-        .expect_err("CSMI 0.1 must not silently discard implicit-operation identity");
-    assert!(matches!(
-        implicit_operation_error,
-        CsmiExportError::Unsupported { path, .. } if path.contains("implicitOperation")
-    ));
+    let exported = export_authored_csmi_pack(&value_semantics, &artifact, &options)
+        .expect("standardized implicit-operation identity exports");
+    let document: CsmiSemanticDocument = serde_json::from_slice(
+        exported
+            .resources
+            .get(DEFAULT_SEMANTIC_RESOURCE_PATH)
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        document.semantic_models[0].extension_facts[0].family,
+        "implicit-operations"
+    );
 
     let rules: AuthoredSemanticModelPack =
         serde_json::from_slice(GENERATOR_RULES_JSON).expect("generator fixture is valid");

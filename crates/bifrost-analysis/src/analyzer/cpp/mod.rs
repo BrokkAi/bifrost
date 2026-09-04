@@ -55,7 +55,9 @@ use brokk_bifrost_cpp::compile_context::{CppCompileContext, CppCompileContexts};
 pub(crate) use brokk_bifrost_cpp::declarations::CppRecoveredExportClassIndex;
 use brokk_bifrost_cpp::graph::CppWorkspaceSource;
 use brokk_bifrost_cpp::graph::extractor::build_source_using_index;
-use brokk_bifrost_cpp::graph::resolver::{CppClassDeclarationStrength, SourceUsingIndex};
+use brokk_bifrost_cpp::graph::resolver::{
+    CppClassDeclarationStrength, OrphanedNamespaceScopeIndex, SourceUsingIndex,
+};
 use brokk_bifrost_cpp::graph_support::CppSource;
 use brokk_bifrost_cpp::identity::{
     CppReconcileCandidates, CppReconcileGroupKey, CppReconciledDefinitionIndex,
@@ -116,6 +118,11 @@ pub struct CppAnalyzer {
     /// [`CppSource::recovered_export_class_index`], memoized here for the same
     /// reason as `source_using_index_by_file` (#1496).
     recovered_export_class_index_by_file: Cache<ProjectFile, Arc<CppRecoveredExportClassIndex>>,
+    /// The per-file namespaces parse recovery dropped, behind
+    /// [`CppSource::orphaned_namespace_scopes`]. Both lookup directions derive
+    /// every lexical scope in a file through it, so it is memoized here for
+    /// the same reason as `source_using_index_by_file` (#1537).
+    orphaned_namespace_scopes_by_file: Cache<ProjectFile, Arc<OrphanedNamespaceScopeIndex>>,
     /// The C reading of a header blob, when the store holds one (#1970). See
     /// [`projection::CppCReading`]. `None` is a real, memoized answer: it says
     /// the two readings of that blob agree, so every question about the C view
@@ -308,6 +315,10 @@ impl CppAnalyzer {
             recovered_export_class_index_by_file: build_weighted_cache(
                 memo_budget / 8,
                 cache::weight_recovered_export_class_index,
+            ),
+            orphaned_namespace_scopes_by_file: build_weighted_cache(
+                memo_budget / 8,
+                cache::weight_orphaned_namespace_scopes,
             ),
             c_readings_by_file: build_weighted_cache(memo_budget / 8, cache::weight_c_reading),
             reconcile_candidates_by_identifier: build_weighted_cache(
@@ -502,6 +513,10 @@ impl CppAnalyzer {
             recovered_export_class_index_by_file: build_weighted_cache(
                 self.memo_budget / 8,
                 cache::weight_recovered_export_class_index,
+            ),
+            orphaned_namespace_scopes_by_file: build_weighted_cache(
+                self.memo_budget / 8,
+                cache::weight_orphaned_namespace_scopes,
             ),
             c_readings_by_file: build_weighted_cache(self.memo_budget / 8, cache::weight_c_reading),
             reconcile_candidates_by_identifier: build_weighted_cache(
@@ -1110,6 +1125,23 @@ impl CppSource for CppAnalyzer {
             })
     }
 
+    fn orphaned_namespace_scopes(
+        &self,
+        token: QueryToken<'_>,
+        file: &ProjectFile,
+    ) -> Arc<OrphanedNamespaceScopeIndex> {
+        self.orphaned_namespace_scopes_by_file
+            .get_with_by_ref(file, || {
+                let Some(prepared) = self.prepared_syntax(token, file) else {
+                    return Arc::new(OrphanedNamespaceScopeIndex::default());
+                };
+                Arc::new(OrphanedNamespaceScopeIndex::build(
+                    prepared.tree().root_node(),
+                    prepared.source(),
+                ))
+            })
+    }
+
     fn cached_class_declaration_strength(
         &self,
         candidate: &CodeUnit,
@@ -1632,6 +1664,10 @@ impl IAnalyzer for CppAnalyzer {
         self.inner.end_query(context);
     }
 
+    fn prefetch_definitions(&self, fq_names: &[String]) {
+        self.inner.prefetch_definitions(fq_names);
+    }
+
     fn record_query_failure(&self, error: crate::analyzer::store::StoreError) {
         self.inner.record_query_failure(error);
     }
@@ -1824,6 +1860,42 @@ impl IAnalyzer for CppAnalyzer {
 
 #[cfg(any(test, feature = "test-support"))]
 impl crate::analyzer::AnalyzerTestHooks for CppAnalyzer {
+    fn reset_relational_definition_batch_call_count_for_test(&self) {
+        self.inner
+            .test_hooks()
+            .reset_relational_definition_batch_call_count_for_test();
+    }
+
+    fn relational_definition_batch_call_count_for_test(&self) -> usize {
+        self.inner
+            .test_hooks()
+            .relational_definition_batch_call_count_for_test()
+    }
+
+    fn reset_definition_candidates_query_count_for_test(&self) {
+        self.inner
+            .test_hooks()
+            .reset_definition_candidates_query_count_for_test();
+    }
+
+    fn definition_candidates_query_count_for_test(&self) -> usize {
+        self.inner
+            .test_hooks()
+            .definition_candidates_query_count_for_test()
+    }
+
+    fn reset_definition_prefetch_batch_count_for_test(&self) {
+        self.inner
+            .test_hooks()
+            .reset_definition_prefetch_batch_count_for_test();
+    }
+
+    fn definition_prefetch_batch_count_for_test(&self) -> usize {
+        self.inner
+            .test_hooks()
+            .definition_prefetch_batch_count_for_test()
+    }
+
     fn reset_full_declaration_scan_count_for_test(&self) {
         self.inner
             .test_hooks()
@@ -1842,6 +1914,14 @@ impl crate::analyzer::AnalyzerTestHooks for CppAnalyzer {
 
     fn candidate_hydration_count_for_test(&self) -> usize {
         self.inner.full_hydration_count_for_test() + self.inner.bulk_hydration_count_for_test()
+    }
+
+    fn reset_blob_hash_count_for_test(&self) {
+        self.inner.reset_blob_hash_count_for_test();
+    }
+
+    fn blob_hash_count_for_test(&self) -> usize {
+        self.inner.blob_hash_count_for_test()
     }
 }
 

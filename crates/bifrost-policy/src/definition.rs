@@ -154,7 +154,7 @@ impl PolicyAnalysis {
 pub const FLOW_INTERNAL_LABEL: &str = "flow-value";
 
 /// The JSON-pointer segments the shared taint-shaped model publishes for its
-/// five entry sets. Taint and flow decode into the same typed model but must
+/// entry sets. Taint and flow decode into the same typed model but must
 /// not share authoring vocabulary, so each kind names its own segments and
 /// every selector path, dependency origin, and canonical key follows them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -162,24 +162,30 @@ pub struct TaintSetSegments {
     pub sources: &'static str,
     pub sinks: &'static str,
     pub sanitizers: &'static str,
+    pub entry_points: &'static str,
     pub transforms: &'static str,
     pub external_models: &'static str,
+    pub stores: &'static str,
 }
 
 pub const TAINT_SET_SEGMENTS: TaintSetSegments = TaintSetSegments {
     sources: "sources",
     sinks: "sinks",
     sanitizers: "sanitizers",
+    entry_points: "entry_points",
     transforms: "transforms",
     external_models: "external_models",
+    stores: "stores",
 };
 
 pub const FLOW_SET_SEGMENTS: TaintSetSegments = TaintSetSegments {
     sources: "origins",
     sinks: "observations",
     sanitizers: "kills",
+    entry_points: "entry_points",
     transforms: "transforms",
     external_models: "external_models",
+    stores: "stores",
 };
 
 /// The one internal category minted for flow origins and observations. Flow
@@ -1734,8 +1740,15 @@ pub struct TaintPolicySpec {
     pub sources: TaintEndpointSet<TaintSourceSpec>,
     pub sinks: TaintEndpointSet<TaintSinkSpec>,
     pub sanitizers: TaintEndpointSet<TaintSanitizerSpec>,
+    pub entry_points: TaintEndpointSet<TaintEntryPointSpec>,
     pub transforms: TaintEndpointSet<TaintTransformSpec>,
     pub external_models: TaintEndpointSet<TaintExternalModelSpec>,
+    /// Policy-local persistence-store write declarations. Stores compose only
+    /// from local entries, so they are plain vectors rather than composable
+    /// endpoint sets.
+    pub store_writes: Vec<TaintStoreWriteSpec>,
+    /// Policy-local persistence-store read declarations.
+    pub store_reads: Vec<TaintStoreReadSpec>,
     pub finding_combinations: Vec<FindingCombinationSpec>,
 }
 
@@ -1818,9 +1831,22 @@ pub enum PolicyPort {
     MatchedValue,
     Receiver,
     ReturnValue,
-    ResultIndex { index: u32 },
-    ArgumentIndex { index: u32 },
-    ArgumentName { name: String },
+    ResultIndex {
+        index: u32,
+    },
+    ArgumentIndex {
+        index: u32,
+    },
+    ArgumentName {
+        name: String,
+    },
+    /// One named field of a call-port base object, accepted only as an
+    /// external-model transfer write destination (#2691). The base is an
+    /// argument or the receiver; the decoder enforces both restrictions.
+    FieldOf {
+        base: Box<PolicyPort>,
+        name: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -1875,6 +1901,44 @@ pub struct TaintSanitizerSpec {
     pub input: PolicyPort,
     pub output: PolicyPort,
     pub removes: Vec<TaintLabel>,
+}
+
+/// One authored `(store-write ...)` entry: the selected call writes its
+/// `input` port's value into the named persistence store, optionally
+/// discriminated by a `key` port and an `instance` port. Write and read
+/// entries sharing one store name form a persistence boundary.
+#[derive(Debug, Clone)]
+pub struct TaintStoreWriteSpec {
+    pub id: TaintEntryId,
+    pub selector: PolicySelector,
+    pub store: TaintStoreName,
+    pub key: Option<PolicyPort>,
+    pub instance: Option<PolicyPort>,
+    pub input: PolicyPort,
+}
+
+/// One authored `(store-read ...)` entry: the selected call's `output` port
+/// returns data from the named persistence store under the same optional key
+/// and instance dimensions as the store's writes.
+#[derive(Debug, Clone)]
+pub struct TaintStoreReadSpec {
+    pub id: TaintEntryId,
+    pub selector: PolicySelector,
+    pub store: TaintStoreName,
+    pub key: Option<PolicyPort>,
+    pub instance: Option<PolicyPort>,
+    pub output: PolicyPort,
+}
+
+/// One framework-invoked entry point (#2692): the selected procedure
+/// declarations are analysis roots whose bound formal parameter carries the
+/// declared labels on entry, with no analyzed caller required.
+#[derive(Debug, Clone)]
+pub struct TaintEntryPointSpec {
+    pub id: TaintEntryId,
+    pub selector: PolicySelector,
+    pub parameter: PolicyPort,
+    pub labels: Vec<TaintLabel>,
 }
 
 #[derive(Debug, Clone)]
@@ -3070,6 +3134,19 @@ macro_rules! define_sha256_value {
                 Self::from_lower_hex(value)
             }
         }
+
+        /// The inverse of the `Display` rendering every wire spelling of this
+        /// value uses, so a stored evaluation product that names one is read
+        /// back as the same value or as a load error.
+        impl<'de> serde::Deserialize<'de> for $name {
+            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                let wire = <String as serde::Deserialize>::deserialize(deserializer)?;
+                Self::from_lower_hex(&wire).map_err(serde::de::Error::custom)
+            }
+        }
     };
 }
 
@@ -3144,6 +3221,7 @@ define_policy_identifier!(EndpointId, 200, true);
 define_policy_identifier!(PolicyCategoryId, 128, true);
 
 define_policy_identifier!(TaintEntryId, 128, false);
+define_policy_identifier!(TaintStoreName, 128, false);
 define_policy_identifier!(FindingCombinationId, 128, false);
 define_policy_identifier!(TaintLabel, 128, false);
 define_policy_identifier!(TaintTag, 128, false);

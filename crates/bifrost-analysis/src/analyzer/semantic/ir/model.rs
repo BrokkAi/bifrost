@@ -355,6 +355,32 @@ pub enum FormalMultiplicity {
     Rest(ArgumentDomain),
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum FormalParameterPassingMode {
+    PositionalOnly,
+    #[default]
+    PositionalOrNamed,
+    NamedOnly,
+}
+
+impl FormalParameterPassingMode {
+    pub const fn accepts_positional(self) -> bool {
+        matches!(self, Self::PositionalOnly | Self::PositionalOrNamed)
+    }
+
+    pub const fn accepts_named(self) -> bool {
+        matches!(self, Self::PositionalOrNamed | Self::NamedOnly)
+    }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::PositionalOnly => "positional_only",
+            Self::PositionalOrNamed => "positional_or_named",
+            Self::NamedOnly => "named_only",
+        }
+    }
+}
+
 impl FormalMultiplicity {
     pub const fn label(&self) -> &'static str {
         match self {
@@ -375,6 +401,8 @@ pub enum SemanticValueKind {
     Parameter {
         ordinal: u32,
         multiplicity: FormalMultiplicity,
+        name: Option<Box<str>>,
+        passing_mode: FormalParameterPassingMode,
     },
     /// The procedure's receiver formal. `dispatch` states whether the value
     /// is the object the call dispatches on (`this`/`self`), as opposed to a
@@ -436,6 +464,10 @@ impl CallArgumentExpansion {
 pub struct SemanticCallArgument {
     pub value: ValueId,
     pub expansion: CallArgumentExpansion,
+    /// The canonical name written by a direct keyword argument. `None` on a
+    /// direct keyword preserves a structured keyword domain whose key is not
+    /// statically nameable, such as a Ruby pair with a dynamic key.
+    pub keyword: Option<Box<str>>,
 }
 
 impl SemanticCallArgument {
@@ -445,6 +477,15 @@ impl SemanticCallArgument {
         Self {
             value,
             expansion: CallArgumentExpansion::Direct(domain),
+            keyword: None,
+        }
+    }
+
+    pub fn keyword(value: ValueId, name: impl Into<Box<str>>) -> Self {
+        Self {
+            value,
+            expansion: CallArgumentExpansion::Direct(ArgumentDomain::Keyword),
+            keyword: Some(name.into()),
         }
     }
 
@@ -455,6 +496,7 @@ impl SemanticCallArgument {
         Self {
             value,
             expansion: CallArgumentExpansion::Unclassified,
+            keyword: None,
         }
     }
 }
@@ -1879,6 +1921,11 @@ pub enum GuardPredicate {
     /// The condition compares the subject against a constant value.
     /// `negated` distinguishes an inequality from an equality.
     ConstantEquality { negated: bool, constant: ValueId },
+    /// The condition tests whether `value` is an instance of one or more
+    /// classes denoted by `classes`.
+    InstanceOf { value: ValueId, classes: ValueId },
+    /// The condition tests whether `value` has the member named by `member`.
+    HasMember { value: ValueId, member: ValueId },
     /// The decision is represented, but its condition was not normalizable.
     Opaque { digest: GuardConditionDigest },
 }
@@ -1890,6 +1937,8 @@ impl GuardPredicate {
         "constant_boolean",
         "null_comparison",
         "constant_equality",
+        "instance_of",
+        "has_member",
         "opaque",
     ];
 
@@ -1898,6 +1947,8 @@ impl GuardPredicate {
             Self::ConstantBoolean { .. } => "constant_boolean",
             Self::NullComparison { .. } => "null_comparison",
             Self::ConstantEquality { .. } => "constant_equality",
+            Self::InstanceOf { .. } => "instance_of",
+            Self::HasMember { .. } => "has_member",
             Self::Opaque { .. } => "opaque",
         }
     }
@@ -1907,9 +1958,11 @@ impl GuardPredicate {
     pub const fn constant_value(self) -> Option<bool> {
         match self {
             Self::ConstantBoolean { value } => Some(value),
-            Self::NullComparison { .. } | Self::ConstantEquality { .. } | Self::Opaque { .. } => {
-                None
-            }
+            Self::NullComparison { .. }
+            | Self::ConstantEquality { .. }
+            | Self::InstanceOf { .. }
+            | Self::HasMember { .. }
+            | Self::Opaque { .. } => None,
         }
     }
 }

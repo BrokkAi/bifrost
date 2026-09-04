@@ -17,6 +17,7 @@ use super::resolution::EnvironmentAxis;
 use super::routes::{IdentityAxis, RouteHopKind};
 use crate::analyzer::QueryScope;
 use crate::analyzer::content_identity::WorkspaceContentIdentity;
+use crate::analyzer::store::StoreError;
 use crate::analyzer::tree_sitter_analyzer::{
     LanguageAdapter, PreparedSyntaxLimitedOutcome, PreparedSyntaxTree, TreeSitterAnalyzer,
 };
@@ -319,7 +320,10 @@ struct CachedFacts {
     facts: Arc<FileFacts>,
 }
 
-fn hash_source(source: &str) -> u64 {
+/// The cheap identity of one in-memory source string: the FxHash the
+/// structural facts cache validates its entries with, and that the analyzer's
+/// blob-oid memo (`TreeSitterAnalyzer::blob_oid_of`) recognizes repeat bytes by.
+pub(crate) fn hash_source(source: &str) -> u64 {
     let mut hasher = rustc_hash::FxHasher::default();
     hasher.write(source.as_bytes());
     hasher.finish()
@@ -516,11 +520,7 @@ impl<A: LanguageAdapter> StructuralFactProvider for TreeSitterAnalyzer<A> {
         // The structural facts of one file are a per-file read of exactly these
         // bytes, recorded whether the cache, the store, or a fresh extraction
         // answers: all three are the same input.
-        self.record_reads(|sink| {
-            if let Some(key) = self.source_file_read_key(file, &source) {
-                sink.push(key);
-            }
-        });
+        self.record_reads(|sink| sink.push(self.source_file_read_key(file, &source)));
         let snapshot_key = self.structural_snapshot_key(file, &source);
         self.structural_cache().get_or_materialize(
             file,
@@ -535,10 +535,35 @@ impl<A: LanguageAdapter> StructuralFactProvider for TreeSitterAnalyzer<A> {
             || {
                 let grammar = self.adapter().parser_language_for_file(file);
                 let facts = extract_file_facts(spec, &grammar, &source)?;
-                if let Some(key) = snapshot_key.as_ref()
-                    && let Ok(rows) = facts.persisted_rows()
-                {
-                    let _ = self.persist_structural_facts_rows(key, STRUCTURAL_FACTS_VERSION, rows);
+                if let Some(key) = snapshot_key.as_ref() {
+                    // The fresh extraction answers this request either way. A
+                    // failure to persist it is a store error like any other
+                    // and is reported on the open query contexts: two silent
+                    // drops here hid the 0034 label drift for every file it
+                    // affected, which then re-extracted on every warm run
+                    // (#2922). The one quiet outcome is a parsed blob that is
+                    // not complete yet; the span trace still shows it.
+                    match facts.persisted_rows() {
+                        Ok(rows) => match self.persist_structural_facts_rows(
+                            key,
+                            STRUCTURAL_FACTS_VERSION,
+                            rows,
+                        ) {
+                            Ok(true) => {}
+                            Ok(false) => crate::profiling::note_with(|| {
+                                format!(
+                                    "structural facts of {file} not persisted: its parsed blob \
+                                     is not complete at the current generation"
+                                )
+                            }),
+                            Err(error) => self.record_store_error(
+                                error.context(format!("persisting structural facts of {file}")),
+                            ),
+                        },
+                        Err(error) => self.record_store_error(StoreError::new(format!(
+                            "converting structural facts of {file} to rows: {error}"
+                        ))),
+                    }
                 }
                 Some(facts)
             },

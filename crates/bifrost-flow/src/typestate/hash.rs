@@ -1,8 +1,8 @@
 use std::fmt;
 
-use serde::{Serialize, Serializer};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 
-use crate::analyzer::canonical_hash::{hash_domain_bytes, write_lower_hex};
+use crate::analyzer::canonical_hash::{hash_domain_bytes, parse_lower_sha256, write_lower_hex};
 
 const TYPESTATE_PROTOCOL_DOMAIN: &[u8] = b"bifrost-typestate-protocol/v1";
 const TYPESTATE_BINDING_PLAN_DOMAIN: &[u8] = b"bifrost-typestate-binding-plan/v1";
@@ -29,6 +29,12 @@ macro_rules! define_typestate_hash {
             pub fn from_canonical_bytes(bytes: &[u8]) -> Self {
                 Self(hash_domain_bytes($domain, bytes))
             }
+
+            /// The identity these wire bytes spell, which is the exact inverse
+            /// of the `Display` rendering this type serializes as.
+            pub fn from_lower_hex(value: &str) -> Option<Self> {
+                parse_lower_sha256(value).map(Self)
+            }
         }
 
         impl fmt::Display for $name {
@@ -43,6 +49,24 @@ macro_rules! define_typestate_hash {
                 S: Serializer,
             {
                 serializer.collect_str(self)
+            }
+        }
+
+        /// The inverse of the `Serialize` above, so a stored evaluation
+        /// product that names one of these identities is read back as the
+        /// same identity or as a load error, never as a different one.
+        impl<'de> Deserialize<'de> for $name {
+            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+            where
+                D: Deserializer<'de>,
+            {
+                let wire = String::deserialize(deserializer)?;
+                Self::from_lower_hex(&wire).ok_or_else(|| {
+                    de::Error::custom(format!(
+                        "`{wire}` is not the lower-hex sha-256 spelling of a {} identity",
+                        stringify!($name)
+                    ))
+                })
             }
         }
     }

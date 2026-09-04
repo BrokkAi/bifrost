@@ -336,6 +336,8 @@ fn wrapper_query_to_json(expr: &Expr) -> LowerResult<Option<Value>> {
         | RqlForm::CfgPredecessorEdges
         | RqlForm::CfgEdgeSource
         | RqlForm::CfgEdgeTarget
+        | RqlForm::ClassSet
+        | RqlForm::AbsentMember
         | RqlForm::FileOf
         | RqlForm::ImportsOf
         | RqlForm::ImportersOf
@@ -1853,6 +1855,9 @@ fn pattern_to_json(expr: &Expr) -> LowerResult<Value> {
         | RqlForm::ControlRelations
         | RqlForm::RewritePathsOf => unreachable!("wrapper filtered above"),
         RqlForm::ConcurrentAccessConflicts => unreachable!("wrapper filtered above"),
+        RqlForm::ClassSet | RqlForm::AbsentMember => {
+            unreachable!("wrapper filtered above")
+        }
         RqlForm::Paths | RqlForm::SegmentsOf | RqlForm::SegmentTarget => {
             unreachable!("wrapper filtered above")
         }

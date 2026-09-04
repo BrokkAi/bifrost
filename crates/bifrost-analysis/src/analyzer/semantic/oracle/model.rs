@@ -236,6 +236,7 @@ impl ProcedurePortHandle {
                 SemanticValueKind::Parameter {
                     ordinal: actual,
                     multiplicity,
+                    ..
                 } if *actual == ordinal => Some(multiplicity),
                 _ => None,
             })

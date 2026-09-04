@@ -241,28 +241,62 @@ pub fn parse_source_region_with_cancellation(
     end: usize,
     cancellation: Option<&CancellationToken>,
 ) -> Option<tree_sitter::Tree> {
-    if start >= end
-        || end > source.len()
-        || !source.is_char_boundary(start)
-        || !source.is_char_boundary(end)
-        || cancellation.is_some_and(CancellationToken::is_cancelled)
-    {
+    parse_source_ranges_with_cancellation(language, source, &[(start, end)], cancellation)
+}
+
+/// Parse only the byte spans in `ranges` of `source` as `language`, confining
+/// the parser to those spans via tree-sitter included ranges. Every node
+/// keeps its original byte offset and line/column position, exactly like
+/// [`parse_source_region`] for a single span -- this is the form a recovery
+/// needs when the clean text is scattered across more than one span of the
+/// original source rather than one contiguous region. For example, a C
+/// prototype hidden behind a K&R-compatibility macro invocation such as
+/// `RET name _(( args ));` is recovered by parsing `RET name`, then the
+/// parenthesized `args` list (keeping one of the two nested parenthesis
+/// pairs so it reads as an ordinary parameter list), then the terminating
+/// `;`, each at its own original offset, which is exactly what a
+/// preprocessor's `#define _(args) args` expansion would leave behind
+/// (issue #2932).
+///
+/// `ranges` must be non-empty and given in increasing, non-overlapping
+/// order (each span's end at or before the next span's start); this
+/// mirrors tree-sitter's own requirement on `Parser::set_included_ranges`.
+/// Returns `None` if `ranges` is empty or if any span is empty or invalid
+/// (out of bounds, not on char boundaries, or out of order).
+pub fn parse_source_ranges_with_cancellation(
+    language: &tree_sitter::Language,
+    source: &str,
+    ranges: &[(usize, usize)],
+    cancellation: Option<&CancellationToken>,
+) -> Option<tree_sitter::Tree> {
+    if ranges.is_empty() {
         return None;
     }
     let bytes = source.as_bytes();
-    let start_point = advance_ts_point(bytes, tree_sitter::Point { row: 0, column: 0 }, 0, start);
-    let end_point = advance_ts_point(bytes, start_point, start, end);
-    parse_source_range_with_cancellation(
-        language,
-        source,
-        tree_sitter::Range {
+    let mut point = tree_sitter::Point { row: 0, column: 0 };
+    let mut previous_end = 0usize;
+    let mut ts_ranges = Vec::with_capacity(ranges.len());
+    for &(start, end) in ranges {
+        if start >= end
+            || end > source.len()
+            || !source.is_char_boundary(start)
+            || !source.is_char_boundary(end)
+            || start < previous_end
+        {
+            return None;
+        }
+        let start_point = advance_ts_point(bytes, point, previous_end, start);
+        let end_point = advance_ts_point(bytes, start_point, start, end);
+        ts_ranges.push(tree_sitter::Range {
             start_byte: start,
             end_byte: end,
             start_point,
             end_point,
-        },
-        cancellation,
-    )
+        });
+        point = end_point;
+        previous_end = end;
+    }
+    parse_source_included_ranges(language, source, &ts_ranges, cancellation)
 }
 
 /// Parse one parser-provided source range without recomputing its points.
@@ -276,13 +310,31 @@ pub fn parse_source_range_with_cancellation(
         || range.end_byte > source.len()
         || !source.is_char_boundary(range.start_byte)
         || !source.is_char_boundary(range.end_byte)
-        || cancellation.is_some_and(CancellationToken::is_cancelled)
     {
+        return None;
+    }
+    parse_source_included_ranges(language, source, &[range], cancellation)
+}
+
+/// The parser-driving core [`parse_source_range_with_cancellation`] and
+/// [`parse_source_ranges_with_cancellation`] share once their included
+/// ranges are validated and built: set the language and the included
+/// ranges, then run a cancellation-aware parse. Every caller has already
+/// validated `ranges` (non-empty, in bounds, in order); this function trusts
+/// that and only re-checks cancellation, which can change between
+/// validation and this call.
+fn parse_source_included_ranges(
+    language: &tree_sitter::Language,
+    source: &str,
+    ranges: &[tree_sitter::Range],
+    cancellation: Option<&CancellationToken>,
+) -> Option<tree_sitter::Tree> {
+    if cancellation.is_some_and(CancellationToken::is_cancelled) {
         return None;
     }
     let mut parser = tree_sitter::Parser::new();
     parser.set_language(language).ok()?;
-    parser.set_included_ranges(&[range]).ok()?;
+    parser.set_included_ranges(ranges).ok()?;
     if let Some(cancellation) = cancellation {
         let mut read = |offset: usize, _| &source.as_bytes()[offset..];
         let mut progress = |_: &tree_sitter::ParseState| cancellation.is_cancelled();

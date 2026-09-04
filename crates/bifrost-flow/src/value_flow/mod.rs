@@ -4,6 +4,7 @@ use crate::analyzer::Language;
 
 mod backward_client;
 mod client;
+mod discovery;
 mod model;
 mod plan;
 mod planned;
@@ -37,6 +38,10 @@ pub use client::{
     ValueFlowFact, ValueFlowProblem, ValueFlowSolveError, ValueFlowUncertainty,
     solve_value_flow_with_summaries, solve_value_flow_with_witnesses,
 };
+pub use discovery::{
+    BindingCoverage, CallSiteCoverage, ClosureLimits, DiscoveredClosure, DispatchStatus,
+    DurableProcedureKey, SkipReason, discover_closure, discover_closure_with,
+};
 pub(crate) use model::semantic_locator_heap_bytes;
 pub use model::{
     ValueFlowCarrier, ValueFlowCarrierId, ValueFlowCarrierKey, ValueFlowEventKey,
@@ -46,8 +51,9 @@ pub use model::{
 };
 pub(crate) use plan::ValueFlowCarrierSummaryIdentity;
 pub use plan::{
-    AuthoredArmClosure, ValueFlowCuratedCallModel, ValueFlowIncompleteCause, ValueFlowInput,
-    ValueFlowPlan, ValueFlowPlanError, ValueFlowPlanLimits, ValueFlowSummaryLocationBinding,
+    AuthoredArmClosure, ValueFlowCuratedCallModel, ValueFlowEdgeKillSpec, ValueFlowIncompleteCause,
+    ValueFlowInput, ValueFlowPlan, ValueFlowPlanError, ValueFlowPlanLimits,
+    ValueFlowSummaryLocationBinding,
 };
 pub use planned::{
     ValueFlowCanonicalMeeting, ValueFlowDirectionPlan, ValueFlowDirectionPlanError,

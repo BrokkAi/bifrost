@@ -1,0 +1,8 @@
+{
+  "kind": "transfer",
+  "transferKind": { "kind": "conversion", "preservation": "changing" },
+  "operation": {
+    "kind": "unknown",
+    "limitation": { "kind": "unsupported", "message": "exact conversion operation is unavailable" }
+  }
+}

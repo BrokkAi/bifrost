@@ -33,6 +33,20 @@ mod semantic_identifier_range_tests {
         source[range.start_byte..range.end_byte].to_string()
     }
 
+    fn selected_kind_text(source: &str, expected_kind: &str) -> String {
+        let tree = parse_ruby_tree(source).expect("parse Ruby range fixture");
+        let mut stack = vec![tree.root_node()];
+        while let Some(node) = stack.pop() {
+            if node.kind() == expected_kind {
+                let range = ruby_semantic_identifier_range(node, source);
+                return source[range.start_byte..range.end_byte].to_string();
+            }
+            let mut cursor = node.walk();
+            stack.extend(node.named_children(&mut cursor));
+        }
+        panic!("missing node kind {expected_kind:?}");
+    }
+
     #[test]
     fn selects_only_static_ruby_symbol_identifier_content() {
         let source = r#"audit
@@ -40,6 +54,7 @@ public_send(:audit)
 public_send(:"audit")
 public_send(:"au#{suffix}dit")
 notify("audit")
+configure(audit: true)
 "#;
 
         assert_eq!(selected_text(source, "audit"), "audit");
@@ -50,6 +65,7 @@ notify("audit")
             ":\"au#{suffix}dit\""
         );
         assert_eq!(selected_text(source, "\"audit\""), "\"audit\"");
+        assert_eq!(selected_kind_text(source, "hash_key_symbol"), "audit");
     }
 }
 

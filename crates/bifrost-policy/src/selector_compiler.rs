@@ -7,8 +7,16 @@ use crate::definition::{RowBindingName, RowBindingSource, RowExpansionStep};
 use crate::relational::{
     RelationCoverage, RelationalInput, evaluate_row_selector_ir, validate_row_selector_plan,
 };
+use crate::resolved::LoadedPolicy;
+use crate::unit_execution::{UnitAttempt, UnitReuse, recompute_unit};
+use crate::units::{
+    PolicyIncrementalContext, PolicyUnitKey, PolicyUnitProduct, SelectorProduct,
+    SelectorProductSite, UnitPartition, WidenReason,
+};
 use crate::{PolicyWorkMetric, PolicyWorkReport, PolicyWorkUnit, ResolvedPolicySelector};
 use brokk_bifrost_analysis::CancellationToken;
+use brokk_bifrost_analysis::analyzer::common::language_for_file;
+use brokk_bifrost_analysis::analyzer::semantic::ids::StableDigest;
 use brokk_bifrost_analysis::analyzer::semantic::{
     CallBinding, CallSiteHandle, CallerReceiverBinding, CandidateCoverage, DispatchOracle,
     DurablePortIdentity, EvidenceCompleteness, OracleCallContext, ProcedureHandle, ProofStatus,
@@ -19,11 +27,13 @@ use brokk_bifrost_analysis::analyzer::semantic::{
     ValueId,
 };
 use brokk_bifrost_analysis::analyzer::usages::effects::EffectCoverage;
-use brokk_bifrost_analysis::analyzer::{ProjectFile, Range, WorkspaceAnalyzer};
+use brokk_bifrost_analysis::analyzer::{ProjectFile, Range, ReadKey, WorkspaceAnalyzer};
+use brokk_bifrost_analysis::path_utils::rel_path_string;
 use brokk_bifrost_rql::structural::search::{
-    CodeQuerySemanticReceipt, DetailedCodeQueryDecoratedParameterEvidence, DetailedCodeQueryDomain,
-    DetailedCodeQueryEvidence,
+    CodeQueryExecutionScope, CodeQuerySemanticReceipt, DetailedCodeQueryDecoratedParameterEvidence,
+    DetailedCodeQueryDomain, DetailedCodeQueryEvidence, UnitExecutionResult, UnitRowItem,
     execute_code_query_detailed_eager_index_workspace_with_semantic_receipt,
+    execute_code_query_selector_unit, merge_unit_rows, plan_seed_files,
 };
 use brokk_bifrost_rql::structural::{
     CodeQueryCompletion, CodeQueryDiagnosticCode, CodeQueryDiagnosticImpact,
@@ -33,7 +43,7 @@ use brokk_bifrost_rql::structural::{
     CodeQuerySemanticRowLimits, CodeQuerySemanticWork, QueryValueKind,
 };
 use brokk_bifrost_rql::{
-    CallInputSelector, CodeQuery, CodeQueryPlan, CodeQueryPlanSource, QueryStep,
+    CallInputSelector, CodeQuery, CodeQueryPlan, CodeQueryPlanSource, PlanPartitioning, QueryStep,
 };
 
 #[derive(Debug)]
@@ -44,6 +54,12 @@ pub(super) enum PolicySelectorSessionError {
     },
     Unavailable(String),
     Provider(String),
+    /// The sliced compile cannot claim to have produced what a whole compile
+    /// would have produced, and the caller must compile the policy again with
+    /// no units. Not a failure: the reason says which step refused, and the
+    /// answer is the compile this session was avoiding
+    /// (`.agents/plans/impact-sliced-diff-base.md`, "The head algorithm").
+    Widen(WidenReason),
 }
 
 impl fmt::Display for PolicySelectorSessionError {
@@ -52,6 +68,11 @@ impl fmt::Display for PolicySelectorSessionError {
             Self::Incomplete { detail, .. }
             | Self::Unavailable(detail)
             | Self::Provider(detail) => formatter.write_str(detail),
+            Self::Widen(reason) => write!(
+                formatter,
+                "the sliced selector compile widened: {}",
+                reason.stable_label()
+            ),
         }
     }
 }
@@ -414,6 +435,20 @@ pub(super) struct PolicySelectorSession<'a> {
     query_limits: CodeQueryExecutionLimits,
     max_selector_results: usize,
     cancellation: &'a CancellationToken,
+    /// Which files every selector this session runs enumerates seeds over.
+    ///
+    /// The whole analyzed file set by default, which is byte for byte what
+    /// every selector did before units existed. A caller compiling one
+    /// selector unit per seed file narrows it, and only the seed enumeration
+    /// narrows: callers, importers, descendants, dispatch and references still
+    /// answer over the whole workspace, because those answers are what make a
+    /// finding in an unedited file change.
+    execution_scope: CodeQueryExecutionScope<'a>,
+    /// The per-seed selector units this compile may reuse, when it holds an
+    /// incremental context. Absent for a compile that has nothing to reuse and
+    /// for every family that does not unitize its selectors, which then run
+    /// byte for byte as they always have.
+    units: Option<SelectorUnits<'a>>,
     semantic_budget: SemanticBudget,
     semantic_execution_budget: SemanticExecutionBudget,
     query_work: CodeQueryExecutionWork,
@@ -471,12 +506,18 @@ pub(super) struct PolicySelectorSession<'a> {
 }
 
 impl<'a> PolicySelectorSession<'a> {
+    /// `execution_scope` is which files every selector of this session
+    /// enumerates seeds over. A per-seed selector unit passes its one seed
+    /// file; everything else passes
+    /// [`CodeQueryExecutionScope::whole_workspace`] and executes byte for byte
+    /// as it always has.
     pub(super) fn new(
         workspace: &'a WorkspaceAnalyzer,
         analysis: &'static str,
         query_limits: CodeQueryExecutionLimits,
         max_selector_results: usize,
         cancellation: &'a CancellationToken,
+        execution_scope: CodeQueryExecutionScope<'a>,
     ) -> Self {
         // Size the materialized-file budget to the workspace, not the fixed
         // per-query IDE cap. That cap bounds how much a single interactive query
@@ -499,6 +540,8 @@ impl<'a> PolicySelectorSession<'a> {
             query_limits,
             max_selector_results,
             cancellation,
+            execution_scope,
+            units: None,
             semantic_budget: SemanticBudget::new(semantic_work_limits(query_limits.semantic))
                 .expect("validated CodeQuery semantic limits are positive"),
             semantic_execution_budget: SemanticExecutionBudget::new(
@@ -527,11 +570,12 @@ impl<'a> PolicySelectorSession<'a> {
         }
     }
 
-    /// Record that discovery built one procedure value-flow snapshot through
-    /// the oracle rather than reusing a cached one (#2284).
-    pub(super) fn record_semantic_snapshot_materialization(&mut self) {
-        self.semantic_snapshot_materializations =
-            self.semantic_snapshot_materializations.saturating_add(1);
+    /// Record how many procedure value-flow snapshots discovery built through
+    /// the oracle rather than reusing cached outcomes (#2284, #2951).
+    pub(super) fn record_semantic_snapshot_materializations(&mut self, count: u64) {
+        self.semantic_snapshot_materializations = self
+            .semantic_snapshot_materializations
+            .saturating_add(count);
     }
 
     /// Record how many procedure visits this compile served on a handle from a
@@ -637,6 +681,7 @@ impl<'a> PolicySelectorSession<'a> {
             &self.semantic_budget,
             &self.semantic_execution_budget,
             artifact_leases,
+            self.execution_scope,
         );
         let semantic_receipt = detailed.take_semantic_receipt();
         self.query_work = self.query_work.saturating_add(detailed.work);
@@ -677,6 +722,31 @@ impl<'a> PolicySelectorSession<'a> {
         Ok(selected)
     }
 
+    /// Compile this session's selectors one seed file at a time, reusing what
+    /// a previous run published.
+    ///
+    /// Called once per compile, before any selector runs. A session that is
+    /// never given units executes every selector over the whole workspace,
+    /// which is byte for byte what every family did before units existed.
+    pub(super) fn with_units(
+        &mut self,
+        policy: &'a LoadedPolicy,
+        incremental: &'a PolicyIncrementalContext<'a>,
+        budget: &'a crate::budget::PolicyBudget,
+    ) {
+        self.units = Some(SelectorUnits::new(
+            policy,
+            incremental,
+            budget,
+            self.workspace,
+        ));
+    }
+
+    /// The keys this compile decided about and what it did with them.
+    pub(super) fn take_units(&mut self) -> Option<SelectorUnitOutcome> {
+        self.units.take().map(SelectorUnits::into_outcome)
+    }
+
     pub(super) fn select_with_artifact_continuation(
         &mut self,
         selector: &ResolvedPolicySelector,
@@ -685,6 +755,9 @@ impl<'a> PolicySelectorSession<'a> {
             return self.select_rows(selector, plan);
         }
         let query = self.selector_query(selector)?;
+        if self.units.is_some() {
+            return self.select_sliced(selector, &query);
+        }
         let detailed = self.execute_selector_query_with_artifact_continuation(&query)?;
         let retained_incomplete_result_contracts = detailed.retained_incomplete_result_contracts;
         let (selected, artifact_charge) = Self::selected_sites(selector, detailed)?;
@@ -715,6 +788,195 @@ impl<'a> PolicySelectorSession<'a> {
                 .invalidate_selector_continuation_semantic_cache_if_armed_for_test();
         }
         Ok(selected)
+    }
+
+    /// Compile one selector as the merge of one execution per seed file.
+    ///
+    /// The units are taken out of the session for the duration, because every
+    /// unit's execution charges the session's own ledgers and the two cannot
+    /// be borrowed at once. They go back in either way: a widened compile
+    /// still reports what its attempt did.
+    fn select_sliced(
+        &mut self,
+        selector: &ResolvedPolicySelector,
+        query: &CodeQuery,
+    ) -> Result<Vec<PolicySelectedSite>, PolicySelectorSessionError> {
+        let mut units = self
+            .units
+            .take()
+            .expect("a sliced selector compile holds its units");
+        let selected = self.select_sliced_units(&mut units, selector, query);
+        if let Err(PolicySelectorSessionError::Widen(reason)) = &selected {
+            units.widened(*reason);
+        }
+        self.units = Some(units);
+        selected
+    }
+
+    fn select_sliced_units(
+        &mut self,
+        units: &mut SelectorUnits<'_>,
+        selector: &ResolvedPolicySelector,
+        query: &CodeQuery,
+    ) -> Result<Vec<PolicySelectedSite>, PolicySelectorSessionError> {
+        self.selector_scans = self.selector_scans.saturating_add(1);
+        let seed_files = units.enumerate(query, selector.path.as_str())?;
+        let mut products = Vec::with_capacity(seed_files.len());
+        let mut selected = Vec::new();
+        for (index, file) in seed_files.iter().enumerate() {
+            let rows = match units.published(index)? {
+                Some(product) => {
+                    // The unit's own execution moved the compile's shared
+                    // semantic ledgers, and reusing it must move them the same
+                    // way or the next unit would run under an allowance no
+                    // whole compile would have given it.
+                    self.charge_stored_selector_work(&product)?;
+                    selected.extend(units.sites(&product)?);
+                    product.rows
+                }
+                None => {
+                    let executed = self.execute_selector_unit(units, selector, query, file)?;
+                    selected.extend(executed.sites.iter().cloned());
+                    units.publish(index, &executed);
+                    executed.rows
+                }
+            };
+            check_exhaustive_selector_rows(&rows)?;
+            products.push(rows);
+        }
+        let merged = merge_unit_rows(products);
+        // Every cumulative cap the whole execution enforces, summed over the
+        // units. Reaching one means the whole execution might have truncated
+        // somewhere in its own order, so the merged rows are not its rows.
+        if merged
+            .reached_limit(&self.query_limits, query.limit)
+            .is_some()
+        {
+            return Err(PolicySelectorSessionError::Widen(
+                WidenReason::MergedLimitReached,
+            ));
+        }
+        Ok(selected)
+    }
+
+    /// Run one seed file's execution of one selector, and read its sites.
+    fn execute_selector_unit(
+        &mut self,
+        units: &SelectorUnits<'_>,
+        selector: &ResolvedPolicySelector,
+        query: &CodeQuery,
+        file: &ProjectFile,
+    ) -> Result<ExecutedSelectorUnit, PolicySelectorSessionError> {
+        let query_limits = self.remaining_query_limits()?;
+        let artifact_leases = self.artifact_leases.snapshot();
+        let semantic_before = self.semantic_budget.used();
+        let execution_before = self.semantic_execution_budget.work();
+        let (executed, reads) = recompute_unit(self.workspace.analyzer(), || {
+            execute_code_query_selector_unit(
+                self.workspace,
+                query,
+                query_limits,
+                Some(self.cancellation),
+                &self.semantic_budget,
+                &self.semantic_execution_budget,
+                artifact_leases,
+                CodeQueryExecutionScope::for_seed_files(
+                    std::slice::from_ref(file),
+                    &units.workspace_files,
+                ),
+            )
+        });
+        let mut detailed = executed.detailed;
+        let rows = executed.unit;
+        let semantic_receipt = detailed.take_semantic_receipt();
+        self.query_work = self.query_work.saturating_add(detailed.work);
+        let complete = matches!(detailed.result.completion(), CodeQueryCompletion::Complete);
+        let artifact_charge = self.charge_query_semantic_work_with_artifact_continuation(
+            detailed.work.semantic,
+            semantic_receipt,
+            complete,
+        )?;
+        // A unit that did not complete is not a partition of a complete
+        // execution, whatever it selected.
+        if !complete {
+            return Err(PolicySelectorSessionError::Widen(
+                WidenReason::UnitDiagnostics,
+            ));
+        }
+        // The allocations this unit retained cannot be reproduced from a
+        // stored product -- they are process-local artifacts -- so a unit that
+        // retained any is used here and never published.
+        let retained_artifacts = artifact_charge
+            .as_ref()
+            .is_some_and(|charge| !charge.is_empty());
+        let (sites, artifact_charge) = Self::selected_sites(
+            selector,
+            PolicySelectorQueryResult {
+                result: detailed.result,
+                evidence: detailed.evidence,
+                artifact_charge,
+                retained_incomplete_result_contracts: false,
+            },
+        )?;
+        if let Some(artifact_charge) = artifact_charge {
+            let retained_before = self.artifact_leases.len();
+            self.apply_artifact_charge(
+                Ok(artifact_charge),
+                "selector result-contract continuation",
+            )?;
+            self.result_contract_artifact_leases = self
+                .result_contract_artifact_leases
+                .saturating_add(self.artifact_leases.len().saturating_sub(retained_before));
+        }
+        let semantic = self.semantic_budget.used().saturating_sub(semantic_before);
+        let execution_after = self.semantic_execution_budget.work();
+        Ok(ExecutedSelectorUnit {
+            reads,
+            publishable: !retained_artifacts && sites.iter().all(selector_site_is_projectable),
+            product: SelectorProduct {
+                rows: rows.clone(),
+                sites: sites.iter().map(project_selector_site).collect(),
+                semantic,
+                materialized_files: lane(
+                    execution_after
+                        .materialized_files
+                        .saturating_sub(execution_before.materialized_files),
+                ),
+                traversal_steps: lane(
+                    execution_after
+                        .traversal_steps
+                        .saturating_sub(execution_before.traversal_steps),
+                ),
+            },
+            rows,
+            sites,
+        })
+    }
+
+    /// Charge what a reused unit's own execution took out of the shared
+    /// semantic ledgers.
+    ///
+    /// The scalar work rather than the child charge the live path applies: a
+    /// stored product carries no process-local artifact identities, so a later
+    /// unit may pay a census this one already paid. That over-charges the
+    /// semantic lane, which can only widen more often, never less.
+    fn charge_stored_selector_work(
+        &mut self,
+        product: &SelectorProduct,
+    ) -> Result<(), PolicySelectorSessionError> {
+        if self.semantic_budget.charge(product.semantic).is_err()
+            || !self.semantic_execution_budget.charge_external_query_work(
+                usize::try_from(product.materialized_files).unwrap_or(usize::MAX),
+                usize::try_from(product.traversal_steps).unwrap_or(usize::MAX),
+            )
+        {
+            return Err(semantic_budget_error(format!(
+                "{} selectors exhausted the shared semantic materialization budget",
+                self.analysis
+            )));
+        }
+        self.query_work = self.query_work.saturating_add(product.rows.work);
+        Ok(())
     }
 
     fn selector_query(
@@ -759,6 +1021,7 @@ impl<'a> PolicySelectorSession<'a> {
             &self.semantic_budget,
             &self.semantic_execution_budget,
             artifact_leases,
+            self.execution_scope,
         );
         let semantic_receipt = detailed.take_semantic_receipt();
         self.query_work = self.query_work.saturating_add(detailed.work);
@@ -786,6 +1049,7 @@ impl<'a> PolicySelectorSession<'a> {
             &self.semantic_budget,
             &self.semantic_execution_budget,
             artifact_leases,
+            self.execution_scope,
         );
         let semantic_receipt = detailed.take_semantic_receipt();
         self.query_work = self.query_work.saturating_add(detailed.work);
@@ -993,6 +1257,7 @@ impl<'a> PolicySelectorSession<'a> {
                     &self.semantic_budget,
                     &self.semantic_execution_budget,
                     artifact_leases,
+                    self.execution_scope,
                 );
             let semantic_receipt = detailed.take_semantic_receipt();
             self.query_work = self.query_work.saturating_add(detailed.work);
@@ -1033,12 +1298,27 @@ impl<'a> PolicySelectorSession<'a> {
             executed.push((binding, detailed));
         }
 
+        // One adapter serves every path that evaluates a relational plan: the
+        // rendered rows are projected into the same product a unit publishes
+        // before the plan reads a field of them.
+        let projected = executed
+            .iter()
+            .map(|(_, detailed)| {
+                detailed
+                    .result
+                    .results
+                    .iter()
+                    .map(UnitRowItem::project)
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
         let inputs = executed
             .iter()
             .zip(&coverages)
-            .map(|((binding, detailed), coverage)| RelationalInput {
+            .zip(&projected)
+            .map(|(((binding, _), coverage), rows)| RelationalInput {
                 binding,
-                rows: &detailed.result.results,
+                rows,
                 coverage: coverage.clone(),
             })
             .collect::<Vec<_>>();
@@ -1553,6 +1833,10 @@ impl<'a> PolicySelectorSession<'a> {
         &self.semantic_execution_budget
     }
 
+    pub(super) fn semantic_budget_mut(&mut self) -> &mut SemanticBudget {
+        &mut self.semantic_budget
+    }
+
     pub(super) fn semantic_used(&self) -> SemanticWork {
         self.semantic_budget.used()
     }
@@ -2059,6 +2343,286 @@ impl<'a> PolicySelectorSession<'a> {
             .expect("semantic charge was preflighted against an exclusively borrowed ledger");
         Ok(())
     }
+}
+
+/// One recomputed selector unit, both as the compile consumes it and as the
+/// store would keep it.
+struct ExecutedSelectorUnit {
+    rows: UnitExecutionResult,
+    sites: Vec<PolicySelectedSite>,
+    product: SelectorProduct,
+    /// The reads that licence publishing this unit, absent when the ledger
+    /// could not name every read the execution made.
+    reads: Option<Vec<ReadKey>>,
+    publishable: bool,
+}
+
+/// Whether a selected site is one a stored product can name.
+///
+/// A site whose selection carries result-contract, call-shape, call-binding or
+/// decorated-parameter evidence is derived from semantic identities the
+/// product does not project, so the unit that produced it is used by this
+/// compile and never published. Publishability is per unit: the units around
+/// it are still independent partitions and stay reusable.
+fn selector_site_is_projectable(site: &PolicySelectedSite) -> bool {
+    site.result_contract.is_none()
+        && site.call_shape.is_none()
+        && site.call_binding.is_none()
+        && site.decorated_parameter.is_none()
+        && !site.retained_incomplete_result_contract_query
+}
+
+fn project_selector_site(site: &PolicySelectedSite) -> SelectorProductSite {
+    SelectorProductSite {
+        rel_path: Box::from(rel_path_string(&site.file).as_str()),
+        start: site.span.start,
+        end: site.span.end,
+        unproven: match &site.proof {
+            ProofStatus::Proven => None,
+            ProofStatus::Unproven(reason) => Some(reason.clone()),
+        },
+        partial: match &site.completeness {
+            EvidenceCompleteness::Complete => None,
+            EvidenceCompleteness::Partial(reason) => Some(reason.clone()),
+        },
+    }
+}
+
+/// Exhaustiveness is checked on the product rather than on how it was
+/// obtained: a unit that truncated or raised a diagnostic is not a partition
+/// of a whole execution, whichever run computed it.
+fn check_exhaustive_selector_rows(
+    rows: &UnitExecutionResult,
+) -> Result<(), PolicySelectorSessionError> {
+    if rows.truncated {
+        return Err(PolicySelectorSessionError::Widen(
+            WidenReason::UnitNotExhaustive,
+        ));
+    }
+    if !rows.diagnostics.is_empty() {
+        return Err(PolicySelectorSessionError::Widen(
+            WidenReason::UnitDiagnostics,
+        ));
+    }
+    Ok(())
+}
+
+fn lane(value: usize) -> u64 {
+    u64::try_from(value).unwrap_or(u64::MAX)
+}
+
+/// The per-seed selector units of one policy compile.
+///
+/// One of these is built per compile that holds an incremental context. It
+/// owns the shared reuse decision, the key of every unit every selector of the
+/// policy asks about, and the count of what the compile did with them.
+pub(super) struct SelectorUnits<'a> {
+    reuse: UnitReuse<'a>,
+    policy: &'a LoadedPolicy,
+    incremental: &'a PolicyIncrementalContext<'a>,
+    workspace_files: Vec<ProjectFile>,
+    files_by_rel: HashMap<String, ProjectFile>,
+    /// The keys of the selector this session is executing now, in seed order.
+    current: Vec<PolicyUnitKey>,
+    keys: Vec<PolicyUnitKey>,
+    attempt: UnitAttempt,
+    widen: Option<WidenReason>,
+    /// Whether every unit this compile decided about is in the store. A run's
+    /// unit list is what another run replays instead of evaluating the policy,
+    /// so a list naming a unit that was never published would name work no run
+    /// did.
+    all_published: bool,
+}
+
+impl<'a> SelectorUnits<'a> {
+    fn new(
+        policy: &'a LoadedPolicy,
+        incremental: &'a PolicyIncrementalContext<'a>,
+        budget: &'a crate::budget::PolicyBudget,
+        workspace: &WorkspaceAnalyzer,
+    ) -> Self {
+        let workspace_files = workspace.analyzer().analyzed_files();
+        let files_by_rel = workspace_files
+            .iter()
+            .map(|file| (rel_path_string(file), file.clone()))
+            .collect();
+        Self {
+            reuse: UnitReuse::new(policy, incremental, budget),
+            policy,
+            incremental,
+            workspace_files,
+            files_by_rel,
+            current: Vec::new(),
+            keys: Vec::new(),
+            attempt: UnitAttempt::default(),
+            widen: None,
+            all_published: true,
+        }
+    }
+
+    /// Key every seed file of one selector, and load them all in one batch.
+    fn enumerate(
+        &mut self,
+        query: &CodeQuery,
+        selector_path: &str,
+    ) -> Result<Vec<ProjectFile>, PolicySelectorSessionError> {
+        if !PlanPartitioning::classify(&query.plan).is_by_seed() {
+            return Err(PolicySelectorSessionError::Widen(
+                WidenReason::PlanCrossesSeeds,
+            ));
+        }
+        // A changed-fact set that could not be completed is smaller than the
+        // truth, and a smaller set would let a changed input pass verification.
+        if !self.incremental.changed().is_complete() {
+            return Err(PolicySelectorSessionError::Widen(
+                WidenReason::ReverseDependencyEvidenceMissing,
+            ));
+        }
+        let seed_files = plan_seed_files(&query.plan, &self.workspace_files);
+        self.attempt.enumerated(seed_files.len());
+        let selector = StableDigest::sha256(selector_path);
+        self.current = Vec::with_capacity(seed_files.len());
+        for file in &seed_files {
+            let language = language_for_file(file);
+            let rel_path = rel_path_string(file);
+            let Some(blob) = self.incremental.changed().head_blob(language, &rel_path) else {
+                // Without the blob this path resolves to there is no content
+                // identity to key the unit by, which is missing evidence rather
+                // than evidence of sameness.
+                return Err(PolicySelectorSessionError::Widen(
+                    WidenReason::ReverseDependencyEvidenceMissing,
+                ));
+            };
+            self.current.push(self.incremental.inputs().unit_key(
+                self.policy,
+                UnitPartition::Selector {
+                    language,
+                    rel_path: rel_path.into_boxed_str(),
+                    blob,
+                    selector,
+                },
+            ));
+        }
+        self.reuse
+            .prefetch(&self.current)
+            .map_err(PolicySelectorSessionError::Widen)?;
+        self.keys.extend(self.current.iter().cloned());
+        Ok(seed_files)
+    }
+
+    /// The published product for one seed file of the selector being compiled.
+    fn published(
+        &mut self,
+        index: usize,
+    ) -> Result<Option<SelectorProduct>, PolicySelectorSessionError> {
+        let key = self.current[index].clone();
+        match self
+            .reuse
+            .published(&key)
+            .map_err(PolicySelectorSessionError::Widen)?
+        {
+            Some(product) => {
+                self.attempt.reused();
+                // One key names one product shape; anything else is a store
+                // that answered a different question.
+                let product = product
+                    .into_selector()
+                    .ok_or(PolicySelectorSessionError::Widen(
+                        WidenReason::ProductLoadFailed,
+                    ))?;
+                Ok(Some(product))
+            }
+            None => {
+                self.attempt.recomputed();
+                Ok(None)
+            }
+        }
+    }
+
+    /// One stored product's sites, against this workspace's files.
+    fn sites(
+        &self,
+        product: &SelectorProduct,
+    ) -> Result<Vec<PolicySelectedSite>, PolicySelectorSessionError> {
+        product
+            .sites
+            .iter()
+            .map(|site| {
+                let file = self.files_by_rel.get(site.rel_path.as_ref()).ok_or(
+                    // The unit verified against this head, so every path it
+                    // named is a path this head analyzes.
+                    PolicySelectorSessionError::Widen(
+                        WidenReason::ReverseDependencyEvidenceMissing,
+                    ),
+                )?;
+                Ok(PolicySelectedSite {
+                    file: file.clone(),
+                    span: site.start..site.end,
+                    proof: match &site.unproven {
+                        None => ProofStatus::Proven,
+                        Some(reason) => ProofStatus::Unproven(reason.clone()),
+                    },
+                    completeness: match &site.partial {
+                        None => EvidenceCompleteness::Complete,
+                        Some(reason) => EvidenceCompleteness::Partial(reason.clone()),
+                    },
+                    result_contract: None,
+                    call_shape: None,
+                    call_binding: None,
+                    decorated_parameter: None,
+                    retained_incomplete_result_contract_query: false,
+                })
+            })
+            .collect()
+    }
+
+    /// Publish one recomputed unit under the reads that produced it.
+    fn publish(&mut self, index: usize, executed: &ExecutedSelectorUnit) {
+        if !executed.publishable {
+            self.all_published = false;
+            return;
+        }
+        let Some(reads) = executed.reads.clone() else {
+            self.all_published = false;
+            self.attempt.unbounded();
+            return;
+        };
+        self.reuse.publish(
+            self.current[index].clone(),
+            PolicyUnitProduct::Selector(executed.product.clone()),
+            reads,
+        );
+    }
+
+    fn widened(&mut self, reason: WidenReason) {
+        self.widen.get_or_insert(reason);
+    }
+
+    fn into_outcome(self) -> SelectorUnitOutcome {
+        SelectorUnitOutcome {
+            all_published: self.all_published,
+            keys: if self.all_published {
+                self.keys
+            } else {
+                Vec::new()
+            },
+            attempt: self.attempt,
+            widen: self.widen,
+        }
+    }
+}
+
+/// What one compile's selector units did.
+///
+/// `keys` is empty when any unit was not published, because a run's unit list
+/// is what another run replays instead of evaluating the policy, and a list
+/// naming a unit that was never published would name work no run did.
+#[derive(Debug, Default)]
+pub(super) struct SelectorUnitOutcome {
+    pub(super) keys: Vec<PolicyUnitKey>,
+    pub(super) attempt: UnitAttempt,
+    pub(super) widen: Option<WidenReason>,
+    pub(super) all_published: bool,
 }
 
 fn semantic_budget_error(detail: impl Into<String>) -> PolicySelectorSessionError {
@@ -2607,6 +3171,29 @@ pub(super) fn selected_site_quality(
                     )
                 },
             ),
+            // A class-set row's own status is its proof story: only a `known`
+            // row is a proven claim, every other status carries no proof.
+            CodeQueryResultValue::ClassSetRow { value } => (
+                if value.status == "known" {
+                    ProofStatus::Proven
+                } else {
+                    ProofStatus::Unproven("class-set row carries no proof".into())
+                },
+                if value.status == "known" {
+                    EvidenceCompleteness::Complete
+                } else {
+                    EvidenceCompleteness::Partial(
+                        format!("class-set status is {}", value.status).into(),
+                    )
+                },
+            ),
+            // An absent-member finding fires only on a fully known class set
+            // and a proven-absent member lookup, so the row is its own proof;
+            // set-level completeness is the query diagnostics' business, the
+            // reference-edge precedent.
+            CodeQueryResultValue::AbsentMemberFinding { .. } => {
+                (ProofStatus::Proven, EvidenceCompleteness::Complete)
+            }
             CodeQueryResultValue::DetachedTaskTransfer { value } => (
                 if value.proof == "exact" {
                     ProofStatus::Proven
@@ -3057,6 +3644,7 @@ func caller() { target() }
             PolicyBudget::default().query_limits(),
             64,
             &cancellation,
+            CodeQueryExecutionScope::whole_workspace(),
         );
 
         let selected = session
@@ -3189,6 +3777,7 @@ func inspect(item resource, callback callbacks, unknown unknownpkg.Resource) {
             budget.query_limits(),
             64,
             &cancellation,
+            CodeQueryExecutionScope::whole_workspace(),
         );
         let mut selected = session
             .select(&selector)
@@ -3293,6 +3882,7 @@ func inspect(item resource, callback callbacks, unknown unknownpkg.Resource) {
             budget.query_limits(),
             64,
             &cancellation,
+            CodeQueryExecutionScope::whole_workspace(),
         );
 
         session
@@ -3340,6 +3930,7 @@ func inspect(item resource, callback callbacks, unknown unknownpkg.Resource) {
             budget.query_limits(),
             64,
             &cancellation,
+            CodeQueryExecutionScope::whole_workspace(),
         );
 
         session
@@ -3387,6 +3978,7 @@ func inspect(item resource, callback callbacks, unknown unknownpkg.Resource) {
             budget.query_limits(),
             64,
             &cancellation,
+            CodeQueryExecutionScope::whole_workspace(),
         );
 
         let _ = session.charge_query_semantic_work(
@@ -3396,6 +3988,64 @@ func inspect(item resource, callback callbacks, unknown unknownpkg.Resource) {
             },
             None,
         );
+    }
+
+    /// A session narrowed to one seed file selects only that file's sites;
+    /// the same selector over the whole workspace selects every file's.
+    ///
+    /// This is the seam a per-seed selector unit runs through. Only the seed
+    /// enumeration narrows, and the whole-workspace default is what every
+    /// caller that does not narrow keeps.
+    #[test]
+    fn a_narrowed_selector_session_enumerates_only_its_seed_files() {
+        let project = InlineTestProject::with_language(Language::Go)
+            .file("a.go", "package p\n\nfunc target() {}\n")
+            .file("b.go", "package p\n\nfunc target() {}\n")
+            .build();
+        let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+        let cancellation = CancellationToken::default();
+        let limits = PolicyBudget::default().query_limits();
+        let selector = resolved_selector(r#"(function :name "target")"#, "/analysis/subject");
+
+        let mut whole = PolicySelectorSession::new(
+            &workspace,
+            "test",
+            limits,
+            64,
+            &cancellation,
+            CodeQueryExecutionScope::whole_workspace(),
+        );
+        let every_site = whole
+            .select_with_artifact_continuation(&selector)
+            .expect("the whole-workspace selector completes");
+        assert_eq!(
+            every_site.len(),
+            2,
+            "the default scope enumerates both files, not {}",
+            every_site.len()
+        );
+
+        let mut files = workspace.analyzer().analyzed_files();
+        files.sort();
+        let seed = project.file("a.go");
+        let mut narrowed = PolicySelectorSession::new(
+            &workspace,
+            "test",
+            limits,
+            64,
+            &cancellation,
+            CodeQueryExecutionScope::for_seed_files(std::slice::from_ref(&seed), &files),
+        );
+        let one_site = narrowed
+            .select_with_artifact_continuation(&selector)
+            .expect("the narrowed selector completes");
+        assert_eq!(
+            one_site.len(),
+            1,
+            "the narrowed scope enumerates one file, not {}",
+            one_site.len()
+        );
+        assert_eq!(one_site[0].file, seed);
     }
 
     /// A selector and the policy compiler continuation are one accounting
@@ -3408,8 +4058,14 @@ func inspect(item resource, callback callbacks, unknown unknownpkg.Resource) {
         let default_limits = PolicyBudget::default().query_limits();
         let selector = cfg_entry_selector("subject", "/analysis/subject");
 
-        let mut calibration =
-            PolicySelectorSession::new(&workspace, "test", default_limits, 64, &cancellation);
+        let mut calibration = PolicySelectorSession::new(
+            &workspace,
+            "test",
+            default_limits,
+            64,
+            &cancellation,
+            CodeQueryExecutionScope::whole_workspace(),
+        );
         let calibrated = calibration
             .select(&selector)
             .expect("calibration selector completes");
@@ -3422,8 +4078,14 @@ func inspect(item resource, callback callbacks, unknown unknownpkg.Resource) {
 
         let tight_limits =
             limits_for_one_census_and_repeats(default_limits, census, retained_peak, traversal, 1);
-        let mut session =
-            PolicySelectorSession::new(&workspace, "test", tight_limits, 64, &cancellation);
+        let mut session = PolicySelectorSession::new(
+            &workspace,
+            "test",
+            tight_limits,
+            64,
+            &cancellation,
+            CodeQueryExecutionScope::whole_workspace(),
+        );
         let selected = session
             .select(&selector)
             .expect("one tightly budgeted selector completes");
@@ -3462,8 +4124,14 @@ func inspect(item resource, callback callbacks, unknown unknownpkg.Resource) {
         let second = cfg_entry_selector("second", "/analysis/second");
         let third = cfg_entry_selector("third", "/analysis/third");
 
-        let mut calibration =
-            PolicySelectorSession::new(&workspace, "test", default_limits, 64, &cancellation);
+        let mut calibration = PolicySelectorSession::new(
+            &workspace,
+            "test",
+            default_limits,
+            64,
+            &cancellation,
+            CodeQueryExecutionScope::whole_workspace(),
+        );
         assert_eq!(
             calibration
                 .select(&first)
@@ -3479,8 +4147,14 @@ func inspect(item resource, callback callbacks, unknown unknownpkg.Resource) {
         let tight_limits =
             limits_for_one_census_and_repeats(default_limits, census, retained_peak, traversal, 1);
         assert_eq!(tight_limits.semantic.max_retained_bytes, retained_peak);
-        let mut session =
-            PolicySelectorSession::new(&workspace, "test", tight_limits, 64, &cancellation);
+        let mut session = PolicySelectorSession::new(
+            &workspace,
+            "test",
+            tight_limits,
+            64,
+            &cancellation,
+            CodeQueryExecutionScope::whole_workspace(),
+        );
         assert_eq!(
             session
                 .select(&first)

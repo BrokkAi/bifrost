@@ -1,0 +1,16 @@
+{
+  "kind": "special-member",
+  "language": "c",
+  "owner": "basic-string-primary",
+  "member": "basic-string-copy-constructor",
+  "operation": "copy-constructor",
+  "signature": {},
+  "memberDisambiguator": "cppsig-0.1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "resolutionContext": {
+    "vocabulary": "csmi.c-cpp-resolution",
+    "version": "0.1.0",
+    "contextDigest": "0c0d1ea7b503dfbd5197a6541b64553359cf9e62841c49741ddd86ad4cd72b3f",
+    "language": "c",
+    "headerClosure": "complete"
+  }
+}

@@ -71,6 +71,9 @@ pub struct CompiledPackManifest {
     /// sources keep byte-identical manifests and digests.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub carried_sources: Vec<String>,
+    /// Exact native C/C++ portability evidence retained at pack scope.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpp_portability: Option<CppPortabilityEvidence>,
     pub semantic_sha256: String,
     pub content_sha256: String,
     pub shards: Vec<CompiledShardDescriptor>,
@@ -92,6 +95,10 @@ pub struct CompiledShard {
     pub(crate) license: String,
     pub(crate) completeness: Completeness,
     pub(crate) safety: Safety,
+    /// The pack-level native C/C++ evidence is repeated in each shard wire
+    /// envelope so a shard remains self-describing after extraction.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) cpp_portability: Option<CppPortabilityEvidence>,
     pub(crate) payload: CompiledPayload,
 }
 
@@ -130,6 +137,10 @@ impl CompiledShard {
 
     pub fn safety(&self) -> &Safety {
         &self.safety
+    }
+
+    pub fn cpp_portability(&self) -> Option<&CppPortabilityEvidence> {
+        self.cpp_portability.as_ref()
     }
 }
 
@@ -388,6 +399,78 @@ pub struct CompiledSummaryTransfer {
     pub input: CompiledSummaryInput,
     pub exit_kind: CompiledSummaryExitKind,
     pub output: CompiledSummaryOutput,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value_transfer: Option<CompiledSummaryValueTransfer>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompiledSummaryValueTransfer {
+    pub kind: CompiledSummaryValueTransferKind,
+    pub operation: CompiledSummaryValueTransferOperation,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum CompiledSummaryValueTransferKind {
+    Copy {},
+    AggregateCopy {},
+    Move {
+        invalidation: CompiledSummaryMoveInvalidation,
+    },
+    Conversion {
+        preservation: CompiledSummaryValuePreservation,
+    },
+    Boxing {},
+    Unboxing {},
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompiledSummaryMoveInvalidation {
+    Invalidated,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompiledSummaryValuePreservation {
+    Identity,
+    Preserving,
+    Changing,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum CompiledSummaryValueTransferOperation {
+    None {},
+    Implicit {
+        member: String,
+    },
+    Unknown {
+        limitation: CompiledSummaryValueTransferLimitation,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompiledSummaryValueTransferLimitation {
+    pub kind: CompiledSummaryValueTransferLimitationKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompiledSummaryValueTransferLimitationKind {
+    BudgetExhausted,
+    Cancelled,
+    Unsupported,
+    UnresolvedIdentity,
+    AmbiguousIdentity,
+    IncompleteInput,
+    Other,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -547,6 +630,8 @@ struct WireCompiledShard {
     license: String,
     completeness: Completeness,
     safety: Safety,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cpp_portability: Option<CppPortabilityEvidence>,
     payload: CompiledPayload,
 }
 
@@ -926,6 +1011,7 @@ fn compiled_from_wire(wire: WireCompiledShard) -> CompiledShard {
         license: wire.license,
         completeness: wire.completeness,
         safety: wire.safety,
+        cpp_portability: wire.cpp_portability,
         payload: wire.payload,
     }
 }
@@ -1083,6 +1169,8 @@ pub(crate) fn semantic_digest(shard: &CompiledShard) -> Result<String, ArtifactE
         activation: &'a [ActivationSelector],
         completeness: Completeness,
         safety: &'a Safety,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cpp_portability: &'a Option<CppPortabilityEvidence>,
         payload: &'a CompiledPayload,
     }
     let bytes = canonical_json(&SemanticView {
@@ -1095,6 +1183,7 @@ pub(crate) fn semantic_digest(shard: &CompiledShard) -> Result<String, ArtifactE
         activation: &shard.activation,
         completeness: shard.completeness,
         safety: &shard.safety,
+        cpp_portability: &shard.cpp_portability,
         payload: &shard.payload,
     })?;
     Ok(digest_hex(SEMANTIC_HASH_DOMAIN, &bytes))
@@ -1113,6 +1202,8 @@ pub(crate) fn manifest_semantic_digest(
         compatibility: &'a Compatibility,
         completeness: Completeness,
         safety: &'a Safety,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cpp_portability: &'a Option<CppPortabilityEvidence>,
         shards: Vec<(&'a str, &'a str)>,
     }
     let bytes = canonical_json(&ManifestSemanticView {
@@ -1124,6 +1215,7 @@ pub(crate) fn manifest_semantic_digest(
         compatibility: &manifest.compatibility,
         completeness: manifest.completeness,
         safety: &manifest.safety,
+        cpp_portability: &manifest.cpp_portability,
         shards: manifest
             .shards
             .iter()
@@ -1149,6 +1241,8 @@ pub(crate) fn manifest_content_digest(
         license: &'a str,
         completeness: Completeness,
         safety: &'a Safety,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cpp_portability: &'a Option<CppPortabilityEvidence>,
         #[serde(skip_serializing_if = "<[String]>::is_empty")]
         carried_sources: &'a [String],
         semantic_sha256: &'a str,
@@ -1166,6 +1260,7 @@ pub(crate) fn manifest_content_digest(
         license: &manifest.license,
         completeness: manifest.completeness,
         safety: &manifest.safety,
+        cpp_portability: &manifest.cpp_portability,
         carried_sources: &manifest.carried_sources,
         semantic_sha256: &manifest.semantic_sha256,
         shards: &manifest.shards,
@@ -1280,6 +1375,15 @@ pub(crate) fn payload_inventory(payload: &CompiledPayload) -> (Vec<String>, Vec<
             for summary in summaries {
                 defined.insert(format!("{PROCEDURE_ID_INVENTORY_PREFIX}{}", summary.id));
                 defined.insert(procedure_target_inventory_id(&summary.target));
+                for transfer in &summary.transfers {
+                    if let Some(CompiledSummaryValueTransfer {
+                        operation: CompiledSummaryValueTransferOperation::Implicit { member },
+                        ..
+                    }) = &transfer.value_transfer
+                    {
+                        referenced.insert(member.clone());
+                    }
+                }
                 for effect in &summary.effects {
                     match effect {
                         CompiledSummaryEffect::Call { callee, .. } => {
@@ -1338,7 +1442,7 @@ fn collect_declared_type_refs(root: &TypeRef, ids: &mut HashSet<String>) {
                 stack.extend(arguments);
             }
             TypeRef::Array { element }
-            | TypeRef::ByRef { element }
+            | TypeRef::ByRef { element, .. }
             | TypeRef::Pointer { element }
             | TypeRef::Slice { element }
             | TypeRef::FixedArray { element, .. }
@@ -1372,6 +1476,7 @@ fn authored_pack_from_wire(shard: &WireCompiledShard) -> AuthoredSemanticModelPa
         completeness: shard.completeness,
         safety: shard.safety.clone(),
         carried_sources: Vec::new(),
+        cpp_portability: shard.cpp_portability.clone(),
         shards: vec![AuthoredShard {
             id: shard.shard_id.clone(),
             activation: shard.activation.clone(),
@@ -1440,6 +1545,10 @@ fn authored_procedure_summary_from_compiled(
                     CompiledSummaryExitKind::Exceptional => AuthoredSummaryExitKind::Exceptional,
                 },
                 output: authored_summary_output_from_compiled(&transfer.output),
+                value_transfer: transfer
+                    .value_transfer
+                    .as_ref()
+                    .map(authored_summary_value_transfer_from_compiled),
             })
             .collect(),
         effects: summary
@@ -1545,6 +1654,91 @@ fn authored_procedure_summary_from_compiled(
                 predicate: authored_result_predicate_from_compiled(refinement.predicate),
             })
             .collect(),
+    }
+}
+
+fn authored_summary_value_transfer_from_compiled(
+    transfer: &CompiledSummaryValueTransfer,
+) -> SummaryValueTransfer {
+    SummaryValueTransfer {
+        kind: match transfer.kind {
+            CompiledSummaryValueTransferKind::Copy {} => SummaryValueTransferKind::Copy {},
+            CompiledSummaryValueTransferKind::AggregateCopy {} => {
+                SummaryValueTransferKind::AggregateCopy {}
+            }
+            CompiledSummaryValueTransferKind::Move { invalidation } => {
+                SummaryValueTransferKind::Move {
+                    invalidation: match invalidation {
+                        CompiledSummaryMoveInvalidation::Invalidated => {
+                            SummaryMoveInvalidation::Invalidated
+                        }
+                        CompiledSummaryMoveInvalidation::Unknown => {
+                            SummaryMoveInvalidation::Unknown
+                        }
+                    },
+                }
+            }
+            CompiledSummaryValueTransferKind::Conversion { preservation } => {
+                SummaryValueTransferKind::Conversion {
+                    preservation: match preservation {
+                        CompiledSummaryValuePreservation::Identity => {
+                            SummaryValuePreservation::Identity
+                        }
+                        CompiledSummaryValuePreservation::Preserving => {
+                            SummaryValuePreservation::Preserving
+                        }
+                        CompiledSummaryValuePreservation::Changing => {
+                            SummaryValuePreservation::Changing
+                        }
+                        CompiledSummaryValuePreservation::Unknown => {
+                            SummaryValuePreservation::Unknown
+                        }
+                    },
+                }
+            }
+            CompiledSummaryValueTransferKind::Boxing {} => SummaryValueTransferKind::Boxing {},
+            CompiledSummaryValueTransferKind::Unboxing {} => SummaryValueTransferKind::Unboxing {},
+        },
+        operation: match &transfer.operation {
+            CompiledSummaryValueTransferOperation::None {} => {
+                SummaryValueTransferOperation::None {}
+            }
+            CompiledSummaryValueTransferOperation::Implicit { member } => {
+                SummaryValueTransferOperation::Implicit {
+                    member: member.clone(),
+                }
+            }
+            CompiledSummaryValueTransferOperation::Unknown { limitation } => {
+                SummaryValueTransferOperation::Unknown {
+                    limitation: SummaryValueTransferLimitation {
+                        kind: match limitation.kind {
+                            CompiledSummaryValueTransferLimitationKind::BudgetExhausted => {
+                                SummaryValueTransferLimitationKind::BudgetExhausted
+                            }
+                            CompiledSummaryValueTransferLimitationKind::Cancelled => {
+                                SummaryValueTransferLimitationKind::Cancelled
+                            }
+                            CompiledSummaryValueTransferLimitationKind::Unsupported => {
+                                SummaryValueTransferLimitationKind::Unsupported
+                            }
+                            CompiledSummaryValueTransferLimitationKind::UnresolvedIdentity => {
+                                SummaryValueTransferLimitationKind::UnresolvedIdentity
+                            }
+                            CompiledSummaryValueTransferLimitationKind::AmbiguousIdentity => {
+                                SummaryValueTransferLimitationKind::AmbiguousIdentity
+                            }
+                            CompiledSummaryValueTransferLimitationKind::IncompleteInput => {
+                                SummaryValueTransferLimitationKind::IncompleteInput
+                            }
+                            CompiledSummaryValueTransferLimitationKind::Other => {
+                                SummaryValueTransferLimitationKind::Other
+                            }
+                        },
+                        message: limitation.message.clone(),
+                    },
+                }
+            }
+        },
     }
 }
 

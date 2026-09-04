@@ -81,6 +81,7 @@ fn units(
         .map(|file| {
             execute_code_query_unit(
                 workspace.analyzer(),
+                None,
                 query,
                 CodeQueryExecutionLimits::default(),
                 None,
@@ -189,6 +190,7 @@ fn a_unit_still_expands_a_derived_value_over_the_whole_workspace() {
 
     let unit = execute_code_query_unit(
         workspace.analyzer(),
+        None,
         &callers_query(),
         CodeQueryExecutionLimits::default(),
         None,
@@ -198,11 +200,8 @@ fn a_unit_still_expands_a_derived_value_over_the_whole_workspace() {
     let callers: Vec<String> = unit
         .rows
         .iter()
-        .map(|row| match &row.item.value {
-            UnitRowItemValue::Presented {
-                terminal: UnitRowItemTerminal::Declaration { fq_name, .. },
-                ..
-            } => fq_name.to_string(),
+        .map(|row| match &row.item.terminal {
+            Some(UnitRowItemTerminal::Declaration { fq_name, .. }) => fq_name.to_string(),
             other => panic!("expected a declaration row, got {other:?}"),
         })
         .collect();
@@ -230,6 +229,7 @@ fn a_seed_scope_outside_the_query_scope_yields_no_rows() {
     let outside = project.file("src/mod3.ts");
     let unit = execute_code_query_unit(
         workspace.analyzer(),
+        None,
         &query,
         CodeQueryExecutionLimits::default(),
         None,
@@ -310,6 +310,7 @@ fn an_execution_exports_the_budgeted_lanes_its_public_work_drops() {
 
     let unit = execute_code_query_unit(
         workspace.analyzer(),
+        None,
         &query,
         CodeQueryExecutionLimits::default(),
         None,
@@ -355,6 +356,7 @@ fn an_execution_exports_the_import_lanes_it_charged() {
 
     let unit = execute_code_query_unit(
         workspace.analyzer(),
+        None,
         &query,
         CodeQueryExecutionLimits::default(),
         None,
@@ -525,6 +527,7 @@ fn unit_read_keys(
         );
         execute_code_query_unit(
             workspace.analyzer(),
+            None,
             query,
             CodeQueryExecutionLimits::default(),
             None,

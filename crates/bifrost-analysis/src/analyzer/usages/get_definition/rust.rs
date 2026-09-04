@@ -700,9 +700,7 @@ fn rust_scope_forward_candidates_to_cargo_target(
                 support
                     .fqn(&definition.fq_name())
                     .into_iter()
-                    .filter(|candidate| {
-                        rust_same_declaration_namespace(rust, definition, candidate)
-                    }),
+                    .filter(|candidate| rust_same_declaration_namespace(definition, candidate)),
             );
             expanded.extend(
                 support
@@ -710,7 +708,7 @@ fn rust_scope_forward_candidates_to_cargo_target(
                     .into_iter()
                     .filter(|candidate| {
                         candidate.fq_name() == definition.fq_name()
-                            && rust_same_declaration_namespace(rust, definition, candidate)
+                            && rust_same_declaration_namespace(definition, candidate)
                     }),
             );
         }
@@ -794,17 +792,17 @@ fn rust_scope_forward_candidates_to_cargo_target(
     scoped_outcome
 }
 
-fn rust_same_declaration_namespace(
-    rust: &RustAnalyzer,
-    expected: &CodeUnit,
-    candidate: &CodeUnit,
-) -> bool {
+/// Whether two declarations occupy the same Rust namespace.
+///
+/// The CodeUnit kinds decide it on their own since #2911: a `type` alias is a
+/// class-kind unit like every other type declaration, so it no longer has to be
+/// told apart from a same-named `const` by the type-alias marker.
+fn rust_same_declaration_namespace(expected: &CodeUnit, candidate: &CodeUnit) -> bool {
     expected.is_module() == candidate.is_module()
         && expected.is_class() == candidate.is_class()
         && expected.is_macro() == candidate.is_macro()
         && expected.is_function() == candidate.is_function()
         && expected.is_field() == candidate.is_field()
-        && (!expected.is_field() || rust.is_type_alias(expected) == rust.is_type_alias(candidate))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1714,7 +1712,7 @@ fn rust_type_binding_name_outcome(
             let candidates: Vec<_> = support
                 .fqn(&format!("{owner_fqn}.{name}"))
                 .into_iter()
-                .filter(CodeUnit::is_field)
+                .filter(CodeUnit::is_class)
                 .collect();
             if !candidates.is_empty() {
                 return candidates_outcome(candidates);
@@ -1948,7 +1946,7 @@ fn rust_same_crate_types(rust: &RustAnalyzer, file: &ProjectFile, name: &str) ->
     rust.declaration_candidates_by_identifier(name)
         .into_iter()
         .filter(|unit| rust_crate_root_package(unit.source()) == crate_root)
-        .filter(|unit| unit.is_class() || rust_declaration_is_module_type_alias(rust, unit))
+        .filter(|unit| rust_bare_type_candidate(rust, unit))
         .collect()
 }
 
@@ -3411,17 +3409,13 @@ fn rust_role_accepts_imported(
     candidate: &CodeUnit,
 ) -> bool {
     match role {
-        RustBareReferenceRole::Type => {
-            candidate.is_class() || rust_declaration_is_module_type_alias(rust, candidate)
-        }
+        RustBareReferenceRole::Type => rust_bare_type_candidate(rust, candidate),
         RustBareReferenceRole::Value => {
             rust_value_namespace_candidate(rust, candidate) || candidate.is_field()
         }
         RustBareReferenceRole::Callable => rust_callable_namespace_candidate(rust, candidate),
         RustBareReferenceRole::Owner => {
-            candidate.is_module()
-                || candidate.is_class()
-                || rust_declaration_is_module_type_alias(rust, candidate)
+            candidate.is_module() || rust_bare_type_candidate(rust, candidate)
         }
         RustBareReferenceRole::Macro => candidate.is_macro(),
     }
@@ -3433,9 +3427,7 @@ fn rust_role_accepts_current_module(
     candidate: &CodeUnit,
 ) -> bool {
     match role {
-        RustBareReferenceRole::Type => {
-            candidate.is_class() || rust_declaration_is_module_type_alias(rust, candidate)
-        }
+        RustBareReferenceRole::Type => rust_bare_type_candidate(rust, candidate),
         RustBareReferenceRole::Value => {
             (candidate.is_class() && has_rust_value_constructor(rust, candidate))
                 || (candidate.is_function() && rust_declaration_is_free_function(rust, candidate))
@@ -3446,9 +3438,7 @@ fn rust_role_accepts_current_module(
                 || (candidate.is_function() && rust_declaration_is_free_function(rust, candidate))
         }
         RustBareReferenceRole::Owner => {
-            candidate.is_module()
-                || candidate.is_class()
-                || rust_declaration_is_module_type_alias(rust, candidate)
+            candidate.is_module() || rust_bare_type_candidate(rust, candidate)
         }
         RustBareReferenceRole::Macro => candidate.is_macro(),
     }
@@ -3508,9 +3498,7 @@ fn rust_role_accepts_scoped(
     candidate: &CodeUnit,
 ) -> bool {
     match role {
-        RustBareReferenceRole::Type => {
-            candidate.is_class() || rust_declaration_is_module_type_alias(rust, candidate)
-        }
+        RustBareReferenceRole::Type => rust_bare_type_candidate(rust, candidate),
         RustBareReferenceRole::Value => {
             candidate.is_class()
                 || candidate.is_function()
@@ -3524,9 +3512,7 @@ fn rust_role_accepts_scoped(
                 || (candidate.is_field() && rust_declaration_is_enum_variant(rust, candidate))
         }
         RustBareReferenceRole::Owner => {
-            candidate.is_module()
-                || candidate.is_class()
-                || rust_declaration_is_module_type_alias(rust, candidate)
+            candidate.is_module() || rust_bare_type_candidate(rust, candidate)
         }
         RustBareReferenceRole::Macro => candidate.is_macro(),
     }
@@ -3583,6 +3569,20 @@ fn rust_declaration_is_free_function(rust: &RustAnalyzer, candidate: &CodeUnit) 
         }
         true
     })
+}
+
+/// Whether a bare name written in type position can denote `candidate`.
+///
+/// Every `struct`, `enum`, `union`, and `trait` qualifies, and so does a
+/// module-level `type` alias. An associated type does not: `Trait::Output` is
+/// only ever named through its owner, so a bare `Output` never denotes it.
+/// Since #2911 an alias is a [`CodeUnit`] of class kind like any other type
+/// declaration, which is why the associated-type exclusion has to be asked
+/// here rather than implied by the alias's old field kind.
+fn rust_bare_type_candidate(rust: &RustAnalyzer, candidate: &CodeUnit) -> bool {
+    candidate.is_class()
+        && (!rust.is_type_alias(candidate)
+            || rust_declaration_is_module_type_alias(rust, candidate))
 }
 
 fn rust_declaration_is_module_type_alias(rust: &RustAnalyzer, candidate: &CodeUnit) -> bool {
@@ -3706,7 +3706,7 @@ fn rust_impl_associated_type_declaration_outcome(
     let mut candidates: Vec<_> = support
         .fqn(&format!("{trait_fqn}.{associated_type}"))
         .into_iter()
-        .filter(CodeUnit::is_field)
+        .filter(CodeUnit::is_class)
         .collect();
     if candidates.is_empty() {
         return None;
@@ -3766,7 +3766,7 @@ fn rust_qualified_associated_type_navigation_outcome(
     let trait_members: Vec<_> = support
         .fqn(&format!("{trait_fqn}.{member_name}"))
         .into_iter()
-        .filter(CodeUnit::is_field)
+        .filter(CodeUnit::is_class)
         .collect();
     if trait_members.is_empty() {
         return None;
@@ -3849,7 +3849,7 @@ fn rust_self_scoped_associated_type_candidates(
             file,
             name,
             site.focus_start_byte,
-            CodeUnit::is_field,
+            CodeUnit::is_class,
         )
         .map(|candidate| vec![candidate]);
     };
@@ -3877,7 +3877,7 @@ fn rust_self_scoped_associated_type_candidates(
         file,
         name,
         site.focus_start_byte,
-        CodeUnit::is_field,
+        CodeUnit::is_class,
     );
     let candidate_is_in_impl = candidate.as_ref().is_some_and(|candidate| {
         candidate.source() == file

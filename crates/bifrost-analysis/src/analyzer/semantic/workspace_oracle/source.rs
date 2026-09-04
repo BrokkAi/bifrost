@@ -149,21 +149,11 @@ impl PreparedSourceDispatchSession<'_> {
             }
         }
 
-        let coverage = if calls_truncated || any_result_truncated {
-            CandidateCoverage::Truncated
-        } else if all_results_exhaustive
-            && !matches!(
-                quality,
-                SourceOutcomeQuality::Unknown
-                    | SourceOutcomeQuality::Unsupported(_)
-                    | SourceOutcomeQuality::ExceededBudget(_)
-                    | SourceOutcomeQuality::Cancelled
-            )
-        {
-            CandidateCoverage::Exhaustive
-        } else {
-            CandidateCoverage::Open
-        };
+        let coverage = projected_source_coverage(
+            quality,
+            calls_truncated || any_result_truncated,
+            all_results_exhaustive,
+        );
         // Aggregate coverage does not feed back into quality. Each delegated
         // call already classified its own open or truncated answer; only
         // source-observation omission introduced by this seam is absorbed
@@ -407,12 +397,78 @@ impl<'a> WorkspaceSemanticOracle<'a> {
 /// Domain for the digest of one dispatch answer.
 const DISPATCH_ANSWER_DOMAIN: &[u8] = b"bifrost-read-ledger:dispatch-answer:v1";
 
+/// The coverage a source-range dispatch answer publishes.
+///
+/// `truncated` is set when the located call set, or any located call's own
+/// answer, was cut short; `exhaustive` when every located call answered
+/// exhaustively. A quality that asserts no answer -- unknown, unsupported,
+/// budgeted, cancelled -- cannot publish an exhaustive range answer even when
+/// every call it did retain was itself exhaustive.
+///
+/// Shared with [`one_call_dispatch_answer_digest`], which is the same rule for
+/// a range that located exactly one call site.
+const fn projected_source_coverage(
+    quality: SourceOutcomeQuality,
+    truncated: bool,
+    exhaustive: bool,
+) -> CandidateCoverage {
+    if truncated {
+        CandidateCoverage::Truncated
+    } else if exhaustive
+        && !matches!(
+            quality,
+            SourceOutcomeQuality::Unknown
+                | SourceOutcomeQuality::Unsupported(_)
+                | SourceOutcomeQuality::ExceededBudget(_)
+                | SourceOutcomeQuality::Cancelled
+        )
+    {
+        CandidateCoverage::Exhaustive
+    } else {
+        CandidateCoverage::Open
+    }
+}
+
+/// The answer digest [`WorkspaceSemanticOracle::dispatch_at_source_in_artifact`]
+/// would record for a source range that located exactly `call`.
+///
+/// This is what lets the handle-keyed dispatch funnel record a read that
+/// [`crate::analyzer::read_verification::replay_lookup`] can replay: replay
+/// goes through the source range, so the recording has to state its answer in
+/// the source range's terms. `source_call_sites` selects the narrowest
+/// containing mapping, so a range that is exactly one call's own span locates
+/// that call and no other, and the range answer is that call's answer with the
+/// source seam's coverage rule applied to it.
+///
+/// The materialization quality is `Complete` by construction here: the caller
+/// holds a `CallSiteHandle` into an artifact that materialized.
+pub(crate) fn one_call_dispatch_answer_digest(
+    call: &CallSiteHandle,
+    outcome: &SemanticOutcome<DispatchResult>,
+) -> crate::analyzer::semantic::ids::StableDigest {
+    let Some(dispatch) = outcome.available_value() else {
+        return dispatch_answer_digest(None);
+    };
+    let coverage = projected_source_coverage(
+        SourceOutcomeQuality::from_outcome(outcome),
+        dispatch.coverage().is_truncated(),
+        dispatch.coverage().is_exhaustive(),
+    );
+    dispatch_answer_digest(Some(&SourceDispatchResult {
+        observations: Box::new([SourceDispatchObservation {
+            call: call.clone(),
+            dispatch: dispatch.clone(),
+        }]),
+        coverage,
+    }))
+}
+
 /// The replayable question "dispatch at this range of this artifact".
 ///
 /// The file is named by its workspace-relative path and the artifact by its
 /// public fingerprint, never by the mount-bearing `SemanticArtifactKey`, so
 /// the same question over the same content at two roots is the same question.
-fn dispatch_question(
+pub(crate) fn dispatch_question(
     artifact: &SemanticArtifact,
     range: Range,
 ) -> crate::analyzer::read_ledger::LookupQuestion {

@@ -23,7 +23,7 @@ pub enum PlanPartitioning {
 impl PlanPartitioning {
     /// Classify `plan` from its source kind and its steps.
     ///
-    /// Two shapes are `Whole`:
+    /// Three shapes are `Whole`:
     ///
     /// - A `Set` source. A set node gives each branch a fair share of the live
     ///   budget, re-runs a starved branch, and drops truncated seed results
@@ -33,6 +33,11 @@ impl PlanPartitioning {
     ///   `DetailedCodeQueryDecoratedParameterEvidence`, runtime-only semantic
     ///   identity that is deliberately outside the serializable row model, so a
     ///   unit product cannot carry it.
+    /// - A registration-dependent step ([`QueryStepOp::is_registration_dependent`]).
+    ///   Those steps read the interprocedural graph and the summary repository
+    ///   through funnels that record no read key today, so a per-seed unit over
+    ///   one would carry a read set that names none of what decided its rows and
+    ///   would be reused whenever the files it did name held still.
     ///
     /// Everything else is `BySeed`, including derived-value steps (whose answer
     /// is a whole-workspace relation the unit's read set records) and batched
@@ -42,11 +47,9 @@ impl PlanPartitioning {
         if matches!(plan.source, CodeQueryPlanSource::Set { .. }) {
             return Self::Whole;
         }
-        if plan
-            .steps
-            .iter()
-            .any(|step| step.op() == QueryStepOp::DecoratorBindings)
-        {
+        if plan.steps.iter().any(|step| {
+            step.op() == QueryStepOp::DecoratorBindings || step.op().is_registration_dependent()
+        }) {
             return Self::Whole;
         }
         Self::BySeed
@@ -147,6 +150,66 @@ mod tests {
         }));
         assert_eq!(plan.steps[0].op().shape(), QueryStepShape::Batched);
         assert_eq!(PlanPartitioning::classify(&plan), PlanPartitioning::Whole);
+    }
+
+    /// Every registration-dependent step forces a whole plan, whatever its
+    /// declared driver shape: the rows come from an analysis a host
+    /// registered, read through funnels that record nothing, so a per-seed
+    /// unit over one could never state what its rows depend on.
+    #[test]
+    fn every_registration_dependent_step_forces_a_whole_plan() {
+        // Every one of them consumes a procedure, and the witness projection
+        // consumes what one of the others produced, so each is spelled with
+        // the shortest plan its own signature admits.
+        for steps in [
+            json!([
+                { "op": "procedure_of" },
+                { "op": "typestate", "protocol_ref": "test:protocol" }
+            ]),
+            json!([
+                { "op": "procedure_of" },
+                { "op": "value_flow", "plan_ref": "test:plan" }
+            ]),
+            json!([
+                { "op": "procedure_of" },
+                { "op": "taint", "taint_ref": "test:result" }
+            ]),
+            json!([
+                { "op": "procedure_of" },
+                { "op": "typestate", "protocol_ref": "test:protocol" },
+                { "op": "witness" }
+            ]),
+        ] {
+            let plan = plan(json!({ "match": { "kind": "function" }, "steps": steps }));
+            assert!(
+                plan.steps
+                    .iter()
+                    .any(|step| step.op().is_registration_dependent()),
+                "{steps} names a registration-dependent step"
+            );
+            assert_eq!(
+                PlanPartitioning::classify(&plan),
+                PlanPartitioning::Whole,
+                "{steps} cannot be sliced by seed"
+            );
+        }
+    }
+
+    /// The registration-dependent set is exactly those four operations, so a
+    /// new step declared beside them cannot join it by accident and a step
+    /// that leaves it cannot do so silently.
+    #[test]
+    fn the_registration_dependent_operations_are_the_four_declared_ones() {
+        let registration_dependent = crate::query::schema::ALL_QUERY_STEP_OPS
+            .iter()
+            .copied()
+            .filter(|op| op.is_registration_dependent())
+            .map(QueryStepOp::label)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            registration_dependent,
+            vec!["typestate", "value_flow", "taint", "witness"]
+        );
     }
 
     #[test]

@@ -35,6 +35,12 @@ use super::{
 const DEFAULT_ICFG_PROVIDER_BEHAVIOR_DOMAIN: &[u8] = b"bifrost-icfg-provider/default-behavior/v1";
 const WORKSPACE_ICFG_PROVIDER_BEHAVIOR_DOMAIN: &[u8] =
     b"bifrost-icfg-provider/workspace-behavior/v3";
+/// The domain of the same behavior without the workspace's content identity.
+///
+/// Its own domain rather than a shorter message under the one above, so that
+/// no read half can ever equal a full identity by accident.
+const WORKSPACE_ICFG_PROVIDER_READ_BEHAVIOR_DOMAIN: &[u8] =
+    b"bifrost-icfg-provider/workspace-read-behavior/v1";
 
 /// Whether this first authored non-return consumer has an unambiguous call
 /// identity and immediate-invocation contract for `language`.
@@ -55,20 +61,49 @@ const fn supports_authored_normal_continuation_absence(language: SemanticLanguag
 /// Providers whose behavior varies independently of their semantic artifacts
 /// must override [`IcfgProvider::behavior_identity`]. The default preserves one
 /// conservative identity for stateless providers and existing test fakes.
+/// `read` is the same identity with the workspace's content identity left out,
+/// for a record that must compare across two checkouts of the same content.
+/// Everything else the digest folds -- the active model set, the semantic-model
+/// overlay's presence, the dispatch hierarchy expansion -- is an engine input a
+/// reader states independently, while the content identity rotates on every
+/// edit anywhere in the workspace. A record keyed by the full digest could
+/// therefore never be verified after any edit, however unrelated
+/// (`.agents/plans/impact-sliced-diff-base.md`, Decision Log (5b)).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct IcfgProviderBehaviorIdentity(StableDigest);
+pub struct IcfgProviderBehaviorIdentity {
+    digest: StableDigest,
+    read: StableDigest,
+}
 
 impl IcfgProviderBehaviorIdentity {
+    /// One provider identity named by its own bytes.
+    ///
+    /// Both halves are the same digest: a provider that states its behavior as
+    /// a fixed name folds no workspace content, so there is nothing to leave
+    /// out.
     pub fn hash_bytes(bytes: impl AsRef<[u8]>) -> Self {
-        Self(StableDigest::sha256(bytes))
+        let digest = StableDigest::sha256(bytes);
+        Self {
+            digest,
+            read: digest,
+        }
     }
 
     pub const fn digest(self) -> StableDigest {
-        self.0
+        self.digest
     }
 
     pub const fn as_bytes(&self) -> &[u8; 32] {
-        self.0.as_bytes()
+        self.digest.as_bytes()
+    }
+
+    /// This identity without the workspace's content identity.
+    pub const fn read_digest(self) -> StableDigest {
+        self.read
+    }
+
+    pub const fn read_bytes(&self) -> &[u8; 32] {
+        self.read.as_bytes()
     }
 
     fn workspace(
@@ -77,30 +112,50 @@ impl IcfgProviderBehaviorIdentity {
         snapshot: Option<&ActiveSemanticModelSnapshot>,
     ) -> Self {
         let mut digest = LengthDelimitedDigest::new(WORKSPACE_ICFG_PROVIDER_BEHAVIOR_DOMAIN);
-        match snapshot {
-            Some(snapshot) => {
-                digest.push(b"active-semantic-model-set");
-                digest.push(snapshot.active_models().active_model_set_hash().as_bytes());
-                if snapshot.semantic_model_overlay().is_some() {
-                    digest.push(b"semantic-model-overlay-present");
-                } else {
-                    digest.push(b"semantic-model-overlay-absent");
+        let mut read = LengthDelimitedDigest::new(WORKSPACE_ICFG_PROVIDER_READ_BEHAVIOR_DOMAIN);
+        // Every engine input except the workspace's own content identity, into
+        // both halves: each of these is something a reader of a recorded read
+        // states for itself, and none of them moves because an unrelated file
+        // was edited.
+        let push_engine_inputs = |digest: &mut LengthDelimitedDigest| {
+            match snapshot {
+                Some(snapshot) => {
+                    digest.push(b"active-semantic-model-set");
+                    digest.push(snapshot.active_models().active_model_set_hash().as_bytes());
+                    if snapshot.semantic_model_overlay().is_some() {
+                        digest.push(b"semantic-model-overlay-present");
+                    } else {
+                        digest.push(b"semantic-model-overlay-absent");
+                    }
                 }
+                None => digest.push(b"no-active-semantic-model-set"),
             }
-            None => digest.push(b"no-active-semantic-model-set"),
-        }
-        digest.push(b"dispatch-hierarchy-expansion");
-        digest.push(if hierarchy_expansion.concrete_overrides {
-            b"concrete-overrides"
-        } else {
-            b"off"
-        });
+            digest.push(b"dispatch-hierarchy-expansion");
+            digest.push(if hierarchy_expansion.concrete_overrides {
+                b"concrete-overrides"
+            } else {
+                b"off"
+            });
+            match workspace.analyzer().external_dispatch_behavior_identity() {
+                Some(identity) => {
+                    digest.push(b"external-dispatch-surface");
+                    digest.push(identity.as_bytes());
+                }
+                None => digest.push(b"no-external-dispatch-surface"),
+            }
+        };
+        push_engine_inputs(&mut digest);
+        push_engine_inputs(&mut read);
         // Dispatch can materialize any compatible declaration in the analyzer,
         // not only procedures from the root artifact. Bind the exact analyzed
         // file-set, language composition, epochs, and configuration through
         // their stable content identity. A pointer or generation would prevent
         // valid reuse across equivalent analyzer snapshots without proving the
         // target universes equal.
+        //
+        // The read half deliberately stops here: it names the same engine,
+        // and which files that engine has is what a read set's own `File` and
+        // `Artifact` keys state exactly.
         match workspace.analyzer().workspace_content_identity() {
             Some(identity) => {
                 digest.push(b"workspace-dispatch-universe");
@@ -118,14 +173,10 @@ impl IcfgProviderBehaviorIdentity {
                 digest.push(b"empty-workspace-dispatch-universe");
             }
         }
-        match workspace.analyzer().external_dispatch_behavior_identity() {
-            Some(identity) => {
-                digest.push(b"external-dispatch-surface");
-                digest.push(identity.as_bytes());
-            }
-            None => digest.push(b"no-external-dispatch-surface"),
+        Self {
+            digest: digest.finish(),
+            read: read.finish(),
         }
-        Self(digest.finish())
     }
 }
 
@@ -401,6 +452,67 @@ impl<'a> WorkspaceIcfgProvider<'a> {
 
     pub const fn oracle(&self) -> &WorkspaceSemanticOracle<'a> {
         &self.oracle
+    }
+
+    /// Record that this provider read `procedure`'s owning semantic artifact
+    /// (issue: impact-sliced `--diff-base`, Milestone 5).
+    ///
+    /// A snapshot, a call-transfer projection and an exit profile all read the
+    /// procedure, point, edge and call-site rows of one immutable artifact, and
+    /// the artifact is the unit derivation publishes, so the read is named
+    /// exactly as `semantic::service::materialize_with_lowerer` names it: by
+    /// the artifact's public fingerprint and its workspace-relative path,
+    /// never by the mount-bearing `SemanticArtifactKey`. Recording the whole
+    /// artifact rather than the rows actually touched is the over-recording
+    /// direction the ledger requires.
+    ///
+    /// A run with no ledger attached pays one relaxed load and allocates
+    /// nothing.
+    fn record_artifact_read(&self, procedure: &ProcedureHandle) {
+        let analyzer = self.workspace().analyzer();
+        if !analyzer.read_ledger_attached() {
+            return;
+        }
+        let key = procedure.artifact().key();
+        analyzer.record_read(crate::analyzer::read_ledger::ReadKey::artifact(
+            crate::analyzer::invalidation::DerivedArtifactId::semantic_artifact(
+                key.public_fingerprint(),
+            ),
+            Some(key.path().as_str()),
+        ));
+    }
+
+    /// Record one dispatch answer this provider read.
+    ///
+    /// Dispatch is the channel a typestate or taint solve composes callee
+    /// bodies through, so which targets a call site resolved to -- and whether
+    /// that set was exhaustive -- is itself an input the solve depended on. The
+    /// question and the answer digest are built by the same helpers
+    /// `WorkspaceSemanticOracle::dispatch_at_source_in_artifact` uses, so
+    /// `read_verification::replay_lookup` replays this recording through the
+    /// source-range entry point without a second rendering of the answer.
+    ///
+    /// A call site with no retained source mapping cannot be named in the
+    /// source-range terms replay asks in. That is a funnel crossing this
+    /// provider cannot attribute, and it says so rather than staying silent.
+    fn record_dispatch_read(
+        &self,
+        call: &CallSiteHandle,
+        outcome: &SemanticOutcome<DispatchResult>,
+    ) {
+        let analyzer = self.workspace().analyzer();
+        if !analyzer.read_ledger_attached() {
+            return;
+        }
+        let Ok(range) = super::workspace_oracle::exact_call_range(call) else {
+            analyzer.record_unattributed_read();
+            return;
+        };
+        analyzer.record_read(crate::analyzer::read_ledger::ReadKey::lookup(
+            crate::analyzer::read_ledger::LookupKind::Dispatch,
+            super::workspace_oracle::dispatch_question(call.procedure().artifact(), range),
+            super::workspace_oracle::one_call_dispatch_answer_digest(call, outcome),
+        ));
     }
 }
 
@@ -1088,12 +1200,31 @@ impl DispatchOracle for WorkspaceIcfgProvider<'_> {
         call: &CallSiteHandle,
         request: &mut SemanticRequest<'_>,
     ) -> Result<SemanticOutcome<DispatchResult>, SemanticProviderError> {
-        self.oracle.resolve_call(call, request)
+        let outcome = self.oracle.resolve_call(call, request)?;
+        self.record_artifact_read(call.procedure());
+        self.record_dispatch_read(call, &outcome);
+        Ok(outcome)
     }
 }
 impl IcfgProvider for WorkspaceIcfgProvider<'_> {
     fn behavior_identity(&self) -> IcfgProviderBehaviorIdentity {
         self.behavior_identity
+    }
+
+    /// The default profile projection, with the callee artifact it reads
+    /// named.
+    ///
+    /// The entry and exit points scope one procedure of one artifact, and the
+    /// profile is a bounded scan of that procedure's own topology, so the read
+    /// is the artifact. The default implementation is otherwise unchanged.
+    fn exit_profile(
+        &self,
+        callee_entry: &ProgramPointHandle,
+        callee_exit: &ProgramPointHandle,
+        request: &mut SemanticRequest<'_>,
+    ) -> Result<SemanticOutcome<IcfgExitProfile>, SemanticProviderError> {
+        self.record_artifact_read(callee_entry.procedure());
+        materialize_exit_profile(callee_entry, callee_exit, request)
     }
 
     fn call_transfers(
@@ -1102,6 +1233,7 @@ impl IcfgProvider for WorkspaceIcfgProvider<'_> {
         call: CallSiteId,
         request: &mut SemanticRequest<'_>,
     ) -> Result<SemanticOutcome<CallTransferSet>, SemanticProviderError> {
+        self.record_artifact_read(caller);
         let semantic_call = caller
             .semantics()
             .call_site(call)
@@ -1331,6 +1463,7 @@ impl IcfgProvider for WorkspaceIcfgProvider<'_> {
         limits: IcfgSnapshotLimits,
         request: &mut SemanticRequest<'_>,
     ) -> Result<SemanticOutcome<IcfgSnapshot>, SemanticProviderError> {
+        self.record_artifact_read(root);
         limits
             .validate()
             .map_err(|error| SemanticProviderError::internal(error.to_string()))?;

@@ -6,6 +6,7 @@ use brokk_bifrost_core::analyzer::model::{
     StructuredTypeIdentityBuilder, StructuredTypeName,
 };
 use brokk_bifrost_core::analyzer::parsed_file::ParsedFile;
+use brokk_bifrost_core::analyzer::structural::resolution::DeclaredVisibility;
 use brokk_bifrost_core::analyzer::{CodeUnit, ProjectFile};
 use tree_sitter::{Node, Point, Tree};
 
@@ -612,17 +613,45 @@ fn php_function_signature(node: Node<'_>, source: &str) -> String {
     }
 }
 
+/// The one place PHP builds callable signature metadata, so no declaration
+/// path can record parameter labels and forget the modifier facts that make
+/// the callable keyable for procedure-summary binding (#2912):
+/// `receiver_contract_of` refuses to answer for a callable whose adapter never
+/// inspected modifiers.
+///
+/// PHP has no constructor declaration shape; `__construct` is an ordinary
+/// `method_declaration` and stays an instance member here. Visibility stays
+/// `Unknown`, matching the TypeScript (#2597) and Rust (#2589) adapters.
+/// tree-sitter-php does publish `visibility_modifier` as its own node, but
+/// nothing on the summary-binding path reads visibility, and recording it
+/// would change the RQL `visibility` property for every PHP callable. That is
+/// its own decision, not a side effect of this one.
 fn php_signature_metadata(signature: String, node: Node<'_>, source: &str) -> SignatureMetadata {
+    let parameters = php_parameter_metadata(&signature, node, source);
+    SignatureMetadata::new(signature, parameters)
+        .with_return_type_text(php_declared_type_text(node, source))
+        .with_return_type_identity(php_declared_type_identity(node, source))
+        .with_callable_modifiers(
+            php_callable_is_static(node),
+            false,
+            DeclaredVisibility::Unknown,
+        )
+}
+
+/// The callable's parameter labels, positioned inside the rendered
+/// `signature`. Empty when the declaration carries no parameter list or the
+/// rendered header does not contain it.
+fn php_parameter_metadata(signature: &str, node: Node<'_>, source: &str) -> Vec<ParameterMetadata> {
     let Some(parameters_node) = node.child_by_field_name("parameters") else {
-        return SignatureMetadata::new(signature, Vec::new());
+        return Vec::new();
     };
     let parameter_text = normalize_php_snippet(&php_node_text(parameters_node, source));
     let Some(parameters_start) = signature.find(&parameter_text) else {
-        return SignatureMetadata::new(signature, Vec::new());
+        return Vec::new();
     };
     let parameters_end = parameters_start + parameter_text.len();
     let mut search_start = parameters_start;
-    let parameters = php_parameter_label_nodes(parameters_node)
+    php_parameter_label_nodes(parameters_node)
         .into_iter()
         .filter_map(|label_node| {
             let label = normalize_php_snippet(&php_node_text(label_node, source));
@@ -636,10 +665,31 @@ fn php_signature_metadata(signature: String, node: Node<'_>, source: &str) -> Si
             search_start = end_byte;
             Some(ParameterMetadata::new(label, start_byte, end_byte))
         })
-        .collect();
-    SignatureMetadata::new(signature, parameters)
-        .with_return_type_text(php_declared_type_text(node, source))
-        .with_return_type_identity(php_declared_type_identity(node, source))
+        .collect()
+}
+
+/// Whether this callable binds no `$this`, in the sense the receiver contract
+/// asks about.
+///
+/// Only a `method_declaration` can bind a class receiver, and it does not when
+/// it declares the `static` modifier, which tree-sitter-php publishes as a
+/// `static_modifier` child of the declaration. Reading that child answers the
+/// question the rendered header only approximates: the keyword could equally
+/// appear inside an attribute argument or a parameter default. A
+/// `function_definition` is reached through its own name, so nothing has to be
+/// bound in receiver position and it is static in the same sense.
+fn php_callable_is_static(node: Node<'_>) -> bool {
+    debug_assert!(
+        matches!(node.kind(), "function_definition" | "method_declaration"),
+        "PHP callable signature metadata is built for function_definition and method_declaration, not {}",
+        node.kind()
+    );
+    if node.kind() != "method_declaration" {
+        return true;
+    }
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .any(|child| child.kind() == "static_modifier")
 }
 
 fn php_declared_type_text(node: Node<'_>, source: &str) -> Option<String> {
@@ -840,5 +890,63 @@ fn php_range(start_byte: usize, start: Point, end_byte: usize, end: Point) -> Ra
         end_byte,
         start_line: start.row + 1,
         end_line: end.row + 1,
+    }
+}
+
+#[cfg(test)]
+mod callable_modifier_tests {
+    use super::*;
+    use tree_sitter::Parser;
+
+    /// The PHP half of #2912. A `function_definition` at namespace scope binds
+    /// no receiver, a `method_declaration` binds one unless it declares
+    /// `static`, and every callable states that the walk read its modifiers.
+    /// An abstract method and an interface method are included because both
+    /// are body-less `method_declaration` nodes that the same walk must key.
+    #[test]
+    fn callable_metadata_records_php_static_structurally() {
+        let source = "<?php\nnamespace App;\n\nfunction free(string $value): string { return $value; }\n\nabstract class Widget {\n    public function __construct(string $spec) {}\n    public static function build(string $spec): Widget { return new Widget($spec); }\n    public function render(string $target): string { return $target; }\n    abstract protected function measure(string $target): int;\n    private static function reset(): void {}\n}\n\ninterface Renders {\n    public function paint(string $target): string;\n}\n";
+        let file = ProjectFile::new(std::env::temp_dir(), "widget.php");
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_php::LANGUAGE_PHP.into())
+            .expect("PHP parser language");
+        let tree = parser.parse(source, None).expect("parse PHP fixture");
+        let parsed = parse_php_file(&file, source, &tree);
+
+        let modifiers = |fq_name: &str| {
+            let metadata = parsed
+                .signature_metadata
+                .iter()
+                .find(|(unit, _)| unit.fq_name() == fq_name)
+                .and_then(|(_, metadata)| metadata.first())
+                .unwrap_or_else(|| {
+                    panic!(
+                        "missing PHP callable {fq_name}; recorded {:?}",
+                        parsed
+                            .signature_metadata
+                            .keys()
+                            .map(CodeUnit::fq_name)
+                            .collect::<Vec<_>>()
+                    )
+                });
+            assert!(
+                metadata.callable_modifiers_recorded(),
+                "{fq_name} must record that the walk read its modifiers"
+            );
+            (
+                metadata.callable_is_static(),
+                metadata.callable_is_constructor(),
+                metadata.parameters().len(),
+            )
+        };
+
+        assert_eq!(modifiers("App.free"), (true, false, 1));
+        assert_eq!(modifiers("App.Widget.__construct"), (false, false, 1));
+        assert_eq!(modifiers("App.Widget.build"), (true, false, 1));
+        assert_eq!(modifiers("App.Widget.render"), (false, false, 1));
+        assert_eq!(modifiers("App.Widget.measure"), (false, false, 1));
+        assert_eq!(modifiers("App.Widget.reset"), (true, false, 0));
+        assert_eq!(modifiers("App.Renders.paint"), (false, false, 1));
     }
 }

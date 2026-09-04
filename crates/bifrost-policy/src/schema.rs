@@ -296,12 +296,16 @@ policy_records! {
     Source { labels: ["source"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_TAINT, signature: "(source :id ID :display-name TEXT :categories [...] :selector SELECTOR :bind PORT :labels [...] [:evidence EVIDENCE])", description: "Declare one policy-local taint source." }
     Sink { labels: ["sink"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_TAINT, signature: "(sink :id ID :display-name TEXT :categories [...] :selector SELECTOR :dangerous-operand PORT :accepts [...] [:tags [...]] [:impacts [...]])", description: "Declare one policy-local taint sink." }
     Sanitizer { labels: ["sanitizer"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_TAINT, signature: "(sanitizer :id ID :selector SELECTOR :input PORT :output PORT :removes [LABEL...])", description: "Declare one policy-local sanitizer transfer." }
+    StoreWrite { labels: ["store-write"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_TAINT, signature: "(store-write :id ID :selector SELECTOR :store STORE [:key PORT] [:instance PORT] :input PORT)", description: "Declare that the selected call writes its input port's value into the named persistence store, optionally discriminated by a key port and an instance port." }
+    StoreRead { labels: ["store-read"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_TAINT, signature: "(store-read :id ID :selector SELECTOR :store STORE [:key PORT] [:instance PORT] :output PORT)", description: "Declare that the selected call's output port returns data from the named persistence store under the same optional key and instance dimensions." }
+    EntryPoint { labels: ["entry-point"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_TAINT, signature: "(entry-point :id ID :selector SELECTOR :parameter (argument ...) :labels [LABEL...])", description: "Declare one framework-invoked entry point: the analysis roots the selected procedure declaration and taints the bound formal parameter on entry." }
     Origin { labels: ["origin"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_FLOW, signature: "(origin :id ID :display-name TEXT :selector SELECTOR :bind PORT)", description: "Declare one value-flow origin: the site and typed port where the tracked value is established." }
     Observation { labels: ["observation"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_FLOW, signature: "(observation :id ID :display-name TEXT :selector SELECTOR :observed-operand PORT)", description: "Declare one value-flow observation: the site and typed port that consumes the tracked value." }
     Kill { labels: ["kill"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_FLOW, signature: "(kill :id ID :selector SELECTOR :input PORT :output PORT)", description: "Declare one value-flow kill: at this site the output port no longer carries the tracked value established at the input port." }
     TransformEntry { labels: ["transform"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_TAINT, signature: "(transform :id ID :selector SELECTOR :input PORT :output PORT [:removes [...]] [:adds [...]])", description: "Declare one policy-local label transform." }
     ExternalModel { labels: ["external-model"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_TAINT, signature: "(external-model :id ID :selector SELECTOR :transfers [TRANSFER...])", description: "Declare typed transfer behavior for one external API." }
     Transfer { labels: ["transfer"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_TAINT, signature: "(transfer :from PORT :to PORT :labels [LABEL...] :effect EFFECT)", description: "Move selected labels between two typed external-model ports." }
+    Field { labels: ["field"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_TAINT, signature: "(field :name \"NAME\" :of (argument ...)|receiver)", description: "Bind one named field of an argument or receiver as an external-model write destination." }
     SanitizeEffect { labels: ["sanitize"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_TAINT, signature: "(sanitize :removes [LABEL...])", description: "Remove one or more labels during an external transfer." }
     TransformEffect { labels: ["transform"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_TAINT, signature: "(transform [:removes [...]] [:adds [...]])", description: "Remove and/or add labels during an external transfer." }
     FindingCombination { labels: ["finding-combination"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_TAINT, signature: "(finding-combination :id ID :source PREDICATE :sink PREDICATE :message TEXT ...)", description: "Override generic presentation for one finite source/sink endpoint combination." }
@@ -389,8 +393,13 @@ pub enum PolicyRecordContext {
     TaintSources,
     TaintSinks,
     TaintSanitizers,
+    TaintEntryPoints,
     TaintTransforms,
     TaintExternalModels,
+    /// Persistence-store entries (#2693). Stores compose only local
+    /// `store-write`/`store-read` entries; catalog and match inclusion is a
+    /// validation error in this context.
+    TaintStores,
     /// Generic value-flow origin entries (#2436).
     FlowOrigins,
     /// Generic value-flow observation entries (#2436).
@@ -410,9 +419,14 @@ pub enum FieldContextApplicability {
     TaintSourcesOnly,
     TaintSinksOnly,
     TaintSanitizersOnly,
+    TaintEntryPointsOnly,
     TaintTransformsOnly,
     TaintExternalModelsOnly,
+    TaintStoresOnly,
     TaintSourceOrSinkOnly,
+    /// The taint set contexts that may compose catalog endpoint sets. Stores
+    /// are policy-local only, so `:include-sets` is rejected there.
+    TaintCatalogSetsOnly,
     FlowOriginsOnly,
     FlowObservationsOnly,
     FlowKillsOnly,
@@ -428,13 +442,25 @@ impl FieldContextApplicability {
             Self::TaintSanitizersOnly => {
                 matches!(context, PolicyRecordContext::TaintSanitizers)
             }
+            Self::TaintEntryPointsOnly => {
+                matches!(context, PolicyRecordContext::TaintEntryPoints)
+            }
             Self::TaintTransformsOnly => matches!(context, PolicyRecordContext::TaintTransforms),
             Self::TaintExternalModelsOnly => {
                 matches!(context, PolicyRecordContext::TaintExternalModels)
             }
+            Self::TaintStoresOnly => matches!(context, PolicyRecordContext::TaintStores),
             Self::TaintSourceOrSinkOnly => matches!(
                 context,
                 PolicyRecordContext::TaintSources | PolicyRecordContext::TaintSinks
+            ),
+            Self::TaintCatalogSetsOnly => matches!(
+                context,
+                PolicyRecordContext::TaintSources
+                    | PolicyRecordContext::TaintSinks
+                    | PolicyRecordContext::TaintSanitizers
+                    | PolicyRecordContext::TaintTransforms
+                    | PolicyRecordContext::TaintExternalModels
             ),
             Self::FlowOriginsOnly => matches!(context, PolicyRecordContext::FlowOrigins),
             Self::FlowObservationsOnly => {
@@ -510,9 +536,9 @@ macro_rules! value_shapes {
                     Self::EndpointBinding | Self::PolicyPort | Self::TypestateBinding => {
                         Some(AtomDomain::Port)
                     }
-                    Self::TypestateCallBinding | Self::ExternalModelPort => {
-                        Some(AtomDomain::CallPort)
-                    }
+                    Self::TypestateCallBinding
+                    | Self::ExternalModelPort
+                    | Self::ExternalModelWritePort => Some(AtomDomain::CallPort),
                     Self::TaintMode => Some(AtomDomain::TaintMode),
                     Self::UnmodeledCallBehavior => Some(AtomDomain::UnmodeledCallBehavior),
                     Self::UnknownVerdict => Some(AtomDomain::UnknownVerdict),
@@ -556,6 +582,7 @@ macro_rules! value_shapes {
                     | Self::PolicyId
                     | Self::EndpointId
                     | Self::LocalEntryId
+                    | Self::StoreName
                     | Self::StateId
                     | Self::EventId
                     | Self::ExpectationId
@@ -608,6 +635,9 @@ macro_rules! value_shapes {
                     | Self::SourceEntries
                     | Self::SinkEntries
                     | Self::SanitizerEntries
+                    | Self::StoreEntries
+                    | Self::EntryPointEntries
+                    | Self::EntryPointParameter
                     | Self::OriginEntries
                     | Self::ObservationEntries
                     | Self::KillEntries
@@ -663,6 +693,11 @@ macro_rules! value_shapes {
                     | Self::TypestateBinding
                     | Self::TypestateCallBinding
                     | Self::ExternalModelPort => &[PolicyRecord::Argument, PolicyRecord::Result],
+                    Self::ExternalModelWritePort => &[
+                        PolicyRecord::Argument,
+                        PolicyRecord::Result,
+                        PolicyRecord::Field,
+                    ],
                     Self::EndpointSemantics => &[
                         PolicyRecord::SourceSemantics,
                         PolicyRecord::SinkSemantics,
@@ -722,6 +757,9 @@ macro_rules! value_shapes {
                     Self::SourceEntries => &[PolicyRecord::Source],
                     Self::SinkEntries => &[PolicyRecord::Sink],
                     Self::SanitizerEntries => &[PolicyRecord::Sanitizer],
+                    Self::StoreEntries => &[PolicyRecord::StoreWrite, PolicyRecord::StoreRead],
+                    Self::EntryPointEntries => &[PolicyRecord::EntryPoint],
+                    Self::EntryPointParameter => &[PolicyRecord::Argument],
                     Self::OriginEntries => &[PolicyRecord::Origin],
                     Self::ObservationEntries => &[PolicyRecord::Observation],
                     Self::KillEntries => &[PolicyRecord::Kill],
@@ -807,6 +845,7 @@ macro_rules! value_shapes {
                     | Self::PolicyId
                     | Self::EndpointId
                     | Self::LocalEntryId
+                    | Self::StoreName
                     | Self::StateId
                     | Self::EventId
                     | Self::ExpectationId
@@ -869,6 +908,7 @@ value_shapes! {
     PolicyId => "a stable lowercase policy identifier",
     EndpointId => "a stable lowercase endpoint identifier",
     LocalEntryId => "a lowercase local entry identifier",
+    StoreName => "a lowercase persistence store name",
     StateId => "a lowercase typestate state identifier",
     EventId => "a lowercase typestate event identifier",
     ExpectationId => "a lowercase typestate expectation identifier",
@@ -946,6 +986,7 @@ value_shapes! {
     TypestateBinding => "matched-value, receiver, return-value, an indexed result record, or an argument record",
     TypestateCallBinding => "receiver, return-value, an indexed result record, or an argument record",
     ExternalModelPort => "receiver, return-value, an indexed result record, or an argument record; matched-value is forbidden",
+    ExternalModelWritePort => "an external-model call port, or a field record naming one written field of an argument or receiver; matched-value is forbidden",
     InconclusivePolicy => "the inconclusive uncertainty policy",
     SemanticEvent => "a normal-procedure-exit or exceptional-procedure-exit record",
     ExitScope => "the analysis-root exit scope",
@@ -977,6 +1018,9 @@ value_shapes! {
     SourceEntries => "policy-local source records",
     SinkEntries => "policy-local sink records",
     SanitizerEntries => "policy-local sanitizer records",
+    StoreEntries => "policy-local store-write and store-read records",
+    EntryPointEntries => "policy-local entry-point records",
+    EntryPointParameter => "an argument record naming the tainted formal parameter",
     OriginEntries => "policy-local origin records",
     ObservationEntries => "policy-local observation records",
     KillEntries => "policy-local kill records",
@@ -1075,14 +1119,23 @@ macro_rules! policy_field_context {
     (TaintSanitizersOnly) => {
         FieldContextApplicability::TaintSanitizersOnly
     };
+    (TaintEntryPointsOnly) => {
+        FieldContextApplicability::TaintEntryPointsOnly
+    };
     (TaintTransformsOnly) => {
         FieldContextApplicability::TaintTransformsOnly
     };
     (TaintExternalModelsOnly) => {
         FieldContextApplicability::TaintExternalModelsOnly
     };
+    (TaintStoresOnly) => {
+        FieldContextApplicability::TaintStoresOnly
+    };
     (TaintSourceOrSinkOnly) => {
         FieldContextApplicability::TaintSourceOrSinkOnly
+    };
+    (TaintCatalogSetsOnly) => {
+        FieldContextApplicability::TaintCatalogSetsOnly
     };
     (FlowOriginsOnly) => {
         FieldContextApplicability::FlowOriginsOnly
@@ -1149,6 +1202,8 @@ policy_fields! {
     AnalysisSources { record: Analysis, labels: ["sources"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: TaintEndpointSet, owner: OwnerApplicability::POLICY_TAINT, child_context: TaintSources, signature: ":sources (endpoint-set ...)", description: "Compose the complete taint source set." }
     AnalysisSinks { record: Analysis, labels: ["sinks"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: TaintEndpointSet, owner: OwnerApplicability::POLICY_TAINT, child_context: TaintSinks, signature: ":sinks (endpoint-set ...)", description: "Compose the complete taint sink set." }
     AnalysisSanitizers { record: Analysis, labels: ["sanitizers"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: TaintEndpointSet, owner: OwnerApplicability::POLICY_TAINT, child_context: TaintSanitizers, signature: ":sanitizers (endpoint-set ...)", description: "Compose optional sanitizer models; omission is empty." }
+    AnalysisStores { record: Analysis, labels: ["stores"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: TaintEndpointSet, owner: OwnerApplicability::POLICY_TAINT, child_context: TaintStores, signature: ":stores (endpoint-set ...)", description: "Compose optional persistence-store models from local store-write and store-read entries; omission is empty." }
+    AnalysisEntryPoints { record: Analysis, labels: ["entry-points"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: TaintEndpointSet, owner: OwnerApplicability::POLICY_TAINT, child_context: TaintEntryPoints, signature: ":entry-points (endpoint-set ...)", description: "Compose optional framework entry-point models; omission is empty." }
     AnalysisTransforms { record: Analysis, labels: ["transforms"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: TaintEndpointSet, owner: OwnerApplicability::POLICY_TAINT, child_context: TaintTransforms, signature: ":transforms (endpoint-set ...)", description: "Compose optional label transforms; omission is empty." }
     AnalysisExternalModels { record: Analysis, labels: ["external-models"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: TaintEndpointSet, owner: OwnerApplicability::POLICY_TAINT, child_context: TaintExternalModels, signature: ":external-models (endpoint-set ...)", description: "Compose optional external transfer models; omission is empty." }
     AnalysisOrigins { record: Analysis, labels: ["origins"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: TaintEndpointSet, owner: OwnerApplicability::POLICY_FLOW, child_context: FlowOrigins, signature: ":origins (endpoint-set :entries [(origin ...)...])", description: "Compose the complete value-flow origin set." }
@@ -1222,11 +1277,13 @@ policy_fields! {
     WitnessMaxSteps { record: Witness, labels: ["max-steps"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: NonNegativeInteger, owner: OwnerApplicability::POLICY_ALL, signature: ":max-steps N", description: "Bound retained steps in one witness." }
     WitnessMaxBytes { record: Witness, labels: ["max-bytes"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: NonNegativeInteger, owner: OwnerApplicability::POLICY_ALL, signature: ":max-bytes N", description: "Bound encoded bytes in one witness." }
 
-    EndpointSetIncludeSets { record: EndpointSet, labels: ["include-sets"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: ValueMultiplicity::set(0, 64), shape: CatalogRefs, owner: OwnerApplicability::POLICY_TAINT, signature: ":include-sets [(catalog ...)...]", description: "Include explicitly registered catalog endpoint sets." }
+    EndpointSetIncludeSets { record: EndpointSet, labels: ["include-sets"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: ValueMultiplicity::set(0, 64), shape: CatalogRefs, owner: OwnerApplicability::POLICY_TAINT, context: TaintCatalogSetsOnly, signature: ":include-sets [(catalog ...)...]", description: "Include explicitly registered catalog endpoint sets; a store set composes only local entries and rejects this field." }
     EndpointSetIncludeMatches { record: EndpointSet, labels: ["include-matches"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: ValueMultiplicity::set(0, 64), shape: MatchEndpointSets, owner: OwnerApplicability::POLICY_TAINT, context: TaintSourceOrSinkOnly, signature: ":include-matches [(match-directory ...)|(match-endpoints ...)...]", description: "Include explicitly selected source or sink endpoint leaves; other taint set kinds reject this field." }
     EndpointSetSourceEntries { record: EndpointSet, labels: ["entries"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SET_256, shape: SourceEntries, owner: OwnerApplicability::POLICY_TAINT, context: TaintSourcesOnly, signature: ":entries [(source ...)...]", description: "Add bounded policy-local source entries." }
     EndpointSetSinkEntries { record: EndpointSet, labels: ["entries"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SET_256, shape: SinkEntries, owner: OwnerApplicability::POLICY_TAINT, context: TaintSinksOnly, signature: ":entries [(sink ...)...]", description: "Add bounded policy-local sink entries." }
     EndpointSetSanitizerEntries { record: EndpointSet, labels: ["entries"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SET_256, shape: SanitizerEntries, owner: OwnerApplicability::POLICY_TAINT, context: TaintSanitizersOnly, signature: ":entries [(sanitizer ...)...]", description: "Add bounded policy-local sanitizer entries." }
+    EndpointSetStoreEntries { record: EndpointSet, labels: ["entries"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SET_256, shape: StoreEntries, owner: OwnerApplicability::POLICY_TAINT, context: TaintStoresOnly, signature: ":entries [(store-write ...)|(store-read ...)...]", description: "Add bounded policy-local persistence-store entries." }
+    EndpointSetEntryPointEntries { record: EndpointSet, labels: ["entries"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SET_256, shape: EntryPointEntries, owner: OwnerApplicability::POLICY_TAINT, context: TaintEntryPointsOnly, signature: ":entries [(entry-point ...)...]", description: "Add bounded policy-local entry-point entries." }
     EndpointSetTransformEntries { record: EndpointSet, labels: ["entries"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SET_256, shape: TransformEntries, owner: OwnerApplicability::POLICY_TAINT, context: TaintTransformsOnly, signature: ":entries [(transform ...)...]", description: "Add bounded policy-local transform entries." }
     EndpointSetOriginEntries { record: EndpointSet, labels: ["entries"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SET_256, shape: OriginEntries, owner: OwnerApplicability::POLICY_FLOW, context: FlowOriginsOnly, signature: ":entries [(origin ...)...]", description: "Add bounded policy-local value-flow origin entries." }
     EndpointSetObservationEntries { record: EndpointSet, labels: ["entries"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SET_256, shape: ObservationEntries, owner: OwnerApplicability::POLICY_FLOW, context: FlowObservationsOnly, signature: ":entries [(observation ...)...]", description: "Add bounded policy-local value-flow observation entries." }
@@ -1286,6 +1343,22 @@ policy_fields! {
     SanitizerInput { record: Sanitizer, labels: ["input"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: PolicyPort, owner: OwnerApplicability::POLICY_TAINT, signature: ":input PORT", description: "Bind the sanitizer input value." }
     SanitizerOutput { record: Sanitizer, labels: ["output"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: PolicyPort, owner: OwnerApplicability::POLICY_TAINT, signature: ":output PORT", description: "Bind the sanitizer output value." }
     SanitizerRemoves { record: Sanitizer, labels: ["removes"], placement: FieldPlacement::Keyword, required: Required, multiplicity: NON_EMPTY_SET_64, shape: TaintLabels, owner: OwnerApplicability::POLICY_TAINT, signature: ":removes [LABEL...]", description: "Declare the non-empty labels removed by the sanitizer." }
+    StoreWriteId { record: StoreWrite, labels: ["id"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: LocalEntryId, owner: OwnerApplicability::POLICY_TAINT, signature: ":id \"entry-id\"", description: "Set the store-write identity in the shared local taint entry namespace." }
+    StoreWriteSelector { record: StoreWrite, labels: ["selector"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: Selector, owner: OwnerApplicability::POLICY_TAINT, signature: ":selector SELECTOR", description: "Select the store-writing calls." }
+    StoreWriteStore { record: StoreWrite, labels: ["store"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: StoreName, owner: OwnerApplicability::POLICY_TAINT, signature: ":store STORE", description: "Name the persistence store this call writes into; write and read entries sharing one store name form a persistence boundary." }
+    StoreWriteKey { record: StoreWrite, labels: ["key"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: PolicyPort, owner: OwnerApplicability::POLICY_TAINT, signature: ":key PORT", description: "Optionally bind the port carrying the key the write is stored under." }
+    StoreWriteInstance { record: StoreWrite, labels: ["instance"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: PolicyPort, owner: OwnerApplicability::POLICY_TAINT, signature: ":instance PORT", description: "Optionally bind the port carrying the store instance the write targets." }
+    StoreWriteInput { record: StoreWrite, labels: ["input"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: PolicyPort, owner: OwnerApplicability::POLICY_TAINT, signature: ":input PORT", description: "Bind the port whose value the call writes into the store." }
+    StoreReadId { record: StoreRead, labels: ["id"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: LocalEntryId, owner: OwnerApplicability::POLICY_TAINT, signature: ":id \"entry-id\"", description: "Set the store-read identity in the shared local taint entry namespace." }
+    StoreReadSelector { record: StoreRead, labels: ["selector"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: Selector, owner: OwnerApplicability::POLICY_TAINT, signature: ":selector SELECTOR", description: "Select the store-reading calls." }
+    StoreReadStore { record: StoreRead, labels: ["store"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: StoreName, owner: OwnerApplicability::POLICY_TAINT, signature: ":store STORE", description: "Name the persistence store this call reads from; write and read entries sharing one store name form a persistence boundary." }
+    StoreReadKey { record: StoreRead, labels: ["key"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: PolicyPort, owner: OwnerApplicability::POLICY_TAINT, signature: ":key PORT", description: "Optionally bind the port carrying the key the read looks up." }
+    StoreReadInstance { record: StoreRead, labels: ["instance"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: PolicyPort, owner: OwnerApplicability::POLICY_TAINT, signature: ":instance PORT", description: "Optionally bind the port carrying the store instance the read targets." }
+    StoreReadOutput { record: StoreRead, labels: ["output"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: PolicyPort, owner: OwnerApplicability::POLICY_TAINT, signature: ":output PORT", description: "Bind the port that returns data read from the store." }
+    EntryPointId { record: EntryPoint, labels: ["id"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: LocalEntryId, owner: OwnerApplicability::POLICY_TAINT, signature: ":id \"entry-id\"", description: "Set the entry-point identity." }
+    EntryPointSelector { record: EntryPoint, labels: ["selector"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: Selector, owner: OwnerApplicability::POLICY_TAINT, signature: ":selector SELECTOR", description: "Select the entry-point procedure declarations." }
+    EntryPointParameterField { record: EntryPoint, labels: ["parameter"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: EntryPointParameter, owner: OwnerApplicability::POLICY_TAINT, signature: ":parameter (argument :index N)|(argument :name \"NAME\")", description: "Bind the formal parameter tainted on entry." }
+    EntryPointLabels { record: EntryPoint, labels: ["labels"], placement: FieldPlacement::Keyword, required: Required, multiplicity: NON_EMPTY_SET_64, shape: TaintLabels, owner: OwnerApplicability::POLICY_TAINT, signature: ":labels [LABEL...]", description: "Declare the non-empty labels the parameter carries on entry." }
     TransformId { record: TransformEntry, labels: ["id"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: LocalEntryId, owner: OwnerApplicability::POLICY_TAINT, signature: ":id \"entry-id\"", description: "Set the transform identity." }
     TransformSelector { record: TransformEntry, labels: ["selector"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: Selector, owner: OwnerApplicability::POLICY_TAINT, signature: ":selector SELECTOR", description: "Select transform calls or values." }
     TransformInput { record: TransformEntry, labels: ["input"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: PolicyPort, owner: OwnerApplicability::POLICY_TAINT, signature: ":input PORT", description: "Bind the transform input value." }
@@ -1296,7 +1369,9 @@ policy_fields! {
     ExternalModelSelector { record: ExternalModel, labels: ["selector"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: Selector, owner: OwnerApplicability::POLICY_TAINT, signature: ":selector SELECTOR", description: "Select the modeled external calls." }
     ExternalModelTransfers { record: ExternalModel, labels: ["transfers"], placement: FieldPlacement::Keyword, required: Required, multiplicity: ValueMultiplicity::set(1, 256), shape: Transfers, owner: OwnerApplicability::POLICY_TAINT, signature: ":transfers [(transfer ...)...]", description: "Declare a duplicate-free semantic set of typed port transfers." }
     TransferFrom { record: Transfer, labels: ["from"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: ExternalModelPort, owner: OwnerApplicability::POLICY_TAINT, signature: ":from receiver|return-value|(result :index N)|(argument ...)", description: "Bind the transfer input call port; matched-value is forbidden." }
-    TransferTo { record: Transfer, labels: ["to"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: ExternalModelPort, owner: OwnerApplicability::POLICY_TAINT, signature: ":to receiver|return-value|(result :index N)|(argument ...)", description: "Bind the transfer output call port; matched-value is forbidden." }
+    FieldName { record: Field, labels: ["name"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: Name, owner: OwnerApplicability::POLICY_TAINT, signature: ":name \"field-name\"", description: "Name the written field on the base port's object." }
+    FieldOfBase { record: Field, labels: ["of"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: ExternalModelPort, owner: OwnerApplicability::POLICY_TAINT, signature: ":of (argument ...)|receiver", description: "Bind the object whose field is written: an argument or the receiver." }
+    TransferTo { record: Transfer, labels: ["to"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: ExternalModelWritePort, owner: OwnerApplicability::POLICY_TAINT, signature: ":to receiver|return-value|(result :index N)|(argument ...)|(field :name \"NAME\" :of PORT)", description: "Bind the transfer output call port or one written field of an argument or receiver; matched-value is forbidden." }
     TransferLabels { record: Transfer, labels: ["labels"], placement: FieldPlacement::Keyword, required: Required, multiplicity: NON_EMPTY_SET_64, shape: TaintLabels, owner: OwnerApplicability::POLICY_TAINT, signature: ":labels [LABEL...]", description: "Select the non-empty labels affected by this transfer." }
     TransferEffectField { record: Transfer, labels: ["effect"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: TransferEffect, owner: OwnerApplicability::POLICY_TAINT, signature: ":effect propagate|(sanitize ...)|(transform ...)", description: "Choose propagation, sanitization, or transformation." }
     SanitizeEffectRemoves { record: SanitizeEffect, labels: ["removes"], placement: FieldPlacement::Keyword, required: Required, multiplicity: NON_EMPTY_SET_64, shape: TaintLabels, owner: OwnerApplicability::POLICY_TAINT, signature: ":removes [LABEL...]", description: "Declare the non-empty labels removed by the effect." }
@@ -1897,8 +1972,10 @@ mod tests {
                 PolicyRecordContext::TaintSources,
                 PolicyRecordContext::TaintSinks,
                 PolicyRecordContext::TaintSanitizers,
+                PolicyRecordContext::TaintEntryPoints,
                 PolicyRecordContext::TaintTransforms,
                 PolicyRecordContext::TaintExternalModels,
+                PolicyRecordContext::TaintStores,
                 PolicyRecordContext::FlowOrigins,
                 PolicyRecordContext::FlowObservations,
                 PolicyRecordContext::FlowKills,
@@ -2102,6 +2179,72 @@ mod tests {
                 PolicyRecordContext::TaintSanitizers,
             )
             .is_none()
+        );
+
+        // Stores are policy-local only: the store entries slot is reachable in
+        // exactly the store context, and neither composition field is.
+        assert_eq!(
+            lookup_field(PolicyRecord::Analysis, "stores")
+                .unwrap()
+                .child_context,
+            PolicyRecordContext::TaintStores
+        );
+        assert_eq!(
+            lookup_applicable_field(
+                PolicyRecord::EndpointSet,
+                "entries",
+                RqlpDocumentKind::Policy,
+                Some(PolicyAnalysisKind::Taint),
+                PolicyRecordContext::TaintStores,
+            )
+            .unwrap()
+            .value_shape,
+            PolicyValueShape::StoreEntries
+        );
+        assert!(
+            lookup_applicable_field(
+                PolicyRecord::EndpointSet,
+                "include-sets",
+                RqlpDocumentKind::Policy,
+                Some(PolicyAnalysisKind::Taint),
+                PolicyRecordContext::TaintStores,
+            )
+            .is_none()
+        );
+        assert!(
+            lookup_applicable_field(
+                PolicyRecord::EndpointSet,
+                "include-matches",
+                RqlpDocumentKind::Policy,
+                Some(PolicyAnalysisKind::Taint),
+                PolicyRecordContext::TaintStores,
+            )
+            .is_none()
+        );
+        assert!(
+            lookup_applicable_field(
+                PolicyRecord::EndpointSet,
+                "include-sets",
+                RqlpDocumentKind::Policy,
+                Some(PolicyAnalysisKind::Taint),
+                PolicyRecordContext::TaintSanitizers,
+            )
+            .is_some()
+        );
+        let stores = lookup_field(PolicyRecord::Analysis, "stores").unwrap();
+        assert!(
+            stores
+                .applicability
+                .allows(RqlpDocumentKind::Policy, Some(PolicyAnalysisKind::Taint))
+        );
+        assert!(
+            !stores
+                .applicability
+                .allows(RqlpDocumentKind::Policy, Some(PolicyAnalysisKind::Flow))
+        );
+        assert_eq!(
+            PolicyValueShape::StoreEntries.accepted_records(),
+            &[PolicyRecord::StoreWrite, PolicyRecord::StoreRead]
         );
     }
 

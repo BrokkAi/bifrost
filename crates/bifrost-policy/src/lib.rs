@@ -40,6 +40,7 @@ mod source;
 mod suppression;
 mod taint_policy;
 mod typestate_policy;
+mod unit_execution;
 mod units;
 mod witness_projection;
 
@@ -50,6 +51,8 @@ mod flow_policy_tests;
 #[cfg(test)]
 #[path = "../../../test-support/inline_project.rs"]
 mod inline_project;
+#[cfg(test)]
+mod store_policy_tests;
 
 pub use assertion_policy::*;
 pub use baseline::*;

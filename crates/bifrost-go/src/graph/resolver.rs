@@ -21,6 +21,7 @@ use crate::packages::{GO_MODULE_SCOPE_SEGMENT, GoWorkspacePathIndex};
 use brokk_bifrost_core::analyzer::capabilities::{ImportAnalysisProvider, TypeAliasProvider};
 use brokk_bifrost_core::analyzer::common::language_for_file;
 use brokk_bifrost_core::analyzer::model::{ImportInfo, StructuredTypeIdentity};
+use brokk_bifrost_core::analyzer::pool_memo::KeyedPoolSafeMemo;
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
 pub use brokk_bifrost_core::analyzer::usages::common::node_text;
 use brokk_bifrost_core::analyzer::usages::local_inference::LocalInferenceEngine;
@@ -176,6 +177,17 @@ pub struct GoEdgeIndex {
     namespace_packages_by_file: HashMap<ProjectFile, NamespacePackages>,
     import_binding_names_by_file: HashMap<ProjectFile, HashSet<String>>,
     underlying_types_by_fqn: HashMap<String, Vec<GoUnderlyingTypeFact>>,
+    /// Per-file source-text cache backing `build_go_graph_with_edge_index`'s
+    /// identifier/owner text prefilter, and `parsed_files_cache` below for the
+    /// full parse it gates. A workspace with heavy per-platform build-tag
+    /// duplication (many `_linux.go`/`_darwin.go`/... files declaring the
+    /// same function name, e.g. golang.org/x/sys/unix) makes hundreds of
+    /// distinct ambiguous targets share a near-identical candidate file set;
+    /// each target used to re-read and, on a text match, re-parse every
+    /// shared candidate from scratch. Shared across every target's call for
+    /// the lifetime of this index instead (bifrost#15).
+    source_cache: KeyedPoolSafeMemo<ProjectFile, Option<Arc<String>>>,
+    parsed_files_cache: KeyedPoolSafeMemo<ProjectFile, Option<Arc<ParsedFile>>>,
 }
 
 #[derive(Clone)]
@@ -586,6 +598,8 @@ fn build_go_edge_index_from_parsed(
         namespace_packages_by_file,
         import_binding_names_by_file,
         underlying_types_by_fqn,
+        source_cache: KeyedPoolSafeMemo::new(),
+        parsed_files_cache: KeyedPoolSafeMemo::new(),
     }
 }
 
@@ -1427,14 +1441,24 @@ pub fn build_go_graph_with_edge_index(
                 if cancellation.is_some_and(CancellationToken::is_cancelled) {
                     return None;
                 }
-                let source = file.read_to_string().ok()?;
+                let source_cell = edge_index.source_cache.cell(&file);
+                let source = source_cell.get_or_build(
+                    || file.read_to_string().ok().map(Arc::new),
+                    || file.read_to_string().ok().map(Arc::new),
+                );
+                let source = source.as_ref().as_ref()?;
                 if &file != target_file
                     && !source.contains(identifier)
                     && !owner.as_deref().is_some_and(|owner| source.contains(owner))
                 {
                     return None;
                 }
-                Some((file, Arc::new(parse_go_source(source)?)))
+                let parsed_cell = edge_index.parsed_files_cache.cell(&file);
+                let parsed_file = parsed_cell.get_or_build(
+                    || parse_go_source((**source).clone()).map(Arc::new),
+                    || parse_go_source((**source).clone()).map(Arc::new),
+                );
+                Some((file, parsed_file.as_ref().as_ref()?.clone()))
             })
             .collect()
     };

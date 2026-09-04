@@ -1,0 +1,248 @@
+{
+  "documentType": "semantic-document",
+  "schema": "https://csmi.brokk.ai/schema/0.1/schema.json",
+  "semanticModelVersion": "0.1",
+  "serializationVersion": "0.1-json",
+  "defaultProvenance": "bifrost2846",
+  "provenanceRecords": [
+    {
+      "id": "bifrost2846",
+      "producer": {
+        "identifier": "https://github.com/BrokkAi/bifrost",
+        "version": "8a724c2d2e9975831519b6cdbda0d38ee00dd203"
+      },
+      "generationMethod": "source-analysis",
+      "inputs": [
+        { "role": "reviewed-native-evidence", "identifier": "https://github.com/BrokkAi/bifrost/issues/2846" }
+      ]
+    }
+  ],
+  "semanticModels": [
+    {
+      "artifactSelectors": [
+        {
+          "purl": "pkg:generic/cpp-reference-headers@1.0.0",
+          "digests": [
+            {
+              "algorithm": "sha-256",
+              "coverage": "canonical-header-tree",
+              "value": "1111111111111111111111111111111111111111111111111111111111111111"
+            }
+          ]
+        }
+      ],
+      "vocabularyUses": [
+        {
+          "identifier": "csmi.value-transfer",
+          "version": "0.1.0",
+          "schema": "https://csmi.brokk.ai/schema/profiles/value-transfer/0.1/schema.json",
+          "requirement": "required",
+          "affects": [
+            {
+              "kind": "attachment",
+              "attachmentPoint": "procedure-summary-transfer",
+              "target": { "callable": "copyConstructor" }
+            },
+            {
+              "kind": "fact-family",
+              "family": "type-value-semantics",
+              "scope": { "type": "basicString", "aspect": "copy" }
+            },
+            {
+              "kind": "fact-family",
+              "family": "implicit-operations",
+              "scope": { "owner": "basicString", "operation": "copy-constructor" }
+            },
+            {
+              "kind": "fact-family",
+              "family": "identity-separating-transfers",
+              "scope": { "callable": "copyConstructor" }
+            }
+          ]
+        },
+        {
+          "identifier": "csmi.c-cpp-resolution",
+          "version": "0.1.0",
+          "schema": "https://csmi.brokk.ai/schema/profiles/cpp/0.1/schema.json",
+          "requirement": "required",
+          "affects": [
+            {
+              "kind": "core-slot",
+              "slot": "artifact-compatibility",
+              "target": { "semanticModel": "current" }
+            }
+          ]
+        },
+        {
+          "identifier": "csmi.cpp",
+          "version": "0.1.0",
+          "schema": "https://csmi.brokk.ai/schema/profiles/cpp/0.1/schema.json",
+          "requirement": "required",
+          "affects": [
+            {
+              "kind": "core-slot",
+              "slot": "symbol-identity-scheme",
+              "target": { "symbol": "basicString" }
+            },
+            {
+              "kind": "core-slot",
+              "slot": "symbol-identity-scheme",
+              "target": { "symbol": "copyConstructor" }
+            }
+          ]
+        }
+      ],
+      "compatibilityConstraints": [
+        {
+          "vocabulary": "csmi.c-cpp-resolution",
+          "version": "0.1.0",
+          "value": {
+            "kind": "resolution-context",
+            "language": "c++",
+            "translationUnit": "src/value_transfer.cpp",
+            "compileArgumentsDigest": "d868042524d31a745040503f32d9e5649912815d8e3a1e2636fa8124b2d62bcd",
+            "directHeaders": [
+              {
+                "includeName": "string",
+                "artifact": {
+                  "purl": "pkg:generic/cpp-reference-headers@1.0.0",
+                  "digests": [
+                    {
+                      "algorithm": "sha-256",
+                      "coverage": "canonical-header-tree",
+                      "value": "1111111111111111111111111111111111111111111111111111111111111111"
+                    }
+                  ]
+                }
+              }
+            ],
+            "headerClosure": "complete"
+          }
+        }
+      ],
+      "symbols": [
+        {
+          "id": "basicString",
+          "scheme": "csmi.cpp.declaration",
+          "schemeVersion": "0.1.0",
+          "stability": "portable",
+          "descriptors": [
+            { "role": "namespace", "name": "std", "disambiguator": "namespace" },
+            { "role": "type", "name": "basic_string", "disambiguator": "template-primary:3" }
+          ]
+        },
+        {
+          "id": "copyConstructor",
+          "scheme": "csmi.cpp.declaration",
+          "schemeVersion": "0.1.0",
+          "stability": "portable",
+          "descriptors": [
+            { "role": "namespace", "name": "std", "disambiguator": "namespace" },
+            { "role": "type", "name": "basic_string", "disambiguator": "template-primary:3" },
+            {
+              "role": "callable",
+              "name": "basic_string",
+              "disambiguator": "cppsig-0.1:670e0719b1b6b5ae53e61b7e9b5d04dffd8beb7fbe6514a93b2a6b6d276b0bbb"
+            }
+          ]
+        }
+      ],
+      "declarations": [
+        { "symbol": "basicString", "category": "type" },
+        {
+          "symbol": "copyConstructor",
+          "category": "callable",
+          "owner": "basicString",
+          "callable": {
+            "kind": "constructor",
+            "parameters": [
+              {
+                "position": 0,
+                "binding": "positional-only",
+                "required": true,
+                "type": { "kind": "reference", "symbol": "basicString" }
+              }
+            ],
+            "results": []
+          }
+        }
+      ],
+      "procedureSummaries": [
+        {
+          "callable": "copyConstructor",
+          "transfers": [
+            {
+              "source": { "root": { "phase": "input", "role": "parameter", "position": 0 } },
+              "destination": { "root": { "phase": "output", "role": "receiver" } },
+              "extensions": [
+                {
+                  "vocabulary": "csmi.value-transfer",
+                  "version": "0.1.0",
+                  "payload": {
+                    "kind": "transfer",
+                    "transferKind": { "kind": "copy" },
+                    "operation": { "kind": "implicit", "symbol": "copyConstructor" }
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      ],
+      "extensionFacts": [
+        {
+          "vocabulary": "csmi.value-transfer",
+          "version": "0.1.0",
+          "family": "type-value-semantics",
+          "scope": { "type": "basicString", "aspect": "copy" },
+          "payload": {
+            "kind": "type-value-semantics",
+            "type": "basicString",
+            "aspect": "copy",
+            "semantics": { "kind": "via-member", "member": "copyConstructor" }
+          }
+        },
+        {
+          "vocabulary": "csmi.value-transfer",
+          "version": "0.1.0",
+          "family": "implicit-operations",
+          "scope": { "owner": "basicString", "operation": "copy-constructor" },
+          "payload": {
+            "kind": "implicit-operation",
+            "symbol": "copyConstructor",
+            "owner": "basicString",
+            "operation": "copy-constructor"
+          }
+        }
+      ],
+      "completenessStatements": [
+        {
+          "family": "procedure-summaries",
+          "scope": { "callable": "copyConstructor" },
+          "status": "complete"
+        },
+        {
+          "vocabulary": "csmi.value-transfer",
+          "version": "0.1.0",
+          "family": "identity-separating-transfers",
+          "scope": { "callable": "copyConstructor" },
+          "status": "complete"
+        },
+        {
+          "vocabulary": "csmi.value-transfer",
+          "version": "0.1.0",
+          "family": "type-value-semantics",
+          "scope": { "type": "basicString", "aspect": "copy" },
+          "status": "complete"
+        },
+        {
+          "vocabulary": "csmi.value-transfer",
+          "version": "0.1.0",
+          "family": "implicit-operations",
+          "scope": { "owner": "basicString", "operation": "copy-constructor" },
+          "status": "complete"
+        }
+      ]
+    }
+  ]
+}

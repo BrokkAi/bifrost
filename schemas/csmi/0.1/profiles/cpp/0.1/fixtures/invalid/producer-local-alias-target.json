@@ -1,0 +1,9 @@
+{
+  "kind": "type-alias",
+  "alias": "std-string-alias",
+  "target": {
+    "kind": "declared",
+    "producerId": "type-42"
+  },
+  "resolutionContextDigest": "3333333333333333333333333333333333333333333333333333333333333333"
+}

@@ -12,17 +12,18 @@ use sha2::{Digest, Sha256};
 use super::WorkspaceSemanticOracle;
 use crate::analyzer::languages::{LanguageSupport, language_support};
 use crate::analyzer::semantic::{
-    CallSiteHandle, CallableTarget, CallableTargetResolution, CancellationToken, CandidateCoverage,
-    ContentIdentity, DeclarationLocator, DeclarationSegment, DeclarationSegmentKind,
-    DispatchBoundary, DispatchBoundaryKind, DispatchCandidate, DispatchExtensibility,
-    DispatchOracle, DispatchResult, EvidenceCompleteness, EvidenceHandle,
-    ExactExternalFormalContract, ExactExternalProcedureTarget, MemoryLocationKind, OracleLimits,
-    OracleRelationArena, OracleRelationId, OracleRelationOwner, OracleRelationRecord,
-    OracleRelationSubject, ProcedureHandle, ProcedureKind, ProcedureSemantics, ProofStatus,
-    SemanticArtifact, SemanticBudgetExceeded, SemanticCallSite, SemanticCapability, SemanticGap,
-    SemanticGapImpact, SemanticGapKind, SemanticGapSubject, SemanticLanguage, SemanticLocator,
-    SemanticOutcome, SemanticProviderError, SemanticRequest, SemanticRole, SemanticWork,
-    SourceAnchor, SourcePosition, SourceSpan, StableDigest, UnmaterializedExternalTarget,
+    AbstractObjectIdentity, CallSiteHandle, CallableTarget, CallableTargetResolution,
+    CancellationToken, CandidateCoverage, ContentIdentity, DeclarationLocator, DeclarationSegment,
+    DeclarationSegmentKind, DispatchBoundary, DispatchBoundaryKind, DispatchCandidate,
+    DispatchExtensibility, DispatchOracle, DispatchResult, EvidenceCompleteness, EvidenceHandle,
+    ExactExternalFormalContract, ExactExternalProcedureTarget, HeapOracle, MemoryLocationKind,
+    ObjectCardinality, ObservationPhase, OracleCallContext, OracleLimits, OracleRelationArena,
+    OracleRelationId, OracleRelationOwner, OracleRelationRecord, OracleRelationSubject,
+    ProcedureHandle, ProcedureKind, ProcedureSemantics, ProofStatus, SemanticArtifact,
+    SemanticBudgetExceeded, SemanticCallSite, SemanticCapability, SemanticGap, SemanticGapImpact,
+    SemanticGapKind, SemanticGapSubject, SemanticLanguage, SemanticLocator, SemanticOutcome,
+    SemanticProviderError, SemanticRequest, SemanticRole, SemanticWork, SourceAnchor,
+    SourcePosition, SourceSpan, StableDigest, UnmaterializedExternalTarget, ValueAtPoint,
     WorkspaceMountId, WorkspaceRelativePath, split_canonical_qualified_callee,
     unmaterialized_external_mount, unmaterialized_external_path,
 };
@@ -395,7 +396,7 @@ impl PreparedWorkspaceDispatchSession<'_> {
     }
 }
 
-fn exact_call_range(call: &CallSiteHandle) -> Result<Range, SemanticProviderError> {
+pub(crate) fn exact_call_range(call: &CallSiteHandle) -> Result<Range, SemanticProviderError> {
     let semantic_call = call
         .procedure()
         .semantics()
@@ -940,38 +941,54 @@ impl<'a> WorkspaceSemanticOracle<'a> {
                 merge_dispatch_quality(materialization_quality, DispatchQuality::Truncated);
         }
 
+        let (anonymous_receiver_refined, receiver_refinement_work) = self
+            .refine_java_anonymous_receiver_dispatch(
+                call,
+                semantic_call,
+                &mut candidates,
+                &mut boundaries,
+                &mut staged_request,
+            )?;
+        reported_work = reported_work.conservative_add(receiver_refinement_work);
+        if anonymous_receiver_refined {
+            materialization_quality = DispatchQuality::Complete;
+        }
+
         let resolver_proven_external_static =
             resolver_proven_external_static_boundary(lookup.status, &candidates, &boundaries);
-        let call_dispatch_gap = call_dispatch_gap.filter(|gap| {
-            !closed_dispatch_discharges_gap(&candidates, gap)
-                && !proven_static_target_discharges_gap(
-                    call.procedure(),
-                    &semantic_call.declared_targets,
-                    semantic_call.receiver.is_none(),
-                    &candidates,
-                    &boundaries,
-                    lookup.status == Some(DefinitionLookupStatus::Resolved),
-                    materialization_quality,
-                    gap,
-                )
-                && !concrete_overrides_proven_absent_discharges_gap(
-                    &candidates,
-                    &boundaries,
-                    gap,
-                    matched_concrete_groups,
-                    concrete_overrides_proven_absent,
-                )
-                && !exact_go_external_dispatch_discharges_gap(
-                    exact_go_external_call,
-                    &candidates,
-                    &boundaries,
-                    gap,
-                )
-                && !resolver_proven_external_static_dispatch_discharges_gap(
-                    resolver_proven_external_static,
-                    gap,
-                )
-        });
+        let call_dispatch_gap = (!anonymous_receiver_refined)
+            .then_some(call_dispatch_gap)
+            .flatten()
+            .filter(|gap| {
+                !closed_dispatch_discharges_gap(&candidates, gap)
+                    && !proven_static_target_discharges_gap(
+                        call.procedure(),
+                        &semantic_call.declared_targets,
+                        semantic_call.receiver.is_none(),
+                        &candidates,
+                        &boundaries,
+                        lookup.status == Some(DefinitionLookupStatus::Resolved),
+                        materialization_quality,
+                        gap,
+                    )
+                    && !concrete_overrides_proven_absent_discharges_gap(
+                        &candidates,
+                        &boundaries,
+                        gap,
+                        matched_concrete_groups,
+                        concrete_overrides_proven_absent,
+                    )
+                    && !exact_go_external_dispatch_discharges_gap(
+                        exact_go_external_call,
+                        &candidates,
+                        &boundaries,
+                        gap,
+                    )
+                    && !resolver_proven_external_static_dispatch_discharges_gap(
+                        resolver_proven_external_static,
+                        gap,
+                    )
+            });
         let gap_exceeded = call_dispatch_gap
             .and_then(|gap| gap.budget)
             .or_else(|| procedure_call_gap.and_then(|gap| gap.budget));
@@ -1082,7 +1099,7 @@ impl<'a> WorkspaceSemanticOracle<'a> {
             CandidateCoverage::Truncated
         } else if cancelled {
             CandidateCoverage::Open
-        } else if resolver_proven_external_static {
+        } else if anonymous_receiver_refined || resolver_proven_external_static {
             CandidateCoverage::Exhaustive
         } else {
             dispatch_coverage(lookup.status, &boundaries)
@@ -1119,7 +1136,7 @@ impl<'a> WorkspaceSemanticOracle<'a> {
                 Ok(result) => result,
                 Err(outcome) => return Ok(*outcome),
             };
-        let status_quality = if resolver_proven_external_static {
+        let status_quality = if anonymous_receiver_refined || resolver_proven_external_static {
             DispatchQuality::Complete
         } else {
             dispatch_quality_for_status(lookup.status, lookup.boundary)
@@ -1138,6 +1155,140 @@ impl<'a> WorkspaceSemanticOracle<'a> {
             merge_dispatch_quality(status_quality, materialization_quality)
         };
         dispatch_outcome(result, quality, reported_work)
+    }
+
+    /// Refine a Java virtual call only when the source resolver and heap
+    /// oracle independently close the callable and receiver identities.
+    ///
+    /// Resolver candidates own callable identity. A proven singleton
+    /// allocation owns receiver identity. An anonymous implementation method
+    /// is structurally contained by its object-creation source anchor, so one
+    /// contained resolver candidate composes those facts without comparing a
+    /// method name or rendered signature.
+    fn refine_java_anonymous_receiver_dispatch(
+        &self,
+        call: &CallSiteHandle,
+        semantic_call: &SemanticCallSite,
+        candidates: &mut Vec<DispatchCandidate>,
+        boundaries: &mut Vec<DispatchBoundary>,
+        request: &mut SemanticRequest<'_>,
+    ) -> Result<(bool, SemanticWork), SemanticProviderError> {
+        if call.procedure().artifact().key().language()
+            != SemanticLanguage::Standard(Language::Java)
+        {
+            return Ok((false, SemanticWork::default()));
+        }
+        let Some(receiver_id) = semantic_call.receiver else {
+            return Ok((false, SemanticWork::default()));
+        };
+        if candidates.is_empty()
+            || boundaries.is_empty()
+            || boundaries
+                .iter()
+                .any(|boundary| !matches!(boundary.kind, DispatchBoundaryKind::Unmaterialized(_)))
+            || candidates.iter().any(|candidate| {
+                !candidate
+                    .target()
+                    .semantics()
+                    .locator()
+                    .declaration()
+                    .segments()
+                    .iter()
+                    .any(|segment| {
+                        segment.kind() == DeclarationSegmentKind::Type && segment.name().is_none()
+                    })
+            })
+        {
+            return Ok((false, SemanticWork::default()));
+        }
+
+        let procedure = call.procedure();
+        let receiver = procedure.value_handle(receiver_id).ok_or_else(|| {
+            SemanticProviderError::internal("Java dispatch receiver value is stale")
+        })?;
+        let point = procedure
+            .point_handle(semantic_call.point)
+            .ok_or_else(|| SemanticProviderError::internal("Java dispatch call point is stale"))?;
+        let query = ValueAtPoint::new(
+            receiver,
+            point,
+            ObservationPhase::BeforeEffects,
+            OracleCallContext::empty(),
+        )
+        .map_err(|error| {
+            SemanticProviderError::internal(format!(
+                "could not construct Java receiver points-to query: {error}"
+            ))
+        })?;
+        let outcome = HeapOracle::pointees(self, &query, request)?;
+        let work = outcome.work();
+        let SemanticOutcome::Complete {
+            value: points_to, ..
+        } = &outcome
+        else {
+            return Ok((false, work));
+        };
+        if points_to.objects().coverage() != CandidateCoverage::Exhaustive {
+            return Ok((false, work));
+        }
+        let [object] = points_to.objects().candidates() else {
+            return Ok((false, work));
+        };
+        if !object.is_proven_complete()
+            || object.value().cardinality() != ObjectCardinality::Singleton
+        {
+            return Ok((false, work));
+        }
+        let AbstractObjectIdentity::Allocation(allocation) = object.value().identity() else {
+            return Ok((false, work));
+        };
+        if allocation.procedure() != procedure {
+            return Ok((false, work));
+        }
+        let allocation_row = procedure
+            .semantics()
+            .allocation(allocation.id())
+            .ok_or_else(|| SemanticProviderError::internal("Java receiver allocation is stale"))?;
+        let allocation_span = procedure
+            .semantics()
+            .source_mapping(allocation_row.source)
+            .ok_or_else(|| {
+                SemanticProviderError::internal("Java receiver allocation source is stale")
+            })?
+            .locator
+            .anchor()
+            .span();
+
+        let mut retained = candidates
+            .iter()
+            .filter(|candidate| {
+                let target = candidate.target();
+                if target.artifact().key() != procedure.artifact().key() {
+                    return false;
+                }
+                let span = target.semantics().locator().anchor().span();
+                allocation_span.start_byte() <= span.start_byte()
+                    && span.end_byte() <= allocation_span.end_byte()
+            })
+            .cloned();
+        let Some(mut exact) = retained.next() else {
+            return Ok((false, work));
+        };
+        if retained.next().is_some() {
+            return Ok((false, work));
+        }
+
+        exact.excluded_targets = candidates
+            .iter()
+            .filter(|candidate| candidate.target() != exact.target())
+            .map(|candidate| candidate.target().clone())
+            .collect();
+        exact.proof = ProofStatus::Proven;
+        exact.completeness = EvidenceCompleteness::Complete;
+        candidates.clear();
+        candidates.push(exact);
+        boundaries.clear();
+        Ok((true, work))
     }
 }
 

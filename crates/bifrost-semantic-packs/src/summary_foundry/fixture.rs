@@ -532,6 +532,7 @@ fn pack_source(
             review_required: false,
         },
         carried_sources: Vec::new(),
+        cpp_portability: None,
         shards: vec![AuthoredShard {
             id: "summaries.fixture".to_owned(),
             activation: vec![ActivationSelector {
@@ -714,6 +715,7 @@ mod tests {
             input,
             exit_kind: AuthoredSummaryExitKind::Normal,
             output: AuthoredSummaryOutput::NormalReturn {},
+            value_transfer: None,
         }
     }
 
@@ -883,6 +885,7 @@ mod tests {
                 input: AuthoredSummaryInput::Parameter { ordinal: 0 },
                 exit_kind: AuthoredSummaryExitKind::Normal,
                 output: AuthoredSummaryOutput::Receiver {},
+                value_transfer: None,
             }],
         );
         assert_eq!(

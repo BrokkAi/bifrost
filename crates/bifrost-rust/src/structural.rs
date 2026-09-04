@@ -65,7 +65,12 @@ pub const RUST_KIND_TABLE: &[(&str, NormalizedKind)] = &[
     ("struct_item", NormalizedKind::Class),
     ("enum_item", NormalizedKind::Class),
     ("trait_item", NormalizedKind::Class),
-    ("type_item", NormalizedKind::Declaration),
+    // A `type` alias declares a type, so its fact is a type-namespace
+    // declaration and its name inherits `Namespace::Type` through
+    // `default_occurrence_namespace`. Recorded as a bare `Declaration`, the
+    // alias name landed in the value namespace beside a same-named `const`
+    // (#2911).
+    ("type_item", NormalizedKind::Class),
     ("mod_item", NormalizedKind::Module),
     ("const_item", NormalizedKind::Assignment),
     ("static_item", NormalizedKind::Assignment),

@@ -123,7 +123,12 @@ pub const TS_KIND_TABLE: &[(&str, NormalizedKind)] = js_ts_kind_table!(
     ("abstract_class_declaration", NormalizedKind::Class),
     ("interface_declaration", NormalizedKind::Class),
     ("enum_declaration", NormalizedKind::Class),
-    ("type_alias_declaration", NormalizedKind::Declaration),
+    // A `type` alias declares a type, so its fact is a type-namespace
+    // declaration and its name inherits `Namespace::Type` through
+    // `default_occurrence_namespace`. Recorded as a bare `Declaration`, the
+    // alias name landed in the value namespace beside a same-named `const`
+    // (#2911).
+    ("type_alias_declaration", NormalizedKind::Class),
     ("type_identifier", NormalizedKind::Identifier),
     ("nested_identifier", NormalizedKind::Identifier),
     // Bodiless callable declarations: overload signatures, ambient

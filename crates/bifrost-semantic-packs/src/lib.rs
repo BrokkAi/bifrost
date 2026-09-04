@@ -208,6 +208,7 @@ const GO_STDLIB_TESTING_SHARDS: &[&[u8]] = &[
 const GO_CONCURRENCY_SHARDS: &[&[u8]] = &[
     include_bytes!("../embedded/go-concurrency/shards/go.concurrency.errgroup.deflate"),
     include_bytes!("../embedded/go-concurrency/shards/go.concurrency.sync.deflate"),
+    include_bytes!("../embedded/go-concurrency/shards/go.concurrency.time.json"),
 ];
 const GO_CONCURRENCY_DECLARATION_SHARDS: &[&[u8]] = &[
     include_bytes!(
@@ -215,6 +216,9 @@ const GO_CONCURRENCY_DECLARATION_SHARDS: &[&[u8]] = &[
     ),
     include_bytes!(
         "../embedded/go-concurrency-declarations/shards/go.concurrency.sync.declarations.deflate"
+    ),
+    include_bytes!(
+        "../embedded/go-concurrency-declarations/shards/go.concurrency.time.declarations.json"
     ),
 ];
 const GO_STDLIB_SYNC_ATOMIC_SHARDS: &[&[u8]] = &[include_bytes!(
@@ -629,7 +633,32 @@ mod tests {
                         input: CompiledSummaryInput::Receiver {},
                         exit_kind: CompiledSummaryExitKind::Normal,
                         output: CompiledSummaryOutput::NormalReturn {},
+                        value_transfer: None,
                     }]
+        }));
+
+        let time = concurrency
+            .shards
+            .iter()
+            .find(|shard| shard.descriptor.shard_id == "go.concurrency.time")
+            .expect("the Go concurrency pack carries its time shard");
+        let time = decode_shard_for_manifest(
+            &concurrency.manifest,
+            &time.descriptor,
+            &time.bytes,
+            &DecodeLimits::default(),
+        )
+        .expect("the Go time shard decodes");
+        let time = time
+            .payload()
+            .procedure_summaries()
+            .expect("the Go time shard carries procedure summaries");
+        assert!(time.iter().any(|summary| {
+            summary.id == "time.after-func"
+                && matches!(
+                    summary.concurrency_effects.as_slice(),
+                    [CompiledConcurrencyEffect::TaskSpawn { .. }]
+                )
         }));
         assert!(summaries.iter().any(|summary| {
             summary.id == "sync.waitgroup.go"
@@ -704,7 +733,7 @@ mod tests {
             concurrency_declarations.manifest.completeness,
             Completeness::Partial
         );
-        assert_eq!(concurrency_declarations.shards.len(), 2);
+        assert_eq!(concurrency_declarations.shards.len(), 3);
         let mut declaration_type_count = 0;
         let mut declaration_member_count = 0;
         for artifact in &concurrency_declarations.shards {
@@ -764,8 +793,8 @@ mod tests {
             declaration_type_count += types.len();
             declaration_member_count += members.len();
         }
-        assert_eq!(declaration_type_count, 11);
-        assert_eq!(declaration_member_count, 32);
+        assert_eq!(declaration_type_count, 12);
+        assert_eq!(declaration_member_count, 33);
 
         let atomic = decoded
             .iter()

@@ -21,21 +21,25 @@ use crate::dataflow::{
     ExternalSemanticSummarySet, ExternalSummaryCompatibilityKey, ExternalSummaryContentHash,
     ExternalSummaryModelId, ExternalSummaryOrigin, ExternalSummarySetError,
     ProcedureSummaryIdentity, ProcedureSummaryKey, SemanticProcedureSummary, SummaryCompleteness,
-    SummaryDependencyKey, SummaryEffect, SummaryEffectKey, SummaryEventKey, SummaryEvidence,
-    SummaryExit, SummaryExitKind, SummaryIncompleteReason, SummaryLocationKey, SummaryOrigin,
-    SummaryPort, SummaryRecursiveEdge, SummaryRecursiveGroupKey, SummaryTransfer,
-    SummaryValidationError,
+    SummaryConcurrencyAccessPath, SummaryConcurrencyAtomicOperation, SummaryConcurrencyEffect,
+    SummaryConcurrencyEffectKind, SummaryConcurrencyLockMode, SummaryConcurrencyLockOperation,
+    SummaryConcurrencyTargetCoverage, SummaryDependencyKey, SummaryEffect, SummaryEffectKey,
+    SummaryEventKey, SummaryEvidence, SummaryExit, SummaryExitKind, SummaryIncompleteReason,
+    SummaryLocationKey, SummaryOrigin, SummaryPort, SummaryRecursiveEdge, SummaryRecursiveGroupKey,
+    SummaryTransfer, SummaryValidationError,
 };
 use crate::hash::{HashMap, map_with_capacity};
 
 use brokk_bifrost_analysis::analyzer::semantic_model::{
-    CompiledProcedureSummary, CompiledProcedureTarget, CompiledSummaryEffect,
-    CompiledSummaryExitKind, CompiledSummaryInput, CompiledSummaryLocationKind,
-    CompiledSummaryOutput, CompiledSummaryTransfer, Completeness,
+    CompiledAtomicOperation, CompiledConcurrencyEffect, CompiledLockMode, CompiledProcedureSummary,
+    CompiledProcedureTarget, CompiledSummaryEffect, CompiledSummaryExitKind, CompiledSummaryInput,
+    CompiledSummaryLocationKind, CompiledSummaryOutput, CompiledSummaryTransfer, Completeness,
 };
 
 const LOCATION_KEY_DOMAIN: &[u8] = b"bifrost.semantic-model.procedure-summary.location.v1";
 const EVENT_KEY_DOMAIN: &[u8] = b"bifrost.semantic-model.procedure-summary.event.v1";
+const CONCURRENCY_EVENT_KEY_DOMAIN: &[u8] =
+    b"bifrost.semantic-model.procedure-summary.concurrency-event.v1";
 const MODEL_UNPROVEN_REASON: &str = "external semantic model row is not source-backed proof";
 const MODEL_INCOMPLETE_REASON: &str = "external semantic model summary is partial";
 
@@ -624,7 +628,7 @@ fn build_summary_set(
                 .iter()
                 .map(|transfer| lower_transfer(summary, binding, &locations, transfer, &evidence))
                 .collect::<Result<Vec<_>, _>>()?;
-            let effects = summary
+            let mut effects = summary
                 .effects
                 .iter()
                 .map(|effect| {
@@ -640,6 +644,16 @@ fn build_summary_set(
                     )
                 })
                 .collect::<Result<Vec<_>, _>>()?;
+            effects.extend(
+                summary
+                    .concurrency_effects
+                    .iter()
+                    .enumerate()
+                    .map(|(ordinal, effect)| {
+                        lower_concurrency_effect(summary, binding, ordinal, effect, &evidence)
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
+            );
             let completeness = match summary.completeness {
                 Completeness::Complete => SummaryCompleteness::Complete,
                 Completeness::Partial => SummaryCompleteness::partial(vec![
@@ -859,6 +873,91 @@ fn lower_effect(
         }
     };
     Ok(SummaryEffect::new(key, evidence.clone()))
+}
+
+fn lower_concurrency_effect(
+    summary: &CompiledProcedureSummary,
+    binding: &ExactProcedureSummaryTargetBinding,
+    ordinal: usize,
+    effect: &CompiledConcurrencyEffect,
+    evidence: &SummaryEvidence,
+) -> Result<SummaryEffect, ProcedureSummaryBindingError> {
+    let mut hasher = CanonicalHasher::new(CONCURRENCY_EVENT_KEY_DOMAIN);
+    hasher.field("model_id", summary.model_id.as_bytes());
+    hasher.field("record_id", summary.id.as_bytes());
+    hasher.field("canonical_ordinal", &ordinal.to_le_bytes());
+    let event = SummaryEventKey::from_digest(StableDigest::from_array(hasher.finish()));
+    let lower = |input| lower_input(summary, binding, input);
+    let path = |input| lower(input).map(SummaryConcurrencyAccessPath::port);
+    let effect = match effect {
+        CompiledConcurrencyEffect::Unsupported { protocol } => {
+            SummaryConcurrencyEffectKind::Unsupported {
+                protocol: protocol.clone().into_boxed_str(),
+            }
+        }
+        CompiledConcurrencyEffect::TaskSpawn { callable, group } => {
+            SummaryConcurrencyEffectKind::TaskSpawn {
+                callable: lower(callable)?,
+                target_coverage: SummaryConcurrencyTargetCoverage::Exhaustive,
+                group: group.as_ref().map(path).transpose()?,
+            }
+        }
+        CompiledConcurrencyEffect::TaskJoin { group } => SummaryConcurrencyEffectKind::TaskJoin {
+            group: path(group)?,
+        },
+        CompiledConcurrencyEffect::LockAcquire { lock, mode }
+        | CompiledConcurrencyEffect::LockRelease { lock, mode } => {
+            SummaryConcurrencyEffectKind::Lock {
+                lock: path(lock)?,
+                operation: match effect {
+                    CompiledConcurrencyEffect::LockAcquire { .. } => {
+                        SummaryConcurrencyLockOperation::Acquire
+                    }
+                    CompiledConcurrencyEffect::LockRelease { .. } => {
+                        SummaryConcurrencyLockOperation::Release
+                    }
+                    _ => unreachable!("the outer pattern accepts only lock effects"),
+                },
+                mode: match mode {
+                    CompiledLockMode::Shared => SummaryConcurrencyLockMode::Shared,
+                    CompiledLockMode::Exclusive => SummaryConcurrencyLockMode::Exclusive,
+                },
+            }
+        }
+        CompiledConcurrencyEffect::WaitGroupAdd { group, delta } => {
+            SummaryConcurrencyEffectKind::WaitGroupAdd {
+                group: path(group)?,
+                delta: lower(delta)?,
+            }
+        }
+        CompiledConcurrencyEffect::WaitGroupDone { group } => {
+            SummaryConcurrencyEffectKind::WaitGroupDone {
+                group: path(group)?,
+            }
+        }
+        CompiledConcurrencyEffect::WaitGroupWait { group } => {
+            SummaryConcurrencyEffectKind::WaitGroupWait {
+                group: path(group)?,
+            }
+        }
+        CompiledConcurrencyEffect::Atomic {
+            location,
+            operation,
+        } => SummaryConcurrencyEffectKind::Atomic {
+            location: path(location)?,
+            operation: match operation {
+                CompiledAtomicOperation::Load => SummaryConcurrencyAtomicOperation::Load,
+                CompiledAtomicOperation::Store => SummaryConcurrencyAtomicOperation::Store,
+                CompiledAtomicOperation::ReadModifyWrite => {
+                    SummaryConcurrencyAtomicOperation::ReadModifyWrite
+                }
+            },
+        },
+    };
+    Ok(SummaryEffect::new(
+        SummaryEffectKey::Concurrency(SummaryConcurrencyEffect::modeled(event, effect)),
+        evidence.clone(),
+    ))
 }
 
 fn find_dependency(

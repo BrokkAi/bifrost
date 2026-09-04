@@ -313,14 +313,20 @@ fn resolved_taint_to_json(
     sinks.sort_by(|left, right| left.identity.cmp(&right.identity));
     let mut sanitizers = spec.sanitizers.iter().collect::<Vec<_>>();
     sanitizers.sort_by(|left, right| left.identity.cmp(&right.identity));
+    let mut entry_points = spec.entry_points.iter().collect::<Vec<_>>();
+    entry_points.sort_by(|left, right| left.identity.cmp(&right.identity));
     let mut transforms = spec.transforms.iter().collect::<Vec<_>>();
     transforms.sort_by(|left, right| left.identity.cmp(&right.identity));
     let mut external_models = spec.external_models.iter().collect::<Vec<_>>();
     external_models.sort_by(|left, right| left.identity.cmp(&right.identity));
+    let mut store_writes = spec.store_writes.iter().collect::<Vec<_>>();
+    store_writes.sort_by(|left, right| left.identity.cmp(&right.identity));
+    let mut store_reads = spec.store_reads.iter().collect::<Vec<_>>();
+    store_reads.sort_by(|left, right| left.identity.cmp(&right.identity));
     let mut combinations = spec.finding_combinations.iter().collect::<Vec<_>>();
     combinations.sort_by(|left, right| left.id.cmp(&right.id));
 
-    Ok(json!({
+    let mut value = json!({
         "type": "taint",
         "mode": may_mode_label(spec.mode),
         "call_modeling": {
@@ -338,6 +344,10 @@ fn resolved_taint_to_json(
             .into_iter()
             .map(|entry| taint_sanitizer_to_json(entry, selectors))
             .collect::<Result<Vec<_>, _>>()?,
+        "entry_points": entry_points
+            .into_iter()
+            .map(|endpoint| resolved_taint_source_to_json(endpoint, selectors))
+            .collect::<Result<Vec<_>, _>>()?,
         "transforms": transforms
             .into_iter()
             .map(|entry| taint_transform_to_json(entry, selectors))
@@ -352,6 +362,62 @@ fn resolved_taint_to_json(
             .into_iter()
             .map(resolved_finding_combination_to_json)
             .collect::<Vec<_>>(),
+    });
+    // `stores` is omitted entirely when the policy declares none, which keeps
+    // every loaded projection authored before persistence stores existed
+    // byte-identical, and therefore keeps its hashes valid.
+    if !(store_writes.is_empty() && store_reads.is_empty()) {
+        let stores = json!({
+            "writes": store_writes
+                .into_iter()
+                .map(|entry| taint_store_write_to_json(entry, selectors))
+                .collect::<Result<Vec<_>, _>>()?,
+            "reads": store_reads
+                .into_iter()
+                .map(|entry| taint_store_read_to_json(entry, selectors))
+                .collect::<Result<Vec<_>, _>>()?,
+        });
+        value
+            .as_object_mut()
+            .expect("the resolved taint projection is an object")
+            .insert("stores".to_string(), stores);
+    }
+    Ok(value)
+}
+
+fn taint_store_write_to_json(
+    entry: &ResolvedTaintAuxiliary<ResolvedTaintStoreWriteDefinition>,
+    selectors: &[ResolvedPolicySelector],
+) -> Result<Value, LoadedModelError> {
+    let selector = selector_by_path(selectors, &entry.selector_path)?;
+    let definition = &entry.definition;
+    Ok(json!({
+        "identity": resolved_endpoint_identity_to_json(&entry.identity),
+        "definition": {
+            "selector": resolved_selector_to_json(selector),
+            "store": definition.store.as_str(),
+            "key": definition.key.as_ref().map(policy_port_to_json),
+            "instance": definition.instance.as_ref().map(policy_port_to_json),
+            "input": policy_port_to_json(&definition.input),
+        },
+    }))
+}
+
+fn taint_store_read_to_json(
+    entry: &ResolvedTaintAuxiliary<ResolvedTaintStoreReadDefinition>,
+    selectors: &[ResolvedPolicySelector],
+) -> Result<Value, LoadedModelError> {
+    let selector = selector_by_path(selectors, &entry.selector_path)?;
+    let definition = &entry.definition;
+    Ok(json!({
+        "identity": resolved_endpoint_identity_to_json(&entry.identity),
+        "definition": {
+            "selector": resolved_selector_to_json(selector),
+            "store": definition.store.as_str(),
+            "key": definition.key.as_ref().map(policy_port_to_json),
+            "instance": definition.instance.as_ref().map(policy_port_to_json),
+            "output": policy_port_to_json(&definition.output),
+        },
     }))
 }
 
@@ -879,6 +945,9 @@ fn policy_port_to_json(port: &PolicyPort) -> Value {
         }
         PolicyPort::ArgumentName { name } => {
             json!({ "type": "argument_name", "name": name })
+        }
+        PolicyPort::FieldOf { base, name } => {
+            json!({ "type": "field", "name": name, "of": policy_port_to_json(base) })
         }
     }
 }

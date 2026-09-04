@@ -41,7 +41,6 @@ use std::collections::BTreeSet;
 use std::hash::Hash;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
-use std::thread::ThreadId;
 use std::time::{Duration, Instant};
 use tree_sitter::{Node, Parser, Tree};
 
@@ -634,7 +633,7 @@ type AliasCell = Arc<OnceLock<Box<[CppAlias]>>>;
 pub type OrdinaryTypeImportCell = Arc<EffectiveUsingIndex>;
 pub type MacroEventCell = Arc<OnceLock<Box<[MacroEvent]>>>;
 type MacroIncludeProtectionCell = Arc<OnceLock<MacroIncludeProtection>>;
-pub type MacroEnvironmentCursorCell = Arc<Mutex<MacroEnvironmentCursor>>;
+type MacroEnvironmentCheckpointCell = Arc<OnceLock<MacroEnvironmentCheckpoints>>;
 type MacroReplacementCache = HashMap<(ProjectFile, usize), Arc<ParsedMacroReplacement>>;
 type MacroLocalBindingTemplateCache =
     HashMap<(ProjectFile, usize), Option<Arc<MacroLocalBindingTemplate>>>;
@@ -654,10 +653,46 @@ pub struct MacroEnvironment {
     maybe_applied_pragma_once_files: HashSet<ProjectFile>,
 }
 
-#[derive(Default)]
-pub struct MacroEnvironmentCursor {
+/// How many macro events one checkpoint window may cover.
+///
+/// A request for an environment replays only the events between the nearest
+/// earlier checkpoint and its own frontier, so one file's whole scan costs its
+/// event count (the checkpoint build) plus this many applications per request,
+/// whatever order the requests arrive in. The forward cursor this replaced was
+/// optimal for one worker reading one file in byte order and quadratic for the
+/// inverse, which asks many workers for positions that move backwards (#1496).
+pub const MACRO_ENVIRONMENT_CHECKPOINT_STRIDE: usize = 32;
+
+/// One event prefix of a file whose environment the index keeps.
+struct MacroEnvironmentCheckpoint {
+    /// How many of the file's events this environment has applied.
     frontier: usize,
     environment: Arc<MacroEnvironment>,
+}
+
+/// The replay checkpoints for one file's macro events, ascending by frontier
+/// and always starting at frontier zero (the compile-proven defines alone).
+///
+/// A checkpoint lands every [`MACRO_ENVIRONMENT_CHECKPOINT_STRIDE`] events and
+/// directly after every `#include` event, because applying an include event
+/// replays the included file's complete event list: keeping one there is what
+/// holds that unbounded cost out of every later replay window.
+struct MacroEnvironmentCheckpoints {
+    checkpoints: Vec<MacroEnvironmentCheckpoint>,
+}
+
+impl MacroEnvironmentCheckpoints {
+    /// The latest checkpoint at or before `frontier`.
+    fn at_or_before(&self, frontier: usize) -> &MacroEnvironmentCheckpoint {
+        let index = self
+            .checkpoints
+            .partition_point(|checkpoint| checkpoint.frontier <= frontier);
+        assert!(
+            index > 0,
+            "a checkpoint vector starts at frontier zero, which precedes every request"
+        );
+        &self.checkpoints[index - 1]
+    }
 }
 
 impl MacroEnvironment {
@@ -899,13 +934,13 @@ pub struct VisibilityIndex<'a> {
     precise_parent_cache: Mutex<HashMap<CodeUnit, Option<CodeUnit>>>,
     macro_event_cells: Mutex<HashMap<ProjectFile, MacroEventCell>>,
     pub macro_include_protection_cells: Mutex<HashMap<ProjectFile, MacroIncludeProtectionCell>>,
-    // A forward cursor is useful only while its caller visits one source in byte order. The
-    // authoritative differential shares this index across target workers, whose frontiers can
-    // interleave arbitrarily, so sharing one cursor per file would serialize the include replay
-    // and repeatedly reset it. Keep one bounded cursor per participating worker instead; the
-    // immutable event and parse caches above remain shared.
-    pub macro_environment_cursors:
-        Mutex<HashMap<(ProjectFile, ThreadId), MacroEnvironmentCursorCell>>,
+    // The environment at selected event prefixes of each file, built once and read by every
+    // worker. The authoritative differential shares this index across target workers whose
+    // frontiers interleave arbitrarily and move backwards, so a forward cursor -- per worker or
+    // not -- replayed a file's events once per backward request. Checkpoints answer any position
+    // with a binary search and at most one stride of replay, and being immutable they need no
+    // per-worker copy (#1496).
+    macro_environment_checkpoints: Mutex<HashMap<ProjectFile, MacroEnvironmentCheckpointCell>>,
     macro_replacements: Mutex<MacroReplacementCache>,
     macro_local_binding_templates: Mutex<MacroLocalBindingTemplateCache>,
     macro_replacement_bodies: Mutex<MacroReplacementBodyCache>,
@@ -914,6 +949,12 @@ pub struct VisibilityIndex<'a> {
     pub macro_replacement_parse_count: AtomicUsize,
     #[cfg(any(test, feature = "test-support"))]
     pub macro_event_application_count: AtomicUsize,
+    /// How many files had their checkpoint vector built. One build per file
+    /// per query even when workers race for the same file.
+    #[cfg(any(test, feature = "test-support"))]
+    pub macro_environment_checkpoint_build_count: AtomicUsize,
+    /// How many requests landed off a checkpoint and so had to copy one and
+    /// replay the events after it.
     #[cfg(any(test, feature = "test-support"))]
     pub macro_environment_copy_count: AtomicUsize,
     #[cfg(any(test, feature = "test-support"))]
@@ -931,6 +972,15 @@ impl Drop for VisibilityIndex<'_> {
         if std::env::var_os("BIFROST_CPP_VISIBILITY_STATS").is_none() {
             return;
         }
+        #[cfg(any(test, feature = "test-support"))]
+        eprintln!(
+            "BIFROST_CPP_MACRO_STATS requests={} copies={} checkpoint_builds={} applications={}",
+            self.macro_environment_request_count.load(Ordering::Relaxed),
+            self.macro_environment_copy_count.load(Ordering::Relaxed),
+            self.macro_environment_checkpoint_build_count
+                .load(Ordering::Relaxed),
+            self.macro_event_application_count.load(Ordering::Relaxed),
+        );
         let calls = self.parser_alias_fallback_calls.load(Ordering::Relaxed);
         if calls == 0 {
             return;
@@ -1350,23 +1400,36 @@ impl MacroBinding {
     }
 }
 
+/// The preprocessor conditionals whose truth decides whether one macro event
+/// applies, by the start byte of each conditional node. Empty means the event
+/// is unconditional.
+///
+/// [`VisibilityIndex::macro_event_condition_value`] needs exactly the
+/// conditional ancestors that structurally contain the event, and deciding
+/// containment means asking [`cpp_displaced_preprocessor_boundary`] for an
+/// `#endif` tree-sitter displaced into error recovery -- a walk of the
+/// conditional's whole subtree. That answer is a fact about the tree alone, so
+/// it is settled once, when the events are collected, instead of on every
+/// replay of the event (#1496).
+type OwningPreprocessorConditionals = Box<[usize]>;
+
 #[derive(Clone)]
 pub enum MacroEvent {
     Define {
         name: String,
         binding: MacroBinding,
         byte: usize,
-        conditional: bool,
+        conditionals: OwningPreprocessorConditionals,
     },
     Undef {
         name: String,
         byte: usize,
-        conditional: bool,
+        conditionals: OwningPreprocessorConditionals,
     },
     Include {
         targets: Vec<ProjectFile>,
         byte: usize,
-        conditional: bool,
+        conditionals: OwningPreprocessorConditionals,
     },
     Invalidate {
         byte: usize,
@@ -1541,13 +1604,14 @@ impl<'a> VisibilityIndex<'a> {
             precise_parent_cache: Mutex::new(HashMap::default()),
             macro_event_cells: Mutex::new(HashMap::default()),
             macro_include_protection_cells: Mutex::new(HashMap::default()),
-            macro_environment_cursors: Mutex::new(HashMap::default()),
+            macro_environment_checkpoints: Mutex::new(HashMap::default()),
             macro_replacements: Mutex::new(HashMap::default()),
             macro_local_binding_templates: Mutex::new(HashMap::default()),
             macro_replacement_bodies: Mutex::new(HashMap::default()),
             callable_parameter_macro_arities: Mutex::new(HashMap::default()),
             macro_replacement_parse_count: AtomicUsize::new(0),
             macro_event_application_count: AtomicUsize::new(0),
+            macro_environment_checkpoint_build_count: AtomicUsize::new(0),
             macro_environment_copy_count: AtomicUsize::new(0),
             macro_environment_request_count: AtomicUsize::new(0),
             cpp_template_metadata: HashMap::default(),
@@ -1806,7 +1870,7 @@ impl<'a> VisibilityIndex<'a> {
             precise_parent_cache: Mutex::new(HashMap::default()),
             macro_event_cells: Mutex::new(HashMap::default()),
             macro_include_protection_cells: Mutex::new(HashMap::default()),
-            macro_environment_cursors: Mutex::new(HashMap::default()),
+            macro_environment_checkpoints: Mutex::new(HashMap::default()),
             macro_replacements: Mutex::new(HashMap::default()),
             macro_local_binding_templates: Mutex::new(HashMap::default()),
             macro_replacement_bodies: Mutex::new(HashMap::default()),
@@ -1815,6 +1879,8 @@ impl<'a> VisibilityIndex<'a> {
             macro_replacement_parse_count: AtomicUsize::new(0),
             #[cfg(any(test, feature = "test-support"))]
             macro_event_application_count: AtomicUsize::new(0),
+            #[cfg(any(test, feature = "test-support"))]
+            macro_environment_checkpoint_build_count: AtomicUsize::new(0),
             #[cfg(any(test, feature = "test-support"))]
             macro_environment_copy_count: AtomicUsize::new(0),
             #[cfg(any(test, feature = "test-support"))]
@@ -2331,16 +2397,19 @@ impl<'a> VisibilityIndex<'a> {
             .clone()
     }
 
-    pub fn macro_environment_cursor_cell(&self, file: &ProjectFile) -> MacroEnvironmentCursorCell {
-        let key = (file.clone(), std::thread::current().id());
-        self.macro_environment_cursors
+    fn macro_environment_checkpoint_cell(
+        &self,
+        file: &ProjectFile,
+    ) -> MacroEnvironmentCheckpointCell {
+        self.macro_environment_checkpoints
             .lock()
-            .expect("C++ macro environment cursor cache poisoned")
-            .entry(key)
+            .expect("C++ macro environment checkpoint cache poisoned")
+            .entry(file.clone())
             .or_default()
             .clone()
     }
 
+    /// The environment of `file`'s macro events applied up to `before_byte`.
     pub fn macro_environment(
         &self,
         file: &ProjectFile,
@@ -2352,44 +2421,67 @@ impl<'a> VisibilityIndex<'a> {
         let cell = self.macro_event_cell(file);
         let events = cell.get_or_init(|| self.collect_macro_events(file).into_boxed_slice());
         let frontier = events.partition_point(|event| event.byte() < before_byte);
-        let cursor_cell = self.macro_environment_cursor_cell(file);
-        let mut cursor = cursor_cell
-            .lock()
-            .expect("C++ macro environment cursor poisoned");
-        if frontier < cursor.frontier {
-            *cursor = MacroEnvironmentCursor::default();
+        let checkpoint_cell = self.macro_environment_checkpoint_cell(file);
+        let checkpoints =
+            checkpoint_cell.get_or_init(|| self.build_macro_environment_checkpoints(file, events));
+        let checkpoint = checkpoints.at_or_before(frontier);
+        if checkpoint.frontier == frontier {
+            return Arc::clone(&checkpoint.environment);
         }
-        // Seed the TU's build-proven defines once, before any event applies
-        // (#2011). They are facts of the whole compile, so they hold from the
-        // first byte; a later explicit #undef event still overrides them
+        #[cfg(any(test, feature = "test-support"))]
+        self.macro_environment_copy_count
+            .fetch_add(1, Ordering::Relaxed);
+        let mut environment = checkpoint.environment.as_ref().clone();
+        let mut include_stack = HashSet::from_iter([file.clone()]);
+        for event in &events[checkpoint.frontier..frontier] {
+            self.apply_macro_event(file, event, &mut environment, &mut include_stack);
+        }
+        Arc::new(environment)
+    }
+
+    /// Apply `file`'s events once, keeping the environment at the prefixes
+    /// [`MacroEnvironmentCheckpoints`] describes.
+    fn build_macro_environment_checkpoints(
+        &self,
+        file: &ProjectFile,
+        events: &[MacroEvent],
+    ) -> MacroEnvironmentCheckpoints {
+        #[cfg(any(test, feature = "test-support"))]
+        self.macro_environment_checkpoint_build_count
+            .fetch_add(1, Ordering::Relaxed);
+        // The TU's build-proven defines hold from the first byte (#2011): they
+        // are facts of the whole compile, so they seed the frontier-zero
+        // checkpoint. A later explicit #undef event still overrides them
         // through `known_undefined_names`.
-        if cursor.frontier == 0 {
-            let proven = self.compile_proven_guards(file);
-            if !proven.is_empty() && cursor.environment.build_proven_defines.len() != proven.len() {
-                Arc::make_mut(&mut cursor.environment).build_proven_defines = proven
-                    .iter()
-                    .filter_map(|guard| match guard {
-                        PreprocessorGuard::Defined(name) => Some(name.clone()),
-                        _ => None,
-                    })
-                    .collect();
+        let mut environment = MacroEnvironment {
+            build_proven_defines: self
+                .compile_proven_guards(file)
+                .iter()
+                .filter_map(|guard| match guard {
+                    PreprocessorGuard::Defined(name) => Some(name.clone()),
+                    _ => None,
+                })
+                .collect(),
+            ..MacroEnvironment::default()
+        };
+        let mut checkpoints = vec![MacroEnvironmentCheckpoint {
+            frontier: 0,
+            environment: Arc::new(environment.clone()),
+        }];
+        let mut include_stack = HashSet::from_iter([file.clone()]);
+        for (index, event) in events.iter().enumerate() {
+            self.apply_macro_event(file, event, &mut environment, &mut include_stack);
+            let frontier = index + 1;
+            if frontier % MACRO_ENVIRONMENT_CHECKPOINT_STRIDE == 0
+                || matches!(event, MacroEvent::Include { .. })
+            {
+                checkpoints.push(MacroEnvironmentCheckpoint {
+                    frontier,
+                    environment: Arc::new(environment.clone()),
+                });
             }
         }
-        if frontier > cursor.frontier {
-            #[cfg(any(test, feature = "test-support"))]
-            if Arc::strong_count(&cursor.environment) > 1 {
-                self.macro_environment_copy_count
-                    .fetch_add(1, Ordering::Relaxed);
-            }
-            let start = cursor.frontier;
-            let environment = Arc::make_mut(&mut cursor.environment);
-            let mut include_stack = HashSet::from_iter([file.clone()]);
-            for event in &events[start..frontier] {
-                self.apply_macro_event(file, event, environment, &mut include_stack);
-            }
-            cursor.frontier = frontier;
-        }
-        Arc::clone(&cursor.environment)
+        MacroEnvironmentCheckpoints { checkpoints }
     }
 
     /// Whether `name` is bound as a macro at `before_byte` in `file`,
@@ -2682,50 +2774,39 @@ impl<'a> VisibilityIndex<'a> {
             MacroEvent::Define {
                 name,
                 binding,
-                conditional,
+                conditionals,
                 byte,
-            } => {
-                match conditional
-                    .then(|| self.macro_event_condition_value(file, *byte, environment))
-                    .unwrap_or(Some(true))
-                {
-                    Some(true) => environment.insert(name.clone(), binding.clone()),
-                    Some(false) => {}
-                    None => Self::merge_conditional_macro_definition(
-                        environment,
-                        name,
-                        binding,
-                        file,
-                        *byte,
-                    ),
-                }
-            }
+            } => match self.macro_event_condition_value(file, *byte, environment, conditionals) {
+                Some(true) => environment.insert(name.clone(), binding.clone()),
+                Some(false) => {}
+                None => Self::merge_conditional_macro_definition(
+                    environment,
+                    name,
+                    binding,
+                    file,
+                    *byte,
+                ),
+            },
             MacroEvent::Undef {
                 name,
-                conditional,
+                conditionals,
                 byte,
-            } => {
-                match conditional
-                    .then(|| self.macro_event_condition_value(file, *byte, environment))
-                    .unwrap_or(Some(true))
-                {
-                    Some(true) => environment.remove(name),
-                    Some(false) => {}
-                    None => {
-                        if environment.binding(name).is_some() {
-                            environment.insert(name.clone(), MacroBinding::ambiguous(file, *byte));
-                        }
+            } => match self.macro_event_condition_value(file, *byte, environment, conditionals) {
+                Some(true) => environment.remove(name),
+                Some(false) => {}
+                None => {
+                    if environment.binding(name).is_some() {
+                        environment.insert(name.clone(), MacroBinding::ambiguous(file, *byte));
                     }
                 }
-            }
+            },
             MacroEvent::Include {
                 targets,
-                conditional,
+                conditionals,
                 byte,
             } => {
-                let condition = conditional
-                    .then(|| self.macro_event_condition_value(file, *byte, environment))
-                    .unwrap_or(Some(true));
+                let condition =
+                    self.macro_event_condition_value(file, *byte, environment, conditionals);
                 if condition == Some(false) {
                     return;
                 }
@@ -2761,12 +2842,21 @@ impl<'a> VisibilityIndex<'a> {
     /// `Some(true)` and `Some(false)` are proofs from exact macro bindings at
     /// this source byte. `None` preserves the old conditional merge when a
     /// build/configuration input or an unsupported expression is involved.
+    ///
+    /// `conditionals` is the event's own [`OwningPreprocessorConditionals`]:
+    /// which ancestors structurally own the event was decided when the events
+    /// were collected, so all this walk does is find those nodes again and ask
+    /// the environment what their conditions are worth here.
     fn macro_event_condition_value(
         &self,
         file: &ProjectFile,
         event_byte: usize,
         environment: &MacroEnvironment,
+        conditionals: &OwningPreprocessorConditionals,
     ) -> Option<bool> {
+        if conditionals.is_empty() {
+            return Some(true);
+        }
         let prepared = self.cpp.prepared_syntax(self.token, file)?;
         let source = prepared.source();
         let root = prepared.tree().root_node();
@@ -2780,8 +2870,7 @@ impl<'a> VisibilityIndex<'a> {
             if matches!(
                 conditional.kind(),
                 "preproc_if" | "preproc_ifdef" | "preproc_elif"
-            ) && !is_file_covering_include_guard(conditional, source)
-                && preprocessor_conditional_contains_descendant(conditional, descendant)
+            ) && conditionals.contains(&conditional.start_byte())
             {
                 let mut value = match conditional.kind() {
                     "preproc_ifdef" => {
@@ -3110,9 +3199,9 @@ impl<'a> VisibilityIndex<'a> {
         };
         let source = prepared.source();
         let mut events = Vec::new();
-        let mut stack = vec![prepared.tree().root_node()];
+        let root = prepared.tree().root_node();
+        let mut stack = vec![root];
         while let Some(node) = stack.pop() {
-            let conditional = has_preprocessor_conditional_ancestor(node, source);
             match node.kind() {
                 "preproc_def" | "preproc_function_def" => {
                     let Some(name) = node.child_by_field_name("name") else {
@@ -3128,7 +3217,7 @@ impl<'a> VisibilityIndex<'a> {
                             exact: true,
                         },
                         byte: node.start_byte(),
-                        conditional,
+                        conditionals: owning_preprocessor_conditionals(root, node, source),
                     });
                     continue;
                 }
@@ -3137,7 +3226,7 @@ impl<'a> VisibilityIndex<'a> {
                         events.push(MacroEvent::Include {
                             targets: Vec::new(),
                             byte: node.start_byte(),
-                            conditional,
+                            conditionals: owning_preprocessor_conditionals(root, node, source),
                         });
                         continue;
                     };
@@ -3159,7 +3248,7 @@ impl<'a> VisibilityIndex<'a> {
                     events.push(MacroEvent::Include {
                         targets,
                         byte: node.start_byte(),
-                        conditional,
+                        conditionals: owning_preprocessor_conditionals(root, node, source),
                     });
                     continue;
                 }
@@ -3177,7 +3266,7 @@ impl<'a> VisibilityIndex<'a> {
                         events.push(MacroEvent::Undef {
                             name,
                             byte: node.start_byte(),
-                            conditional,
+                            conditionals: owning_preprocessor_conditionals(root, node, source),
                         });
                     } else {
                         events.push(MacroEvent::Invalidate {
@@ -5572,6 +5661,28 @@ impl<'a> VisibilityIndex<'a> {
         visible_from: &ProjectFile,
         unit: &CodeUnit,
     ) -> Option<CodeUnit> {
+        self.canonical_type_resolution(analyzer, visible_from, unit)
+            .ok()
+    }
+
+    /// Follow an alias only when it is visible at `reference`.
+    ///
+    /// The consumer need not spell the alias target. In particular, a
+    /// conditional include can make `PublicPtr` visible at the reference while
+    /// ordinary physical-include visibility is false. Prove the public alias
+    /// with the reference's guard environment, then use the existing structured
+    /// alias-chain resolver over the consumer's bounded declaration index.
+    pub fn canonical_type_unit_in_context(
+        &self,
+        analyzer: &CppGraphSource<'_>,
+        visible_from: &ProjectFile,
+        reference: Node<'_>,
+        unit: &CodeUnit,
+    ) -> Option<CodeUnit> {
+        if !self.external_type_candidate_visible_in_context(analyzer, visible_from, unit, reference)
+        {
+            return None;
+        }
         self.canonical_type_resolution(analyzer, visible_from, unit)
             .ok()
     }
@@ -10335,28 +10446,6 @@ fn direct_unmatched_closing_brace(node: Node<'_>) -> bool {
             .any(|index| node.child(index).is_some_and(|child| child.kind() == "}"))
 }
 
-fn unmatched_closing_brace_is_followed_by_semicolon(node: Node<'_>) -> bool {
-    let mut following = node.next_named_sibling();
-    let following = loop {
-        match following {
-            Some(candidate) if candidate.kind() == "comment" => {
-                following = candidate.next_named_sibling();
-                continue;
-            }
-            candidate => break candidate,
-        }
-    };
-    following.is_some_and(|candidate| {
-        candidate.kind() == "expression_statement"
-            && candidate.named_child_count() == 0
-            && (0..candidate.child_count()).any(|index| {
-                candidate
-                    .child(index)
-                    .is_some_and(|child| child.kind() == ";")
-            })
-    })
-}
-
 pub fn callable_preprocessor_context_is_visible(node: Node<'_>, source: &str) -> bool {
     let mut ancestor = node.parent();
     while let Some(parent) = ancestor {
@@ -11517,6 +11606,43 @@ fn has_preprocessor_conditional_ancestor(mut node: Node<'_>, source: &str) -> bo
     false
 }
 
+/// The [`OwningPreprocessorConditionals`] of a macro event at `event`.
+///
+/// The descendant this walks up from is the one
+/// [`VisibilityIndex::macro_event_condition_value`] starts from -- the
+/// innermost node at the event's first byte, not the event node itself --
+/// because containment compares that descendant's end against the recovered
+/// conditional boundary, and the two nodes end in different places. An event
+/// that [`has_preprocessor_conditional_ancestor`] rejects owns nothing: that
+/// predicate is what has always decided whether an event is conditional at
+/// all, and answering it first also skips the walk for the ordinary
+/// unconditional event.
+fn owning_preprocessor_conditionals(
+    root: Node<'_>,
+    event: Node<'_>,
+    source: &str,
+) -> OwningPreprocessorConditionals {
+    if !has_preprocessor_conditional_ancestor(event, source) {
+        return OwningPreprocessorConditionals::default();
+    }
+    let start = event.start_byte();
+    let descendant = root
+        .descendant_for_byte_range(start, start.saturating_add(1).min(source.len()))
+        .expect("a byte inside the parsed tree names a descendant");
+    let mut owners = Vec::new();
+    let mut current = descendant.parent();
+    while let Some(conditional) = current {
+        if is_preprocessor_conditional(conditional)
+            && !is_file_covering_include_guard(conditional, source)
+            && preprocessor_conditional_contains_descendant(conditional, descendant)
+        {
+            owners.push(conditional.start_byte());
+        }
+        current = conditional.parent();
+    }
+    owners.into_boxed_slice()
+}
+
 fn is_preprocessor_conditional(node: Node<'_>) -> bool {
     matches!(
         node.kind(),
@@ -11747,87 +11873,247 @@ pub fn is_declarator_node(node: Node<'_>) -> bool {
     )
 }
 
-#[derive(Clone, Default)]
-pub struct OrphanedNamespaceTypeScopeIndex {
-    scopes: Vec<OrphanedNamespaceTypeScope>,
+/// One run of a container's children that tree-sitter parsed outside the
+/// namespaces that really enclose it, with the namespaces that do.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RecoveredNamespaceRegion {
+    /// Start byte of the first child in the run.
+    pub start: usize,
+    /// End byte of the last child in the run.
+    pub end: usize,
+    /// The complete enclosing namespace path of the run, outermost first: the
+    /// namespaces the parse tree still attributes to the container, then the
+    /// ones recovery dropped.
+    pub components: Vec<String>,
 }
 
-#[derive(Clone)]
-struct OrphanedNamespaceTypeScope {
-    body_end: usize,
-    scope_end: usize,
-    components: Vec<String>,
+/// The namespaces C++ parse recovery drops from a file's tree.
+///
+/// When tree-sitter cannot parse a construct inside a namespace body it closes
+/// an inner scope with a MISSING brace, or skips an opening brace into an
+/// ERROR node. Every real `}` after that then closes one scope too early: a
+/// class body's `}` closes the namespace, the namespace's own `}` closes its
+/// parent, and the outermost real closes land in a trailing ERROR node. The
+/// declarations between a stolen close and the real one keep their byte
+/// positions but lose their `namespace_definition` ancestors (Catch2's
+/// `catch_matchers_templated.hpp`, issue #1537).
+///
+/// Braces balance in source that compiles, so the lost scopes are exactly what
+/// a brace stack over tree-sitter's own tokens leaves open. Within one node, in
+/// child order: a real `{` opens a scope (the node's namespace when the node is
+/// a named namespace body, otherwise an opaque scope); a real `}` closes the
+/// innermost open scope, or is owed to the parent when the node has none open;
+/// a MISSING brace is not a token and does nothing; a child without errors is
+/// balanced and contributes nothing; an error-marked child contributes the
+/// closes it owes and the scopes it leaves open. Whatever is open before a
+/// child starts, beyond the node's own scope, is what the parse lost for that
+/// child. Consecutive children with the same lost namespaces form one
+/// [`RecoveredNamespaceRegion`]. A file without parse errors has no regions.
+#[derive(Clone, Debug, Default)]
+pub struct OrphanedNamespaceScopeIndex {
+    regions: Vec<RecoveredNamespaceRegion>,
 }
 
-impl OrphanedNamespaceTypeScopeIndex {
-    /// Index the physical namespace interval that remains after tree-sitter
-    /// prematurely closes an error-marked namespace at a recovered class body.
-    /// The later unmatched `}` is the structured upper bound. A nested damaged
-    /// namespace can lose that token to its still-open enclosing namespace; in
-    /// that shape the enclosing namespace body's end is the tighter surviving
-    /// bound. Declarations after either bound do not enter the recovered scope.
+impl OrphanedNamespaceScopeIndex {
     pub fn build(root: Node<'_>, source: &str) -> Self {
-        let mut scopes = Vec::new();
-        let mut stack = vec![root];
-        while let Some(current) = stack.pop() {
-            if current.kind() == "namespace_definition"
-                && current.has_error()
-                && let Some(body) = current.child_by_field_name("body")
-                && current.end_byte() == body.end_byte()
-                && let Some(name) = current.child_by_field_name("name")
-            {
-                let mut components =
-                    enclosing_namespace_components(current, source).unwrap_or_default();
-                if append_cpp_name_components(name, source, &mut components).is_some()
-                    && !components.is_empty()
-                {
-                    let mut scope_end = None;
-                    let mut following = current.next_named_sibling();
-                    while let Some(candidate) = following {
-                        if direct_unmatched_closing_brace(candidate)
-                            && !unmatched_closing_brace_is_followed_by_semicolon(candidate)
-                        {
-                            scope_end = Some(candidate.start_byte());
-                            break;
-                        }
-                        following = candidate.next_named_sibling();
+        if !root.has_error() {
+            return Self::default();
+        }
+        struct Frame<'tree> {
+            node: Node<'tree>,
+            children: std::vec::IntoIter<Node<'tree>>,
+            /// The enclosing namespace path of this node's children before
+            /// this node's own scopes: the parent's path plus what was open in
+            /// the parent when this node started.
+            scope: Vec<String>,
+            /// The namespace this node's own real `{` opens; empty when the
+            /// node is not a named namespace body.
+            own_scope: Vec<String>,
+            /// Scopes opened inside this node and still open, innermost last.
+            /// A namespace carries its name components; an opaque scope (a
+            /// class body, a function body, a brace inside an ERROR) is empty.
+            open: Vec<Vec<String>>,
+            /// Whether `open[0]` is this node's own scope.
+            own_open: bool,
+            /// Real closes seen with nothing open here; the parent closes them.
+            owed: usize,
+            /// The run of children currently sharing the same lost namespaces.
+            run: Option<RecoveredNamespaceRegion>,
+        }
+        fn frame<'tree>(
+            node: Node<'tree>,
+            scope: Vec<String>,
+            own_scope: Vec<String>,
+        ) -> Frame<'tree> {
+            let mut cursor = node.walk();
+            let children = node.children(&mut cursor).collect::<Vec<_>>().into_iter();
+            Frame {
+                node,
+                children,
+                scope,
+                own_scope,
+                open: Vec::new(),
+                own_open: false,
+                owed: 0,
+                run: None,
+            }
+        }
+        let mut regions = Vec::new();
+        let mut frames = vec![frame(root, Vec::new(), Vec::new())];
+        while let Some(current) = frames.last_mut() {
+            let Some(child) = current.children.next() else {
+                let done = frames.pop().expect("the frame just borrowed");
+                regions.extend(done.run);
+                let Some(parent) = frames.last_mut() else {
+                    break;
+                };
+                for _ in 0..done.owed {
+                    if parent.open.pop().is_none() {
+                        parent.owed += 1;
                     }
-                    let scope_end = scope_end.or_else(|| {
-                        std::iter::successors(current.parent(), |ancestor| ancestor.parent())
-                            .filter(|ancestor| ancestor.kind() == "namespace_definition")
-                            .filter_map(|ancestor| ancestor.child_by_field_name("body"))
-                            .map(|body| body.end_byte())
-                            .find(|end| *end > body.end_byte())
+                }
+                parent.own_open &= !parent.open.is_empty();
+                parent.open.extend(done.open);
+                continue;
+            };
+            match child.kind() {
+                "{" if !child.is_missing() => {
+                    let own = current.open.is_empty();
+                    current.open.push(if own {
+                        current.own_scope.clone()
+                    } else {
+                        Vec::new()
                     });
-                    if let Some(scope_end) = scope_end {
-                        scopes.push(OrphanedNamespaceTypeScope {
-                            body_end: body.end_byte(),
-                            scope_end,
-                            components,
+                    current.own_open |= own;
+                    continue;
+                }
+                "}" if !child.is_missing() => {
+                    if current.open.pop().is_none() {
+                        current.owed += 1;
+                    }
+                    // The node's own close, or a close that reached it once
+                    // every lost scope was popped: nothing of this node's is
+                    // open for the children that follow.
+                    current.own_open &= !current.open.is_empty();
+                    continue;
+                }
+                _ => {}
+            }
+            let lost = &current.open[usize::from(current.own_open)..];
+            let child_scope = current
+                .scope
+                .iter()
+                .chain(current.open.iter().flatten())
+                .cloned()
+                .collect::<Vec<_>>();
+            if lost.iter().any(|scope| !scope.is_empty()) {
+                match &mut current.run {
+                    Some(run) if run.components == child_scope => run.end = child.end_byte(),
+                    run => {
+                        regions.extend(run.take());
+                        *run = Some(RecoveredNamespaceRegion {
+                            start: child.start_byte(),
+                            end: child.end_byte(),
+                            components: child_scope.clone(),
                         });
                     }
                 }
+            } else {
+                regions.extend(current.run.take());
             }
-            if !current.has_error() {
-                continue;
+            if child.has_error() {
+                let own_scope = namespace_body_name_components(current.node, child, source);
+                frames.push(frame(child, child_scope, own_scope));
             }
-            let mut cursor = current.walk();
-            stack.extend(
-                current
-                    .named_children(&mut cursor)
-                    .filter(|child| child.has_error()),
-            );
         }
-        Self { scopes }
+        Self { regions }
     }
 
-    pub fn scope_at(&self, byte: usize) -> Option<(usize, &[String])> {
-        self.scopes
-            .iter()
-            .filter(|scope| scope.body_end < byte && byte < scope.scope_end)
-            .max_by_key(|scope| (scope.components.len(), scope.body_end))
-            .map(|scope| (scope.body_end, scope.components.as_slice()))
+    pub fn is_empty(&self) -> bool {
+        self.regions.is_empty()
     }
+
+    /// The bytes this index holds, for the analyzer cache's weight.
+    pub fn approximate_size(&self) -> usize {
+        self.regions.iter().fold(0usize, |total, region| {
+            total
+                .saturating_add(std::mem::size_of::<RecoveredNamespaceRegion>())
+                .saturating_add(region.components.iter().map(String::len).sum::<usize>())
+        })
+    }
+
+    /// The innermost recovered region containing `byte`.
+    pub fn region_at(&self, byte: usize) -> Option<&RecoveredNamespaceRegion> {
+        self.regions
+            .iter()
+            .filter(|region| region.start <= byte && byte < region.end)
+            .min_by_key(|region| region.end - region.start)
+    }
+
+    /// The enclosing namespaces of `node`, outermost first, restoring the ones
+    /// parse recovery dropped from its ancestor chain. The one answer both
+    /// lookup directions and declaration collection use (issue #1537).
+    pub fn enclosing_namespace_components(&self, node: Node<'_>, source: &str) -> Vec<String> {
+        let mut parsed = Vec::new();
+        let mut current = node.parent();
+        while let Some(parent) = current {
+            if parent.kind() == "namespace_definition"
+                && let Some(name) = parent.child_by_field_name("name")
+            {
+                let mut components = Vec::new();
+                if append_cpp_name_components(name, source, &mut components).is_some() {
+                    parsed.push((parent.start_byte(), components));
+                }
+            }
+            current = parent.parent();
+        }
+        parsed.reverse();
+        self.restore_enclosing_namespaces(parsed, node.start_byte())
+    }
+
+    /// [`Self::enclosing_namespace_components`] for a caller that has already
+    /// climbed the ancestor chain: `parsed` lists the node's named
+    /// `namespace_definition` ancestors outermost first, each with its start
+    /// byte. A region covering the node supplies every namespace outside it;
+    /// only the parsed ancestors that start inside the region still apply.
+    pub fn restore_enclosing_namespaces(
+        &self,
+        parsed: Vec<(usize, Vec<String>)>,
+        node_start: usize,
+    ) -> Vec<String> {
+        let Some(region) = self.region_at(node_start) else {
+            return parsed
+                .into_iter()
+                .flat_map(|(_, components)| components)
+                .collect();
+        };
+        region
+            .components
+            .iter()
+            .cloned()
+            .chain(
+                parsed
+                    .into_iter()
+                    .filter(|(start, _)| *start >= region.start)
+                    .flat_map(|(_, components)| components),
+            )
+            .collect()
+    }
+}
+
+/// The name components of the namespace whose body `body` is, or empty when
+/// `body` is not the body of a named `namespace_definition` `parent`.
+fn namespace_body_name_components(parent: Node<'_>, body: Node<'_>, source: &str) -> Vec<String> {
+    let mut components = Vec::new();
+    if body.kind() == "declaration_list"
+        && parent.kind() == "namespace_definition"
+        && parent.child_by_field_name("body") == Some(body)
+        && let Some(name) = parent.child_by_field_name("name")
+        && append_cpp_name_components(name, source, &mut components).is_none()
+    {
+        components.clear();
+    }
+    components
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -15001,6 +15287,100 @@ mod tests {
         assert_eq!(node.kind(), "identifier");
         assert!(is_c_sizeof_expression_type_candidate(&c_file, node));
         assert!(!is_c_sizeof_expression_type_candidate(&cpp_file, node));
+    }
+
+    fn parse_cpp(source: &str) -> Tree {
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_cpp::LANGUAGE.into())
+            .expect("C++ grammar");
+        parser.parse(source, None).expect("fixture tree")
+    }
+
+    fn named_node_at<'tree>(tree: &'tree Tree, source: &str, needle: &str) -> Node<'tree> {
+        let start = source.find(needle).expect("fixture needle");
+        tree.root_node()
+            .named_descendant_for_byte_range(start, start + needle.len())
+            .expect("node at needle")
+    }
+
+    /// Two macro-decorated class heads make tree-sitter close `detail` at the
+    /// first class's `}`, `matchers` at the second's, and `app` at `detail`'s
+    /// real `}`; the tail parses at translation-unit level and the two real
+    /// closes for `matchers` and `app` land in a trailing ERROR (#1537).
+    const STOLEN_BRACE_CASCADE: &str = r#"namespace app {
+namespace matchers {
+    namespace detail {
+        class API [[nodiscard]] First {
+        public:
+            int value() const { return count_ + 1; }
+        private:
+            int count_;
+        };
+        class API [[nodiscard]] Second {
+        public:
+            int value() const { return count_ + 2; }
+        private:
+            int count_;
+        };
+    } // namespace detail
+
+    template <typename T>
+    void tail_function(MatcherBase<T> const& value);
+
+    class TailClass {};
+} // namespace matchers
+} // namespace app
+
+struct AfterAll {};
+"#;
+
+    #[test]
+    fn orphaned_namespace_scope_index_restores_a_stolen_brace_cascade() {
+        let source = STOLEN_BRACE_CASCADE;
+        let tree = parse_cpp(source);
+        let index = OrphanedNamespaceScopeIndex::build(tree.root_node(), source);
+
+        let tail_class = named_node_at(&tree, source, "TailClass");
+        assert!(
+            !has_ancestor_kind(tail_class, "namespace_definition"),
+            "the fixture must reproduce the recovery: the tail has no namespace ancestor"
+        );
+        let displaced = named_node_at(&tree, source, "Second");
+        assert_eq!(
+            enclosing_namespace_components(displaced, source),
+            Some(vec!["app".to_string(), "matchers".to_string()]),
+            "the fixture must displace the second class out of detail"
+        );
+
+        let components = |needle: &str| {
+            index.enclosing_namespace_components(named_node_at(&tree, source, needle), source)
+        };
+        assert_eq!(components("First"), ["app", "matchers", "detail"]);
+        assert_eq!(components("Second"), ["app", "matchers", "detail"]);
+        assert_eq!(components("MatcherBase<T>"), ["app", "matchers"]);
+        assert_eq!(components("tail_function"), ["app", "matchers"]);
+        assert_eq!(components("TailClass"), ["app", "matchers"]);
+        assert!(components("AfterAll").is_empty());
+    }
+
+    #[test]
+    fn orphaned_namespace_scope_index_is_empty_without_lost_scopes() {
+        let clean = "namespace a { namespace b { class C {}; } class D {}; }\n";
+        let tree = parse_cpp(clean);
+        assert!(!tree.root_node().has_error());
+        assert!(OrphanedNamespaceScopeIndex::build(tree.root_node(), clean).is_empty());
+
+        // A namespace that merely contains a parse error closes where its
+        // brace says; the declarations after it keep their parsed scope.
+        let damaged = "namespace a { namespace b { UNKNOWN_MACRO(x) } class C {}; }\n";
+        let tree = parse_cpp(damaged);
+        assert!(tree.root_node().has_error());
+        let index = OrphanedNamespaceScopeIndex::build(tree.root_node(), damaged);
+        assert_eq!(
+            index.enclosing_namespace_components(named_node_at(&tree, damaged, "class C"), damaged),
+            ["a"]
+        );
     }
 
     #[test]

@@ -967,6 +967,8 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             } else {
                 self.value_mapping(builder, node)?
             };
+            let parameter_name = slot.unique_name().map(Box::<str>::from);
+            let passing_mode = slot.passing_mode;
             let receiver_slot = slot.receiver || slot.names.iter().any(|name| name == "this");
             if receiver_slot {
                 let receiver = self.session.add_value_with_metadata(
@@ -982,6 +984,8 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     SemanticValueKind::Parameter {
                         ordinal,
                         multiplicity: formal_multiplicity(slot.variadic),
+                        name: parameter_name,
+                        passing_mode,
                     },
                 )?;
                 for name in slot.names {

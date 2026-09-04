@@ -10,35 +10,338 @@ use crate::analyzer::semantic_model::{
     Compatibility, Completeness, DependencyArtifactRole, DependencyDiscoveryOutcome,
     DependencyDiscoveryProfile, DependencyPackAdapter, DependencyPackDiagnostic,
     DependencyPackDiagnosticSeverity, DependencyPackLimits, DependencyPackProduction,
-    ExactDependencyArtifact, ExternalArtifactKind, HierarchyFact, HierarchyKind, Locator,
-    MemberFact, MemberIdentity, MemberKind, NameSelector, Parameter, Producer, Provenance,
+    ExactDependencyArtifact, ExternalArtifactKind, HierarchyFact, HierarchyKind, ImplicitOperation,
+    Locator, MemberFact, MemberIdentity, MemberKind, NameSelector, Parameter, Producer, Provenance,
     ReceiverFact, ResolvedDependency, ResolvedDependencyArtifact, Safety,
-    SemanticModelActivationEvidence, Signature, TypeFact, TypeIdentity, TypeKind, TypeRef,
-    Visibility, WildcardVariance, member_declaration_id, type_declaration_id,
+    SemanticModelActivationEvidence, Signature, StructuredTypeExpression, TypeCopySemantics,
+    TypeFact, TypeIdentity, TypeKind, TypeMoveSemantics, TypeRef, TypeRefReferenceKind,
+    TypeValueSemantics, Visibility, WildcardVariance, member_declaration_id, type_declaration_id,
 };
-use crate::analyzer::semantic_model::{SemanticModelCompleteness, SemanticModelOverlay};
+use crate::analyzer::semantic_model::{
+    SemanticModelCompleteness, SemanticModelOriginKind, SemanticModelOverlay,
+    SemanticModelSymbolKind,
+};
 use crate::analyzer::structural::BoundaryStatus;
 use crate::analyzer::topology::DependencyScope;
 use crate::analyzer::{AnalyzerQueryScope, QueryScope};
 use crate::analyzer::{Language, Project};
 use crate::hash::HashMap;
 use brokk_bifrost_core::analyzer::model::{
+    CppTemplateExpression, CppTemplateMetadata, CppTemplateParameterKind, CppTemplateTerm,
     StructuredTypeIdentity, StructuredTypeNodeId, StructuredTypeNodeView,
 };
 use brokk_bifrost_core::analyzer::project::decode_source_bytes;
 use brokk_bifrost_cpp::compile_context::CppCompileContexts;
 use brokk_bifrost_cpp::compile_context::CppExternalIncludeResolution;
-use brokk_bifrost_cpp::declarations::CppParameterType;
+use brokk_bifrost_cpp::declarations::{CppComparableNode, CppComparableSlot, CppParameterType};
 use brokk_bifrost_cpp::external_declarations::{
-    CppExternalDeclarationCompleteness, CppExternalDeclarationLimits, CppExternalMemberKind,
-    CppExternalVisibility, external_angle_include_paths, external_angle_include_paths_from_root,
-    extract_external_declarations,
+    CppCallableExplicitness, CppExternalDeclarationCompleteness, CppExternalDeclarationLimits,
+    CppExternalMemberKind, CppExternalVisibility, external_angle_include_paths,
+    external_angle_include_paths_from_root, extract_external_declarations,
 };
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct CppDependencyPackAdapter;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum BasicStringConstructorRole {
+    Copy,
+    Move,
+    CharacterData,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum BasicStringAssignmentRole {
+    Copy,
+    Move,
+}
+
+impl BasicStringAssignmentRole {
+    fn operation(self) -> ImplicitOperation {
+        match self {
+            Self::Copy => ImplicitOperation::CopyAssignment,
+            Self::Move => ImplicitOperation::MoveAssignment,
+        }
+    }
+}
+
+impl BasicStringConstructorRole {
+    fn operation(self) -> ImplicitOperation {
+        match self {
+            Self::Copy => ImplicitOperation::CopyConstructor,
+            Self::Move => ImplicitOperation::MoveConstructor,
+            Self::CharacterData => ImplicitOperation::ValuePreservingConstructor,
+        }
+    }
+}
+
+/// Return the exact template parameter names of the standard library's primary
+/// `std::basic_string` declaration. The names themselves are retained in the
+/// pack, while the canonical identity and default relationships are proven by
+/// the structured metadata terms.
+fn exact_basic_string_template_parameters(
+    name: &str,
+    metadata: Option<&CppTemplateMetadata>,
+) -> Option<Vec<String>> {
+    if name != "std.basic_string" {
+        return None;
+    }
+    let metadata = metadata?;
+    if metadata.primary_name != "basic_string"
+        || metadata.primary_fq_name != "std.basic_string"
+        || metadata.alias_target.is_some()
+        || !metadata.is_primary()
+    {
+        return None;
+    }
+    let [character, traits, allocator] = metadata.parameters.as_slice() else {
+        return None;
+    };
+    if [character, traits, allocator]
+        .into_iter()
+        .any(|parameter| parameter.kind != CppTemplateParameterKind::Type || parameter.variadic)
+        || character.default.is_some()
+        || !template_default_relation(traits.default.as_ref(), "char_traits", &character.name)
+        || !template_default_relation(allocator.default.as_ref(), "allocator", &character.name)
+        || character.name == traits.name
+        || character.name == allocator.name
+        || traits.name == allocator.name
+    {
+        return None;
+    }
+    Some(
+        metadata
+            .parameters
+            .iter()
+            .map(|parameter| parameter.name.clone())
+            .collect(),
+    )
+}
+
+/// Match one default template argument without consulting its rendered source
+/// text. The extractor's term is a `template_type` whose argument list has one
+/// parameter reference; this proves the default relation independently of the
+/// parameter spelling chosen by a particular standard-library implementation.
+fn template_default_relation(
+    expression: Option<&CppTemplateExpression>,
+    expected_base: &str,
+    parameter_name: &str,
+) -> bool {
+    let Some(CppTemplateTerm::Node { kind, children }) = expression.map(|value| &value.term) else {
+        return false;
+    };
+    if kind != "template_type" {
+        return false;
+    }
+    let [base, arguments] = children.as_slice() else {
+        return false;
+    };
+    if !matches!(
+        base,
+        CppTemplateTerm::Atom { kind, text }
+            if kind == "identifier" && text == expected_base
+    ) {
+        return false;
+    }
+    let CppTemplateTerm::Node {
+        kind: argument_kind,
+        children: argument_children,
+    } = arguments
+    else {
+        return false;
+    };
+    let [open, parameter, close] = argument_children.as_slice() else {
+        return false;
+    };
+    matches!(
+        (open, parameter, close),
+        (
+            CppTemplateTerm::Atom { kind: open_kind, text: open_text },
+            CppTemplateTerm::Parameter(name),
+            CppTemplateTerm::Atom { kind: close_kind, text: close_text },
+        ) if argument_kind == "template_argument_list"
+            && open_kind == "<"
+            && open_text == "<"
+            && name == parameter_name
+            && close_kind == ">"
+            && close_text == ">"
+    )
+}
+
+fn basic_string_constructor_role(
+    owner_name: &str,
+    type_parameters: &[String],
+    member: &brokk_bifrost_cpp::external_declarations::CppExternalMember,
+) -> Option<BasicStringConstructorRole> {
+    if member.kind != CppExternalMemberKind::Function
+        || member.owner.as_deref() != Some(owner_name)
+        || member.name != "basic_string"
+        || member.return_type.is_some()
+    {
+        return None;
+    }
+    match member.parameter_types.as_deref()? {
+        [CppParameterType::Structured(identity)] => {
+            let root = identity.root_id();
+            let (role, inner) = match identity.view(root)? {
+                StructuredTypeNodeView::Reference(inner) => {
+                    (BasicStringConstructorRole::Copy, inner)
+                }
+                StructuredTypeNodeView::RvalueReference(inner) => {
+                    (BasicStringConstructorRole::Move, inner)
+                }
+                _ => return None,
+            };
+            is_basic_string_self_type(identity, inner).then_some(role)
+        }
+        [
+            CppParameterType::Structured(character_data),
+            CppParameterType::Structured(allocator),
+        ] => {
+            let [character_parameter, _, allocator_parameter] = type_parameters else {
+                return None;
+            };
+            let Some(StructuredTypeNodeView::Pointer(character)) =
+                character_data.view(character_data.root_id())
+            else {
+                return None;
+            };
+            let Some(StructuredTypeNodeView::Reference(allocator_type)) =
+                allocator.view(allocator.root_id())
+            else {
+                return None;
+            };
+            let [
+                CppComparableSlot::Shape(character_shape),
+                CppComparableSlot::Shape(allocator_shape),
+            ] = member.parameter_shapes.as_deref()?
+            else {
+                return None;
+            };
+            (member.explicitness == Some(CppCallableExplicitness::Implicit)
+                && member.callable_arity
+                    == Some(brokk_bifrost_core::analyzer::model::CallableArity::new(
+                        1, 2, false,
+                    ))
+                && is_basic_string_type_parameter(character_data, character, character_parameter)
+                && is_basic_string_type_parameter(allocator, allocator_type, allocator_parameter)
+                && is_const_pointer_to_basic_string_type_parameter(
+                    character_shape,
+                    character_parameter,
+                )
+                && is_const_reference_to_basic_string_type_parameter(
+                    allocator_shape,
+                    allocator_parameter,
+                ))
+            .then_some(BasicStringConstructorRole::CharacterData)
+        }
+        _ => None,
+    }
+}
+
+fn is_const_pointer_to_basic_string_type_parameter(
+    shape: &brokk_bifrost_cpp::declarations::CppComparableParameter,
+    parameter: &str,
+) -> bool {
+    let CppComparableNode::Pointer {
+        inner,
+        konst: false,
+        volatil: false,
+    } = shape.node(shape.root())
+    else {
+        return false;
+    };
+    comparable_basic_string_type_parameter(shape, *inner, parameter, true)
+}
+
+fn is_const_reference_to_basic_string_type_parameter(
+    shape: &brokk_bifrost_cpp::declarations::CppComparableParameter,
+    parameter: &str,
+) -> bool {
+    let CppComparableNode::Reference { inner } = shape.node(shape.root()) else {
+        return false;
+    };
+    comparable_basic_string_type_parameter(shape, *inner, parameter, true)
+}
+
+fn comparable_basic_string_type_parameter(
+    shape: &brokk_bifrost_cpp::declarations::CppComparableParameter,
+    node: usize,
+    parameter: &str,
+    expected_const: bool,
+) -> bool {
+    let CppComparableNode::Named {
+        name,
+        primitive: false,
+        konst,
+        volatil: false,
+    } = shape.node(node)
+    else {
+        return false;
+    };
+    *konst == expected_const
+        && name.lexical_scope() == ["std", "basic_string"]
+        && name.path() == [parameter]
+        && !name.is_absolute()
+}
+
+fn is_basic_string_type_parameter(
+    identity: &StructuredTypeIdentity,
+    node: StructuredTypeNodeId,
+    parameter: &str,
+) -> bool {
+    let Some(StructuredTypeNodeView::Named(name)) = identity.view(node) else {
+        return false;
+    };
+    name.lexical_scope() == ["std", "basic_string"]
+        && name.path() == [parameter]
+        && !name.is_absolute()
+}
+
+fn basic_string_assignment_role(
+    owner_name: &str,
+    member: &brokk_bifrost_cpp::external_declarations::CppExternalMember,
+) -> Option<BasicStringAssignmentRole> {
+    if member.kind != CppExternalMemberKind::Function
+        || member.owner.as_deref() != Some(owner_name)
+        || member.name != "operator="
+    {
+        return None;
+    }
+    let return_type = member.return_type.as_ref()?;
+    let Some(StructuredTypeNodeView::Reference(returned)) = return_type.view(return_type.root_id())
+    else {
+        return None;
+    };
+    if !is_basic_string_self_type(return_type, returned) {
+        return None;
+    }
+    let [CppParameterType::Structured(identity)] = member.parameter_types.as_deref()? else {
+        return None;
+    };
+    let root = identity.root_id();
+    let (role, inner) = match identity.view(root)? {
+        StructuredTypeNodeView::Reference(inner) => (BasicStringAssignmentRole::Copy, inner),
+        StructuredTypeNodeView::RvalueReference(inner) => (BasicStringAssignmentRole::Move, inner),
+        _ => return None,
+    };
+    is_basic_string_self_type(identity, inner).then_some(role)
+}
+
+fn is_basic_string_self_type(
+    identity: &StructuredTypeIdentity,
+    node: StructuredTypeNodeId,
+) -> bool {
+    let Some(StructuredTypeNodeView::Named(name)) = identity.view(node) else {
+        return false;
+    };
+    let path = name.path();
+    let scope = name.lexical_scope();
+    scope == ["std", "basic_string"]
+        && ((path == ["basic_string"] && !name.is_absolute()) || (path == ["std", "basic_string"]))
+}
 
 /// Refine one C++ route with explicit include and activated-pack evidence.
 pub(crate) fn external_boundary_evidence(
@@ -77,6 +380,91 @@ pub(crate) enum CppExternalMemberResolution {
     DeclaredUnindexed,
     Absent,
     Unknown,
+}
+
+/// Exact active-model identity corresponding to one structurally resolved C++
+/// external type occurrence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CppExternalTypeModelResolution {
+    Unique(String),
+    Incomplete,
+    Conflict,
+}
+
+/// Resolve one parser-derived C++ type occurrence through a directly reached
+/// generated header model.
+///
+/// Only an explicitly qualified structured name is admitted. The matched
+/// alias, its declared target, exact artifact provenance, and complete header
+/// closure must all agree. A rendered spelling or terminal name alone can
+/// therefore never select a model owner.
+pub(crate) fn external_structured_type_model_resolution(
+    analyzer: &CppAnalyzer,
+    overlay: Option<&SemanticModelOverlay>,
+    file: &ProjectFile,
+    identity: &StructuredTypeIdentity,
+) -> CppExternalTypeModelResolution {
+    let Some(headers) = directly_reached_external_headers(analyzer, file) else {
+        return CppExternalTypeModelResolution::Incomplete;
+    };
+    let Some(headers) = headers.headers() else {
+        return CppExternalTypeModelResolution::Incomplete;
+    };
+    let Some(overlay) = overlay else {
+        return CppExternalTypeModelResolution::Incomplete;
+    };
+    let Some(name) = identity.nominal_name() else {
+        return CppExternalTypeModelResolution::Incomplete;
+    };
+    if !name.lexical_scope().is_empty() || name.path().len() < 2 {
+        return CppExternalTypeModelResolution::Incomplete;
+    }
+    let qualified_name = name.path().join(".");
+    let mut records = overlay
+        .symbols_named(&qualified_name)
+        .records
+        .into_iter()
+        .filter(|symbol| {
+            symbol.language == "cpp"
+                && symbol.owner_id.is_none()
+                && symbol.qualified_name == qualified_name
+                && symbol_is_in_headers(symbol, headers)
+                && symbol.provenance.origin == SemanticModelOriginKind::ExactGeneratedOutput
+        })
+        .collect::<Vec<_>>();
+    records.sort_by(|left, right| left.id.cmp(&right.id));
+    if records.len() > 1 || records.iter().any(|record| record.provenance.ambiguous) {
+        return CppExternalTypeModelResolution::Conflict;
+    }
+    let [record] = records.as_slice() else {
+        return CppExternalTypeModelResolution::Incomplete;
+    };
+    if record.provenance.completeness != SemanticModelCompleteness::Complete
+        || record.kind != SemanticModelSymbolKind::TypeAlias
+    {
+        return CppExternalTypeModelResolution::Incomplete;
+    }
+    let Some(underlying) = record.underlying_type.as_ref() else {
+        return CppExternalTypeModelResolution::Incomplete;
+    };
+    let [TypeRef::Declared { id, .. }] = underlying.referenced_types.as_slice() else {
+        return CppExternalTypeModelResolution::Incomplete;
+    };
+    let target = overlay.symbols_with_id(id);
+    let [target] = target.records.as_slice() else {
+        return CppExternalTypeModelResolution::Incomplete;
+    };
+    if target.owner_id.is_some()
+        || target.language != "cpp"
+        || target.provenance.pack_digest != record.provenance.pack_digest
+        || target.provenance.origin != SemanticModelOriginKind::ExactGeneratedOutput
+        || target.provenance.completeness != SemanticModelCompleteness::Complete
+        || target.provenance.ambiguous
+        || !symbol_is_in_headers(target, headers)
+    {
+        return CppExternalTypeModelResolution::Incomplete;
+    }
+    CppExternalTypeModelResolution::Unique(target.id.clone())
 }
 
 pub(crate) fn external_member_resolution(
@@ -398,6 +786,54 @@ impl DependencyPackAdapter for CppDependencyPackAdapter {
             })
         });
         extracted_types.dedup_by(|left, right| left.name == right.name);
+        let basic_string_type_parameters = extracted_types
+            .iter()
+            .filter_map(|record| {
+                (!record.is_type_alias)
+                    .then(|| {
+                        exact_basic_string_template_parameters(
+                            &record.name,
+                            record.template_metadata.as_ref(),
+                        )
+                    })
+                    .flatten()
+                    .map(|parameters| (record.name.clone(), parameters))
+            })
+            .collect::<HashMap<_, _>>();
+        let mut constructor_candidates =
+            HashMap::<(String, BasicStringConstructorRole), Vec<usize>>::default();
+        let mut assignment_candidates =
+            HashMap::<(String, BasicStringAssignmentRole), Vec<usize>>::default();
+        for (index, member) in extracted_members.iter().enumerate() {
+            for (owner_name, parameters) in &basic_string_type_parameters {
+                if let Some(role) = basic_string_constructor_role(owner_name, parameters, member) {
+                    constructor_candidates
+                        .entry((owner_name.clone(), role))
+                        .or_default()
+                        .push(index);
+                }
+                if let Some(role) = basic_string_assignment_role(owner_name, member) {
+                    assignment_candidates
+                        .entry((owner_name.clone(), role))
+                        .or_default()
+                        .push(index);
+                }
+            }
+        }
+        let unique_constructor_roles = constructor_candidates
+            .into_iter()
+            .filter_map(|((owner, role), indices)| {
+                (indices.len() == 1).then_some((indices[0], owner, role))
+            })
+            .collect::<Vec<_>>();
+        let unique_constructor_roles_by_index = unique_constructor_roles
+            .iter()
+            .map(|(index, _, role)| (*index, *role))
+            .collect::<HashMap<_, _>>();
+        let unique_assignment_roles_by_index = assignment_candidates
+            .into_iter()
+            .filter_map(|((_, role), indices)| (indices.len() == 1).then_some((indices[0], role)))
+            .collect::<HashMap<_, _>>();
         let type_ids = extracted_types
             .iter()
             .map(|record| {
@@ -410,12 +846,21 @@ impl DependencyPackAdapter for CppDependencyPackAdapter {
                 )
             })
             .collect::<HashMap<_, _>>();
-        let types = extracted_types
+        let basic_string_type_id = basic_string_type_parameters
+            .contains_key("std.basic_string")
+            .then(|| type_ids.get("std.basic_string"))
+            .flatten()
+            .map(String::as_str);
+        let mut types = extracted_types
             .into_iter()
             .map(|record| TypeFact {
                 id: type_ids[&record.name].clone(),
                 name: record.name.clone(),
-                type_kind: TypeKind::Class,
+                type_kind: if record.is_type_alias {
+                    TypeKind::TypeAlias
+                } else {
+                    TypeKind::Class
+                },
                 visibility: match record.visibility {
                     CppExternalVisibility::Public => Visibility::Public,
                     CppExternalVisibility::Protected => Visibility::Protected,
@@ -424,9 +869,19 @@ impl DependencyPackAdapter for CppDependencyPackAdapter {
                 is_abstract: false,
                 is_sealed: false,
                 has_explicit_type_terms: false,
-                type_parameters: Vec::new(),
+                type_parameters: basic_string_type_parameters
+                    .get(&record.name)
+                    .cloned()
+                    .unwrap_or_default(),
                 type_parameter_constraints: Vec::new(),
-                underlying_type: None,
+                underlying_type: record
+                    .underlying_type
+                    .as_ref()
+                    .and_then(|identity| pack_alias_type_ref(identity, basic_string_type_id))
+                    .map(|target| StructuredTypeExpression {
+                        display: "structured C++ alias target".to_owned(),
+                        referenced_types: vec![target],
+                    }),
                 value_semantics: None,
                 embedded_types: Vec::new(),
                 hierarchy: record
@@ -452,7 +907,9 @@ impl DependencyPackAdapter for CppDependencyPackAdapter {
             .collect::<Vec<_>>();
 
         let mut members = Vec::new();
-        for record in extracted_members {
+        let mut emitted_constructor_ids =
+            HashMap::<(String, BasicStringConstructorRole), String>::default();
+        for (record_index, record) in extracted_members.into_iter().enumerate() {
             let Some(owner_name) = record.owner.as_deref() else {
                 partial = true;
                 diagnostics.warning(
@@ -489,6 +946,7 @@ impl DependencyPackAdapter for CppDependencyPackAdapter {
                     CppParameterType::Unstructured => (unknown_type(), false),
                 })
                 .collect::<Vec<_>>();
+            let callable_arity = record.callable_arity;
             let parameter_types = parameters
                 .iter()
                 .map(|(r#type, _)| r#type.clone())
@@ -498,8 +956,18 @@ impl DependencyPackAdapter for CppDependencyPackAdapter {
                 .map(|(_, variadic)| *variadic)
                 .collect::<Vec<_>>();
             let return_type = record.return_type.as_ref().and_then(pack_type_ref);
+            let constructor_role = unique_constructor_roles_by_index
+                .get(&record_index)
+                .copied();
+            let assignment_role = unique_assignment_roles_by_index.get(&record_index).copied();
+            let is_basic_string_constructor = basic_string_type_parameters.contains_key(owner_name)
+                && record.name == "basic_string";
             let member_kind = match record.kind {
-                CppExternalMemberKind::Function if record.is_constructor => MemberKind::Constructor,
+                CppExternalMemberKind::Function
+                    if record.is_constructor || is_basic_string_constructor =>
+                {
+                    MemberKind::Constructor
+                }
                 CppExternalMemberKind::Function => MemberKind::Method,
                 CppExternalMemberKind::Field => MemberKind::Field,
                 CppExternalMemberKind::Macro => MemberKind::Macro,
@@ -519,10 +987,14 @@ impl DependencyPackAdapter for CppDependencyPackAdapter {
                 type_parameters: Vec::new(),
                 parameters: parameters
                     .into_iter()
-                    .map(|(r#type, variadic)| Parameter {
+                    .enumerate()
+                    .map(|(index, (r#type, variadic))| Parameter {
                         name: None,
                         r#type,
-                        optional: false,
+                        optional: !variadic
+                            && callable_arity.is_some_and(|arity| {
+                                index >= arity.required() && index < arity.total()
+                            }),
                         variadic,
                         passing_mode: Default::default(),
                     })
@@ -530,7 +1002,7 @@ impl DependencyPackAdapter for CppDependencyPackAdapter {
                 returns: return_type,
             });
             members.push(MemberFact {
-                id,
+                id: id.clone(),
                 owner: owner_id.clone(),
                 name: record.name,
                 member_kind,
@@ -542,7 +1014,9 @@ impl DependencyPackAdapter for CppDependencyPackAdapter {
                 is_static: false,
                 is_abstract: false,
                 is_virtual: false,
-                implicit_operation: None,
+                implicit_operation: constructor_role
+                    .map(BasicStringConstructorRole::operation)
+                    .or_else(|| assignment_role.map(BasicStringAssignmentRole::operation)),
                 callable_family_complete: false,
                 signature,
                 receiver: Some(ReceiverFact { pointer: false }),
@@ -555,9 +1029,30 @@ impl DependencyPackAdapter for CppDependencyPackAdapter {
                     symbol: record.qualified_name,
                 },
             });
+            if let Some(role) = constructor_role {
+                emitted_constructor_ids.insert((owner_name.to_owned(), role), id.clone());
+            }
         }
         members.sort_by(|left, right| left.id.cmp(&right.id));
         members.dedup_by(|left, right| left.id == right.id);
+
+        for type_fact in &mut types {
+            let Some(parameters) = basic_string_type_parameters.get(&type_fact.name) else {
+                continue;
+            };
+            type_fact.type_parameters = parameters.clone();
+            let copy_member = emitted_constructor_ids
+                .get(&(type_fact.name.clone(), BasicStringConstructorRole::Copy))
+                .cloned();
+            let move_member = emitted_constructor_ids
+                .contains_key(&(type_fact.name.clone(), BasicStringConstructorRole::Move));
+            if copy_member.is_some() || move_member {
+                type_fact.value_semantics = Some(TypeValueSemantics {
+                    copy: copy_member.map(|member| TypeCopySemantics::ViaMember { member }),
+                    move_semantics: move_member.then_some(TypeMoveSemantics::Invalidating),
+                });
+            }
+        }
 
         let (diagnostics, suppressed_diagnostics) = diagnostics.finish();
         let completeness =
@@ -600,6 +1095,7 @@ impl DependencyPackAdapter for CppDependencyPackAdapter {
                     review_required: false,
                 },
                 carried_sources: Vec::new(),
+                cpp_portability: None,
                 shards: vec![AuthoredShard {
                     id: "declarations.external".to_owned(),
                     activation: vec![ActivationSelector {
@@ -802,14 +1298,9 @@ fn discover_reachable_header_sets(
                 limits.max_source_path_depth
             )));
         }
-        let root_paths = paths_by_root.entry(root).or_default();
-        root_paths.insert(relative);
-        if root_paths.len() > limits.max_source_files_per_artifact {
-            return Err(HeaderDiscoveryError::Failed(format!(
-                "C++ header source set exceeded file limit {}",
-                limits.max_source_files_per_artifact
-            )));
-        }
+        // Read before recording: a header this run could not read is not a
+        // member of the source set it publishes, so the artifact a producer
+        // later materializes names no path that already failed here.
         let (source, raw_bytes) = match read_external_header(&header) {
             Ok(source) => source,
             Err(error) => {
@@ -820,6 +1311,14 @@ fn discover_reachable_header_sets(
                 continue;
             }
         };
+        let root_paths = paths_by_root.entry(root).or_default();
+        root_paths.insert(relative);
+        if root_paths.len() > limits.max_source_files_per_artifact {
+            return Err(HeaderDiscoveryError::Failed(format!(
+                "C++ header source set exceeded file limit {}",
+                limits.max_source_files_per_artifact
+            )));
+        }
         bytes_read = bytes_read.saturating_add(raw_bytes as u64);
         if bytes_read > limits.max_total_artifact_bytes {
             return Err(HeaderDiscoveryError::Failed(format!(
@@ -904,7 +1403,8 @@ fn pack_type_ref(identity: &StructuredTypeIdentity) -> Option<TypeRef> {
     enum Work {
         Visit(StructuredTypeNodeId),
         Pointer,
-        ByRef,
+        LvalueReference,
+        RvalueReference,
         Array,
         Slice,
         Map,
@@ -940,7 +1440,11 @@ fn pack_type_ref(identity: &StructuredTypeIdentity) -> Option<TypeRef> {
                     work.push(Work::Visit(inner));
                 }
                 StructuredTypeNodeView::Reference(inner) => {
-                    work.push(Work::ByRef);
+                    work.push(Work::LvalueReference);
+                    work.push(Work::Visit(inner));
+                }
+                StructuredTypeNodeView::RvalueReference(inner) => {
+                    work.push(Work::RvalueReference);
                     work.push(Work::Visit(inner));
                 }
                 StructuredTypeNodeView::Array(inner) => {
@@ -970,9 +1474,19 @@ fn pack_type_ref(identity: &StructuredTypeIdentity) -> Option<TypeRef> {
                 let element = Box::new(values.pop()?);
                 values.push(TypeRef::Pointer { element });
             }
-            Work::ByRef => {
+            Work::LvalueReference => {
                 let element = Box::new(values.pop()?);
-                values.push(TypeRef::ByRef { element });
+                values.push(TypeRef::ByRef {
+                    element,
+                    reference_kind: TypeRefReferenceKind::Lvalue,
+                });
+            }
+            Work::RvalueReference => {
+                let element = Box::new(values.pop()?);
+                values.push(TypeRef::ByRef {
+                    element,
+                    reference_kind: TypeRefReferenceKind::Rvalue,
+                });
             }
             Work::Array => {
                 let element = Box::new(values.pop()?);
@@ -1005,6 +1519,73 @@ fn pack_type_ref(identity: &StructuredTypeIdentity) -> Option<TypeRef> {
     (values.len() == 1).then(|| values.pop()).flatten()
 }
 
+/// Translate an alias target while retaining the declaration identity of the
+/// canonical C++ standard-library `basic_string` primary.
+///
+/// `pack_type_ref` deliberately publishes nominal names because most external
+/// references cannot be proven to name one of the declarations in this source
+/// set. An alias target is different only when the parser-derived structured
+/// identity proves that its base is the canonical `std::basic_string` name and
+/// the extracted source set contains the exact, reviewed primary declaration.
+/// In that case, using `TypeRef::Declared` lets consumers follow the alias to
+/// the generated declaration without matching a rendered spelling. All other
+/// targets retain the ordinary named reference (or remain unknown when their
+/// structured shape cannot be translated).
+fn pack_alias_type_ref(
+    identity: &StructuredTypeIdentity,
+    basic_string_id: Option<&str>,
+) -> Option<TypeRef> {
+    let packed = pack_type_ref(identity)?;
+    let Some(basic_string_id) = basic_string_id else {
+        return Some(packed);
+    };
+    let base = match identity.view(identity.root_id())? {
+        StructuredTypeNodeView::Named(_) => identity.root_id(),
+        StructuredTypeNodeView::Generic { base, .. } => base,
+        _ => return Some(packed),
+    };
+    let Some(StructuredTypeNodeView::Named(name)) = identity.view(base) else {
+        return Some(packed);
+    };
+    if !is_canonical_basic_string_name(name) {
+        return Some(packed);
+    }
+    let TypeRef::Named {
+        arguments,
+        nullable,
+        ..
+    } = packed
+    else {
+        return Some(packed);
+    };
+    Some(TypeRef::Declared {
+        id: basic_string_id.to_owned(),
+        arguments,
+        nullable,
+    })
+}
+
+/// Whether a parser-derived name resolves to the canonical `std::basic_string`
+/// declaration at the alias's lexical site.
+///
+/// The unqualified form is accepted only from the `std` namespace captured by
+/// the extractor. The qualified form must be rooted at the global namespace;
+/// a same-named type in another lexical scope therefore remains a `Named`
+/// reference instead of acquiring a declaration id by display-name matching.
+fn is_canonical_basic_string_name(
+    name: &brokk_bifrost_core::analyzer::model::StructuredTypeName,
+) -> bool {
+    if name.path() == ["std", "basic_string"] {
+        // A qualified spelling without a leading `::` is still accepted at
+        // global scope: there is no enclosing namespace in which a shadowing
+        // `std` declaration could be found. Nested scopes are intentionally
+        // declined because this producer has no resolver for qualified-name
+        // shadowing.
+        return name.lexical_scope().is_empty();
+    }
+    name.lexical_scope() == ["std"] && name.path() == ["basic_string"]
+}
+
 fn stable_path(path: &Path) -> String {
     path.components()
         .filter_map(|component| match component {
@@ -1018,6 +1599,10 @@ fn stable_path(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::analyzer::semantic::{
+        SemanticBudget, SemanticCapability, SemanticEffect, SemanticGapImpact, SemanticOutcome,
+        SemanticRequest, TransferKind, TransferOperation, ValueFlowKind,
+    };
     use crate::analyzer::semantic_model::CompilerOptions;
     use crate::analyzer::semantic_model::{
         AuthoredPayload, CatalogOptions, ResolvedDependencyArtifactInput,
@@ -1034,7 +1619,277 @@ mod tests {
         OverlayProject, Project, TestProject, WorkspaceAnalyzer,
     };
     use brokk_bifrost_core::analyzer::ProjectFile;
+    use brokk_bifrost_core::analyzer::model::CppTemplateParameterMetadata;
+    use brokk_bifrost_cpp::external_declarations::CppExternalDeclarationSet;
     use std::sync::Arc;
+
+    fn extract_test_declarations(source: &str) -> CppExternalDeclarationSet {
+        let temp = tempfile::tempdir().expect("temp root");
+        extract_external_declarations(
+            temp.path(),
+            Path::new("basic_string"),
+            source,
+            CppExternalDeclarationLimits::default(),
+        )
+    }
+
+    fn template_default(base: &str, parameter: &str) -> CppTemplateExpression {
+        CppTemplateExpression {
+            text: format!("{base}<{parameter}>"),
+            term: CppTemplateTerm::Node {
+                kind: "template_type".to_owned(),
+                children: vec![
+                    CppTemplateTerm::Atom {
+                        kind: "identifier".to_owned(),
+                        text: base.to_owned(),
+                    },
+                    CppTemplateTerm::Node {
+                        kind: "template_argument_list".to_owned(),
+                        children: vec![
+                            CppTemplateTerm::Atom {
+                                kind: "<".to_owned(),
+                                text: "<".to_owned(),
+                            },
+                            CppTemplateTerm::Parameter(parameter.to_owned()),
+                            CppTemplateTerm::Atom {
+                                kind: ">".to_owned(),
+                                text: ">".to_owned(),
+                            },
+                        ],
+                    },
+                ],
+            },
+        }
+    }
+
+    fn basic_string_metadata() -> CppTemplateMetadata {
+        CppTemplateMetadata {
+            primary_name: "basic_string".to_owned(),
+            primary_fq_name: "std.basic_string".to_owned(),
+            parameters: vec![
+                CppTemplateParameterMetadata {
+                    name: "C".to_owned(),
+                    kind: CppTemplateParameterKind::Type,
+                    variadic: false,
+                    default: None,
+                },
+                CppTemplateParameterMetadata {
+                    name: "Traits".to_owned(),
+                    kind: CppTemplateParameterKind::Type,
+                    variadic: false,
+                    default: Some(template_default("char_traits", "C")),
+                },
+                CppTemplateParameterMetadata {
+                    name: "Alloc".to_owned(),
+                    kind: CppTemplateParameterKind::Type,
+                    variadic: false,
+                    default: Some(template_default("allocator", "C")),
+                },
+            ],
+            specialization_arguments: Vec::new(),
+            alias_target: None,
+        }
+    }
+
+    #[test]
+    fn basic_string_model_rejects_structured_template_near_misses() {
+        let exact = basic_string_metadata();
+        assert_eq!(
+            Some(vec![
+                "C".to_owned(),
+                "Traits".to_owned(),
+                "Alloc".to_owned()
+            ]),
+            exact_basic_string_template_parameters("std.basic_string", Some(&exact))
+        );
+        assert_eq!(
+            None,
+            exact_basic_string_template_parameters("custom.basic_string", Some(&exact)),
+            "a same-named custom template is not the standard owner"
+        );
+
+        let mut wrong_arity = exact.clone();
+        wrong_arity.parameters.pop();
+        assert_eq!(
+            None,
+            exact_basic_string_template_parameters("std.basic_string", Some(&wrong_arity))
+        );
+
+        let mut wrong_traits = exact.clone();
+        wrong_traits.parameters[1].default = Some(template_default("custom_traits", "C"));
+        assert_eq!(
+            None,
+            exact_basic_string_template_parameters("std.basic_string", Some(&wrong_traits))
+        );
+
+        let mut wrong_allocator_parameter = exact;
+        wrong_allocator_parameter.parameters[2].default =
+            Some(template_default("allocator", "Traits"));
+        assert_eq!(
+            None,
+            exact_basic_string_template_parameters(
+                "std.basic_string",
+                Some(&wrong_allocator_parameter),
+            )
+        );
+    }
+
+    #[test]
+    fn basic_string_character_data_role_requires_exact_defaulted_allocator_shape() {
+        let declarations = extract_test_declarations(
+            r#"
+            namespace std {
+            template <class C, class Traits, class Alloc> class basic_string {
+            public:
+                basic_string(const C*, const Alloc& = Alloc());
+                basic_string(const C&, const Alloc& = Alloc());
+            };
+            }
+            "#,
+        );
+        let parameters = vec!["C".to_owned(), "Traits".to_owned(), "Alloc".to_owned()];
+        let constructors = declarations
+            .members
+            .iter()
+            .filter(|member| {
+                member.owner.as_deref() == Some("std.basic_string") && member.name == "basic_string"
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(2, constructors.len(), "{declarations:#?}");
+        assert_eq!(
+            1,
+            constructors
+                .iter()
+                .filter(|member| {
+                    basic_string_constructor_role("std.basic_string", &parameters, member)
+                        == Some(BasicStringConstructorRole::CharacterData)
+                })
+                .count(),
+            "only the character pointer plus defaulted allocator constructor is implicit from one argument"
+        );
+        assert!(constructors.iter().all(|member| {
+            basic_string_constructor_role("custom.basic_string", &parameters, member).is_none()
+        }));
+
+        let required_allocator = extract_test_declarations(
+            r#"
+            namespace std {
+            template <class C, class Traits, class Alloc> class basic_string {
+            public:
+                basic_string(const C*, const Alloc&);
+            };
+            }
+            "#,
+        );
+        let required_allocator = required_allocator
+            .members
+            .first()
+            .unwrap_or_else(|| panic!("required allocator constructor: {required_allocator:#?}"));
+        assert_eq!(
+            None,
+            basic_string_constructor_role("std.basic_string", &parameters, required_allocator),
+            "a constructor requiring the allocator is not callable from one character-data argument"
+        );
+
+        for source in [
+            "explicit basic_string(const C*, const Alloc& = Alloc());",
+            "basic_string(C*, const Alloc& = Alloc());",
+            "basic_string(const C*, Alloc& = Alloc());",
+        ] {
+            let near_miss = extract_test_declarations(&format!(
+                "namespace std {{ template <class C, class Traits, class Alloc> class basic_string {{ public: {source} }}; }}"
+            ));
+            let near_miss = near_miss
+                .members
+                .first()
+                .unwrap_or_else(|| panic!("near-miss constructor: {near_miss:#?}"));
+            assert_eq!(
+                None,
+                basic_string_constructor_role("std.basic_string", &parameters, near_miss),
+                "explicit or cv-mismatched constructors must not acquire the implicit preserving role: {near_miss:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn basic_string_assignment_roles_require_unique_structured_self_parameters() {
+        let declarations = extract_test_declarations(
+            r#"
+            namespace std {
+            class basic_string {
+            public:
+                basic_string& operator=(const basic_string&);
+                basic_string& operator=(basic_string&&);
+                basic_string& operator=(const other_string&);
+                basic_string& operator=(int);
+            };
+            class other_string {};
+            }
+            "#,
+        );
+        let assignments = declarations
+            .members
+            .iter()
+            .filter(|member| {
+                member.owner.as_deref() == Some("std.basic_string") && member.name == "operator="
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(4, assignments.len(), "{declarations:#?}");
+        assert_eq!(
+            1,
+            assignments
+                .iter()
+                .filter(|member| {
+                    basic_string_assignment_role("std.basic_string", member)
+                        == Some(BasicStringAssignmentRole::Copy)
+                })
+                .count(),
+            "copy assignment must have one exact self-reference candidate"
+        );
+        assert_eq!(
+            1,
+            assignments
+                .iter()
+                .filter(|member| {
+                    basic_string_assignment_role("std.basic_string", member)
+                        == Some(BasicStringAssignmentRole::Move)
+                })
+                .count(),
+            "move assignment must have one exact self-reference candidate"
+        );
+        assert!(
+            assignments.iter().any(|member| {
+                basic_string_assignment_role("std.basic_string", member).is_none()
+            }),
+            "non-self overloads must not acquire an implicit assignment role"
+        );
+        assert!(
+            basic_string_assignment_role("custom.basic_string", assignments[0]).is_none(),
+            "a same-shaped overload on a different owner is not canonical basic_string"
+        );
+
+        let wrong_return = extract_test_declarations(
+            r#"
+            namespace std {
+            class basic_string {
+            public:
+                void operator=(const basic_string&);
+            };
+            }
+            "#,
+        );
+        let wrong_return = wrong_return
+            .members
+            .iter()
+            .find(|member| member.name == "operator=")
+            .unwrap_or_else(|| panic!("wrong-return assignment: {wrong_return:#?}"));
+        assert_eq!(
+            None,
+            basic_string_assignment_role("std.basic_string", wrong_return),
+            "a wrong-return-type overload must not acquire an implicit assignment role"
+        );
+    }
 
     #[test]
     fn discovers_and_produces_vector_type_and_member_facts() {
@@ -1115,8 +1970,18 @@ mod tests {
         ProjectFile::new(root.clone(), "fake/include/vector")
             .write(concat!(
                 "namespace ns { class Widget; }\n",
+                "namespace custom { class basic_string {}; using string = basic_string; }\n",
                 "namespace std {\n",
-                "class string;\n",
+                "template <class C, class Traits = char_traits<C>, class Alloc = allocator<C>>\n",
+                "class basic_string {\n",
+                "public:\n",
+                "  basic_string(const basic_string&);\n",
+                "  basic_string(basic_string&&);\n",
+                "  basic_string(const C*, const Alloc& = Alloc());\n",
+                "  basic_string& operator=(const basic_string&);\n",
+                "  basic_string& operator=(basic_string&&);\n",
+                "};\n",
+                "using string = basic_string<char, char_traits<char>, allocator<char>>;\n",
                 "template <typename T> class vector {\n",
                 "public:\n",
                 "  void push_back(const T& value);\n",
@@ -1179,6 +2044,88 @@ mod tests {
             .iter()
             .find(|fact| fact.name == "std.vector")
             .expect("vector type");
+        let basic_string = types
+            .iter()
+            .find(|fact| fact.name == "std.basic_string")
+            .expect("basic_string type");
+        assert_eq!(vec!["C", "Traits", "Alloc"], basic_string.type_parameters);
+        let basic_string_members = members
+            .iter()
+            .filter(|fact| fact.owner == basic_string.id)
+            .collect::<Vec<_>>();
+        assert!(basic_string_members.iter().any(|member| {
+            member.implicit_operation == Some(ImplicitOperation::CopyConstructor)
+        }));
+        assert!(basic_string_members.iter().any(|member| {
+            member.implicit_operation == Some(ImplicitOperation::MoveConstructor)
+        }));
+        assert!(basic_string_members.iter().any(|member| {
+            member.implicit_operation == Some(ImplicitOperation::ValuePreservingConstructor)
+                && member.signature.as_ref().is_some_and(|signature| {
+                    signature.parameters.len() == 2
+                        && !signature.parameters[0].optional
+                        && signature.parameters[1].optional
+                })
+        }));
+        assert!(
+            basic_string_members.iter().any(|member| {
+                member.name == "operator="
+                    && member.implicit_operation == Some(ImplicitOperation::CopyAssignment)
+            }),
+            "copy assignment role: {basic_string_members:#?}"
+        );
+        assert!(
+            basic_string_members.iter().any(|member| {
+                member.name == "operator="
+                    && member.implicit_operation == Some(ImplicitOperation::MoveAssignment)
+            }),
+            "move assignment role: {basic_string_members:#?}"
+        );
+        assert!(matches!(
+            &basic_string.value_semantics,
+            Some(TypeValueSemantics {
+                copy: Some(TypeCopySemantics::ViaMember { member }),
+                move_semantics: Some(TypeMoveSemantics::Invalidating),
+            }) if basic_string_members.iter().any(|candidate| candidate.id == *member)
+        ));
+        let string_alias = types
+            .iter()
+            .find(|fact| fact.name == "std.string")
+            .expect("string alias");
+        assert_eq!(TypeKind::TypeAlias, string_alias.type_kind);
+        let Some(underlying) = string_alias.underlying_type.as_ref() else {
+            panic!("structured string alias target: {string_alias:#?}");
+        };
+        let [
+            TypeRef::Declared {
+                id,
+                arguments,
+                nullable,
+            },
+        ] = underlying.referenced_types.as_slice()
+        else {
+            panic!("one declared string alias target: {underlying:#?}");
+        };
+        assert_eq!(
+            type_declaration_id(TypeIdentity {
+                ecosystem: "cpp-headers",
+                name: "std.basic_string",
+            }),
+            *id
+        );
+        assert!(!nullable);
+        assert_eq!(3, arguments.len());
+        let custom_string_alias = types
+            .iter()
+            .find(|fact| fact.name == "custom.string")
+            .expect("custom string alias");
+        assert!(matches!(
+            custom_string_alias
+                .underlying_type
+                .as_ref()
+                .and_then(|underlying| underlying.referenced_types.first()),
+            Some(TypeRef::Named { name, .. }) if name == "basic_string"
+        ));
         let parameters = |name: &str, arity: usize| {
             members
                 .iter()
@@ -1193,6 +2140,7 @@ mod tests {
             name: None,
             r#type: TypeRef::ByRef {
                 element: Box::new(element),
+                reference_kind: TypeRefReferenceKind::Lvalue,
             },
             optional: false,
             variadic: false,
@@ -1529,6 +2477,133 @@ mod tests {
         );
     }
 
+    /// The same hole with no diagnostic cap in play, which is the shape a real
+    /// workspace hits: the readable sibling contributes its whole include
+    /// closure, the bad file surfaces exactly one error diagnostic charged to
+    /// it, and nothing is suppressed.
+    ///
+    /// The last assertion is the one with a policy behind it. Discovery
+    /// completeness is a fact about the dependency set rather than a gate on
+    /// preparing it (#2887), so the header sets this run did resolve are still
+    /// prepared and activated; what the incompleteness buys is
+    /// `DependencyDiscoveryEvidence::truncated`, which keeps a name the
+    /// unreadable file would have answered unproven rather than proved absent.
+    /// That is why the answer has to survive the hole instead of being thrown
+    /// away by an early return (#2750): after #2887 the resolved sets are what
+    /// the workspace actually gets.
+    #[test]
+    fn an_unreadable_named_source_leaves_the_other_sources_discovered() {
+        let temp = tempfile::tempdir().expect("temp root");
+        let root = temp.path().canonicalize().expect("canonical root");
+        ProjectFile::new(root.clone(), "src/good.cpp")
+            .write("#include <widget.h>\nint good() { return 0; }\n")
+            .expect("readable source");
+        std::fs::write(root.join("src/binary.cpp"), b"int bad() {\0}\n")
+            .expect("NUL-bearing source");
+        ProjectFile::new(root.clone(), "fake/include/widget.h")
+            .write("#include <detail/inner.h>\nclass Widget {};\n")
+            .expect("entry header");
+        ProjectFile::new(root.clone(), "fake/include/detail/inner.h")
+            .write("class Inner {};\n")
+            .expect("nested header");
+        ProjectFile::new(root.clone(), "compile_commands.json")
+            .write(r#"[{"directory":".","file":"src/good.cpp","arguments":["clang++","-isystem","fake/include","-c","src/good.cpp"]},{"directory":".","file":"src/binary.cpp","arguments":["clang++","-isystem","fake/include","-c","src/binary.cpp"]}]"#)
+            .expect("database");
+        let project = TestProject::new(root.clone(), Language::Cpp);
+
+        let discovery = resolve_cpp_semantic_pack_dependencies(
+            &project,
+            &DependencyPackLimits::default(),
+            None,
+        );
+
+        assert_eq!(
+            vec![(
+                root_dependency_name(&root.join("fake/include")),
+                "fake/include".to_owned(),
+                vec!["detail/inner.h".to_owned(), "widget.h".to_owned()],
+            )],
+            discovered_header_sets(&discovery, &root),
+            "the readable source still yields its whole include closure"
+        );
+        let [diagnostic] = discovery.diagnostics.as_slice() else {
+            panic!("exactly one read failure: {discovery:#?}");
+        };
+        assert_eq!("cpp.header_discovery_failed", diagnostic.code);
+        assert_eq!(
+            DependencyPackDiagnosticSeverity::Error,
+            diagnostic.severity,
+            "{diagnostic:#?}"
+        );
+        assert_eq!(
+            Some(Path::new("src/binary.cpp")),
+            diagnostic.location.as_deref().map(Path::new),
+            "the diagnostic is charged to the file it happened on"
+        );
+        assert_eq!(
+            0,
+            discovery.suppressed_diagnostics.total(),
+            "{discovery:#?}"
+        );
+        assert!(
+            !discovery.complete,
+            "a read hole keeps the run incomplete: {discovery:#?}"
+        );
+    }
+
+    /// An external header the traversal cannot read is dropped before its
+    /// source set records it, so no artifact a producer later materializes
+    /// names a path that already failed to read here. The readable header
+    /// beside it stays a member of that set (#2750).
+    #[test]
+    fn an_unreadable_external_header_is_not_recorded_into_its_source_set() {
+        let temp = tempfile::tempdir().expect("temp root");
+        let root = temp.path().canonicalize().expect("canonical root");
+        ProjectFile::new(root.clone(), "src/main.cpp")
+            .write("#include <widget.h>\n#include <broken.h>\n")
+            .expect("source");
+        ProjectFile::new(root.clone(), "fake/include/widget.h")
+            .write("class Widget {};\n")
+            .expect("readable header");
+        std::fs::write(root.join("fake/include/broken.h"), b"class Broken {\0};\n")
+            .expect("NUL-bearing header");
+        ProjectFile::new(root.clone(), "compile_commands.json")
+            .write(r#"[{"directory":".","file":"src/main.cpp","arguments":["clang++","-isystem","fake/include","-c","src/main.cpp"]}]"#)
+            .expect("database");
+        let project = TestProject::new(root.clone(), Language::Cpp);
+
+        let discovery = resolve_cpp_semantic_pack_dependencies(
+            &project,
+            &DependencyPackLimits::default(),
+            None,
+        );
+
+        assert_eq!(
+            vec![(
+                root_dependency_name(&root.join("fake/include")),
+                "fake/include".to_owned(),
+                vec!["widget.h".to_owned()],
+            )],
+            discovered_header_sets(&discovery, &root),
+            "the unreadable header is not a member of the published set"
+        );
+        let [diagnostic] = discovery.diagnostics.as_slice() else {
+            panic!("exactly one read failure: {discovery:#?}");
+        };
+        assert_eq!("cpp.header_discovery_failed", diagnostic.code);
+        assert!(
+            Path::new(
+                diagnostic
+                    .location
+                    .as_deref()
+                    .expect("the diagnostic names the header")
+            )
+            .ends_with("fake/include/broken.h"),
+            "{diagnostic:#?}"
+        );
+        assert!(!discovery.complete, "{discovery:#?}");
+    }
+
     #[test]
     fn dependency_limit_makes_discovery_incomplete() {
         let temp = tempfile::tempdir().expect("temp root");
@@ -1699,6 +2774,392 @@ mod tests {
             },
             cpp.external_header_closure_work_counts_for_test(),
             "a later forward batch reuses the published closure"
+        );
+    }
+
+    #[test]
+    fn activated_basic_string_pack_lowers_exact_copy_and_move_operations() {
+        let temp = tempfile::tempdir().expect("temp root");
+        let root = temp.path().canonicalize().expect("canonical root");
+        let source = concat!(
+            "#include <string>\n",
+            "std::string copy(std::string source) {\n",
+            "  std::string copied = source;\n",
+            "  std::string assigned;\n",
+            "  assigned = source;\n",
+            "  return copied;\n",
+            "}\n",
+            "std::string relay(std::string source) {\n",
+            "  return source;\n",
+            "}\n",
+            "std::string relay_local(std::string source) {\n",
+            "  std::string local = source;\n",
+            "  return local;\n",
+            "}\n",
+            "std::string relay_const(const std::string source) {\n",
+            "  return source;\n",
+            "}\n",
+            "std::string from_literal() {\n",
+            "  return \"tainted\";\n",
+            "}\n",
+            "std::string from_wide_literal() {\n",
+            "  return L\"tainted\";\n",
+            "}\n",
+        );
+        let file = ProjectFile::new(root.clone(), "src/main.cpp");
+        file.write(source).expect("source");
+        ProjectFile::new(root.clone(), "fake/include/string")
+            .write(concat!(
+                "namespace std {\n",
+                "template <class C, class Traits = char_traits<C>, class Alloc = allocator<C>>\n",
+                "class basic_string { public: basic_string(); basic_string(const basic_string&); basic_string(basic_string&&); basic_string(const C*, const Alloc& = Alloc()); basic_string& operator=(const basic_string&); basic_string& operator=(basic_string&&); };\n",
+                "using string = basic_string<char, char_traits<char>, allocator<char>>;\n",
+                "}\n",
+            ))
+            .expect("header");
+        ProjectFile::new(root.clone(), "compile_commands.json")
+            .write(r#"[{"directory":".","file":"src/main.cpp","arguments":["clang++","-isystem","fake/include","-c","src/main.cpp"]}]"#)
+            .expect("database");
+        let project: Arc<dyn Project> = Arc::new(TestProject::new(root, Language::Cpp));
+        let workspace =
+            WorkspaceAnalyzer::build_ephemeral_footgun(project, AnalyzerConfig::default())
+                .expect("ephemeral workspace should build");
+        let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default())
+            .expect("ephemeral catalog");
+        let cancellation = CancellationToken::new();
+        let activation = SemanticModelActivationRequest {
+            bifrost_version: semver::Version::parse(env!("CARGO_PKG_VERSION"))
+                .expect("crate version"),
+            evidence: Vec::new(),
+            controls: vec![SemanticModelActivationControl {
+                scope: SemanticModelControlScope::Workspace,
+                action: SemanticModelControlAction::Enable,
+                selector: SemanticModelPackSelector {
+                    pack_id: "bifrost.external.cpp-headers".to_owned(),
+                    version: None,
+                    manifest_digest: None,
+                },
+            }],
+            limits: SemanticModelRuntimeLimits::default(),
+        };
+        let outcome = workspace.activate_dependency_packs(
+            &AnalyzerConfig::default(),
+            &[DependencyPackEcosystem::Cpp],
+            DependencyPackWorkspaceContext {
+                catalog: &catalog,
+                persistence: None,
+                activation: &activation,
+                limits: DependencyPackLimits::default(),
+                cancellation: &cancellation,
+            },
+        );
+        assert!(outcome.complete(), "{outcome:#?}");
+
+        let snapshot = workspace.analyzer().active_semantic_model_snapshot();
+        let _scope =
+            AnalyzerQueryScope::with_active_semantic_model_snapshot(workspace.analyzer(), snapshot);
+        let mut budget = SemanticBudget::default();
+        let SemanticOutcome::Complete {
+            value: artifact, ..
+        } = workspace
+            .materialize_program_semantics(
+                &file,
+                &mut SemanticRequest::new(&mut budget, &cancellation),
+            )
+            .expect("C++ semantic materialization")
+        else {
+            panic!("C++ semantic materialization must complete");
+        };
+        let copy = artifact
+            .procedures()
+            .iter()
+            .find(|procedure| {
+                procedure
+                    .locator()
+                    .declaration()
+                    .segments()
+                    .last()
+                    .and_then(|segment| segment.name())
+                    == Some("copy")
+            })
+            .expect("copy procedure");
+        let transfers = copy
+            .points()
+            .iter()
+            .flat_map(|point| point.events.windows(2))
+            .filter(|events| {
+                matches!(
+                    (&events[0].effect, &events[1].effect),
+                    (
+                        SemanticEffect::Assignment { target, value },
+                        SemanticEffect::ValueFlow {
+                            kind: ValueFlowKind::Transfer(transfer),
+                            source,
+                            target: flow_target,
+                        }
+                    ) if transfer.kind == TransferKind::Copy
+                        && matches!(transfer.operation, TransferOperation::CallSite(_))
+                        && source == value
+                        && flow_target == target
+                )
+            })
+            .count();
+        assert_eq!(
+            2, transfers,
+            "exact copy construction and assignment must publish adjacent call-backed transfers: {copy:#?}",
+        );
+
+        let relay = artifact
+            .procedures()
+            .iter()
+            .find(|procedure| {
+                procedure
+                    .locator()
+                    .declaration()
+                    .segments()
+                    .last()
+                    .and_then(|segment| segment.name())
+                    == Some("relay")
+            })
+            .expect("relay procedure");
+        let move_transfers = relay
+            .points()
+            .iter()
+            .flat_map(|point| point.events.windows(2))
+            .filter(|events| {
+                matches!(
+                    (&events[0].effect, &events[1].effect),
+                    (
+                        SemanticEffect::Assignment { target, value },
+                        SemanticEffect::ValueFlow {
+                            kind: ValueFlowKind::Transfer(transfer),
+                            source,
+                            target: flow_target,
+                        }
+                    ) if transfer.kind
+                        == TransferKind::Move {
+                            invalidation: crate::analyzer::semantic::MoveInvalidation::Invalidated,
+                        }
+                        && matches!(transfer.operation, TransferOperation::CallSite(_))
+                        && source == value
+                        && flow_target == target
+                )
+            })
+            .count();
+        assert_eq!(
+            1, move_transfers,
+            "a by-value basic_string parameter return must publish one adjacent call-backed invalidating move: {relay:#?}",
+        );
+        assert_eq!(
+            1,
+            relay
+                .points()
+                .iter()
+                .flat_map(|point| &point.events)
+                .filter(|event| matches!(
+                    event.effect,
+                    SemanticEffect::ValueFlow {
+                        kind: ValueFlowKind::Return,
+                        ..
+                    }
+                ))
+                .count(),
+            "the moved value must feed the procedure's normal return port: {relay:#?}",
+        );
+        assert!(
+            !relay.gaps().iter().any(|gap| {
+                gap.capability == SemanticCapability::Values
+                    && gap.impacts.contains(SemanticGapImpact::ReturnTransfer)
+            }),
+            "an exact parameter move return must not retain a return-transfer gap: {relay:#?}",
+        );
+
+        let relay_local = artifact
+            .procedures()
+            .iter()
+            .find(|procedure| {
+                procedure
+                    .locator()
+                    .declaration()
+                    .segments()
+                    .last()
+                    .and_then(|segment| segment.name())
+                    == Some("relay_local")
+            })
+            .expect("relay_local procedure");
+        let local_copy_transfers = relay_local
+            .points()
+            .iter()
+            .flat_map(|point| point.events.windows(2))
+            .filter(|events| {
+                matches!(
+                    (&events[0].effect, &events[1].effect),
+                    (
+                        SemanticEffect::Assignment { target, value },
+                        SemanticEffect::ValueFlow {
+                            kind: ValueFlowKind::Transfer(transfer),
+                            source,
+                            target: flow_target,
+                        }
+                    ) if transfer.kind == TransferKind::Copy
+                        && matches!(transfer.operation, TransferOperation::CallSite(_))
+                        && source == value
+                        && flow_target == target
+                )
+            })
+            .count();
+        assert_eq!(
+            1, local_copy_transfers,
+            "named-local copy initialization remains an exact copy transfer: {relay_local:#?}",
+        );
+        assert_eq!(
+            1,
+            relay_local
+                .gaps()
+                .iter()
+                .filter(|gap| {
+                    gap.capability == SemanticCapability::Values
+                        && gap.impacts.contains(SemanticGapImpact::ReturnTransfer)
+                })
+                .count(),
+            "returning a named local must retain its typed return-transfer gap: {relay_local:#?}",
+        );
+
+        let relay_const = artifact
+            .procedures()
+            .iter()
+            .find(|procedure| {
+                procedure
+                    .locator()
+                    .declaration()
+                    .segments()
+                    .last()
+                    .and_then(|segment| segment.name())
+                    == Some("relay_const")
+            })
+            .expect("relay_const procedure");
+        assert!(
+            !relay_const
+                .points()
+                .iter()
+                .any(|point| point.events.iter().any(|event| {
+                    matches!(
+                        event.effect,
+                        SemanticEffect::ValueFlow {
+                            kind: ValueFlowKind::Transfer(
+                                crate::analyzer::semantic::ValueTransfer {
+                                    kind: TransferKind::Move { .. },
+                                    ..
+                                }
+                            ),
+                            ..
+                        }
+                    )
+                })),
+            "a const by-value parameter cannot select the move constructor: {relay_const:#?}",
+        );
+        assert!(
+            relay_const.gaps().iter().any(|gap| {
+                gap.capability == SemanticCapability::Values
+                    && gap.impacts.contains(SemanticGapImpact::ReturnTransfer)
+            }),
+            "a const parameter return must retain typed return incompleteness: {relay_const:#?}",
+        );
+
+        let from_literal = artifact
+            .procedures()
+            .iter()
+            .find(|procedure| {
+                procedure
+                    .locator()
+                    .declaration()
+                    .segments()
+                    .last()
+                    .and_then(|segment| segment.name())
+                    == Some("from_literal")
+            })
+            .expect("from_literal procedure");
+        assert!(
+            from_literal.points().iter().any(|point| {
+                point.events.windows(2).any(|events| {
+                    matches!(
+                        (&events[0].effect, &events[1].effect),
+                        (
+                            SemanticEffect::Assignment { target, value },
+                            SemanticEffect::ValueFlow {
+                                kind: ValueFlowKind::Transfer(transfer),
+                                source,
+                                target: flow_target,
+                            }
+                        ) if transfer.kind == TransferKind::Conversion {
+                            preservation: crate::analyzer::semantic::ValuePreservation::Preserving,
+                        }
+                            && matches!(transfer.operation, TransferOperation::CallSite(_))
+                            && source == value
+                            && flow_target == target
+                    )
+                })
+            }),
+            "narrow character data must use the exact value-preserving constructor: {from_literal:#?}",
+        );
+        assert!(
+            !from_literal.gaps().iter().any(|gap| {
+                gap.capability == SemanticCapability::Values
+                    && gap.impacts.contains(SemanticGapImpact::ReturnTransfer)
+            }),
+            "an exact character-data return must not retain a return-transfer gap: {from_literal:#?}",
+        );
+        assert_eq!(
+            1,
+            from_literal
+                .points()
+                .iter()
+                .flat_map(|point| &point.events)
+                .filter(|event| matches!(
+                    event.effect,
+                    SemanticEffect::ValueFlow {
+                        kind: ValueFlowKind::Return,
+                        ..
+                    }
+                ))
+                .count(),
+            "the exact character-data construction must feed the normal return port: {from_literal:#?}",
+        );
+
+        let from_wide_literal = artifact
+            .procedures()
+            .iter()
+            .find(|procedure| {
+                procedure
+                    .locator()
+                    .declaration()
+                    .segments()
+                    .last()
+                    .and_then(|segment| segment.name())
+                    == Some("from_wide_literal")
+            })
+            .expect("from_wide_literal procedure");
+        assert!(
+            !from_wide_literal
+                .points()
+                .iter()
+                .any(|point| point.events.iter().any(|event| {
+                    matches!(
+                        event.effect,
+                        SemanticEffect::ValueFlow {
+                            kind: ValueFlowKind::Transfer(_),
+                            ..
+                        }
+                    )
+                })),
+            "a wide literal must not acquire the narrow character-data constructor: {from_wide_literal:#?}",
+        );
+        assert!(
+            from_wide_literal.gaps().iter().any(|gap| {
+                gap.capability == SemanticCapability::Values
+                    && gap.impacts.contains(SemanticGapImpact::ReturnTransfer)
+            }),
+            "the rejected wide-literal return must retain typed incompleteness: {from_wide_literal:#?}",
         );
     }
 

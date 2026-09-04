@@ -969,7 +969,7 @@ impl Decoder {
                 "duplicate-entry-id",
                 id_expr.range.clone(),
                 format!(
-                    "duplicate policy-local taint entry ID `{}`; IDs are shared across source, sink, sanitizer, transform, and external-model sets",
+                    "duplicate policy-local taint entry ID `{}`; IDs are shared across source, sink, sanitizer, entry-point, transform, external-model, and store sets",
                     id.as_ref()
                 ),
             ));
@@ -1386,8 +1386,11 @@ impl Decoder {
             sources: origins,
             sinks: observations,
             sanitizers: kills,
+            entry_points: TaintEndpointSet::default(),
             transforms: TaintEndpointSet::default(),
             external_models: TaintEndpointSet::default(),
+            store_writes: Vec::new(),
+            store_reads: Vec::new(),
             finding_combinations: Vec::new(),
         })
     }
@@ -1603,6 +1606,11 @@ impl Decoder {
             .map(|value| self.decode_sanitizer_set(value, &format!("{path}/sanitizers")))
             .transpose()?
             .unwrap_or_default();
+        let entry_points = fields
+            .get("entry-points")
+            .map(|value| self.decode_entry_point_set(value, &format!("{path}/entry_points")))
+            .transpose()?
+            .unwrap_or_default();
         let transforms = fields
             .get("transforms")
             .map(|value| self.decode_transform_set(value, &format!("{path}/transforms")))
@@ -1611,6 +1619,11 @@ impl Decoder {
         let external_models = fields
             .get("external-models")
             .map(|value| self.decode_external_model_set(value, &format!("{path}/external_models")))
+            .transpose()?
+            .unwrap_or_default();
+        let (store_writes, store_reads) = fields
+            .get("stores")
+            .map(|value| self.decode_store_set(value, &format!("{path}/stores")))
             .transpose()?
             .unwrap_or_default();
         let finding_combinations = fields
@@ -1630,8 +1643,11 @@ impl Decoder {
             sources,
             sinks,
             sanitizers,
+            entry_points,
             transforms,
             external_models,
+            store_writes,
+            store_reads,
             finding_combinations,
         })
     }
@@ -1735,6 +1751,39 @@ impl Decoder {
         })
     }
 
+    fn decode_entry_point_set(
+        &mut self,
+        expr: &Expr,
+        path: &str,
+    ) -> Result<TaintEndpointSet<TaintEntryPointSpec>, PolicySourceError> {
+        let parts = self.decode_taint_set_parts(
+            expr,
+            PolicyAnalysisKind::Taint,
+            PolicyRecordContext::TaintEntryPoints,
+            false,
+            path,
+        )?;
+        let mut entries = Vec::with_capacity(parts.entries.len());
+        let mut ids = HashSet::with_capacity(parts.entries.len());
+        for entry in &parts.entries {
+            let value = self.decode_entry_point(entry, path)?;
+            if !ids.insert(value.id.as_str().to_string()) {
+                return Err(source_error(
+                    "duplicate-entry-id",
+                    entry.range.clone(),
+                    "duplicate entry-point ID",
+                ));
+            }
+            entries.push(value);
+        }
+        entries.sort_by(|left, right| left.id.as_str().cmp(right.id.as_str()));
+        Ok(TaintEndpointSet {
+            include_sets: parts.include_sets,
+            include_matches: parts.include_matches,
+            entries,
+        })
+    }
+
     fn decode_transform_set(
         &mut self,
         expr: &Expr,
@@ -1798,6 +1847,115 @@ impl Decoder {
             include_sets: parts.include_sets,
             include_matches: parts.include_matches,
             entries,
+        })
+    }
+
+    /// Decode `:stores (endpoint-set :entries [(store-write ...)|(store-read
+    /// ...)...])` into the two local entry vectors. Stores compose only local
+    /// entries: the schema registry rejects `:include-sets` and
+    /// `:include-matches` in the store context, so the shared set parts can
+    /// never carry composition inputs here.
+    fn decode_store_set(
+        &mut self,
+        expr: &Expr,
+        path: &str,
+    ) -> Result<(Vec<TaintStoreWriteSpec>, Vec<TaintStoreReadSpec>), PolicySourceError> {
+        let parts = self.decode_taint_set_parts(
+            expr,
+            PolicyAnalysisKind::Taint,
+            PolicyRecordContext::TaintStores,
+            false,
+            path,
+        )?;
+        assert!(
+            parts.include_sets.is_empty() && parts.include_matches.is_empty(),
+            "the schema registry rejects store-set composition fields before decoding"
+        );
+        let mut writes = Vec::new();
+        let mut reads = Vec::new();
+        for entry in &parts.entries {
+            match select_record(
+                entry,
+                &[PolicyRecord::StoreWrite, PolicyRecord::StoreRead],
+                "persistence store entry",
+            )? {
+                PolicyRecord::StoreWrite => writes.push(self.decode_store_write(entry, path)?),
+                PolicyRecord::StoreRead => reads.push(self.decode_store_read(entry, path)?),
+                record => unreachable!("store entry selector returned {record:?}"),
+            }
+        }
+        writes.sort_by(|left, right| left.id.as_str().cmp(right.id.as_str()));
+        reads.sort_by(|left, right| left.id.as_str().cmp(right.id.as_str()));
+        Ok((writes, reads))
+    }
+
+    fn decode_store_write(
+        &mut self,
+        expr: &Expr,
+        path: &str,
+    ) -> Result<TaintStoreWriteSpec, PolicySourceError> {
+        let context = DecodeContext::policy(PolicyAnalysisKind::Taint);
+        let fields = RecordCursor::parse(expr, PolicyRecord::StoreWrite, context)?;
+        let id: TaintEntryId = parse_identifier(fields.required("id"), "store-write ID")?;
+        self.register_local_taint_entry(&id, fields.required("id"))?;
+        let selector_path = format!(
+            "{path}/entries/{}/selector",
+            json_pointer_segment(id.as_str())
+        );
+        Ok(TaintStoreWriteSpec {
+            id,
+            selector: self.decode_selector(fields.required("selector"), context, &selector_path)?,
+            store: parse_identifier(fields.required("store"), "store name")?,
+            key: fields
+                .get("key")
+                .map(|value| decode_binding(value, context, PolicyValueShape::PolicyPort))
+                .transpose()?
+                .map(decoded_binding_to_port),
+            instance: fields
+                .get("instance")
+                .map(|value| decode_binding(value, context, PolicyValueShape::PolicyPort))
+                .transpose()?
+                .map(decoded_binding_to_port),
+            input: decoded_binding_to_port(decode_binding(
+                fields.required("input"),
+                context,
+                PolicyValueShape::PolicyPort,
+            )?),
+        })
+    }
+
+    fn decode_store_read(
+        &mut self,
+        expr: &Expr,
+        path: &str,
+    ) -> Result<TaintStoreReadSpec, PolicySourceError> {
+        let context = DecodeContext::policy(PolicyAnalysisKind::Taint);
+        let fields = RecordCursor::parse(expr, PolicyRecord::StoreRead, context)?;
+        let id: TaintEntryId = parse_identifier(fields.required("id"), "store-read ID")?;
+        self.register_local_taint_entry(&id, fields.required("id"))?;
+        let selector_path = format!(
+            "{path}/entries/{}/selector",
+            json_pointer_segment(id.as_str())
+        );
+        Ok(TaintStoreReadSpec {
+            id,
+            selector: self.decode_selector(fields.required("selector"), context, &selector_path)?,
+            store: parse_identifier(fields.required("store"), "store name")?,
+            key: fields
+                .get("key")
+                .map(|value| decode_binding(value, context, PolicyValueShape::PolicyPort))
+                .transpose()?
+                .map(decoded_binding_to_port),
+            instance: fields
+                .get("instance")
+                .map(|value| decode_binding(value, context, PolicyValueShape::PolicyPort))
+                .transpose()?
+                .map(decoded_binding_to_port),
+            output: decoded_binding_to_port(decode_binding(
+                fields.required("output"),
+                context,
+                PolicyValueShape::PolicyPort,
+            )?),
         })
     }
 
@@ -2188,6 +2346,27 @@ impl Decoder {
         })
     }
 
+    fn decode_entry_point(
+        &mut self,
+        expr: &Expr,
+        path: &str,
+    ) -> Result<TaintEntryPointSpec, PolicySourceError> {
+        let context = DecodeContext::policy(PolicyAnalysisKind::Taint);
+        let fields = RecordCursor::parse(expr, PolicyRecord::EntryPoint, context)?;
+        let id: TaintEntryId = parse_identifier(fields.required("id"), "entry-point ID")?;
+        self.register_local_taint_entry(&id, fields.required("id"))?;
+        let selector_path = format!(
+            "{path}/entries/{}/selector",
+            json_pointer_segment(id.as_str())
+        );
+        Ok(TaintEntryPointSpec {
+            id,
+            selector: self.decode_selector(fields.required("selector"), context, &selector_path)?,
+            parameter: decode_entry_point_parameter(fields.required("parameter"), context)?,
+            labels: decode_id_set(fields.required("labels"), "entry-point labels", 1, 64)?,
+        })
+    }
+
     fn decode_transform(
         &mut self,
         expr: &Expr,
@@ -2295,7 +2474,7 @@ impl Decoder {
             to: decoded_binding_to_port(decode_binding(
                 fields.required("to"),
                 context,
-                PolicyValueShape::ExternalModelPort,
+                PolicyValueShape::ExternalModelWritePort,
             )?),
             labels: decode_id_set(fields.required("labels"), "transfer labels", 1, 64)?,
             effect: self.decode_transfer_effect(fields.required("effect"), context)?,
@@ -3840,6 +4019,9 @@ impl Decoder {
                 Ok(PolicyEndpointBinding::ArgumentIndex { index })
             }
             DecodedBinding::ArgumentName(name) => Ok(PolicyEndpointBinding::ArgumentName { name }),
+            DecodedBinding::FieldOf { .. } => unreachable!(
+                "field ports are only decoded for external-model transfer destinations"
+            ),
         }
     }
 
@@ -4948,6 +5130,12 @@ enum DecodedBinding {
     ResultIndex(u32),
     ArgumentIndex(u32),
     ArgumentName(String),
+    /// Only produced under the `ExternalModelWritePort` shape, so it can never
+    /// reach the seed or call-binding conversions.
+    FieldOf {
+        base: Box<DecodedBinding>,
+        name: String,
+    },
 }
 
 fn decode_binding(
@@ -4989,12 +5177,26 @@ fn decode_binding(
             value => unreachable!("binding registry returned {value:?}"),
         };
     }
-    let record = select_record(
-        expr,
-        &[PolicyRecord::Argument, PolicyRecord::Result],
-        "binding",
-    )?;
+    let record = select_record(expr, value_shape.accepted_records(), "binding")?;
     let fields = RecordCursor::parse(expr, record, context)?;
+    if record == PolicyRecord::Field {
+        let name = expect_string(fields.required("name"), "field name", MAX_HUMAN_NAME_BYTES)?;
+        let of = fields.required("of");
+        let base = decode_binding(of, context, PolicyValueShape::ExternalModelPort)?;
+        return match base {
+            DecodedBinding::Receiver
+            | DecodedBinding::ArgumentIndex(_)
+            | DecodedBinding::ArgumentName(_) => Ok(DecodedBinding::FieldOf {
+                base: Box::new(base),
+                name,
+            }),
+            _ => Err(source_error(
+                "binding-not-allowed",
+                of.range.clone(),
+                "a field base must be an argument or the receiver",
+            )),
+        };
+    }
     if record == PolicyRecord::Result {
         return Ok(DecodedBinding::ResultIndex(expect_u32(
             fields.required("index"),
@@ -5026,6 +5228,36 @@ fn decode_binding(
     }
 }
 
+/// An entry-point `:parameter` names a formal of the selected declaration, so
+/// only an `(argument :index N)` or `(argument :name "NAME")` record is
+/// meaningful; there is no call whose receiver, result, or matched value could
+/// be bound.
+fn decode_entry_point_parameter(
+    expr: &Expr,
+    context: DecodeContext,
+) -> Result<PolicyPort, PolicySourceError> {
+    let record = select_record(expr, &[PolicyRecord::Argument], "entry-point parameter")?;
+    let fields = RecordCursor::parse(expr, record, context)?;
+    match (fields.get("index"), fields.get("name")) {
+        (Some(index), None) => Ok(PolicyPort::ArgumentIndex {
+            index: expect_u32(index, "argument index", true)?,
+        }),
+        (None, Some(name)) => Ok(PolicyPort::ArgumentName {
+            name: expect_string(name, "argument name", MAX_HUMAN_NAME_BYTES)?,
+        }),
+        (None, None) => Err(source_error(
+            "missing-binding-variant",
+            expr.range.clone(),
+            "argument requires exactly one of :index or :name",
+        )),
+        (Some(_), Some(name)) => Err(source_error(
+            "conflicting-binding-variant",
+            name.range.clone(),
+            "argument :index and :name are mutually exclusive",
+        )),
+    }
+}
+
 fn decoded_binding_to_port(binding: DecodedBinding) -> PolicyPort {
     match binding {
         DecodedBinding::MatchedValue => PolicyPort::MatchedValue,
@@ -5034,6 +5266,10 @@ fn decoded_binding_to_port(binding: DecodedBinding) -> PolicyPort {
         DecodedBinding::ResultIndex(index) => PolicyPort::ResultIndex { index },
         DecodedBinding::ArgumentIndex(index) => PolicyPort::ArgumentIndex { index },
         DecodedBinding::ArgumentName(name) => PolicyPort::ArgumentName { name },
+        DecodedBinding::FieldOf { base, name } => PolicyPort::FieldOf {
+            base: Box::new(decoded_binding_to_port(*base)),
+            name,
+        },
     }
 }
 
@@ -5045,6 +5281,9 @@ fn decoded_binding_to_seed(binding: DecodedBinding) -> TypestateSeedBinding {
         DecodedBinding::ResultIndex(index) => TypestateSeedBinding::ResultIndex { index },
         DecodedBinding::ArgumentIndex(index) => TypestateSeedBinding::ArgumentIndex { index },
         DecodedBinding::ArgumentName(name) => TypestateSeedBinding::ArgumentName { name },
+        DecodedBinding::FieldOf { .. } => {
+            unreachable!("field ports are only decoded for external-model transfer destinations")
+        }
     }
 }
 
@@ -5063,6 +5302,9 @@ fn decoded_binding_to_call(
         DecodedBinding::ResultIndex(index) => Ok(TypestateCallBinding::ResultIndex { index }),
         DecodedBinding::ArgumentIndex(index) => Ok(TypestateCallBinding::ArgumentIndex { index }),
         DecodedBinding::ArgumentName(name) => Ok(TypestateCallBinding::ArgumentName { name }),
+        DecodedBinding::FieldOf { .. } => {
+            unreachable!("field ports are only decoded for external-model transfer destinations")
+        }
     }
 }
 
@@ -8813,6 +9055,54 @@ mod tests {
                 :subject matched-value :phase before-call))]
               :transitions [(transition :from open :on finish :to closed)])))"#;
         assert_error_token(invalid_binding, "binding-not-allowed", "matched-value");
+    }
+
+    #[test]
+    fn external_model_field_ports_are_write_destinations_only() {
+        // A field record is accepted as a transfer's write destination, with
+        // an argument or the receiver as its base.
+        let accepted = taint_policy(
+            r#":external-models (endpoint-set :entries [(external-model :id store
+              :selector (rql (call)) :transfers [
+                (transfer :from (argument :index 0)
+                  :to (field :name "payload" :of (argument :index 1))
+                  :labels [secret] :effect propagate)
+                (transfer :from (argument :index 0)
+                  :to (field :name "payload" :of receiver)
+                  :labels [secret] :effect propagate)])])"#,
+        );
+        parse(&accepted).expect("field write destinations parse");
+
+        // A field port is not an input port.
+        let field_input = taint_policy(
+            r#":external-models (endpoint-set :entries [(external-model :id store
+              :selector (rql (call)) :transfers [
+                (transfer :from (field :name "payload" :of (argument :index 1))
+                  :to return-value :labels [secret] :effect propagate)])])"#,
+        );
+        let error = parse(&field_input).unwrap_err().diagnostic;
+        assert_eq!(error.code, "wrong-record-kind");
+
+        // A field base names the written object, never a call output.
+        let output_base = taint_policy(
+            r#":external-models (endpoint-set :entries [(external-model :id store
+              :selector (rql (call)) :transfers [
+                (transfer :from (argument :index 0)
+                  :to (field :name "payload" :of return-value)
+                  :labels [secret] :effect propagate)])])"#,
+        );
+        let error = parse(&output_base).unwrap_err().diagnostic;
+        assert_eq!(error.code, "binding-not-allowed");
+
+        // Field ports stay out of every other port position.
+        let sanitizer_field = taint_policy(
+            r#":sanitizers (endpoint-set :entries [(sanitizer :id scrub
+              :selector (rql (call))
+              :input (field :name "payload" :of receiver)
+              :output return-value :removes [secret])])"#,
+        );
+        let error = parse(&sanitizer_field).unwrap_err().diagnostic;
+        assert_eq!(error.code, "wrong-record-kind");
     }
 
     #[test]

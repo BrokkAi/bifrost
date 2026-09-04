@@ -160,6 +160,7 @@ mod taint;
 #[cfg(test)]
 mod tests;
 mod topology_rows;
+mod type_flow;
 mod typestate;
 mod units;
 mod value_flow;
@@ -183,15 +184,17 @@ use semantic::{
     SemanticProgramPointValue, SemanticQueryContext,
 };
 use taint::SemanticTaintFindingValue;
+use type_flow::{AbsentMemberFindingValue, ClassSetRowValue};
 use typestate::{SemanticTypestateFindingValue, SemanticTypestateWitnessValue};
 use units::unit_row_key;
 pub use units::{
-    CodeQueryExecutionScope, MergedLimit, MergedUnitRows, UnitExecutionResult, UnitRow,
-    UnitRowEvidence, UnitRowIdentities, UnitRowIdentityCandidate, UnitRowItem,
-    UnitRowItemProvenance, UnitRowItemProvenanceStep, UnitRowItemRef, UnitRowItemRefValue,
-    UnitRowItemTerminal, UnitRowItemValue, UnitRowKey, UnitRowProvenance, UnitRowProvenanceRef,
-    UnitRowProvenanceStep, execute_code_query_unit, merge_unit_rows, plan_seed_files,
-    seed_file_order, structural_seed_file_order,
+    CodeQueryExecutionScope, MergedLimit, MergedUnitRows, SelectorUnitExecution,
+    UnitExecutionResult, UnitRow, UnitRowCapture, UnitRowEvidence, UnitRowField, UnitRowIdentities,
+    UnitRowIdentityCandidate, UnitRowItem, UnitRowItemProvenance, UnitRowItemProvenanceStep,
+    UnitRowItemRef, UnitRowItemRefValue, UnitRowItemTerminal, UnitRowKey, UnitRowProvenance,
+    UnitRowProvenanceRef, UnitRowProvenanceStep, UnitRowScalar, execute_code_query_selector_unit,
+    execute_code_query_unit, merge_unit_rows, plan_seed_files, seed_file_order,
+    structural_seed_file_order,
 };
 pub(crate) use value_flow::public_witness_step;
 use value_flow::{SemanticFlowEndpointValue, SemanticFlowWitnessValue};
@@ -224,6 +227,7 @@ use brokk_bifrost_rql::{
     OccurrenceFilter, OccurrenceSeed, RewritePathFilter, ScopeFilter, StateEventFilter,
 };
 pub use results::ALL_DETAILED_CODE_QUERY_DOMAINS;
+pub use results::CodeQueryAbsentMemberFinding;
 pub use results::CodeQueryBinding;
 pub use results::CodeQueryBudgetedWork;
 pub use results::CodeQueryCallArgument;
@@ -240,6 +244,7 @@ pub use results::CodeQueryCallableSignature;
 pub use results::CodeQueryCandidateHop;
 pub use results::CodeQueryCandidateRef;
 pub use results::CodeQueryCapture;
+pub use results::CodeQueryClassSetRow;
 pub use results::CodeQueryCompletion;
 pub use results::CodeQueryConcurrentAccessConflict;
 pub use results::CodeQueryControlEdge;
@@ -335,6 +340,7 @@ pub use results::CodeQueryTaintLimits;
 pub use results::CodeQueryTaintOrigin;
 pub use results::CodeQueryTaintProjectionLimits;
 pub use results::CodeQueryTaintWitness;
+pub use results::CodeQueryTypeFlowWork;
 pub use results::CodeQueryTypestateCertainty;
 pub use results::CodeQueryTypestateFinding;
 pub use results::CodeQueryTypestateFindingKind;
@@ -356,7 +362,7 @@ pub use results::DetailedCodeQueryProvenanceEvidence;
 pub use results::DetailedCodeQueryProvenanceIdentities;
 pub use results::DetailedCodeQueryProvenanceRefEvidence;
 pub(crate) use results::DetailedCodeQueryProvenanceStepEvidence;
-pub(crate) use results::DetailedCodeQueryResult;
+pub use results::DetailedCodeQueryResult;
 pub(crate) use results::UnionExecutionStrategy;
 pub use results::code_query_completion;
 pub use results::{CodeQueryFlowRelation, CodeQueryStateEvent, CodeQueryStateEventRef};
@@ -820,6 +826,8 @@ enum PipelineValue {
     NilnessOperation(Box<NilnessOperationValue>),
     SwitchCoverage(Box<SwitchCoverageValue>),
     ConcurrentAccessConflict(Box<ConcurrentAccessConflictValue>),
+    ClassSetRow(Box<ClassSetRowValue>),
+    AbsentMemberFinding(Box<AbsentMemberFindingValue>),
     DetachedTaskTransfer(Box<DetachedTaskTransferValue>),
     ProcedureEffect(Box<ProcedureEffectValue>),
     CallableSignature(Box<CallableSignatureValue>),
@@ -923,6 +931,8 @@ enum PipelineKey {
     NilnessOperation(String),
     SwitchCoverage(String),
     ConcurrentAccessConflict(String),
+    ClassSetRow(String),
+    AbsentMemberFinding(String),
     DetachedTaskTransfer(String),
     ProcedureEffect(String),
     CallableSignature(String),
@@ -1016,6 +1026,8 @@ impl PipelineValue {
             Self::ConcurrentAccessConflict(value) => {
                 PipelineKey::ConcurrentAccessConflict(value.id.clone())
             }
+            Self::ClassSetRow(value) => PipelineKey::ClassSetRow(value.id.clone()),
+            Self::AbsentMemberFinding(value) => PipelineKey::AbsentMemberFinding(value.id.clone()),
             Self::DetachedTaskTransfer(value) => {
                 PipelineKey::DetachedTaskTransfer(value.id.clone())
             }
@@ -1309,6 +1321,8 @@ enum PipelineTraceValue {
     NilnessOperation(Box<NilnessOperationValue>),
     SwitchCoverage(Box<SwitchCoverageValue>),
     ConcurrentAccessConflict(Box<ConcurrentAccessConflictValue>),
+    ClassSetRow(Box<ClassSetRowValue>),
+    AbsentMemberFinding(Box<AbsentMemberFindingValue>),
     DetachedTaskTransfer(Box<DetachedTaskTransferValue>),
     ProcedureEffect(Box<ProcedureEffectValue>),
     CallableSignature(Box<CallableSignatureValue>),
@@ -2224,7 +2238,7 @@ pub fn execute_with_limits(
 #[doc(hidden)]
 pub fn execute_workspace_with_limits(
     workspace: &WorkspaceAnalyzer,
-    _flow_state: &brokk_bifrost_flow::FlowWorkspaceState,
+    flow_state: &brokk_bifrost_flow::FlowWorkspaceState,
     query: &CodeQuery,
     limits: CodeQueryExecutionLimits,
 ) -> CodeQueryResult {
@@ -2236,6 +2250,7 @@ pub fn execute_workspace_with_limits(
         workspace.analyzer(),
         token,
         Some(workspace),
+        Some(flow_state.semantic_summaries()),
         None,
         0,
         query,
@@ -2497,6 +2512,8 @@ fn execute_request_internal(
     } else {
         None
     };
+    let semantic_summaries =
+        flow_state.map(brokk_bifrost_flow::FlowWorkspaceState::semantic_summaries);
     let workspace_generation = registrations.map_or(0, |(generation, _, _, _)| generation);
     match query.execution_mode {
         CodeQueryExecutionMode::Results => {
@@ -2504,6 +2521,7 @@ fn execute_request_internal(
                 analyzer,
                 token,
                 workspace,
+                semantic_summaries.clone(),
                 analysis_context.as_ref(),
                 workspace_generation,
                 query,
@@ -2538,6 +2556,7 @@ fn execute_request_internal(
                 analyzer,
                 token,
                 workspace,
+                semantic_summaries,
                 analysis_context.as_ref(),
                 workspace_generation,
                 query,
@@ -2579,6 +2598,7 @@ pub fn execute_code_query_detailed(
         token,
         None,
         None,
+        None,
         0,
         query,
         limits,
@@ -2607,6 +2627,7 @@ pub fn execute_code_query_detailed_eager_index(
     execute_internal_with_analysis_strategy(
         analyzer,
         token,
+        None,
         None,
         None,
         0,
@@ -2653,6 +2674,7 @@ pub fn execute_code_query_detailed_eager_index_without_targets(
         token,
         None,
         None,
+        None,
         0,
         query,
         limits,
@@ -2694,6 +2716,7 @@ pub fn execute_code_query_detailed_eager_index_workspace(
         token,
         Some(workspace),
         None,
+        None,
         0,
         query,
         limits,
@@ -2726,6 +2749,13 @@ pub fn execute_code_query_detailed_eager_index_workspace(
 /// exact complete allocations behind policy-relevant rows. The coordinator
 /// must import performed work before atomically promoting or dropping those
 /// allocations.
+///
+/// `execution_scope` narrows the seed enumeration exactly as it does for
+/// [`execute_code_query_unit`]: a policy compiling one selector per seed file
+/// passes that file, and every whole-workspace caller passes
+/// [`CodeQueryExecutionScope::whole_workspace`] and executes byte for byte as
+/// it always has.
+#[allow(clippy::too_many_arguments)]
 pub fn execute_code_query_detailed_eager_index_workspace_with_semantic_receipt(
     workspace: &WorkspaceAnalyzer,
     query: &CodeQuery,
@@ -2734,6 +2764,7 @@ pub fn execute_code_query_detailed_eager_index_workspace_with_semantic_receipt(
     parent_semantic: &SemanticBudget,
     parent_execution: &SemanticExecutionBudget,
     artifact_leases: SemanticArtifactLeaseSnapshot,
+    execution_scope: CodeQueryExecutionScope<'_>,
 ) -> DetailedCodeQueryResult {
     let parent_scope = parent_semantic.scope_snapshot();
     let (execution_before, execution_child) = parent_execution.fork_with_additional_limits(
@@ -2750,6 +2781,7 @@ pub fn execute_code_query_detailed_eager_index_workspace_with_semantic_receipt(
         workspace.analyzer(),
         token,
         Some(workspace),
+        None,
         None,
         0,
         query,
@@ -2769,7 +2801,7 @@ pub fn execute_code_query_detailed_eager_index_workspace_with_semantic_receipt(
             artifact_leases,
         }),
         None,
-        CodeQueryExecutionScope::whole_workspace(),
+        execution_scope,
         None,
     )
 }
@@ -2793,7 +2825,7 @@ pub(crate) fn execute_code_query_profiled(
     let scope = AnalyzerQueryScope::new(analyzer);
     let token = scope.token();
     execute_internal_with_analysis(
-        analyzer, token, None, None, 0, query, limits, None, None, true,
+        analyzer, token, None, None, None, 0, query, limits, None, None, true,
     )
 }
 
@@ -2812,6 +2844,7 @@ pub(crate) fn execute_code_query_with_union_strategy(
     execute_internal_with_analysis_strategy(
         analyzer,
         token,
+        None,
         None,
         None,
         0,
@@ -2845,6 +2878,7 @@ pub(crate) fn execute_code_query_with_access_mode(
     let detailed = execute_internal_with_analysis_strategy(
         analyzer,
         token,
+        None,
         None,
         None,
         0,
@@ -2881,6 +2915,7 @@ fn execute_with_receiver_budget_for_test(
         token,
         None,
         None,
+        None,
         0,
         query,
         CodeQueryExecutionLimits::default(),
@@ -2908,6 +2943,7 @@ fn execute_internal(
         token,
         workspace,
         None,
+        None,
         0,
         query,
         limits,
@@ -2922,6 +2958,9 @@ fn execute_internal_with_analysis(
     analyzer: &dyn IAnalyzer,
     token: QueryToken<'_>,
     workspace: Option<&WorkspaceAnalyzer>,
+    semantic_summaries: Option<
+        Arc<brokk_bifrost_flow::dataflow::ProductionSemanticSummaryRepository>,
+    >,
     analysis_context: Option<&QueryAnalysisContext>,
     workspace_generation: u64,
     query: &CodeQuery,
@@ -2934,6 +2973,7 @@ fn execute_internal_with_analysis(
         analyzer,
         token,
         workspace,
+        semantic_summaries,
         analysis_context,
         workspace_generation,
         query,
@@ -2981,6 +3021,7 @@ fn execute_internal_with_strategy(
         token,
         workspace,
         None,
+        None,
         0,
         query,
         limits,
@@ -3003,6 +3044,9 @@ fn execute_internal_with_analysis_strategy(
     analyzer: &dyn IAnalyzer,
     token: QueryToken<'_>,
     workspace: Option<&WorkspaceAnalyzer>,
+    semantic_summaries: Option<
+        Arc<brokk_bifrost_flow::dataflow::ProductionSemanticSummaryRepository>,
+    >,
     analysis_context: Option<&QueryAnalysisContext>,
     workspace_generation: u64,
     query: &CodeQuery,
@@ -3112,6 +3156,7 @@ fn execute_internal_with_analysis_strategy(
                     workspace_generation,
                     analysis_context,
                     active_semantic_model_snapshot,
+                    semantic_summaries.clone(),
                     &continuation.parent_scope,
                     continuation.child_semantic_limits,
                     continuation.execution_before,
@@ -3128,6 +3173,7 @@ fn execute_internal_with_analysis_strategy(
                     workspace_generation,
                     analysis_context,
                     active_semantic_model_snapshot,
+                    semantic_summaries,
                 ),
             }
         }),
@@ -3987,6 +4033,34 @@ fn detailed_evidence_for_pipeline_value(
             provenance: Vec::new(),
             decorated_parameter: None,
         },
+        PipelineValue::ClassSetRow(value) => DetailedCodeQueryEvidence {
+            result_index,
+            domain: DetailedCodeQueryDomain::ClassSetRow,
+            key: DetailedCodeQueryKey::ClassSetRow {
+                id: value.id.clone(),
+            },
+            file: value.file.clone(),
+            source_slice_sha256: None,
+            byte_span: Some(range_byte_span(value.range)),
+            identities: DetailedCodeQueryProvenanceIdentities::None,
+            stable_owner_candidate: None,
+            provenance: Vec::new(),
+            decorated_parameter: None,
+        },
+        PipelineValue::AbsentMemberFinding(value) => DetailedCodeQueryEvidence {
+            result_index,
+            domain: DetailedCodeQueryDomain::AbsentMemberFinding,
+            key: DetailedCodeQueryKey::AbsentMemberFinding {
+                id: value.id.clone(),
+            },
+            file: value.file.clone(),
+            source_slice_sha256: None,
+            byte_span: Some(range_byte_span(value.range)),
+            identities: DetailedCodeQueryProvenanceIdentities::None,
+            stable_owner_candidate: None,
+            provenance: Vec::new(),
+            decorated_parameter: None,
+        },
         PipelineValue::DetachedTaskTransfer(value) => DetailedCodeQueryEvidence {
             result_index,
             domain: DetailedCodeQueryDomain::DetachedTaskTransfer,
@@ -4639,6 +4713,8 @@ fn terminal_source_file(value: &PipelineValue) -> Option<&ProjectFile> {
         PipelineValue::NilnessOperation(value) => Some(value.file()),
         PipelineValue::SwitchCoverage(value) => Some(value.file()),
         PipelineValue::ConcurrentAccessConflict(value) => Some(value.file()),
+        PipelineValue::ClassSetRow(value) => Some(value.file()),
+        PipelineValue::AbsentMemberFinding(value) => Some(value.file()),
         PipelineValue::DetachedTaskTransfer(value) => Some(value.file()),
         PipelineValue::ProcedureEffect(value) => Some(value.file()),
         PipelineValue::Occurrence(value) => Some(value.file()),
@@ -4811,6 +4887,13 @@ fn collect_pipeline_value_source_files(value: &PipelineValue, files: &mut BTreeS
         PipelineValue::ConcurrentAccessConflict(value) => {
             files.insert(value.file().clone());
         }
+        PipelineValue::ClassSetRow(value) => {
+            files.insert(value.file().clone());
+        }
+        PipelineValue::AbsentMemberFinding(value) => {
+            files.insert(value.file().clone());
+            files.insert(value.origin_file.clone());
+        }
         PipelineValue::DetachedTaskTransfer(value) => {
             files.insert(value.file().clone());
         }
@@ -4968,6 +5051,13 @@ fn collect_trace_value_source_files(value: &PipelineTraceValue, files: &mut BTre
         }
         PipelineTraceValue::ConcurrentAccessConflict(value) => {
             files.insert(value.file().clone());
+        }
+        PipelineTraceValue::ClassSetRow(value) => {
+            files.insert(value.file().clone());
+        }
+        PipelineTraceValue::AbsentMemberFinding(value) => {
+            files.insert(value.file().clone());
+            files.insert(value.origin_file.clone());
         }
         PipelineTraceValue::DetachedTaskTransfer(value) => {
             files.insert(value.file().clone());
@@ -5392,6 +5482,24 @@ fn detailed_trace_provenance_ref(
             DetailedCodeQueryKey::ConcurrentAccessConflict {
                 id: value.id.clone(),
                 root_procedure_id: value.root_procedure_id.clone(),
+            },
+            value.file(),
+            value.range,
+            cache,
+        ),
+        PipelineTraceValue::ClassSetRow(value) => detailed_call_shape_provenance_ref(
+            DetailedCodeQueryDomain::ClassSetRow,
+            DetailedCodeQueryKey::ClassSetRow {
+                id: value.id.clone(),
+            },
+            value.file(),
+            value.range,
+            cache,
+        ),
+        PipelineTraceValue::AbsentMemberFinding(value) => detailed_call_shape_provenance_ref(
+            DetailedCodeQueryDomain::AbsentMemberFinding,
+            DetailedCodeQueryKey::AbsentMemberFinding {
+                id: value.id.clone(),
             },
             value.file(),
             value.range,
@@ -6327,6 +6435,10 @@ fn pipeline_trace_value(value: &PipelineValue) -> Option<PipelineTraceValue> {
         }
         PipelineValue::ConcurrentAccessConflict(value) => {
             Some(PipelineTraceValue::ConcurrentAccessConflict(value.clone()))
+        }
+        PipelineValue::ClassSetRow(value) => Some(PipelineTraceValue::ClassSetRow(value.clone())),
+        PipelineValue::AbsentMemberFinding(value) => {
+            Some(PipelineTraceValue::AbsentMemberFinding(value.clone()))
         }
         PipelineValue::DetachedTaskTransfer(value) => {
             Some(PipelineTraceValue::DetachedTaskTransfer(value.clone()))

@@ -7,8 +7,8 @@ use std::{
 };
 
 use crate::analyzer::semantic::{
-    CallTransfer, IcfgEdgeKind, MatchedReturnProjection, ProcedureHandle, ProcedureIcfgEdge,
-    SemanticBudget, SemanticWork,
+    CallSiteHandle, CallTransfer, IcfgEdgeKind, MatchedReturnProjection, ProcedureHandle,
+    ProcedureIcfgEdge, SemanticBudget, SemanticWork,
 };
 use crate::hash::{HashMap, HashSet};
 
@@ -173,6 +173,11 @@ pub trait IdeDataflowProblem {
 
     /// See [`super::DistributiveDataflowProblem::resolved_call_to_return`].
     fn resolved_call_to_return(&self) -> bool {
+        false
+    }
+
+    /// See [`super::DistributiveDataflowProblem::call_replaced_by_model`].
+    fn call_replaced_by_model(&self, _call: &CallSiteHandle) -> bool {
         false
     }
 
@@ -748,6 +753,10 @@ where
 
     fn resolved_call_to_return(&self) -> bool {
         self.problem.resolved_call_to_return()
+    }
+
+    fn call_replaced_by_model(&self, call: &CallSiteHandle) -> bool {
+        self.problem.call_replaced_by_model(call)
     }
 
     fn is_flow_observation(&self, fact: &Self::Fact) -> bool {

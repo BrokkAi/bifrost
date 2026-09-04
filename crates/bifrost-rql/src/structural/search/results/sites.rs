@@ -1117,8 +1117,9 @@ pub struct CodeQuerySwitchCoverage {
     pub reason: Option<&'static str>,
 }
 
-/// One exact same-location ordinary-access pair in a bounded concurrent task
-/// slice. Built-in policies select only `proven` and `exhaustive` rows whose
+/// One same-location ordinary-access pair in a bounded concurrent task slice.
+/// The row retains both defects and structured safe explanations. Built-in
+/// policies select only `conflict`, `proven`, and `exhaustive` rows whose
 /// ordering is `unordered` and whose protection is `unprotected`.
 #[derive(Debug, Clone, Serialize)]
 pub struct CodeQueryConcurrentAccessConflict {

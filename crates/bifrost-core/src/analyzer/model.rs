@@ -1148,6 +1148,9 @@ enum StructuredTypeNode {
         base: StructuredTypeNodeId,
         arguments: Vec<StructuredTypeNodeId>,
     },
+    // Keep this appended so the bincode discriminants of existing structured
+    // identities remain stable when the C++ rvalue-reference shape is added.
+    RvalueReference(StructuredTypeNodeId),
 }
 
 /// A read-only view of one [`StructuredTypeIdentity`] arena node.
@@ -1160,6 +1163,7 @@ pub enum StructuredTypeNodeView<'a> {
     Named(&'a StructuredTypeName),
     Pointer(StructuredTypeNodeId),
     Reference(StructuredTypeNodeId),
+    RvalueReference(StructuredTypeNodeId),
     Array(StructuredTypeNodeId),
     Slice(StructuredTypeNodeId),
     Map {
@@ -1187,6 +1191,7 @@ enum StructuredTypeNodeWire {
         base: StructuredTypeNodeId,
         arguments: BoundedStructuredTypeNodeIds,
     },
+    RvalueReference(StructuredTypeNodeId),
 }
 
 struct BoundedStructuredTypeNodeIds(Vec<StructuredTypeNodeId>);
@@ -1251,6 +1256,7 @@ impl<'de> Deserialize<'de> for StructuredTypeNode {
             StructuredTypeNodeWire::Named(name) => Self::Named(name),
             StructuredTypeNodeWire::Pointer(inner) => Self::Pointer(inner),
             StructuredTypeNodeWire::Reference(inner) => Self::Reference(inner),
+            StructuredTypeNodeWire::RvalueReference(inner) => Self::RvalueReference(inner),
             StructuredTypeNodeWire::Array(inner) => Self::Array(inner),
             StructuredTypeNodeWire::Slice(inner) => Self::Slice(inner),
             StructuredTypeNodeWire::Map { key, value } => Self::Map { key, value },
@@ -1290,6 +1296,7 @@ enum CanonicalStructuredTypeNode {
     Named(StructuredTypeName),
     Pointer(u32),
     Reference(u32),
+    RvalueReference(u32),
     Array(u32),
     Slice(u32),
     Map { key: u32, value: u32 },
@@ -1466,6 +1473,7 @@ impl StructuredTypeIdentity {
                         StructuredTypeNode::Named(_) => {}
                         StructuredTypeNode::Pointer(inner)
                         | StructuredTypeNode::Reference(inner)
+                        | StructuredTypeNode::RvalueReference(inner)
                         | StructuredTypeNode::Array(inner)
                         | StructuredTypeNode::Slice(inner) => {
                             pending.push(StructuredTypeTraversalFrame::Enter(*inner));
@@ -1506,6 +1514,9 @@ impl StructuredTypeIdentity {
                 }
                 StructuredTypeNode::Reference(inner) => {
                     CanonicalStructuredTypeNode::Reference(*canonical_ids.get(inner)?)
+                }
+                StructuredTypeNode::RvalueReference(inner) => {
+                    CanonicalStructuredTypeNode::RvalueReference(*canonical_ids.get(inner)?)
                 }
                 StructuredTypeNode::Array(inner) => {
                     CanonicalStructuredTypeNode::Array(*canonical_ids.get(inner)?)
@@ -1552,6 +1563,10 @@ impl StructuredTypeIdentity {
                     2_u8.hash(&mut hasher);
                     digests.get(inner)?.hash(&mut hasher);
                 }
+                StructuredTypeNode::RvalueReference(inner) => {
+                    7_u8.hash(&mut hasher);
+                    digests.get(inner)?.hash(&mut hasher);
+                }
                 StructuredTypeNode::Array(inner) => {
                     3_u8.hash(&mut hasher);
                     digests.get(inner)?.hash(&mut hasher);
@@ -1594,6 +1609,7 @@ impl StructuredTypeIdentity {
                 StructuredTypeNode::Named(_) => true,
                 StructuredTypeNode::Pointer(inner)
                 | StructuredTypeNode::Reference(inner)
+                | StructuredTypeNode::RvalueReference(inner)
                 | StructuredTypeNode::Array(inner)
                 | StructuredTypeNode::Slice(inner) => valid_child(*inner),
                 StructuredTypeNode::Map { key, value } => valid_child(*key) && valid_child(*value),
@@ -1621,6 +1637,9 @@ impl StructuredTypeIdentity {
             StructuredTypeNode::Named(name) => StructuredTypeNodeView::Named(name),
             StructuredTypeNode::Pointer(inner) => StructuredTypeNodeView::Pointer(*inner),
             StructuredTypeNode::Reference(inner) => StructuredTypeNodeView::Reference(*inner),
+            StructuredTypeNode::RvalueReference(inner) => {
+                StructuredTypeNodeView::RvalueReference(*inner)
+            }
             StructuredTypeNode::Array(inner) => StructuredTypeNodeView::Array(*inner),
             StructuredTypeNode::Slice(inner) => StructuredTypeNodeView::Slice(*inner),
             StructuredTypeNode::Map { key, value } => StructuredTypeNodeView::Map {
@@ -1652,9 +1671,9 @@ impl StructuredTypeIdentity {
             }
             match self.node(current)? {
                 StructuredTypeNode::Named(name) => return Some(name),
-                StructuredTypeNode::Pointer(inner) | StructuredTypeNode::Reference(inner) => {
-                    current = *inner
-                }
+                StructuredTypeNode::Pointer(inner)
+                | StructuredTypeNode::Reference(inner)
+                | StructuredTypeNode::RvalueReference(inner) => current = *inner,
                 StructuredTypeNode::Generic { base, .. } => current = *base,
                 StructuredTypeNode::Array(_)
                 | StructuredTypeNode::Slice(_)
@@ -1728,7 +1747,10 @@ impl StructuredTypeIdentity {
     }
 
     pub fn is_reference(&self) -> bool {
-        matches!(self.node(self.root), Some(StructuredTypeNode::Reference(_)))
+        matches!(
+            self.node(self.root),
+            Some(StructuredTypeNode::Reference(_) | StructuredTypeNode::RvalueReference(_))
+        )
     }
 
     pub fn is_array(&self) -> bool {
@@ -1757,6 +1779,11 @@ impl StructuredTypeIdentity {
 
     pub fn wrap_reference(mut self) -> Option<Self> {
         self.root = self.push_node(StructuredTypeNode::Reference(self.root))?;
+        Some(self)
+    }
+
+    pub fn wrap_rvalue_reference(mut self) -> Option<Self> {
+        self.root = self.push_node(StructuredTypeNode::RvalueReference(self.root))?;
         Some(self)
     }
 
@@ -1821,6 +1848,13 @@ impl StructuredTypeIdentityBuilder {
 
     pub fn reference(&mut self, inner: StructuredTypeNodeId) -> Option<StructuredTypeNodeId> {
         self.push_with_children(StructuredTypeNode::Reference(inner), &[inner])
+    }
+
+    pub fn rvalue_reference(
+        &mut self,
+        inner: StructuredTypeNodeId,
+    ) -> Option<StructuredTypeNodeId> {
+        self.push_with_children(StructuredTypeNode::RvalueReference(inner), &[inner])
     }
 
     pub fn array(&mut self, inner: StructuredTypeNodeId) -> Option<StructuredTypeNodeId> {
@@ -1900,6 +1934,7 @@ fn structured_type_node_resource_cost(node: &StructuredTypeNode) -> Option<(usiz
         StructuredTypeNode::Named(_) => 0,
         StructuredTypeNode::Pointer(_)
         | StructuredTypeNode::Reference(_)
+        | StructuredTypeNode::RvalueReference(_)
         | StructuredTypeNode::Array(_)
         | StructuredTypeNode::Slice(_) => 1,
         StructuredTypeNode::Map { .. } => 2,
@@ -1915,6 +1950,7 @@ fn structured_type_node_resource_cost(node: &StructuredTypeNode) -> Option<(usiz
             })?,
         StructuredTypeNode::Pointer(_)
         | StructuredTypeNode::Reference(_)
+        | StructuredTypeNode::RvalueReference(_)
         | StructuredTypeNode::Array(_)
         | StructuredTypeNode::Slice(_)
         | StructuredTypeNode::Map { .. }
@@ -3131,6 +3167,12 @@ impl CodeUnit {
         self.0.rendered_name.display.clone()
     }
 
+    /// The borrowed form of [`Self::fq_name`], for consumers that render the
+    /// qualified name without owning a copy.
+    pub fn fq_name_str(&self) -> &str {
+        &self.0.rendered_name.display
+    }
+
     // This is the structural identifier used by lookup, import, and usage code.
     // For user-facing names, prefer the display helpers in `analyzer::common`
     // so languages like Scala can render idiomatic names without changing the
@@ -3291,13 +3333,23 @@ pub struct Range {
     pub end_line: usize,
 }
 
-/// The persisted facts required to render one file's declaration summary.
+/// The persisted facts required to render one file's declaration summary or
+/// enumerate its declarations without hydrating the complete file state.
 ///
 /// This deliberately differs from `FileState`: it is a read model for summary
 /// rendering and omits unrelated imports, types, graph edges, and diagnostics.
 #[derive(Debug, Clone, Default)]
 pub struct SummaryFileProjection {
+    /// The roots of the rendering hierarchy. A wrapper analyzer may prune
+    /// synthetic entries from this list and from `children`, so neither is a
+    /// declaration inventory.
     pub top_level_declarations: Vec<CodeUnit>,
+    /// Every declaration the file publishes, in a deterministic order. This
+    /// mirrors `FileState::declarations` and is the authoritative per-file
+    /// inventory: it reaches declarations that no rendering hierarchy exposes,
+    /// such as a named method inside an anonymous class. File scopes are
+    /// excluded, matching the workspace declaration inventory.
+    pub declarations: Vec<CodeUnit>,
     pub signatures: HashMap<CodeUnit, Vec<String>>,
     pub ranges: HashMap<CodeUnit, Vec<Range>>,
     pub children: HashMap<CodeUnit, Vec<CodeUnit>>,
@@ -4244,7 +4296,10 @@ mod package_anchor_tests {
     use super::*;
 
     fn anchored_unit() -> CodeUnit {
-        let source = ProjectFile::new(PathBuf::from("/repo"), PathBuf::from("src/describe.rs"));
+        let source = ProjectFile::new(
+            std::env::current_dir().expect("test working directory should be available"),
+            PathBuf::from("src/describe.rs"),
+        );
         CodeUnit::with_signature(
             source,
             CodeUnitType::Function,
@@ -4285,7 +4340,10 @@ mod package_anchor_tests {
 
     #[test]
     fn units_default_to_the_adapter_anchor() {
-        let source = ProjectFile::new(PathBuf::from("/repo"), PathBuf::from("src/lib.rs"));
+        let source = ProjectFile::new(
+            std::env::current_dir().expect("test working directory should be available"),
+            PathBuf::from("src/lib.rs"),
+        );
         let unit = CodeUnit::new(source, CodeUnitType::Class, "demo", "JsError");
         assert_eq!(unit.package_anchor(), None);
         assert_eq!(unit.without_signature().package_anchor(), None);
@@ -4410,6 +4468,51 @@ mod structured_type_identity_tests {
             shared.nodes.len() + split.nodes.len(),
             "bounded equality must inspect each reachable arena node once"
         );
+    }
+
+    #[test]
+    fn lvalue_and_rvalue_reference_shapes_have_distinct_stable_identities() {
+        let name = || {
+            StructuredTypeName::new(
+                vec!["std".to_string(), "string".to_string()],
+                Vec::new(),
+                false,
+            )
+            .expect("structured name")
+        };
+
+        let mut lvalue_builder = StructuredTypeIdentityBuilder::default();
+        let lvalue_leaf = lvalue_builder.named(name()).expect("lvalue leaf");
+        let lvalue_root = lvalue_builder
+            .reference(lvalue_leaf)
+            .expect("lvalue reference");
+        let lvalue = lvalue_builder.finish(lvalue_root).expect("lvalue identity");
+
+        let mut rvalue_builder = StructuredTypeIdentityBuilder::default();
+        let rvalue_leaf = rvalue_builder.named(name()).expect("rvalue leaf");
+        let rvalue_root = rvalue_builder
+            .rvalue_reference(rvalue_leaf)
+            .expect("rvalue reference");
+        let rvalue = rvalue_builder.finish(rvalue_root).expect("rvalue identity");
+
+        assert_ne!(lvalue, rvalue);
+        assert_ne!(hash(&lvalue), hash(&rvalue));
+        assert!(lvalue.is_reference());
+        assert!(rvalue.is_reference());
+        assert!(matches!(
+            lvalue.view(lvalue.root_id()),
+            Some(StructuredTypeNodeView::Reference(_))
+        ));
+        assert!(matches!(
+            rvalue.view(rvalue.root_id()),
+            Some(StructuredTypeNodeView::RvalueReference(_))
+        ));
+
+        let decoded: StructuredTypeIdentity =
+            bincode::deserialize(&bincode::serialize(&rvalue).expect("serialize rvalue identity"))
+                .expect("deserialize rvalue identity");
+        assert_eq!(rvalue, decoded);
+        assert_eq!(hash(&rvalue), hash(&decoded));
     }
 
     #[test]

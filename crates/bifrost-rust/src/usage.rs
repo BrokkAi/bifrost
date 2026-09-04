@@ -99,10 +99,7 @@ pub enum RustReferenceNamespace {
 }
 
 impl RustSymbolNamespace {
-    pub fn of(analyzer: &dyn RustFactSource, declaration: &CodeUnit) -> Option<Self> {
-        if analyzer.is_type_alias(declaration) {
-            return Some(Self::Type);
-        }
+    pub fn of(declaration: &CodeUnit) -> Option<Self> {
         match declaration.kind() {
             brokk_bifrost_core::analyzer::model::CodeUnitType::Class => Some(Self::Type),
             brokk_bifrost_core::analyzer::model::CodeUnitType::Function
@@ -785,7 +782,6 @@ impl RustUsageWalks<'_> {
 
     pub fn binding_seeds_while(
         &self,
-        analyzer: &dyn RustFactSource,
         roots: &BTreeSet<CodeUnit>,
         keep_going: &impl Fn() -> bool,
     ) -> Option<RustBindingSeeds> {
@@ -807,8 +803,7 @@ impl RustUsageWalks<'_> {
                     file: root.source().clone(),
                     module: ModuleKey::new(root.source(), root.package_name()),
                     name: root.identifier().to_string(),
-                    namespace: RustSymbolNamespace::of(analyzer, root)
-                        .unwrap_or(RustSymbolNamespace::Value),
+                    namespace: RustSymbolNamespace::of(root).unwrap_or(RustSymbolNamespace::Value),
                 });
             }
             for identity in candidate_identities {
@@ -1175,7 +1170,7 @@ pub fn usage_candidate_files_while(
 ) -> Option<HashSet<ProjectFile>> {
     let walks = RustUsageWalks::new_while(analyzer, token, keep_going)?;
     keep_going().then_some(())?;
-    let seeds = walks.binding_seeds_while(analyzer, roots, keep_going)?;
+    let seeds = walks.binding_seeds_while(roots, keep_going)?;
     keep_going().then_some(())?;
     walks.importers_of_seeds_while(&seeds, keep_going)
 }
@@ -1204,7 +1199,7 @@ pub fn usage_binding_seeds_while(
 ) -> Option<RustBindingSeeds> {
     let walks = RustUsageWalks::new_while(analyzer, token, keep_going)?;
     keep_going().then_some(())?;
-    walks.binding_seeds_while(analyzer, roots, keep_going)
+    walks.binding_seeds_while(roots, keep_going)
 }
 
 /// Canonical local binding identities for a target, including named private
@@ -1215,7 +1210,7 @@ pub fn usage_binding_seeds(
     roots: &BTreeSet<CodeUnit>,
 ) -> RustBindingSeeds {
     RustUsageWalks::new(analyzer, token)
-        .binding_seeds_while(analyzer, roots, &|| true)
+        .binding_seeds_while(roots, &|| true)
         .expect("uninterrupted Rust binding-seed construction")
 }
 

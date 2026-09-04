@@ -6,11 +6,16 @@
 
 use crate::adapter::parse_cpp_file;
 use crate::declarations::{
-    CppParameterType, cpp_callable_parameter_type_identities, cpp_function_declarator_at, node_text,
+    CppComparableSlot, CppParameterType, cpp_callable_parameter_type_identities,
+    cpp_callable_return_type_identity, cpp_comparable_parameter_shapes, cpp_function_declarator_at,
+    node_text,
 };
 use crate::graph::resolver::cpp_name_for;
 use brokk_bifrost_core::analyzer::ProjectFile;
-use brokk_bifrost_core::analyzer::model::{CodeUnit, CodeUnitType, StructuredTypeIdentity};
+use brokk_bifrost_core::analyzer::model::{
+    CallableArity, CodeUnit, CodeUnitType, CppTemplateMetadata, SignatureMetadata,
+    StructuredTypeIdentity,
+};
 use brokk_bifrost_core::analyzer::tree_walk::{ParentIndex, collect_parse_errors};
 use brokk_bifrost_core::hash::HashMap;
 use std::path::{Path, PathBuf};
@@ -53,6 +58,13 @@ pub enum CppExternalVisibility {
 pub struct CppExternalType {
     pub name: String,
     pub source_name: String,
+    pub is_type_alias: bool,
+    pub underlying_type: Option<StructuredTypeIdentity>,
+    /// Structured template declaration metadata, when the class declaration
+    /// was reached through a template declaration.  Keeping this alongside
+    /// the neutral record lets a consumer prove a primary template's exact
+    /// arity/defaults without re-reading source text.
+    pub template_metadata: Option<CppTemplateMetadata>,
     pub visibility: CppExternalVisibility,
     pub source_path: PathBuf,
     pub direct_bases: Vec<String>,
@@ -74,8 +86,22 @@ pub struct CppExternalMember {
     /// the consumer publishes them into a type model, and a spelling such as
     /// `const T&` is a source text, not a type name.
     pub parameter_types: Option<Vec<CppParameterType>>,
+    /// Parser-derived parameter shapes retaining C++ cv-qualification.
+    pub parameter_shapes: Option<Vec<CppComparableSlot>>,
+    /// Invocation arity, including default and repeated parameters, when the
+    /// declaration is callable and its parameter list was reached.
+    pub callable_arity: Option<CallableArity>,
+    /// Whether a constructor is available to implicit conversion.
+    pub explicitness: Option<CppCallableExplicitness>,
     pub return_type: Option<StructuredTypeIdentity>,
     pub source_path: PathBuf,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CppCallableExplicitness {
+    Implicit,
+    Explicit,
+    Conditional,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -228,6 +254,14 @@ pub fn extract_external_declarations(
             CodeUnitType::Class => types.push(CppExternalType {
                 name: declaration.fq_name(),
                 source_name: cpp_name_for(&declaration),
+                is_type_alias: parsed.type_aliases.contains(&declaration),
+                underlying_type: parsed
+                    .signature_metadata
+                    .get(&declaration)
+                    .and_then(|records| records.first())
+                    .and_then(|metadata| metadata.underlying_type_identity())
+                    .cloned(),
+                template_metadata: parsed.cpp_template_metadata.get(&declaration).cloned(),
                 visibility: parsed
                     .ranges
                     .get(&declaration)
@@ -250,17 +284,26 @@ pub fn extract_external_declarations(
                     .ranges
                     .get(&declaration)
                     .and_then(|ranges| ranges.iter().map(|range| range.start_byte).min());
-                let parameter_types = (declaration.kind() == CodeUnitType::Function)
+                let function_declarator = (declaration.kind() == CodeUnitType::Function)
                     .then(|| {
                         declaration_start
                             .and_then(|start| cpp_function_declarator_at(tree.root_node(), start))
-                            .map(|declarator| {
-                                cpp_callable_parameter_type_identities(
-                                    declarator, source, &ancestry,
-                                )
-                            })
                     })
                     .flatten();
+                let parameter_types = function_declarator.map(|declarator| {
+                    cpp_callable_parameter_type_identities(declarator, source, &ancestry)
+                });
+                let parameter_shapes = function_declarator.map(|declarator| {
+                    cpp_comparable_parameter_shapes(declarator, source, &ancestry)
+                });
+                let return_type = metadata
+                    .and_then(|metadata| metadata.return_type_identity())
+                    .cloned()
+                    .or_else(|| {
+                        function_declarator.and_then(|declarator| {
+                            cpp_callable_return_type_identity(declarator, source, &ancestry)
+                        })
+                    });
                 members.push(CppExternalMember {
                     owner: nearest_type_owner(&declaration, &parent_by_child),
                     name: declaration.terminal_name().to_owned(),
@@ -278,9 +321,10 @@ pub fn extract_external_declarations(
                         .is_some_and(|metadata| metadata.callable_is_constructor()),
                     signature: declaration.signature().map(str::to_owned),
                     parameter_types,
-                    return_type: metadata
-                        .and_then(|metadata| metadata.return_type_identity())
-                        .cloned(),
+                    parameter_shapes,
+                    callable_arity: metadata.and_then(SignatureMetadata::callable_arity),
+                    explicitness: function_declarator.and_then(cpp_callable_explicitness),
+                    return_type,
                     source_path: source_path.to_path_buf(),
                 });
             }
@@ -329,6 +373,36 @@ fn cpp_member_visibility(root: Node<'_>, source: &str, start_byte: usize) -> Cpp
     CppExternalVisibility::Public
 }
 
+fn cpp_callable_explicitness(mut declarator: Node<'_>) -> Option<CppCallableExplicitness> {
+    while !matches!(
+        declarator.kind(),
+        "declaration" | "field_declaration" | "function_definition"
+    ) {
+        declarator = declarator.parent()?;
+    }
+    if declarator.has_error() {
+        return None;
+    }
+    let mut stack = vec![declarator];
+    let mut explicit = None;
+    while let Some(node) = stack.pop() {
+        if node.kind() == "explicit_function_specifier" {
+            if explicit.is_some() {
+                return None;
+            }
+            explicit = Some(if node.named_child_count() == 0 {
+                CppCallableExplicitness::Explicit
+            } else {
+                CppCallableExplicitness::Conditional
+            });
+            continue;
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.named_children(&mut cursor));
+    }
+    Some(explicit.unwrap_or(CppCallableExplicitness::Implicit))
+}
+
 fn nearest_type_owner(
     declaration: &CodeUnit,
     parent_by_child: &HashMap<CodeUnit, CodeUnit>,
@@ -367,6 +441,8 @@ fn has_unsupported_preprocessing(root: Node<'_>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use brokk_bifrost_core::analyzer::model::CallableArity;
+    use brokk_bifrost_core::analyzer::model::StructuredTypeNodeView;
 
     fn extract(source: &str) -> CppExternalDeclarationSet {
         let temp = tempfile::tempdir().expect("temp root");
@@ -435,6 +511,215 @@ mod tests {
             }),
             "{declarations:#?}"
         );
+    }
+
+    #[test]
+    fn preserves_copy_and_move_reference_parameter_shapes() {
+        let source = r#"
+            class Widget {
+            public:
+                Widget(const Widget&);
+                Widget(Widget&&);
+            };
+        "#;
+        let declarations = extract(source);
+        let constructors = declarations
+            .members
+            .iter()
+            .filter(|member| member.owner.as_deref() == Some("Widget") && member.name == "Widget")
+            .collect::<Vec<_>>();
+
+        assert_eq!(constructors.len(), 2, "{declarations:#?}");
+        let shapes = constructors
+            .iter()
+            .map(|constructor| {
+                let parameters = constructor
+                    .parameter_types
+                    .as_ref()
+                    .expect("constructor parameters");
+                assert_eq!(parameters.len(), 1, "{constructor:#?}");
+                let CppParameterType::Structured(identity) = &parameters[0] else {
+                    panic!("constructor parameter shape: {constructor:#?}");
+                };
+                (
+                    identity.clone(),
+                    matches!(
+                        identity.view(identity.root_id()),
+                        Some(StructuredTypeNodeView::Reference(_))
+                    ),
+                    matches!(
+                        identity.view(identity.root_id()),
+                        Some(StructuredTypeNodeView::RvalueReference(_))
+                    ),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        assert_ne!(shapes[0].0, shapes[1].0);
+        assert!(shapes.iter().any(|(_, is_lvalue, _)| *is_lvalue));
+        assert!(shapes.iter().any(|(_, _, is_rvalue)| *is_rvalue));
+        assert_eq!(declarations, extract(source));
+    }
+
+    #[test]
+    fn preserves_callable_arities_for_defaulted_and_required_parameters() {
+        let declarations = extract(
+            r#"
+            namespace std {
+            template <class C, class Alloc> class basic_string {
+            public:
+                basic_string(const C*, const Alloc& = Alloc());
+                basic_string(const C&, const Alloc&);
+            };
+            }
+            "#,
+        );
+        let constructors = declarations
+            .members
+            .iter()
+            .filter(|member| {
+                member.owner.as_deref() == Some("std.basic_string") && member.name == "basic_string"
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(constructors.len(), 2, "{declarations:#?}");
+        assert!(
+            constructors
+                .iter()
+                .any(|member| { member.callable_arity == Some(CallableArity::new(1, 2, false)) }),
+            "defaulted constructor arity must be required=1,total=2: {constructors:#?}"
+        );
+        assert!(
+            constructors
+                .iter()
+                .any(|member| { member.callable_arity == Some(CallableArity::new(2, 2, false)) }),
+            "non-defaulted constructor arity must be required=2,total=2: {constructors:#?}"
+        );
+    }
+
+    #[test]
+    fn preserves_callable_explicitness_for_implicit_binding() {
+        for (declaration, expected) in [
+            ("Widget(const char*);", CppCallableExplicitness::Implicit),
+            (
+                "explicit Widget(const char*);",
+                CppCallableExplicitness::Explicit,
+            ),
+            (
+                "explicit(true) Widget(const char*);",
+                CppCallableExplicitness::Conditional,
+            ),
+        ] {
+            let declarations = extract(&format!("class Widget {{ public: {declaration} }};"));
+            let member = declarations
+                .members
+                .first()
+                .unwrap_or_else(|| panic!("constructor declaration: {declarations:#?}"));
+            assert_eq!(Some(expected), member.explicitness, "{member:#?}");
+        }
+    }
+
+    #[test]
+    fn preserves_callable_return_reference_shapes() {
+        let declarations = extract(
+            r#"
+            namespace std {
+            class basic_string {
+            public:
+                basic_string& operator=(const basic_string&);
+                basic_string&& operator=(basic_string&&);
+                void operator=(int);
+            };
+            }
+            "#,
+        );
+        let assignments = declarations
+            .members
+            .iter()
+            .filter(|member| member.name == "operator=")
+            .collect::<Vec<_>>();
+        assert_eq!(assignments.len(), 3, "{declarations:#?}");
+
+        let copy = assignments
+            .iter()
+            .find(|member| member.signature.as_deref() == Some("(const basic_string &)"))
+            .unwrap_or_else(|| panic!("copy assignment: {declarations:#?}"));
+        let Some(StructuredTypeNodeView::Reference(inner)) = copy
+            .return_type
+            .as_ref()
+            .and_then(|identity| identity.view(identity.root_id()))
+        else {
+            panic!("copy return type: {copy:#?}");
+        };
+        let Some(StructuredTypeNodeView::Named(name)) = copy
+            .return_type
+            .as_ref()
+            .and_then(|identity| identity.view(inner))
+        else {
+            panic!("copy return target: {copy:#?}");
+        };
+        assert_eq!(["basic_string"], name.path());
+        assert_eq!(["std", "basic_string"], name.lexical_scope());
+
+        let move_assignment = declarations
+            .members
+            .iter()
+            .find(|member| member.signature.as_deref() == Some("(basic_string &&)"))
+            .unwrap_or_else(|| panic!("move assignment: {declarations:#?}"));
+        assert!(matches!(
+            move_assignment
+                .return_type
+                .as_ref()
+                .and_then(|identity| identity.view(identity.root_id())),
+            Some(StructuredTypeNodeView::RvalueReference(_))
+        ));
+
+        let void_assignment = declarations
+            .members
+            .iter()
+            .find(|member| member.signature.as_deref() == Some("(int)"))
+            .unwrap_or_else(|| panic!("void assignment: {declarations:#?}"));
+        let Some(StructuredTypeNodeView::Named(name)) = void_assignment
+            .return_type
+            .as_ref()
+            .and_then(|identity| identity.view(identity.root_id()))
+        else {
+            panic!("void return type: {void_assignment:#?}");
+        };
+        assert_eq!(["void"], name.path());
+    }
+
+    #[test]
+    fn preserves_type_alias_underlying_structured_identity() {
+        let declarations = extract(
+            r#"
+            namespace std {
+            template<class C, class Traits, class Alloc> class basic_string;
+            using string = basic_string<char, char_traits<char>, allocator<char>>;
+            }
+            "#,
+        );
+        let alias = declarations
+            .types
+            .iter()
+            .find(|record| record.name == "std.string")
+            .unwrap_or_else(|| panic!("string alias: {declarations:#?}"));
+        assert!(alias.is_type_alias, "{alias:#?}");
+        let identity = alias
+            .underlying_type
+            .as_ref()
+            .unwrap_or_else(|| panic!("structured alias target: {alias:#?}"));
+        let Some(StructuredTypeNodeView::Generic { base, arguments }) =
+            identity.view(identity.root_id())
+        else {
+            panic!("generic basic_string alias target: {identity:#?}");
+        };
+        assert_eq!(3, arguments.len());
+        let Some(StructuredTypeNodeView::Named(name)) = identity.view(base) else {
+            panic!("named basic_string alias base: {identity:#?}");
+        };
+        assert_eq!(["basic_string"], name.path());
+        assert_eq!(["std"], name.lexical_scope());
     }
 
     #[test]

@@ -205,12 +205,19 @@ fn policy_selector_paths(definition: &PolicyDefinition) -> HashSet<String> {
             extend_taint_selector_paths(&mut paths, segments.sources, &spec.sources.entries);
             extend_taint_selector_paths(&mut paths, segments.sinks, &spec.sinks.entries);
             extend_taint_selector_paths(&mut paths, segments.sanitizers, &spec.sanitizers.entries);
+            extend_taint_selector_paths(
+                &mut paths,
+                segments.entry_points,
+                &spec.entry_points.entries,
+            );
             extend_taint_selector_paths(&mut paths, segments.transforms, &spec.transforms.entries);
             extend_taint_selector_paths(
                 &mut paths,
                 segments.external_models,
                 &spec.external_models.entries,
             );
+            extend_taint_selector_paths(&mut paths, segments.stores, &spec.store_writes);
+            extend_taint_selector_paths(&mut paths, segments.stores, &spec.store_reads);
         }
         PolicyAnalysis::Typestate { spec } => {
             paths.extend(spec.subjects.entries.iter().map(|subject| {
@@ -281,8 +288,11 @@ impl_taint_selector_entry!(
     TaintSourceSpec,
     TaintSinkSpec,
     TaintSanitizerSpec,
+    TaintEntryPointSpec,
     TaintTransformSpec,
     TaintExternalModelSpec,
+    TaintStoreWriteSpec,
+    TaintStoreReadSpec,
 );
 
 fn json_pointer_segment(value: &str) -> String {
@@ -296,6 +306,7 @@ fn ensure_inline_local_taint(
     ensure_local_endpoint_set(&spec.sources)?;
     ensure_local_endpoint_set(&spec.sinks)?;
     ensure_local_endpoint_set(&spec.sanitizers)?;
+    ensure_local_endpoint_set(&spec.entry_points)?;
     ensure_local_endpoint_set(&spec.transforms)?;
     ensure_local_endpoint_set(&spec.external_models)?;
 
@@ -308,11 +319,20 @@ fn ensure_inline_local_taint(
     for sanitizer in &spec.sanitizers.entries {
         ensure_inline_selector(&sanitizer.selector)?;
     }
+    for entry_point in &spec.entry_points.entries {
+        ensure_inline_selector(&entry_point.selector)?;
+    }
     for transform in &spec.transforms.entries {
         ensure_inline_selector(&transform.selector)?;
     }
     for model in &spec.external_models.entries {
         ensure_inline_selector(&model.selector)?;
+    }
+    for write in &spec.store_writes {
+        ensure_inline_selector(&write.selector)?;
+    }
+    for read in &spec.store_reads {
+        ensure_inline_selector(&read.selector)?;
     }
     for combination in &spec.finding_combinations {
         ensure_local_endpoint_predicate(&combination.source, local_endpoint_ids)?;
@@ -439,6 +459,12 @@ fn taint_local_endpoint_ids(spec: &TaintPolicySpec) -> HashSet<&str> {
                 .map(|entry| entry.id.as_str()),
         )
         .chain(
+            spec.entry_points
+                .entries
+                .iter()
+                .map(|entry| entry.id.as_str()),
+        )
+        .chain(
             spec.transforms
                 .entries
                 .iter()
@@ -450,6 +476,8 @@ fn taint_local_endpoint_ids(spec: &TaintPolicySpec) -> HashSet<&str> {
                 .iter()
                 .map(|entry| entry.id.as_str()),
         )
+        .chain(spec.store_writes.iter().map(|entry| entry.id.as_str()))
+        .chain(spec.store_reads.iter().map(|entry| entry.id.as_str()))
         .collect()
 }
 
@@ -675,6 +703,15 @@ fn policy_analysis_to_json(analysis: &PolicyAnalysis) -> Value {
             );
             insert(
                 &mut object,
+                "entry_points",
+                endpoint_set_to_json(
+                    &spec.entry_points,
+                    |left, right| left.id.cmp(&right.id),
+                    taint_entry_point_to_json,
+                ),
+            );
+            insert(
+                &mut object,
                 "transforms",
                 endpoint_set_to_json(
                     &spec.transforms,
@@ -691,6 +728,33 @@ fn policy_analysis_to_json(analysis: &PolicyAnalysis) -> Value {
                     taint_external_model_to_json,
                 ),
             );
+            // `stores` is omitted entirely when the policy declares none,
+            // which keeps every document authored before persistence stores
+            // existed byte-identical under this projection, and therefore
+            // keeps its semantic hash, its baselines and its suppressions
+            // valid.
+            if !(spec.store_writes.is_empty() && spec.store_reads.is_empty()) {
+                let mut stores = Map::new();
+                insert(
+                    &mut stores,
+                    "writes",
+                    sorted_typed_values(
+                        spec.store_writes.iter(),
+                        |left, right| left.id.cmp(&right.id),
+                        taint_store_write_to_json,
+                    ),
+                );
+                insert(
+                    &mut stores,
+                    "reads",
+                    sorted_typed_values(
+                        spec.store_reads.iter(),
+                        |left, right| left.id.cmp(&right.id),
+                        taint_store_read_to_json,
+                    ),
+                );
+                insert(&mut object, "stores", Value::Object(stores));
+            }
             insert(
                 &mut object,
                 "finding_combinations",
@@ -1691,6 +1755,9 @@ fn policy_port_to_json(port: &PolicyPort) -> Value {
         PolicyPort::ArgumentName { name } => {
             json!({ "type": "argument_name", "name": name })
         }
+        PolicyPort::FieldOf { base, name } => {
+            json!({ "type": "field", "name": name, "of": policy_port_to_json(base) })
+        }
     }
 }
 
@@ -1777,6 +1844,15 @@ fn flow_kill_to_json(kill: &TaintSanitizerSpec) -> Value {
     })
 }
 
+fn taint_entry_point_to_json(entry_point: &TaintEntryPointSpec) -> Value {
+    json!({
+        "id": entry_point.id.as_str(),
+        "selector": selector_to_json(&entry_point.selector),
+        "parameter": policy_port_to_json(&entry_point.parameter),
+        "labels": id_set(entry_point.labels.iter().map(TaintLabel::as_str)),
+    })
+}
+
 fn taint_sanitizer_to_json(sanitizer: &TaintSanitizerSpec) -> Value {
     json!({
         "id": sanitizer.id.as_str(),
@@ -1785,6 +1861,44 @@ fn taint_sanitizer_to_json(sanitizer: &TaintSanitizerSpec) -> Value {
         "output": policy_port_to_json(&sanitizer.output),
         "removes": id_set(sanitizer.removes.iter().map(TaintLabel::as_str)),
     })
+}
+
+fn taint_store_write_to_json(write: &TaintStoreWriteSpec) -> Value {
+    let mut object = Map::new();
+    insert(&mut object, "id", json!(write.id.as_str()));
+    insert(&mut object, "selector", selector_to_json(&write.selector));
+    insert(&mut object, "store", json!(write.store.as_str()));
+    insert_option(
+        &mut object,
+        "key",
+        write.key.as_ref().map(policy_port_to_json),
+    );
+    insert_option(
+        &mut object,
+        "instance",
+        write.instance.as_ref().map(policy_port_to_json),
+    );
+    insert(&mut object, "input", policy_port_to_json(&write.input));
+    Value::Object(object)
+}
+
+fn taint_store_read_to_json(read: &TaintStoreReadSpec) -> Value {
+    let mut object = Map::new();
+    insert(&mut object, "id", json!(read.id.as_str()));
+    insert(&mut object, "selector", selector_to_json(&read.selector));
+    insert(&mut object, "store", json!(read.store.as_str()));
+    insert_option(
+        &mut object,
+        "key",
+        read.key.as_ref().map(policy_port_to_json),
+    );
+    insert_option(
+        &mut object,
+        "instance",
+        read.instance.as_ref().map(policy_port_to_json),
+    );
+    insert(&mut object, "output", policy_port_to_json(&read.output));
+    Value::Object(object)
 }
 
 fn taint_transform_to_json(transform: &TaintTransformSpec) -> Value {
@@ -2765,8 +2879,11 @@ mod tests {
                         },
                         sinks: TaintEndpointSet::default(),
                         sanitizers: TaintEndpointSet::default(),
+                        entry_points: TaintEndpointSet::default(),
                         transforms: TaintEndpointSet::default(),
                         external_models: TaintEndpointSet::default(),
+                        store_writes: vec![],
+                        store_reads: vec![],
                         finding_combinations: vec![],
                     },
                 },
@@ -2797,6 +2914,7 @@ mod tests {
                 },
                 "sinks": { "include_sets": [], "include_matches": [], "entries": [] },
                 "sanitizers": { "include_sets": [], "include_matches": [], "entries": [] },
+                "entry_points": { "include_sets": [], "include_matches": [], "entries": [] },
                 "transforms": { "include_sets": [], "include_matches": [], "entries": [] },
                 "external_models": { "include_sets": [], "include_matches": [], "entries": [] },
                 "finding_combinations": [],
@@ -3195,7 +3313,8 @@ mod tests {
             .document()
             .to_inline_local_canonical_semantic_json()
             .expect("an inline relational policy is a closed document");
-        serde_json::to_vec(&value).expect("serde_json::Value serialization is infallible")
+        serde_json_canonicalizer::to_vec(&value)
+            .expect("validated policy values have a canonical JSON encoding")
     }
 
     fn canonical_semantic_sha256(source: &str) -> String {
@@ -3245,8 +3364,10 @@ mod tests {
             .pointer("/analysis/plan")
             .and_then(Value::as_object)
             .expect("a relational analysis projects a plan");
+        let mut plan_keys = plan.keys().map(String::as_str).collect::<Vec<_>>();
+        plan_keys.sort_unstable();
         assert_eq!(
-            plan.keys().map(String::as_str).collect::<Vec<_>>(),
+            plan_keys,
             vec!["assertions", "bindings", "groups", "joins", "limits"],
             "a plan with no derivations must not publish a derivations key"
         );
@@ -3254,8 +3375,10 @@ mod tests {
             .pointer("/analysis/plan/groups/0/aggregates/0/where/0")
             .and_then(Value::as_object)
             .expect("the group aggregate projects its predicate");
+        let mut predicate_keys = predicate.keys().map(String::as_str).collect::<Vec<_>>();
+        predicate_keys.sort_unstable();
         assert_eq!(
-            predicate.keys().map(String::as_str).collect::<Vec<_>>(),
+            predicate_keys,
             vec!["field", "op", "value"],
             "an equality predicate over a literal keeps the object it always projected"
         );
@@ -3475,8 +3598,10 @@ mod tests {
             .pointer("/analysis/asserts/0")
             .and_then(Value::as_object)
             .expect("an assertion analysis projects its asserts");
+        let mut assertion_keys = assertion.keys().map(String::as_str).collect::<Vec<_>>();
+        assertion_keys.sort_unstable();
         assert_eq!(
-            assertion.keys().map(String::as_str).collect::<Vec<_>>(),
+            assertion_keys,
             vec![
                 "anchor",
                 "at",

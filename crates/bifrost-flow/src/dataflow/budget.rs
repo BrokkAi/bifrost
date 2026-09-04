@@ -15,7 +15,15 @@ define_work_dimensions! {
     #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
     pub enum SolverBudgetDimension;
     /// Work performed or limits applied by one data-flow solve.
-    #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
+    ///
+    /// Serializable because a reused policy evaluation unit replays the exact
+    /// solver charge its own solve made, and that charge outlives the process
+    /// that measured it (`.agents/plans/impact-sliced-diff-base.md`, Decision
+    /// Log (5c)).
+    #[derive(
+        Debug, Default, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize,
+    )]
+    #[serde(deny_unknown_fields)]
     pub struct SolverWork;
     all: pub [17];
     InternedFacts => interned_facts = 100_000,

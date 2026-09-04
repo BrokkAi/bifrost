@@ -517,8 +517,21 @@ mod path_properties {
                 );
             }
             if let Some(last) = keys.last() {
+                let expected = path
+                    .components()
+                    .filter_map(|component| match component {
+                        Component::Normal(part) => Some(part.to_string_lossy().into_owned()),
+                        _ => None,
+                    })
+                    .next_back()
+                    .expect("a suffix key exists only when a Normal component exists");
                 prop_assert!(!last.is_empty(), "empty final key in {keys:?}");
-                prop_assert!(!last.contains('/'), "final key is not one component: {keys:?}");
+                prop_assert_eq!(
+                    last,
+                    &expected,
+                    "final key is not the final component: {:?}",
+                    keys,
+                );
             }
         }
 

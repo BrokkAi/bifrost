@@ -942,6 +942,57 @@ fn rewrite_path_constrained_values_report_their_allowed_set() {
     assert_eq!(&json[diagnostic.range.clone()], "\"ruby_require\"");
 }
 
+/// Hover help and validation ranges for the class-set type-flow steps, in
+/// both frontends. Each form takes exactly one query and no option axis, so
+/// an extra argument or a borrowed option is reported rather than ignored.
+#[test]
+fn class_set_and_absent_member_help_and_diagnostics_are_range_precise() {
+    for form in ["class-set", "absent-member"] {
+        let rql = format!("({form} (procedure-of (function)))");
+        let offset = rql.find(form).unwrap();
+        let help = query_source_help_at(&rql, offset).unwrap_or_else(|| panic!("no {form} help"));
+        assert_eq!(&rql[help.range], form);
+        assert!(!help.description.is_empty());
+        assert!(validate_query_source(&rql).is_empty(), "{rql}");
+    }
+
+    for op in ["class_set", "absent_member"] {
+        let json = format!(
+            r#"{{"match":{{"kind":"function"}},"steps":[{{"op":"procedure_of"}},{{"op":"{op}"}}]}}"#
+        );
+        let offset = json.find(op).unwrap();
+        let help =
+            query_source_help_at(&json, offset).unwrap_or_else(|| panic!("no JSON {op} help"));
+        assert!(!help.description.is_empty());
+        assert!(validate_query_source(&json).is_empty(), "{json}");
+    }
+
+    let rql = "(class-set (function) (function))";
+    let diagnostic = validate_query_source(rql)
+        .into_iter()
+        .find(|diagnostic| diagnostic.code == "wrong-value-shape")
+        .expect("class-set takes exactly one query");
+    assert!(diagnostic.message.contains("class-set"), "{diagnostic:?}");
+
+    let rql = "(absent-member :plan-ref test:flow (function))";
+    let diagnostic = validate_query_source(rql)
+        .into_iter()
+        .find(|diagnostic| diagnostic.code == "wrong-value-shape")
+        .expect("absent-member takes no option axis");
+    assert!(
+        diagnostic.message.contains("absent-member"),
+        "{diagnostic:?}"
+    );
+
+    let json =
+        r#"{"match":{"kind":"function"},"steps":[{"op":"class_set","plan_ref":"test:flow"}]}"#;
+    let diagnostic = validate_query_source(json)
+        .into_iter()
+        .find(|diagnostic| diagnostic.code == "unknown-property")
+        .expect("JSON class_set takes no option axis");
+    assert_eq!(&json[diagnostic.range.clone()], "\"plan_ref\"");
+}
+
 #[test]
 fn value_flow_help_and_diagnostics_are_range_precise() {
     let rql = "(witness :max-steps 8 (value-flow :plan-ref test:flow (procedure-of (function))))";

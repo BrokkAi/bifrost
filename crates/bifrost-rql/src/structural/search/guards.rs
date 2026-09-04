@@ -117,29 +117,65 @@ pub(super) fn public_guard(value: &GuardValue) -> CodeQueryGuard {
     // discriminator that makes the public digest injective, exactly as the
     // program-point wire id does.
     digest.push(&fact.id.get().to_le_bytes());
-    let (null_on_true, null_target_id, equality_negated, constant_value, opaque_digest) =
-        match fact.predicate {
-            GuardPredicate::NullComparison { null_on_true } => (
-                Some(null_on_true),
-                if null_on_true {
-                    true_target_id.clone()
-                } else {
-                    false_target_id.clone()
-                },
-                None,
-                None,
-                None,
-            ),
-            GuardPredicate::ConstantEquality { negated, constant } => (
-                None,
-                None,
-                Some(negated),
-                Some(u64::from(constant.get())),
-                None,
-            ),
-            GuardPredicate::Opaque { digest } => (None, None, None, None, Some(digest.get())),
-            GuardPredicate::ConstantBoolean { .. } => (None, None, None, None, None),
-        };
+    let (
+        null_on_true,
+        null_target_id,
+        equality_negated,
+        constant_value,
+        guarded_value,
+        classes_value,
+        member_value,
+        opaque_digest,
+    ) = match fact.predicate {
+        GuardPredicate::NullComparison { null_on_true } => (
+            Some(null_on_true),
+            if null_on_true {
+                true_target_id.clone()
+            } else {
+                false_target_id.clone()
+            },
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        ),
+        GuardPredicate::ConstantEquality { negated, constant } => (
+            None,
+            None,
+            Some(negated),
+            Some(u64::from(constant.get())),
+            None,
+            None,
+            None,
+            None,
+        ),
+        GuardPredicate::InstanceOf { value, classes } => (
+            None,
+            None,
+            None,
+            None,
+            Some(u64::from(value.get())),
+            Some(u64::from(classes.get())),
+            None,
+            None,
+        ),
+        GuardPredicate::HasMember { value, member } => (
+            None,
+            None,
+            None,
+            None,
+            Some(u64::from(value.get())),
+            None,
+            Some(u64::from(member.get())),
+            None,
+        ),
+        GuardPredicate::Opaque { digest } => {
+            (None, None, None, None, None, None, None, Some(digest.get()))
+        }
+        GuardPredicate::ConstantBoolean { .. } => (None, None, None, None, None, None, None, None),
+    };
     CodeQueryGuard {
         id: digest.finish().to_string(),
         procedure_id: procedure.id,
@@ -153,6 +189,9 @@ pub(super) fn public_guard(value: &GuardValue) -> CodeQueryGuard {
         null_target_id,
         equality_negated,
         constant_value,
+        guarded_value,
+        classes_value,
+        member_value,
         opaque_digest,
         subject_value: fact.subject.map(|subject| u64::from(subject.get())),
         true_edge_id,
@@ -227,6 +266,14 @@ mod tests {
                 negated: false,
                 constant: crate::analyzer::semantic::ValueId::new(0),
             },
+            GuardPredicate::InstanceOf {
+                value: crate::analyzer::semantic::ValueId::new(0),
+                classes: crate::analyzer::semantic::ValueId::new(1),
+            },
+            GuardPredicate::HasMember {
+                value: crate::analyzer::semantic::ValueId::new(0),
+                member: crate::analyzer::semantic::ValueId::new(1),
+            },
             GuardPredicate::Opaque {
                 digest: crate::analyzer::semantic::GuardConditionDigest::from_syntax_kind(
                     "method_invocation",
@@ -238,7 +285,7 @@ mod tests {
                 "{predicate:?}"
             );
         }
-        assert_eq!(GuardPredicate::LABELS.len(), 4);
+        assert_eq!(GuardPredicate::LABELS.len(), 6);
     }
 
     /// A constant condition proves one arm cannot execute, and which arm that

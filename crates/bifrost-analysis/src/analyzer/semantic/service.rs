@@ -1,14 +1,20 @@
 //! Shared snapshot, publication, and complete-cache mechanics for language lowerers.
 
+#[cfg(any(test, feature = "test-support"))]
+use std::collections::HashMap;
 use std::mem::size_of;
 use std::sync::Arc;
 #[cfg(any(test, feature = "test-support"))]
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::sync::Mutex;
+#[cfg(any(test, feature = "test-support"))]
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 use git2::Oid;
 use moka::sync::Cache;
 
 use crate::analyzer::QueryScope;
+#[cfg(any(test, feature = "test-support"))]
+use crate::analyzer::complete_value_cache::CompleteValueRevivalCensus;
 use crate::analyzer::complete_value_cache::{
     CompleteValueAcquisition, CompleteValueCache, CompleteValueWait,
 };
@@ -56,9 +62,73 @@ pub(crate) struct CompleteSemanticArtifactCache {
     #[cfg(any(test, feature = "test-support"))]
     active_invalidation_witness: Arc<AtomicU8>,
     #[cfg(any(test, feature = "test-support"))]
-    selector_continuation_revivals: Arc<AtomicU64>,
+    selector_continuation_revival_census: Arc<Mutex<SemanticCacheRevivalCensus>>,
     #[cfg(any(test, feature = "test-support"))]
-    evaluation_root_continuation_revivals: Arc<AtomicU64>,
+    evaluation_root_continuation_revival_census: Arc<Mutex<SemanticCacheRevivalCensus>>,
+    /// How this analyzer produced each file's semantics, per file. Shared by
+    /// analyzer clones for the same reason the cache itself is.
+    #[cfg(any(test, feature = "test-support"))]
+    materializations: Arc<Mutex<HashMap<WorkspaceRelativePath, SemanticMaterializationCensus>>>,
+}
+
+/// How one file's semantics were produced inside one analyzer, split by the
+/// physical work each production actually performed.
+///
+/// This is the unit behind semantic work accounting across a cache eviction.
+/// A lowering reads the source and builds the artifact again, and charges that
+/// whole materialization. A complete-artifact cache hit performs none of that:
+/// the first hit in a budget scope charges the artifact's retained-row census,
+/// and every later hit in the same scope charges exactly one
+/// [`repeat_materialization_work`] unit. Which of the three a touch becomes is
+/// what the complete cache's ready state decides.
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SemanticMaterializationCensus {
+    /// Touches that read the source and lowered the file again.
+    pub lowerings: u64,
+    /// Cache hits that paid the artifact's whole retained-row census.
+    pub census_hits: u64,
+    /// Cache hits that paid one `nested_entries` repeat-materialization unit.
+    pub repeat_hits: u64,
+}
+
+/// Test-only account of semantic artifacts revived after an armed cache
+/// invalidation.
+///
+/// One oversize artifact may be reinserted repeatedly while remaining the
+/// same allocation. `operations` retains that cache-pressure diagnostic;
+/// `distinct_artifacts` is the exact key/allocation identity contract.
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SemanticCacheRevivalCensus {
+    pub operations: u64,
+    pub distinct_artifacts: u64,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl SemanticCacheRevivalCensus {
+    fn from_complete_value(census: CompleteValueRevivalCensus) -> Self {
+        Self {
+            operations: census.operations,
+            distinct_artifacts: census.distinct_values,
+        }
+    }
+
+    fn component_max(self, other: Self) -> Self {
+        Self {
+            operations: self.operations.max(other.operations),
+            distinct_artifacts: self.distinct_artifacts.max(other.distinct_artifacts),
+        }
+    }
+
+    pub(crate) fn saturating_add(self, other: Self) -> Self {
+        Self {
+            operations: self.operations.saturating_add(other.operations),
+            distinct_artifacts: self
+                .distinct_artifacts
+                .saturating_add(other.distinct_artifacts),
+        }
+    }
 }
 
 impl Default for CompleteSemanticArtifactCache {
@@ -78,10 +148,55 @@ impl CompleteSemanticArtifactCache {
             #[cfg(any(test, feature = "test-support"))]
             active_invalidation_witness: Arc::new(AtomicU8::new(NO_SEMANTIC_INVALIDATION_WITNESS)),
             #[cfg(any(test, feature = "test-support"))]
-            selector_continuation_revivals: Arc::new(AtomicU64::new(0)),
+            selector_continuation_revival_census: Arc::new(Mutex::new(
+                SemanticCacheRevivalCensus::default(),
+            )),
             #[cfg(any(test, feature = "test-support"))]
-            evaluation_root_continuation_revivals: Arc::new(AtomicU64::new(0)),
+            evaluation_root_continuation_revival_census: Arc::new(Mutex::new(
+                SemanticCacheRevivalCensus::default(),
+            )),
+            #[cfg(any(test, feature = "test-support"))]
+            materializations: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    fn record_lowering(&self, path: &WorkspaceRelativePath) {
+        let mut census = self
+            .materializations
+            .lock()
+            .expect("semantic materialization census mutex poisoned");
+        let file = census.entry(path.clone()).or_default();
+        file.lowerings = file.lowerings.saturating_add(1);
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    fn record_hit(&self, path: &WorkspaceRelativePath, repeat: bool) {
+        let mut census = self
+            .materializations
+            .lock()
+            .expect("semantic materialization census mutex poisoned");
+        let file = census.entry(path.clone()).or_default();
+        if repeat {
+            file.repeat_hits = file.repeat_hits.saturating_add(1);
+        } else {
+            file.census_hits = file.census_hits.saturating_add(1);
+        }
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn materialization_census_for_test(
+        &self,
+    ) -> Vec<(WorkspaceRelativePath, SemanticMaterializationCensus)> {
+        let mut census: Vec<_> = self
+            .materializations
+            .lock()
+            .expect("semantic materialization census mutex poisoned")
+            .iter()
+            .map(|(path, file)| (path.clone(), *file))
+            .collect();
+        census.sort_by(|left, right| left.0.cmp(&right.0));
+        census
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -100,7 +215,7 @@ impl CompleteSemanticArtifactCache {
         }
         self.activate_invalidation_witness_for_test(
             SELECTOR_CONTINUATION_INVALIDATION_WITNESS,
-            &self.selector_continuation_revivals,
+            &self.selector_continuation_revival_census,
         );
     }
 
@@ -120,60 +235,82 @@ impl CompleteSemanticArtifactCache {
         }
         self.activate_invalidation_witness_for_test(
             EVALUATION_ROOT_CONTINUATION_INVALIDATION_WITNESS,
-            &self.evaluation_root_continuation_revivals,
+            &self.evaluation_root_continuation_revival_census,
         );
     }
 
     #[cfg(any(test, feature = "test-support"))]
-    fn activate_invalidation_witness_for_test(&self, witness: u8, counter: &AtomicU64) {
-        self.latch_active_invalidation_revivals_for_test();
-        counter.store(0, Ordering::Relaxed);
+    fn activate_invalidation_witness_for_test(
+        &self,
+        witness: u8,
+        census: &Mutex<SemanticCacheRevivalCensus>,
+    ) {
+        self.latch_active_invalidation_revival_census_for_test();
+        *census
+            .lock()
+            .expect("semantic invalidation revival census mutex poisoned") =
+            SemanticCacheRevivalCensus::default();
         self.active_invalidation_witness
             .store(witness, Ordering::Release);
-        self.inner.reset_revivals_for_test();
+        self.inner.reset_revival_census_for_test();
         self.inner.invalidate_all_for_test();
     }
 
     #[cfg(any(test, feature = "test-support"))]
-    fn latch_active_invalidation_revivals_for_test(&self) {
-        let revivals = self.inner.revivals_for_test();
-        match self.active_invalidation_witness.load(Ordering::Acquire) {
+    fn latch_active_invalidation_revival_census_for_test(&self) {
+        let current =
+            SemanticCacheRevivalCensus::from_complete_value(self.inner.revival_census_for_test());
+        let retained = match self.active_invalidation_witness.load(Ordering::Acquire) {
             SELECTOR_CONTINUATION_INVALIDATION_WITNESS => {
-                self.selector_continuation_revivals
-                    .fetch_max(revivals, Ordering::Relaxed);
+                &self.selector_continuation_revival_census
             }
             EVALUATION_ROOT_CONTINUATION_INVALIDATION_WITNESS => {
-                self.evaluation_root_continuation_revivals
-                    .fetch_max(revivals, Ordering::Relaxed);
+                &self.evaluation_root_continuation_revival_census
             }
-            NO_SEMANTIC_INVALIDATION_WITNESS => {}
+            NO_SEMANTIC_INVALIDATION_WITNESS => return,
             witness => panic!("unknown semantic invalidation witness {witness}"),
-        }
+        };
+        let mut retained = retained
+            .lock()
+            .expect("semantic invalidation revival census mutex poisoned");
+        *retained = retained.component_max(current);
     }
 
     #[cfg(any(test, feature = "test-support"))]
-    fn invalidation_revivals_for_test(&self, witness: u8, counter: &AtomicU64) -> u64 {
-        let retained = counter.load(Ordering::Relaxed);
+    fn invalidation_revival_census_for_test(
+        &self,
+        witness: u8,
+        census: &Mutex<SemanticCacheRevivalCensus>,
+    ) -> SemanticCacheRevivalCensus {
+        let retained = *census
+            .lock()
+            .expect("semantic invalidation revival census mutex poisoned");
         if self.active_invalidation_witness.load(Ordering::Acquire) == witness {
-            retained.max(self.inner.revivals_for_test())
+            retained.component_max(SemanticCacheRevivalCensus::from_complete_value(
+                self.inner.revival_census_for_test(),
+            ))
         } else {
             retained
         }
     }
 
     #[cfg(any(test, feature = "test-support"))]
-    pub(crate) fn selector_continuation_revivals_for_test(&self) -> u64 {
-        self.invalidation_revivals_for_test(
+    pub(crate) fn selector_continuation_revival_census_for_test(
+        &self,
+    ) -> SemanticCacheRevivalCensus {
+        self.invalidation_revival_census_for_test(
             SELECTOR_CONTINUATION_INVALIDATION_WITNESS,
-            &self.selector_continuation_revivals,
+            &self.selector_continuation_revival_census,
         )
     }
 
     #[cfg(any(test, feature = "test-support"))]
-    pub(crate) fn evaluation_root_continuation_revivals_for_test(&self) -> u64 {
-        self.invalidation_revivals_for_test(
+    pub(crate) fn evaluation_root_continuation_revival_census_for_test(
+        &self,
+    ) -> SemanticCacheRevivalCensus {
+        self.invalidation_revival_census_for_test(
             EVALUATION_ROOT_CONTINUATION_INVALIDATION_WITNESS,
-            &self.evaluation_root_continuation_revivals,
+            &self.evaluation_root_continuation_revival_census,
         )
     }
 
@@ -315,7 +452,8 @@ fn retained_artifact_bytes(key: &SemanticArtifactKey, artifact: &SemanticArtifac
         .procedures()
         .iter()
         .fold(
-            retained_artifact_base_bytes(artifact),
+            retained_artifact_base_bytes(artifact)
+                .saturating_add(artifact.lexical_children_index_retained_bytes()),
             |bytes, procedure| {
                 bytes
                     .saturating_add(procedure.call_indexes_retained_bytes())
@@ -494,7 +632,13 @@ fn materialize_with_lowerer_inner<A: LanguageAdapter>(
     // is also the only one that can charge a lookup rather than a file.
     if let Some(artifact) = served_from_unchanged_source(analyzer, cache, lowerer, file, request)? {
         let staged_budget = request.budget.clone();
-        let outcome = publish_cached(artifact, SemanticWork::default(), staged_budget, request);
+        let outcome = publish_cached(
+            cache,
+            artifact,
+            SemanticWork::default(),
+            staged_budget,
+            request,
+        );
         observe_complete_artifact(file, &outcome, request);
         return outcome;
     }
@@ -569,7 +713,7 @@ fn materialize_with_lowerer_inner<A: LanguageAdapter>(
     }
     let permit = match acquisition {
         CompleteValueAcquisition::Cached { value: artifact } => {
-            let outcome = publish_cached(artifact, source_work, staged_budget, request);
+            let outcome = publish_cached(cache, artifact, source_work, staged_budget, request);
             observe_complete_artifact(file, &outcome, request);
             return outcome;
         }
@@ -592,6 +736,8 @@ fn materialize_with_lowerer_inner<A: LanguageAdapter>(
         });
     }
 
+    #[cfg(any(test, feature = "test-support"))]
+    cache.record_lowering(key.path());
     let lowered = lowerer.lower(file, &prepared, &staged_budget, request.cancellation)?;
     if request.cancellation.is_cancelled() {
         if let SemanticOutcome::Cancelled {
@@ -641,6 +787,16 @@ fn observe_complete_artifact(
 /// What one repeat cache hit actually performs: derive the artifact key, look
 /// it up, and clone an `Arc`.
 ///
+/// This is what makes semantic work accounting bounded rather than exact
+/// across cache states. Within one cache state the charge is exact: a scope
+/// pays one artifact's census once and one unit per later hit. Across states
+/// the same touch may find the complete cache not ready and lower the file
+/// again instead, which charges that whole physical materialization -- the
+/// file's source bytes plus the lowering's transient control-flow work, which
+/// the retained-row census does not represent. A consumer that compares work
+/// across an eviction must therefore bound the difference by the repeated
+/// physical materializations rather than require equality (#2926).
+///
 /// It is deliberately non-zero. A budget scope that only ever hits the cache
 /// must still run out, and the traversal lane that would otherwise bound such a
 /// loop lives on [`super::SemanticExecutionBudget`], which is optional: the
@@ -663,6 +819,8 @@ const fn repeat_materialization_work() -> SemanticWork {
 /// charged for has already been paid for in this scope and is not performed
 /// again (#2295).
 fn publish_cached(
+    #[cfg_attr(not(any(test, feature = "test-support")), allow(unused_variables))]
+    cache: &CompleteSemanticArtifactCache,
     artifact: Arc<SemanticArtifact>,
     source_work: SemanticWork,
     mut staged_budget: super::SemanticBudget,
@@ -670,6 +828,8 @@ fn publish_cached(
 ) -> Result<SemanticOutcome<Arc<SemanticArtifact>>, SemanticProviderError> {
     let fingerprint = artifact.key().fingerprint();
     let repeat = staged_budget.has_charged_artifact(fingerprint);
+    #[cfg(any(test, feature = "test-support"))]
+    cache.record_hit(artifact.key().path(), repeat);
     let charge = if repeat {
         repeat_materialization_work()
     } else {
@@ -1582,8 +1742,14 @@ mod tests {
         cache.invalidate_evaluation_root_continuation_if_armed_for_test();
         assert_eq!(cache.len(), 1, "the evaluation witness is not armed");
         cache.invalidate_selector_continuation_if_armed_for_test();
-        assert_eq!(cache.selector_continuation_revivals_for_test(), 0);
-        assert_eq!(cache.evaluation_root_continuation_revivals_for_test(), 0);
+        assert_eq!(
+            cache.selector_continuation_revival_census_for_test(),
+            SemanticCacheRevivalCensus::default()
+        );
+        assert_eq!(
+            cache.evaluation_root_continuation_revival_census_for_test(),
+            SemanticCacheRevivalCensus::default()
+        );
         assert_eq!(cache.len(), 0);
 
         let mut budget = SemanticBudget::default();
@@ -1598,15 +1764,54 @@ mod tests {
             panic!("revived complete artifact")
         };
         assert!(Arc::ptr_eq(&held, &revived));
-        assert_eq!(cache.selector_continuation_revivals_for_test(), 1);
-        assert_eq!(cache.evaluation_root_continuation_revivals_for_test(), 0);
+        assert_eq!(
+            cache.selector_continuation_revival_census_for_test(),
+            SemanticCacheRevivalCensus {
+                operations: 1,
+                distinct_artifacts: 1,
+            }
+        );
+        assert_eq!(
+            cache.evaluation_root_continuation_revival_census_for_test(),
+            SemanticCacheRevivalCensus::default()
+        );
+
+        cache.inner.invalidate_all_for_test();
+        let mut budget = SemanticBudget::default();
+        let SemanticOutcome::Complete { value: revived, .. } = materialize(
+            &analyzer,
+            &cache,
+            &lowerer,
+            &file,
+            &mut budget,
+            &cancellation,
+        ) else {
+            panic!("same artifact revived a second time")
+        };
+        assert!(Arc::ptr_eq(&held, &revived));
+        assert_eq!(
+            cache.selector_continuation_revival_census_for_test(),
+            SemanticCacheRevivalCensus {
+                operations: 2,
+                distinct_artifacts: 1,
+            }
+        );
 
         cloned_cache.arm_evaluation_root_continuation_invalidation_for_test();
         cache.invalidate_selector_continuation_if_armed_for_test();
         assert_eq!(cache.len(), 1, "the selector witness is no longer armed");
         cache.invalidate_evaluation_root_continuation_if_armed_for_test();
-        assert_eq!(cache.selector_continuation_revivals_for_test(), 1);
-        assert_eq!(cache.evaluation_root_continuation_revivals_for_test(), 0);
+        assert_eq!(
+            cache.selector_continuation_revival_census_for_test(),
+            SemanticCacheRevivalCensus {
+                operations: 2,
+                distinct_artifacts: 1,
+            }
+        );
+        assert_eq!(
+            cache.evaluation_root_continuation_revival_census_for_test(),
+            SemanticCacheRevivalCensus::default()
+        );
         assert_eq!(cache.len(), 0);
 
         let mut budget = SemanticBudget::default();
@@ -1621,12 +1826,36 @@ mod tests {
             panic!("second revived complete artifact")
         };
         assert!(Arc::ptr_eq(&held, &revived));
-        assert_eq!(cache.selector_continuation_revivals_for_test(), 1);
-        assert_eq!(cache.evaluation_root_continuation_revivals_for_test(), 1);
+        assert_eq!(
+            cache.selector_continuation_revival_census_for_test(),
+            SemanticCacheRevivalCensus {
+                operations: 2,
+                distinct_artifacts: 1,
+            }
+        );
+        assert_eq!(
+            cache.evaluation_root_continuation_revival_census_for_test(),
+            SemanticCacheRevivalCensus {
+                operations: 1,
+                distinct_artifacts: 1,
+            }
+        );
 
         cache.invalidate_evaluation_root_continuation_if_armed_for_test();
-        assert_eq!(cache.selector_continuation_revivals_for_test(), 1);
-        assert_eq!(cache.evaluation_root_continuation_revivals_for_test(), 1);
+        assert_eq!(
+            cache.selector_continuation_revival_census_for_test(),
+            SemanticCacheRevivalCensus {
+                operations: 2,
+                distinct_artifacts: 1,
+            }
+        );
+        assert_eq!(
+            cache.evaluation_root_continuation_revival_census_for_test(),
+            SemanticCacheRevivalCensus {
+                operations: 1,
+                distinct_artifacts: 1,
+            }
+        );
         assert_eq!(cache.len(), 1);
         assert_eq!(lowerer.calls(), 1);
     }
@@ -1987,6 +2216,7 @@ mod tests {
             .iter()
             .map(ProcedureSemantics::value_identity_index_retained_bytes)
             .sum::<u64>();
+        let lexical_children_index_bytes = artifact.lexical_children_index_retained_bytes();
         assert!(
             call_index_bytes > 0,
             "fixture must retain derived call-phase indexes"
@@ -1997,7 +2227,8 @@ mod tests {
             retained_bytes,
             base_bytes
                 .saturating_add(call_index_bytes)
-                .saturating_add(value_identity_index_bytes),
+                .saturating_add(value_identity_index_bytes)
+                .saturating_add(lexical_children_index_bytes),
             "cache weight must include every derived semantic-index allocation"
         );
 

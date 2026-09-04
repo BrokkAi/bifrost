@@ -101,13 +101,14 @@ pub fn parse_typescript_file(file: &ProjectFile, source: &str, tree: &Tree) -> P
             "function_declaration" | "function_signature" => {
                 visit_ts_function(file, source, child, None, &mut parsed, false);
             }
-            "lexical_declaration" | "variable_declaration" | "type_alias_declaration" => {
-                if matches!(child.kind(), "lexical_declaration" | "variable_declaration") {
-                    let imports = parse_commonjs_require_import_infos_from_node(child, source);
-                    if !imports.is_empty() {
-                        module_has_imports = true;
-                        parsed.imports.extend(imports);
-                    }
+            "type_alias_declaration" => {
+                visit_ts_type_alias(file, source, child, None, &mut parsed, false);
+            }
+            "lexical_declaration" | "variable_declaration" => {
+                let imports = parse_commonjs_require_import_infos_from_node(child, source);
+                if !imports.is_empty() {
+                    module_has_imports = true;
+                    parsed.imports.extend(imports);
                 }
                 visit_ts_value(
                     file,
@@ -194,7 +195,10 @@ fn visit_ts_ambient_declarations(
         "function_declaration" | "function_signature" => {
             visit_ts_function(file, source, definition, parent, parsed, exported);
         }
-        "lexical_declaration" | "variable_declaration" | "type_alias_declaration" => {
+        "type_alias_declaration" => {
+            visit_ts_type_alias(file, source, definition, parent, parsed, exported);
+        }
+        "lexical_declaration" | "variable_declaration" => {
             visit_ts_value(
                 file,
                 source,
@@ -295,13 +299,15 @@ fn visit_ts_export(
                     visit_ts_function(file, source, node, parent, parsed, true);
                 }
             }
-            "lexical_declaration" | "variable_declaration" | "type_alias_declaration" => {
+            "type_alias_declaration" => {
                 if parent.is_none() {
-                    if declaration.kind() == "type_alias_declaration" {
-                        record_named_export(source, node, declaration, false, parsed);
-                    } else {
-                        record_named_declarator_exports(source, node, declaration, parsed);
-                    }
+                    record_named_export(source, node, declaration, false, parsed);
+                }
+                visit_ts_type_alias(file, source, node, parent, parsed, true);
+            }
+            "lexical_declaration" | "variable_declaration" => {
+                if parent.is_none() {
+                    record_named_declarator_exports(source, node, declaration, parsed);
                 }
                 visit_ts_value(
                     file,
@@ -607,6 +613,71 @@ fn visit_ts_function(
     visit_ts_return_surface_members(file, source, definition, &code_unit, &top_level, parsed);
 }
 
+/// Index a `type` alias as the type declaration it is: a
+/// [`CodeUnitType::Class`] carrying a [`SegmentKind::Type`] segment, the same
+/// identity rule [`visit_ts_class_like`] applies to a class, an interface, and
+/// an enum.
+///
+/// It used to mint a `Field` unit with a `SegmentKind::Member` segment, which
+/// is byte-for-byte what [`visit_ts_value`] mints for a module-scope `const` of
+/// the same name. `declaration_id` hashes segment kinds, so
+/// `type Config = ...` beside `const Config = ...` produced one CodeUnit
+/// instead of two and the `const` was unreachable (#2911).
+///
+/// The alias keeps the file-name `Path` prefix a module-scope binding carries
+/// rather than the bare name a class carries, so the rendered name is unchanged
+/// and only the persisted identity moves.
+fn visit_ts_type_alias(
+    file: &ProjectFile,
+    source: &str,
+    node: Node<'_>,
+    parent: Option<&CodeUnit>,
+    parsed: &mut brokk_bifrost_core::analyzer::parsed_file::ParsedFile,
+    exported: bool,
+) {
+    let definition = if node.kind() == "export_statement" {
+        node.child_by_field_name("declaration").unwrap_or(node)
+    } else {
+        node
+    };
+    let Some(name_node) = definition.child_by_field_name("name") else {
+        return;
+    };
+    let name = trim_statement(node_text(name_node, source));
+    let short_name = parent
+        .map(|parent| format!("{}.{}", parent.short_name(), name))
+        .unwrap_or_else(|| file_scoped_field_name(file, &name));
+    // Mirrors `short_name` above: a nested type alias is its owner's name
+    // extended by its own `Type` segment; a top-level one carries the same
+    // file-name `Path` prefix a module-scope binding carries.
+    let fq = match parent {
+        Some(parent) => parent
+            .fq()
+            .clone()
+            .with_pushed(js_ts_segment(&name, SegmentKind::Type)),
+        None => file_scoped_type_fq(file, &name),
+    };
+    let code_unit = CodeUnit::new_fq(
+        file.clone(),
+        brokk_bifrost_core::analyzer::model::CodeUnitType::Class,
+        "",
+        short_name,
+        fq,
+    );
+    let top_level = parent.cloned().unwrap_or_else(|| code_unit.clone());
+    let range_node = if exported { node } else { definition };
+    parsed.add_code_unit(
+        code_unit.clone(),
+        range_node,
+        source,
+        parent.cloned(),
+        Some(top_level.clone()),
+    );
+    parsed.add_signature(code_unit.clone(), trim_statement(node_text(node, source)));
+    parsed.mark_type_alias(code_unit.clone());
+    visit_ts_type_alias_members(file, source, definition, &code_unit, &top_level, parsed);
+}
+
 #[allow(clippy::too_many_arguments)]
 fn visit_ts_value(
     file: &ProjectFile,
@@ -623,56 +694,6 @@ fn visit_ts_value(
     } else {
         node
     };
-
-    if definition.kind() == "type_alias_declaration" {
-        let Some(name_node) = definition.child_by_field_name("name") else {
-            return;
-        };
-        let name = trim_statement(node_text(name_node, source));
-        let short_name = parent
-            .map(|parent| format!("{}.{}", parent.short_name(), name))
-            .unwrap_or_else(|| {
-                format!(
-                    "{}.{}",
-                    file.rel_path()
-                        .file_name()
-                        .and_then(|name| name.to_str())
-                        .unwrap_or("module"),
-                    name
-                )
-            });
-        // Mirrors `short_name` above: a nested type alias is a plain `Member`
-        // off the parent's `fq`; a top-level one is qualified by the same
-        // file-name `Path` prefix as `file_scoped_field_name` (built by hand
-        // above rather than via the shared helper, but structurally identical).
-        let fq = match parent {
-            Some(parent) => parent
-                .fq()
-                .clone()
-                .with_pushed(js_ts_segment(&name, SegmentKind::Member)),
-            None => file_scoped_field_fq(file, &name),
-        };
-        let code_unit = CodeUnit::new_fq(
-            file.clone(),
-            brokk_bifrost_core::analyzer::model::CodeUnitType::Field,
-            "",
-            short_name,
-            fq,
-        );
-        let top_level = parent.cloned().unwrap_or_else(|| code_unit.clone());
-        let range_node = if exported { node } else { definition };
-        parsed.add_code_unit(
-            code_unit.clone(),
-            range_node,
-            source,
-            parent.cloned(),
-            Some(top_level.clone()),
-        );
-        parsed.add_signature(code_unit.clone(), trim_statement(node_text(node, source)));
-        parsed.mark_type_alias(code_unit.clone());
-        visit_ts_type_alias_members(file, source, definition, &code_unit, &top_level, parsed);
-        return;
-    }
 
     for index in 0..definition.named_child_count() {
         let Some(child) = definition.named_child(index) else {

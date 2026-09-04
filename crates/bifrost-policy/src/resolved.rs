@@ -781,6 +781,22 @@ pub struct ResolvedTaintSanitizerDefinition {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedTaintStoreWriteDefinition {
+    pub store: TaintStoreName,
+    pub key: Option<PolicyPort>,
+    pub instance: Option<PolicyPort>,
+    pub input: PolicyPort,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedTaintStoreReadDefinition {
+    pub store: TaintStoreName,
+    pub key: Option<PolicyPort>,
+    pub instance: Option<PolicyPort>,
+    pub output: PolicyPort,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedTaintTransformDefinition {
     pub input: PolicyPort,
     pub output: PolicyPort,
@@ -849,8 +865,16 @@ pub struct ResolvedTaintPolicySpec {
     pub sources: Vec<ResolvedTaintEndpoint<ResolvedTaintSourceDefinition>>,
     pub sinks: Vec<ResolvedTaintEndpoint<ResolvedTaintSinkDefinition>>,
     pub sanitizers: Vec<ResolvedTaintAuxiliary<ResolvedTaintSanitizerDefinition>>,
+    /// Framework entry points (#2692). Each is a full source-shaped endpoint
+    /// whose `bind` names the tainted formal parameter of the *selected
+    /// declaration* rather than a port of a selected call.
+    pub entry_points: Vec<ResolvedTaintEndpoint<ResolvedTaintSourceDefinition>>,
     pub transforms: Vec<ResolvedTaintAuxiliary<ResolvedTaintTransformDefinition>>,
     pub external_models: Vec<ResolvedTaintAuxiliary<ResolvedTaintExternalModelDefinition>>,
+    /// Persistence-store writes. Stores compose only from local entries.
+    pub store_writes: Vec<ResolvedTaintAuxiliary<ResolvedTaintStoreWriteDefinition>>,
+    /// Persistence-store reads. Stores compose only from local entries.
+    pub store_reads: Vec<ResolvedTaintAuxiliary<ResolvedTaintStoreReadDefinition>>,
     pub catalogs: Vec<ResolvedCatalogIdentity>,
     pub match_manifests: Vec<ResolvedMatchDirectoryManifest>,
     pub finding_combinations: Vec<ResolvedFindingCombination>,
@@ -864,8 +888,11 @@ impl ResolvedTaintPolicySpec {
         mut sources: Vec<ResolvedTaintEndpoint<ResolvedTaintSourceDefinition>>,
         mut sinks: Vec<ResolvedTaintEndpoint<ResolvedTaintSinkDefinition>>,
         mut sanitizers: Vec<ResolvedTaintAuxiliary<ResolvedTaintSanitizerDefinition>>,
+        mut entry_points: Vec<ResolvedTaintEndpoint<ResolvedTaintSourceDefinition>>,
         mut transforms: Vec<ResolvedTaintAuxiliary<ResolvedTaintTransformDefinition>>,
         mut external_models: Vec<ResolvedTaintAuxiliary<ResolvedTaintExternalModelDefinition>>,
+        mut store_writes: Vec<ResolvedTaintAuxiliary<ResolvedTaintStoreWriteDefinition>>,
+        mut store_reads: Vec<ResolvedTaintAuxiliary<ResolvedTaintStoreReadDefinition>>,
         mut catalogs: Vec<ResolvedCatalogIdentity>,
         mut match_manifests: Vec<ResolvedMatchDirectoryManifest>,
         mut finding_combinations: Vec<ResolvedFindingCombination>,
@@ -873,8 +900,11 @@ impl ResolvedTaintPolicySpec {
         sources.sort_by(|left, right| left.identity.cmp(&right.identity));
         sinks.sort_by(|left, right| left.identity.cmp(&right.identity));
         sanitizers.sort_by(|left, right| left.identity.cmp(&right.identity));
+        entry_points.sort_by(|left, right| left.identity.cmp(&right.identity));
         transforms.sort_by(|left, right| left.identity.cmp(&right.identity));
         external_models.sort_by(|left, right| left.identity.cmp(&right.identity));
+        store_writes.sort_by(|left, right| left.identity.cmp(&right.identity));
+        store_reads.sort_by(|left, right| left.identity.cmp(&right.identity));
         catalogs.sort();
         catalogs.dedup();
         match_manifests.sort_by(|left, right| left.path.cmp(&right.path));
@@ -885,8 +915,11 @@ impl ResolvedTaintPolicySpec {
             sources,
             sinks,
             sanitizers,
+            entry_points,
             transforms,
             external_models,
+            store_writes,
+            store_reads,
             catalogs,
             match_manifests,
             finding_combinations,
@@ -1681,6 +1714,18 @@ fn validate_resolved_taint(
                     .external_models
                     .iter()
                     .map(|entry| entry.identity.clone()),
+            )
+            .chain(
+                resolved
+                    .store_writes
+                    .iter()
+                    .map(|entry| entry.identity.clone()),
+            )
+            .chain(
+                resolved
+                    .store_reads
+                    .iter()
+                    .map(|entry| entry.identity.clone()),
             ),
     ) {
         return invalid("resolved auxiliary taint identities must be globally unique");
@@ -1694,6 +1739,12 @@ fn validate_resolved_taint(
     for entry in &resolved.external_models {
         validate_resolved_auxiliary(entry, segments.external_models, policy_id, catalogs)?;
     }
+    for entry in &resolved.store_writes {
+        validate_resolved_auxiliary(entry, segments.stores, policy_id, catalogs)?;
+    }
+    for entry in &resolved.store_reads {
+        validate_resolved_auxiliary(entry, segments.stores, policy_id, catalogs)?;
+    }
     let endpoint_identities = resolved
         .sources
         .iter()
@@ -1701,6 +1752,12 @@ fn validate_resolved_taint(
         .chain(
             resolved
                 .sinks
+                .iter()
+                .map(|endpoint| endpoint.identity.clone()),
+        )
+        .chain(
+            resolved
+                .entry_points
                 .iter()
                 .map(|endpoint| endpoint.identity.clone()),
         )
@@ -1725,6 +1782,41 @@ fn validate_resolved_taint(
     }
     for endpoint in &resolved.sinks {
         validate_resolved_taint_sink(endpoint, &dependencies_by_identity)?;
+    }
+    for endpoint in &resolved.entry_points {
+        validate_resolved_taint_source(endpoint, &dependencies_by_identity)?;
+    }
+
+    for entry_point in &authored.entry_points.entries {
+        let identity = ResolvedEndpointIdentity::Local {
+            policy_id: policy_id.clone(),
+            entry_id: entry_point.id.clone(),
+        };
+        let Some(endpoint) = resolved
+            .entry_points
+            .iter()
+            .find(|endpoint| endpoint.identity == identity)
+        else {
+            return invalid(
+                "authored local taint entry point is absent from the resolved entry-point set",
+            );
+        };
+        let expected_path = PolicySelectorPath::new(taint_entry_selector_path(
+            segments.entry_points,
+            entry_point.id.as_str(),
+        ))
+        .map_err(|error| LoadedModelError::CanonicalProjection(error.to_string()))?;
+        if endpoint.definition.display_name != entry_point.id.as_str()
+            || !endpoint.definition.categories.is_empty()
+            || endpoint.definition.selector_path != expected_path
+            || endpoint.definition.bind != entry_point.parameter
+            || !same_set(&endpoint.definition.labels, &entry_point.labels)
+            || endpoint.definition.evidence.is_some()
+        {
+            return invalid(
+                "resolved local taint entry point differs from its authored definition",
+            );
+        }
     }
 
     for source in &authored.sources.entries {
@@ -1838,6 +1930,54 @@ fn validate_resolved_taint(
             &authored_entry.transfers,
         ) {
             return invalid("resolved local external model differs from its authored definition");
+        }
+    }
+
+    // Stores compose only from local entries, so the resolved sets are exactly
+    // the authored ones.
+    if resolved.store_writes.len() != authored.store_writes.len()
+        || resolved.store_reads.len() != authored.store_reads.len()
+    {
+        return invalid("resolved store entry counts differ from the authored policy");
+    }
+    for authored_entry in &authored.store_writes {
+        let identity = ResolvedEndpointIdentity::Local {
+            policy_id: policy_id.clone(),
+            entry_id: authored_entry.id.clone(),
+        };
+        let resolved_entry = resolved
+            .store_writes
+            .iter()
+            .find(|entry| entry.identity == identity)
+            .ok_or(LoadedModelError::InvalidResolvedModel {
+                reason: "authored local store-write is absent from the resolved store set",
+            })?;
+        if resolved_entry.definition.store != authored_entry.store
+            || resolved_entry.definition.key != authored_entry.key
+            || resolved_entry.definition.instance != authored_entry.instance
+            || resolved_entry.definition.input != authored_entry.input
+        {
+            return invalid("resolved local store-write differs from its authored definition");
+        }
+    }
+    for authored_entry in &authored.store_reads {
+        let identity = ResolvedEndpointIdentity::Local {
+            policy_id: policy_id.clone(),
+            entry_id: authored_entry.id.clone(),
+        };
+        let resolved_entry = resolved
+            .store_reads
+            .iter()
+            .find(|entry| entry.identity == identity)
+            .ok_or(LoadedModelError::InvalidResolvedModel {
+                reason: "authored local store-read is absent from the resolved store set",
+            })?;
+        if resolved_entry.definition.store != authored_entry.store
+            || resolved_entry.definition.key != authored_entry.key
+            || resolved_entry.definition.instance != authored_entry.instance
+            || resolved_entry.definition.output != authored_entry.output
+        {
+            return invalid("resolved local store-read differs from its authored definition");
         }
     }
 
@@ -2663,6 +2803,20 @@ fn validate_authored_policy_selectors(
                     selectors,
                 )?;
             }
+            for write in &spec.store_writes {
+                validate_authored_selector_at(
+                    &taint_entry_selector_path(segments.stores, write.id.as_str()),
+                    &write.selector,
+                    selectors,
+                )?;
+            }
+            for read in &spec.store_reads {
+                validate_authored_selector_at(
+                    &taint_entry_selector_path(segments.stores, read.id.as_str()),
+                    &read.selector,
+                    selectors,
+                )?;
+            }
         }
         PolicyAnalysis::Typestate { spec } => {
             for subject in &spec.subjects.entries {
@@ -3005,6 +3159,16 @@ fn validate_selector_closure(
                 .iter()
                 .map(|entry| entry.selector_path.clone()),
         );
+        expected.extend(
+            spec.store_writes
+                .iter()
+                .map(|entry| entry.selector_path.clone()),
+        );
+        expected.extend(
+            spec.store_reads
+                .iter()
+                .map(|entry| entry.selector_path.clone()),
+        );
     }
     let expected: HashSet<_> = expected.into_iter().collect();
     let actual: HashSet<_> = selectors
@@ -3050,6 +3214,8 @@ fn expected_selector_paths(
                 segments.external_models,
                 &spec.external_models.entries,
             )?;
+            extend_taint_paths(&mut paths, segments.stores, &spec.store_writes)?;
+            extend_taint_paths(&mut paths, segments.stores, &spec.store_reads)?;
         }
         PolicyAnalysis::Typestate { spec } => {
             for subject in &spec.subjects.entries {
@@ -3093,6 +3259,8 @@ impl_selector_entry!(
     TaintSanitizerSpec,
     TaintTransformSpec,
     TaintExternalModelSpec,
+    TaintStoreWriteSpec,
+    TaintStoreReadSpec,
 );
 
 fn extend_taint_paths<T: SelectorEntry>(
@@ -3328,8 +3496,11 @@ mod tests {
             Vec::new(),
             Vec::new(),
             vec![sanitizer],
+            Vec::new(),
             vec![transform],
             vec![model],
+            Vec::new(),
+            Vec::new(),
             Vec::new(),
             Vec::new(),
             Vec::new(),

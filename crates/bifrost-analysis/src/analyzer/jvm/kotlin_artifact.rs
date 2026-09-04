@@ -1724,6 +1724,7 @@ fn finish(
             completeness,
             safety: request.safety.clone(),
             carried_sources: carried_source_paths(&shards),
+            cpp_portability: None,
             shards,
         }),
         completeness,

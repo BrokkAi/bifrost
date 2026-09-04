@@ -2777,6 +2777,26 @@ fn valid_ordinary_different_task_call_has_matched_continuations() {
         SemanticCapability::NormalCallContinuation,
         SemanticCapability::ExceptionalCallContinuation,
     ]);
+    let mut invalid_keyword = parts.clone();
+    invalid_keyword.values.push(SemanticValue {
+        id: ValueId::new(1),
+        kind: SemanticValueKind::Local,
+        source,
+        evidence,
+    });
+    invalid_keyword.call_sites[0].arguments = Box::new([SemanticCallArgument {
+        value: ValueId::new(1),
+        expansion: CallArgumentExpansion::Direct(ArgumentDomain::Positional),
+        keyword: Some("named".into()),
+    }]);
+    let error = SemanticArtifact::try_new(
+        key.clone(),
+        semantic_capabilities.clone(),
+        vec![invalid_keyword],
+    )
+    .expect_err("only a direct keyword argument may carry a keyword name");
+    assert_eq!(error.kind(), SemanticIrErrorKind::CallContract);
+
     let mut valid_detached = parts.clone();
     valid_detached.call_sites[0].invocation_mode = CallInvocationMode::Detached;
     valid_detached.call_sites[0].exceptional_continuation = ControlContinuation::Absent;

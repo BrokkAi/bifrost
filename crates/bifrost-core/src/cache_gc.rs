@@ -10,6 +10,7 @@ use git2::Repository;
 use growable_bloom_filter::GrowableBloom;
 use rusqlite::{Connection, TransactionBehavior};
 
+use crate::path_normalization::NormalizePath;
 use crate::{cache_db, gitblob};
 
 pub use crate::cache_db::{VERSION_STORE_GRACE_SECS, sweep_disused_version_stores};
@@ -239,7 +240,8 @@ fn ignored_workspace_file_oids(
         .workdir()
         .ok_or_else(|| "repository has no working directory".to_string())?
         .canonicalize()
-        .map_err(|err| format!("canonicalizing git workdir: {err}"))?;
+        .map_err(|err| format!("canonicalizing git workdir: {err}"))?
+        .normalize();
     let files = crate::analyzer::project::collect_workspace_files(workspace_root)
         .map_err(|err| format!("walking workspace {}: {err}", workspace_root.display()))?;
     let mut out = std::collections::HashSet::new();

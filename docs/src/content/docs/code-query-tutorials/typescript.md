@@ -93,7 +93,7 @@ A type alias is a normalized `declaration`; interfaces, enums, and abstract clas
       "result_type": "structural_match",
       "path": "typescript/service.ts",
       "language": "typescript",
-      "kind": "declaration",
+      "kind": "class",
       "start_line": 14,
       "end_line": 14,
       "text": "type UserId = string;",

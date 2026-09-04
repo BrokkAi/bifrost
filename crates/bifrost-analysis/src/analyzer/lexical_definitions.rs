@@ -8,6 +8,7 @@
 use tree_sitter::Node;
 
 use super::languages::{LocalDeclarationVisibility, language_support};
+pub use super::semantic::FormalParameterPassingMode;
 use super::{DeclarationKind, Language, Range};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -45,21 +46,12 @@ pub struct FormalParameterSlot {
     pub default_range: Option<Range>,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum FormalParameterPassingMode {
-    PositionalOnly,
-    #[default]
-    PositionalOrNamed,
-    NamedOnly,
-}
-
-impl FormalParameterPassingMode {
-    pub(crate) const fn accepts_positional(self) -> bool {
-        matches!(self, Self::PositionalOnly | Self::PositionalOrNamed)
-    }
-
-    pub(crate) const fn accepts_named(self) -> bool {
-        matches!(self, Self::PositionalOrNamed | Self::NamedOnly)
+impl FormalParameterSlot {
+    pub fn unique_name(&self) -> Option<&str> {
+        let [name] = self.names.as_slice() else {
+            return None;
+        };
+        Some(name)
     }
 }
 

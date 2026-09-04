@@ -103,6 +103,7 @@ pub use config::{
     PhpAnalyzerConfig, PhpDependencyApiEvidence, PythonAnalyzerConfig, PythonEnvironmentConfig,
     PythonEnvironmentLimits, RubyAnalyzerConfig, RubyDependencyApiEvidence, RubyGemApiArtifact,
     RustAnalyzerConfig, RustDependencyApiEvidence, RustPackageApiArtifact, RustSelectedTarget,
+    ensure_global_rayon_pool,
 };
 pub use cpp::CppAnalyzer;
 pub(crate) use cpp::{
@@ -223,10 +224,12 @@ pub use python::{
 };
 pub use read_ledger::{
     IndexFamily, LookupKind, LookupQuestion, ReadKey, ReadLedger, ReadSetDigest,
+    absent_summary_digest,
 };
 pub use read_verification::{
-    ChangedFacts, ChangedRead, HeadInputs, LookupMemo, LookupReplayLimits, ReadVerdict,
-    WorkspaceFactIndex, analysis_epoch_digest, replay_lookup, verify_read_set,
+    ChangedFacts, ChangedRead, HeadInputs, LookupMemo, LookupReplayLimits, NoSummaryAnswers,
+    ReadVerdict, SummaryAnswers, WorkspaceFactIndex, analysis_epoch_digest, replay_lookup,
+    verify_read_set,
 };
 pub use ruby::RubyAnalyzer;
 pub use ruby::{

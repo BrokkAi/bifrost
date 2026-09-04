@@ -16,6 +16,17 @@
     "completeness": {
       "$ref": "#/$defs/Completeness"
     },
+    "cpp_portability": {
+      "description": "Exact resolver-backed C and C++ applicability and declaration evidence.\n\nThis is intentionally a pack-level, optional container.  A pack that\ndoes not carry native C++ evidence omits the field and therefore keeps\nits historical serialized form.  Native declaration ids are the\nreferences used by this container; display names and rendered\nsignatures are never identities.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/CppPortabilityEvidence"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
     "ecosystem": {
       "type": "string"
     },
@@ -1149,6 +1160,17 @@
         },
         "output": {
           "$ref": "#/$defs/AuthoredSummaryOutput"
+        },
+        "value_transfer": {
+          "description": "Optional identity-separating value-transfer semantics for this core\ntransfer. The endpoints remain the core transfer's ports; this field\nonly classifies the value/identity relationship and selected\noperation. Omission means this profile was not reviewed.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SummaryValueTransfer"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       },
       "additionalProperties": false,
@@ -1419,6 +1441,507 @@
       "enum": [
         "partial",
         "complete"
+      ]
+    },
+    "CppArtifactDigest": {
+      "type": "object",
+      "properties": {
+        "algorithm": {
+          "$ref": "#/$defs/CppDigestAlgorithm"
+        },
+        "canonicalization": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "coverage": {
+          "type": "string"
+        },
+        "value": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "algorithm",
+        "coverage",
+        "value"
+      ]
+    },
+    "CppArtifactSelector": {
+      "type": "object",
+      "properties": {
+        "digests": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/CppArtifactDigest"
+          }
+        },
+        "purl": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "purl",
+        "digests"
+      ]
+    },
+    "CppCallableKind": {
+      "type": "string",
+      "enum": [
+        "constructor",
+        "method"
+      ]
+    },
+    "CppCallableSignature": {
+      "type": "object",
+      "properties": {
+        "callable_kind": {
+          "$ref": "#/$defs/CppCallableKind"
+        },
+        "owner": {
+          "type": "string"
+        },
+        "parameters": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/CppCanonicalType"
+          }
+        },
+        "receiver": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CppCanonicalType"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "result": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CppCanonicalType"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "callable_kind",
+        "owner",
+        "parameters"
+      ]
+    },
+    "CppCanonicalType": {
+      "description": "Closed canonical type tree for C++ identity.  Declared and template\nprimary references use native declaration ids whose complete portable keys\nare retained in `CppPortabilityEvidence::symbols`.",
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "fundamental"
+            },
+            "name": {
+              "$ref": "#/$defs/CppFundamentalTypeName"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "name"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "declared"
+            },
+            "symbol": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "symbol"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "arguments": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/CppCanonicalType"
+              }
+            },
+            "kind": {
+              "type": "string",
+              "const": "template_specialization"
+            },
+            "primary": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "primary",
+            "arguments"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "qualified"
+            },
+            "qualifiers": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/CppTypeQualifier"
+              }
+            },
+            "type": {
+              "$ref": "#/$defs/CppCanonicalType"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "qualifiers",
+            "type"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "reference"
+            },
+            "reference_kind": {
+              "$ref": "#/$defs/CppReferenceKind"
+            },
+            "referent": {
+              "$ref": "#/$defs/CppCanonicalType"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "reference_kind",
+            "referent"
+          ]
+        }
+      ]
+    },
+    "CppDescriptorRole": {
+      "type": "string",
+      "enum": [
+        "namespace",
+        "type",
+        "callable"
+      ]
+    },
+    "CppDigestAlgorithm": {
+      "type": "string",
+      "enum": [
+        "sha256"
+      ]
+    },
+    "CppDirectHeader": {
+      "type": "object",
+      "properties": {
+        "artifact": {
+          "$ref": "#/$defs/CppArtifactSelector"
+        },
+        "include_name": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "include_name",
+        "artifact"
+      ]
+    },
+    "CppFundamentalTypeName": {
+      "type": "string",
+      "enum": [
+        "char"
+      ]
+    },
+    "CppHeaderClosure": {
+      "type": "string",
+      "enum": [
+        "complete"
+      ]
+    },
+    "CppIdentityStability": {
+      "type": "string",
+      "enum": [
+        "portable"
+      ]
+    },
+    "CppLanguage": {
+      "type": "string",
+      "enum": [
+        "c",
+        "cpp"
+      ]
+    },
+    "CppPortabilityEvidence": {
+      "description": "Exact C/C++ portability evidence imported from the CSMI 0.1 C/C++ profile.\n\nThe vectors are sorted into a canonical order by the semantic-pack\ncompiler.  Their contents remain typed all the way through artifact\nencoding and decoding so a consumer can distinguish an exact resolver\nresult from a missing or unsupported one without inspecting JSON values.",
+      "type": "object",
+      "properties": {
+        "resolution_contexts": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/CppResolutionContextRecord"
+          }
+        },
+        "special_members": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/CppSpecialMemberEvidence"
+          }
+        },
+        "symbols": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/CppPortableSymbolRecord"
+          }
+        },
+        "type_aliases": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/CppTypeAliasEvidence"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "CppPortableSymbolKey": {
+      "type": "object",
+      "properties": {
+        "artifact_selectors": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/CppArtifactSelector"
+          }
+        },
+        "descriptors": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/CppSymbolDescriptor"
+          }
+        },
+        "scheme": {
+          "type": "string"
+        },
+        "scheme_version": {
+          "type": "string"
+        },
+        "stability": {
+          "$ref": "#/$defs/CppIdentityStability"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "artifact_selectors",
+        "scheme",
+        "scheme_version",
+        "stability",
+        "descriptors"
+      ]
+    },
+    "CppPortableSymbolRecord": {
+      "description": "A portable C++ symbol key retained alongside the native declaration id\nthat the Bifrost pack uses for references.",
+      "type": "object",
+      "properties": {
+        "key": {
+          "$ref": "#/$defs/CppPortableSymbolKey"
+        },
+        "native_id": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "native_id",
+        "key"
+      ]
+    },
+    "CppReferenceKind": {
+      "type": "string",
+      "enum": [
+        "lvalue",
+        "rvalue"
+      ]
+    },
+    "CppResolutionContextRecord": {
+      "description": "A complete resolver context and the exact digest used to refer to it from\nalias and special-member facts.",
+      "type": "object",
+      "properties": {
+        "compile_arguments_digest": {
+          "type": "string"
+        },
+        "context_digest": {
+          "type": "string"
+        },
+        "direct_headers": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/CppDirectHeader"
+          }
+        },
+        "header_closure": {
+          "$ref": "#/$defs/CppHeaderClosure"
+        },
+        "language": {
+          "$ref": "#/$defs/CppLanguage"
+        },
+        "translation_unit": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "context_digest",
+        "language",
+        "translation_unit",
+        "compile_arguments_digest",
+        "direct_headers",
+        "header_closure"
+      ]
+    },
+    "CppResolutionContextRef": {
+      "description": "The CSMI resolution-profile reference carried by a C++ profile fact.",
+      "type": "object",
+      "properties": {
+        "context_digest": {
+          "type": "string"
+        },
+        "header_closure": {
+          "$ref": "#/$defs/CppHeaderClosure"
+        },
+        "language": {
+          "$ref": "#/$defs/CppLanguage"
+        },
+        "version": {
+          "type": "string"
+        },
+        "vocabulary": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "vocabulary",
+        "version",
+        "context_digest",
+        "language",
+        "header_closure"
+      ]
+    },
+    "CppSpecialMemberEvidence": {
+      "description": "An exact copy/move special-member declaration identity.",
+      "type": "object",
+      "properties": {
+        "member": {
+          "type": "string"
+        },
+        "member_disambiguator": {
+          "type": "string"
+        },
+        "operation": {
+          "$ref": "#/$defs/CppSpecialMemberOperation"
+        },
+        "owner": {
+          "type": "string"
+        },
+        "resolution_context": {
+          "$ref": "#/$defs/CppResolutionContextRef"
+        },
+        "signature": {
+          "$ref": "#/$defs/CppCallableSignature"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "owner",
+        "member",
+        "operation",
+        "signature",
+        "member_disambiguator",
+        "resolution_context"
+      ]
+    },
+    "CppSpecialMemberOperation": {
+      "type": "string",
+      "enum": [
+        "copy_constructor",
+        "copy_assignment",
+        "move_constructor"
+      ]
+    },
+    "CppSymbolDescriptor": {
+      "type": "object",
+      "properties": {
+        "disambiguator": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "role": {
+          "$ref": "#/$defs/CppDescriptorRole"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "role",
+        "name",
+        "disambiguator"
+      ]
+    },
+    "CppTypeAliasEvidence": {
+      "description": "A type alias fact keyed by the native alias declaration id.",
+      "type": "object",
+      "properties": {
+        "alias": {
+          "type": "string"
+        },
+        "resolution_context": {
+          "$ref": "#/$defs/CppResolutionContextRef"
+        },
+        "target": {
+          "$ref": "#/$defs/CppCanonicalType"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "alias",
+        "target",
+        "resolution_context"
+      ]
+    },
+    "CppTypeQualifier": {
+      "type": "string",
+      "enum": [
+        "const",
+        "volatile"
       ]
     },
     "DeclarationGuard": {
@@ -1741,6 +2264,46 @@
             "kind": {
               "type": "string",
               "const": "move_constructor"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "description": "Construction creates a distinct object whose relevant logical value is\npreserved from one source argument. Consumers must still prove that the\nexact member accepts the source expression at the call site.",
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "value_preserving_constructor"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "copy_assignment"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "move_assignment"
             }
           },
           "additionalProperties": false,
@@ -2376,6 +2939,211 @@
         "display"
       ]
     },
+    "SummaryMoveInvalidation": {
+      "type": "string",
+      "enum": [
+        "invalidated",
+        "unknown"
+      ]
+    },
+    "SummaryValuePreservation": {
+      "type": "string",
+      "enum": [
+        "identity",
+        "preserving",
+        "changing",
+        "unknown"
+      ]
+    },
+    "SummaryValueTransfer": {
+      "description": "Typed identity-separating semantics attached to one procedure-summary\ntransfer. This is intentionally separate from the core transfer endpoints\nso a consumer can distinguish value-flow coverage from profile coverage.",
+      "type": "object",
+      "properties": {
+        "kind": {
+          "$ref": "#/$defs/SummaryValueTransferKind"
+        },
+        "operation": {
+          "$ref": "#/$defs/SummaryValueTransferOperation"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "operation"
+      ]
+    },
+    "SummaryValueTransferKind": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "copy"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "aggregate_copy"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "invalidation": {
+              "$ref": "#/$defs/SummaryMoveInvalidation"
+            },
+            "kind": {
+              "type": "string",
+              "const": "move"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "invalidation"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "conversion"
+            },
+            "preservation": {
+              "$ref": "#/$defs/SummaryValuePreservation"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "preservation"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "boxing"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "unboxing"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind"
+          ]
+        }
+      ]
+    },
+    "SummaryValueTransferLimitation": {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "$ref": "#/$defs/SummaryValueTransferLimitationKind"
+        },
+        "message": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "kind"
+      ]
+    },
+    "SummaryValueTransferLimitationKind": {
+      "type": "string",
+      "enum": [
+        "budget_exhausted",
+        "cancelled",
+        "unsupported",
+        "unresolved_identity",
+        "ambiguous_identity",
+        "incomplete_input",
+        "other"
+      ]
+    },
+    "SummaryValueTransferOperation": {
+      "description": "The selected operation behind one value transfer. An implicit operation\nnames the exact stable member declaration id; it never carries a display\nname or rendered signature. Unknown operation identity remains typed and\ncarries the reason it could not be established.",
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "none"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "implicit"
+            },
+            "member": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "member"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "unknown"
+            },
+            "limitation": {
+              "$ref": "#/$defs/SummaryValueTransferLimitation"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "limitation"
+          ]
+        }
+      ]
+    },
     "TemplateCondition": {
       "oneOf": [
         {
@@ -2972,6 +3740,10 @@
             "kind": {
               "type": "string",
               "const": "by_ref"
+            },
+            "reference_kind": {
+              "description": "The reference category, when the source language distinguishes\nlvalue and rvalue references. Existing producers omit this field\nand therefore retain the historical lvalue-reference meaning.",
+              "$ref": "#/$defs/TypeRefReferenceKind"
             }
           },
           "additionalProperties": false,
@@ -3154,6 +3926,14 @@
             "parameters"
           ]
         }
+      ]
+    },
+    "TypeRefReferenceKind": {
+      "description": "The source-level category of a by-reference type.\n\nThis is separate from the tagged [`TypeRef`] variant because the outer\n`kind` field already identifies the type constructor. Keeping the category\nhere lets C++ copy and move overloads retain distinct parameter identities,\nwhile producers that do not distinguish categories continue to use the\ndefault lvalue form.",
+      "type": "string",
+      "enum": [
+        "lvalue",
+        "rvalue"
       ]
     },
     "TypeValueSemantics": {

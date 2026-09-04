@@ -552,6 +552,7 @@ mod tests {
             input: AuthoredSummaryInput::Parameter { ordinal: 0 },
             exit_kind: AuthoredSummaryExitKind::Normal,
             output: AuthoredSummaryOutput::NormalReturn {},
+            value_transfer: None,
         };
         let entry = FoundryEntry {
             id: summary_id(FoundryCorpus::Codeql, &target),

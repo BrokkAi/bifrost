@@ -12,7 +12,294 @@ use crate::analyzer::semantic::{
     TransferOperation, ValueFlowKind, ValueId, ValuePreservation, ValueTransfer,
 };
 use crate::hash::{HashMap, HashSet};
+use std::cmp::Ordering;
 use std::collections::VecDeque;
+
+/// A signed integer that can represent `-u128::MAX` through `u128::MAX`
+/// without host-language casts or overflow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ScalarIntegerValue {
+    negative: bool,
+    magnitude: u128,
+}
+
+impl ScalarIntegerValue {
+    pub const fn new(negative: bool, magnitude: u128) -> Self {
+        Self {
+            negative: negative && magnitude != 0,
+            magnitude,
+        }
+    }
+
+    pub const fn unsigned(value: u128) -> Self {
+        Self::new(false, value)
+    }
+
+    pub const fn negative(self) -> bool {
+        self.negative
+    }
+
+    pub const fn magnitude(self) -> u128 {
+        self.magnitude
+    }
+
+    pub fn checked_add(self, other: Self) -> Option<Self> {
+        if self.negative == other.negative {
+            return self
+                .magnitude
+                .checked_add(other.magnitude)
+                .map(|magnitude| Self::new(self.negative, magnitude));
+        }
+        Some(match self.magnitude.cmp(&other.magnitude) {
+            Ordering::Greater => Self::new(self.negative, self.magnitude - other.magnitude),
+            Ordering::Less => Self::new(other.negative, other.magnitude - self.magnitude),
+            Ordering::Equal => Self::unsigned(0),
+        })
+    }
+
+    pub fn checked_sub(self, other: Self) -> Option<Self> {
+        self.checked_add(Self::new(!other.negative, other.magnitude))
+    }
+}
+
+impl PartialOrd for ScalarIntegerValue {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for ScalarIntegerValue {
+    fn cmp(&self, other: &Self) -> Ordering {
+        match (self.negative, other.negative) {
+            (true, false) => Ordering::Less,
+            (false, true) => Ordering::Greater,
+            (false, false) => self.magnitude.cmp(&other.magnitude),
+            (true, true) => other.magnitude.cmp(&self.magnitude),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ScalarIntegerDomain {
+    Mathematical,
+    Signed { bits: u16 },
+    Unsigned { bits: u16 },
+}
+
+impl ScalarIntegerDomain {
+    pub fn signed(bits: u16) -> Self {
+        assert!((1..=128).contains(&bits), "signed integer width is 1..=128");
+        Self::Signed { bits }
+    }
+
+    pub fn unsigned(bits: u16) -> Self {
+        assert!(
+            (1..=128).contains(&bits),
+            "unsigned integer width is 1..=128"
+        );
+        Self::Unsigned { bits }
+    }
+
+    pub fn contains(self, value: ScalarIntegerValue) -> bool {
+        match self {
+            Self::Mathematical => true,
+            Self::Unsigned { bits } => {
+                assert_integer_width(bits);
+                !value.negative && value.magnitude <= unsigned_max(bits)
+            }
+            Self::Signed { bits } if value.negative => {
+                assert_integer_width(bits);
+                value.magnitude <= signed_min_magnitude(bits)
+            }
+            Self::Signed { bits } => {
+                assert_integer_width(bits);
+                value.magnitude <= signed_max(bits)
+            }
+        }
+    }
+
+    pub fn finite_bounds(self) -> Option<(ScalarIntegerValue, ScalarIntegerValue)> {
+        match self {
+            Self::Mathematical => None,
+            Self::Signed { bits } => {
+                assert_integer_width(bits);
+                Some((
+                    ScalarIntegerValue::new(true, signed_min_magnitude(bits)),
+                    ScalarIntegerValue::unsigned(signed_max(bits)),
+                ))
+            }
+            Self::Unsigned { bits } => {
+                assert_integer_width(bits);
+                Some((
+                    ScalarIntegerValue::unsigned(0),
+                    ScalarIntegerValue::unsigned(unsigned_max(bits)),
+                ))
+            }
+        }
+    }
+}
+
+fn assert_integer_width(bits: u16) {
+    assert!((1..=128).contains(&bits), "integer width is 1..=128");
+}
+
+const fn unsigned_max(bits: u16) -> u128 {
+    if bits == 128 {
+        u128::MAX
+    } else {
+        (1_u128 << bits) - 1
+    }
+}
+
+const fn signed_min_magnitude(bits: u16) -> u128 {
+    1_u128 << (bits - 1)
+}
+
+const fn signed_max(bits: u16) -> u128 {
+    signed_min_magnitude(bits) - 1
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ScalarIntegerInterval {
+    lower: ScalarIntegerValue,
+    upper: ScalarIntegerValue,
+    domain: ScalarIntegerDomain,
+}
+
+impl ScalarIntegerInterval {
+    pub fn new(
+        lower: ScalarIntegerValue,
+        upper: ScalarIntegerValue,
+        domain: ScalarIntegerDomain,
+    ) -> Self {
+        assert!(lower <= upper, "integer interval bounds are ordered");
+        assert!(
+            domain.contains(lower) && domain.contains(upper),
+            "integer interval bounds belong to their domain"
+        );
+        Self {
+            lower,
+            upper,
+            domain,
+        }
+    }
+
+    pub fn exact(value: ScalarIntegerValue, domain: ScalarIntegerDomain) -> Self {
+        Self::new(value, value, domain)
+    }
+
+    pub const fn lower(self) -> ScalarIntegerValue {
+        self.lower
+    }
+
+    pub const fn upper(self) -> ScalarIntegerValue {
+        self.upper
+    }
+
+    pub const fn domain(self) -> ScalarIntegerDomain {
+        self.domain
+    }
+
+    pub fn exact_value(self) -> Option<ScalarIntegerValue> {
+        if self.lower == self.upper {
+            Some(self.lower)
+        } else {
+            None
+        }
+    }
+
+    pub fn hull(self, other: Self) -> Option<Self> {
+        (self.domain == other.domain).then(|| {
+            Self::new(
+                self.lower.min(other.lower),
+                self.upper.max(other.upper),
+                self.domain,
+            )
+        })
+    }
+
+    pub fn add_interval(self, other: Self) -> ScalarIntegerArithmetic {
+        self.binary_operation(other, ScalarIntegerValue::checked_add)
+    }
+
+    pub fn subtract_interval(self, other: Self) -> ScalarIntegerArithmetic {
+        if self.domain != other.domain {
+            return ScalarIntegerArithmetic::UnknownDomain;
+        }
+        let Some(lower) = self.lower.checked_sub(other.upper) else {
+            return ScalarIntegerArithmetic::MagnitudeExceeded;
+        };
+        let Some(upper) = self.upper.checked_sub(other.lower) else {
+            return ScalarIntegerArithmetic::MagnitudeExceeded;
+        };
+        if !self.domain.contains(lower) || !self.domain.contains(upper) {
+            return ScalarIntegerArithmetic::Overflow;
+        }
+        ScalarIntegerArithmetic::Interval(Self::new(lower, upper, self.domain))
+    }
+
+    pub fn widen(self, next: Self) -> ScalarIntegerWidening {
+        if self.domain != next.domain {
+            return ScalarIntegerWidening::UnknownDomain;
+        }
+        let expands_lower = next.lower < self.lower;
+        let expands_upper = next.upper > self.upper;
+        if !expands_lower && !expands_upper {
+            return ScalarIntegerWidening::Interval(self);
+        }
+        let Some((domain_lower, domain_upper)) = self.domain.finite_bounds() else {
+            return ScalarIntegerWidening::Unbounded;
+        };
+        ScalarIntegerWidening::Interval(Self::new(
+            if expands_lower {
+                domain_lower
+            } else {
+                self.lower
+            },
+            if expands_upper {
+                domain_upper
+            } else {
+                self.upper
+            },
+            self.domain,
+        ))
+    }
+
+    fn binary_operation(
+        self,
+        other: Self,
+        operation: fn(ScalarIntegerValue, ScalarIntegerValue) -> Option<ScalarIntegerValue>,
+    ) -> ScalarIntegerArithmetic {
+        if self.domain != other.domain {
+            return ScalarIntegerArithmetic::UnknownDomain;
+        }
+        let Some(lower) = operation(self.lower, other.lower) else {
+            return ScalarIntegerArithmetic::MagnitudeExceeded;
+        };
+        let Some(upper) = operation(self.upper, other.upper) else {
+            return ScalarIntegerArithmetic::MagnitudeExceeded;
+        };
+        if !self.domain.contains(lower) || !self.domain.contains(upper) {
+            return ScalarIntegerArithmetic::Overflow;
+        }
+        ScalarIntegerArithmetic::Interval(Self::new(lower, upper, self.domain))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScalarIntegerArithmetic {
+    Interval(ScalarIntegerInterval),
+    Overflow,
+    MagnitudeExceeded,
+    UnknownDomain,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScalarIntegerWidening {
+    Interval(ScalarIntegerInterval),
+    Unbounded,
+    UnknownDomain,
+}
 
 /// One finite scalar statement at a program point.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -26,7 +313,7 @@ pub enum ScalarFact {
     True,
     False,
     EitherBoolean,
-    ExactInteger(u128),
+    Integer(ScalarIntegerInterval),
     NonExactInteger,
     /// Required structured information is absent or an operation is outside
     /// the bounded scalar vocabulary.
@@ -34,7 +321,7 @@ pub enum ScalarFact {
 }
 
 impl ScalarFact {
-    pub const fn label(self) -> &'static str {
+    pub fn label(self) -> &'static str {
         match self {
             Self::Unreachable => "unreachable",
             Self::Nil => "nil",
@@ -43,7 +330,8 @@ impl ScalarFact {
             Self::True => "true",
             Self::False => "false",
             Self::EitherBoolean => "either_boolean",
-            Self::ExactInteger(_) => "exact_integer",
+            Self::Integer(interval) if interval.exact_value().is_some() => "exact_integer",
+            Self::Integer(_) => "integer_interval",
             Self::NonExactInteger => "non_exact_integer",
             Self::Unknown => "unknown",
         }
@@ -51,8 +339,8 @@ impl ScalarFact {
 
     pub fn join(self, other: Self) -> Self {
         use ScalarFact::{
-            EitherBoolean, ExactInteger, False, MaybeNil, Nil, NonExactInteger, NonNil, True,
-            Unknown, Unreachable,
+            EitherBoolean, False, Integer, MaybeNil, Nil, NonExactInteger, NonNil, True, Unknown,
+            Unreachable,
         };
         match (self, other) {
             (Unreachable, value) | (value, Unreachable) => value,
@@ -63,10 +351,8 @@ impl ScalarFact {
             (True, False | EitherBoolean)
             | (False, True | EitherBoolean)
             | (EitherBoolean, True | False) => EitherBoolean,
-            (ExactInteger(left), ExactInteger(right)) if left != right => NonExactInteger,
-            (ExactInteger(_), NonExactInteger) | (NonExactInteger, ExactInteger(_)) => {
-                NonExactInteger
-            }
+            (Integer(left), Integer(right)) => left.hull(right).map_or(NonExactInteger, Integer),
+            (Integer(_), NonExactInteger) | (NonExactInteger, Integer(_)) => NonExactInteger,
             _ => Unknown,
         }
     }
@@ -392,7 +678,12 @@ fn intrinsic_fact(
         SemanticValueKind::Null => ScalarFact::Nil,
         SemanticValueKind::Boolean(true) => ScalarFact::True,
         SemanticValueKind::Boolean(false) => ScalarFact::False,
-        SemanticValueKind::UnsignedInteger(value) => ScalarFact::ExactInteger(value),
+        SemanticValueKind::UnsignedInteger(value) => {
+            ScalarFact::Integer(ScalarIntegerInterval::exact(
+                ScalarIntegerValue::unsigned(value),
+                ScalarIntegerDomain::Mathematical,
+            ))
+        }
         SemanticValueKind::Address => ScalarFact::NonNil,
         _ if semantics
             .allocations()
@@ -445,12 +736,15 @@ fn apply_guard_refinement(
                 ScalarFact::True => ScalarFact::False,
                 ScalarFact::False if equality_arm => ScalarFact::False,
                 ScalarFact::False => ScalarFact::True,
-                ScalarFact::ExactInteger(value) if equality_arm => ScalarFact::ExactInteger(value),
-                ScalarFact::ExactInteger(_) => ScalarFact::NonExactInteger,
+                ScalarFact::Integer(value) if equality_arm => ScalarFact::Integer(value),
+                ScalarFact::Integer(_) => ScalarFact::NonExactInteger,
                 _ => return,
             }
         }
-        GuardPredicate::ConstantBoolean { .. } | GuardPredicate::Opaque { .. } => return,
+        GuardPredicate::ConstantBoolean { .. }
+        | GuardPredicate::InstanceOf { .. }
+        | GuardPredicate::HasMember { .. }
+        | GuardPredicate::Opaque { .. } => return,
     };
     state[subject.index()] = refined;
     if let Some(binding) = unique_binding_origin(procedure, subject) {
@@ -458,48 +752,67 @@ fn apply_guard_refinement(
     }
 }
 
+pub(crate) struct BindingOriginIndex<'procedure> {
+    procedure: &'procedure ProcedureHandle,
+    predecessors: HashMap<ValueId, Vec<ValueId>>,
+}
+
+impl<'procedure> BindingOriginIndex<'procedure> {
+    pub(crate) fn new(procedure: &'procedure ProcedureHandle) -> Self {
+        let semantics = procedure.semantics();
+        let mut predecessors = HashMap::<ValueId, Vec<ValueId>>::default();
+        for point in semantics.points() {
+            for event in &point.events {
+                match event.effect {
+                    SemanticEffect::Assignment { target, value }
+                        if !semantics.value(target).is_some_and(|value| {
+                            matches!(
+                                value.kind,
+                                SemanticValueKind::Local
+                                    | SemanticValueKind::Parameter { .. }
+                                    | SemanticValueKind::Receiver { .. }
+                            )
+                        }) =>
+                    {
+                        predecessors.entry(target).or_default().push(value);
+                    }
+                    SemanticEffect::ValueFlow { source, target, .. } => {
+                        predecessors.entry(target).or_default().push(source);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Self {
+            procedure,
+            predecessors,
+        }
+    }
+
+    pub(crate) fn unique_binding_origin(&self, subject: ValueId) -> Option<ValueId> {
+        let semantics = self.procedure.semantics();
+        let mut pending = vec![subject];
+        let mut visited = HashSet::default();
+        let mut bindings = HashSet::default();
+        while let Some(value) = pending.pop() {
+            if !visited.insert(value) {
+                continue;
+            }
+            match semantics.value(value)?.kind {
+                SemanticValueKind::Local
+                | SemanticValueKind::Parameter { .. }
+                | SemanticValueKind::Receiver { .. } => {
+                    bindings.insert(value);
+                }
+                _ => pending.extend(self.predecessors.get(&value).into_iter().flatten().copied()),
+            }
+        }
+        (bindings.len() == 1).then(|| *bindings.iter().next().expect("one binding"))
+    }
+}
+
 pub fn unique_binding_origin(procedure: &ProcedureHandle, subject: ValueId) -> Option<ValueId> {
-    let semantics = procedure.semantics();
-    let mut predecessors = HashMap::<ValueId, Vec<ValueId>>::default();
-    for point in semantics.points() {
-        for event in &point.events {
-            match event.effect {
-                SemanticEffect::Assignment { target, value }
-                    if !semantics.value(target).is_some_and(|value| {
-                        matches!(
-                            value.kind,
-                            SemanticValueKind::Local
-                                | SemanticValueKind::Parameter { .. }
-                                | SemanticValueKind::Receiver { .. }
-                        )
-                    }) =>
-                {
-                    predecessors.entry(target).or_default().push(value);
-                }
-                SemanticEffect::ValueFlow { source, target, .. } => {
-                    predecessors.entry(target).or_default().push(source);
-                }
-                _ => {}
-            }
-        }
-    }
-    let mut pending = vec![subject];
-    let mut visited = HashSet::default();
-    let mut bindings = HashSet::default();
-    while let Some(value) = pending.pop() {
-        if !visited.insert(value) {
-            continue;
-        }
-        match semantics.value(value)?.kind {
-            SemanticValueKind::Local
-            | SemanticValueKind::Parameter { .. }
-            | SemanticValueKind::Receiver { .. } => {
-                bindings.insert(value);
-            }
-            _ => pending.extend(predecessors.get(&value).into_iter().flatten().copied()),
-        }
-    }
-    (bindings.len() == 1).then(|| *bindings.iter().next().expect("one binding"))
+    BindingOriginIndex::new(procedure).unique_binding_origin(subject)
 }
 
 #[cfg(test)]
@@ -512,6 +825,13 @@ mod tests {
     use crate::cancellation::CancellationToken;
 
     use crate::inline_project::{BuiltInlineTestProject, InlineTestProject};
+
+    fn exact_integer(value: u128) -> ScalarFact {
+        ScalarFact::Integer(ScalarIntegerInterval::exact(
+            ScalarIntegerValue::unsigned(value),
+            ScalarIntegerDomain::Mathematical,
+        ))
+    }
 
     struct Fixture {
         _project: BuiltInlineTestProject,
@@ -583,6 +903,137 @@ mod tests {
     }
 
     #[test]
+    fn signed_magnitude_intervals_order_and_join_without_host_casts() {
+        let domain = ScalarIntegerDomain::signed(8);
+        let negative_two = ScalarIntegerValue::new(true, 2);
+        let positive_three = ScalarIntegerValue::unsigned(3);
+        let negative_seven = ScalarIntegerValue::new(true, 7);
+        assert!(negative_seven < negative_two);
+        assert!(negative_two < ScalarIntegerValue::unsigned(0));
+        assert!(domain.contains(ScalarIntegerValue::new(true, 128)));
+        assert!(!domain.contains(ScalarIntegerValue::new(true, 129)));
+        assert!(domain.contains(ScalarIntegerValue::unsigned(127)));
+        assert!(!domain.contains(ScalarIntegerValue::unsigned(128)));
+
+        let left = ScalarIntegerInterval::new(negative_two, positive_three, domain);
+        let right = ScalarIntegerInterval::new(
+            ScalarIntegerValue::new(true, 7),
+            ScalarIntegerValue::unsigned(1),
+            domain,
+        );
+        assert_eq!(
+            left.hull(right),
+            Some(ScalarIntegerInterval::new(
+                negative_seven,
+                positive_three,
+                domain
+            ))
+        );
+        assert_eq!(
+            ScalarFact::Integer(left).join(ScalarFact::Integer(right)),
+            ScalarFact::Integer(ScalarIntegerInterval::new(
+                negative_seven,
+                positive_three,
+                domain
+            ))
+        );
+    }
+
+    #[test]
+    fn interval_arithmetic_distinguishes_domain_overflow_from_representation_limits() {
+        let mathematical = ScalarIntegerDomain::Mathematical;
+        let left = ScalarIntegerInterval::new(
+            ScalarIntegerValue::new(true, 2),
+            ScalarIntegerValue::unsigned(3),
+            mathematical,
+        );
+        let right = ScalarIntegerInterval::new(
+            ScalarIntegerValue::unsigned(4),
+            ScalarIntegerValue::unsigned(5),
+            mathematical,
+        );
+        assert_eq!(
+            left.add_interval(right),
+            ScalarIntegerArithmetic::Interval(ScalarIntegerInterval::new(
+                ScalarIntegerValue::unsigned(2),
+                ScalarIntegerValue::unsigned(8),
+                mathematical,
+            ))
+        );
+        assert_eq!(
+            left.subtract_interval(right),
+            ScalarIntegerArithmetic::Interval(ScalarIntegerInterval::new(
+                ScalarIntegerValue::new(true, 7),
+                ScalarIntegerValue::new(true, 1),
+                mathematical,
+            ))
+        );
+
+        let unsigned = ScalarIntegerDomain::unsigned(8);
+        assert_eq!(
+            ScalarIntegerInterval::exact(ScalarIntegerValue::unsigned(255), unsigned).add_interval(
+                ScalarIntegerInterval::exact(ScalarIntegerValue::unsigned(1), unsigned,)
+            ),
+            ScalarIntegerArithmetic::Overflow
+        );
+        assert_eq!(
+            ScalarIntegerInterval::exact(ScalarIntegerValue::unsigned(u128::MAX), mathematical)
+                .add_interval(ScalarIntegerInterval::exact(
+                    ScalarIntegerValue::unsigned(1),
+                    mathematical
+                )),
+            ScalarIntegerArithmetic::MagnitudeExceeded
+        );
+        assert_eq!(
+            ScalarIntegerInterval::exact(ScalarIntegerValue::unsigned(1), mathematical)
+                .add_interval(ScalarIntegerInterval::exact(
+                    ScalarIntegerValue::unsigned(1),
+                    unsigned,
+                )),
+            ScalarIntegerArithmetic::UnknownDomain
+        );
+    }
+
+    #[test]
+    fn widening_is_finite_only_when_the_integer_domain_is_finite() {
+        let signed = ScalarIntegerDomain::signed(8);
+        let current = ScalarIntegerInterval::new(
+            ScalarIntegerValue::new(true, 2),
+            ScalarIntegerValue::unsigned(3),
+            signed,
+        );
+        let growing = ScalarIntegerInterval::new(
+            ScalarIntegerValue::new(true, 4),
+            ScalarIntegerValue::unsigned(5),
+            signed,
+        );
+        assert_eq!(
+            current.widen(growing),
+            ScalarIntegerWidening::Interval(ScalarIntegerInterval::new(
+                ScalarIntegerValue::new(true, 128),
+                ScalarIntegerValue::unsigned(127),
+                signed,
+            ))
+        );
+
+        let mathematical = ScalarIntegerDomain::Mathematical;
+        let current = ScalarIntegerInterval::exact(ScalarIntegerValue::unsigned(1), mathematical);
+        let growing = ScalarIntegerInterval::new(
+            ScalarIntegerValue::unsigned(1),
+            ScalarIntegerValue::unsigned(2),
+            mathematical,
+        );
+        assert_eq!(current.widen(growing), ScalarIntegerWidening::Unbounded);
+        assert_eq!(
+            current.widen(ScalarIntegerInterval::exact(
+                ScalarIntegerValue::unsigned(1),
+                ScalarIntegerDomain::unsigned(8),
+            )),
+            ScalarIntegerWidening::UnknownDomain
+        );
+    }
+
+    #[test]
     fn pointer_zero_and_address_join_to_maybe_nil() {
         let fixture = Fixture::go(
             r#"package sample
@@ -628,9 +1079,9 @@ func run(flag bool) int {
         ];
         for transfer in transfers {
             assert_eq!(
-                transferred_scalar_fact(ScalarFact::ExactInteger(7), transfer),
+                transferred_scalar_fact(exact_integer(7), transfer),
                 (
-                    ScalarFact::ExactInteger(7),
+                    exact_integer(7),
                     matches!(transfer.kind, TransferKind::Move { .. })
                 ),
                 "{transfer:?}"
@@ -666,7 +1117,7 @@ func run(flag bool) int {
         ];
         for transfer in transfers {
             assert_eq!(
-                transferred_scalar_fact(ScalarFact::ExactInteger(7), transfer),
+                transferred_scalar_fact(exact_integer(7), transfer),
                 (ScalarFact::Unknown, false),
                 "{transfer:?}"
             );
@@ -739,7 +1190,7 @@ func run(values []int) int {
                 })
             })
             .collect::<Vec<_>>();
-        assert_eq!(facts, vec![ScalarFact::ExactInteger(1)], "{semantics:#?}");
+        assert_eq!(facts, vec![exact_integer(1)], "{semantics:#?}");
     }
 
     #[test]

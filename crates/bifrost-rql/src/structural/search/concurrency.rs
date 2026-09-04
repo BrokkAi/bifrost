@@ -5,7 +5,7 @@ use std::sync::Arc;
 use super::{ProjectFile, Range, SemanticProcedureValue, WorkspaceAnalyzer};
 use crate::analyzer::semantic::{
     AccessPath, AccessPathAtPoint, AccessPathRoot, AccessSelector, AllocationId, CallSiteHandle,
-    CallableTarget, CallableTargetResolution, CandidateCoverage, DispatchOracle,
+    CallSiteId, CallableTarget, CallableTargetResolution, CandidateCoverage, DispatchOracle,
     EvidenceCompleteness, HeapOracle, IndexSelector, IndexedLocationIdentity, MemoryLocationId,
     MemoryLocationKind, ObjectCardinality, ObservationPhase, OracleCallContext, OracleLimits,
     ProcedureHandle, ProgramPointId, ProofStatus, ScopedSemanticLocator, SemanticEffect,
@@ -17,25 +17,29 @@ use crate::analyzer::semantic_model::{
     ProcedureSummaryMemberKey, SemanticModelMatchDisposition,
 };
 use brokk_bifrost_flow::concurrency::{
-    CanonicalConcurrencyLocation, ConcurrencyAnswer, ConcurrencyAtomicOperation,
-    ConcurrencyLockMode, ConcurrencyOpenReason, ConcurrencyProvider, ConcurrentAccessConflict,
-    ResolvedConcurrencyEffect, ResolvedConcurrencySubject,
+    CanonicalConcurrencyLocation, ConcurrencyAnswer, ConcurrencyAtomicOperation, ConcurrencyEscape,
+    ConcurrencyLockMode, ConcurrencyObjectCardinality, ConcurrencyOpenReason, ConcurrencyOwnership,
+    ConcurrencyProvider, ConcurrencySubjectIdentity, ConcurrentAccessConflict,
+    ResolvedConcurrencyEffect, ResolvedConcurrencyLocation, ResolvedConcurrencySubject,
 };
 use brokk_bifrost_flow::typestate::TypestateObjectKey;
 
 pub(super) struct WorkspaceConcurrencyProvider<'a> {
     workspace: &'a WorkspaceAnalyzer,
     active_models: Option<Arc<ActiveSemanticModelSnapshot>>,
+    summaries: Option<brokk_bifrost_flow::typestate::ProductionSemanticSummarySet>,
 }
 
 impl<'a> WorkspaceConcurrencyProvider<'a> {
     pub(super) fn new(
         workspace: &'a WorkspaceAnalyzer,
         active_models: Option<Arc<ActiveSemanticModelSnapshot>>,
+        summaries: Option<brokk_bifrost_flow::typestate::ProductionSemanticSummarySet>,
     ) -> Self {
         Self {
             workspace,
             active_models,
+            summaries,
         }
     }
 
@@ -79,6 +83,10 @@ impl<'a> WorkspaceConcurrencyProvider<'a> {
             value,
             canonical,
             reasons: reasons.clone(),
+            identity: match input {
+                CompiledSummaryInput::Receiver {} => ConcurrencySubjectIdentity::Backing,
+                CompiledSummaryInput::Parameter { .. } => ConcurrencySubjectIdentity::Value,
+            },
         };
         Ok(if reasons.is_empty() {
             ConcurrencyAnswer::Proven(Some(subject))
@@ -99,6 +107,18 @@ impl<'a> WorkspaceConcurrencyProvider<'a> {
         request: &mut SemanticRequest<'_>,
     ) -> Result<ConcurrencyAnswer<Option<CanonicalConcurrencyLocation>>, SemanticProviderError>
     {
+        self.resolved_value_at(procedure, point, value, phase, request)
+            .map(legacy_canonical_answer)
+    }
+
+    fn resolved_value_at(
+        &self,
+        procedure: &ProcedureHandle,
+        point: ProgramPointId,
+        value: ValueId,
+        phase: ObservationPhase,
+        request: &mut SemanticRequest<'_>,
+    ) -> Result<ConcurrencyAnswer<ResolvedConcurrencyLocation>, SemanticProviderError> {
         let query = ValueAtPoint::new(
             value_handle(procedure, value)?,
             procedure
@@ -113,34 +133,53 @@ impl<'a> WorkspaceConcurrencyProvider<'a> {
             .semantic_oracle_provider()
             .pointees(&query, request)?;
         let Some(result) = outcome.available_value() else {
-            return Ok(open_location());
+            return Ok(open_resolved_location());
         };
-        let [candidate] = result.objects().candidates() else {
-            return Ok(open_location());
-        };
-        if !outcome.is_complete()
-            || !result.objects().coverage().is_exhaustive()
-            || !candidate.is_proven_complete()
-        {
-            return Ok(open_location());
-        }
-        let object = candidate.value();
-        if object.cardinality() != ObjectCardinality::Singleton
-            || matches!(
+        let mut candidates = Vec::new();
+        let mut all_singleton = true;
+        let mut exhaustive = outcome.is_complete() && result.objects().coverage().is_exhaustive();
+        for candidate in result.objects().candidates() {
+            if !candidate.is_proven_complete() {
+                exhaustive = false;
+            }
+            let object = candidate.value();
+            all_singleton &= object.cardinality() == ObjectCardinality::Singleton;
+            if matches!(
                 object.identity(),
                 AccessPathRoot::CallResult(_)
                     | AccessPathRoot::ProcedurePort(_)
                     | AccessPathRoot::CaptureSlot(_)
-            )
-        {
-            return Ok(open_location());
-        }
-        Ok(ConcurrencyAnswer::Proven(Some(
-            CanonicalConcurrencyLocation::new(
+            ) {
+                exhaustive = false;
+                continue;
+            }
+            candidates.push(CanonicalConcurrencyLocation::new(
                 TypestateObjectKey::for_object(object).public_canonical_rendering(),
                 "object",
-            ),
-        )))
+            ));
+        }
+        let cardinality = if all_singleton && candidates.len() == 1 {
+            ConcurrencyObjectCardinality::Singleton
+        } else if candidates.is_empty() {
+            ConcurrencyObjectCardinality::Unknown
+        } else {
+            ConcurrencyObjectCardinality::Multiple
+        };
+        let resolved = ResolvedConcurrencyLocation::new(
+            candidates,
+            exhaustive,
+            cardinality,
+            ConcurrencyEscape::Unknown,
+            ConcurrencyOwnership::Unknown,
+        );
+        Ok(if exhaustive && !resolved.candidates().is_empty() {
+            ConcurrencyAnswer::Proven(resolved)
+        } else {
+            ConcurrencyAnswer::Open {
+                partial: resolved,
+                reasons: vec![ConcurrencyOpenReason::AliasSetTruncated],
+            }
+        })
     }
 
     fn callback_targets(
@@ -204,7 +243,13 @@ impl<'a> WorkspaceConcurrencyProvider<'a> {
                 );
             }
         }
-        targets.sort_by_key(|target| format!("{:?}", target.durable_key()));
+        // Sorted by the mount-free procedure wire id, which is the identity
+        // the conflict rows publish: a total order that is the same at every
+        // workspace root, so the dedup below removes the same duplicates and
+        // the callee list arrives in the same order in a base export as in the
+        // head. Cached because the key is a digest over the procedure's
+        // locator, not a field read.
+        targets.sort_by_cached_key(super::semantic::procedure_wire_id);
         targets.dedup();
         if !open && !targets.is_empty() {
             ConcurrencyAnswer::Proven(targets)
@@ -212,6 +257,95 @@ impl<'a> WorkspaceConcurrencyProvider<'a> {
             ConcurrencyAnswer::Open {
                 partial: targets,
                 reasons: vec![ConcurrencyOpenReason::UnresolvedTarget],
+            }
+        }
+    }
+
+    fn declaration_has_concurrency_model(
+        &self,
+        language: &str,
+        path: &str,
+        member: &str,
+        has_receiver: bool,
+        parameter_count: u32,
+    ) -> bool {
+        let Some(active) = self.active_models.as_ref() else {
+            return false;
+        };
+        active
+            .active_models()
+            .procedure_summaries_for_declaration(ProcedureSummaryDeclarationKey::new(
+                language,
+                path,
+                member,
+                has_receiver,
+                parameter_count,
+            ))
+            .records
+            .iter()
+            .any(|record| !record.concurrency_effects().is_empty())
+    }
+
+    fn procedure_has_concurrency_model(&self, procedure: &ProcedureHandle) -> bool {
+        let locator = procedure.semantics().locator();
+        let Some(member) = locator
+            .declaration()
+            .segments()
+            .last()
+            .and_then(|segment| segment.name())
+        else {
+            return false;
+        };
+        let mut has_receiver = false;
+        let mut parameter_count = 0_u32;
+        for value in procedure.semantics().values() {
+            match value.kind {
+                crate::analyzer::semantic::SemanticValueKind::Receiver { .. } => {
+                    has_receiver = true;
+                }
+                crate::analyzer::semantic::SemanticValueKind::Parameter { .. } => {
+                    parameter_count = parameter_count.saturating_add(1);
+                }
+                _ => {}
+            }
+        }
+        self.declaration_has_concurrency_model(
+            locator.language().semantic_pack_label(),
+            locator.path().as_str(),
+            member,
+            has_receiver,
+            parameter_count,
+        )
+    }
+
+    fn declared_target_has_concurrency_model(
+        &self,
+        procedure: &ProcedureHandle,
+        call: &crate::analyzer::semantic::SemanticCallSite,
+        target: &CallableTarget,
+    ) -> bool {
+        match target {
+            CallableTarget::Local(target) => procedure
+                .artifact()
+                .procedure_handle(*target)
+                .is_some_and(|target| self.procedure_has_concurrency_model(&target)),
+            CallableTarget::External(locator) | CallableTarget::Unmaterialized(locator) => {
+                let Some(member) = locator
+                    .declaration()
+                    .segments()
+                    .last()
+                    .and_then(|segment| segment.name())
+                else {
+                    return false;
+                };
+                self.declaration_has_concurrency_model(
+                    locator.language().semantic_pack_label(),
+                    locator.path().as_str(),
+                    member,
+                    call.receiver.is_some(),
+                    u32::try_from(call.arguments.len())
+                        .expect("validated call argument count fits u32"),
+                )
             }
         }
     }
@@ -451,6 +585,62 @@ impl<'a> WorkspaceConcurrencyProvider<'a> {
 }
 
 impl ConcurrencyProvider for WorkspaceConcurrencyProvider<'_> {
+    fn complete_summary(
+        &self,
+        procedure: &ProcedureHandle,
+    ) -> Option<&brokk_bifrost_flow::dataflow::SemanticProcedureSummary> {
+        self.summaries.as_ref()?.summary_for(procedure)
+    }
+
+    fn procedure_semantics_precharged(&self, _procedure: &ProcedureHandle) -> bool {
+        self.summaries.is_some()
+    }
+
+    fn complete_call_targets(
+        &self,
+        procedure: &ProcedureHandle,
+        call: CallSiteId,
+    ) -> Option<&[ProcedureHandle]> {
+        self.summaries
+            .as_ref()?
+            .complete_call_targets(procedure, call)
+    }
+
+    fn may_have_modeled_effects(&self, call: &CallSiteHandle) -> bool {
+        if self.active_models.is_none() {
+            return false;
+        }
+        let row = call
+            .procedure()
+            .semantics()
+            .call_site(call.id())
+            .expect("validated call handle resolves");
+        let retained_targets = self
+            .summaries
+            .as_ref()
+            .and_then(|summaries| summaries.complete_call_targets(call.procedure(), call.id()));
+        let Some(retained_targets) = retained_targets else {
+            return true;
+        };
+        if retained_targets
+            .iter()
+            .any(|target| self.procedure_has_concurrency_model(target))
+        {
+            return true;
+        }
+        match &row.declared_targets {
+            CallableTargetResolution::Proven(target) => {
+                self.declared_target_has_concurrency_model(call.procedure(), row, target)
+            }
+            CallableTargetResolution::Ambiguous(targets)
+            | CallableTargetResolution::Unproven(targets)
+            | CallableTargetResolution::ExceededBudget(targets) => targets.iter().any(|target| {
+                self.declared_target_has_concurrency_model(call.procedure(), row, target)
+            }),
+            CallableTargetResolution::Unknown | CallableTargetResolution::Unsupported => false,
+        }
+    }
+
     fn resolve_call(
         &self,
         call: &CallSiteHandle,
@@ -507,6 +697,17 @@ impl ConcurrencyProvider for WorkspaceConcurrencyProvider<'_> {
         request: &mut SemanticRequest<'_>,
     ) -> Result<ConcurrencyAnswer<Option<CanonicalConcurrencyLocation>>, SemanticProviderError>
     {
+        self.resolved_location(procedure, point, location, request)
+            .map(legacy_canonical_answer)
+    }
+
+    fn resolved_location(
+        &self,
+        procedure: &ProcedureHandle,
+        point: ProgramPointId,
+        location: MemoryLocationId,
+        request: &mut SemanticRequest<'_>,
+    ) -> Result<ConcurrencyAnswer<ResolvedConcurrencyLocation>, SemanticProviderError> {
         let row = procedure
             .semantics()
             .memory_location(location)
@@ -517,26 +718,30 @@ impl ConcurrencyProvider for WorkspaceConcurrencyProvider<'_> {
             ..
         } = row.kind
         {
-            return Ok(
-                match self.canonical_value(procedure, point, base, request)? {
-                    ConcurrencyAnswer::Proven(Some(base)) => {
-                        ConcurrencyAnswer::Proven(Some(CanonicalConcurrencyLocation::new(
+            let answer = self.resolved_value(procedure, point, base, request)?;
+            return Ok(match answer {
+                ConcurrencyAnswer::Proven(base) => match base.exact_candidate() {
+                    Some(base) => ConcurrencyAnswer::Proven(ResolvedConcurrencyLocation::exact(
+                        CanonicalConcurrencyLocation::new(
                             format!("{}/index:aggregate", base.identity),
                             row.kind.label(),
-                        )))
-                    }
-                    ConcurrencyAnswer::Proven(None) => open_location(),
-                    ConcurrencyAnswer::Open { partial, reasons } => ConcurrencyAnswer::Open {
-                        partial: partial.map(|base| {
-                            CanonicalConcurrencyLocation::new(
+                        ),
+                    )),
+                    None => open_resolved_location(),
+                },
+                ConcurrencyAnswer::Open { partial, reasons } => {
+                    let partial = partial.exact_candidate().map_or_else(
+                        ResolvedConcurrencyLocation::unknown,
+                        |base| {
+                            ResolvedConcurrencyLocation::exact(CanonicalConcurrencyLocation::new(
                                 format!("{}/index:aggregate", base.identity),
                                 row.kind.label(),
-                            )
-                        }),
-                        reasons,
-                    },
-                },
-            );
+                            ))
+                        },
+                    );
+                    ConcurrencyAnswer::Open { partial, reasons }
+                }
+            });
         }
         let point = procedure
             .point_handle(point)
@@ -586,31 +791,50 @@ impl ConcurrencyProvider for WorkspaceConcurrencyProvider<'_> {
             .semantic_oracle_provider()
             .locations(&query, request)?;
         let Some(result) = outcome.available_value() else {
-            return Ok(open_location());
+            return Ok(open_resolved_location());
         };
-        let [candidate] = result.locations().candidates() else {
-            return Ok(open_location());
-        };
-        if !outcome.is_complete()
-            || !result.locations().coverage().is_exhaustive()
-            || !candidate.is_proven_complete()
-        {
-            return Ok(open_location());
-        }
-        let location = candidate.value();
-        if location.object().cardinality() != ObjectCardinality::Singleton {
-            return Ok(open_location());
-        }
-        let Some(path_identity) = exact_path_identity(location.path()) else {
-            return Ok(open_location());
-        };
-        let object = TypestateObjectKey::for_object(location.object()).public_canonical_rendering();
-        Ok(ConcurrencyAnswer::Proven(Some(
-            CanonicalConcurrencyLocation::new(
+        let mut candidates = Vec::new();
+        let mut all_singleton = true;
+        let mut exhaustive = outcome.is_complete() && result.locations().coverage().is_exhaustive();
+        for candidate in result.locations().candidates() {
+            if !candidate.is_proven_complete() {
+                exhaustive = false;
+            }
+            let location = candidate.value();
+            all_singleton &= location.object().cardinality() == ObjectCardinality::Singleton;
+            let Some(path_identity) = exact_path_identity(location.path()) else {
+                exhaustive = false;
+                continue;
+            };
+            let object =
+                TypestateObjectKey::for_object(location.object()).public_canonical_rendering();
+            candidates.push(CanonicalConcurrencyLocation::new(
                 format!("{object}/{path_identity}"),
                 row.kind.label(),
-            ),
-        )))
+            ));
+        }
+        let cardinality = if all_singleton && candidates.len() == 1 {
+            ConcurrencyObjectCardinality::Singleton
+        } else if candidates.is_empty() {
+            ConcurrencyObjectCardinality::Unknown
+        } else {
+            ConcurrencyObjectCardinality::Multiple
+        };
+        let resolved = ResolvedConcurrencyLocation::new(
+            candidates,
+            exhaustive,
+            cardinality,
+            ConcurrencyEscape::Unknown,
+            ConcurrencyOwnership::Unknown,
+        );
+        Ok(if exhaustive && !resolved.candidates().is_empty() {
+            ConcurrencyAnswer::Proven(resolved)
+        } else {
+            ConcurrencyAnswer::Open {
+                partial: resolved,
+                reasons: vec![ConcurrencyOpenReason::AliasSetTruncated],
+            }
+        })
     }
 
     fn canonical_value(
@@ -622,6 +846,22 @@ impl ConcurrencyProvider for WorkspaceConcurrencyProvider<'_> {
     ) -> Result<ConcurrencyAnswer<Option<CanonicalConcurrencyLocation>>, SemanticProviderError>
     {
         self.canonical_value_at(
+            procedure,
+            point,
+            value,
+            ObservationPhase::BeforeEffects,
+            request,
+        )
+    }
+
+    fn resolved_value(
+        &self,
+        procedure: &ProcedureHandle,
+        point: ProgramPointId,
+        value: ValueId,
+        request: &mut SemanticRequest<'_>,
+    ) -> Result<ConcurrencyAnswer<ResolvedConcurrencyLocation>, SemanticProviderError> {
+        self.resolved_value_at(
             procedure,
             point,
             value,
@@ -642,6 +882,25 @@ impl ConcurrencyProvider for WorkspaceConcurrencyProvider<'_> {
             .allocation(allocation)
             .expect("validated allocation exists");
         self.canonical_value_at(
+            procedure,
+            allocation.point,
+            allocation.result,
+            ObservationPhase::AfterEffects,
+            request,
+        )
+    }
+
+    fn resolved_allocation(
+        &self,
+        procedure: &ProcedureHandle,
+        allocation: AllocationId,
+        request: &mut SemanticRequest<'_>,
+    ) -> Result<ConcurrencyAnswer<ResolvedConcurrencyLocation>, SemanticProviderError> {
+        let allocation = procedure
+            .semantics()
+            .allocation(allocation)
+            .expect("validated allocation exists");
+        self.resolved_value_at(
             procedure,
             allocation.point,
             allocation.result,
@@ -698,10 +957,36 @@ fn value_handle(
     })
 }
 
-fn open_location<T>() -> ConcurrencyAnswer<Option<T>> {
+fn open_resolved_location() -> ConcurrencyAnswer<ResolvedConcurrencyLocation> {
     ConcurrencyAnswer::Open {
-        partial: None,
+        partial: ResolvedConcurrencyLocation::unknown(),
         reasons: vec![ConcurrencyOpenReason::UnknownLocation],
+    }
+}
+
+fn legacy_canonical_answer(
+    answer: ConcurrencyAnswer<ResolvedConcurrencyLocation>,
+) -> ConcurrencyAnswer<Option<CanonicalConcurrencyLocation>> {
+    match answer {
+        ConcurrencyAnswer::Proven(location) => match location.exact_candidate() {
+            Some(candidate) => ConcurrencyAnswer::Proven(Some(candidate.clone())),
+            None => ConcurrencyAnswer::Open {
+                partial: None,
+                reasons: vec![ConcurrencyOpenReason::UnknownLocation],
+            },
+        },
+        ConcurrencyAnswer::Open { reasons, .. } => ConcurrencyAnswer::Open {
+            partial: None,
+            reasons: reasons
+                .into_iter()
+                .map(|reason| match reason {
+                    ConcurrencyOpenReason::AliasSetTruncated => {
+                        ConcurrencyOpenReason::UnknownLocation
+                    }
+                    reason => reason,
+                })
+                .collect(),
+        },
     }
 }
 
@@ -800,7 +1085,7 @@ pub(super) fn project_conflict(
     let mut digest = crate::analyzer::semantic::LengthDelimitedDigest::new(
         b"bifrost.code_query.concurrent_access_conflict.v1",
     );
-    digest.push(format!("{:?}", root.handle.durable_key()).as_bytes());
+    digest.push(super::semantic::procedure_wire_id(&root.handle).as_bytes());
     digest.push(conflict.location.identity.as_bytes());
     let mut sites = [stable_site(&conflict.first), stable_site(&conflict.second)];
     sites.sort();
@@ -809,7 +1094,7 @@ pub(super) fn project_conflict(
     ConcurrentAccessConflictValue {
         conflict,
         id: digest.finish().to_string(),
-        root_procedure_id: format!("{:?}", root.handle.durable_key()),
+        root_procedure_id: super::semantic::procedure_wire_id(&root.handle),
         file,
         range: Range {
             start_byte: span.start_byte() as usize,
@@ -837,10 +1122,17 @@ fn conflict_anchor(
     }
 }
 
+/// One access site's identity inside a conflict digest.
+///
+/// The procedure is named by its mount-free wire id rather than by the
+/// `SemanticArtifactKey` its durable key folds: that key carries a
+/// `WorkspaceMountId` hashed from the absolute workspace root, so a conflict
+/// found in the same content at two roots would digest differently and every
+/// data-race finding would classify as new under `--diff-base`.
 fn stable_site(site: &brokk_bifrost_flow::concurrency::ConcurrentAccessSite) -> String {
     format!(
-        "{:?}:{}:{}",
-        site.procedure.durable_key(),
+        "{}:{}:{}",
+        super::semantic::procedure_wire_id(&site.procedure),
         site.point.get(),
         site.source.get()
     )

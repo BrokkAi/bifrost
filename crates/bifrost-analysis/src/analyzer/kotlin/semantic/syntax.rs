@@ -548,15 +548,15 @@ pub(super) struct CallArgumentNode<'tree> {
     /// The expression evaluated for the argument. For a spread this is the
     /// spread operand, because `*` itself produces no value of its own.
     pub(super) value: Node<'tree>,
-    /// Whether the source spelled a label, which Kotlin binds by keyword.
-    pub(super) keyword: bool,
+    /// The structured label node, when Kotlin binds this argument by keyword.
+    pub(super) keyword: Option<Node<'tree>>,
     /// Whether the source spread an array into the positional tail.
     pub(super) spread: bool,
 }
 
 impl CallArgumentNode<'_> {
     pub(super) fn expansion(self) -> CallArgumentExpansion {
-        let domain = if self.keyword {
+        let domain = if self.keyword.is_some() {
             ArgumentDomain::Keyword
         } else {
             ArgumentDomain::Positional
@@ -581,9 +581,10 @@ pub(super) fn value_argument_parts(argument: Node<'_>) -> Option<CallArgumentNod
         .filter(|child| child.kind() != "annotation")
         .collect::<Vec<_>>();
     let value = children.last().copied()?;
-    let keyword = children.len() >= 2 && kotlin_named_argument_label(argument, children[0]);
+    let keyword = (children.len() >= 2 && kotlin_named_argument_label(argument, children[0]))
+        .then_some(children[0]);
     debug_assert!(
-        children.len() < 2 || keyword,
+        children.len() < 2 || keyword.is_some(),
         "a two-child value_argument is a named argument"
     );
     if value.kind() == "spread_expression" {
@@ -621,7 +622,7 @@ pub(super) fn call_arguments(call: Node<'_>) -> Vec<CallArgumentNode<'_>> {
         .unwrap_or_default();
     arguments.extend(trailing_lambda(call).map(|lambda| CallArgumentNode {
         value: lambda,
-        keyword: false,
+        keyword: None,
         spread: false,
     }));
     arguments

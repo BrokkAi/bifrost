@@ -66,6 +66,18 @@ pub trait JvmActiveSemanticModel {
     /// types in bare workspaces (#2678).
     fn is_published(&self) -> bool;
 
+    /// Whether the dependency discovery behind the published surface could not
+    /// read everything the build declared (#2887).
+    ///
+    /// Publication no longer implies a complete dependency set. An ecosystem
+    /// whose discovery left coordinates unresolved still prepares and
+    /// activates the dependencies it did resolve, so a workspace can hold an
+    /// activated JDK pack beside a Maven coordinate nothing indexed. The
+    /// published surface then answers positively for what it declares and says
+    /// nothing about the artifacts discovery never reached, which is silence,
+    /// not evidence of absence.
+    fn discovery_truncated(&self) -> bool;
+
     /// What the published set says about the fully-qualified name `fqn`.
     fn qualified_name_disposition(&self, fqn: &str) -> JvmModelDisposition;
 
@@ -261,6 +273,16 @@ pub fn prove_against_active_model(
         Ok(JvmModelDisposition::Conflicting { declarations }) => JvmNameProof::Ambiguous {
             boundaries: vec![BoundaryStatus::ExternalIndexed; declarations],
         },
+        // A truncated discovery left coordinates the build declares and no
+        // pack covers (#2887), so the published surface's silence is the same
+        // silence a partially read jar index gives: the name may be in the
+        // dependency nothing indexed. A positive answer still counts -- what
+        // truncation removes is only the ability to prove a miss.
+        Ok(JvmModelDisposition::Absent) if model.discovery_truncated() => {
+            JvmNameProof::Incomplete(JvmProofGap::ExternalBoundary {
+                boundary: BoundaryStatus::ExternalDeclaredUnindexed,
+            })
+        }
         Ok(JvmModelDisposition::Absent) => JvmNameProof::Absent {
             boundary: BoundaryStatus::ExternalIndexed,
         },

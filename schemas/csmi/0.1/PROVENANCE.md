@@ -1,8 +1,8 @@
 # CSMI v0.1 pinned assets
 
-The 120 files listed below are copied byte-for-byte from the immutable local
+The 143 files listed below are copied byte-for-byte from the immutable local
 Git object for BrokkAi/code-semantic-model-interchange at commit
-7f9f1975be99529a42bceb94d37adddcf083d0ba.
+d0e8535fc73dc5804c191d5a2a218ef63083df64.
 The source commit is the normative CSMI v0.1 revision for this pin. The core
 schema is stored at spec/0.1/schema.json upstream and is vendored as
 schema.json. Java/JVM profile fixtures are stored under
@@ -14,7 +14,7 @@ Each digest is SHA-256 of the vendored file bytes. The deterministic inventory
 record is the UTF-8 concatenation of sorted rows in the form
 target-path<TAB>source-path<TAB>sha256<LF>, hashed as:
 
-4b5cfcca58c46a578ec192d774ae94152bae0939ac4b92eff4f042090abf5b87
+419b206a31db9834a03b91cb3fd65f72451a4e548e594b56b2700575478e60c6
 
 | Vendored path | Upstream path | SHA-256 |
 | --- | --- | --- |
@@ -32,6 +32,8 @@ target-path<TAB>source-path<TAB>sha256<LF>, hashed as:
 | fixtures/invalid/unknown-type-variant.json | fixtures/invalid/unknown-type-variant.json | a187f5e19068fb166b0b1e26e104089657f9779be7e48dbbad385a84c1a43db7 |
 | fixtures/invalid/unsafe-resource-path.json | fixtures/invalid/unsafe-resource-path.json | 7f7e16c56573b2d1e615bebe448652a5cacf48947d5254cde2c3585cfbd986c7 |
 | fixtures/invalid/versionless-purl-without-range.json | fixtures/invalid/versionless-purl-without-range.json | 2b0796f154de05ed7f147e66a0bf3218231b336c623a34743cade5fb4cfdffea |
+| fixtures/profile-inputs/cpp-resolution.json | fixtures/profile-inputs/cpp-resolution.json | 164b57b1337f3a5d626200374b55af0f20f119c34f1d8103d1f55130776432e1 |
+| fixtures/profile-inputs/cpp-signatures.json | fixtures/profile-inputs/cpp-signatures.json | a0914a2dfaa8f3d7ec1d8fa7c0bac67fc4971b510c51e660ea6d4db1395528f6 |
 | fixtures/profile-inputs/typescript-signatures.json | fixtures/profile-inputs/typescript-signatures.json | e6d067138a57e6299750afc290853dbf55e682569644373abdd560dc2615dd60 |
 | fixtures/semantic-invalid/README.md | fixtures/semantic-invalid/README.md | 46f844c8ec55b40a4ef8f35c6dc6b30a52ad43fd0d3a9d34a98753f2655e8554 |
 | fixtures/semantic-invalid/duplicate-completeness-scope.json | fixtures/semantic-invalid/duplicate-completeness-scope.json | f48f7d8980998066836c7a7f8d1e5b86c1be2fc59f403c922f6884fe42323947 |
@@ -62,6 +64,16 @@ target-path<TAB>source-path<TAB>sha256<LF>, hashed as:
 | fixtures/valid/receiver-summary.json | fixtures/valid/receiver-summary.json | 752c755f14e96874d92cb775e57f9b54f74de5e8b1ab862239b9bf6a5cb2468e |
 | fixtures/valid/rust-profile.json | fixtures/valid/rust-profile.json | 5778f37b1c42d0b33b25b797d1103da35ed498b5d67e130cd36098f465054475 |
 | fixtures/valid/rust-sysroot-profile.json | fixtures/valid/rust-sysroot-profile.json | 54458e99a19a465c59fc4c7458e8a4d4d41393d7066ad0cbf7f04a8fa131266a |
+| profiles/cpp/0.1/fixtures/invalid/c-special-member.json | profiles/cpp/0.1/fixtures/invalid/c-special-member.json | 1ff39a2c89abe2fe0f345f0cef366df504b8188883f0a536f2fd27fb0bb8ac09 |
+| profiles/cpp/0.1/fixtures/invalid/incomplete-header-closure.json | profiles/cpp/0.1/fixtures/invalid/incomplete-header-closure.json | e8498d81b1042c7baa7abb6cb921191d6b56a4a3b489f6add9a712a1a7e3edf2 |
+| profiles/cpp/0.1/fixtures/invalid/producer-local-alias-target.json | profiles/cpp/0.1/fixtures/invalid/producer-local-alias-target.json | 7a44af5bcc0272ea5091692c7dcb010e2b5c4c1ebc7a542f97fd739d7762c1dc |
+| profiles/cpp/0.1/fixtures/invalid/rendered-signature.json | profiles/cpp/0.1/fixtures/invalid/rendered-signature.json | 33df08df9c54211f69e5f7f29ec12b02a02e25b809a7b92fe2bb350cd980d86e |
+| profiles/cpp/0.1/fixtures/invalid/versionless-header-artifact.json | profiles/cpp/0.1/fixtures/invalid/versionless-header-artifact.json | 030d8b659fa3b8088ce42838d68272cf533538f74a3c6aa4aaaf9d744100011a |
+| profiles/cpp/0.1/fixtures/valid/copy-constructor.json | profiles/cpp/0.1/fixtures/valid/copy-constructor.json | 44869616049fc10e2d5dfbe6461bb1cb4ceabfc400aada17800be8f840c58d32 |
+| profiles/cpp/0.1/fixtures/valid/resolution-context.json | profiles/cpp/0.1/fixtures/valid/resolution-context.json | 2ab8f1ea24cc55844ca6bdf45e68769ba47d888ee617aae4df264c51a3eea195 |
+| profiles/cpp/0.1/fixtures/valid/std-string-alias.json | profiles/cpp/0.1/fixtures/valid/std-string-alias.json | 66c14aa82c207b8758a819d206e67f62f46c5e2529160044f48073fcb6923407 |
+| profiles/cpp/0.1/profile.md | profiles/cpp/0.1/profile.md | a912188ef652b401ada54c7a66ce3193fb6f55b5158601e1a958444acf7ca1a4 |
+| profiles/cpp/0.1/schema.json | profiles/cpp/0.1/schema.json | 2e52e3984df98480d2ca2ebf6318fbbfff0470c38c36866de877c2cc84ff2111 |
 | profiles/java-jvm/0.1/fixtures/invalid/compatibility-empty-constraints.json | fixtures/profiles/java-jvm/invalid/compatibility-empty-constraints.json | 33d41b6eb6e7c11cfe9339c8ecf5239af282e522607b33a6fbf2088710d1350f |
 | profiles/java-jvm/0.1/fixtures/invalid/compatibility-relative-vendor.json | fixtures/profiles/java-jvm/invalid/compatibility-relative-vendor.json | 681fe3327e3445f45d0f6ff0cd04eeb02a65eacf20062c72bdc121409944cd5c |
 | profiles/java-jvm/0.1/fixtures/invalid/java-constructor-with-name.json | fixtures/profiles/java-jvm/invalid/java-constructor-with-name.json | 6c871756410b3b9600f72661df831721d8efeebf6577fbbc9141a9243b44c40e |
@@ -137,6 +149,17 @@ target-path<TAB>source-path<TAB>sha256<LF>, hashed as:
 | profiles/rust/0.1/fixtures/valid/sysroot-core.json | profiles/rust/0.1/fixtures/valid/sysroot-core.json | 3ce806774ccf038149c6368bb12c7868f2708120df0c186ebae102f6d9859d4d |
 | profiles/rust/0.1/fixtures/valid/workspace.json | profiles/rust/0.1/fixtures/valid/workspace.json | 33c9ca38cf0280098b3ba16d2a05e071893b5e6f5f5852d51dc1ad74ff3f1127 |
 | profiles/rust/0.1/schema.json | profiles/rust/0.1/schema.json | 1af9d7dc34f23a43bcdd795bc7010bba21ad277ec7b97c7c774e42d7fb1a1488 |
+| profiles/value-transfer/0.1/fixtures/invalid/copy-with-preservation.json | profiles/value-transfer/0.1/fixtures/invalid/copy-with-preservation.json | f09d34eac8588249bfd18fa0a59aa8969d2000d6b445b269337510a6c98a65d1 |
+| profiles/value-transfer/0.1/fixtures/invalid/flat-transfer-kind.json | profiles/value-transfer/0.1/fixtures/invalid/flat-transfer-kind.json | 9ad89490df3a42d0631760543466baa24f6368cdb3a72a2f8a1b886d0680f35b |
+| profiles/value-transfer/0.1/fixtures/invalid/implicit-operation-with-name.json | profiles/value-transfer/0.1/fixtures/invalid/implicit-operation-with-name.json | a0fffa46968485a5b1f1153d180a5e81a940dd9ea2c5822e28cc25f6aea83521 |
+| profiles/value-transfer/0.1/fixtures/invalid/move-without-invalidation.json | profiles/value-transfer/0.1/fixtures/invalid/move-without-invalidation.json | 6949cdd7f00a02056bcb6c782e971ced72df02bbeca7dd6be914e3aa0edfc04d |
+| profiles/value-transfer/0.1/fixtures/invalid/trivial-move-semantics.json | profiles/value-transfer/0.1/fixtures/invalid/trivial-move-semantics.json | 6f03cbb7ad98a582388334392b5b2d367f24bf12d8d86a041b79558f626cdcf8 |
+| profiles/value-transfer/0.1/fixtures/valid/basic-string-copy.json | profiles/value-transfer/0.1/fixtures/valid/basic-string-copy.json | 7700453223350e85a5c790aa3befa67438ae414cdcb5fefd74b8f4c2adb5e55a |
+| profiles/value-transfer/0.1/fixtures/valid/invalidating-move-semantics.json | profiles/value-transfer/0.1/fixtures/valid/invalidating-move-semantics.json | 844f44873f0361cf9eb848e077050d48b73ef9f77179cfc4eb9fefb34ec82862 |
+| profiles/value-transfer/0.1/fixtures/valid/move-unknown.json | profiles/value-transfer/0.1/fixtures/valid/move-unknown.json | 873e3c6559d93d6cbbb08347781045247d88eba926d7cff0e5fb36d2f407d409 |
+| profiles/value-transfer/0.1/fixtures/valid/value-changing-conversion.json | profiles/value-transfer/0.1/fixtures/valid/value-changing-conversion.json | 268d617a855a42d09e18f676edbc28639dc18c3fb442883c9659d9f59af03e45 |
+| profiles/value-transfer/0.1/profile.md | profiles/value-transfer/0.1/profile.md | 830eafda8a7f24c2abe5a2158f62fa19290d27b7f6c1191983f3af671b28db19 |
+| profiles/value-transfer/0.1/schema.json | profiles/value-transfer/0.1/schema.json | 22a012b5862a13d593d492cf438d96c335f6b4e61a5589ef9b98d704103c258f |
 | schema.json | spec/0.1/schema.json | 99d280864662e947421e0a840d7dbbd81bdf635fedaefaa7e44fa63bd49221b8 |
 
 The canonical core schema URI is

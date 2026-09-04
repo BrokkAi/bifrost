@@ -1615,13 +1615,14 @@ mod tests {
             first_elapsed < SMALL_PERSISTED_OPEN_LATENCY_LIMIT,
             "first persisted open took {first_elapsed:?}; expected under {SMALL_PERSISTED_OPEN_LATENCY_LIMIT:?}"
         );
+        let project_root = first.project_root().to_path_buf();
         let store = first.store().clone();
         assert_eq!(store.requested, ExtensionPersistenceMode::Persisted);
         assert_eq!(store.engaged, ExtensionPersistenceMode::Persisted);
         assert!(store.diagnostics.is_empty());
         let cache_db =
             Path::new(store.cache_db.as_deref().expect("engaged store has a path")).to_path_buf();
-        assert!(cache_db.starts_with(root.join(".bifrost/cache")));
+        assert!(cache_db.starts_with(project_root.join(".bifrost/cache")));
         assert!(cache_db.exists(), "the reported store must exist on disk");
         let facts = provider(&first).structural_facts(&file).unwrap();
         assert_eq!(facts.source(), SOURCE);

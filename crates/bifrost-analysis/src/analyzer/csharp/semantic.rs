@@ -1129,6 +1129,8 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 )
                 .unwrap_or(callable);
             let metadata = self.value_mapping(builder, node)?;
+            let parameter_name = slot.unique_name().map(Box::<str>::from);
+            let passing_mode = slot.passing_mode;
             let value = if slot.receiver {
                 let value = self.session.add_value_with_metadata(
                     builder,
@@ -1144,6 +1146,8 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     SemanticValueKind::Parameter {
                         ordinal,
                         multiplicity: formal_multiplicity(slot.variadic),
+                        name: parameter_name,
+                        passing_mode,
                     },
                 )?;
                 ordinal = ordinal.checked_add(1).ok_or_else(|| {
@@ -4017,8 +4021,15 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     SemanticCallArgument::direct(value, ArgumentDomain::Positional)
                 }
                 CSharpCallArgumentShape::Named => {
-                    incomplete_argument_mapping = true;
-                    SemanticCallArgument::direct(value, ArgumentDomain::Keyword)
+                    let name = argument
+                        .child_by_field_name("name")
+                        .and_then(|name| node_text(self.prepared.source(), name))
+                        .ok_or_else(|| {
+                            CSharpLoweringError::Invalid(
+                                "C# named argument is missing its structured name".into(),
+                            )
+                        })?;
+                    SemanticCallArgument::keyword(value, name)
                 }
                 CSharpCallArgumentShape::ByReference => {
                     incomplete_argument_mapping = true;
@@ -4049,7 +4060,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 SemanticGapSubject::CallSite(call_site),
                 SemanticCapability::ParameterFlow,
                 SemanticGapKind::Unsupported,
-                "named and by-reference C# argument-to-parameter mapping is not yet lowered",
+                "by-reference C# argument-to-parameter mapping is not yet lowered",
             )?;
         }
         if matches!(

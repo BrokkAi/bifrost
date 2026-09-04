@@ -1011,6 +1011,11 @@ pub(crate) fn policy_port_to_endpoint_binding(port: &PolicyPort) -> PolicyEndpoi
         PolicyPort::ArgumentName { name } => {
             PolicyEndpointBinding::ArgumentName { name: name.clone() }
         }
+        // Field ports exist only as external-model transfer destinations and
+        // never reach an endpoint binding.
+        PolicyPort::FieldOf { .. } => {
+            unreachable!("field ports are only valid as external-model transfer destinations")
+        }
     }
 }
 

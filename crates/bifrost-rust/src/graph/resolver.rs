@@ -484,9 +484,7 @@ pub fn lexical_explicit_import_fqn(
             .flat_map(|(target_file, target_name)| {
                 support.file_identifier(&target_file, &target_name)
             })
-            .filter(|candidate| {
-                candidate.is_module() || candidate.is_class() || rust.is_type_alias(candidate)
-            })
+            .filter(|candidate| candidate.is_module() || candidate.is_class())
             .map(|candidate| candidate.fq_name())
             .collect();
     if fqns.len() == 1 {
@@ -559,9 +557,7 @@ fn resolve_lexical_import_target_fqns(
         let direct = support
             .file_identifier(&target_file, &target_name)
             .into_iter()
-            .filter(|candidate| {
-                candidate.is_module() || candidate.is_class() || rust.is_type_alias(candidate)
-            })
+            .filter(|candidate| candidate.is_module() || candidate.is_class())
             .collect::<Vec<_>>();
         if !direct.is_empty() {
             imported_fqns.extend(direct.into_iter().map(|candidate| candidate.fq_name()));
@@ -905,19 +901,16 @@ fn parsed_identifier_is_direct_pattern(node: Node<'_>) -> bool {
 }
 
 pub fn rust_unique_nominal_reference_namespace(
-    rust: &dyn RustFactSource,
     support: &dyn RustDefinitionProvider,
     fqn: &str,
 ) -> Option<crate::usage::RustReferenceNamespace> {
     use crate::usage::RustReferenceNamespace;
 
     let declarations = support.fqn(fqn);
-    let has_type = declarations
+    let has_type = declarations.iter().any(CodeUnit::is_class);
+    let has_value = declarations
         .iter()
-        .any(|declaration| declaration.is_class() || rust.is_type_alias(declaration));
-    let has_value = declarations.iter().any(|declaration| {
-        !rust.is_type_alias(declaration) && (declaration.is_function() || declaration.is_field())
-    });
+        .any(|declaration| declaration.is_function() || declaration.is_field());
     let has_macro = declarations.iter().any(CodeUnit::is_macro);
     let has_module = declarations.iter().any(CodeUnit::is_module);
     let namespace_count = [has_type, has_value, has_macro, has_module]
@@ -946,14 +939,16 @@ pub fn is_member_target(analyzer: &dyn RustFactSource, target: &CodeUnit) -> boo
     // A member is referenced through a value of its owning type (`receiver.member`).
     // Free items belong on the top-level scan path even if a same-FQN module/macro
     // collision gives one a non-module hierarchy parent.
-    (target.is_function() || target.is_field())
+    // A class-kind target owned by a type is an associated type, the one Rust
+    // declaration that is both type-namespace and owned by a type (#2911). A
+    // module-level type declaration is excluded by the owner test below.
+    (target.is_function() || target.is_field() || target.is_class())
         && analyzer.parent_of(target).is_some_and(|parent| {
             // Rust members are owned by structs, enums, traits, or impl target
             // types. A same-FQN module/macro collision can otherwise attach a
             // free item to a macro CodeUnit and incorrectly route it through
             // receiver-based member scanning.
             parent.is_class()
-                || analyzer.is_type_alias(&parent)
                 || is_rust_enum_variant_declaration(analyzer, &parent)
                     && analyzer
                         .parent_of(&parent)
@@ -985,7 +980,10 @@ pub fn is_graph_visible_member_target(rust: &dyn RustFactSource, target: &CodeUn
         return false;
     }
 
-    (is_rust_trait_declaration(rust, &owner) && (target.is_function() || target.is_field()))
+    // A trait owns methods, associated consts, and associated types; the last
+    // are class-kind CodeUnits since #2911.
+    (is_rust_trait_declaration(rust, &owner)
+        && (target.is_function() || target.is_field() || target.is_class()))
         || (is_rust_enum_declaration(rust, &owner) && target.is_field())
         || is_trait_impl_member_target(rust, target, &owner)
 }
@@ -1017,7 +1015,12 @@ fn is_trait_impl_member_target(
     target: &CodeUnit,
     owner: &CodeUnit,
 ) -> bool {
-    if !(target.is_function() || target.is_field()) || is_rust_trait_declaration(rust, owner) {
+    // An impl block writes methods, associated consts, and associated types.
+    // An associated type is class-kind since #2911; no other class-kind Rust
+    // declaration is owned by a type.
+    if !(target.is_function() || target.is_field() || target.is_class())
+        || is_rust_trait_declaration(rust, owner)
+    {
         return false;
     }
     is_rust_trait_impl_member_declaration(rust, target)
@@ -1036,18 +1039,17 @@ fn trait_member(
         impl_member.identifier(),
         has_parameters,
     )
-    .filter(|trait_member| rust_member_roles_match(rust, impl_member, trait_member))
+    .filter(|trait_member| rust_member_roles_match(impl_member, trait_member))
 }
 
-fn rust_member_roles_match(
-    rust: &dyn RustFactSource,
-    impl_member: &CodeUnit,
-    trait_member: &CodeUnit,
-) -> bool {
+/// An impl member answers a trait member only in the same namespace: a method
+/// for a method, an associated type for an associated type, an associated const
+/// for an associated const. Since #2911 the CodeUnit kinds say all three, so no
+/// separate type-alias marker comparison is needed.
+fn rust_member_roles_match(impl_member: &CodeUnit, trait_member: &CodeUnit) -> bool {
     (impl_member.is_function() && trait_member.is_function())
-        || (impl_member.is_field()
-            && trait_member.is_field()
-            && rust.is_type_alias(impl_member) == rust.is_type_alias(trait_member))
+        || (impl_member.is_class() && trait_member.is_class())
+        || (impl_member.is_field() && trait_member.is_field())
 }
 
 pub fn resolve_scoped_associated_item(
@@ -1546,7 +1548,7 @@ fn imported_impl_target_fqn(
 }
 
 fn infer_export_names(analyzer: &dyn RustFactSource, target: &CodeUnit) -> BTreeSet<String> {
-    if (target.is_function() || target.is_field())
+    if (target.is_function() || target.is_field() || analyzer.is_type_alias(target))
         && let Some(owner) = analyzer.parent_of(target)
     {
         let owner_exports =
@@ -1597,7 +1599,7 @@ fn reexport_fallback_export_names(
     if !is_export_visible_declaration(analyzer, target) {
         return BTreeSet::new();
     }
-    if (target.is_function() || target.is_field())
+    if (target.is_function() || target.is_field() || analyzer.is_type_alias(target))
         && let Some(owner) = analyzer.parent_of(target)
         && !owner.is_module()
         && is_export_visible_declaration(analyzer, &owner)

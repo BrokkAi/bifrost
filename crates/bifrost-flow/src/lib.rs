@@ -13,6 +13,7 @@ pub mod flow_state;
 pub mod scalar_state;
 mod semantic_summary;
 pub mod taint;
+pub mod type_flow;
 pub mod typestate;
 pub mod value_flow;
 
@@ -33,14 +34,22 @@ pub use semantic_summary::{
 #[derive(Debug, Clone)]
 pub struct FlowWorkspaceState {
     value_flow: value_flow::ValueFlowCache,
+    semantic_summaries: Arc<dataflow::ProductionSemanticSummaryRepository>,
     typestate_summaries: Arc<typestate::ProductionTypestateSummaryRepository>,
 }
 
 impl Default for FlowWorkspaceState {
     fn default() -> Self {
+        let semantic_summaries = Arc::new(dataflow::ProductionSemanticSummaryRepository::new());
         Self {
             value_flow: value_flow::ValueFlowCache::default(),
-            typestate_summaries: Arc::new(typestate::ProductionTypestateSummaryRepository::new()),
+            typestate_summaries: Arc::new(
+                typestate::ProductionTypestateSummaryRepository::with_shared_semantic_summaries(
+                    typestate::TypestateSummaryRepositoryLimits::default(),
+                    Arc::clone(&semantic_summaries),
+                ),
+            ),
+            semantic_summaries,
         }
     }
 }
@@ -56,5 +65,23 @@ impl FlowWorkspaceState {
 
     pub fn typestate_summaries(&self) -> Arc<typestate::ProductionTypestateSummaryRepository> {
         Arc::clone(&self.typestate_summaries)
+    }
+
+    pub fn semantic_summaries(&self) -> Arc<dataflow::ProductionSemanticSummaryRepository> {
+        Arc::clone(&self.semantic_summaries)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn workspace_flow_clients_share_one_semantic_summary_repository() {
+        let state = FlowWorkspaceState::new();
+        let workspace = state.semantic_summaries();
+        let typestate = state.typestate_summaries().semantic_summaries();
+
+        assert!(Arc::ptr_eq(&workspace, &typestate));
     }
 }

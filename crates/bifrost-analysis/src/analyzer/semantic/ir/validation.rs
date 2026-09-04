@@ -205,11 +205,18 @@ pub(super) fn measure_artifact_work(
             match &value.kind {
                 SemanticValueKind::LanguageDefined(name) => account_text(name, &mut work),
                 SemanticValueKind::Parameter {
-                    multiplicity: FormalMultiplicity::Rest(ArgumentDomain::LanguageDefined(name)),
-                    ..
-                } => account_text(name, &mut work),
+                    multiplicity, name, ..
+                } => {
+                    if let Some(name) = name {
+                        account_text(name, &mut work);
+                    }
+                    if let FormalMultiplicity::Rest(ArgumentDomain::LanguageDefined(domain)) =
+                        multiplicity
+                    {
+                        account_text(domain, &mut work);
+                    }
+                }
                 SemanticValueKind::Local
-                | SemanticValueKind::Parameter { .. }
                 | SemanticValueKind::Receiver { .. }
                 | SemanticValueKind::Return
                 | SemanticValueKind::Temporary
@@ -247,6 +254,9 @@ pub(super) fn measure_artifact_work(
                 .nested_entries
                 .saturating_add(call_site.arguments.len());
             for argument in &call_site.arguments {
+                if let Some(keyword) = &argument.keyword {
+                    account_text(keyword, &mut work);
+                }
                 if let Some(ArgumentDomain::LanguageDefined(name)) = argument.expansion.domain() {
                     account_text(name, &mut work);
                 }
@@ -804,6 +814,23 @@ fn validate_procedure(
             "call site",
         )?;
         validate_call_site(procedures, procedure_locators, procedure, call_site)?;
+        for argument in &call_site.arguments {
+            if argument.keyword.is_some()
+                && !matches!(
+                    argument.expansion,
+                    CallArgumentExpansion::Direct(ArgumentDomain::Keyword)
+                )
+            {
+                return Err(SemanticIrError::procedure(
+                    id,
+                    SemanticIrErrorKind::CallContract,
+                    format!(
+                        "call site {} argument value {} carries a keyword outside a direct keyword expansion",
+                        call_site.id, argument.value
+                    ),
+                ));
+            }
+        }
     }
     if !procedure.call_sites.is_empty() {
         require_capability(
@@ -1027,6 +1054,20 @@ fn validate_guard_facts(
                     ),
                 ));
             }
+        }
+        match guard.predicate {
+            GuardPredicate::InstanceOf { value, classes } => {
+                ensure_value(id, value, procedure.values.len(), "guarded value")?;
+                ensure_value(id, classes, procedure.values.len(), "guard classes")?;
+            }
+            GuardPredicate::HasMember { value, member } => {
+                ensure_value(id, value, procedure.values.len(), "guarded value")?;
+                ensure_value(id, member, procedure.values.len(), "guard member")?;
+            }
+            GuardPredicate::ConstantBoolean { .. }
+            | GuardPredicate::NullComparison { .. }
+            | GuardPredicate::ConstantEquality { .. }
+            | GuardPredicate::Opaque { .. } => {}
         }
     }
     Ok(())

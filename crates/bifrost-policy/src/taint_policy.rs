@@ -4,7 +4,7 @@
 //! closed [`ResolvedTaintPolicySpec`] boundary and lowers only structured,
 //! source-backed selector results into the diagnostic-neutral taint engine.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
@@ -14,7 +14,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::budget::PolicyBudget;
-use crate::definition::{PolicyId, PolicyPort, PolicySelectorPath, TaintLabel};
+use crate::definition::{
+    PolicyId, PolicyPort, PolicySelectorPath, TaintLabel, TaintTransferEffect,
+};
 use crate::evaluator::{PolicyEvaluationContext, TaintPolicyEvaluator};
 use crate::finding::{
     AuthoredArmClosureEvidence, BoundedWitness, CertaintyReason, FindingCertainty,
@@ -36,26 +38,27 @@ use crate::projection::{
     TaintProjectionAuthority, TaintProjectionPayload,
 };
 use crate::resolved::{
-    LoadedPolicy, ResolvedEndpointIdentity, ResolvedPolicySelector, ResolvedTaintEndpoint,
-    ResolvedTaintPolicySpec, ResolvedTaintSourceDefinition,
+    LoadedPolicy, ResolvedEndpointIdentity, ResolvedPolicySelector, ResolvedTaintAuxiliary,
+    ResolvedTaintEndpoint, ResolvedTaintExternalModelDefinition, ResolvedTaintPolicySpec,
+    ResolvedTaintSourceDefinition,
 };
 use crate::selector_compiler::{
     ReceiverBindingApplicability, parameter_name_matches, parameter_names_match,
 };
 use crate::{ProductionTaintAnalysisResult, ProductionTaintPhaseMetrics};
 use brokk_bifrost_analysis::CancellationToken;
-use brokk_bifrost_analysis::analyzer::common::language_for_file;
-use brokk_bifrost_analysis::analyzer::lexical_definitions::formal_parameter_slots;
 use brokk_bifrost_analysis::analyzer::semantic::workspace_oracle::{
     ProcedureRangeLookupStatus, procedures_in_artifact,
 };
 use brokk_bifrost_analysis::analyzer::semantic::{
-    CallArgumentMapping, CallArgumentMember, CallBinding, CallSiteHandle, CandidateCoverage,
-    DurablePortIdentity, EvidenceCompleteness, ExactExternalProcedureTarget, ObservationPhase,
+    CallArgumentMapping, CallArgumentMember, CallBinding, CallBindings, CallSiteHandle,
+    CandidateCoverage, DispatchCandidate, DispatchResult, DurablePortIdentity,
+    EvidenceCompleteness, ExactExternalProcedureTarget, LengthDelimitedDigest, ObservationPhase,
     OracleCallContext, ProcedureHandle, ProcedurePortHandle, ProcedurePortKind, ProgramPointHandle,
-    ProofStatus, SemanticArtifactKey, SemanticBudget, SemanticOutcome, SemanticValueKind,
-    UnmaterializedExternalTarget, ValueHandle, WorkspaceIcfgProvider, WorkspaceRelativePath,
-    authored_procedure_target_identity,
+    ProofStatus, SemanticArtifactKey, SemanticBudget, SemanticExecutionBudget, SemanticOutcome,
+    SemanticRequest, SemanticValueKind, SemanticWork, SourceMappingKind,
+    UnmaterializedExternalTarget, ValueFlowSnapshot, ValueHandle, WorkspaceIcfgProvider,
+    WorkspaceRelativePath, WorkspaceSemanticOracle, authored_procedure_target_identity,
 };
 use brokk_bifrost_analysis::analyzer::semantic::{DispatchOracle, ValueFlowOracle};
 use brokk_bifrost_analysis::analyzer::semantic_model::{
@@ -64,35 +67,43 @@ use brokk_bifrost_analysis::analyzer::semantic_model::{
     ProcedureSummaryTargetKey, ResolvedActiveSemanticModels, SemanticModelMatchDisposition,
     UnmaterializedExternalSummaryCallShapeBinding,
 };
-use brokk_bifrost_analysis::analyzer::usages::get_definition::parse_tree_for_language;
-use brokk_bifrost_analysis::analyzer::{ProjectFile, Range, WorkspaceAnalyzer};
+use brokk_bifrost_analysis::analyzer::usages::get_definition::{
+    DefinitionLookupRequest, DefinitionLookupStatus, resolve_definition_batch_with_source,
+};
+use brokk_bifrost_analysis::analyzer::{ProjectFile, WorkspaceAnalyzer};
 use brokk_bifrost_flow::dataflow::{
-    DataflowRequest, ExternalSemanticSummarySet, ExternalSummaryCompatibilityKey,
-    ExternalSummaryTarget, SemanticInputStatus, SolverBudget, SolverTermination,
-    SummaryBehaviorKey, SummaryContextKey, SummarySchemaVersion, SummarySemanticsVersion,
-    SummaryWitness, SummaryWitnessStepKind, WitnessReconstructionLimits, WitnessRetentionLimits,
+    CuratedCallModel, DataflowRequest, ExternalSemanticSummarySet, ExternalSummaryCompatibilityKey,
+    ExternalSummaryContentHash, ExternalSummaryModelId, ExternalSummaryTarget, SemanticInputStatus,
+    SolverBudget, SolverTermination, SummaryBehaviorKey, SummaryContextKey, SummaryEffect,
+    SummaryEffectKey, SummaryEvidence, SummaryExit, SummaryExitKind, SummaryPort,
+    SummarySchemaVersion, SummarySemanticsVersion, SummaryTransfer, SummaryWitness,
+    SummaryWitnessStepKind, WitnessReconstructionLimits, WitnessRetentionLimits,
 };
 use brokk_bifrost_flow::taint::{
     SourceClassId, SourceEventKey, TaintAnalysisPlan, TaintBatch, TaintBatchCompatibilityKey,
     TaintBatchPlanner, TaintClassSet, TaintFindingCollectionLimits, TaintFindingReport,
     TaintOriginFindingEvidence, TaintPolicyPlan, TaintPropagationSemanticsId,
-    TaintSanitizerBinding, TaintSinkBinding, TaintSourceBinding, TaintUniverse,
+    TaintSanitizerBinding, TaintSinkBinding, TaintSourceBinding, TaintStoreChannel,
+    TaintStoreDimension, TaintStoreReadBinding, TaintStoreWriteBinding, TaintUniverse,
     collect_taint_findings_with_limits,
 };
 use brokk_bifrost_flow::value_flow::{
-    ValueFlowCarrier, ValueFlowCarrierId, ValueFlowEventKey, ValueFlowEventKind,
-    ValueFlowIncompleteCause, ValueFlowInput, ValueFlowObservationPhase, ValueFlowPlan,
-    ValueFlowSinkSpec, ValueFlowSourceSpec,
+    ClosureLimits, ValueFlowCarrier, ValueFlowCarrierId, ValueFlowCuratedCallModel,
+    ValueFlowEventKey, ValueFlowEventKind, ValueFlowIncompleteCause, ValueFlowInput,
+    ValueFlowObservationPhase, ValueFlowPlan, ValueFlowProvider, ValueFlowSinkId,
+    ValueFlowSinkSpec, ValueFlowSourceId, ValueFlowSourceSpec, ValueFlowSummaryLocationBinding,
+    discover_closure_with,
 };
 use brokk_bifrost_flow::{
     ExactProcedureSummaryBoundary, ExactProcedureSummaryParameter, ExactProcedureSummaryReceiver,
     ExactProcedureSummaryTargetBinding, bind_compiled_procedure_summaries,
 };
+use brokk_bifrost_rql::structural::search::CodeQueryExecutionScope;
 use brokk_bifrost_rql::structural::{
     CodeQueryCompletion, CodeQueryDiagnosticCode, CodeQueryExecutionLimits,
 };
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) enum TaintPolicyCompileError {
     MissingSelector(String),
     QueryIncomplete {
@@ -618,7 +629,110 @@ impl ProductionTaintPolicyEvaluator {
         let batch_planning_elapsed = batch_planning_started.elapsed();
         match batches {
             Ok(batches) => {
-                for batch in batches {
+                // Persistence boundaries first: compute what each store read
+                // establishes from the writes its channel may alias, across
+                // batches, before any batch reports findings. An error here is
+                // an evaluation failure for every policy, exactly like a batch
+                // planning failure: the store semantics were declared and
+                // could not be executed.
+                let seeding = match seed_store_channels(
+                    &batches,
+                    &metadata,
+                    workspace,
+                    cancellation,
+                    budget,
+                    &mut execution_budget,
+                    icfg_active_semantic_model_snapshot.clone(),
+                ) {
+                    Ok(seeding) => seeding,
+                    Err(error) => {
+                        for payload in payloads.values_mut() {
+                            *payload = prepared_failure_payload(
+                                &format!("taint store seeding failed: {error}"),
+                                PolicyWorkReport::default(),
+                            );
+                        }
+                        return Self {
+                            prepared: RefCell::new(payloads),
+                            public_findings: RefCell::new(public_findings),
+                            retained_analyses: RefCell::new(retained_analyses),
+                        };
+                    }
+                };
+                // A store-read origin's compiled metadata rows over-approximate
+                // (one row per policy source). Narrow each read event's rows to
+                // the endpoints that actually contributed classes, so a finding
+                // fed across the boundary attributes to real provenance only.
+                for (batch_index, batch) in batches.iter().enumerate() {
+                    let read_events = batch
+                        .analysis()
+                        .store_reads()
+                        .iter()
+                        .filter_map(|read| {
+                            batch
+                                .analysis()
+                                .value_flow()
+                                .source(read.source())
+                                .map(|spec| (spec.key().clone(), read.source()))
+                        })
+                        .collect::<Vec<_>>();
+                    if read_events.is_empty() {
+                        continue;
+                    }
+                    for internal in batch.policy_ids() {
+                        let Some(plan) = metadata.get_mut(internal) else {
+                            continue;
+                        };
+                        let sources = std::mem::take(&mut plan.sources);
+                        plan.sources = sources
+                            .into_vec()
+                            .into_iter()
+                            .filter(|row| {
+                                let Some((_, source)) =
+                                    read_events.iter().find(|(event, _)| *event == row.event)
+                                else {
+                                    return true;
+                                };
+                                seeding.seeds[batch_index].iter().any(|seed| {
+                                    seed.source == *source
+                                        && seed.contributors.contains(&row.endpoint)
+                                })
+                            })
+                            .collect();
+                    }
+                }
+                for (batch_index, batch) in batches.into_iter().enumerate() {
+                    let seeds = seeding.seeds[batch_index]
+                        .iter()
+                        .map(|seed| (seed.source, seed.classes.clone()))
+                        .collect::<Vec<_>>();
+                    let batch = if seeds.is_empty() {
+                        batch
+                    } else {
+                        match batch.with_seeded_store_reads(&seeds) {
+                            Ok(seeded) => seeded,
+                            Err(error) => {
+                                for internal_id in batch.policy_ids() {
+                                    if let Some(plan) = metadata.get(internal_id) {
+                                        payloads.insert(
+                                            plan.policy_id.clone(),
+                                            prepared_failure_payload(
+                                                &format!("taint store seeding failed: {error}"),
+                                                PolicyWorkReport::default(),
+                                            ),
+                                        );
+                                    }
+                                }
+                                continue;
+                            }
+                        }
+                    };
+                    // A store-fed batch whose seed provenance is uncertain
+                    // (an observation solve stayed incomplete) must not
+                    // report a complete verdict: a missing class could hide a
+                    // real flow behind a clean read.
+                    let store_fed_uncertain =
+                        seeding.uncertain && !batch.analysis().store_reads().is_empty();
                     let Err(failure) = solve_and_project_batch(
                         &batch,
                         &metadata,
@@ -633,6 +747,16 @@ impl ProductionTaintPolicyEvaluator {
                         batch_planning_elapsed,
                         icfg_active_semantic_model_snapshot.clone(),
                     ) else {
+                        if store_fed_uncertain {
+                            for internal_id in batch.policy_ids() {
+                                let Some(plan) = metadata.get(internal_id) else {
+                                    continue;
+                                };
+                                if let Some(payload) = payloads.get_mut(&plan.policy_id) {
+                                    downgrade_for_uncertain_store_seed(payload);
+                                }
+                            }
+                        }
                         continue;
                     };
                     for internal_id in batch.policy_ids() {
@@ -719,13 +843,6 @@ pub(crate) struct TaintPolicyCompiler<'a> {
     /// as a compile failure so one unresolvable row costs its own sites and not
     /// the whole run (#2308).
     refused_sites: Vec<RefusedCallSite>,
-    /// Per-callee formal parameter names, in declaration order, for
-    /// `(argument :name ...)` resolution. The names are syntax-derived, so the
-    /// cache is keyed on the materialization-scoped procedure handle the
-    /// dispatch candidate names.
-    formal_slot_names: HashMap<ProcedureHandle, Option<FormalSlotNames>>,
-    /// Parsed declaration trees reused by formal-name resolution.
-    syntax_trees: HashMap<ProjectFile, tree_sitter::Tree>,
     /// Per (selector, formal name), the source spans of the actuals the
     /// analyzer's structural actual-to-formal relation bound to that formal.
     /// It is consulted only where the oracle relation retains no mapping, and
@@ -854,6 +971,72 @@ struct BoundSanitizer {
     output: BoundEndpoint,
 }
 
+/// One persistence-store write or read end bound to a selected call site: the
+/// value carrier that crosses the boundary plus the resolved runtime channel
+/// identity linking the two ends. The `endpoint` labels stay empty; the
+/// classes a read establishes are computed at evaluation time from the writes
+/// its channel may alias.
+#[derive(Clone)]
+struct BoundStoreEnd {
+    endpoint: BoundEndpoint,
+    channel: TaintStoreChannel,
+    /// The selected call. The declaration models this call's whole value
+    /// behavior -- nothing flows through it directly; taint crosses only via
+    /// the declared boundary -- so the call receives an empty-transfer
+    /// curated model and stops blocking completeness when its own dispatch
+    /// cannot be resolved.
+    call: CallSiteHandle,
+}
+
+/// One policy-declared external model bound to one exact selected call site
+/// (#2691).
+///
+/// The declaration replaces the selected call's analyzed body: discovery does
+/// not bind the callee for a modeled call, and the declared transfers run on
+/// the caller-side continuation edge as a curated call model. Selection and
+/// per-port resolution quality is retained so an unproven or partial
+/// declaration degrades the run instead of overstating itself.
+#[derive(Clone)]
+struct BoundExternalModel {
+    /// The declaring entry's stable identity, used for the curated model id
+    /// and for deterministic merging when several entries select one call.
+    entry: ResolvedEndpointIdentity,
+    call: CallSiteHandle,
+    transfers: Vec<LoweredModelTransfer>,
+    proof: ProofStatus,
+    completeness: EvidenceCompleteness,
+}
+
+/// The declared identity of one field write destination, resolved to a
+/// concrete carrier against the finished value-flow plan (#2691): the plan's
+/// carrier set is the closed universe of observable locations, so a write
+/// whose field no reachable carrier names is a complete no-op, exactly one
+/// matching carrier binds the heap port, and several (aliasing disagreement)
+/// leave the port unbound so the run degrades instead of guessing.
+#[derive(Clone)]
+struct ModelFieldDestination {
+    name: String,
+    /// Caller value ids the written object is known as, from the caller's own
+    /// value-copy relations (the argument slot holds a copy of the variable).
+    base_values: Vec<brokk_bifrost_analysis::analyzer::semantic::ValueId>,
+}
+
+/// One declared transfer after per-call resolution: formal-name argument
+/// ports are index-resolved and each port is mapped to the engine's stable
+/// summary-port vocabulary. The effect is reduced to the labels the transfer
+/// moves and the labels it removes at the seam; the universe complement of
+/// the moved set is removed as well when the curated model is built, so a
+/// transfer only ever carries its declared labels.
+#[derive(Clone)]
+struct LoweredModelTransfer {
+    from: SummaryPort,
+    to: SummaryPort,
+    labels: Vec<TaintLabel>,
+    removes: Vec<TaintLabel>,
+    /// Present exactly when `to` is a field-destination heap port.
+    field: Option<ModelFieldDestination>,
+}
+
 struct ResolvedTaintValue {
     call: Option<CallSiteHandle>,
     point: ProgramPointHandle,
@@ -977,32 +1160,24 @@ struct DiscoveredValueFlow {
 #[derive(Default)]
 struct DiscoveryMaterializationCache {
     /// One canonical artifact instance per artifact key, for the whole compile.
-    artifacts: HashMap<
-        SemanticArtifactKey,
-        Arc<brokk_bifrost_analysis::analyzer::semantic::SemanticArtifact>,
+    artifacts: RefCell<
+        HashMap<
+            SemanticArtifactKey,
+            Arc<brokk_bifrost_analysis::analyzer::semantic::SemanticArtifact>,
+        >,
     >,
-    procedures: HashMap<
-        DurableProcedureKey,
-        ValueFlowInput<brokk_bifrost_analysis::analyzer::semantic::ValueFlowSnapshot>,
-    >,
-    dispatch: HashMap<
-        DurableCallSiteKey,
-        (
-            Option<brokk_bifrost_analysis::analyzer::semantic::DispatchResult>,
-            SemanticInputStatus,
-        ),
-    >,
-    bindings: HashMap<
-        (DurableCallSiteKey, DurableProcedureKey),
-        ValueFlowInput<brokk_bifrost_analysis::analyzer::semantic::CallBindings>,
+    procedures: RefCell<HashMap<DurableProcedureKey, CachedSemanticOutcome<ValueFlowSnapshot>>>,
+    dispatch: RefCell<HashMap<DurableCallSiteKey, CachedSemanticOutcome<DispatchResult>>>,
+    bindings: RefCell<
+        HashMap<(DurableCallSiteKey, DurableProcedureKey), CachedSemanticOutcome<CallBindings>>,
     >,
     /// Snapshot lookups served from an entry this compile already held.
-    procedure_hits: u64,
+    procedure_hits: Cell<u64>,
     /// Snapshot lookups with no entry at all, each of which runs the oracle and
     /// charges the budget. This is the number the compile reports as
     /// `taint.semantic_snapshot_materializations`, and it must equal the number
     /// of distinct procedures the compile reached.
-    procedure_misses: u64,
+    procedure_misses: Cell<u64>,
     /// Procedure visits whose handle named a second materialization of an
     /// artifact this compile had already canonicalized, so the handle was
     /// rewritten onto the canonical instance before any lookup.
@@ -1013,27 +1188,124 @@ struct DiscoveryMaterializationCache {
     /// sites' dispatch, and each candidate's bindings. Keyed durably they are
     /// hits, so `procedure_misses` counts only genuinely new procedures and the
     /// handle-identity component of it is zero.
-    handle_identity_reuses: u64,
-    /// Per-artifact index from a procedure to the procedures it lexically
-    /// encloses, built once per artifact key (#2640).
-    lexical_children: HashMap<
-        SemanticArtifactKey,
-        HashMap<
-            brokk_bifrost_analysis::analyzer::semantic::ProcedureId,
-            Vec<brokk_bifrost_analysis::analyzer::semantic::ProcedureId>,
-        >,
-    >,
+    handle_identity_reuses: Cell<u64>,
 }
 
-impl DiscoveryMaterializationCache {
-    /// Return `procedure` anchored to this compile's canonical instance of its
-    /// artifact, adopting it as canonical when the artifact is new here.
-    ///
-    /// See the type's documentation for why one instance per artifact key is
-    /// required and why the substitution is sound.
-    fn canonical_procedure(&mut self, procedure: &ProcedureHandle) -> ProcedureHandle {
-        let canonical = self
-            .artifacts
+#[derive(Clone)]
+struct CachedSemanticOutcome<T> {
+    value: Option<T>,
+    status: SemanticInputStatus,
+}
+
+impl<T: Clone> CachedSemanticOutcome<T> {
+    fn from_outcome(outcome: &SemanticOutcome<T>) -> Self {
+        Self {
+            value: outcome.available_value().cloned(),
+            status: SemanticInputStatus::from_outcome(outcome),
+        }
+    }
+
+    /// Replay a cached verdict without replaying work: the oracle call that
+    /// populated the cache already charged the compile's budgets.
+    fn replay(&self) -> SemanticOutcome<T> {
+        let work = SemanticWork::default();
+        match self.status {
+            SemanticInputStatus::Complete => SemanticOutcome::Complete {
+                value: self
+                    .value
+                    .clone()
+                    .expect("a complete semantic outcome carries a value"),
+                work,
+            },
+            SemanticInputStatus::Ambiguous => SemanticOutcome::Ambiguous {
+                candidates: self
+                    .value
+                    .clone()
+                    .expect("an ambiguous semantic outcome carries candidates"),
+                work,
+            },
+            SemanticInputStatus::Unknown => SemanticOutcome::Unknown {
+                partial: self.value.clone(),
+                work,
+            },
+            SemanticInputStatus::Unsupported { capability } => SemanticOutcome::Unsupported {
+                capability,
+                partial: self.value.clone(),
+                work,
+            },
+            SemanticInputStatus::Unproven => SemanticOutcome::Unproven {
+                partial: self
+                    .value
+                    .clone()
+                    .expect("an unproven semantic outcome carries a partial value"),
+                work,
+            },
+            SemanticInputStatus::ExceededBudget { exceeded } => SemanticOutcome::ExceededBudget {
+                partial: self.value.clone(),
+                exceeded,
+                work,
+            },
+            SemanticInputStatus::Cancelled => SemanticOutcome::Cancelled {
+                partial: self.value.clone(),
+                work,
+            },
+        }
+    }
+
+    fn value_input(&self) -> Option<ValueFlowInput<T>> {
+        self.value
+            .clone()
+            .map(|value| ValueFlowInput::new(value, self.status))
+    }
+}
+
+struct PolicyDiscoveryProvider<'a, 'cache> {
+    oracle: WorkspaceSemanticOracle<'a>,
+    execution_budget: SemanticExecutionBudget,
+    cache: &'cache DiscoveryMaterializationCache,
+    poison: RefCell<Option<TaintPolicyCompileError>>,
+}
+
+impl PolicyDiscoveryProvider<'_, '_> {
+    fn poison(&self, error: TaintPolicyCompileError) -> TaintPolicyCompileError {
+        let mut poison = self.poison.borrow_mut();
+        if poison.is_none() {
+            *poison = Some(error);
+        }
+        poison
+            .as_ref()
+            .expect("the provider poison was just initialized")
+            .clone()
+    }
+
+    fn poisoned(&self) -> Option<TaintPolicyCompileError> {
+        self.poison.borrow().clone()
+    }
+
+    fn require_live(&self) -> Result<(), TaintPolicyCompileError> {
+        match self.poisoned() {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
+    fn require_outcome<T>(
+        &self,
+        outcome: &SemanticOutcome<T>,
+        operation: &str,
+    ) -> Result<(), TaintPolicyCompileError> {
+        require_uninterrupted_outcome(outcome, operation)
+            .and_then(|()| require_discovery_execution_budget(&self.execution_budget, operation))
+            .map_err(|error| self.poison(error))
+    }
+}
+
+impl ValueFlowProvider for PolicyDiscoveryProvider<'_, '_> {
+    type Error = TaintPolicyCompileError;
+
+    fn canonical_procedure(&self, procedure: &ProcedureHandle) -> ProcedureHandle {
+        let mut artifacts = self.cache.artifacts.borrow_mut();
+        let canonical = artifacts
             .entry(procedure.artifact().key().clone())
             .or_insert_with(|| Arc::clone(procedure.artifact()));
         if Arc::ptr_eq(canonical, procedure.artifact()) {
@@ -1044,43 +1316,113 @@ impl DiscoveryMaterializationCache {
             procedure.artifact().work(),
             "two complete lowerings of one artifact key must retain the same rows"
         );
-        self.handle_identity_reuses = self.handle_identity_reuses.saturating_add(1);
+        self.cache
+            .handle_identity_reuses
+            .set(self.cache.handle_identity_reuses.get().saturating_add(1));
         canonical
             .procedure_handle(procedure.id())
             .expect("one artifact key denotes one procedure table in every materialization")
     }
 
-    /// Every procedure `procedure` lexically encloses, as handles on
-    /// `procedure`'s own artifact instance.
-    ///
-    /// The index is built once per artifact key because a discovery asks this
-    /// of every procedure it visits, and rescanning the artifact's procedure
-    /// table on each visit is quadratic in the file's callable count.
-    fn lexical_children(&mut self, procedure: &ProcedureHandle) -> Vec<ProcedureHandle> {
-        let artifact = Arc::clone(procedure.artifact());
-        let index = self
-            .lexical_children
-            .entry(artifact.key().clone())
-            .or_insert_with(|| {
-                let mut index: HashMap<_, Vec<_>> = HashMap::new();
-                for child in artifact.procedures() {
-                    if let Some(parent) = child.lexical_parent() {
-                        index.entry(parent).or_default().push(child.id());
-                    }
-                }
-                index
-            });
-        let Some(children) = index.get(&procedure.id()) else {
-            return Vec::new();
-        };
-        children
-            .iter()
-            .map(|id| {
-                artifact
-                    .procedure_handle(*id)
-                    .expect("a live artifact owns each retained procedure")
-            })
-            .collect()
+    fn procedure_snapshot(
+        &self,
+        procedure: &ProcedureHandle,
+        context: &OracleCallContext,
+        request: &mut SemanticRequest<'_>,
+    ) -> Result<SemanticOutcome<ValueFlowSnapshot>, Self::Error> {
+        self.require_live()?;
+        let key = procedure.durable_key();
+        if let Some(cached) = self.cache.procedures.borrow().get(&key).cloned() {
+            self.cache
+                .procedure_hits
+                .set(self.cache.procedure_hits.get().saturating_add(1));
+            return Ok(cached.replay());
+        }
+
+        self.cache
+            .procedure_misses
+            .set(self.cache.procedure_misses.get().saturating_add(1));
+        let outcome = self
+            .oracle
+            .procedure_relations(
+                procedure,
+                context,
+                &mut request.staged_with_execution_budget(&self.execution_budget),
+            )
+            .map_err(|error| {
+                self.poison(TaintPolicyCompileError::SemanticProvider(error.to_string()))
+            })?;
+        self.require_outcome(&outcome, "taint value-flow discovery")?;
+        if outcome.available_value().is_none() {
+            return Err(self.poison(TaintPolicyCompileError::SemanticUnavailable(
+                "taint value-flow discovery returned no procedure snapshot".to_owned(),
+            )));
+        }
+        self.cache
+            .procedures
+            .borrow_mut()
+            .insert(key, CachedSemanticOutcome::from_outcome(&outcome));
+        Ok(outcome)
+    }
+
+    fn resolve_call(
+        &self,
+        call: &CallSiteHandle,
+        request: &mut SemanticRequest<'_>,
+    ) -> Result<SemanticOutcome<DispatchResult>, Self::Error> {
+        self.require_live()?;
+        let key = call.durable_key();
+        if let Some(cached) = self.cache.dispatch.borrow().get(&key).cloned() {
+            return Ok(cached.replay());
+        }
+        let outcome = self
+            .oracle
+            .resolve_call(
+                call,
+                &mut request.staged_with_execution_budget(&self.execution_budget),
+            )
+            .map_err(|error| {
+                self.poison(TaintPolicyCompileError::SemanticProvider(error.to_string()))
+            })?;
+        self.require_outcome(&outcome, "taint call dispatch")?;
+        self.cache
+            .dispatch
+            .borrow_mut()
+            .insert(key, CachedSemanticOutcome::from_outcome(&outcome));
+        Ok(outcome)
+    }
+
+    fn call_bindings(
+        &self,
+        call: &CallSiteHandle,
+        candidate: &DispatchCandidate,
+        context: &OracleCallContext,
+        request: &mut SemanticRequest<'_>,
+    ) -> Result<SemanticOutcome<CallBindings>, Self::Error> {
+        self.require_live()?;
+        let key = (call.durable_key(), candidate.target().durable_key());
+        if let Some(cached) = self.cache.bindings.borrow().get(&key).cloned() {
+            return Ok(cached.replay());
+        }
+        let outcome = self
+            .oracle
+            .call_bindings(
+                call,
+                candidate,
+                context,
+                &mut request.staged_with_execution_budget(&self.execution_budget),
+            )
+            .map_err(|error| {
+                self.poison(TaintPolicyCompileError::SemanticProvider(error.to_string()))
+            })?;
+        self.require_outcome(&outcome, "taint call binding")?;
+        if outcome.available_value().is_some() {
+            self.cache
+                .bindings
+                .borrow_mut()
+                .insert(key, CachedSemanticOutcome::from_outcome(&outcome));
+        }
+        Ok(outcome)
     }
 }
 
@@ -1105,11 +1447,12 @@ impl<'a> TaintPolicyCompiler<'a> {
                 query_limits,
                 max_selector_results,
                 cancellation,
+                // Taint stays a whole-policy unit while its solve crosses
+                // funnels nobody names, so its selectors stay whole too.
+                CodeQueryExecutionScope::whole_workspace(),
             ),
             active_semantic_models,
             refused_sites: Vec::new(),
-            formal_slot_names: HashMap::new(),
-            syntax_trees: HashMap::new(),
             named_actuals: HashMap::new(),
             bound_endpoints: BoundEndpointCounts::default(),
             authored_selector_summary: false,
@@ -1155,11 +1498,7 @@ impl<'a> TaintPolicyCompiler<'a> {
                 "transform",
             ));
         }
-        if !spec.external_models.is_empty() {
-            return Err(TaintPolicyCompileError::UnsupportedAuxiliarySemantics(
-                "external-model",
-            ));
-        }
+        validate_external_model_entries(&spec.external_models)?;
 
         let selectors = policy
             .resolved_selectors()
@@ -1248,6 +1587,156 @@ impl<'a> TaintPolicyCompiler<'a> {
                 }
             }
         }
+        // External models (#2691): each entry declares the transfer semantics
+        // of the calls its selector identifies. A bound declaration replaces
+        // the call's analyzed body, so binding happens before discovery and the
+        // bound call set steers discovery below.
+        let mut all_models = Vec::new();
+        for model in &spec.external_models {
+            let selector = required_selector(&selectors, &model.selector_path)?;
+            for selected in self.select(selector, &PolicyPort::ReturnValue)? {
+                all_models.extend(self.resolve_selected_model_calls(
+                    selected,
+                    selector,
+                    &model.definition,
+                    &model.identity,
+                )?);
+            }
+        }
+        sort_bound_external_models(&mut all_models);
+        // Entry points (#2692) declare procedures the framework invokes with a
+        // tainted formal parameter. Each selected declaration lowers to an
+        // ordinary source-shaped endpoint bound at the procedure's own entry
+        // point (`BeforeEffects`, port carrier), so the procedure roots its own
+        // analysis region and the parameter is a live taint origin even though
+        // no analyzed caller exists.
+        for entry_point in &spec.entry_points {
+            let selector = required_selector(&selectors, &entry_point.definition.selector_path)?;
+            let mut bound_ports = HashSet::new();
+            for selected in self.select(selector, &entry_point.definition.bind)? {
+                for resolved in self
+                    .resolve_entry_point_parameter_values(selected, &entry_point.definition.bind)?
+                {
+                    // One declaration can surface as several selector rows
+                    // (a definition node and its binding occurrence); they
+                    // name one formal port and must bind it once.
+                    let ValueFlowCarrier::Port(port) = &resolved.carrier else {
+                        unreachable!("entry-point resolution binds a procedure port carrier")
+                    };
+                    let identity = DurablePortIdentity::of(port).map_err(|error| {
+                        TaintPolicyCompileError::SemanticUnavailable(format!(
+                            "entry-point parameter port identity is unavailable: {error}"
+                        ))
+                    })?;
+                    if !bound_ports.insert(identity) {
+                        continue;
+                    }
+                    all_sources.push(BoundEndpoint {
+                        endpoint: entry_point.identity.clone(),
+                        point: resolved.point,
+                        phase: resolved.phase,
+                        carrier: resolved.carrier,
+                        proof: resolved.proof,
+                        completeness: resolved.completeness,
+                        labels: entry_point.definition.labels.clone().into_boxed_slice(),
+                    });
+                }
+            }
+            // An entry point whose selector matches nothing roots nothing,
+            // exactly like a source or sanitizer whose selector matches
+            // nothing: one policy commonly serves many workspaces, and only
+            // the workspaces that declare the handler synthesize its root.
+            // The shared empty-endpoint check below still refuses a policy
+            // that bound no source-shaped endpoint at all.
+        }
+        // Persistence-store ends. A write binds its declared input carrier at
+        // the selected call and a read its declared output carrier; the
+        // optional key and instance ports resolve into the channel identity
+        // that decides which writes reach which reads at evaluation time. An
+        // unresolvable dimension joins (whole-store) rather than separating,
+        // so nothing here refuses a site over a dimension.
+        let mut all_store_writes = Vec::new();
+        for write in &spec.store_writes {
+            let selector = required_selector(&selectors, &write.selector_path)?;
+            if matches!(write.definition.input, PolicyPort::MatchedValue) {
+                return Err(TaintPolicyCompileError::UnsupportedBinding(
+                    "store-write input must be a call port".to_owned(),
+                ));
+            }
+            for selected in self.select(selector, &write.definition.input)? {
+                for resolved in
+                    self.resolve_selected_values(selected, selector, &write.definition.input)?
+                {
+                    let channel = self.resolve_store_channel(
+                        write.definition.store.as_str(),
+                        write.definition.instance.as_ref(),
+                        write.definition.key.as_ref(),
+                        &resolved,
+                    )?;
+                    let call = resolved.call.clone().ok_or_else(|| {
+                        TaintPolicyCompileError::UnsupportedBinding(
+                            "store-write input must bind a call site".to_owned(),
+                        )
+                    })?;
+                    all_store_writes.push(BoundStoreEnd {
+                        endpoint: BoundEndpoint {
+                            endpoint: write.identity.clone(),
+                            point: resolved.point,
+                            phase: resolved.phase,
+                            carrier: resolved.carrier,
+                            proof: resolved.proof,
+                            completeness: resolved.completeness,
+                            labels: Box::default(),
+                        },
+                        channel,
+                        call,
+                    });
+                }
+            }
+        }
+        let mut all_store_reads = Vec::new();
+        for read in &spec.store_reads {
+            let selector = required_selector(&selectors, &read.selector_path)?;
+            if matches!(read.definition.output, PolicyPort::MatchedValue) {
+                return Err(TaintPolicyCompileError::UnsupportedBinding(
+                    "store-read output must be a call port".to_owned(),
+                ));
+            }
+            for selected in self.select(selector, &read.definition.output)? {
+                for resolved in
+                    self.resolve_selected_values(selected, selector, &read.definition.output)?
+                {
+                    let channel = self.resolve_store_channel(
+                        read.definition.store.as_str(),
+                        read.definition.instance.as_ref(),
+                        read.definition.key.as_ref(),
+                        &resolved,
+                    )?;
+                    let call = resolved.call.clone().ok_or_else(|| {
+                        TaintPolicyCompileError::UnsupportedBinding(
+                            "store-read output must bind a call site".to_owned(),
+                        )
+                    })?;
+                    all_store_reads.push(BoundStoreEnd {
+                        endpoint: BoundEndpoint {
+                            endpoint: read.identity.clone(),
+                            point: resolved.point,
+                            phase: resolved.phase,
+                            carrier: resolved.carrier,
+                            proof: resolved.proof,
+                            completeness: resolved.completeness,
+                            labels: Box::default(),
+                        },
+                        channel,
+                        call,
+                    });
+                }
+            }
+        }
+        // An end whose channel aliases no counterpart stays bound: it keeps
+        // its region viable and decidable (a read from a store nothing writes
+        // is a proven-clean negative, not an abstain), and the evaluation
+        // driver simply never seeds it.
         self.bound_endpoints = BoundEndpointCounts {
             sources: all_sources.len(),
             sinks: all_sinks.len(),
@@ -1277,6 +1766,26 @@ impl<'a> TaintPolicyCompiler<'a> {
                     .iter()
                     .flat_map(|sanitizer| sanitizer.definition.removes.iter()),
             )
+            // Every label an external model mentions joins the universe, so a
+            // declared transfer's moved and removed sets resolve to dense
+            // classes even when no source currently mints them.
+            .chain(spec.external_models.iter().flat_map(|model| {
+                model.definition.transfers.iter().flat_map(|transfer| {
+                    let effect_labels: &[TaintLabel] = match &transfer.effect {
+                        TaintTransferEffect::Propagate => &[],
+                        TaintTransferEffect::Sanitize { removes } => removes,
+                        TaintTransferEffect::Transform { .. } => {
+                            unreachable!("transform effects are refused before endpoint binding")
+                        }
+                    };
+                    transfer.labels.iter().chain(effect_labels.iter())
+                })
+            }))
+            .chain(
+                spec.entry_points
+                    .iter()
+                    .flat_map(|entry_point| entry_point.definition.labels.iter()),
+            )
             .map(|label| {
                 SourceClassId::new(label.as_str())
                     .map_err(|error| TaintPolicyCompileError::Model(error.to_string()))
@@ -1290,6 +1799,8 @@ impl<'a> TaintPolicyCompiler<'a> {
         let mut roots = all_sources
             .iter()
             .chain(&all_sinks)
+            .chain(all_store_writes.iter().map(|end| &end.endpoint))
+            .chain(all_store_reads.iter().map(|end| &end.endpoint))
             .map(|endpoint| endpoint.point.procedure().clone())
             .chain(all_kills.iter().flat_map(|kill| {
                 [
@@ -1297,6 +1808,11 @@ impl<'a> TaintPolicyCompiler<'a> {
                     kill.output.point.procedure().clone(),
                 ]
             }))
+            .chain(
+                all_models
+                    .iter()
+                    .map(|model| model.call.procedure().clone()),
+            )
             .chain(
                 self.selectors
                     .materialized_artifacts()
@@ -1317,10 +1833,17 @@ impl<'a> TaintPolicyCompiler<'a> {
         // root the same region twice (#2289).
         roots.dedup_by(|left, right| left.durable_key() == right.durable_key());
         let mut discoveries = Vec::with_capacity(roots.len());
+        // Calls covered by a bound external model are opaque: their declared
+        // transfers are the semantics, so discovery must not bind their callee
+        // bodies (#2691).
+        let modeled_calls = all_models
+            .iter()
+            .map(|model| model.call.durable_key())
+            .collect::<HashSet<_>>();
         // One cache serves every root in this compile. It charges each shared
         // procedure, dispatch, and binding one time, not one time for each root
         // that reaches it (#1936).
-        let mut materialization = DiscoveryMaterializationCache::default();
+        let materialization = DiscoveryMaterializationCache::default();
         for root in roots {
             // Each region is an independent source-to-sink analysis, so budget
             // it independently rather than accumulating every region's
@@ -1329,7 +1852,7 @@ impl<'a> TaintPolicyCompiler<'a> {
             // cross-region work amortized, so a region's fresh budget only
             // accounts for the procedures it newly pulls.
             self.selectors.reset_region_semantic_budget();
-            match self.discover_value_flow(&root, &mut materialization) {
+            match self.discover_value_flow(&root, &modeled_calls, &materialization) {
                 Ok(discovery) => discoveries.push(discovery),
                 Err(error) if is_region_budget_exhausted(&error) => {
                     // This root's forward closure did not fit its own per-region
@@ -1348,7 +1871,7 @@ impl<'a> TaintPolicyCompiler<'a> {
             }
         }
         self.selectors
-            .record_semantic_handle_identity_reuses(materialization.handle_identity_reuses);
+            .record_semantic_handle_identity_reuses(materialization.handle_identity_reuses.get());
         // Drop every region that could contain a refused selector row (#2308).
         // A refused row bound no endpoint, so a region holding it is missing an
         // endpoint the policy asked for; solving it anyway could report a clean
@@ -1397,14 +1920,35 @@ impl<'a> TaintPolicyCompiler<'a> {
             .iter()
             .map(|kill| kill.input.point.procedure().durable_key())
             .collect::<Vec<_>>();
+        let store_write_procedures = all_store_writes
+            .iter()
+            .map(|end| end.endpoint.point.procedure().durable_key())
+            .collect::<Vec<_>>();
+        let store_read_procedures = all_store_reads
+            .iter()
+            .map(|end| end.endpoint.point.procedure().durable_key())
+            .collect::<Vec<_>>();
+        // A region can host a flow when it contains something that establishes
+        // taint (a source, or a store read fed across the boundary) and
+        // something that consumes it (a sink, or a store write feeding the
+        // boundary). Without stores this is exactly the source-and-sink test;
+        // with them, the write region and the read region each stay viable on
+        // their own and the evaluation driver links them through the channel.
+        let model_procedures = all_models
+            .iter()
+            .map(|model| model.call.procedure().durable_key())
+            .collect::<Vec<_>>();
         let (mut covering_discoveries, mut disconnected_discoveries): (Vec<_>, Vec<_>) =
             discoveries.into_iter().partition(|discovery| {
-                source_procedures
+                let establishes = source_procedures
                     .iter()
-                    .any(|procedure| discovery.procedures.contains(procedure))
-                    && sink_procedures
-                        .iter()
-                        .any(|procedure| discovery.procedures.contains(procedure))
+                    .chain(&store_read_procedures)
+                    .any(|procedure| discovery.procedures.contains(procedure));
+                let consumes = sink_procedures
+                    .iter()
+                    .chain(&store_write_procedures)
+                    .any(|procedure| discovery.procedures.contains(procedure));
+                establishes && consumes
             });
         if covering_discoveries.is_empty()
             && let Some(mut discovery) = disconnected_discoveries
@@ -1428,7 +1972,12 @@ impl<'a> TaintPolicyCompiler<'a> {
             // stays finding-free, while neither sibling can be read as clean.
             for endpoint in source_procedures.iter().chain(&sink_procedures) {
                 if discovery.procedures.insert(endpoint.clone()) {
-                    let Some(snapshot) = materialization.procedures.get(endpoint) else {
+                    let snapshot = materialization
+                        .procedures
+                        .borrow()
+                        .get(endpoint)
+                        .and_then(CachedSemanticOutcome::value_input);
+                    let Some(snapshot) = snapshot else {
                         // A skipped budget-exhausted root has no finished
                         // snapshot. Do not turn that absence into a fabricated
                         // mounted procedure; preserve the existing compile
@@ -1437,7 +1986,7 @@ impl<'a> TaintPolicyCompiler<'a> {
                             "no analysis root contains both a selected source and sink".to_owned(),
                         ));
                     };
-                    discovery.snapshots.push(snapshot.clone());
+                    discovery.snapshots.push(snapshot);
                 }
             }
             covering_discoveries.push(discovery);
@@ -1479,21 +2028,102 @@ impl<'a> TaintPolicyCompiler<'a> {
                 .filter(|(_, procedure)| discovery.procedures.contains(*procedure))
                 .map(|(kill, _)| kill.clone())
                 .collect::<Vec<_>>();
+            let mut store_writes = all_store_writes
+                .iter()
+                .zip(&store_write_procedures)
+                .filter(|(_, procedure)| discovery.procedures.contains(*procedure))
+                .map(|(end, _)| end.clone())
+                .collect::<Vec<_>>();
+            let mut store_reads = all_store_reads
+                .iter()
+                .zip(&store_read_procedures)
+                .filter(|(_, procedure)| discovery.procedures.contains(*procedure))
+                .map(|(end, _)| end.clone())
+                .collect::<Vec<_>>();
+            let models = all_models
+                .iter()
+                .zip(&model_procedures)
+                .filter(|(_, procedure)| discovery.procedures.contains(*procedure))
+                .map(|(model, _)| model.clone())
+                .collect::<Vec<_>>();
             sort_bound_endpoints(&mut sources);
             sort_bound_endpoints(&mut sinks);
             sort_bound_sanitizers(&mut kills);
-            let source_specs = source_event_specs(&sources)?;
-            let sink_specs = sink_event_specs(&sinks)?;
+            sort_bound_store_ends(&mut store_writes);
+            sort_bound_store_ends(&mut store_reads);
+            // Store ends ride the ordinary source/sink event machinery: a
+            // write is an internal value-flow sink observing the written
+            // carrier and a read an internal source establishing the returned
+            // carrier. Their event ordinals continue after the policy
+            // endpoints' so every key stays unique, and every later binding
+            // is matched by event key rather than by list position.
+            let mut source_specs = keyed_source_event_specs(&sources, 0)?;
+            let read_specs = keyed_source_event_specs(
+                &store_reads
+                    .iter()
+                    .map(|end| end.endpoint.clone())
+                    .collect::<Vec<_>>(),
+                sources.len(),
+            )?;
+            source_specs.extend(read_specs.iter().cloned());
+            let mut sink_specs = keyed_sink_event_specs(&sinks, 0)?;
+            let write_specs = keyed_sink_event_specs(
+                &store_writes
+                    .iter()
+                    .map(|end| end.endpoint.clone())
+                    .collect::<Vec<_>>(),
+                sinks.len(),
+            )?;
+            sink_specs.extend(write_specs.iter().cloned());
             let value_flow = self.build_value_flow_plan(
                 discovery,
-                source_specs,
-                sink_specs,
+                source_specs.iter().map(|(_, spec)| spec.clone()).collect(),
+                sink_specs.iter().map(|(_, spec)| spec.clone()).collect(),
                 spec.call_modeling.unmodeled,
             )?;
-            let taint_sources = bind_taint_sources(&value_flow, &universe, &sources)?;
-            let taint_sinks = bind_taint_sinks(&value_flow, &universe, &sinks)?;
+            let value_flow = self.install_bound_external_models(value_flow, &models, &universe)?;
+            // A store declaration models its selected call outright: nothing
+            // flows through the call directly, taint crosses only via the
+            // declared boundary. The empty-transfer curated model is what
+            // states that, and it is what lets an opaque store call (an
+            // unresolvable static or dynamic dispatch) stop blocking a
+            // complete verdict instead of abstaining the region.
+            let mut store_calls: Vec<CallSiteHandle> = Vec::new();
+            for end in store_writes.iter().chain(&store_reads) {
+                if !store_calls
+                    .iter()
+                    .any(|call| call.durable_key() == end.call.durable_key())
+                {
+                    store_calls.push(end.call.clone());
+                }
+            }
+            let value_flow = if store_calls.is_empty() {
+                value_flow
+            } else {
+                let model = store_boundary_call_model()?;
+                value_flow
+                    .with_curated_call_models(
+                        store_calls
+                            .into_iter()
+                            .map(|call| ValueFlowCuratedCallModel::new(call, model.clone()))
+                            .collect(),
+                    )
+                    .map_err(|error| TaintPolicyCompileError::Plan(error.to_string()))?
+            };
+            let taint_sources = bind_taint_sources(
+                &value_flow,
+                &universe,
+                &sources,
+                &source_specs[..sources.len()],
+            )?;
+            let taint_sinks =
+                bind_taint_sinks(&value_flow, &universe, &sinks, &sink_specs[..sinks.len()])?;
             let taint_sanitizers = bind_taint_sanitizers(&value_flow, &universe, &kills)?;
+            let store_write_bindings = bind_store_writes(&value_flow, &store_writes, &write_specs)?;
+            let store_read_bindings = bind_store_reads(&value_flow, &store_reads, &read_specs)?;
             let sanitizer_hash = sanitizer_compatibility_hash(&value_flow, &taint_sanitizers);
+            let store_hash =
+                store_compatibility_hash(&value_flow, &store_write_bindings, &store_read_bindings);
             let analysis = TaintAnalysisPlan::new(
                 value_flow,
                 universe.clone(),
@@ -1502,6 +2132,7 @@ impl<'a> TaintPolicyCompiler<'a> {
                 taint_sanitizers,
                 Vec::new(),
             )
+            .and_then(|analysis| analysis.with_stores(store_write_bindings, store_read_bindings))
             .map_err(|error| TaintPolicyCompileError::Plan(error.to_string()))?;
             let internal_policy_id = format!(
                 "{}#root-{root_index}",
@@ -1510,23 +2141,39 @@ impl<'a> TaintPolicyCompiler<'a> {
             let compatibility = TaintBatchCompatibilityKey::with_call_behavior(
                 // The value-flow propagation hash deliberately excludes
                 // endpoint observations so compatible demand can share a solve,
-                // but it also excludes sanitizers, which DO change propagation.
-                // Folding them in is what keeps two policies with different
-                // kills in different batches instead of colliding on one key
-                // and failing the planner's own equality check.
+                // but it also excludes sanitizers and store boundaries, which
+                // DO change propagation results. Folding them in is what keeps
+                // two policies with different kills or store models in
+                // different batches instead of colliding on one key and
+                // failing the planner's own equality check.
                 TaintPropagationSemanticsId::new(
                     &root.artifact().key().fingerprint(),
                     root.semantics().locator(),
                     value_flow_compatibility_hash(analysis.value_flow()),
                     sanitizer_hash,
+                    store_hash,
                 ),
                 spec.call_modeling.unmodeled,
                 universe.hash(),
             );
             let plan = TaintPolicyPlan::new(internal_policy_id.clone(), compatibility, analysis)
                 .map_err(|error| TaintPolicyCompileError::Plan(error.to_string()))?;
-            let source_metadata = value_flow_sources(&plan, &sources)?;
-            let sink_metadata = value_flow_sinks(&plan, &sinks)?;
+            let mut source_metadata = endpoint_metadata(&sources, &source_specs[..sources.len()]);
+            // A store-read origin is attributed back to the policy sources
+            // whose labels actually flowed into the boundary: one metadata row
+            // per (read event, policy source), filtered at projection time by
+            // the observed classes. The read itself is not a policy source, so
+            // it never stands alone in a projected finding.
+            for (key, _) in &read_specs {
+                for source in &spec.sources {
+                    source_metadata.push(CompiledTaintEndpoint {
+                        endpoint: source.identity.clone(),
+                        event: key.clone(),
+                        labels: source.definition.labels.clone().into_boxed_slice(),
+                    });
+                }
+            }
+            let sink_metadata = endpoint_metadata(&sinks, &sink_specs[..sinks.len()]);
             compiled.push(CompiledTaintPolicyPlan {
                 internal_policy_id,
                 plan,
@@ -1552,12 +2199,21 @@ impl<'a> TaintPolicyCompiler<'a> {
             .map_err(taint_selector_error)
     }
 
-    fn resolve_selected_values(
+    /// Materialize the selected row's file and bind it to the semantic call
+    /// sites it identifies. An ambiguous row is refused into `refused_sites`
+    /// and answered with `None`, so a caller drops the row rather than guess.
+    fn selected_semantic_calls(
         &mut self,
-        mut selection: SelectedSite,
-        selector: &ResolvedPolicySelector,
-        binding: &PolicyPort,
-    ) -> Result<Vec<ResolvedTaintValue>, TaintPolicyCompileError> {
+        selection: &SelectedSite,
+    ) -> Result<
+        Option<
+            Vec<(
+                ProcedureHandle,
+                brokk_bifrost_analysis::analyzer::semantic::CallSiteHandle,
+            )>,
+        >,
+        TaintPolicyCompileError,
+    > {
         if selection
             .call_binding
             .as_ref()
@@ -1569,9 +2225,6 @@ impl<'a> TaintPolicyCompiler<'a> {
                 .expect("authored selector has a call-binding row")
                 .assert_valid_identity();
             self.authored_selector_summary = true;
-        }
-        if matches!(binding, PolicyPort::MatchedValue) {
-            return self.resolve_matched_value(selection);
         }
         let artifact = self
             .selectors
@@ -1614,8 +2267,8 @@ impl<'a> TaintPolicyCompiler<'a> {
                 "taint semantic call binding exhausted the shared traversal budget",
             ));
         }
-        let sites = match select_call(&lookup.handles, &selection)? {
-            SelectedCallSites::One(sites) => sites,
+        match select_call(&lookup.handles, selection)? {
+            SelectedCallSites::One(sites) => Ok(Some(sites)),
             SelectedCallSites::Ambiguous { ranges, procedures } => {
                 // The row names more than one distinct call. Refuse this row
                 // only, and record which procedures could hold the site so the
@@ -1628,8 +2281,34 @@ impl<'a> TaintPolicyCompiler<'a> {
                     reason: RefusalReason::AmbiguousCallSite(ranges),
                     procedures,
                 });
-                return Ok(Vec::new());
+                Ok(None)
             }
+        }
+    }
+
+    fn resolve_selected_values(
+        &mut self,
+        mut selection: SelectedSite,
+        selector: &ResolvedPolicySelector,
+        binding: &PolicyPort,
+    ) -> Result<Vec<ResolvedTaintValue>, TaintPolicyCompileError> {
+        if matches!(binding, PolicyPort::MatchedValue) {
+            if selection
+                .call_binding
+                .as_ref()
+                .is_some_and(|row| row.selector_proof == "authored_summary")
+            {
+                selection
+                    .call_binding
+                    .as_ref()
+                    .expect("authored selector has a call-binding row")
+                    .assert_valid_identity();
+                self.authored_selector_summary = true;
+            }
+            return self.resolve_matched_value(selection);
+        }
+        let Some(sites) = self.selected_semantic_calls(&selection)? else {
+            return Ok(Vec::new());
         };
         if matches!(binding, PolicyPort::Receiver) {
             match self
@@ -1798,6 +2477,425 @@ impl<'a> TaintPolicyCompiler<'a> {
         Ok(resolved)
     }
 
+    /// Resolve one store end's runtime channel identity from its declared
+    /// dimensions at the selected call. Resolution never refuses a site: a
+    /// dimension the analysis cannot prove joins as `Unproven`, which is the
+    /// whole-store fallback the public contract documents.
+    fn resolve_store_channel(
+        &mut self,
+        store: &str,
+        instance: Option<&PolicyPort>,
+        key: Option<&PolicyPort>,
+        resolved: &ResolvedTaintValue,
+    ) -> Result<TaintStoreChannel, TaintPolicyCompileError> {
+        let instance = match instance {
+            None => TaintStoreDimension::Undeclared,
+            Some(port) => self.resolve_instance_dimension(resolved, port)?,
+        };
+        let key = match key {
+            None => TaintStoreDimension::Undeclared,
+            Some(port) => self.resolve_key_dimension(resolved, port)?,
+        };
+        Ok(TaintStoreChannel::new(store, instance, key))
+    }
+
+    /// The dimension ports bind operands of the already-selected call, so
+    /// only index and receiver ports are meaningful; a formal-name or result
+    /// port here is an authoring error rather than an evidence shortfall.
+    fn store_dimension_value(
+        &mut self,
+        resolved: &ResolvedTaintValue,
+        port: &PolicyPort,
+    ) -> Result<Option<ValueHandle>, TaintPolicyCompileError> {
+        if !matches!(
+            port,
+            PolicyPort::ArgumentIndex { .. } | PolicyPort::Receiver
+        ) {
+            return Err(TaintPolicyCompileError::UnsupportedBinding(
+                "a store dimension port must be (argument :index N) or receiver".to_owned(),
+            ));
+        }
+        let Some(call) = resolved.call.as_ref() else {
+            return Ok(None);
+        };
+        let procedure = resolved.point.procedure();
+        // The span parameter feeds only matched-value ports, which the port
+        // check above excludes.
+        match select_value(procedure, call, &(0..0), port) {
+            Ok((value, _point)) => Ok(Some(value)),
+            // A call without the named operand (fewer arguments, or no
+            // receiver) leaves the dimension unproven; the join is sound.
+            Err(_) => Ok(None),
+        }
+    }
+
+    /// A key identity is proven only for a plain, escape-free string literal
+    /// argument: the literal's content bytes, read through the semantic
+    /// value's exact source mapping, are the identity. Anything else joins.
+    fn resolve_key_dimension(
+        &mut self,
+        resolved: &ResolvedTaintValue,
+        port: &PolicyPort,
+    ) -> Result<TaintStoreDimension, TaintPolicyCompileError> {
+        let Some(value) = self.store_dimension_value(resolved, port)? else {
+            return Ok(TaintStoreDimension::Unproven);
+        };
+        let procedure = resolved.point.procedure();
+        let semantics = procedure.semantics();
+        let Some(semantic_value) = semantics.value(value.id()) else {
+            return Ok(TaintStoreDimension::Unproven);
+        };
+        if !semantic_value.kind.is_constant() {
+            return Ok(TaintStoreDimension::Unproven);
+        }
+        let Some(mapping) = semantics.source_mapping(semantic_value.source) else {
+            return Ok(TaintStoreDimension::Unproven);
+        };
+        if mapping.kind != SourceMappingKind::Exact {
+            return Ok(TaintStoreDimension::Unproven);
+        }
+        let span = mapping.locator.anchor().span();
+        let file = ProjectFile::new(
+            self.selectors
+                .workspace()
+                .analyzer()
+                .project()
+                .root()
+                .to_path_buf(),
+            mapping.locator.path().as_path(),
+        );
+        let Some(source) = self.selectors.workspace().analyzer().indexed_source(&file) else {
+            return Ok(TaintStoreDimension::Unproven);
+        };
+        let Some(token) = source.get(span.start_byte() as usize..span.end_byte() as usize) else {
+            return Ok(TaintStoreDimension::Unproven);
+        };
+        Ok(string_literal_key_identity(token))
+    }
+
+    /// Bind one external-model selector row to the exact semantic calls it
+    /// identifies and lower the entry's transfers for each call (#2691).
+    ///
+    /// Formal-name argument ports resolve to this call's own actual, exactly
+    /// as endpoint ports do, and the resolution quality conjoins into the
+    /// bound model so a name resolved through unproven dispatch degrades the
+    /// declaration instead of overstating it. A call whose formal cannot be
+    /// identified is refused into `refused_sites`, dropping the regions that
+    /// could contain it, rather than modeled by guess.
+    fn resolve_selected_model_calls(
+        &mut self,
+        selection: SelectedSite,
+        selector: &ResolvedPolicySelector,
+        definition: &ResolvedTaintExternalModelDefinition,
+        identity: &ResolvedEndpointIdentity,
+    ) -> Result<Vec<BoundExternalModel>, TaintPolicyCompileError> {
+        let Some(sites) = self.selected_semantic_calls(&selection)? else {
+            return Ok(Vec::new());
+        };
+        let mut bound = Vec::with_capacity(sites.len());
+        'site: for (procedure, call) in &sites {
+            let mut proof = selection.proof.clone();
+            let mut completeness = selection.completeness.clone();
+            let mut transfers = Vec::with_capacity(definition.transfers.len());
+            for transfer in &definition.transfers {
+                let from = match self.resolve_model_port(
+                    &transfer.from,
+                    procedure,
+                    call,
+                    selector,
+                    &selection,
+                    &mut proof,
+                    &mut completeness,
+                )? {
+                    Some((port, _)) => port,
+                    None => continue 'site,
+                };
+                let (to, field) = match self.resolve_model_port(
+                    &transfer.to,
+                    procedure,
+                    call,
+                    selector,
+                    &selection,
+                    &mut proof,
+                    &mut completeness,
+                )? {
+                    Some(resolved) => resolved,
+                    None => continue 'site,
+                };
+                let removes = match &transfer.effect {
+                    TaintTransferEffect::Propagate => Vec::new(),
+                    TaintTransferEffect::Sanitize { removes } => removes.clone(),
+                    TaintTransferEffect::Transform { .. } => {
+                        unreachable!("transform effects are refused before endpoint binding")
+                    }
+                };
+                transfers.push(LoweredModelTransfer {
+                    from,
+                    to,
+                    labels: transfer.labels.clone(),
+                    removes,
+                    field,
+                });
+            }
+            bound.push(BoundExternalModel {
+                entry: identity.clone(),
+                call: call.clone(),
+                transfers,
+                proof,
+                completeness,
+            });
+        }
+        Ok(bound)
+    }
+
+    /// Map one declared transfer port to the engine's stable summary-port
+    /// vocabulary at one selected call. `None` means the port was refused for
+    /// this call (recorded in `refused_sites`), so the call stays unmodeled.
+    ///
+    /// A field destination lowers to a stable heap port plus the declared
+    /// field identity; its concrete carrier is decided against the finished
+    /// value-flow plan when the model is installed, so the decision ranges
+    /// over every location the solve can actually observe.
+    #[allow(clippy::too_many_arguments)]
+    fn resolve_model_port(
+        &mut self,
+        port: &PolicyPort,
+        procedure: &ProcedureHandle,
+        call: &CallSiteHandle,
+        selector: &ResolvedPolicySelector,
+        selection: &SelectedSite,
+        proof: &mut ProofStatus,
+        completeness: &mut EvidenceCompleteness,
+    ) -> Result<Option<(SummaryPort, Option<ModelFieldDestination>)>, TaintPolicyCompileError> {
+        let port = match port {
+            PolicyPort::Receiver => SummaryPort::Receiver,
+            PolicyPort::ReturnValue => SummaryPort::NormalReturn,
+            PolicyPort::ResultIndex { index } => SummaryPort::IndexedNormalReturn(*index),
+            PolicyPort::ArgumentIndex { index } => SummaryPort::Parameter(*index),
+            PolicyPort::ArgumentName { name } => {
+                match self.resolve_named_argument(call, name, selector, &selection.file)? {
+                    NamedArgumentResolution::Bound(bound) => {
+                        *proof = conjoin_proof(proof, &bound.proof);
+                        *completeness = conjoin_completeness(completeness, &bound.completeness);
+                        SummaryPort::Parameter(bound.index)
+                    }
+                    NamedArgumentResolution::Unidentified(detail) => {
+                        self.refused_sites.push(RefusedCallSite {
+                            file: selection.file.clone(),
+                            span: selection.span.clone(),
+                            reason: RefusalReason::UnidentifiedFormal {
+                                name: name.clone(),
+                                detail,
+                            },
+                            procedures: vec![procedure.durable_key()],
+                        });
+                        return Ok(None);
+                    }
+                }
+            }
+            PolicyPort::FieldOf { base, name } => {
+                let Some((base_port, _)) = self.resolve_model_port(
+                    base,
+                    procedure,
+                    call,
+                    selector,
+                    selection,
+                    proof,
+                    completeness,
+                )?
+                else {
+                    return Ok(None);
+                };
+                let mut key_bytes = Vec::new();
+                key_bytes.extend_from_slice(b"bifrost-policy-external-model-field/v1\0");
+                key_bytes.extend_from_slice(format!("{base_port:?}").as_bytes());
+                key_bytes.push(0);
+                key_bytes.extend_from_slice(name.as_bytes());
+                let heap = SummaryPort::Heap(
+                    brokk_bifrost_flow::dataflow::SummaryLocationKey::hash_bytes(&key_bytes),
+                );
+                let base_values = self.model_field_base_values(procedure, call, &base_port)?;
+                return Ok(Some((
+                    heap,
+                    Some(ModelFieldDestination {
+                        name: name.clone(),
+                        base_values,
+                    }),
+                )));
+            }
+            PolicyPort::MatchedValue => {
+                return Err(TaintPolicyCompileError::UnsupportedBinding(
+                    "external-model transfer ports must be call ports".to_owned(),
+                ));
+            }
+        };
+        Ok(Some((port, None)))
+    }
+
+    /// Every caller value id the object passed at `base` is known as: the
+    /// argument slot holds a copy of the caller's variable, so the caller's
+    /// own value-to-value relations are closed over backwards from the
+    /// argument value with an explicit worklist (stack-safe for large
+    /// bodies). Field locations the region can read are rooted at one of
+    /// these values.
+    fn model_field_base_values(
+        &mut self,
+        procedure: &ProcedureHandle,
+        call: &CallSiteHandle,
+        base: &SummaryPort,
+    ) -> Result<Vec<brokk_bifrost_analysis::analyzer::semantic::ValueId>, TaintPolicyCompileError>
+    {
+        let Some(row) = procedure.semantics().call_site(call.id()) else {
+            return Ok(Vec::new());
+        };
+        let base_value = match base {
+            SummaryPort::Receiver => row.receiver,
+            SummaryPort::Parameter(index) => usize::try_from(*index)
+                .ok()
+                .and_then(|index| row.arguments.get(index))
+                .map(|argument| argument.value),
+            _ => None,
+        };
+        let Some(base_value) = base_value else {
+            return Ok(Vec::new());
+        };
+        let oracle = self.selectors.workspace().semantic_oracle_provider();
+        let outcome = {
+            let mut request = self.selectors.semantic_request();
+            oracle
+                .procedure_relations(procedure, &OracleCallContext::empty(), &mut request)
+                .map_err(|error| TaintPolicyCompileError::SemanticProvider(error.to_string()))?
+        };
+        require_uninterrupted_outcome(&outcome, "external-model field destination")?;
+        self.selectors
+            .require_execution_budget("external-model field destination")
+            .map_err(taint_selector_error)?;
+        let Some(snapshot) = outcome.available_value() else {
+            return Ok(vec![base_value]);
+        };
+        let mut equivalent = vec![base_value];
+        let mut frontier = vec![base_value];
+        while let Some(current) = frontier.pop() {
+            for relation in snapshot.relations() {
+                let (
+                    brokk_bifrost_analysis::analyzer::semantic::ValueFlowEndpoint::Value(source),
+                    brokk_bifrost_analysis::analyzer::semantic::ValueFlowEndpoint::Value(target),
+                ) = (&relation.source, &relation.target)
+                else {
+                    continue;
+                };
+                if target.id() == current && !equivalent.contains(&source.id()) {
+                    equivalent.push(source.id());
+                    frontier.push(source.id());
+                }
+            }
+        }
+        Ok(equivalent)
+    }
+
+    /// Materialize the declared name of one field memory-location member from
+    /// its declaration anchor in the indexed source. The anchor is the
+    /// adapter-validated identity of the field's declaring identifier, so the
+    /// slice is a structured name lookup, not a text search.
+    fn field_member_name(
+        &mut self,
+        member: &brokk_bifrost_analysis::analyzer::semantic::ScopedSemanticLocator,
+    ) -> Option<String> {
+        let locator = member.locator();
+        let span = locator.anchor().span();
+        let file = ProjectFile::new(
+            self.selectors
+                .workspace()
+                .analyzer()
+                .project()
+                .root()
+                .to_path_buf(),
+            locator.path().as_path(),
+        );
+        let source = self
+            .selectors
+            .workspace()
+            .analyzer()
+            .indexed_source(&file)?;
+        source
+            .get(span.start_byte() as usize..span.end_byte() as usize)
+            .map(str::to_owned)
+    }
+
+    /// An instance identity is proven when the dimension port's operand
+    /// expression resolves, through the reference resolver, to exactly one
+    /// declaration: that declaration's stable identity is the identity. Two
+    /// reads of one static field or module binding then agree across
+    /// procedures, and two distinct declarations separate. A local binder is
+    /// procedure-scoped, so it cannot link across procedures and joins; so
+    /// does anything the resolver cannot answer uniquely.
+    fn resolve_instance_dimension(
+        &mut self,
+        resolved: &ResolvedTaintValue,
+        port: &PolicyPort,
+    ) -> Result<TaintStoreDimension, TaintPolicyCompileError> {
+        let Some(value) = self.store_dimension_value(resolved, port)? else {
+            return Ok(TaintStoreDimension::Unproven);
+        };
+        let procedure = resolved.point.procedure();
+        let semantics = procedure.semantics();
+        let Some(semantic_value) = semantics.value(value.id()) else {
+            return Ok(TaintStoreDimension::Unproven);
+        };
+        let Some(mapping) = semantics.source_mapping(semantic_value.source) else {
+            return Ok(TaintStoreDimension::Unproven);
+        };
+        if mapping.kind != SourceMappingKind::Exact {
+            return Ok(TaintStoreDimension::Unproven);
+        }
+        let span = mapping.locator.anchor().span();
+        let file = ProjectFile::new(
+            self.selectors
+                .workspace()
+                .analyzer()
+                .project()
+                .root()
+                .to_path_buf(),
+            mapping.locator.path().as_path(),
+        );
+        let Some(source) = self.selectors.workspace().analyzer().indexed_source(&file) else {
+            return Ok(TaintStoreDimension::Unproven);
+        };
+        let outcome = resolve_definition_batch_with_source(
+            self.selectors.workspace().analyzer(),
+            vec![DefinitionLookupRequest {
+                file: file.clone(),
+                line: None,
+                column: None,
+                start_byte: Some(span.start_byte() as usize),
+                end_byte: Some(span.end_byte() as usize),
+            }],
+            file,
+            Arc::from(source),
+        )
+        .into_iter()
+        .next();
+        let Some(outcome) = outcome else {
+            return Ok(TaintStoreDimension::Unproven);
+        };
+        if !matches!(outcome.status, DefinitionLookupStatus::Resolved) {
+            return Ok(TaintStoreDimension::Unproven);
+        }
+        let mut declarations = outcome
+            .definitions
+            .iter()
+            .map(|unit| unit.declaration_id())
+            .collect::<Vec<_>>();
+        declarations.sort();
+        declarations.dedup();
+        let [declaration] = declarations.as_slice() else {
+            return Ok(TaintStoreDimension::Unproven);
+        };
+        let mut digest = LengthDelimitedDigest::new(b"bifrost.taint.store-instance.declaration.v1");
+        digest.push(declaration.as_str().as_bytes());
+        Ok(TaintStoreDimension::Proven(digest.finish()))
+    }
+
     /// The structural route's answer for one whole selector, computed once.
     ///
     /// It costs an extra selector scan, so it is taken only where the oracle
@@ -1922,14 +3020,9 @@ impl<'a> TaintPolicyCompiler<'a> {
         // - `declares_formal`: some candidate declares a formal of this name.
         // - `known_nondeclared_candidate`: some candidate's list was read and
         //   does not declare it.
-        // - `formal_names_unavailable`: some candidate's table was withheld.
-        //   `formal_slot_names` returns `None` both when the declaration could
-        //   not be parsed and when the table it would have built has a gap --
-        //   a minted parameter this seam could not locate in the declaration's
-        //   layout withholds the whole table rather than reporting a formal
-        //   absent. Either way this seam does not know what that candidate
-        //   declares, so it may neither bind through the structural relation
-        //   nor raise `UnknownFormalName`.
+        // - `formal_names_unavailable`: some candidate has a parameter whose
+        //   semantic IR does not publish one unique name. This seam may neither
+        //   bind that candidate by ordinal nor report the requested name absent.
         // - `mapped_candidates`: how many candidates mapped the name onto the
         //   single actual `index` holds. Anything short of every candidate is
         //   a set that does not agree.
@@ -1949,7 +3042,7 @@ impl<'a> TaintPolicyCompiler<'a> {
             if let EvidenceCompleteness::Partial(reason) = candidate.completeness() {
                 completeness = EvidenceCompleteness::Partial(reason.clone());
             }
-            let names = self.formal_slot_names(candidate.target())?;
+            let names = self.formal_ir_names(candidate.target())?;
             if let Some(names) = &names {
                 read_formals = true;
                 let candidate_declares = names.iter().any(|slot| parameter_names_match(slot, name));
@@ -2058,13 +3151,11 @@ impl<'a> TaintPolicyCompiler<'a> {
                 "dispatch candidates do not all map the formal to one actual".to_owned(),
             ));
         }
-        // The semantic call row records that an actual is a keyword argument
-        // but not which keyword, so the oracle relation retains no mapping for
-        // `put(value=x)`. Fall back to the analyzer's structural
-        // actual-to-formal relation, which reads the label from the call's own
-        // syntax. It is the same relation `(call-input :parameter-name ...)`
-        // publishes, and the mapping it makes is not oracle-proven, so a
-        // binding taken from it is complete only up to that relation.
+        // An unresolved or incomplete candidate can still retain no semantic
+        // binding for an actual. In that bounded case, consult the analyzer's
+        // structural actual-to-formal relation. This is the same relation
+        // `(call-input :parameter-name ...)` publishes, and a binding taken
+        // from it is complete only up to that relation.
         let index = match index {
             Some(index) => Some(index),
             None => {
@@ -2179,12 +3270,8 @@ impl<'a> TaintPolicyCompiler<'a> {
     /// Whether one retained actual-to-formal mapping reaches the named formal.
     ///
     /// A positional actual states an ordinal, and the name of that ordinal is a
-    /// property of the resolved target's own declaration. A mapping whose
-    /// member is a keyword states the formal's name itself and binds without
-    /// any knowledge of the callee; today's workspace oracle mints no such
-    /// member, because the semantic call row drops the label, but the oracle
-    /// contract allows one and reading it here is what makes the structural
-    /// fallback below removable when the row carries it.
+    /// property of the resolved target's semantic parameter row. A keyword
+    /// mapping states the formal's name directly.
     fn mapping_names_formal(
         &self,
         mapping: &CallArgumentMapping,
@@ -2207,113 +3294,32 @@ impl<'a> TaintPolicyCompiler<'a> {
     /// The formal parameter names of one callee, indexed by the parameter
     /// ordinal a `call_binding` row names.
     ///
-    /// Names are syntax-derived from the declaration the procedure is anchored
-    /// at, which is the same source the `call_binding` relation reads, so a
-    /// port and a relation row cannot disagree about what formal `n` is called.
-    /// `None` means the declaration could not be read here; that is an evidence
-    /// shortfall, never a decision that the formal is absent, and
-    /// `resolve_named_argument` treats it as one: a candidate whose names are
-    /// unavailable can neither be bound through the structural relation nor
-    /// reported as declaring no such formal.
-    fn formal_slot_names(
-        &mut self,
+    /// Names come directly from the parameter rows that define the oracle's
+    /// procedure ports. `None` means at least one parameter has no unique name;
+    /// that is an evidence shortfall, never a decision that a formal is absent.
+    fn formal_ir_names(
+        &self,
         procedure: &ProcedureHandle,
     ) -> Result<Option<FormalSlotNames>, TaintPolicyCompileError> {
-        if let Some(cached) = self.formal_slot_names.get(procedure) {
-            return Ok(cached.clone());
-        }
-        if self.selectors.cancellation().is_cancelled() {
-            return Err(TaintPolicyCompileError::QueryIncomplete {
-                completion: CodeQueryCompletion::Cancelled,
-                detail: "formal-parameter layout resolution was cancelled".to_owned(),
-            });
-        }
-        if !self.selectors.execution_budget().charge_traversal(1) {
-            return Err(query_budget_error(
-                CodeQueryDiagnosticCode::SemanticBudgetExhausted,
-                "formal-parameter layout resolution exhausted the shared traversal budget",
-            ));
-        }
-        let names = self.read_formal_slot_names(procedure);
-        self.formal_slot_names
-            .insert(procedure.clone(), names.clone());
-        Ok(names)
-    }
-
-    fn read_formal_slot_names(&mut self, procedure: &ProcedureHandle) -> Option<FormalSlotNames> {
         let semantics = procedure.semantics();
-        let locator = semantics
-            .source_mapping(semantics.source())
-            .map(|mapping| mapping.locator.clone())?;
-        let span = locator.anchor().span();
-        let file = ProjectFile::new(
-            self.selectors
-                .workspace()
-                .analyzer()
-                .project()
-                .root()
-                .to_path_buf(),
-            locator.path().as_path(),
-        );
-        let source = self
-            .selectors
-            .workspace()
-            .analyzer()
-            .indexed_source(&file)?;
-        let language = language_for_file(&file);
-        if !self.syntax_trees.contains_key(&file) {
-            let tree = parse_tree_for_language(&file, language, &source)?;
-            self.syntax_trees.insert(file.clone(), tree);
-        }
-        let tree = self
-            .syntax_trees
-            .get(&file)
-            .expect("cached parameter syntax tree is retained");
-        let declaration_range = Range {
-            start_byte: span.start_byte() as usize,
-            end_byte: span.end_byte() as usize,
-            start_line: 0,
-            end_line: 0,
-        };
-        let layout =
-            formal_parameter_slots(language, tree.root_node(), &source, &declaration_range)?;
-        // Declaration order is not ordinal order. A language may bind a
-        // declared formal as the receiver -- Python's `self` and `cls` are
-        // ordinary entries in the parameter list, and Go and Java carry a
-        // receiver slot the layout marks -- and the lowering that mints the
-        // ordinals skips whichever one it consumed. Naming ordinal `n` after
-        // the `n`th slot is therefore one slot early on every Python instance
-        // method, which silently binds a port to its neighbour's operand.
-        //
-        // Each ordinal is taken from the procedure's own parameter value
-        // instead. That value's source mapping points into the slot that
-        // declared it, so the table is the lowering's own answer about which
-        // syntax declared formal `n` and cannot drift from it.
         let mut names: Vec<Box<[String]>> = Vec::new();
         for value in semantics.values() {
-            let SemanticValueKind::Parameter { ordinal, .. } = &value.kind else {
+            let SemanticValueKind::Parameter { ordinal, name, .. } = &value.kind else {
                 continue;
             };
-            let mapping = semantics.source_mapping(value.source)?;
-            let span = mapping.locator.anchor().span();
-            let (start, end) = (span.start_byte() as usize, span.end_byte() as usize);
-            let slot = layout.slots.iter().find(|slot| {
-                slot.declaration_range.start_byte <= start && slot.declaration_range.end_byte >= end
-            })?;
+            let Some(name) = name else {
+                return Ok(None);
+            };
             let ordinal = *ordinal as usize;
             if names.len() <= ordinal {
                 names.resize(ordinal + 1, Box::default());
             }
-            names[ordinal] = slot.names.clone().into_boxed_slice();
+            names[ordinal] = vec![name.to_string()].into_boxed_slice();
         }
-        // A dense table is what makes "the target declares no such formal" a
-        // statement about the declaration rather than about this lookup. A gap
-        // means a parameter the lowering minted was not located in the layout,
-        // so the whole answer is withheld as the shortfall it is.
         if names.iter().any(|slot| slot.is_empty()) {
-            return None;
+            return Ok(None);
         }
-        Some(names.into())
+        Ok(Some(names.into()))
     }
 
     fn resolve_matched_value(
@@ -2463,187 +3469,223 @@ impl<'a> TaintPolicyCompiler<'a> {
         }])
     }
 
+    /// Resolve one selected entry-point declaration row to its own procedure's
+    /// formal-parameter port (#2692).
+    ///
+    /// The row selects a *declaration*, not a call, so the procedure is found
+    /// by its declared source range: an exact range match wins, otherwise the
+    /// smallest declaration that fully encloses the selected node (a selector
+    /// may match the name or an annotated sub-node of the declaration). A
+    /// nested callable inside the selected declaration never encloses it, so
+    /// it cannot be chosen. The bound value is the formal at the procedure's
+    /// entry point before any local effect, exactly like a decorated-parameter
+    /// source, so ordinary local value-flow rules carry it into the body.
+    fn resolve_entry_point_parameter_values(
+        &mut self,
+        selection: SelectedSite,
+        parameter: &PolicyPort,
+    ) -> Result<Vec<ResolvedTaintValue>, TaintPolicyCompileError> {
+        let artifact = self
+            .selectors
+            .materialize_with_artifact_continuation(&selection.file)
+            .map_err(taint_selector_error)?;
+        let lookup = procedures_in_artifact(
+            &artifact,
+            self.selectors
+                .remaining_semantic_traversal_steps()
+                .map_err(taint_selector_error)?,
+            self.selectors.cancellation(),
+        );
+        match lookup.status {
+            ProcedureRangeLookupStatus::Complete => {}
+            ProcedureRangeLookupStatus::Cancelled => {
+                return Err(TaintPolicyCompileError::QueryIncomplete {
+                    completion: CodeQueryCompletion::Cancelled,
+                    detail: "entry-point declaration binding was cancelled".to_owned(),
+                });
+            }
+            ProcedureRangeLookupStatus::BudgetExhausted => {
+                return Err(query_budget_error(
+                    CodeQueryDiagnosticCode::SemanticBudgetExhausted,
+                    "entry-point declaration binding exhausted the shared traversal budget",
+                ));
+            }
+            ProcedureRangeLookupStatus::SourceChanged => {
+                return Err(TaintPolicyCompileError::SemanticUnavailable(
+                    "entry-point declaration binding observed a changed source snapshot".to_owned(),
+                ));
+            }
+        }
+        if !self
+            .selectors
+            .execution_budget()
+            .charge_traversal(lookup.examined)
+        {
+            return Err(query_budget_error(
+                CodeQueryDiagnosticCode::SemanticBudgetExhausted,
+                "entry-point declaration binding exhausted the shared traversal budget",
+            ));
+        }
+        let mut candidates = Vec::new();
+        for procedure in &lookup.handles {
+            let semantics = procedure.semantics();
+            let Some(mapping) = semantics.source_mapping(semantics.source()) else {
+                continue;
+            };
+            let span = mapping.locator.anchor().span();
+            let range = span.start_byte() as usize..span.end_byte() as usize;
+            let exact = range == selection.span;
+            let enclosing = range.start <= selection.span.start && range.end >= selection.span.end;
+            if exact || enclosing {
+                candidates.push((!exact, range.len(), range.start, procedure.clone()));
+            }
+        }
+        candidates.sort_by(|left, right| {
+            (left.0, left.1, left.2, left.3.semantics().locator()).cmp(&(
+                right.0,
+                right.1,
+                right.2,
+                right.3.semantics().locator(),
+            ))
+        });
+        let Some((inexact, length, _, procedure)) = candidates.first() else {
+            return Err(TaintPolicyCompileError::SemanticUnavailable(
+                "selected entry-point row does not identify a procedure declaration".to_owned(),
+            ));
+        };
+        let mut tied = candidates
+            .iter()
+            .filter(|candidate| (candidate.0, candidate.1) == (*inexact, *length))
+            .map(|candidate| candidate.3.durable_key())
+            .collect::<Vec<_>>();
+        tied.dedup();
+        if tied.len() > 1 {
+            return Err(TaintPolicyCompileError::AmbiguousSemanticSite(
+                "selected entry-point row names more than one procedure declaration".to_owned(),
+            ));
+        }
+        let ordinal = match parameter {
+            PolicyPort::ArgumentIndex { index } => *index,
+            PolicyPort::ArgumentName { name } => {
+                let Some(formals) = self.formal_ir_names(procedure)? else {
+                    return Err(TaintPolicyCompileError::SemanticUnavailable(
+                        "entry-point formal parameter names are unavailable for the selected declaration".to_owned(),
+                    ));
+                };
+                let matched = formals
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, slot)| parameter_names_match(slot, name))
+                    .map(|(ordinal, _)| ordinal)
+                    .collect::<Vec<_>>();
+                match matched.as_slice() {
+                    [ordinal] => u32::try_from(*ordinal)
+                        .expect("formal parameter ordinals fit the semantic port width"),
+                    [] => {
+                        return Err(TaintPolicyCompileError::Model(format!(
+                            "entry-point parameter `{name}` does not name a formal of the selected declaration; formals: {formals:?}"
+                        )));
+                    }
+                    _ => {
+                        return Err(TaintPolicyCompileError::AmbiguousSemanticSite(format!(
+                            "entry-point parameter `{name}` names more than one formal of the selected declaration"
+                        )));
+                    }
+                }
+            }
+            PolicyPort::MatchedValue
+            | PolicyPort::Receiver
+            | PolicyPort::ReturnValue
+            | PolicyPort::ResultIndex { .. }
+            | PolicyPort::FieldOf { .. } => {
+                unreachable!("entry-point parameter decoding admits only argument ports")
+            }
+        };
+        let port = ProcedurePortHandle::parameter(procedure.clone(), ordinal).map_err(|error| {
+            TaintPolicyCompileError::Model(format!(
+                "entry-point parameter {ordinal} has no matching procedure port on the selected declaration: {error}"
+            ))
+        })?;
+        let point = procedure
+            .point_handle(procedure.semantics().entry_point())
+            .expect("validated semantic procedure has its entry point");
+        Ok(vec![ResolvedTaintValue {
+            call: None,
+            point,
+            phase: ValueFlowObservationPhase::BeforeEffects,
+            carrier: ValueFlowCarrier::Port(port),
+            proof: selection.proof,
+            completeness: selection.completeness,
+        }])
+    }
+
     fn discover_value_flow(
         &mut self,
         root: &ProcedureHandle,
-        cache: &mut DiscoveryMaterializationCache,
+        modeled_calls: &HashSet<DurableCallSiteKey>,
+        cache: &DiscoveryMaterializationCache,
     ) -> Result<DiscoveredValueFlow, TaintPolicyCompileError> {
-        let oracle = self.selectors.workspace().semantic_oracle_provider();
-        let context = OracleCallContext::empty();
-        // Anchor the root, and below every procedure the walk reaches, to this
-        // compile's canonical instance of its artifact, so one discovery never
-        // mixes two materializations of one file (#2289).
-        let root = cache.canonical_procedure(root);
-        let mut pending = vec![root.clone()];
-        let mut seen: HashSet<DurableProcedureKey> = HashSet::new();
-        let mut seen_bindings = HashSet::new();
+        let workspace = self.selectors.workspace();
+        let cancellation = self.selectors.cancellation();
+        let provider = PolicyDiscoveryProvider {
+            oracle: workspace.semantic_oracle_provider(),
+            execution_budget: self.selectors.execution_budget().clone(),
+            cache,
+            poison: RefCell::new(None),
+        };
+        // Anchor the returned root to the same compile-wide artifact instance
+        // the provider uses for every procedure the shared walk touches.
+        let root = provider.canonical_procedure(root);
+        let misses_before = cache.procedure_misses.get();
+        let discovered = discover_closure_with(
+            &provider,
+            &root,
+            ClosureLimits {
+                max_procedures: usize::MAX,
+            },
+            self.selectors.semantic_budget_mut(),
+            cancellation,
+        );
+        let poisoned = provider.poisoned();
+        let newly_materialized = cache.procedure_misses.get().saturating_sub(misses_before);
+        self.selectors
+            .record_semantic_snapshot_materializations(newly_materialized);
+        if let Some(error) = poisoned {
+            return Err(error);
+        }
+        let discovered = discovered?;
+
         let mut seen_external_targets = HashSet::new();
         let mut seen_unmaterialized_targets = HashSet::new();
-        let mut snapshots = Vec::new();
-        let mut bindings = Vec::new();
         let mut external_targets = Vec::new();
         let mut unmaterialized_external_targets = Vec::new();
-        while let Some(procedure) = pending.pop() {
-            let procedure = cache.canonical_procedure(&procedure);
-            let procedure_key = procedure.durable_key();
-            if !seen.insert(procedure_key.clone()) {
-                continue;
+        for boundary in &discovered.boundaries {
+            if let Some(target) = boundary.exact_external_target()
+                && seen_external_targets.insert(target.clone())
+            {
+                external_targets.push(target.clone());
             }
-            // Reuse the cached snapshot when a prior root already materialized
-            // this procedure. The cache holds only present snapshots: the miss
-            // path returns a `SemanticUnavailable` error before it inserts, so a
-            // hit always carries a valid snapshot.
-            //
-            // The cache is deliberately not gated on the snapshot being
-            // complete (#2284). Most procedures at corpus scale are not
-            // complete -- an unlowered construct or an unresolved dispatch is
-            // ordinary -- and a cache that retained only complete answers would
-            // re-materialize and re-charge nearly everything for every root
-            // that reaches it. A non-complete snapshot is still a finished
-            // answer, and it is replayed with its typed status intact, so a
-            // cached `unsupported` stays `unsupported`.
-            let snapshot_input = if let Some(cached) = cache.procedures.get(&procedure_key) {
-                cache.procedure_hits = cache.procedure_hits.saturating_add(1);
-                cached.clone()
-            } else {
-                cache.procedure_misses = cache.procedure_misses.saturating_add(1);
-                self.selectors.record_semantic_snapshot_materialization();
-                let outcome = {
-                    let mut request = self.selectors.semantic_request();
-                    oracle
-                        .procedure_relations(&procedure, &context, &mut request)
-                        .map_err(|error| {
-                            TaintPolicyCompileError::SemanticProvider(error.to_string())
-                        })?
-                };
-                require_uninterrupted_outcome(&outcome, "taint value-flow discovery")?;
-                self.selectors
-                    .require_execution_budget("taint value-flow discovery")
-                    .map_err(taint_selector_error)?;
-                let status = SemanticInputStatus::from_outcome(&outcome);
-                let snapshot = outcome.available_value().cloned().ok_or_else(|| {
-                    TaintPolicyCompileError::SemanticUnavailable(
-                        "taint value-flow discovery returned no procedure snapshot".to_owned(),
-                    )
-                })?;
-                let input = ValueFlowInput::new(snapshot, status);
-                cache
-                    .procedures
-                    .insert(procedure_key.clone(), input.clone());
-                input
-            };
-            snapshots.push(snapshot_input);
-
-            // A nested callable's body belongs to its enclosing procedure's
-            // analysis region even when no call in the region resolves to it
-            // (#2640). The forward closure over calls alone cannot reach a
-            // lambda, closure, Ruby block, or anonymous class body: the
-            // invocation that runs it dispatches on an interface method, a
-            // higher-order library callee, or a runtime block, never on the
-            // nested procedure's own declaration, so the nested body entered no
-            // region and a sink inside it was co-located with no source. The
-            // whole compile then declined with "no analysis root contains both
-            // a selected source and sink".
-            //
-            // Lexical containment answers this structurally: it needs no
-            // dispatch resolution, it is available in every language that
-            // lowers nested callables, and the parent links are validated
-            // acyclic, so the closure still terminates. Widening the region is
-            // also the right half to change -- the containment test below is
-            // durable-key membership and stays exact.
-            for child in cache.lexical_children(&procedure) {
-                pending.push(child);
-            }
-
-            for call_row in procedure.semantics().call_sites() {
-                let call = procedure
-                    .call_site_handle(call_row.id)
-                    .expect("a live procedure owns each retained call site");
-                // Reuse the cached dispatch when a prior root already resolved
-                // this call site. The per-discovery boundary and candidate walk
-                // below still runs, because it feeds this root's own region.
-                let call_key = call.durable_key();
-                let (dispatch_value, dispatch_status) =
-                    if let Some(cached) = cache.dispatch.get(&call_key) {
-                        cached.clone()
-                    } else {
-                        let dispatch = {
-                            let mut request = self.selectors.semantic_request();
-                            oracle.resolve_call(&call, &mut request).map_err(|error| {
-                                TaintPolicyCompileError::SemanticProvider(error.to_string())
-                            })?
-                        };
-                        require_uninterrupted_outcome(&dispatch, "taint call dispatch")?;
-                        self.selectors
-                            .require_execution_budget("taint call dispatch")
-                            .map_err(taint_selector_error)?;
-                        let dispatch_status = SemanticInputStatus::from_outcome(&dispatch);
-                        let entry = (dispatch.available_value().cloned(), dispatch_status);
-                        cache.dispatch.insert(call_key.clone(), entry.clone());
-                        entry
-                    };
-                let Some(dispatch) = dispatch_value else {
-                    continue;
-                };
-                for boundary in dispatch.boundaries() {
-                    if let Some(target) = boundary.exact_external_target()
-                        && seen_external_targets.insert(target.clone())
-                    {
-                        external_targets.push(target.clone());
-                    }
-                    // #1978: a fully-qualified external callee that never
-                    // materializes carries its canonical identity here instead of
-                    // a materialized `exact_external_target`.
-                    if let Some(target) = boundary.unmaterialized_external_target()
-                        && seen_unmaterialized_targets.insert(target.clone())
-                    {
-                        unmaterialized_external_targets.push(target.clone());
-                    }
-                }
-                for candidate in dispatch.candidates() {
-                    let binding_key = (call_key.clone(), candidate.target().durable_key());
-                    if !seen_bindings.insert(binding_key.clone()) {
-                        continue;
-                    }
-                    // Reuse the cached binding when a prior root already bound
-                    // this (call, target) pair. The cache holds only present
-                    // bindings, so a hit reproduces both the pushed binding and
-                    // the pushed callee.
-                    let binding_input = if let Some(cached) = cache.bindings.get(&binding_key) {
-                        Some(cached.clone())
-                    } else {
-                        let outcome = {
-                            let mut request = self.selectors.semantic_request();
-                            oracle
-                                .call_bindings(&call, candidate, &context, &mut request)
-                                .map_err(|error| {
-                                    TaintPolicyCompileError::SemanticProvider(error.to_string())
-                                })?
-                        };
-                        require_uninterrupted_outcome(&outcome, "taint call binding")?;
-                        self.selectors
-                            .require_execution_budget("taint call binding")
-                            .map_err(taint_selector_error)?;
-                        let status =
-                            dispatch_status.merge(SemanticInputStatus::from_outcome(&outcome));
-                        outcome.available_value().cloned().map(|binding| {
-                            let input = ValueFlowInput::new(binding, status);
-                            cache.bindings.insert(binding_key.clone(), input.clone());
-                            input
-                        })
-                    };
-                    if let Some(binding_input) = binding_input {
-                        bindings.push(binding_input);
-                        pending.push(candidate.target().clone());
-                    }
-                }
+            if let Some(target) = boundary.unmaterialized_external_target()
+                && seen_unmaterialized_targets.insert(target.clone())
+            {
+                unmaterialized_external_targets.push(target.clone());
             }
         }
+        let procedures = discovered
+            .procedures
+            .iter()
+            .map(ProcedureHandle::durable_key)
+            .collect();
+        let bindings = discovered
+            .bindings
+            .into_iter()
+            .filter(|binding| !modeled_calls.contains(&binding.value().call().durable_key()))
+            .collect();
         Ok(DiscoveredValueFlow {
             root,
-            snapshots,
+            snapshots: discovered.snapshots,
             bindings,
-            procedures: seen,
+            procedures,
             external_targets,
             unmaterialized_external_targets,
         })
@@ -3095,6 +4137,274 @@ fn unmaterialized_flow_claims_agree(
         && left.effects == right.effects
 }
 
+/// Keep a store-fed run from reporting a complete verdict when its seed
+/// provenance is uncertain: an observation solve over a write region stayed
+/// incomplete, so a class may be missing from the seed and a clean read is
+/// not a proven negative.
+fn downgrade_for_uncertain_store_seed(payload: &mut TaintProjectionPayload) {
+    if !matches!(payload.completion, PolicyRunCompletion::Complete) {
+        return;
+    }
+    if let Ok(completion) =
+        PolicyRunCompletion::inconclusive(vec![PolicyIncompleteReason::PartialDiscovery])
+    {
+        payload.completion = completion;
+    }
+    if let Ok(diagnostic) = PolicyDiagnostic::try_new(
+        PolicyDiagnosticCode::EvaluationFailure,
+        PolicyDiagnosticSeverity::Warning,
+        PolicyDiagnosticImpact::RunIncomplete,
+        "a persistence-store observation solve stayed incomplete, so store-fed \
+         verdicts cannot be proven complete"
+            .to_owned(),
+        None,
+        Vec::new(),
+    ) {
+        payload.diagnostics.push(diagnostic);
+    }
+}
+
+/// The store-read seeds one fixpoint computed for a batch list, plus whether
+/// any observation solve stayed incomplete (in which case a class may be
+/// missing from a seed and no store-fed verdict may be reported complete).
+struct StoreSeeding {
+    /// Per batch: each seeded read's source id, the classes crossing the
+    /// boundary, and the policy source endpoints those classes came from.
+    seeds: Vec<Vec<StoreReadSeed>>,
+    uncertain: bool,
+}
+
+#[derive(Clone, PartialEq)]
+struct StoreReadSeed {
+    source: ValueFlowSourceId,
+    classes: TaintClassSet,
+    contributors: BTreeSet<ResolvedEndpointIdentity>,
+}
+
+impl StoreSeeding {
+    fn empty(batches: usize) -> Self {
+        Self {
+            seeds: vec![Vec::new(); batches],
+            uncertain: false,
+        }
+    }
+}
+
+/// Compute the classes each store read establishes by iterating observation
+/// solves to a fixpoint: solve every batch that declares store writes with
+/// its writes bound as observation sinks, union the classes observed at each
+/// write into its channel, seed every read whose channel a write's may alias,
+/// and repeat until no seed grows. Store names are policy-local, so a write
+/// and a read link only when their batches share a policy.
+///
+/// Termination: seed class sets grow monotonically inside finite universes,
+/// so the loop is bounded by the total class count.
+fn seed_store_channels(
+    batches: &[TaintBatch],
+    metadata: &HashMap<String, PreparedTaintPlan>,
+    workspace: &WorkspaceAnalyzer,
+    cancellation: &CancellationToken,
+    budget: &PolicyBudget,
+    execution_budget: &mut TaintExecutionBudget,
+    active_semantic_model_snapshot: Option<Arc<ActiveSemanticModelSnapshot>>,
+) -> Result<StoreSeeding, String> {
+    let mut seeding = StoreSeeding::empty(batches.len());
+    let has_writes = batches
+        .iter()
+        .any(|batch| !batch.analysis().store_writes().is_empty());
+    let has_reads = batches
+        .iter()
+        .any(|batch| !batch.analysis().store_reads().is_empty());
+    if !has_writes || !has_reads {
+        return Ok(seeding);
+    }
+    // A batch names its members by internal per-root plan id; the store
+    // linkage is policy-local, so map each back to its owning policy id.
+    let batch_policy_ids = batches
+        .iter()
+        .map(|batch| {
+            batch
+                .policy_ids()
+                .filter_map(|internal| metadata.get(internal).map(|plan| &plan.policy_id))
+                .collect::<HashSet<_>>()
+        })
+        .collect::<Vec<_>>();
+    let mut write_classes = batches
+        .iter()
+        .map(|batch| {
+            vec![batch.analysis().universe().empty_set(); batch.analysis().store_writes().len()]
+        })
+        .collect::<Vec<_>>();
+    let mut write_contributors = batches
+        .iter()
+        .map(|batch| {
+            vec![BTreeSet::<ResolvedEndpointIdentity>::new(); batch.analysis().store_writes().len()]
+        })
+        .collect::<Vec<_>>();
+    // Per batch, the compiled metadata's origin-event-to-endpoint rows, for
+    // attributing an observed write back to the policy sources that fed it.
+    let batch_origin_endpoints = batches
+        .iter()
+        .map(|batch| {
+            let mut rows: Vec<(&ValueFlowEventKey, &ResolvedEndpointIdentity)> = Vec::new();
+            for internal in batch.policy_ids() {
+                if let Some(plan) = metadata.get(internal) {
+                    for row in plan.sources.iter() {
+                        rows.push((&row.event, &row.endpoint));
+                    }
+                }
+            }
+            rows
+        })
+        .collect::<Vec<_>>();
+    // Origin evidence is what attributes an observed write back to its policy
+    // sources, and it is reconstructed from retained witnesses, so the
+    // observation solves retain witnesses under the same limits the
+    // projection path uses.
+    let value_flow_limits = budget.query_limits().value_flow;
+    let witness_retention = WitnessRetentionLimits::best_effort(
+        1,
+        value_flow_limits.max_retained_relations,
+        value_flow_limits.max_retained_bytes,
+    )
+    .map_err(|error| error.to_string())?;
+    let witness_limits = WitnessReconstructionLimits::new(
+        value_flow_limits
+            .max_witness_steps
+            .min(budget.max_witness_steps()),
+        value_flow_limits.max_witness_expansions,
+    )
+    .map_err(|error| error.to_string())?;
+    let collection_limits = TaintFindingCollectionLimits::new(
+        usize::MAX / 2,
+        usize::MAX / 2,
+        usize::MAX / 2,
+        usize::MAX / 2,
+        usize::MAX / 2,
+    )
+    .map_err(|error| error.to_string())?;
+    let class_bound: usize = batches
+        .iter()
+        .map(|batch| batch.analysis().universe().classes().len())
+        .sum();
+    for iteration in 0.. {
+        assert!(
+            iteration <= class_bound.saturating_add(2),
+            "store seeding must reach its fixpoint within the class bound"
+        );
+        let mut changed = false;
+        for (index, batch) in batches.iter().enumerate() {
+            if batch.analysis().store_writes().is_empty() {
+                continue;
+            }
+            let seeds = seeding.seeds[index]
+                .iter()
+                .map(|seed| (seed.source, seed.classes.clone()))
+                .collect::<Vec<_>>();
+            let observation = batch
+                .analysis()
+                .with_seeded_store_reads(&seeds)
+                .and_then(|analysis| analysis.with_store_write_observations())
+                .map_err(|error| error.to_string())?;
+            execution_budget.reset_per_batch_solve_budget(budget);
+            let mut request = DataflowRequest::new(&mut execution_budget.solver, cancellation);
+            let provider = WorkspaceIcfgProvider::with_active_semantic_model_snapshot(
+                workspace,
+                active_semantic_model_snapshot.clone(),
+            );
+            let result = brokk_bifrost_flow::taint::solve_taint_batch_with_witnesses(
+                observation.value_flow().root(),
+                &provider,
+                &observation,
+                witness_retention,
+                &mut execution_budget.semantic,
+                &mut request,
+            )
+            .map_err(|error| error.to_string())?;
+            if !result.is_complete() {
+                seeding.uncertain = true;
+            }
+            let report = collect_taint_findings_with_limits(
+                &observation,
+                result,
+                64,
+                witness_limits,
+                collection_limits,
+            )
+            .map_err(|error| error.to_string())?;
+            for finding in report.findings() {
+                let Some(write_index) = batch.analysis().store_writes().iter().position(|write| {
+                    batch
+                        .analysis()
+                        .value_flow()
+                        .sink(write.sink())
+                        .is_some_and(|spec| spec.key() == finding.key().sink())
+                }) else {
+                    continue;
+                };
+                let merged = write_classes[index][write_index].union(finding.classes());
+                if merged != write_classes[index][write_index] {
+                    write_classes[index][write_index] = merged;
+                    changed = true;
+                }
+                for origin in finding.origins().evidence() {
+                    let key = origin.origin().value_flow_key();
+                    for (event, endpoint) in &batch_origin_endpoints[index] {
+                        if *event == key
+                            && write_contributors[index][write_index].insert((*endpoint).clone())
+                        {
+                            changed = true;
+                        }
+                    }
+                }
+            }
+        }
+        for (read_index, read_batch) in batches.iter().enumerate() {
+            let mut next = Vec::new();
+            for read in read_batch.analysis().store_reads() {
+                let mut classes = read_batch.analysis().universe().empty_set();
+                let mut contributors = BTreeSet::new();
+                for (write_index, write_batch) in batches.iter().enumerate() {
+                    if batch_policy_ids[read_index].is_disjoint(&batch_policy_ids[write_index]) {
+                        continue;
+                    }
+                    for (position, write) in
+                        write_batch.analysis().store_writes().iter().enumerate()
+                    {
+                        if !write.channel().may_alias(read.channel()) {
+                            continue;
+                        }
+                        assert_eq!(
+                            write_batch.analysis().universe().hash(),
+                            read_batch.analysis().universe().hash(),
+                            "batches of one policy share one taint universe"
+                        );
+                        classes = classes.union(&write_classes[write_index][position]);
+                        contributors
+                            .extend(write_contributors[write_index][position].iter().cloned());
+                    }
+                }
+                if !classes.is_empty() {
+                    next.push(StoreReadSeed {
+                        source: read.source(),
+                        classes,
+                        contributors,
+                    });
+                }
+            }
+            next.sort_by_key(|seed| seed.source);
+            if next != seeding.seeds[read_index] {
+                seeding.seeds[read_index] = next;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    Ok(seeding)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn solve_and_project_batch(
     batch: &TaintBatch,
@@ -3131,6 +4441,14 @@ fn solve_and_project_batch(
         workspace,
         active_semantic_model_snapshot,
     );
+    // The ICFG provider this solve drives records its own artifact and
+    // dispatch reads, but the solve also consumes the prepared value-flow
+    // analysis and the taint summary repository, and neither funnel holds an
+    // analyzer or names a key. Saying so is the contract: the ledger's
+    // unattributed count is what makes a taint unit `Unbounded` instead of
+    // letting it look complete with inputs nobody named. This is why the plan
+    // keeps taint and flow at `whole_policy_family`.
+    workspace.analyzer().record_unattributed_read();
     let propagation_started = Instant::now();
     let result = brokk_bifrost_flow::taint::solve_taint_batch_with_witnesses(
         batch.analysis().value_flow().root(),
@@ -3728,54 +5046,65 @@ fn project_policy_findings(
         let mut groups = Vec::<ProjectedSourceGroup<'_>>::new();
         for finding in &sink_findings {
             for origin in finding.origins().evidence() {
-                let Some(compiled_source) = plan
+                // A policy source's event has exactly one metadata row. A
+                // store-read origin keeps one row per contributing policy
+                // source (the seeding fixpoint narrowed the compiled rows to
+                // real provenance), and one origin row attributes to exactly
+                // one source: the projection authority rejects one scenario
+                // identity claimed by two endpoints, so the first source
+                // whose labels the observed classes satisfy claims the row.
+                for compiled_source in plan
                     .sources
                     .iter()
-                    .find(|source| &source.event == origin.origin().value_flow_key())
-                else {
-                    continue;
-                };
-                let source = spec
-                    .sources
-                    .iter()
-                    .find(|source| source.identity == compiled_source.endpoint)
-                    .ok_or_else(|| {
-                        "compiled taint source is absent from the loaded policy".to_owned()
-                    })?;
-                let labels = stable_taint_labels(universe, origin)?
-                    .into_iter()
-                    .filter(|label| {
-                        compiled_source.labels.contains(label)
-                            && source.definition.labels.contains(label)
-                            && sink.definition.accepts.contains(label)
-                    })
-                    .collect::<Vec<_>>();
-                if labels.is_empty() {
-                    continue;
-                }
-                match groups
-                    .iter_mut()
-                    .find(|group| group.source.identity == source.identity)
+                    .filter(|source| &source.event == origin.origin().value_flow_key())
                 {
-                    Some(group) => {
-                        // Retain every fact-local evidence row. Rows for the
-                        // same source occurrence can carry distinct bounded
-                        // witnesses or contributing class subsets; later
-                        // projection deduplicates only the public origin row.
-                        group.origins.push(origin);
-                        if !group.findings.contains(finding) {
-                            group.findings.push(finding);
-                        }
-                        group.labels.extend(labels);
-                        group.labels.sort();
-                        group.labels.dedup();
+                    // A finding's origin endpoint is either a declared source
+                    // or a declared entry point; both resolve as source-shaped
+                    // endpoints (#2692).
+                    let source = spec
+                        .sources
+                        .iter()
+                        .chain(spec.entry_points.iter())
+                        .find(|source| source.identity == compiled_source.endpoint)
+                        .ok_or_else(|| {
+                            "compiled taint source is absent from the loaded policy".to_owned()
+                        })?;
+                    let labels = stable_taint_labels(universe, origin)?
+                        .into_iter()
+                        .filter(|label| {
+                            compiled_source.labels.contains(label)
+                                && source.definition.labels.contains(label)
+                                && sink.definition.accepts.contains(label)
+                        })
+                        .collect::<Vec<_>>();
+                    if labels.is_empty() {
+                        continue;
                     }
-                    None => groups.push(ProjectedSourceGroup {
-                        source,
-                        origins: vec![origin],
-                        findings: vec![finding],
-                        labels,
-                    }),
+                    match groups
+                        .iter_mut()
+                        .find(|group| group.source.identity == source.identity)
+                    {
+                        Some(group) => {
+                            // Retain every fact-local evidence row. Rows for the
+                            // same source occurrence can carry distinct bounded
+                            // witnesses or contributing class subsets; later
+                            // projection deduplicates only the public origin row.
+                            group.origins.push(origin);
+                            if !group.findings.contains(finding) {
+                                group.findings.push(finding);
+                            }
+                            group.labels.extend(labels);
+                            group.labels.sort();
+                            group.labels.dedup();
+                        }
+                        None => groups.push(ProjectedSourceGroup {
+                            source,
+                            origins: vec![origin],
+                            findings: vec![finding],
+                            labels,
+                        }),
+                    }
+                    break;
                 }
             }
         }
@@ -4606,6 +5935,11 @@ fn select_value(
         PolicyPort::ArgumentName { .. } => {
             unreachable!("formal-name ports resolve to an ordinal before carrier selection")
         }
+        PolicyPort::FieldOf { .. } => {
+            return Err(TaintPolicyCompileError::UnsupportedBinding(
+                "field ports are only valid as external-model transfer destinations".to_owned(),
+            ));
+        }
     };
     let point_id = if matches!(
         binding,
@@ -4689,54 +6023,480 @@ fn sort_bound_sanitizers(sanitizers: &mut [BoundSanitizer]) {
     });
 }
 
-fn source_event_specs(
+/// Sort bound external models by call identity, then by declaring entry, so
+/// per-call grouping and every derived hash input is deterministic.
+fn sort_bound_external_models(models: &mut [BoundExternalModel]) {
+    models.sort_by(|left, right| {
+        left.call
+            .procedure()
+            .semantics()
+            .locator()
+            .cmp(right.call.procedure().semantics().locator())
+            .then_with(|| left.call.id().cmp(&right.call.id()))
+            .then_with(|| left.entry.cmp(&right.entry))
+    });
+}
+
+/// Refuse the external-model shapes this compiler does not lower, before any
+/// selector runs, so an unsupported declaration is a loud typed failure and
+/// never a silently inert stanza (#2691).
+///
+/// Transform effects (label rewriting) are the propagator contract of #2689
+/// and stay refused wholesale alongside `:transforms`.
+fn validate_external_model_entries(
+    models: &[ResolvedTaintAuxiliary<ResolvedTaintExternalModelDefinition>],
+) -> Result<(), TaintPolicyCompileError> {
+    for model in models {
+        for transfer in &model.definition.transfers {
+            if matches!(transfer.effect, TaintTransferEffect::Transform { .. }) {
+                return Err(TaintPolicyCompileError::UnsupportedAuxiliarySemantics(
+                    "external-model transform-effect",
+                ));
+            }
+            match &transfer.from {
+                PolicyPort::ArgumentIndex { .. }
+                | PolicyPort::ArgumentName { .. }
+                | PolicyPort::Receiver => {}
+                PolicyPort::ReturnValue
+                | PolicyPort::ResultIndex { .. }
+                | PolicyPort::MatchedValue
+                | PolicyPort::FieldOf { .. } => {
+                    return Err(TaintPolicyCompileError::UnsupportedBinding(
+                        "external-model transfer :from must be a call input port (argument or receiver)"
+                            .to_owned(),
+                    ));
+                }
+            }
+            if matches!(transfer.to, PolicyPort::MatchedValue) {
+                return Err(TaintPolicyCompileError::UnsupportedBinding(
+                    "external-model transfer ports must be call ports".to_owned(),
+                ));
+            }
+            if let PolicyPort::FieldOf { base, .. } = &transfer.to
+                && !matches!(
+                    base.as_ref(),
+                    PolicyPort::Receiver
+                        | PolicyPort::ArgumentIndex { .. }
+                        | PolicyPort::ArgumentName { .. }
+                )
+            {
+                return Err(TaintPolicyCompileError::UnsupportedBinding(
+                    "a field base must be an argument or the receiver".to_owned(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The curated-model identity string for one declaring entry. Deterministic
+/// and collision-free across local and catalog entries because each arm keeps
+/// its own prefix and the component identifiers are validated identifiers.
+fn external_model_entry_name(identity: &ResolvedEndpointIdentity) -> String {
+    match identity {
+        ResolvedEndpointIdentity::Local {
+            policy_id,
+            entry_id,
+        } => format!("policy:{}/{}", policy_id.as_str(), entry_id.as_str()),
+        ResolvedEndpointIdentity::Catalog { catalog, entry_id } => format!(
+            "catalog:{}@{}/{}",
+            catalog.name.as_str(),
+            catalog.version,
+            entry_id.as_str()
+        ),
+        ResolvedEndpointIdentity::MatchEndpoint { endpoint_id } => {
+            format!("match:{}", endpoint_id.as_str())
+        }
+    }
+}
+
+/// Resolve one field destination against the finished plan's closed carrier
+/// set. `Bind` is exactly one observable location, `Unobservable` means no
+/// carrier in the solve names the field on the written object (the write is
+/// a complete no-op), and `Ambiguous` (several matching carriers) leaves the
+/// heap port unbound so the run degrades instead of guessing.
+enum FieldDestinationResolution {
+    Bind(ValueFlowCarrier),
+    Unobservable,
+    Ambiguous,
+}
+
+impl<'a> TaintPolicyCompiler<'a> {
+    /// Install one curated call model per modeled call site (#2691).
+    ///
+    /// Several entries selecting one call merge into one model: per port pair
+    /// the moved label set is the union of every declaration that moves the
+    /// label and does not remove it, and the model removes everything else in
+    /// the universe at that seam, so a transfer only ever carries its declared
+    /// labels and an explicit `(sanitize :removes ...)` no-flow declaration
+    /// carries none. The whole group's selection quality conjoins into every
+    /// transfer's evidence, so an unproven or partial selection keeps the run
+    /// from completing while the declared semantics still apply.
+    fn install_bound_external_models(
+        &mut self,
+        plan: ValueFlowPlan,
+        models: &[BoundExternalModel],
+        universe: &TaintUniverse,
+    ) -> Result<ValueFlowPlan, TaintPolicyCompileError> {
+        if models.is_empty() {
+            return Ok(plan);
+        }
+        let plan_error =
+            |error: &dyn fmt::Display| TaintPolicyCompileError::Plan(error.to_string());
+        // `models` is sorted by call identity, so equal calls are adjacent.
+        let mut grouped: Vec<(CallSiteHandle, Vec<&BoundExternalModel>)> = Vec::new();
+        for model in models {
+            match grouped.last_mut() {
+                Some((call, group)) if call.durable_key() == model.call.durable_key() => {
+                    group.push(model);
+                }
+                _ => grouped.push((model.call.clone(), vec![model])),
+            }
+        }
+        let mut curated = Vec::with_capacity(grouped.len());
+        let mut location_bindings = Vec::new();
+        for (call, group) in grouped {
+            let mut proof = ProofStatus::Proven;
+            let mut completeness = EvidenceCompleteness::Complete;
+            let mut names = Vec::with_capacity(group.len());
+            // Per port pair: the union of moved labels across the group's
+            // declarations plus the field destination identity. A label moves
+            // when at least one declaration lists it and does not remove it at
+            // this seam.
+            type Seam<'model> = (BTreeSet<&'model str>, Option<&'model ModelFieldDestination>);
+            let mut moved: BTreeMap<(SummaryPort, SummaryPort), Seam<'_>> = BTreeMap::new();
+            for model in &group {
+                proof = conjoin_proof(&proof, &model.proof);
+                completeness = conjoin_completeness(&completeness, &model.completeness);
+                names.push(external_model_entry_name(&model.entry));
+                for transfer in &model.transfers {
+                    let seam = moved
+                        .entry((transfer.from.clone(), transfer.to.clone()))
+                        .or_default();
+                    for label in &transfer.labels {
+                        if !transfer.removes.contains(label) {
+                            seam.0.insert(label.as_str());
+                        }
+                    }
+                    if seam.1.is_none() {
+                        seam.1 = transfer.field.as_ref();
+                    }
+                }
+            }
+            names.sort_unstable();
+            names.dedup();
+            // Decide every field destination against the plan's closed
+            // carrier set before the model is built, so an unobservable write
+            // drops out of the model entirely and the rest stays complete.
+            let mut dropped_ports = Vec::new();
+            for ((_, to), (_, field)) in &moved {
+                let Some(field) = field else { continue };
+                match self.resolve_field_destination(&plan, &call, field)? {
+                    FieldDestinationResolution::Bind(carrier) => {
+                        location_bindings.push(ValueFlowSummaryLocationBinding::new(
+                            call.clone(),
+                            to.clone(),
+                            carrier,
+                        ));
+                    }
+                    FieldDestinationResolution::Unobservable => dropped_ports.push(to.clone()),
+                    FieldDestinationResolution::Ambiguous => {}
+                }
+            }
+            moved.retain(|(_, to), _| !dropped_ports.contains(to));
+            let evidence = SummaryEvidence::from_semantic(&proof, &completeness)
+                .map_err(|e| plan_error(&e))?;
+            let mut content = Vec::new();
+            content.extend_from_slice(b"bifrost-policy-external-model/v1\0");
+            for name in &names {
+                content.extend_from_slice(name.as_bytes());
+                content.push(0);
+            }
+            let mut transfers = Vec::with_capacity(moved.len());
+            let mut effects = Vec::with_capacity(moved.len());
+            for ((from, to), (seam, _)) in &moved {
+                content.extend_from_slice(format!("{from:?}->{to:?}:").as_bytes());
+                for label in seam.iter() {
+                    content.extend_from_slice(label.as_bytes());
+                    content.push(0);
+                }
+                content.push(b'\n');
+                transfers.push(
+                    SummaryTransfer::try_new(
+                        from.clone(),
+                        SummaryExit::try_new(SummaryExitKind::Normal, to.clone())
+                            .map_err(|e| plan_error(&e))?,
+                        evidence.clone(),
+                    )
+                    .map_err(|e| plan_error(&e))?,
+                );
+                let removed = universe
+                    .classes()
+                    .iter()
+                    .map(|class| class.as_str())
+                    .filter(|class| !seam.contains(class))
+                    .collect::<Vec<_>>();
+                if !removed.is_empty() {
+                    effects.push(SummaryEffect::new(
+                        SummaryEffectKey::sanitize(from.clone(), to.clone(), removed),
+                        evidence.clone(),
+                    ));
+                }
+            }
+            match &proof {
+                ProofStatus::Proven => content.extend_from_slice(b"proven\0"),
+                ProofStatus::Unproven(reason) => {
+                    content.extend_from_slice(b"unproven:");
+                    content.extend_from_slice(reason.as_bytes());
+                    content.push(0);
+                }
+            }
+            match &completeness {
+                EvidenceCompleteness::Complete => content.extend_from_slice(b"complete\0"),
+                EvidenceCompleteness::Partial(reason) => {
+                    content.extend_from_slice(b"partial:");
+                    content.extend_from_slice(reason.as_bytes());
+                    content.push(0);
+                }
+            }
+            let model = CuratedCallModel::try_new_with_effects(
+                ExternalSummaryModelId::new(names.join("+")).map_err(|e| plan_error(&e))?,
+                ExternalSummaryContentHash::hash_bytes(&content),
+                transfers,
+                effects,
+            )
+            .map_err(|e| plan_error(&e))?;
+            curated.push(ValueFlowCuratedCallModel::new(call, model));
+        }
+        let plan = plan
+            .with_curated_call_models(curated)
+            .map_err(|error| TaintPolicyCompileError::Plan(error.to_string()))?;
+        if location_bindings.is_empty() {
+            return Ok(plan);
+        }
+        plan.with_summary_location_bindings(location_bindings)
+            .map_err(|error| TaintPolicyCompileError::Plan(error.to_string()))
+    }
+
+    /// Match one declared field destination against every location carrier
+    /// the plan retained: the last access selector must be a field whose
+    /// declared name matches, and the path root must be one of the caller
+    /// values the written object is known as at the modeled call.
+    fn resolve_field_destination(
+        &mut self,
+        plan: &ValueFlowPlan,
+        call: &CallSiteHandle,
+        field: &ModelFieldDestination,
+    ) -> Result<FieldDestinationResolution, TaintPolicyCompileError> {
+        let procedure_key = call.procedure().durable_key();
+        let mut matched: Vec<&ValueFlowCarrier> = Vec::new();
+        for carrier in plan.carriers() {
+            let ValueFlowCarrier::Location(location) = carrier else {
+                continue;
+            };
+            let path = location.path();
+            let Some(brokk_bifrost_analysis::analyzer::semantic::AccessSelector::Field(member)) =
+                path.selectors().last()
+            else {
+                continue;
+            };
+            let brokk_bifrost_analysis::analyzer::semantic::AccessPathRoot::Value(root) =
+                path.root()
+            else {
+                continue;
+            };
+            if root.procedure().durable_key() != procedure_key
+                || !field.base_values.contains(&root.id())
+            {
+                continue;
+            }
+            if self.field_member_name(member).as_deref() != Some(field.name.as_str()) {
+                continue;
+            }
+            if !matched.contains(&carrier) {
+                matched.push(carrier);
+            }
+        }
+        Ok(match matched.as_slice() {
+            [] => FieldDestinationResolution::Unobservable,
+            [carrier] => FieldDestinationResolution::Bind((*carrier).clone()),
+            _ => FieldDestinationResolution::Ambiguous,
+        })
+    }
+}
+
+/// The one curated call model every store-selected call receives: no direct
+/// transfers, so the call's whole value behavior is the declared boundary.
+fn store_boundary_call_model()
+-> Result<brokk_bifrost_flow::dataflow::CuratedCallModel, TaintPolicyCompileError> {
+    let model =
+        brokk_bifrost_flow::dataflow::ExternalSummaryModelId::new("bifrost.policy.store-boundary")
+            .map_err(|error| TaintPolicyCompileError::Plan(error.to_string()))?;
+    brokk_bifrost_flow::dataflow::CuratedCallModel::try_new(
+        model,
+        brokk_bifrost_flow::dataflow::ExternalSummaryContentHash::hash_bytes(
+            b"bifrost.policy.store-boundary.empty-transfers.v1",
+        ),
+        Vec::new(),
+    )
+    .map_err(|error| TaintPolicyCompileError::Plan(error.to_string()))
+}
+
+/// The proven identity of a plain string-literal key token, or the join.
+///
+/// The token must be one quote-delimited literal whose content carries no
+/// escape and no embedded quote; the content bytes are then the identity, so
+/// `'k'` and `"k"` agree while `"a"` and `"b"` separate. Any other spelling
+/// (an escape, a prefix, a template, a non-string constant) stays unproven:
+/// separating on it could split two spellings of one runtime value, which
+/// would be unsound, while joining only costs precision.
+fn string_literal_key_identity(token: &str) -> TaintStoreDimension {
+    let bytes = token.as_bytes();
+    if bytes.len() >= 2 {
+        let quote = bytes[0];
+        if (quote == b'"' || quote == b'\'') && bytes[bytes.len() - 1] == quote {
+            let content = &bytes[1..bytes.len() - 1];
+            if !content.contains(&b'\\') && !content.contains(&quote) {
+                let mut digest = LengthDelimitedDigest::new(b"bifrost.taint.store-key.string.v1");
+                digest.push(content);
+                return TaintStoreDimension::Proven(digest.finish());
+            }
+        }
+    }
+    TaintStoreDimension::Unproven
+}
+
+fn sort_bound_store_ends(ends: &mut [BoundStoreEnd]) {
+    ends.sort_by(|left, right| {
+        left.endpoint
+            .point
+            .procedure()
+            .semantics()
+            .locator()
+            .cmp(right.endpoint.point.procedure().semantics().locator())
+            .then_with(|| left.endpoint.point.id().cmp(&right.endpoint.point.id()))
+            .then_with(|| left.endpoint.endpoint.cmp(&right.endpoint.endpoint))
+            .then_with(|| left.channel.cmp(&right.channel))
+    });
+}
+
+/// Hash the persistence-store semantics one region compiled, keyed on event
+/// keys rather than dense IDs, mirroring `sanitizer_compatibility_hash`: two
+/// policies may share a propagation solve only when their store models agree,
+/// because a seeded store read changes the classes the solve establishes.
+fn store_compatibility_hash(
+    value_flow: &ValueFlowPlan,
+    writes: &[TaintStoreWriteBinding],
+    reads: &[TaintStoreReadBinding],
+) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    hasher.write_usize(writes.len());
+    for write in writes {
+        if let Some(spec) = value_flow.sink(write.sink()) {
+            std::hash::Hash::hash(spec.key(), &mut hasher);
+        }
+        std::hash::Hash::hash(write.channel(), &mut hasher);
+        hasher.write_u8(u8::from(write.is_complete()));
+    }
+    hasher.write_usize(reads.len());
+    for read in reads {
+        if let Some(spec) = value_flow.source(read.source()) {
+            std::hash::Hash::hash(spec.key(), &mut hasher);
+        }
+        std::hash::Hash::hash(read.channel(), &mut hasher);
+        hasher.write_u8(u8::from(read.is_complete()));
+    }
+    hasher.finish()
+}
+
+/// Mint the value-flow source specs for a bound endpoint list, keeping each
+/// endpoint's minted event key beside its spec. Ordinals start at `offset` so
+/// the policy endpoints and the store ends they share a plan with never
+/// collide on one `(point, ordinal, kind)` key.
+fn keyed_source_event_specs(
     endpoints: &[BoundEndpoint],
-) -> Result<Vec<ValueFlowSourceSpec>, TaintPolicyCompileError> {
+    offset: usize,
+) -> Result<Vec<(ValueFlowEventKey, ValueFlowSourceSpec)>, TaintPolicyCompileError> {
     endpoints
         .iter()
         .enumerate()
         .map(|(index, endpoint)| {
-            let ordinal = u32::try_from(index).map_err(|_| {
+            let ordinal = u32::try_from(offset + index).map_err(|_| {
                 TaintPolicyCompileError::Plan("taint source ordinal overflow".to_owned())
             })?;
             let key =
                 ValueFlowEventKey::at_point(&endpoint.point, ordinal, ValueFlowEventKind::Source)
                     .map_err(|error| TaintPolicyCompileError::Plan(error.to_string()))?;
-            Ok(ValueFlowSourceSpec::new(
-                key,
-                endpoint.point.clone(),
-                endpoint.phase,
-                endpoint.carrier.clone(),
-                endpoint.proof.clone(),
-                endpoint.completeness.clone(),
+            Ok((
+                key.clone(),
+                ValueFlowSourceSpec::new(
+                    key,
+                    endpoint.point.clone(),
+                    endpoint.phase,
+                    endpoint.carrier.clone(),
+                    endpoint.proof.clone(),
+                    endpoint.completeness.clone(),
+                ),
             ))
         })
         .collect()
 }
 
-fn sink_event_specs(
+fn keyed_sink_event_specs(
     endpoints: &[BoundEndpoint],
-) -> Result<Vec<ValueFlowSinkSpec>, TaintPolicyCompileError> {
+    offset: usize,
+) -> Result<Vec<(ValueFlowEventKey, ValueFlowSinkSpec)>, TaintPolicyCompileError> {
     endpoints
         .iter()
         .enumerate()
         .map(|(index, endpoint)| {
-            let ordinal = u32::try_from(index).map_err(|_| {
+            let ordinal = u32::try_from(offset + index).map_err(|_| {
                 TaintPolicyCompileError::Plan("taint sink ordinal overflow".to_owned())
             })?;
             let key =
                 ValueFlowEventKey::at_point(&endpoint.point, ordinal, ValueFlowEventKind::Sink)
                     .map_err(|error| TaintPolicyCompileError::Plan(error.to_string()))?;
-            Ok(ValueFlowSinkSpec::new(
-                key,
-                endpoint.point.clone(),
-                endpoint.phase,
-                endpoint.carrier.clone(),
-                endpoint.proof.clone(),
-                endpoint.completeness.clone(),
+            Ok((
+                key.clone(),
+                ValueFlowSinkSpec::new(
+                    key,
+                    endpoint.point.clone(),
+                    endpoint.phase,
+                    endpoint.carrier.clone(),
+                    endpoint.proof.clone(),
+                    endpoint.completeness.clone(),
+                ),
             ))
         })
         .collect()
+}
+
+fn source_id_for_event(
+    value_flow: &ValueFlowPlan,
+    key: &ValueFlowEventKey,
+) -> Result<ValueFlowSourceId, TaintPolicyCompileError> {
+    value_flow
+        .sources()
+        .find_map(|(id, spec)| (spec.key() == key).then_some(id))
+        .ok_or_else(|| {
+            TaintPolicyCompileError::Plan(
+                "compiled taint source event is absent from the value-flow plan".to_owned(),
+            )
+        })
+}
+
+fn sink_id_for_event(
+    value_flow: &ValueFlowPlan,
+    key: &ValueFlowEventKey,
+) -> Result<ValueFlowSinkId, TaintPolicyCompileError> {
+    value_flow
+        .sinks()
+        .find_map(|(id, spec)| (spec.key() == key).then_some(id))
+        .ok_or_else(|| {
+            TaintPolicyCompileError::Plan(
+                "compiled taint sink event is absent from the value-flow plan".to_owned(),
+            )
+        })
 }
 
 fn class_set(
@@ -4759,20 +6519,21 @@ fn bind_taint_sources(
     value_flow: &ValueFlowPlan,
     universe: &TaintUniverse,
     endpoints: &[BoundEndpoint],
+    specs: &[(ValueFlowEventKey, ValueFlowSourceSpec)],
 ) -> Result<Vec<TaintSourceBinding>, TaintPolicyCompileError> {
-    if value_flow.sources().len() != endpoints.len() {
-        return Err(TaintPolicyCompileError::Plan(
-            "compiled taint source metadata does not match the value-flow plan".to_owned(),
-        ));
-    }
-    value_flow
-        .sources()
-        .zip(endpoints)
-        .map(|((id, spec), endpoint)| {
+    assert_eq!(
+        endpoints.len(),
+        specs.len(),
+        "every bound source endpoint minted exactly one event spec"
+    );
+    endpoints
+        .iter()
+        .zip(specs)
+        .map(|(endpoint, (key, _))| {
             Ok(TaintSourceBinding::new(
-                id,
+                source_id_for_event(value_flow, key)?,
                 class_set(universe, &endpoint.labels)?,
-                SourceEventKey::new(spec.key().clone()),
+                SourceEventKey::new(key.clone()),
             ))
         })
         .collect()
@@ -4782,19 +6543,72 @@ fn bind_taint_sinks(
     value_flow: &ValueFlowPlan,
     universe: &TaintUniverse,
     endpoints: &[BoundEndpoint],
+    specs: &[(ValueFlowEventKey, ValueFlowSinkSpec)],
 ) -> Result<Vec<TaintSinkBinding>, TaintPolicyCompileError> {
-    if value_flow.sinks().len() != endpoints.len() {
-        return Err(TaintPolicyCompileError::Plan(
-            "compiled taint sink metadata does not match the value-flow plan".to_owned(),
-        ));
-    }
-    value_flow
-        .sinks()
-        .zip(endpoints)
-        .map(|((id, _), endpoint)| {
+    assert_eq!(
+        endpoints.len(),
+        specs.len(),
+        "every bound sink endpoint minted exactly one event spec"
+    );
+    endpoints
+        .iter()
+        .zip(specs)
+        .map(|(endpoint, (key, _))| {
             Ok(TaintSinkBinding::new(
-                id,
+                sink_id_for_event(value_flow, key)?,
                 class_set(universe, &endpoint.labels)?,
+            ))
+        })
+        .collect()
+}
+
+/// Lower the region's bound store ends into plan bindings by their minted
+/// event keys. Completeness follows the carrier resolution: a partially
+/// evidenced end still flows (the join direction) but blocks a complete
+/// verdict downstream.
+fn bind_store_writes(
+    value_flow: &ValueFlowPlan,
+    ends: &[BoundStoreEnd],
+    specs: &[(ValueFlowEventKey, ValueFlowSinkSpec)],
+) -> Result<Vec<TaintStoreWriteBinding>, TaintPolicyCompileError> {
+    assert_eq!(
+        ends.len(),
+        specs.len(),
+        "every bound store write minted exactly one event spec"
+    );
+    ends.iter()
+        .zip(specs)
+        .map(|(end, (key, _))| {
+            let complete = matches!(end.endpoint.proof, ProofStatus::Proven)
+                && matches!(end.endpoint.completeness, EvidenceCompleteness::Complete);
+            Ok(TaintStoreWriteBinding::new(
+                sink_id_for_event(value_flow, key)?,
+                end.channel.clone(),
+                complete,
+            ))
+        })
+        .collect()
+}
+
+fn bind_store_reads(
+    value_flow: &ValueFlowPlan,
+    ends: &[BoundStoreEnd],
+    specs: &[(ValueFlowEventKey, ValueFlowSourceSpec)],
+) -> Result<Vec<TaintStoreReadBinding>, TaintPolicyCompileError> {
+    assert_eq!(
+        ends.len(),
+        specs.len(),
+        "every bound store read minted exactly one event spec"
+    );
+    ends.iter()
+        .zip(specs)
+        .map(|(end, (key, _))| {
+            let complete = matches!(end.endpoint.proof, ProofStatus::Proven)
+                && matches!(end.endpoint.completeness, EvidenceCompleteness::Complete);
+            Ok(TaintStoreReadBinding::new(
+                source_id_for_event(value_flow, key)?,
+                end.channel.clone(),
+                complete,
             ))
         })
         .collect()
@@ -4909,38 +6723,22 @@ fn sanitizer_compatibility_hash(
     hasher.finish()
 }
 
-fn value_flow_sources(
-    plan: &TaintPolicyPlan,
+fn endpoint_metadata<Spec>(
     endpoints: &[BoundEndpoint],
-) -> Result<Vec<CompiledTaintEndpoint>, TaintPolicyCompileError> {
-    plan.analysis()
-        .value_flow()
-        .sources()
-        .zip(endpoints)
-        .map(|((_id, spec), endpoint)| {
-            Ok(CompiledTaintEndpoint {
-                endpoint: endpoint.endpoint.clone(),
-                event: spec.key().clone(),
-                labels: endpoint.labels.clone(),
-            })
-        })
-        .collect()
-}
-
-fn value_flow_sinks(
-    plan: &TaintPolicyPlan,
-    endpoints: &[BoundEndpoint],
-) -> Result<Vec<CompiledTaintEndpoint>, TaintPolicyCompileError> {
-    plan.analysis()
-        .value_flow()
-        .sinks()
-        .zip(endpoints)
-        .map(|((_id, spec), endpoint)| {
-            Ok(CompiledTaintEndpoint {
-                endpoint: endpoint.endpoint.clone(),
-                event: spec.key().clone(),
-                labels: endpoint.labels.clone(),
-            })
+    specs: &[(ValueFlowEventKey, Spec)],
+) -> Vec<CompiledTaintEndpoint> {
+    assert_eq!(
+        endpoints.len(),
+        specs.len(),
+        "every bound endpoint minted exactly one event spec"
+    );
+    endpoints
+        .iter()
+        .zip(specs)
+        .map(|(endpoint, (key, _))| CompiledTaintEndpoint {
+            endpoint: endpoint.endpoint.clone(),
+            event: key.clone(),
+            labels: endpoint.labels.clone(),
         })
         .collect()
 }
@@ -4963,6 +6761,20 @@ fn require_uninterrupted_outcome<T>(
         | SemanticOutcome::Unknown { .. }
         | SemanticOutcome::Unsupported { .. }
         | SemanticOutcome::Unproven { .. } => Ok(()),
+    }
+}
+
+fn require_discovery_execution_budget(
+    budget: &SemanticExecutionBudget,
+    operation: &str,
+) -> Result<(), TaintPolicyCompileError> {
+    if budget.work().exhausted {
+        Err(query_budget_error(
+            CodeQueryDiagnosticCode::SemanticBudgetExhausted,
+            format!("{operation} exhausted the shared semantic file or traversal budget"),
+        ))
+    } else {
+        Ok(())
     }
 }
 
@@ -5002,6 +6814,12 @@ fn taint_selector_error(
         super::selector_compiler::PolicySelectorSessionError::Provider(detail) => {
             TaintPolicyCompileError::SemanticProvider(detail)
         }
+        // A taint compile hands its session no units, so nothing in it can ask
+        // to be compiled again (taint is `WholePolicyFamily`).
+        super::selector_compiler::PolicySelectorSessionError::Widen(reason) => unreachable!(
+            "a taint selector session has no units and cannot widen: {}",
+            reason.stable_label()
+        ),
     }
 }
 
@@ -5634,21 +7452,24 @@ def tail(value):
             64,
             &cancellation,
         );
-        let mut cache = DiscoveryMaterializationCache::default();
+        let cache = DiscoveryMaterializationCache::default();
         let discovery = compiler
-            .discover_value_flow(&second_head, &mut cache)
+            .discover_value_flow(&second_head, &std::collections::HashSet::new(), &cache)
             .expect("the fixture closure is discovered");
 
         assert!(
-            cache.handle_identity_reuses > 0,
+            cache.handle_identity_reuses.get() > 0,
             "the fixture must actually present a second materialization, \
              otherwise this test proves nothing"
         );
         assert_eq!(
-            cache.procedure_misses, 2,
+            cache.procedure_misses.get(),
+            2,
             "each distinct procedure must reach the oracle once: \
              hits={}, misses={}, handle-identity reuses={}",
-            cache.procedure_hits, cache.procedure_misses, cache.handle_identity_reuses
+            cache.procedure_hits.get(),
+            cache.procedure_misses.get(),
+            cache.handle_identity_reuses.get()
         );
         assert_eq!(
             discovery.procedures.len(),
@@ -5663,8 +7484,8 @@ def tail(value):
 
         // Every handle the walk produced belongs to one artifact instance, so
         // one region plan never mixes materializations.
-        let canonical = cache
-            .artifacts
+        let artifacts = cache.artifacts.borrow();
+        let canonical = artifacts
             .get(second_artifact.key())
             .expect("the walk canonicalized the fixture artifact");
         assert!(
@@ -5843,9 +7664,9 @@ def entry_0():
             64,
             &cancellation,
         );
-        let mut cache = DiscoveryMaterializationCache::default();
+        let cache = DiscoveryMaterializationCache::default();
         for root in &roots {
-            compiler.discover_value_flow(root, &mut cache).unwrap_or_else(|error| {
+            compiler.discover_value_flow(root, &std::collections::HashSet::new(), &cache).unwrap_or_else(|error| {
                 panic!(
                     "a budget of {SCALE} times the {largest_row_lane}-row census must carry every \
                      root's discovery, failed at {:?}: {error:?}",

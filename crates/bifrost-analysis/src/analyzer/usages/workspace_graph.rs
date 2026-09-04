@@ -8,8 +8,11 @@ use crate::analyzer::languages::{
 use crate::analyzer::{CodeUnit, DeclarationId, IAnalyzer, Language, ProjectFile, Range};
 use crate::cancellation::CancellationToken;
 use crate::hash::{HashMap, HashSet};
+use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
+
+type CatalogDeclaration = (CodeUnit, Option<Range>);
 
 /// The name universe a declaration's identity belongs to.
 ///
@@ -136,17 +139,53 @@ impl WorkspaceUsageCatalog {
             .expect("uncancelled workspace usage catalog construction")
     }
 
-    pub(crate) fn build_with_cancellation(
+    /// Enumerate one file's graph declarations through its persisted summary
+    /// projection. Each lookup is bounded to one live analyzed file and is
+    /// independent of every other file, so the unrooted builder can distribute
+    /// them across Rayon without materializing an analyzer generation.
+    ///
+    /// The inventory comes from `projection.declarations`, never from
+    /// `top_level_declarations` plus `children`: that pair is the rendering
+    /// hierarchy, and the Scala and Kotlin wrappers prune synthetic entries
+    /// from it, which hides every named method declared inside an anonymous
+    /// class (#2992).
+    fn declarations_for_file(
         analyzer: &dyn IAnalyzer,
+        file: &ProjectFile,
         cancellation: &CancellationToken,
-    ) -> Option<Self> {
+    ) -> Option<Vec<CatalogDeclaration>> {
+        if cancellation.is_cancelled() {
+            return None;
+        }
+        #[cfg(test)]
+        let catalog_file_sequence =
+            CATALOG_FILES_ENUMERATED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+
         let mut declarations = Vec::new();
-        for (unit, range) in analyzer.all_declarations_with_primary_ranges() {
-            if cancellation.is_cancelled() {
-                return None;
+        if let Some(projection) = analyzer.summary_file_projection(file) {
+            for unit in &projection.declarations {
+                if cancellation.is_cancelled() {
+                    return None;
+                }
+                if is_graph_declaration(unit) {
+                    declarations.push((
+                        unit.clone(),
+                        projection
+                            .ranges
+                            .get(unit)
+                            .and_then(|ranges| primary_range(ranges)),
+                    ));
+                }
             }
-            if is_graph_declaration(&unit) {
-                declarations.push((unit, range));
+        } else {
+            for unit in analyzer.declarations(file) {
+                if cancellation.is_cancelled() {
+                    return None;
+                }
+                if is_graph_declaration(&unit) {
+                    let range = analyzer.ranges(&unit).into_iter().min_by_key(range_key);
+                    declarations.push((unit, range));
+                }
             }
         }
 
@@ -156,21 +195,44 @@ impl WorkspaceUsageCatalog {
         // graph-only catalog path. This avoids turning the named module into a
         // package Module CodeUnit, which can collide with a package of the same
         // name.
-        for file in analyzer.analyzed_files() {
-            if cancellation.is_cancelled() {
-                return None;
-            }
-            if !is_java_module_descriptor_file(&file) {
-                continue;
-            }
+        if is_java_module_descriptor_file(file) {
             let file_scope = CodeUnit::file_scope(file.clone());
             let range = analyzer
                 .ranges(&file_scope)
                 .into_iter()
-                .min_by_key(|range| (range.start_line, range.start_byte));
+                .min_by_key(range_key);
             declarations.push((file_scope, range));
         }
+        #[cfg(test)]
+        if catalog_file_sequence
+            == CATALOG_CANCEL_AFTER_FILE.load(std::sync::atomic::Ordering::Relaxed)
+        {
+            cancellation.cancel();
+        }
+        (!cancellation.is_cancelled()).then_some(declarations)
+    }
 
+    pub(crate) fn build_with_cancellation(
+        analyzer: &dyn IAnalyzer,
+        cancellation: &CancellationToken,
+    ) -> Option<Self> {
+        if cancellation.is_cancelled() {
+            return None;
+        }
+        let files = analyzer.analyzed_files();
+        let declaration_batches: Option<Vec<Vec<CatalogDeclaration>>> = {
+            let _scope = crate::profiling::scope("workspace_graph::parallel_catalog_enumeration");
+            files
+                .par_iter()
+                .map(|file| Self::declarations_for_file(analyzer, file, cancellation))
+                .collect()
+        };
+        let declarations = declaration_batches?.into_iter().flatten().collect();
+        if cancellation.is_cancelled() {
+            return None;
+        }
+
+        let _scope = crate::profiling::scope("workspace_graph::catalog_grouping");
         Self::from_declarations(declarations, cancellation)
     }
 
@@ -179,51 +241,20 @@ impl WorkspaceUsageCatalog {
     /// enumerate every declaration in a long-lived workspace cache before it can
     /// answer a handful of changed-file roots.
     pub(crate) fn build_for_files(analyzer: &dyn IAnalyzer, files: &[ProjectFile]) -> Self {
-        let mut declarations = Vec::new();
-        for file in files {
-            if let Some(projection) = analyzer.summary_file_projection(file) {
-                let mut stack = projection.top_level_declarations.clone();
-                let mut seen = HashSet::default();
-                while let Some(unit) = stack.pop() {
-                    if !seen.insert(unit.clone()) {
-                        continue;
-                    }
-                    if let Some(children) = projection.children.get(&unit) {
-                        stack.extend(children.iter().cloned());
-                    }
-                    if is_graph_declaration(&unit) {
-                        declarations.push((
-                            unit.clone(),
-                            projection
-                                .ranges
-                                .get(&unit)
-                                .and_then(|ranges| primary_range(ranges)),
-                        ));
-                    }
-                }
-            } else {
-                for unit in analyzer.declarations(file) {
-                    if is_graph_declaration(&unit) {
-                        let range = analyzer.ranges(&unit).into_iter().min_by_key(range_key);
-                        declarations.push((unit, range));
-                    }
-                }
-            }
-            if is_java_module_descriptor_file(file) {
-                let file_scope = CodeUnit::file_scope(file.clone());
-                let range = analyzer
-                    .ranges(&file_scope)
-                    .into_iter()
-                    .min_by_key(range_key);
-                declarations.push((file_scope, range));
-            }
-        }
+        let cancellation = CancellationToken::default();
+        let declarations = files
+            .iter()
+            .flat_map(|file| {
+                Self::declarations_for_file(analyzer, file, &cancellation)
+                    .expect("uncancelled rooted file declaration enumeration")
+            })
+            .collect();
         Self::from_declarations(declarations, &CancellationToken::default())
             .expect("uncancelled rooted workspace usage catalog construction")
     }
 
     pub(crate) fn from_declarations(
-        declarations: Vec<(CodeUnit, Option<Range>)>,
+        declarations: Vec<CatalogDeclaration>,
         cancellation: &CancellationToken,
     ) -> Option<Self> {
         #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -235,7 +266,7 @@ impl WorkspaceUsageCatalog {
             exact_declaration: Option<DeclarationId>,
         }
 
-        let mut grouped: BTreeMap<GroupKey, Vec<(CodeUnit, Option<Range>)>> = BTreeMap::new();
+        let mut grouped: BTreeMap<GroupKey, Vec<CatalogDeclaration>> = BTreeMap::new();
         for (unit, range) in declarations {
             if cancellation.is_cancelled() {
                 return None;
@@ -364,6 +395,13 @@ impl WorkspaceUsageCatalog {
             .collect()
     }
 }
+
+#[cfg(test)]
+static CATALOG_FILES_ENUMERATED: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+static CATALOG_CANCEL_AFTER_FILE: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(usize::MAX);
 
 fn primary_range(ranges: &[Range]) -> Option<Range> {
     ranges.iter().copied().min_by_key(range_key)
@@ -654,10 +692,13 @@ fn record_scoped_weights_exact(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::analyzer::CodeUnitIndex;
     use crate::analyzer::{
         AnalyzerDelegate, JavaAnalyzer, KotlinAnalyzer, MultiAnalyzer, ScalaAnalyzer, TestProject,
     };
     use std::sync::Arc;
+
+    static CATALOG_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// The `Jvm` realm is resolved once even though three builders run over it.
     ///
@@ -669,6 +710,7 @@ mod tests {
     /// reporting `Jvm` twice.
     #[test]
     fn the_jvm_realm_is_resolved_once_across_its_three_builders() {
+        let _guard = CATALOG_TEST_LOCK.lock().unwrap();
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
         ProjectFile::new(root.clone(), "app/Greeter.java")
@@ -737,5 +779,159 @@ mod tests {
                 ))
                 .collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn parallel_catalog_enumeration_matches_authoritative_inventory_in_file_sized_work_units() {
+        let _guard = CATALOG_TEST_LOCK.lock().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        ProjectFile::new(root.clone(), "module-info.java")
+            .write("module example.module {}\n")
+            .unwrap();
+        ProjectFile::new(root.clone(), "app/Greeter.java")
+            .write(
+                "package app;\n\npublic class Greeter {\n    public String greet() { return \"hi\"; }\n}\n",
+            )
+            .unwrap();
+        // Scala indexes the anonymous class as a synthetic owner and its `run`
+        // as an ordinary declaration, and the Scala summary wrapper prunes
+        // synthetic entries out of `children`. So `run` is reachable only
+        // through the persisted declaration inventory (#2992).
+        ProjectFile::new(root.clone(), "app/Service.scala")
+            .write(
+                "package app\n\nclass Service {\n  def task(): Runnable = new Runnable {\n    def run(): Unit = println(\"scala\")\n  }\n}\n",
+            )
+            .unwrap();
+        // The Kotlin declaration tier deliberately does not index members of an
+        // anonymous object, so this file has no equivalent hidden `run`. It is
+        // here so the Kotlin summary wrapper's synthetic pruning is covered by
+        // the exact-equality check below.
+        ProjectFile::new(root.clone(), "app/Task.kt")
+            .write(
+                "package app\n\nclass Task(private val label: String) {\n    fun make(): Runnable = object : Runnable {\n        override fun run() {}\n    }\n}\n",
+            )
+            .unwrap();
+        ProjectFile::new(root.clone(), "app/Caller.kt")
+            .write("package app\n\nclass Caller {\n    fun call(): String = Greeter().greet()\n}\n")
+            .unwrap();
+
+        let project = TestProject::new(root, Language::Java);
+        let make_analyzer = || {
+            MultiAnalyzer::new(BTreeMap::from([
+                (
+                    Language::Java,
+                    AnalyzerDelegate::Java(JavaAnalyzer::new(Arc::new(project.clone()))),
+                ),
+                (
+                    Language::Scala,
+                    AnalyzerDelegate::Scala(ScalaAnalyzer::new(Arc::new(project.clone()))),
+                ),
+                (
+                    Language::Kotlin,
+                    AnalyzerDelegate::Kotlin(KotlinAnalyzer::new(Arc::new(project.clone()))),
+                ),
+            ]))
+        };
+        // The first generation persists the fixture. The second exercises the
+        // same cache-backed summary projections used by a warm real workspace.
+        drop(make_analyzer());
+        let analyzer = make_analyzer();
+
+        let mut authoritative = analyzer.all_declarations_with_primary_ranges();
+        for file in analyzer.analyzed_files() {
+            if is_java_module_descriptor_file(&file) {
+                let file_scope = CodeUnit::file_scope(file.clone());
+                let range = analyzer
+                    .ranges(&file_scope)
+                    .into_iter()
+                    .min_by_key(range_key);
+                authoritative.push((file_scope, range));
+            }
+        }
+        let expected =
+            WorkspaceUsageCatalog::from_declarations(authoritative, &CancellationToken::default())
+                .expect("uncancelled authoritative catalog");
+
+        CATALOG_FILES_ENUMERATED.store(0, std::sync::atomic::Ordering::Relaxed);
+        let actual = WorkspaceUsageCatalog::build(&analyzer);
+        let expected_nodes = expected
+            .nodes
+            .iter()
+            .map(|node| {
+                (
+                    node.key.clone(),
+                    node.primary.clone(),
+                    node.primary_range,
+                    node.declaration_files.clone(),
+                    node.declaration_ids.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let actual_nodes = actual
+            .nodes
+            .iter()
+            .map(|node| {
+                (
+                    node.key.clone(),
+                    node.primary.clone(),
+                    node.primary_range,
+                    node.declaration_files.clone(),
+                    node.declaration_ids.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            actual_nodes, expected_nodes,
+            "per-file enumeration must preserve exact catalog identity, ranges, duplicates, and order"
+        );
+        assert!(
+            actual.nodes.iter().any(|node| {
+                node.primary.identifier() == "run"
+                    && node.primary.source().rel_path().file_name()
+                        == Some(OsStr::new("Service.scala"))
+            }),
+            "per-file enumeration must retain the `run` method declared inside \
+             Service.scala's anonymous class: {:?}",
+            actual
+                .nodes
+                .iter()
+                .map(|node| node.primary.clone())
+                .collect::<Vec<_>>()
+        );
+
+        assert_eq!(
+            CATALOG_FILES_ENUMERATED.load(std::sync::atomic::Ordering::Relaxed),
+            analyzer.analyzed_files().len(),
+            "catalog work must be exactly one bounded projection per analyzed file"
+        );
+
+        assert!(
+            actual.nodes.iter().any(|node| {
+                node.primary.is_file_scope()
+                    && node.primary.source().rel_path() == std::path::Path::new("module-info.java")
+            }),
+            "parallel declaration enumeration must retain the graph-only Java module descriptor"
+        );
+
+        let cancelled = CancellationToken::default();
+        cancelled.cancel();
+        assert!(
+            WorkspaceUsageCatalog::build_with_cancellation(&analyzer, &cancelled).is_none(),
+            "a cancelled inventory must not publish a partial catalog"
+        );
+
+        CATALOG_FILES_ENUMERATED.store(0, std::sync::atomic::Ordering::Relaxed);
+        CATALOG_CANCEL_AFTER_FILE.store(1, std::sync::atomic::Ordering::Relaxed);
+        let cancelled_during_enumeration = CancellationToken::default();
+        assert!(
+            WorkspaceUsageCatalog::build_with_cancellation(
+                &analyzer,
+                &cancelled_during_enumeration
+            )
+            .is_none(),
+            "cancellation after one completed file must discard every parallel batch"
+        );
+        CATALOG_CANCEL_AFTER_FILE.store(usize::MAX, std::sync::atomic::Ordering::Relaxed);
     }
 }

@@ -544,6 +544,136 @@ impl<'a> AnalyzerDefinitionLookup<'a> {
             }
         }
     }
+
+    /// Populates the fqn cache for many names in one language with as few
+    /// relational-store round trips as possible. A caller resolving many
+    /// distinct names in a loop should prefetch them here first so each
+    /// `fqn_for_language` / `fqn_in_language` call afterward is a cache hit
+    /// instead of its own round trip.
+    pub(crate) fn prefetch_fqn_in_language(&self, language: Language, fqns: &[String]) {
+        let mut pending_fqns = Vec::new();
+        {
+            let cache = self
+                .memo
+                .fqn_cache
+                .lock()
+                .expect("definition fqn cache poisoned");
+            let mut seen = crate::hash::HashSet::default();
+            for fqn in fqns {
+                if !cache.contains_key(&(language, fqn.clone())) && seen.insert(fqn.clone()) {
+                    pending_fqns.push(fqn.clone());
+                }
+            }
+        }
+        if pending_fqns.is_empty() {
+            return;
+        }
+        let mut queries = Vec::with_capacity(pending_fqns.len());
+        let mut named_fqns = Vec::with_capacity(pending_fqns.len());
+        for fqn in pending_fqns {
+            let Some(name) = Self::rendered_name(language, &fqn) else {
+                continue;
+            };
+            queries.push((name, RelationalDefinitionQuery::ExactName));
+            named_fqns.push(fqn);
+        }
+        if queries.is_empty() {
+            return;
+        }
+        let results = self.query_values(language, queries);
+        let mut misses = Vec::new();
+        for (fqn, value) in named_fqns.into_iter().zip(results) {
+            let mut units = match value {
+                RelationalDefinitionValue::Definitions(units) => units,
+                _ => panic!("an exact-name query returned the wrong result shape"),
+            };
+            units.retain(|unit| unit.fq_name() == fqn);
+            if units.is_empty() {
+                misses.push(fqn);
+            } else {
+                sort_units(&mut units);
+                units.dedup();
+                self.memo
+                    .fqn_cache
+                    .lock()
+                    .expect("definition fqn cache poisoned")
+                    .insert((language, fqn), units);
+            }
+        }
+        if misses.is_empty() {
+            return;
+        }
+        // Every miss above falls back to the identifier-candidate seek
+        // `exact_for_language` uses one name at a time. Batch that fallback
+        // across every miss too, tagging each query with which name it
+        // answers, so a workspace where most names take this path still
+        // resolves in one round trip instead of one per name (bifrost#15).
+        let mut fallback_queries = Vec::new();
+        let mut fallback_owner = Vec::new();
+        let mut identifiers_by_fqn = Vec::with_capacity(misses.len());
+        for fqn in &misses {
+            let identifiers = self.rendered_identifier_candidates(language, fqn);
+            for identifier in &identifiers {
+                if let Some(name) = Self::identifier_name(identifier) {
+                    fallback_queries
+                        .push((name, RelationalDefinitionQuery::Identifier { file: None }));
+                    fallback_owner.push(identifiers_by_fqn.len());
+                }
+                for seek in decorated_identifier_seeks(language, identifier) {
+                    match seek {
+                        IdentifierSeek::Exact(spelling) => {
+                            if let Some(name) = Self::identifier_name(&spelling) {
+                                fallback_queries.push((
+                                    name,
+                                    RelationalDefinitionQuery::Identifier { file: None },
+                                ));
+                                fallback_owner.push(identifiers_by_fqn.len());
+                            }
+                        }
+                        IdentifierSeek::Prefix(prefix) => {
+                            if let Some(name) = Self::identifier_name(&prefix) {
+                                fallback_queries.push((
+                                    name,
+                                    RelationalDefinitionQuery::IdentifierPrefix { file: None },
+                                ));
+                                fallback_owner.push(identifiers_by_fqn.len());
+                            }
+                        }
+                    }
+                }
+            }
+            identifiers_by_fqn.push(identifiers);
+        }
+        let mut units_by_fqn: Vec<Vec<CodeUnit>> = vec![Vec::new(); misses.len()];
+        if !fallback_queries.is_empty() {
+            let fallback_results = self.query_values(language, fallback_queries);
+            for (owner, value) in fallback_owner.into_iter().zip(fallback_results) {
+                match value {
+                    RelationalDefinitionValue::Definitions(units) => {
+                        units_by_fqn[owner].extend(units);
+                    }
+                    _ => panic!("an identifier query returned the wrong result shape"),
+                }
+            }
+        }
+        for (fqn, (identifiers, mut units)) in misses
+            .into_iter()
+            .zip(identifiers_by_fqn.into_iter().zip(units_by_fqn))
+        {
+            units.retain(|unit| {
+                identifiers.iter().any(|identifier| {
+                    crate::analyzer::common::identifier_addresses_target(unit, identifier)
+                }) && unit.fq_name() == fqn
+            });
+            sort_units(&mut units);
+            units.dedup();
+            self.memo
+                .fqn_cache
+                .lock()
+                .expect("definition fqn cache poisoned")
+                .insert((language, fqn), units);
+        }
+    }
 }
 
 fn analyzer_for_language(

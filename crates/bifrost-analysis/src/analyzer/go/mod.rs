@@ -615,6 +615,10 @@ impl CodeUnitIndex for GoAnalyzer {
         self.inner.definitions(fq_name)
     }
 
+    fn prefetch_definitions(&self, fq_names: &[String]) {
+        self.inner.prefetch_definitions(fq_names);
+    }
+
     fn direct_children(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
         self.inner.direct_children(code_unit)
     }
@@ -791,6 +795,10 @@ impl IAnalyzer for GoAnalyzer {
 
     fn end_query(&self, context: &Arc<crate::analyzer::AnalyzerQueryContext>) {
         self.inner.end_query(context);
+    }
+
+    fn prefetch_definitions(&self, fq_names: &[String]) {
+        self.inner.prefetch_definitions(fq_names);
     }
 
     fn record_query_failure(&self, error: crate::analyzer::store::StoreError) {
@@ -991,10 +999,12 @@ impl crate::analyzer::AnalyzerTestHooks for GoAnalyzer {
             .invalidate_selector_continuation_semantic_cache_if_armed_for_test();
     }
 
-    fn selector_continuation_semantic_cache_revivals_for_test(&self) -> u64 {
+    fn selector_continuation_semantic_cache_revival_census_for_test(
+        &self,
+    ) -> crate::analyzer::semantic::SemanticCacheRevivalCensus {
         self.inner
             .test_hooks()
-            .selector_continuation_semantic_cache_revivals_for_test()
+            .selector_continuation_semantic_cache_revival_census_for_test()
     }
 
     fn arm_evaluation_root_continuation_semantic_cache_invalidation_for_test(&self) {
@@ -1009,10 +1019,59 @@ impl crate::analyzer::AnalyzerTestHooks for GoAnalyzer {
             .invalidate_evaluation_root_continuation_semantic_cache_if_armed_for_test();
     }
 
-    fn evaluation_root_continuation_semantic_cache_revivals_for_test(&self) -> u64 {
+    fn evaluation_root_continuation_semantic_cache_revival_census_for_test(
+        &self,
+    ) -> crate::analyzer::semantic::SemanticCacheRevivalCensus {
         self.inner
             .test_hooks()
-            .evaluation_root_continuation_semantic_cache_revivals_for_test()
+            .evaluation_root_continuation_semantic_cache_revival_census_for_test()
+    }
+
+    fn semantic_materialization_census_for_test(
+        &self,
+    ) -> Vec<(
+        crate::analyzer::semantic::WorkspaceRelativePath,
+        crate::analyzer::semantic::SemanticMaterializationCensus,
+    )> {
+        self.inner
+            .test_hooks()
+            .semantic_materialization_census_for_test()
+    }
+
+    fn reset_relational_definition_batch_call_count_for_test(&self) {
+        self.inner
+            .test_hooks()
+            .reset_relational_definition_batch_call_count_for_test();
+    }
+
+    fn relational_definition_batch_call_count_for_test(&self) -> usize {
+        self.inner
+            .test_hooks()
+            .relational_definition_batch_call_count_for_test()
+    }
+
+    fn reset_definition_candidates_query_count_for_test(&self) {
+        self.inner
+            .test_hooks()
+            .reset_definition_candidates_query_count_for_test();
+    }
+
+    fn definition_candidates_query_count_for_test(&self) -> usize {
+        self.inner
+            .test_hooks()
+            .definition_candidates_query_count_for_test()
+    }
+
+    fn reset_definition_prefetch_batch_count_for_test(&self) {
+        self.inner
+            .test_hooks()
+            .reset_definition_prefetch_batch_count_for_test();
+    }
+
+    fn definition_prefetch_batch_count_for_test(&self) -> usize {
+        self.inner
+            .test_hooks()
+            .definition_prefetch_batch_count_for_test()
     }
 
     fn reset_full_declaration_scan_count_for_test(&self) {
@@ -1323,6 +1382,47 @@ mod hierarchy_tests {
             index.package_lookups(),
             PACKAGES,
             "one probe per import, not one scan of {PACKAGES} files per import"
+        );
+    }
+
+    /// The Kubernetes-scale #1748 remainder: hierarchy construction knows all
+    /// type names after parsing, so resolving them must be one batched read,
+    /// not one rendered-definition transaction per type or alias.
+    #[test]
+    fn hierarchy_build_prefetches_type_and_alias_definitions() {
+        let analyzer = analyzer(&[(
+            "service.go",
+            "package app\n\
+             type Runner interface { Run() error }\n\
+             type Worker struct{}\n\
+             type Helper struct{}\n\
+             type WorkerAlias = Worker\n\
+             func (Worker) Run() error { return nil }\n",
+        )]);
+        let scope = AnalyzerQueryScope::new(&analyzer);
+        analyzer
+            .inner
+            .reset_definition_candidates_query_count_for_test();
+        analyzer
+            .inner
+            .reset_definition_prefetch_batch_count_for_test();
+
+        let index = GoHierarchyIndex::build(scope.token(), &analyzer, &analyzer);
+
+        assert!(index.relations().iter().any(|relation| {
+            relation.kind == TypeRelationKind::StructuralSatisfaction
+                && relation.from.identifier() == "Worker"
+                && relation.to.identifier() == "Runner"
+        }));
+        assert_eq!(
+            1,
+            analyzer.inner.definition_prefetch_batch_count_for_test(),
+            "one batch must serve every type and alias in the hierarchy"
+        );
+        assert_eq!(
+            0,
+            analyzer.inner.definition_candidates_query_count_for_test(),
+            "prefetched hierarchy names must not fall back to point reads"
         );
     }
 

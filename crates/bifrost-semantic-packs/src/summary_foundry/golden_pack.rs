@@ -818,6 +818,7 @@ fn build_pack(
             review_required: true,
         },
         carried_sources: Vec::new(),
+        cpp_portability: None,
         shards: vec![AuthoredShard {
             id: format!("summaries.{}", realm.ecosystem),
             activation: vec![ActivationSelector {

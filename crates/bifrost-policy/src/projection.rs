@@ -11,6 +11,9 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
+use brokk_bifrost_analysis::analyzer::semantic::ids::{LengthDelimitedDigest, StableDigest};
+use serde::{Deserialize, Deserializer, Serialize, de};
+
 use super::budget::PolicyBudget;
 use super::definition::{PolicyAnalysisType, PolicyId, PolicyReportOptions};
 use super::finding::{
@@ -25,10 +28,11 @@ use super::finding_identity::{
     PolicyFindingId, SourceScenarioId, WitnessId,
 };
 use super::future_evidence::{
-    FutureEvidenceError, ResolvedTypestateTerminal, TaintFindingAnchor, TaintOriginEvidence,
-    TaintPolicyProjectionFacts, TaintProjectionFactsHash, TypestateBindingPlanHash,
-    TypestateFindingAnchor, TypestatePolicyProjectionFacts, TypestateProjectionFactsHash,
-    TypestateProtocolHash, TypestateViolationEvidence, typestate_violation_hash,
+    FutureEvidenceError, ResolvedTypestateTerminal, StoredTypestateFindingAnchor,
+    TaintFindingAnchor, TaintOriginEvidence, TaintPolicyProjectionFacts, TaintProjectionFactsHash,
+    TypestateBindingPlanHash, TypestateFindingAnchor, TypestatePolicyProjectionFacts,
+    TypestateProjectionFactsHash, TypestateProjectionFactsSeed, TypestateProtocolHash,
+    TypestateViolationEvidence, typestate_violation_hash,
 };
 use super::identity::{PolicySemanticHash, TypestateAuthoringProjectionHash};
 use super::resolved::{
@@ -147,6 +151,22 @@ impl TypestateCompilationHashes {
     pub(crate) const fn binding_plan_hash(self) -> TypestateBindingPlanHash {
         self.binding_plan_hash
     }
+
+    /// This compile's identity as a unit key folds it.
+    ///
+    /// Every typestate projection is sealed to both hashes and
+    /// [`TypestateProjectionAuthority`] drops a fact that names any other
+    /// compile, so a root unit published under one compile answers a question
+    /// no other compile asked. Folding this into the root's partition is what
+    /// makes the store miss instead of serving projections the authority will
+    /// then silently drop (`.agents/plans/impact-sliced-diff-base.md`,
+    /// Decision Log (5d)).
+    pub(crate) fn unit_digest(self) -> StableDigest {
+        let mut digest = LengthDelimitedDigest::new(b"bifrost-policy-typestate-compilation/v1");
+        digest.push(self.protocol_hash.as_bytes());
+        digest.push(self.binding_plan_hash.as_bytes());
+        digest.finish()
+    }
 }
 
 pub(crate) struct TypestateProjectionAuthority<'a> {
@@ -243,7 +263,7 @@ impl EffectiveReportLimits {
 /// Diagnostic-neutral report facts which an analysis adapter must establish;
 /// policy presentation, classification, CVSS, organizational risk, finding
 /// identity, and run construction remain crate-owned.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub(crate) struct ProjectedFindingReport {
     pub(crate) primary: PolicySourceLocation,
     pub(crate) certainty: FindingCertainty,
@@ -303,7 +323,7 @@ pub(crate) struct TaintProjectedFinding {
 
 /// One diagnostic-neutral typestate violation plus every analysis-owned field
 /// needed for final policy finding assembly.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub(crate) struct TypestateProjectedFinding {
     pub(crate) facts: TypestatePolicyProjectionFacts,
     pub(crate) analysis_finding_id: AnalysisFindingId,
@@ -317,6 +337,184 @@ pub(crate) struct TypestateProjectedFinding {
     pub(crate) witness_refs: Vec<WitnessId>,
     pub(crate) witness_refs_truncated: bool,
     pub(crate) report: ProjectedFindingReport,
+}
+
+// ---------------------------------------------------------------------------
+// Reading a typestate root unit's projections back
+// ---------------------------------------------------------------------------
+//
+// A persisted typestate root unit carries exactly what one iteration of the
+// per-root loop appended (`.agents/plans/impact-sliced-diff-base.md`,
+// Milestone 5), which is a list of these projections. Every value below goes
+// back through the constructor that minted it, and every digest a stored
+// projection carries that this crate can derive locally is re-derived and
+// compared: a stored value that no longer validates is a load error and the
+// policy widens, never a projection that reaches finding assembly claiming an
+// identity its own content does not mint.
+
+impl<'de> Deserialize<'de> for ProjectedFindingReport {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Wire {
+            primary: PolicySourceLocation,
+            certainty: FindingCertainty,
+            completeness: FindingCompleteness,
+            related: Vec<RelatedPolicyLocation>,
+            related_truncated: bool,
+            omitted_related_locations_lower_bound: u64,
+            evidence_refs_truncated: bool,
+            omitted_evidence_refs_lower_bound: u64,
+            proof: ProofMetadata,
+            witnesses: Vec<BoundedWitness>,
+            witnesses_truncated: bool,
+            omitted_witnesses_lower_bound: u64,
+            // A display path is a taint rendering, minted long after a
+            // projection: no typestate projection has ever carried one, so a
+            // stored one did not come from a typestate root unit and reading
+            // it as if it had would admit a shape nothing produces.
+            display_path: Option<de::IgnoredAny>,
+        }
+
+        let wire = Wire::deserialize(deserializer)?;
+        if wire.display_path.is_some() {
+            return Err(de::Error::custom(
+                "a stored typestate projection carries a display path, which no typestate \
+                 projection mints",
+            ));
+        }
+        Ok(Self {
+            primary: wire.primary,
+            certainty: wire.certainty,
+            completeness: wire.completeness,
+            related: wire.related,
+            related_truncated: wire.related_truncated,
+            omitted_related_locations_lower_bound: wire.omitted_related_locations_lower_bound,
+            evidence_refs_truncated: wire.evidence_refs_truncated,
+            omitted_evidence_refs_lower_bound: wire.omitted_evidence_refs_lower_bound,
+            proof: wire.proof,
+            witnesses: wire.witnesses,
+            witnesses_truncated: wire.witnesses_truncated,
+            omitted_witnesses_lower_bound: wire.omitted_witnesses_lower_bound,
+            display_path: None,
+        })
+    }
+}
+
+/// Read one stored typestate projection back under the budget its caps are
+/// stated in.
+///
+/// A seed for the reason [`super::finding::PolicyFindingSeed`] is one: the
+/// projection facts are normalized against a budget, and the budget that
+/// matters is the reading run's, not whatever budget once allowed them.
+pub(crate) struct TypestateProjectedFindingSeed<'a> {
+    budget: &'a PolicyBudget,
+}
+
+impl<'a> TypestateProjectedFindingSeed<'a> {
+    pub(crate) const fn new(budget: &'a PolicyBudget) -> Self {
+        Self { budget }
+    }
+}
+
+/// The field names a stored projection carries, named once so the visitor and
+/// the error it raises for an unknown field cannot disagree.
+const TYPESTATE_PROJECTION_FIELDS: &[&str] = &[
+    "facts",
+    "analysis_finding_id",
+    "anchor",
+    "subject",
+    "witness_refs",
+    "witness_refs_truncated",
+    "report",
+];
+
+impl<'de> de::DeserializeSeed<'de> for TypestateProjectedFindingSeed<'_> {
+    type Value = TypestateProjectedFinding;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_struct(
+            "TypestateProjectedFinding",
+            TYPESTATE_PROJECTION_FIELDS,
+            TypestateProjectedFindingVisitor {
+                budget: self.budget,
+            },
+        )
+    }
+}
+
+/// Reads a stored projection's fields, handing the budget to the facts.
+///
+/// Hand-written rather than derived because a derived struct cannot carry a
+/// seed into one of its fields, and the facts are exactly the field that needs
+/// one. The anchor is rebuilt after the whole map is read rather than while it
+/// is being read, because rebuilding it needs the violation the facts carry
+/// and a map states its fields in whatever order the writer chose.
+struct TypestateProjectedFindingVisitor<'a> {
+    budget: &'a PolicyBudget,
+}
+
+impl<'de> de::Visitor<'de> for TypestateProjectedFindingVisitor<'_> {
+    type Value = TypestateProjectedFinding;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("one projected typestate violation")
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: de::MapAccess<'de>,
+    {
+        let mut facts: Option<TypestatePolicyProjectionFacts> = None;
+        let mut analysis_finding_id: Option<AnalysisFindingId> = None;
+        let mut anchor: Option<StoredTypestateFindingAnchor> = None;
+        let mut subject: Option<AnalysisSubjectRef> = None;
+        let mut witness_refs: Option<Vec<WitnessId>> = None;
+        let mut witness_refs_truncated: Option<bool> = None;
+        let mut report: Option<ProjectedFindingReport> = None;
+        while let Some(field) = map.next_key::<String>()? {
+            let duplicate = match field.as_str() {
+                "facts" => facts
+                    .replace(map.next_value_seed(TypestateProjectionFactsSeed::new(self.budget))?)
+                    .is_some(),
+                "analysis_finding_id" => analysis_finding_id.replace(map.next_value()?).is_some(),
+                "anchor" => anchor.replace(map.next_value()?).is_some(),
+                "subject" => subject.replace(map.next_value()?).is_some(),
+                "witness_refs" => witness_refs.replace(map.next_value()?).is_some(),
+                "witness_refs_truncated" => {
+                    witness_refs_truncated.replace(map.next_value()?).is_some()
+                }
+                "report" => report.replace(map.next_value()?).is_some(),
+                other => {
+                    return Err(de::Error::unknown_field(other, TYPESTATE_PROJECTION_FIELDS));
+                }
+            };
+            if duplicate {
+                return Err(de::Error::duplicate_field("a projection field"));
+            }
+        }
+        let facts = facts.ok_or_else(|| de::Error::missing_field("facts"))?;
+        let anchor = anchor.ok_or_else(|| de::Error::missing_field("anchor"))?;
+        let anchor = TypestateFindingAnchor::try_from_stored(anchor, &facts.violation)
+            .map_err(de::Error::custom)?;
+        Ok(TypestateProjectedFinding {
+            facts,
+            analysis_finding_id: analysis_finding_id
+                .ok_or_else(|| de::Error::missing_field("analysis_finding_id"))?,
+            anchor,
+            subject: subject.ok_or_else(|| de::Error::missing_field("subject"))?,
+            witness_refs: witness_refs.ok_or_else(|| de::Error::missing_field("witness_refs"))?,
+            witness_refs_truncated: witness_refs_truncated
+                .ok_or_else(|| de::Error::missing_field("witness_refs_truncated"))?,
+            report: report.ok_or_else(|| de::Error::missing_field("report"))?,
+        })
+    }
 }
 
 /// Unsealed taint adapter output. The production evaluator binds this payload
@@ -1398,10 +1596,13 @@ fn validate_taint_facts(
     let mut invalid_source_endpoints = HashSet::new();
     for source_fact in facts.source_facts.iter().cloned() {
         let source_endpoint = source_fact.source_endpoint.clone();
+        // A projected origin endpoint is either a declared source or a
+        // declared entry point; both are source-shaped endpoints (#2692).
         let source = authority
             .spec
             .sources
             .iter()
+            .chain(authority.spec.entry_points.iter())
             .find(|source| source.identity == source_fact.source_endpoint)
             .ok_or(ProjectionAuthorityError::UnknownTaintSource);
         let source = match source {
@@ -2768,6 +2969,62 @@ mod tests {
             witness_refs_truncated: false,
             report: projected_report("src/test.rs"),
         }
+    }
+
+    /// A stored typestate root unit's projection reads back as the projection
+    /// that was written, and every digest it carries is re-derived rather than
+    /// trusted.
+    ///
+    /// The round trip is what makes a typestate root unit publishable at all:
+    /// its product is a list of these, and a projection that came back
+    /// different would mint a different finding identity, which is what a
+    /// `--diff-base` join is computed on
+    /// (`.agents/plans/impact-sliced-diff-base.md`, Milestone 5).
+    #[test]
+    fn a_stored_typestate_projection_reads_back_as_itself() {
+        let registry = registry(&[("test:typestate", typestate_policy().to_string())]);
+        let policy = registry.policies().next().unwrap();
+        let protocol_hash = TypestateProtocolHash::from_canonical_bytes(b"protocol");
+        let binding_plan_hash = TypestateBindingPlanHash::from_canonical_bytes(b"bindings");
+        let authority = TypestateProjectionAuthority::from_loaded_compilation(
+            policy,
+            protocol_hash,
+            binding_plan_hash,
+        )
+        .unwrap();
+        let budget = PolicyBudget::default();
+        let projection = typestate_projected_finding(&authority);
+
+        let stored = serde_json::to_string(&projection).unwrap();
+        let mut deserializer = serde_json::Deserializer::from_str(&stored);
+        let read = serde::de::DeserializeSeed::deserialize(
+            TypestateProjectedFindingSeed::new(&budget),
+            &mut deserializer,
+        )
+        .expect("a stored projection reads back");
+        assert_eq!(serde_json::to_string(&read).unwrap(), stored);
+        assert_eq!(read.anchor, projection.anchor);
+        assert_eq!(read.facts, projection.facts);
+
+        // The scenario-set hash is derived from the scenario ids, so a stored
+        // pair that disagrees is a load error rather than a fact set that
+        // would anchor a finding under an identity nothing else mints.
+        let forged = stored.replace(
+            &projection.facts.scenario_set_hash.to_string(),
+            &super::super::future_evidence::TypestateScenarioSetHash::from_bytes([7; 32])
+                .to_string(),
+        );
+        assert_ne!(forged, stored, "the fixture must contain the hash it edits");
+        let mut deserializer = serde_json::Deserializer::from_str(&forged);
+        assert!(
+            serde::de::DeserializeSeed::deserialize(
+                TypestateProjectedFindingSeed::new(&budget),
+                &mut deserializer,
+            )
+            .is_err(),
+            "a stored projection whose scenario-set hash is not the one its scenarios mint is a \
+             load error"
+        );
     }
 
     #[test]

@@ -12,9 +12,8 @@ typeshed revision.
 ## The pinned slice
 
 `typeshed-stdlib-2026.8.31.json` pins typeshed revision
-`1620e225476597f34177351ef913dc8390dade30` and lists 16 stub files. The
-slice is deliberately bounded to the modules an ordinary Python program
-touches first:
+`1620e225476597f34177351ef913dc8390dade30` and lists 48 stub files. The
+slice is deliberately bounded to common runtime and standard-library surfaces:
 
 | Module | Pinned stub files |
 | --- | --- |
@@ -27,9 +26,39 @@ touches first:
 | `json` | `json/__init__.pyi`, `json/decoder.pyi`, `json/encoder.pyi`, `json/scanner.pyi`, `json/tool.pyi` |
 | `collections` | `collections/__init__.pyi` |
 | `collections.abc` | `collections/abc.pyi`, `_collections_abc.pyi` |
+| `abc` | `abc.pyi` |
+| `codecs` | `codecs.pyi` |
+| `contextlib` | `contextlib.pyi` |
+| `ctypes` | `ctypes/__init__.pyi`, `ctypes/wintypes.pyi` |
+| `enum` | `enum.pyi` |
+| `errno` | `errno.pyi` |
+| `functools` | `functools.pyi` |
+| `gettext` | `gettext.pyi` |
+| `importlib` | `importlib/__init__.pyi`, `importlib/metadata/__init__.pyi` |
+| `inspect` | `inspect.pyi` |
+| `io` | `io.pyi` |
+| `itertools` | `itertools.pyi` |
+| `logging` | `logging/__init__.pyi` |
+| `math` | `math/__init__.pyi` |
+| `operator` | `operator.pyi` |
+| `pathlib` | `pathlib/__init__.pyi` |
+| `platform` | `platform.pyi` |
+| `random` | `random.pyi` |
+| `shlex` | `shlex.pyi` |
+| `shutil` | `shutil.pyi` |
+| `stat` | `stat.pyi` |
+| `struct` | `struct.pyi` |
+| `sys` | `sys/__init__.pyi` |
+| `tempfile` | `tempfile.pyi` |
+| `textwrap` | `textwrap.pyi` |
+| `threading` | `threading.pyi` |
+| `time` | `time.pyi` |
+| `types` | `types.pyi` |
+| `warnings` | `warnings.pyi` |
+| `weakref` | `weakref.pyi` |
 
 The pack is one slice of the standard library, not the standard library. It
-publishes nothing about `sys`, `pathlib`, or the other ~270
+publishes nothing about the other standard-library modules
 stdlib modules typeshed carries. A consumer must not read a name's absence
 from this pack as a statement about the standard library. The manifest
 records `completeness: complete` because that field states extraction
@@ -46,6 +75,18 @@ judge reports them as incomplete instead of proving a name absent. The
 modules the shims re-export from are pinned as well, so the declarations
 themselves are in the pack under their own module names: `posixpath.join`
 exists, `os.path.join` does not.
+
+Typeshed publishes overloaded methods as several records with one owner and
+name. The semantic-model overlay treats such records as one present member
+only when the active pack proves the complete callable family. Competing
+fields, partial families, ambiguous records, and records from different packs
+remain incomplete.
+
+The producer omits `Protocol` and `Generic` class bases only when structured
+import bindings resolve them to `typing` or `typing_extensions`. These are
+typing-only class-construction markers rather than runtime inheritance
+surfaces. A local or application-defined class with either name, and an
+unresolved spelling, remains an ordinary base.
 
 Typeshed supports Python 3.10 through 3.14, so the pack's compatibility and
 activation name the `cpython` toolchain over that range. Typeshed guards
@@ -87,12 +128,19 @@ in `notices/typeshed-stdlib-2026.8.31.txt`, which ships with the pack.
 
 ## Regeneration
 
-`scripts/public/build-pinned-python-semantic-packs.sh OUTPUT_DIR WORK_DIR` downloads
+`scripts/public/build-pinned-python-semantic-packs.sh OUTPUT_DIR WORK_DIR [CACHE_ROOT]` downloads
 the pinned archive, checks its SHA-256, extracts the stub root under the
 pinned directory name, and then generates and verifies the bundle. The
 pinned artifact is a source set rather than one file, so its digest is the
 canonical digest over the listed stub paths and bytes. Generation verifies
 that digest itself and refuses a tree that differs.
+
+When `CACHE_ROOT` is present, the recipe also installs the verified bundle
+into the catalog version derived from Bifrost's current catalog schema and
+writes `type-flow-python-pack-activation.json` at the cache root. The receipt
+records the pack id/version, manifest digest, catalog directory, and absolute
+bundle path used by the corpus measurement route. Omitting `CACHE_ROOT`
+preserves the generate-and-verify-only workflow.
 
 GitHub builds a source archive on demand. The archive digest that the script
 checks is therefore a weaker pin than the artifact digest that `generate`

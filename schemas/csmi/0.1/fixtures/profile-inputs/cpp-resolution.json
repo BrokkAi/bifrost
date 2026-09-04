@@ -1,0 +1,9 @@
+{
+  "orderedCompilerArguments": [
+    "clang++",
+    "-std=c++20",
+    "-Iinclude"
+  ],
+  "expectedCompileArgumentsDigest": "d868042524d31a745040503f32d9e5649912815d8e3a1e2636fa8124b2d62bcd",
+  "resolutionContextFixture": "profiles/cpp/0.1/fixtures/valid/resolution-context.json"
+}

@@ -89,6 +89,18 @@ pub fn ruby_semantic_identifier_range(node: Node<'_>, source: &str) -> Range {
                 end_line: node.end_position().row,
             }
         }
+        "hash_key_symbol" => {
+            let text = source.get(node.start_byte()..node.end_byte()).unwrap_or("");
+            if !text.ends_with(':') || text.len() == ':'.len_utf8() {
+                return node_range();
+            }
+            Range {
+                start_byte: node.start_byte(),
+                end_byte: node.end_byte() - ':'.len_utf8(),
+                start_line: node.start_position().row,
+                end_line: node.end_position().row,
+            }
+        }
         "delimited_symbol" => {
             let Some(content) = single_static_string_content_node(node) else {
                 return node_range();

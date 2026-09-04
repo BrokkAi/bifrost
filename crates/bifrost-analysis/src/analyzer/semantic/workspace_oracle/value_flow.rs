@@ -39,12 +39,35 @@ use crate::analyzer::semantic::{
     gap_certifies_canonical_index_identity,
 };
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GapOutcomeQuality {
     Ambiguous,
     Unproven,
     Unknown,
     Unsupported(SemanticCapability),
+}
+
+/// Combine relation evidence with the strongest typed semantic gap.
+///
+/// An unproven relation is retained in the partial artifact regardless of the
+/// top-level outcome. It must not erase a stronger explanation for why the
+/// artifact is incomplete: an unsupported capability or an unknown semantic
+/// choice is more actionable than the generic fact that one retained relation
+/// is not proven complete. Unproven relation evidence still dominates an
+/// ambiguous gap, matching the quality order used by the ICFG builder.
+fn merge_relation_quality(
+    gap_quality: Option<GapOutcomeQuality>,
+    has_unproven_relation: bool,
+) -> Option<GapOutcomeQuality> {
+    match gap_quality {
+        quality @ Some(GapOutcomeQuality::Unsupported(_) | GapOutcomeQuality::Unknown) => quality,
+        Some(GapOutcomeQuality::Unproven | GapOutcomeQuality::Ambiguous) | None
+            if has_unproven_relation =>
+        {
+            Some(GapOutcomeQuality::Unproven)
+        }
+        quality => quality,
+    }
 }
 
 fn merge_gap_quality(
@@ -2187,6 +2210,7 @@ fn publish_flow_outcome(
     gap_quality: Option<GapOutcomeQuality>,
     work: SemanticWork,
 ) -> SemanticOutcome<ValueFlowSnapshot> {
+    let quality = merge_relation_quality(gap_quality, has_unproven_relation);
     match interrupted {
         Some(Interruption::Budget(exceeded)) => SemanticOutcome::ExceededBudget {
             partial: Some(snapshot),
@@ -2197,14 +2221,12 @@ fn publish_flow_outcome(
             partial: Some(snapshot),
             work,
         },
-        None if snapshot.coverage() == CandidateCoverage::Truncated || has_unproven_relation => {
-            SemanticOutcome::Unproven {
-                partial: snapshot,
-                work,
-            }
-        }
-        None if matches!(gap_quality, Some(GapOutcomeQuality::Unsupported(_))) => {
-            let Some(GapOutcomeQuality::Unsupported(capability)) = gap_quality else {
+        None if snapshot.coverage() == CandidateCoverage::Truncated => SemanticOutcome::Unproven {
+            partial: snapshot,
+            work,
+        },
+        None if matches!(quality, Some(GapOutcomeQuality::Unsupported(_))) => {
+            let Some(GapOutcomeQuality::Unsupported(capability)) = quality else {
                 unreachable!("guard establishes unsupported gap quality")
             };
             SemanticOutcome::Unsupported {
@@ -2213,19 +2235,15 @@ fn publish_flow_outcome(
                 work,
             }
         }
-        None if matches!(gap_quality, Some(GapOutcomeQuality::Unknown)) => {
-            SemanticOutcome::Unknown {
-                partial: Some(snapshot),
-                work,
-            }
-        }
-        None if matches!(gap_quality, Some(GapOutcomeQuality::Unproven)) => {
-            SemanticOutcome::Unproven {
-                partial: snapshot,
-                work,
-            }
-        }
-        None if matches!(gap_quality, Some(GapOutcomeQuality::Ambiguous)) => {
+        None if matches!(quality, Some(GapOutcomeQuality::Unknown)) => SemanticOutcome::Unknown {
+            partial: Some(snapshot),
+            work,
+        },
+        None if matches!(quality, Some(GapOutcomeQuality::Unproven)) => SemanticOutcome::Unproven {
+            partial: snapshot,
+            work,
+        },
+        None if matches!(quality, Some(GapOutcomeQuality::Ambiguous)) => {
             SemanticOutcome::Ambiguous {
                 candidates: snapshot,
                 work,
@@ -3856,11 +3874,19 @@ impl ValueFlowOracle for WorkspaceSemanticOracle<'_> {
                 SemanticValueKind::Parameter {
                     ordinal,
                     multiplicity,
-                } => Some((*ordinal, multiplicity.clone(), value.evidence)),
+                    name,
+                    passing_mode,
+                } => Some((
+                    *ordinal,
+                    multiplicity.clone(),
+                    name.clone(),
+                    *passing_mode,
+                    value.evidence,
+                )),
                 _ => None,
             })
             .collect::<Vec<_>>();
-        formals.sort_by_key(|(ordinal, _, _)| *ordinal);
+        formals.sort_by_key(|(ordinal, _, _, _, _)| *ordinal);
 
         let mut bound_formals = std::collections::HashSet::new();
         if interrupted.is_none()
@@ -3975,65 +4001,130 @@ impl ValueFlowOracle for WorkspaceSemanticOracle<'_> {
                 break;
             }
             let actual = value_handle(call.procedure(), argument.value)?;
-            let selected = if positional_width_unknown {
-                None
-            } else {
-                match &argument.expansion {
-                    CallArgumentExpansion::Direct(
-                        crate::analyzer::semantic::ArgumentDomain::Positional
-                        | crate::analyzer::semantic::ArgumentDomain::PositionalOrKeyword,
-                    ) => formals.get(formal_cursor).and_then(
-                        |(ordinal, multiplicity, evidence)| match multiplicity {
-                            FormalMultiplicity::One => {
-                                formal_cursor += 1;
-                                Some((*ordinal, evidence, false))
+            let selected = match &argument.expansion {
+                CallArgumentExpansion::Direct(
+                    crate::analyzer::semantic::ArgumentDomain::Positional
+                    | crate::analyzer::semantic::ArgumentDomain::PositionalOrKeyword,
+                ) if !positional_width_unknown => loop {
+                    let Some((ordinal, multiplicity, _, passing_mode, evidence)) =
+                        formals.get(formal_cursor)
+                    else {
+                        break None;
+                    };
+                    match multiplicity {
+                        FormalMultiplicity::One => {
+                            formal_cursor += 1;
+                            if passing_mode.accepts_positional() && !bound_formals.contains(ordinal)
+                            {
+                                break Some((*ordinal, evidence, false, CallArgumentMember::Whole));
                             }
-                            FormalMultiplicity::Rest(
-                                crate::analyzer::semantic::ArgumentDomain::Positional
-                                | crate::analyzer::semantic::ArgumentDomain::PositionalOrKeyword,
-                            ) => Some((*ordinal, evidence, true)),
-                            FormalMultiplicity::Rest(_) => None,
-                        },
-                    ),
-                    CallArgumentExpansion::Direct(
-                        crate::analyzer::semantic::ArgumentDomain::LanguageDefined(actual),
-                    ) => {
-                        formals
-                            .get(formal_cursor)
-                            .and_then(|(ordinal, multiplicity, evidence)| match multiplicity {
-                                FormalMultiplicity::Rest(
-                                    crate::analyzer::semantic::ArgumentDomain::LanguageDefined(
-                                        expected,
-                                    ),
-                                ) if expected == actual => Some((*ordinal, evidence, true)),
-                                FormalMultiplicity::One | FormalMultiplicity::Rest(_) => None,
+                        }
+                        FormalMultiplicity::Rest(
+                            crate::analyzer::semantic::ArgumentDomain::Positional
+                            | crate::analyzer::semantic::ArgumentDomain::PositionalOrKeyword,
+                        ) if passing_mode.accepts_positional() => {
+                            break Some((*ordinal, evidence, true, CallArgumentMember::Whole));
+                        }
+                        FormalMultiplicity::Rest(_) => formal_cursor += 1,
+                    }
+                },
+                CallArgumentExpansion::Direct(
+                    crate::analyzer::semantic::ArgumentDomain::Keyword,
+                ) => {
+                    let named = argument.keyword.as_deref();
+                    let duplicate = named.is_some_and(|actual| {
+                        formals.iter().any(|(ordinal, multiplicity, name, _, _)| {
+                            matches!(multiplicity, FormalMultiplicity::One)
+                                && name.as_deref() == Some(actual)
+                                && bound_formals.contains(ordinal)
+                        })
+                    });
+                    if duplicate {
+                        None
+                    } else {
+                        let exact = named.and_then(|actual| {
+                            formals
+                                .iter()
+                                .find(|(ordinal, multiplicity, name, mode, _)| {
+                                    matches!(multiplicity, FormalMultiplicity::One)
+                                        && name.as_deref() == Some(actual)
+                                        && mode.accepts_named()
+                                        && !bound_formals.contains(ordinal)
+                                })
+                        });
+                        let rest = || {
+                            formals.iter().find(|(_, multiplicity, _, mode, _)| {
+                                matches!(
+                                    multiplicity,
+                                    FormalMultiplicity::Rest(
+                                        crate::analyzer::semantic::ArgumentDomain::Keyword
+                                            | crate::analyzer::semantic::ArgumentDomain::PositionalOrKeyword
+                                    )
+                                ) && mode.accepts_named()
+                            })
+                        };
+                        exact
+                            .or_else(rest)
+                            .map(|(ordinal, multiplicity, _, _, evidence)| {
+                                let member = named.map_or(CallArgumentMember::Whole, |name| {
+                                    CallArgumentMember::Keyword(name.into())
+                                });
+                                (
+                                    *ordinal,
+                                    evidence,
+                                    matches!(multiplicity, FormalMultiplicity::Rest(_)),
+                                    member,
+                                )
                             })
                     }
-                    CallArgumentExpansion::Spread(_) => {
-                        positional_width_unknown = true;
-                        None
-                    }
-                    CallArgumentExpansion::Unclassified
-                    | CallArgumentExpansion::Direct(
-                        crate::analyzer::semantic::ArgumentDomain::Keyword,
-                    ) => None,
                 }
+                CallArgumentExpansion::Direct(
+                    crate::analyzer::semantic::ArgumentDomain::LanguageDefined(actual),
+                ) => formals
+                    .iter()
+                    .find_map(
+                        |(ordinal, multiplicity, _, _, evidence)| match multiplicity {
+                            FormalMultiplicity::Rest(
+                                crate::analyzer::semantic::ArgumentDomain::LanguageDefined(
+                                    expected,
+                                ),
+                            ) if expected == actual => {
+                                Some((*ordinal, evidence, true, CallArgumentMember::Whole))
+                            }
+                            FormalMultiplicity::One | FormalMultiplicity::Rest(_) => None,
+                        },
+                    ),
+                CallArgumentExpansion::Spread(
+                    crate::analyzer::semantic::ArgumentDomain::Positional
+                    | crate::analyzer::semantic::ArgumentDomain::PositionalOrKeyword,
+                ) => {
+                    positional_width_unknown = true;
+                    None
+                }
+                CallArgumentExpansion::Unclassified
+                | CallArgumentExpansion::Spread(_)
+                | CallArgumentExpansion::Direct(
+                    crate::analyzer::semantic::ArgumentDomain::Positional
+                    | crate::analyzer::semantic::ArgumentDomain::PositionalOrKeyword,
+                ) => None,
             };
             let closure_evidence = vec![call_evidence.clone()];
             let mut relation_evidence = vec![closure_evidence.clone()];
-            let mapping = if let Some((ordinal, formal_evidence_id, _rest)) = selected {
+            let mapping = if let Some((ordinal, formal_evidence_id, rest, member)) = selected {
                 let mapping_evidence = dedup_evidence([
                     call_evidence.clone(),
                     evidence_handle(callee, *formal_evidence_id)?,
                 ]);
                 relation_evidence.push(mapping_evidence.clone());
                 let (proof, completeness) = evidence_quality(&mapping_evidence);
-                bound_formals.insert(ordinal);
+                if !rest {
+                    bound_formals.insert(ordinal);
+                }
                 Some((
                     mapping_evidence,
                     CallArgumentMapping::new(
                         source_index as u32,
-                        CallArgumentMember::Whole,
+                        member,
                         CallArgumentEndpoint::Value(actual),
                         ProcedurePortHandle::parameter(callee.clone(), ordinal).map_err(
                             |error| internal_contract("invalid callee parameter port", error),
@@ -4165,7 +4256,7 @@ impl ValueFlowOracle for WorkspaceSemanticOracle<'_> {
             }
         }
 
-        if formals.iter().any(|(ordinal, multiplicity, _)| {
+        if formals.iter().any(|(ordinal, multiplicity, _, _, _)| {
             matches!(multiplicity, FormalMultiplicity::One) && !bound_formals.contains(ordinal)
         }) {
             build.open = true;
@@ -4179,6 +4270,7 @@ impl ValueFlowOracle for WorkspaceSemanticOracle<'_> {
         };
         let has_unproven_relation = build.has_unproven_relation;
         let gap_quality = build.gap_quality;
+        let quality = merge_relation_quality(gap_quality, has_unproven_relation);
         let bindings =
             materialize_call_bindings(call, candidate, context, build, coverage, *self.limits())?;
         if interrupted.is_none() && !request.cancellation.is_cancelled() {
@@ -4196,14 +4288,12 @@ impl ValueFlowOracle for WorkspaceSemanticOracle<'_> {
                 partial: Some(bindings),
                 work: staged.work,
             },
-            None if coverage == CandidateCoverage::Truncated || has_unproven_relation => {
-                SemanticOutcome::Unproven {
-                    partial: bindings,
-                    work: staged.work,
-                }
-            }
-            None if matches!(gap_quality, Some(GapOutcomeQuality::Unsupported(_))) => {
-                let Some(GapOutcomeQuality::Unsupported(capability)) = gap_quality else {
+            None if coverage == CandidateCoverage::Truncated => SemanticOutcome::Unproven {
+                partial: bindings,
+                work: staged.work,
+            },
+            None if matches!(quality, Some(GapOutcomeQuality::Unsupported(_))) => {
+                let Some(GapOutcomeQuality::Unsupported(capability)) = quality else {
                     unreachable!("guard establishes unsupported gap quality")
                 };
                 SemanticOutcome::Unsupported {
@@ -4212,19 +4302,19 @@ impl ValueFlowOracle for WorkspaceSemanticOracle<'_> {
                     work: staged.work,
                 }
             }
-            None if matches!(gap_quality, Some(GapOutcomeQuality::Unknown)) => {
+            None if matches!(quality, Some(GapOutcomeQuality::Unknown)) => {
                 SemanticOutcome::Unknown {
                     partial: Some(bindings),
                     work: staged.work,
                 }
             }
-            None if matches!(gap_quality, Some(GapOutcomeQuality::Unproven)) => {
+            None if matches!(quality, Some(GapOutcomeQuality::Unproven)) => {
                 SemanticOutcome::Unproven {
                     partial: bindings,
                     work: staged.work,
                 }
             }
-            None if matches!(gap_quality, Some(GapOutcomeQuality::Ambiguous)) => {
+            None if matches!(quality, Some(GapOutcomeQuality::Ambiguous)) => {
                 SemanticOutcome::Ambiguous {
                     candidates: bindings,
                     work: staged.work,
@@ -4249,6 +4339,170 @@ mod tests {
     use crate::cancellation::CancellationToken;
 
     use crate::inline_project::InlineTestProject;
+
+    #[test]
+    fn typed_gap_quality_dominates_unproven_relation_evidence() {
+        assert_eq!(
+            merge_relation_quality(
+                Some(GapOutcomeQuality::Unsupported(SemanticCapability::Calls)),
+                true,
+            ),
+            Some(GapOutcomeQuality::Unsupported(SemanticCapability::Calls))
+        );
+        assert_eq!(
+            merge_relation_quality(Some(GapOutcomeQuality::Unknown), true),
+            Some(GapOutcomeQuality::Unknown)
+        );
+    }
+
+    #[test]
+    fn unproven_relation_evidence_keeps_its_existing_quality_floor() {
+        assert_eq!(
+            merge_relation_quality(None, true),
+            Some(GapOutcomeQuality::Unproven)
+        );
+        assert_eq!(
+            merge_relation_quality(Some(GapOutcomeQuality::Ambiguous), true),
+            Some(GapOutcomeQuality::Unproven)
+        );
+        assert_eq!(
+            merge_relation_quality(Some(GapOutcomeQuality::Unproven), true),
+            Some(GapOutcomeQuality::Unproven)
+        );
+        assert_eq!(merge_relation_quality(None, false), None);
+    }
+
+    #[test]
+    fn issue_2835_balanced_templates_preserve_their_typed_quality_bound() {
+        fn assert_run_outcomes(
+            language: Language,
+            path: &str,
+            source: &str,
+            assert_outcome: impl Fn(&SemanticOutcome<ValueFlowSnapshot>),
+        ) {
+            let project = InlineTestProject::with_language(language)
+                .file(path, source)
+                .build();
+            let file = project.file(path);
+            let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+            let cancellation = CancellationToken::default();
+            let mut materialization_budget = crate::analyzer::semantic::SemanticBudget::default();
+            let artifact = analyzer
+                .materialize_program_semantics(
+                    &file,
+                    &mut SemanticRequest::new(&mut materialization_budget, &cancellation),
+                )
+                .expect("semantic materialization runs")
+                .available_value()
+                .cloned()
+                .expect("semantic artifact is available");
+            let oracle = analyzer.semantic_oracle_provider();
+
+            for name in ["positive", "negative"] {
+                let procedure = artifact
+                    .procedures()
+                    .iter()
+                    .find(|procedure| {
+                        procedure
+                            .locator()
+                            .declaration()
+                            .segments()
+                            .last()
+                            .and_then(|segment| segment.name())
+                            == Some(name)
+                    })
+                    .and_then(|procedure| artifact.procedure_handle(procedure.id()))
+                    .unwrap_or_else(|| panic!("missing {name} procedure"));
+                let mut budget = crate::analyzer::semantic::SemanticBudget::default();
+                let outcome = oracle
+                    .procedure_relations(
+                        &procedure,
+                        &OracleCallContext::empty(),
+                        &mut SemanticRequest::new(&mut budget, &cancellation),
+                    )
+                    .expect("value-flow relation query runs");
+                assert_outcome(&outcome);
+                assert!(
+                    outcome.available_value().is_some(),
+                    "{name} must retain its partial relation artifact: {outcome:#?}"
+                );
+            }
+        }
+
+        assert_run_outcomes(
+            Language::Cpp,
+            "kernel.c",
+            r#"#include <string.h>
+struct Record { const char *key; int value; };
+int source(void) { return 1; }
+void sink(int value) {}
+void positive(void) {
+    struct Record records[2];
+    records[0].key = "record";
+    records[0].value = source();
+    for (int index = 0; index < 2; index++) {
+        if (strcmp(records[index].key, "record") == 0) sink(records[index].value);
+    }
+}
+void negative(void) {
+    struct Record records[2];
+    struct Record others[2];
+    records[0].value = source();
+    others[0].key = "record";
+    others[0].value = 0;
+    for (int index = 0; index < 2; index++) {
+        if (strcmp(others[index].key, "record") == 0) sink(others[index].value);
+    }
+}
+"#,
+            |outcome| {
+                assert!(
+                    matches!(outcome, SemanticOutcome::Unknown { .. }),
+                    "dynamic-index evidence must not hide C's unknown call resolution: {outcome:#?}"
+                );
+            },
+        );
+
+        assert_run_outcomes(
+            Language::Cpp,
+            "kernel.cpp",
+            r#"struct FlowException { int value; };
+int source() { return 1; }
+void sink(int value) {}
+void positive() {
+    try {
+        FlowException flow;
+        flow.value = source();
+        throw flow;
+    } catch (FlowException &caught) {
+        sink(caught.value);
+    }
+}
+void negative() {
+    try {
+        FlowException flow;
+        int ignored = source();
+        flow.value = 0;
+        throw flow;
+    } catch (FlowException &caught) {
+        sink(caught.value);
+    }
+}
+"#,
+            |outcome| {
+                assert!(
+                    matches!(
+                        outcome,
+                        SemanticOutcome::Unsupported {
+                            capability: SemanticCapability::ExceptionalControlFlow,
+                            ..
+                        }
+                    ),
+                    "unproven catch relations must retain C++'s typed handler-selection boundary: {outcome:#?}"
+                );
+            },
+        );
+    }
 
     #[test]
     fn active_cleanup_exceptional_completion_keeps_value_flow_open() {

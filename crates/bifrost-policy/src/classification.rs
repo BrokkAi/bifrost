@@ -7,7 +7,8 @@
 use std::cmp::Ordering;
 use std::fmt;
 
-use serde::Serialize;
+use serde::de;
+use serde::{Deserialize, Deserializer, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::composition::{PrecedenceError, PrecedenceGraph};
@@ -286,6 +287,118 @@ impl RetainedSize for ClassificationProvenance {
                 evidence_refs,
             } => retained_extra(adapter).saturating_add(retained_extra(evidence_refs)),
         })
+    }
+}
+
+/// Read one classification back through the constructors that normalize it.
+///
+/// A stored classification was normalized when it was built -- refinements
+/// sorted, deduplicated, and stripped of the broad identity -- so passing it
+/// back through [`FindingClassification::classified`] must be the identity.
+/// A stored value that is not is a load error, because a classification that
+/// re-normalizes to something else would render differently from the one that
+/// was published.
+impl<'de> Deserialize<'de> for FindingClassification {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(tag = "type", rename_all = "snake_case")]
+        enum Wire {
+            Unclassified,
+            Classified {
+                broad: TaxonomyClassification,
+                refinements: Vec<TaxonomyClassification>,
+            },
+        }
+
+        match Wire::deserialize(deserializer)? {
+            Wire::Unclassified => Ok(Self::Unclassified),
+            Wire::Classified { broad, refinements } => {
+                let expected = refinements.clone();
+                let classification =
+                    Self::classified(broad, refinements).map_err(de::Error::custom)?;
+                if classification.refinements() != expected {
+                    return Err(de::Error::custom(
+                        "a stored classification's refinements are not the normal form the \
+                         reducer produces",
+                    ));
+                }
+                Ok(classification)
+            }
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for TaxonomyClassification {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Wire {
+            taxonomy: String,
+            identifier: String,
+            name: Option<String>,
+            provenance: ClassificationProvenance,
+        }
+
+        let wire = Wire::deserialize(deserializer)?;
+        Self::try_new(wire.taxonomy, wire.identifier, wire.name, wire.provenance)
+            .map_err(de::Error::custom)
+    }
+}
+
+impl<'de> Deserialize<'de> for ClassificationProvenance {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+        enum Wire {
+            PolicyFallback,
+            PolicyRefinement {
+                refinement_index: u32,
+            },
+            FindingCombination {
+                combination_id: String,
+            },
+            AnalysisEvidence {
+                adapter: String,
+                evidence_refs: Vec<EvidenceRef>,
+            },
+        }
+
+        match Wire::deserialize(deserializer)? {
+            Wire::PolicyFallback => Ok(Self::PolicyFallback),
+            Wire::PolicyRefinement { refinement_index } => {
+                Self::policy_refinement(refinement_index).map_err(de::Error::custom)
+            }
+            Wire::FindingCombination { combination_id } => Ok(Self::FindingCombination {
+                combination_id: FindingCombinationId::new(combination_id)
+                    .map_err(de::Error::custom)?,
+            }),
+            Wire::AnalysisEvidence {
+                adapter,
+                evidence_refs,
+            } => {
+                let expected = evidence_refs.clone();
+                let provenance =
+                    Self::analysis_evidence(adapter, evidence_refs).map_err(de::Error::custom)?;
+                let Self::AnalysisEvidence { evidence_refs, .. } = &provenance else {
+                    unreachable!("analysis_evidence builds the analysis-evidence arm");
+                };
+                if evidence_refs != &expected {
+                    return Err(de::Error::custom(
+                        ClassificationError::NonCanonicalEvidenceReferences,
+                    ));
+                }
+                Ok(provenance)
+            }
+        }
     }
 }
 

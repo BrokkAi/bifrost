@@ -531,6 +531,7 @@ fn translate_summary_row(
             input,
             exit_kind: AuthoredSummaryExitKind::Normal,
             output: authored_output.clone(),
+            value_transfer: None,
         });
     }
     builder.add_evidence(FoundryEvidence {

@@ -95,13 +95,14 @@ pub fn has_object_database(root: &Path) -> bool {
 /// Resolve the primary repository root. Linked worktrees collapse to the
 /// checkout that owns the common object database.
 pub fn primary_repo_root(repo: &Repository) -> Option<PathBuf> {
-    if repo.is_bare() {
-        return None;
-    }
-    if repo.is_worktree() {
-        return repo.commondir().parent().map(Path::to_path_buf);
-    }
-    repo.workdir().map(Path::to_path_buf)
+    let root = if repo.is_bare() {
+        None
+    } else if repo.is_worktree() {
+        repo.commondir().parent().map(Path::to_path_buf)
+    } else {
+        repo.workdir().map(Path::to_path_buf)
+    };
+    root.map(|root| root.canonicalize().unwrap_or(root))
 }
 
 /// Resolve the generated cache directory under `.bifrost/cache` at the primary

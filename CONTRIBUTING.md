@@ -474,7 +474,11 @@ Use one explicit handoff from source projection to release publication:
    few minutes, so a correction based on the qualified source is routinely not
    a fast-forward of `master` by the time it can be made. The release branch is
    the ref that holds still for the length of a release. Merge it back into
-   `master` after the tag exists.
+   `master` after the tag exists. A remote branch named `vX.Y.Z-rc` or
+   `*/vX.Y.Z-rc` also locks the four-hour scheduled projection of private
+   `master` while its version is newer than the latest stable public tag, so
+   scheduled publication cannot move public `master` during this handoff.
+   Delete an abandoned RC branch to release its lock.
 1. Project the release branch's commit to public `master`, then wait for
    public CI to validate that projection.
 2. Dispatch `Release readiness` from the public repository with the exact

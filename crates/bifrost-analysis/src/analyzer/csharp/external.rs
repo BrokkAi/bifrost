@@ -11,8 +11,8 @@ use crate::analyzer::semantic_model::{
     MemberFact, MemberIdentity, MemberKind, NameSelector, Parameter, Producer, ProducerDiagnostic,
     ProducerDiagnosticSeverity, Provenance, ResolvedDependency, ResolvedDependencyArtifact, Safety,
     SemanticModelActivationEvidence, Signature, SuppressedDiagnostics, TypeFact, TypeIdentity,
-    TypeKind, TypeRef, Visibility, member_declaration_id, normalize_artifact_locator_paths,
-    read_exact_artifact_while, type_declaration_id,
+    TypeKind, TypeRef, TypeRefReferenceKind, Visibility, member_declaration_id,
+    normalize_artifact_locator_paths, read_exact_artifact_while, type_declaration_id,
 };
 use crate::analyzer::topology::DependencyScope;
 use crate::analyzer::{CSharpAnalyzerConfig, Project};
@@ -151,6 +151,7 @@ impl DecodedType {
             Self::Pointer(_) => Err("pointer types are not representable"),
             Self::ByRef(inner) => Ok(TypeRef::ByRef {
                 element: Box::new(inner.type_ref(owner_type_parameters, member_type_parameters)?),
+                reference_kind: TypeRefReferenceKind::Lvalue,
             }),
         }
     }
@@ -726,7 +727,7 @@ fn decoded_type_from_semantic(
             )?),
             rank: 1,
         }),
-        TypeRef::ByRef { element } => Some(DecodedType::ByRef(Box::new(
+        TypeRef::ByRef { element, .. } => Some(DecodedType::ByRef(Box::new(
             decoded_type_from_semantic(element, owner_parameters, member_parameters)?,
         ))),
         TypeRef::Declared { .. }
@@ -1306,6 +1307,7 @@ impl CSharpAssemblyPackProducer {
             completeness,
             safety: request.safety.clone(),
             carried_sources: Vec::new(),
+            cpp_portability: None,
             shards: vec![AuthoredShard {
                 id: "declarations.external".to_owned(),
                 activation,

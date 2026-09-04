@@ -18,7 +18,15 @@ define_work_dimensions! {
     #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
     pub enum SemanticBudgetDimension;
     /// Work performed or limits applied while materializing semantic facts.
-    #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize)]
+    ///
+    /// Deserializable because a reused policy evaluation unit replays the
+    /// exact semantic charge its own work made, and that charge outlives the
+    /// process that measured it
+    /// (`.agents/plans/impact-sliced-diff-base.md`, Decision Log (5c)).
+    #[derive(
+        Debug, Default, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize,
+    )]
+    #[serde(deny_unknown_fields)]
     pub struct SemanticWork;
     all: pub [16];
     SourceBytes => source_bytes = 16 * 1024 * 1024,

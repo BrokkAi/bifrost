@@ -495,6 +495,7 @@ pub(crate) fn synthesize_summary_module(
     }
     let module = module_code_unit(file);
     projection.top_level_declarations.push(module.clone());
+    projection.declarations.push(module.clone());
     projection.ranges.entry(module).or_default().push(Range {
         start_byte: 0,
         end_byte: source.len(),

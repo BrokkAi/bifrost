@@ -48,8 +48,8 @@ use crate::{
         POLICY_EXIT_UNRELIABLE, PolicyBaselineOptions, PolicyBaselineSource, PolicyBatchOutcome,
         PolicyEvaluationDate, PolicyEvaluationInput, PolicyEvaluationOptions, PolicyExplanation,
         PolicyFailOn, PolicyFindingId, PolicyHostActivationContext, PolicyId,
-        PolicyNearMissRanking, PolicyReportDocument, PolicyScopeOptions, PolicyScopeSource,
-        PolicyStageTiming, PolicySuppressionOptions, PolicySuppressionSource,
+        PolicyNearMissRanking, PolicyReportDocument, PolicyRun, PolicyScopeOptions,
+        PolicyScopeSource, PolicyStageTiming, PolicySuppressionOptions, PolicySuppressionSource,
         built_in_policy_catalog, explain_policy_inputs, rank_policy_near_misses,
         workspace_snapshot_deadline_outcome_with_preflight,
     },
@@ -2184,7 +2184,8 @@ fn decode_run_policy_arguments(
             .with_scope(scope)
             .with_baseline(baseline)
             .with_fail_on(fail_on)
-            .with_incremental(params.incremental.unwrap_or(true));
+            .with_incremental(params.incremental.unwrap_or(true))
+            .with_policy_timings(params.include_stage_timings);
     if let Some(revision) = params.diff_base {
         if revision.is_empty()
             || revision.len() > crate::mcp_extended::MAX_RUN_POLICY_DIFF_BASE_BYTES
@@ -2357,6 +2358,24 @@ impl SearchToolsService {
         Self::new_manual_from_workspace(project, workspace)
     }
 
+    /// Progress-reporting sibling of [`Self::new_manual_persisted_for_project`].
+    pub fn new_manual_persisted_with_progress_for_project<F>(
+        project: Arc<dyn Project>,
+        config: AnalyzerConfig,
+        progress: F,
+    ) -> Result<Self, String>
+    where
+        F: Fn(crate::analyzer::BuildProgressEvent) + Send + Sync + 'static,
+    {
+        let workspace = WorkspaceAnalyzer::build_persisted_without_automatic_gc_with_progress(
+            Arc::clone(&project),
+            config,
+            progress,
+        )
+        .map_err(|error| format!("Failed to build persisted workspace: {error}"))?;
+        Self::new_manual_from_workspace(project, workspace)
+    }
+
     fn new_manual_from_workspace(
         project: Arc<dyn Project>,
         workspace: WorkspaceAnalyzer,
@@ -2441,6 +2460,26 @@ impl SearchToolsService {
                 .finish("evaluate_policy_inputs", result)
                 .map_err(|error| error.to_string());
         }
+    }
+
+    /// Evaluate one canonical policy batch and observe each finalized run.
+    ///
+    /// The observer runs only after the normal batch has finished constructing
+    /// its canonical report, so it sees the same retained findings,
+    /// suppressions, completion state, and truncation decisions as every other
+    /// report consumer. An observer cannot alter evaluation behavior.
+    pub fn evaluate_policy_inputs_with_observer(
+        &self,
+        root: &Path,
+        policy_inputs: &[PolicyEvaluationInput],
+        options: &PolicyEvaluationOptions,
+        mut observer: impl FnMut(&PolicyRun),
+    ) -> Result<PolicyBatchOutcome, String> {
+        let outcome = self.evaluate_policy_inputs(root, policy_inputs, options)?;
+        for run in outcome.report().runs() {
+            observer(run);
+        }
+        Ok(outcome)
     }
 
     /// Register one already-compiled protocol and pre-resolved binding plan for
@@ -5632,10 +5671,6 @@ mod watcher_startup_tests {
     use std::time::Duration;
 
     const WATCHER_FAILURE: &str = "injected watcher startup failure";
-    // Session construction can take roughly 100 seconds on the smallest hosted
-    // runner. This is a hang watchdog, not a workspace-startup performance
-    // contract.
-    const WATCHER_STARTUP_TIMEOUT: Duration = Duration::from_secs(180);
 
     fn workspace(file: &str, source: &str) -> (tempfile::TempDir, PathBuf) {
         let temp = tempfile::tempdir().unwrap();
@@ -5856,7 +5891,8 @@ mod watcher_startup_tests {
         // Under the full library suite, persisted workspace construction can
         // legitimately delay the first watcher-starter callback well beyond
         // the single-test runtime. Keep a bounded hang watchdog here, but do
-        // not treat a short callback threshold as a performance contract.
+        // not treat five seconds as a suite-wide performance contract.
+        const STARTUP_PUBLISH_TIMEOUT: Duration = Duration::from_secs(30);
         let (_temp, root) = workspace("Concurrent.java", "class Concurrent {}\n");
         let calls = Arc::new(AtomicUsize::new(0));
         let (startup_started_tx, startup_started_rx) = mpsc::channel();
@@ -5903,7 +5939,7 @@ mod watcher_startup_tests {
             .collect::<Vec<_>>();
         barrier.wait();
         startup_started_rx
-            .recv_timeout(WATCHER_STARTUP_TIMEOUT)
+            .recv_timeout(STARTUP_PUBLISH_TIMEOUT)
             .expect("one caller should begin watcher startup");
         for _ in 0..CALLERS {
             release_startup_tx
@@ -5957,7 +5993,7 @@ mod watcher_startup_tests {
             .bind_client_workspace(root)
             .expect("client binding should start a deferred build");
         startup_started_rx
-            .recv_timeout(WATCHER_STARTUP_TIMEOUT)
+            .recv_timeout(Duration::from_secs(30))
             .expect("deferred build should wait in watcher startup");
 
         let querying = Arc::clone(&service);
@@ -6104,6 +6140,59 @@ mod watcher_startup_tests {
     }
 
     #[test]
+    fn persisted_manual_service_forwards_analyzer_build_progress() {
+        let (_temp, root) = workspace("Progress.js", "export const answer = 42;\n");
+        let project: Arc<dyn Project> =
+            Arc::new(FilesystemProject::new(root).expect("filesystem project should open"));
+        let observed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed_for_progress = Arc::clone(&observed);
+
+        SearchToolsService::new_manual_persisted_with_progress_for_project(
+            project,
+            AnalyzerConfig::default(),
+            move |_| {
+                observed_for_progress.fetch_add(1, Ordering::Relaxed);
+            },
+        )
+        .expect("manual persisted service should start");
+
+        assert!(observed.load(Ordering::Relaxed) > 0);
+    }
+
+    #[test]
+    fn policy_observer_receives_the_final_canonical_runs() {
+        let (_temp, root) = workspace("Observed.js", "eval(userInput);\n");
+        let service =
+            SearchToolsService::new_manual_ephemeral(root.clone()).expect("manual service");
+        let catalog = built_in_policy_catalog().expect("built-in policy catalog");
+        let selected = catalog
+            .select(&BuiltInPolicySelection {
+                policy_ids: vec!["bifrost.correctness.dynamic-evaluation".to_owned()],
+                ..BuiltInPolicySelection::default()
+            })
+            .expect("select policy");
+        let inputs = selected
+            .into_iter()
+            .map(|policy| {
+                PolicyEvaluationInput::embedded(policy.source_identity(), policy.source())
+            })
+            .collect::<Vec<_>>();
+        let options = PolicyEvaluationOptions::new(
+            PolicyEvaluationDate::from_ymd(2026, 9, 3).expect("fixed date"),
+        );
+        let mut observed = Vec::new();
+
+        let outcome = service
+            .evaluate_policy_inputs_with_observer(&root, &inputs, &options, |run| {
+                observed.push(run.clone());
+            })
+            .expect("policy evaluation");
+
+        assert_eq!(observed, outcome.report().runs());
+        assert_eq!(observed.len(), 1);
+    }
+
+    #[test]
     fn issue_1296_run_policy_snapshot_deadline_returns_canonical_report() {
         let (_temp, root) = workspace("DeferredPolicy.java", "class DeferredPolicy {}\n");
         let (startup_started_tx, startup_started_rx) = mpsc::channel();
@@ -6125,7 +6214,7 @@ mod watcher_startup_tests {
             .bind_client_workspace(root)
             .expect("client binding should start a deferred build");
         startup_started_rx
-            .recv_timeout(WATCHER_STARTUP_TIMEOUT)
+            .recv_timeout(Duration::from_secs(30))
             .expect("deferred build should reach watcher startup");
         let cancellation = CancellationToken::default().with_timeout(Duration::ZERO);
 
@@ -6225,7 +6314,7 @@ mod watcher_startup_tests {
             .bind_client_workspace(root)
             .expect("client binding should start a deferred build");
         startup_started_rx
-            .recv_timeout(WATCHER_STARTUP_TIMEOUT)
+            .recv_timeout(Duration::from_secs(30))
             .expect("deferred build should reach watcher startup");
 
         let result = service
@@ -6283,6 +6372,8 @@ mod watcher_startup_tests {
     #[test]
     fn valid_suppression_preflight_is_carried_into_policy_execution() {
         let (_temp, root) = workspace("Policy.java", "class Policy {}");
+        let service = SearchToolsService::new_manual_ephemeral(root.clone())
+            .expect("manual service should start");
         let suppression_path = root.join(".bifrost/suppressions.json");
         std::fs::create_dir_all(suppression_path.parent().expect("suppression parent"))
             .expect("create suppression directory");
@@ -6291,13 +6382,6 @@ mod watcher_startup_tests {
             r#"{"schema_version":1,"suppressions":[]}"#,
         )
         .expect("write valid suppressions");
-        std::fs::write(
-            root.join(".bifrost/packs.json"),
-            r#"{"schema_version":1,"ecosystems":[]}"#,
-        )
-        .expect("disable unrelated dependency packs");
-        let service = SearchToolsService::new_manual_ephemeral(root.clone())
-            .expect("manual service should start");
         let arguments = json!({
             "policy_ids": ["bifrost.correctness.dynamic-evaluation"],
             "evaluation_date": "2026-07-29",
@@ -6357,7 +6441,7 @@ mod watcher_startup_tests {
             .bind_client_workspace(root)
             .expect("client binding should start a deferred build");
         startup_started_rx
-            .recv_timeout(WATCHER_STARTUP_TIMEOUT)
+            .recv_timeout(Duration::from_secs(30))
             .expect("deferred build should reach watcher startup");
         let cancellation = CancellationToken::default().with_timeout(Duration::ZERO);
 
@@ -6428,7 +6512,7 @@ mod watcher_startup_tests {
             .bind_client_workspace(root)
             .expect("client binding should start one deferred build");
         startup_started_rx
-            .recv_timeout(WATCHER_STARTUP_TIMEOUT)
+            .recv_timeout(Duration::from_secs(30))
             .expect("deferred build should reach watcher startup");
 
         let waiters = (0..2)
@@ -6542,7 +6626,7 @@ mod watcher_startup_tests {
                 release_first_rx
                     .lock()
                     .expect("release lock")
-                    .recv_timeout(WATCHER_STARTUP_TIMEOUT)
+                    .recv_timeout(Duration::from_secs(5))
                     .expect("test should release the first build");
                 let watcher = ProjectChangeWatcher::start_polling_with_claimed_files_for_tests(
                     project,
@@ -6565,7 +6649,7 @@ mod watcher_startup_tests {
             .bind_client_workspace(first_root)
             .expect("first client binding should start");
         first_started_rx
-            .recv_timeout(WATCHER_STARTUP_TIMEOUT)
+            .recv_timeout(Duration::from_secs(30))
             .expect("first build should reach watcher startup");
         service
             .bind_client_workspace(second_root.clone())
@@ -6584,7 +6668,7 @@ mod watcher_startup_tests {
             .send(())
             .expect("release superseded workspace build");
         first_finished_rx
-            .recv_timeout(WATCHER_STARTUP_TIMEOUT)
+            .recv_timeout(Duration::from_secs(5))
             .expect("superseded workspace build should finish");
         assert_eq!(service.active_workspace_root(), Some(second_root));
     }

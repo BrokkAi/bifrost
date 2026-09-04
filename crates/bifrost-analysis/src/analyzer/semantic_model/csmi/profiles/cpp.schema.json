@@ -1,0 +1,215 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://csmi.brokk.ai/schema/profiles/cpp/0.1/schema.json",
+  "title": "CSMI C and C++ interoperability profile 0.1.0",
+  "description": "C/C++ resolution evidence and structured C++ declaration relationships for csmi.c-cpp-resolution and csmi.cpp 0.1.0.",
+  "oneOf": [
+    { "$ref": "#/$defs/resolutionContext" },
+    { "$ref": "#/$defs/typeAlias" },
+    { "$ref": "#/$defs/specialMember" }
+  ],
+  "$defs": {
+    "nonEmptyString": { "type": "string", "minLength": 1 },
+    "localId": { "type": "string", "pattern": "^[A-Za-z][A-Za-z0-9._-]*$" },
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "artifactDigest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["algorithm", "coverage", "value"],
+      "properties": {
+        "algorithm": { "const": "sha-256" },
+        "coverage": { "$ref": "#/$defs/nonEmptyString" },
+        "canonicalization": { "type": "string", "format": "uri" },
+        "value": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "artifactSelector": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["purl", "digests"],
+      "properties": {
+        "purl": { "type": "string", "pattern": "^pkg:[^@]+@[^/?#]+(?:\\?[^#]+)?$" },
+        "digests": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/artifactDigest" }
+        }
+      }
+    },
+    "descriptor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["role", "name", "disambiguator"],
+      "properties": {
+        "role": { "enum": ["namespace", "type", "callable"] },
+        "name": { "$ref": "#/$defs/nonEmptyString" },
+        "disambiguator": { "$ref": "#/$defs/nonEmptyString" }
+      }
+    },
+    "symbolKey": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["artifactSelectors", "scheme", "schemeVersion", "stability", "descriptors"],
+      "properties": {
+        "artifactSelectors": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/artifactSelector" }
+        },
+        "scheme": { "const": "csmi.cpp.declaration" },
+        "schemeVersion": { "const": "0.1.0" },
+        "stability": { "const": "portable" },
+        "descriptors": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/descriptor" }
+        }
+      }
+    },
+    "canonicalType": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "name"],
+          "properties": {
+            "kind": { "const": "fundamental" },
+            "name": { "enum": ["char"] }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "symbol"],
+          "properties": {
+            "kind": { "const": "declared" },
+            "symbol": { "$ref": "#/$defs/symbolKey" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "primary", "arguments"],
+          "properties": {
+            "kind": { "const": "template-specialization" },
+            "primary": { "$ref": "#/$defs/symbolKey" },
+            "arguments": {
+              "type": "array",
+              "minItems": 1,
+              "items": { "$ref": "#/$defs/canonicalType" }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "qualifiers", "type"],
+          "properties": {
+            "kind": { "const": "qualified" },
+            "qualifiers": {
+              "type": "array",
+              "minItems": 1,
+              "uniqueItems": true,
+              "items": { "enum": ["const", "volatile"] }
+            },
+            "type": { "$ref": "#/$defs/canonicalType" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "referenceKind", "referent"],
+          "properties": {
+            "kind": { "const": "reference" },
+            "referenceKind": { "enum": ["lvalue", "rvalue"] },
+            "referent": { "$ref": "#/$defs/canonicalType" }
+          }
+        }
+      ]
+    },
+    "resolutionContext": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "language", "translationUnit", "compileArgumentsDigest", "directHeaders", "headerClosure"],
+      "properties": {
+        "kind": { "const": "resolution-context" },
+        "language": { "enum": ["c", "c++"] },
+        "translationUnit": { "$ref": "#/$defs/nonEmptyString" },
+        "compileArgumentsDigest": { "$ref": "#/$defs/sha256" },
+        "directHeaders": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["includeName", "artifact"],
+            "properties": {
+              "includeName": { "$ref": "#/$defs/nonEmptyString" },
+              "artifact": { "$ref": "#/$defs/artifactSelector" }
+            }
+          }
+        },
+        "headerClosure": { "const": "complete" }
+      }
+    },
+    "cppResolutionContext": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["vocabulary", "version", "contextDigest", "language", "headerClosure"],
+      "properties": {
+        "vocabulary": { "const": "csmi.c-cpp-resolution" },
+        "version": { "const": "0.1.0" },
+        "contextDigest": { "$ref": "#/$defs/sha256" },
+        "language": { "const": "c++" },
+        "headerClosure": { "const": "complete" }
+      }
+    },
+    "typeAlias": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "language", "alias", "target", "resolutionContext"],
+      "properties": {
+        "kind": { "const": "type-alias" },
+        "language": { "const": "c++" },
+        "alias": { "$ref": "#/$defs/localId" },
+        "target": { "$ref": "#/$defs/canonicalType" },
+        "resolutionContext": { "$ref": "#/$defs/cppResolutionContext" }
+      }
+    },
+    "callableSignature": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["callableKind", "owner", "parameters"],
+      "properties": {
+        "callableKind": { "enum": ["constructor", "method"] },
+        "owner": { "$ref": "#/$defs/symbolKey" },
+        "receiver": { "$ref": "#/$defs/canonicalType" },
+        "parameters": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 1,
+          "items": { "$ref": "#/$defs/canonicalType" }
+        },
+        "result": { "$ref": "#/$defs/canonicalType" }
+      }
+    },
+    "specialMember": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "language", "owner", "member", "operation", "signature", "memberDisambiguator", "resolutionContext"],
+      "properties": {
+        "kind": { "const": "special-member" },
+        "language": { "const": "c++" },
+        "owner": { "$ref": "#/$defs/localId" },
+        "member": { "$ref": "#/$defs/localId" },
+        "operation": { "enum": ["copy-constructor", "copy-assignment", "move-constructor"] },
+        "signature": { "$ref": "#/$defs/callableSignature" },
+        "memberDisambiguator": { "type": "string", "pattern": "^cppsig-0\\.1:[0-9a-f]{64}$" },
+        "resolutionContext": { "$ref": "#/$defs/cppResolutionContext" }
+      }
+    }
+  }
+}

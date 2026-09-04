@@ -13,7 +13,21 @@ pub const CSMI_SEMANTIC_MODEL_VERSION: &str = "0.1";
 pub const CSMI_SERIALIZATION_VERSION: &str = "0.1-json";
 pub const CSMI_PACK_FORMAT_VERSION: &str = "0.1";
 pub const CSMI_SEMANTIC_DOCUMENT_MEDIA_TYPE: &str = "application/vnd.csmi.semantic-model.v0.1+json";
-pub const CSMI_NORMATIVE_COMMIT: &str = "a4386f51fc060608da61e81aca4150d2af72f2b5";
+pub const CSMI_NORMATIVE_COMMIT: &str = "d0e8535fc73dc5804c191d5a2a218ef63083df64";
+pub const CSMI_VALUE_TRANSFER_PROFILE_ID: &str = "csmi.value-transfer";
+pub const CSMI_VALUE_TRANSFER_PROFILE_VERSION: &str = "0.1.0";
+pub const CSMI_VALUE_TRANSFER_PROFILE_SCHEMA: &str =
+    "https://csmi.brokk.ai/schema/profiles/value-transfer/0.1/schema.json";
+pub const CSMI_C_CPP_RESOLUTION_PROFILE_ID: &str = "csmi.c-cpp-resolution";
+pub const CSMI_C_CPP_RESOLUTION_PROFILE_VERSION: &str = "0.1.0";
+pub const CSMI_C_CPP_RESOLUTION_PROFILE_SCHEMA: &str =
+    "https://csmi.brokk.ai/schema/profiles/cpp/0.1/schema.json";
+pub const CSMI_CPP_PROFILE_ID: &str = "csmi.cpp";
+pub const CSMI_CPP_PROFILE_VERSION: &str = "0.1.0";
+pub const CSMI_CPP_PROFILE_SCHEMA: &str =
+    "https://csmi.brokk.ai/schema/profiles/cpp/0.1/schema.json";
+pub const CSMI_CPP_DECLARATION_IDENTITY_SCHEME: &str = "csmi.cpp.declaration";
+pub const CSMI_CPP_DECLARATION_IDENTITY_SCHEME_VERSION: &str = "0.1.0";
 
 pub type LocalId = String;
 pub type AbsoluteUri = String;
@@ -995,5 +1009,513 @@ impl CsmiDocument {
             Self::Semantic(_) => None,
             Self::Manifest(manifest) => Some(manifest),
         }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum CsmiValueTransferProfilePayload {
+    Transfer(CsmiValueTransferAttachment),
+    TypeValue(CsmiTypeValueSemantics),
+    ImplicitOperation(CsmiImplicitOperationFact),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CsmiValueTransferAttachment {
+    pub kind: CsmiValueTransferAttachmentKind,
+    #[serde(rename = "transferKind")]
+    pub transfer_kind: CsmiValueTransferKind,
+    pub operation: CsmiValueTransferOperation,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CsmiValueTransferAttachmentKind {
+    #[serde(rename = "transfer")]
+    Transfer,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum CsmiValueTransferKind {
+    Copy {},
+    AggregateCopy {},
+    Move { invalidation: CsmiMoveInvalidation },
+    Conversion { preservation: CsmiValuePreservation },
+    Boxing {},
+    Unboxing {},
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CsmiMoveInvalidation {
+    Invalidated,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CsmiValuePreservation {
+    Identity,
+    Preserving,
+    Changing,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum CsmiValueTransferOperation {
+    None {},
+    Implicit { symbol: LocalId },
+    Unknown { limitation: CsmiProfileLimitation },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CsmiProfileLimitation {
+    pub kind: CsmiProfileLimitationKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CsmiProfileLimitationKind {
+    BudgetExhausted,
+    Cancelled,
+    Unsupported,
+    UnresolvedIdentity,
+    AmbiguousIdentity,
+    IncompleteInput,
+    Other,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CsmiTypeValueSemantics {
+    pub kind: CsmiTypeValueSemanticsKind,
+    pub r#type: LocalId,
+    pub aspect: CsmiTypeValueSemanticsAspect,
+    pub semantics: CsmiTypeSemantics,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CsmiTypeValueSemanticsKind {
+    #[serde(rename = "type-value-semantics")]
+    TypeValueSemantics,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CsmiTypeValueSemanticsAspect {
+    Copy,
+    Move,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum CsmiTypeSemantics {
+    Trivial {},
+    ViaMember {
+        member: LocalId,
+    },
+    Invalidating {},
+    Unknown {
+        limitation: CsmiProfileLimitation,
+    },
+    Unsupported {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CsmiImplicitOperationFact {
+    pub kind: CsmiImplicitOperationKind,
+    pub symbol: LocalId,
+    pub owner: LocalId,
+    pub operation: CsmiImplicitOperationRole,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<LocalId>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CsmiImplicitOperationKind {
+    #[serde(rename = "implicit-operation")]
+    ImplicitOperation,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CsmiImplicitOperationRole {
+    CopyConstructor,
+    MoveConstructor,
+    CopyAssignment,
+    MoveAssignment,
+    ConversionOperator,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum CsmiCppProfilePayload {
+    ResolutionContext(CsmiResolutionContext),
+    TypeAlias(CsmiCppTypeAliasFact),
+    SpecialMember(Box<CsmiCppSpecialMemberFact>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CsmiCppArtifactDigest {
+    pub algorithm: CsmiCppDigestAlgorithm,
+    pub coverage: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub canonicalization: Option<AbsoluteUri>,
+    pub value: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CsmiCppDigestAlgorithm {
+    #[serde(rename = "sha-256")]
+    Sha256,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CsmiCppArtifactSelector {
+    pub purl: String,
+    #[serde(rename = "digests")]
+    pub digests: Vec<CsmiCppArtifactDigest>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CsmiCppDescriptor {
+    pub role: CsmiCppDescriptorRole,
+    pub name: String,
+    pub disambiguator: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CsmiCppDescriptorRole {
+    Namespace,
+    Type,
+    Callable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CsmiCppSymbolKey {
+    #[serde(rename = "artifactSelectors")]
+    pub artifact_selectors: Vec<CsmiCppArtifactSelector>,
+    pub scheme: String,
+    #[serde(rename = "schemeVersion")]
+    pub scheme_version: String,
+    pub stability: CsmiCppIdentityStability,
+    pub descriptors: Vec<CsmiCppDescriptor>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CsmiCppIdentityStability {
+    #[serde(rename = "portable")]
+    Portable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum CsmiCppCanonicalType {
+    Fundamental(CsmiCppFundamentalType),
+    Declared(CsmiCppDeclaredType),
+    TemplateSpecialization(CsmiCppTemplateSpecialization),
+    Qualified(CsmiCppQualifiedType),
+    Reference(CsmiCppReferenceType),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CsmiCppFundamentalType {
+    pub kind: CsmiCppFundamentalTypeKind,
+    pub name: CsmiCppFundamentalTypeName,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CsmiCppFundamentalTypeKind {
+    #[serde(rename = "fundamental")]
+    Fundamental,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CsmiCppFundamentalTypeName {
+    #[serde(rename = "char")]
+    Char,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CsmiCppDeclaredType {
+    pub kind: CsmiCppDeclaredTypeKind,
+    pub symbol: CsmiCppSymbolKey,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CsmiCppDeclaredTypeKind {
+    #[serde(rename = "declared")]
+    Declared,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CsmiCppTemplateSpecialization {
+    pub kind: CsmiCppTemplateSpecializationKind,
+    pub primary: CsmiCppSymbolKey,
+    pub arguments: Vec<CsmiCppCanonicalType>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CsmiCppTemplateSpecializationKind {
+    #[serde(rename = "template-specialization")]
+    TemplateSpecialization,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CsmiCppQualifiedType {
+    pub kind: CsmiCppQualifiedTypeKind,
+    pub qualifiers: Vec<CsmiCppTypeQualifier>,
+    pub r#type: Box<CsmiCppCanonicalType>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CsmiCppQualifiedTypeKind {
+    #[serde(rename = "qualified")]
+    Qualified,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CsmiCppTypeQualifier {
+    Const,
+    Volatile,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CsmiCppReferenceType {
+    pub kind: CsmiCppReferenceTypeKind,
+    #[serde(rename = "referenceKind")]
+    pub reference_kind: CsmiCppReferenceKind,
+    pub referent: Box<CsmiCppCanonicalType>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CsmiCppReferenceTypeKind {
+    #[serde(rename = "reference")]
+    Reference,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CsmiCppReferenceKind {
+    Lvalue,
+    Rvalue,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CsmiCppDirectHeader {
+    #[serde(rename = "includeName")]
+    pub include_name: String,
+    pub artifact: CsmiCppArtifactSelector,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CsmiResolutionContext {
+    pub kind: CsmiResolutionContextKind,
+    pub language: CsmiCppLanguage,
+    #[serde(rename = "translationUnit")]
+    pub translation_unit: String,
+    #[serde(rename = "compileArgumentsDigest")]
+    pub compile_arguments_digest: String,
+    #[serde(rename = "directHeaders")]
+    pub direct_headers: Vec<CsmiCppDirectHeader>,
+    #[serde(rename = "headerClosure")]
+    pub header_closure: CsmiCompleteHeaderClosure,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CsmiResolutionContextKind {
+    #[serde(rename = "resolution-context")]
+    ResolutionContext,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CsmiCppLanguage {
+    #[serde(rename = "c")]
+    C,
+    #[serde(rename = "c++")]
+    Cpp,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CsmiCompleteHeaderClosure {
+    #[serde(rename = "complete")]
+    Complete,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CsmiCppResolutionContext {
+    pub vocabulary: CsmiCCppResolutionVocabulary,
+    pub version: String,
+    #[serde(rename = "contextDigest")]
+    pub context_digest: String,
+    pub language: CsmiCppProfileLanguage,
+    #[serde(rename = "headerClosure")]
+    pub header_closure: CsmiCompleteHeaderClosure,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CsmiCCppResolutionVocabulary {
+    #[serde(rename = "csmi.c-cpp-resolution")]
+    CCppResolution,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CsmiCppProfileLanguage {
+    #[serde(rename = "c++")]
+    Cpp,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CsmiCppTypeAliasFact {
+    pub kind: CsmiCppTypeAliasKind,
+    pub language: CsmiCppProfileLanguage,
+    pub alias: LocalId,
+    pub target: CsmiCppCanonicalType,
+    #[serde(rename = "resolutionContext")]
+    pub resolution_context: CsmiCppResolutionContext,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CsmiCppTypeAliasKind {
+    #[serde(rename = "type-alias")]
+    TypeAlias,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CsmiCppCallableSignature {
+    #[serde(rename = "callableKind")]
+    pub callable_kind: CsmiCppCallableKind,
+    pub owner: CsmiCppSymbolKey,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receiver: Option<CsmiCppCanonicalType>,
+    pub parameters: Vec<CsmiCppCanonicalType>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<CsmiCppCanonicalType>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CsmiCppCallableKind {
+    Constructor,
+    Method,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CsmiCppSpecialMemberFact {
+    pub kind: CsmiCppSpecialMemberKind,
+    pub language: CsmiCppProfileLanguage,
+    pub owner: LocalId,
+    pub member: LocalId,
+    pub operation: CsmiCppSpecialMemberOperation,
+    pub signature: CsmiCppCallableSignature,
+    #[serde(rename = "memberDisambiguator")]
+    pub member_disambiguator: String,
+    #[serde(rename = "resolutionContext")]
+    pub resolution_context: CsmiCppResolutionContext,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CsmiCppSpecialMemberKind {
+    #[serde(rename = "special-member")]
+    SpecialMember,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CsmiCppSpecialMemberOperation {
+    CopyConstructor,
+    CopyAssignment,
+    MoveConstructor,
+}
+
+#[cfg(test)]
+mod profile_payload_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn value_transfer_attachment_round_trips() {
+        let payload = CsmiValueTransferProfilePayload::Transfer(CsmiValueTransferAttachment {
+            kind: CsmiValueTransferAttachmentKind::Transfer,
+            transfer_kind: CsmiValueTransferKind::Move {
+                invalidation: CsmiMoveInvalidation::Invalidated,
+            },
+            operation: CsmiValueTransferOperation::Unknown {
+                limitation: CsmiProfileLimitation {
+                    kind: CsmiProfileLimitationKind::UnresolvedIdentity,
+                    message: None,
+                },
+            },
+        });
+        let value = serde_json::to_value(&payload).expect("payload serializes");
+        assert_eq!(
+            value,
+            json!({
+                "kind": "transfer",
+                "transferKind": {"kind": "move", "invalidation": "invalidated"},
+                "operation": {
+                    "kind": "unknown",
+                    "limitation": {"kind": "unresolved-identity"},
+                },
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<CsmiValueTransferProfilePayload>(value)
+                .expect("payload parses"),
+            payload
+        );
+    }
+
+    #[test]
+    fn cpp_type_alias_round_trips() {
+        let payload = CsmiCppProfilePayload::TypeAlias(CsmiCppTypeAliasFact {
+            kind: CsmiCppTypeAliasKind::TypeAlias,
+            language: CsmiCppProfileLanguage::Cpp,
+            alias: "alias".to_string(),
+            target: CsmiCppCanonicalType::Fundamental(CsmiCppFundamentalType {
+                kind: CsmiCppFundamentalTypeKind::Fundamental,
+                name: CsmiCppFundamentalTypeName::Char,
+            }),
+            resolution_context: CsmiCppResolutionContext {
+                vocabulary: CsmiCCppResolutionVocabulary::CCppResolution,
+                version: "0.1.0".to_string(),
+                context_digest: "0".repeat(64),
+                language: CsmiCppProfileLanguage::Cpp,
+                header_closure: CsmiCompleteHeaderClosure::Complete,
+            },
+        });
+        let value = serde_json::to_value(&payload).expect("payload serializes");
+        assert_eq!(value["kind"], "type-alias");
+        assert_eq!(value["language"], "c++");
+        assert_eq!(
+            serde_json::from_value::<CsmiCppProfilePayload>(value).expect("payload parses"),
+            payload
+        );
     }
 }

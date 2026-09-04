@@ -63,7 +63,6 @@ pub(crate) use crate::analyzer::usages::reference_site::{
     simple_reference_name, smallest_named_node_covering,
 };
 use crate::analyzer::{QueryScope, QueryToken};
-use brokk_bifrost_cpp::graph::resolver::OrphanedNamespaceTypeScopeIndex;
 use brokk_bifrost_js_ts::providers::JsTsSource;
 use brokk_bifrost_js_ts::syntax::JsTsImportBinder;
 // The Ruby definition route is parked on `ResolutionSession`'s siblings while
@@ -998,12 +997,32 @@ fn resolve_definition_requests_traced<'a>(
         .collect()
 }
 
+/// Test-only count of [`resolve_definition_batch_with_source`] invocations,
+/// so a batching caller can assert it collapsed many per-edge calls into one
+/// call per file rather than re-deriving that from timing (bifrost#15).
+#[cfg(test)]
+pub(crate) static RESOLVE_DEFINITION_BATCH_WITH_SOURCE_CALL_COUNT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+pub(crate) fn reset_resolve_definition_batch_with_source_call_count_for_test() {
+    RESOLVE_DEFINITION_BATCH_WITH_SOURCE_CALL_COUNT.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(test)]
+pub(crate) fn resolve_definition_batch_with_source_call_count_for_test() -> usize {
+    RESOLVE_DEFINITION_BATCH_WITH_SOURCE_CALL_COUNT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 pub fn resolve_definition_batch_with_source(
     analyzer: &dyn IAnalyzer,
     requests: Vec<DefinitionLookupRequest>,
     file: ProjectFile,
     source: Arc<str>,
 ) -> Vec<DefinitionLookupOutcome> {
+    #[cfg(test)]
+    RESOLVE_DEFINITION_BATCH_WITH_SOURCE_CALL_COUNT
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let scope = AnalyzerQueryScope::new(analyzer);
     let token = scope.token();
     let scope = AnalyzerQueryScope::new(analyzer);
@@ -1444,7 +1463,6 @@ struct DefinitionBatchContext<'a> {
     cpp_indexed_sources: HashMap<ProjectFile, Option<Arc<String>>>,
     cpp_indexed_trees: HashMap<ProjectFile, Option<Tree>>,
     cpp_navigation_indexes: HashMap<ProjectFile, Option<Arc<cpp::CppNavigationIndex>>>,
-    cpp_orphaned_namespace_scopes: HashMap<ProjectFile, Arc<OrphanedNamespaceTypeScopeIndex>>,
     cpp_structural_alias_paths: HashMap<CodeUnit, Vec<String>>,
     cpp_class_ranges: HashMap<ProjectFile, Arc<ClassRangeIndex>>,
     enclosing_owner_chains: HashMap<CodeUnit, Arc<Vec<CodeUnit>>>,
@@ -1479,7 +1497,6 @@ impl<'a> DefinitionBatchContext<'a> {
             cpp_indexed_sources: HashMap::default(),
             cpp_indexed_trees: HashMap::default(),
             cpp_navigation_indexes: HashMap::default(),
-            cpp_orphaned_namespace_scopes: HashMap::default(),
             cpp_structural_alias_paths: HashMap::default(),
             cpp_class_ranges: HashMap::default(),
             enclosing_owner_chains: HashMap::default(),
@@ -1678,18 +1695,6 @@ impl<'a> DefinitionBatchContext<'a> {
         self.cpp_navigation_indexes
             .insert(file.clone(), index.clone());
         index
-    }
-
-    fn cpp_orphaned_namespace_scopes(
-        &mut self,
-        file: &ProjectFile,
-        root: Node<'_>,
-        source: &str,
-    ) -> Arc<OrphanedNamespaceTypeScopeIndex> {
-        self.cpp_orphaned_namespace_scopes
-            .entry(file.clone())
-            .or_insert_with(|| Arc::new(OrphanedNamespaceTypeScopeIndex::build(root, source)))
-            .clone()
     }
 
     fn cpp_class_ranges(&mut self, file: &ProjectFile) -> Arc<ClassRangeIndex> {

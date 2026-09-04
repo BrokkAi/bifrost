@@ -167,7 +167,7 @@ impl KotlinDiagnosticCollector<'_> {
                 node.start_position().row,
                 node.end_position().row,
             )
-            .map(|owner| kotlin_scope_owners_for(self.kotlin, token, &owner))
+            .map(|owner| kotlin_scope_owners_for(self.kotlin, token, &owner, self.realm))
             .unwrap_or_default();
         let scope = KotlinNameScope {
             package_name: &self.package_name,

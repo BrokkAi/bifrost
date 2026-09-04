@@ -10,9 +10,13 @@
 //! source edit yields a different content key so the stale entry falls out of
 //! the bounded cache.
 //!
-//! This is foundation only. Nothing here is wired into `discover_value_flow`,
-//! the taint solve, or the compile yet; a later Stage C step routes the solve
-//! through this provider.
+//! This is the seam [`discover_closure_with`](super::discover_closure_with)
+//! walks the resolved-call closure through: the default
+//! [`WorkspaceValueFlowProvider`] serves the type-flow client and the
+//! dataflow differential, the policy compiler's materialization cache serves
+//! require-model taint discovery (#2289), and the #2945 feedback provider
+//! appends hinted dispatch candidates through `resolve_call`'s by-value
+//! result.
 //!
 //! ## Non-complete verdicts are retained too (#2284, #2289)
 //!
@@ -105,10 +109,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::analyzer::WorkspaceAnalyzer;
 use crate::analyzer::semantic::{
-    CallBinding, CallBindings, CallSiteHandle, CallSiteId, DispatchCandidate, EvidenceCompleteness,
-    OracleCallContext, OracleLimits, ProcedureHandle, ProcedureId, ProofStatus, SemanticOutcome,
-    SemanticProviderError, SemanticRequest, SemanticWork, StableDigest, ValueFlowOracle,
-    ValueFlowRelation, ValueFlowSnapshot, WorkspaceSemanticOracle,
+    CallBinding, CallBindings, CallSiteHandle, CallSiteId, DispatchCandidate, DispatchOracle,
+    DispatchResult, EvidenceCompleteness, OracleCallContext, OracleLimits, ProcedureHandle,
+    ProcedureId, ProofStatus, SemanticOutcome, SemanticProviderError, SemanticRequest,
+    SemanticWork, StableDigest, ValueFlowOracle, ValueFlowRelation, ValueFlowSnapshot,
+    WorkspaceSemanticOracle,
 };
 use brokk_bifrost_core::complete_value_cache::{CompleteValueAcquisition, CompleteValueCache};
 
@@ -121,14 +126,41 @@ const DEFAULT_VALUE_FLOW_CACHE_BYTES: u64 = 256 * 1024 * 1024 / 8;
 /// [`IcfgProvider`](crate::analyzer::semantic::IcfgProvider) and
 /// [`ValueFlowOracle`], and it returns the same [`SemanticOutcome`] the oracle
 /// returns.
+///
+/// The associated `Error` keeps a consumer's abort reasons nameable outside
+/// this crate: the closure walk reports a provider `Err` with its `Display`
+/// and otherwise treats it as opaque (see `discover_closure_with`).
+///
+/// The trait stays `&self`; a provider that counts or memoizes uses interior
+/// mutability the way [`ValueFlowCache`]'s atomic hit and miss counters do.
 pub trait ValueFlowProvider {
+    /// The consumer-specific failure one operation can abort with.
+    type Error: fmt::Display;
+
+    /// Anchor `procedure` to the provider's canonical artifact instance, so
+    /// every handle the walk mints beneath it belongs to one instance. The
+    /// default keeps the handle as minted; a provider that memoizes by
+    /// durable key across materializations pins one instance (#2289).
+    fn canonical_procedure(&self, procedure: &ProcedureHandle) -> ProcedureHandle {
+        procedure.clone()
+    }
+
     /// Materialize the procedure-local value-flow snapshot on demand.
     fn procedure_snapshot(
         &self,
         procedure: &ProcedureHandle,
         context: &OracleCallContext,
         request: &mut SemanticRequest<'_>,
-    ) -> Result<SemanticOutcome<ValueFlowSnapshot>, SemanticProviderError>;
+    ) -> Result<SemanticOutcome<ValueFlowSnapshot>, Self::Error>;
+
+    /// Resolve one call site's dispatch on demand. The [`DispatchResult`]
+    /// comes back by value (inside its outcome) so a feedback provider can
+    /// append candidates before the walk sees them (#2945).
+    fn resolve_call(
+        &self,
+        call: &CallSiteHandle,
+        request: &mut SemanticRequest<'_>,
+    ) -> Result<SemanticOutcome<DispatchResult>, Self::Error>;
 
     /// Materialize one dispatch candidate's call bindings on demand.
     fn call_bindings(
@@ -137,7 +169,7 @@ pub trait ValueFlowProvider {
         candidate: &DispatchCandidate,
         context: &OracleCallContext,
         request: &mut SemanticRequest<'_>,
-    ) -> Result<SemanticOutcome<CallBindings>, SemanticProviderError>;
+    ) -> Result<SemanticOutcome<CallBindings>, Self::Error>;
 }
 
 /// Content-addressed identity of one procedure-local value-flow snapshot
@@ -258,6 +290,7 @@ struct BindingsKey {
     target_procedure: ProcedureId,
     candidate_proof: ProofStatus,
     candidate_completeness: EvidenceCompleteness,
+    excluded_targets: Box<[ProcedureId]>,
     context: OracleCallContext,
     limits: OracleLimits,
 }
@@ -279,6 +312,11 @@ impl BindingsKey {
             target_procedure: target.id(),
             candidate_proof: candidate.proof().clone(),
             candidate_completeness: candidate.completeness().clone(),
+            excluded_targets: candidate
+                .excluded_targets()
+                .iter()
+                .map(ProcedureHandle::id)
+                .collect(),
             context: context.clone(),
             limits,
         }
@@ -304,8 +342,13 @@ fn weigh_bindings(_key: &BindingsKey, outcome: &Arc<MemoizedBindings>) -> u32 {
         .available_value()
         .map_or(0, |bindings| bindings.bindings().len())
         .saturating_mul(size_of::<CallBinding>());
+    let excluded_targets = outcome
+        .available_value()
+        .map_or(0, |bindings| bindings.candidate().excluded_targets().len())
+        .saturating_mul(size_of::<ProcedureHandle>());
     size_of::<MemoizedBindings>()
         .saturating_add(rows)
+        .saturating_add(excluded_targets)
         .min(u32::MAX as usize) as u32
 }
 
@@ -394,6 +437,16 @@ impl<'a> WorkspaceValueFlowProvider<'a> {
         }
     }
 
+    /// Bind the provider to an externally built oracle and one shared cache.
+    ///
+    /// A caller that already holds the oracle it means discovery to use (the
+    /// executor's snapshot-bound oracle today, a hinted oracle under #2945)
+    /// hands it in here; building a second oracle from the current overlay
+    /// would give one walk two oracle identities.
+    pub const fn with_oracle(oracle: WorkspaceSemanticOracle<'a>, cache: ValueFlowCache) -> Self {
+        Self { oracle, cache }
+    }
+
     /// The shared cache behind this provider.
     pub fn cache(&self) -> &ValueFlowCache {
         &self.cache
@@ -415,6 +468,8 @@ impl fmt::Debug for WorkspaceValueFlowProvider<'_> {
 }
 
 impl ValueFlowProvider for WorkspaceValueFlowProvider<'_> {
+    type Error = SemanticProviderError;
+
     fn procedure_snapshot(
         &self,
         procedure: &ProcedureHandle,
@@ -459,6 +514,16 @@ impl ValueFlowProvider for WorkspaceValueFlowProvider<'_> {
                 work: SemanticWork::default(),
             }),
         }
+    }
+
+    fn resolve_call(
+        &self,
+        call: &CallSiteHandle,
+        request: &mut SemanticRequest<'_>,
+    ) -> Result<SemanticOutcome<DispatchResult>, SemanticProviderError> {
+        // Dispatch answers are not memoized here: a call site resolves once
+        // per walk (the walk dedups bindings), so a cache would never hit.
+        self.oracle.resolve_call(call, request)
     }
 
     fn call_bindings(

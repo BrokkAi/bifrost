@@ -40,7 +40,7 @@
     {
       "path": "policies/go-data-race.rqlp",
       "id": "bifrost.correctness.go-data-race",
-      "semantic_hash": "dde932e5e433d813cfd60d5bafcbe8b4a1728496b92f04845229b9263b965424",
+      "semantic_hash": "1a32c1957d1e55260e9506c216f0b0cbdd854b8264436d7d06005a08dcd2c800",
       "category": "correctness",
       "supported_languages": [
         "go"

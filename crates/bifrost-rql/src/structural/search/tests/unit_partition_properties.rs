@@ -275,6 +275,7 @@ proptest! {
                 .map(|file| {
                     execute_code_query_unit(
                         workspace.analyzer(),
+                        None,
                         &query,
                         limits,
                         None,

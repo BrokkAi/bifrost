@@ -13,11 +13,11 @@ exclude = ["src/bin/bifrost-lsp-test-server.rs", "tests/**"]
 name = "brokk_bifrost_lsp"
 
 [dependencies]
-brokk-bifrost-analysis = { path = "../bifrost-analysis", version = "=0.10.9" }
-brokk-bifrost-flow = { path = "../bifrost-flow", version = "=0.10.9" }
-brokk-bifrost-policy = { path = "../bifrost-policy", version = "=0.10.9" }
-brokk-bifrost-rql = { path = "../bifrost-rql", version = "=0.10.9" }
-brokk-bifrost-runtime = { path = "../bifrost-runtime", version = "=0.10.9" }
+brokk-bifrost-analysis = { path = "../bifrost-analysis", version = "=0.10.7" }
+brokk-bifrost-flow = { path = "../bifrost-flow", version = "=0.10.7" }
+brokk-bifrost-policy = { path = "../bifrost-policy", version = "=0.10.7" }
+brokk-bifrost-rql = { path = "../bifrost-rql", version = "=0.10.7" }
+brokk-bifrost-runtime = { path = "../bifrost-runtime", version = "=0.10.7" }
 # The same channel implementation `lsp-server` exposes through
 # `Connection::{sender,receiver}`. The main loop selects over the client
 # receiver and the dependency-pack activation receiver together (#1628).

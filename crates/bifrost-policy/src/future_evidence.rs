@@ -12,7 +12,7 @@ use std::fmt;
 use std::mem::size_of;
 
 use serde::ser::SerializeStruct;
-use serde::{Serialize, Serializer};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use sha2::{Digest, Sha256};
 
 use brokk_bifrost_analysis::analyzer::canonical_hash::{CanonicalHasher, write_lower_hex};
@@ -71,6 +71,13 @@ macro_rules! define_digest {
             pub const fn as_bytes(&self) -> &[u8; 32] {
                 &self.0
             }
+
+            /// The digest these wire bytes spell, which is the exact inverse
+            /// of the `Display` rendering this type serializes as.
+            pub fn from_lower_hex(value: &str) -> Option<Self> {
+                brokk_bifrost_analysis::analyzer::canonical_hash::parse_lower_sha256(value)
+                    .map(Self)
+            }
         }
 
         impl fmt::Display for $name {
@@ -85,6 +92,24 @@ macro_rules! define_digest {
                 S: Serializer,
             {
                 serializer.collect_str(self)
+            }
+        }
+
+        /// The inverse of the `Serialize` above, so a stored evaluation
+        /// product that names one of these digests is read back as the same
+        /// digest or as a load error, never as a different one.
+        impl<'de> Deserialize<'de> for $name {
+            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+            where
+                D: Deserializer<'de>,
+            {
+                let wire = String::deserialize(deserializer)?;
+                Self::from_lower_hex(&wire).ok_or_else(|| {
+                    de::Error::custom(format!(
+                        "`{wire}` is not the lower-hex sha-256 spelling of a {}",
+                        stringify!($name)
+                    ))
+                })
             }
         }
 
@@ -1246,6 +1271,89 @@ impl TypestatePolicyProjectionFacts {
     }
 }
 
+/// Read one stored projection's facts back under the budget their caps are
+/// stated in.
+///
+/// The wire fields go straight back through [`TypestatePolicyProjectionFacts::
+/// try_normalized`], which renormalizes every set and re-derives both digests:
+/// a stored value whose scenario-set or semantic hash disagrees with its own
+/// content is a load error rather than a fact set that would mint a different
+/// finding identity.
+pub(crate) struct TypestateProjectionFactsSeed<'a> {
+    budget: &'a PolicyBudget,
+}
+
+impl<'a> TypestateProjectionFactsSeed<'a> {
+    pub(crate) const fn new(budget: &'a PolicyBudget) -> Self {
+        Self { budget }
+    }
+}
+
+impl<'de> de::DeserializeSeed<'de> for TypestateProjectionFactsSeed<'_> {
+    type Value = TypestatePolicyProjectionFacts;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Wire {
+            authoring_projection_hash: TypestateAuthoringProjectionHash,
+            protocol_hash: TypestateProtocolHash,
+            binding_plan_hash: TypestateBindingPlanHash,
+            source_endpoint: ResolvedEndpointIdentity,
+            source_endpoint_hash: EndpointSemanticHash,
+            source_endpoint_analysis_projection_hash: EndpointAnalysisProjectionHash,
+            source_categories: Vec<PolicyCategoryId>,
+            source_display_name: String,
+            violation_site: Option<StableSemanticIdentity>,
+            violation: TypestateViolationEvidence,
+            scenario_ids: Vec<TypestateScenarioId>,
+            scenario_set_hash: TypestateScenarioSetHash,
+            semantic_hash: TypestateProjectionFactsHash,
+        }
+
+        let wire = Wire::deserialize(deserializer)?;
+        TypestatePolicyProjectionFacts {
+            authoring_projection_hash: wire.authoring_projection_hash,
+            protocol_hash: wire.protocol_hash,
+            binding_plan_hash: wire.binding_plan_hash,
+            source_endpoint: wire.source_endpoint,
+            source_endpoint_hash: wire.source_endpoint_hash,
+            source_endpoint_analysis_projection_hash: wire.source_endpoint_analysis_projection_hash,
+            source_categories: wire.source_categories,
+            source_display_name: wire.source_display_name,
+            violation_site: wire.violation_site,
+            violation: wire.violation,
+            scenario_ids: wire.scenario_ids,
+            scenario_set_hash: wire.scenario_set_hash,
+            semantic_hash: wire.semantic_hash,
+        }
+        .try_normalized(self.budget)
+        .map_err(de::Error::custom)
+    }
+}
+
+/// One stored typestate anchor, before its violation hash is re-derived.
+///
+/// Only the strong shape: `project_finding` mints strong anchors and nothing
+/// else, so a stored weak anchor did not come from a typestate root unit and
+/// is refused as an unknown variant rather than admitted as a finding whose
+/// identity would never join across two runs.
+#[derive(Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub(crate) enum StoredTypestateFindingAnchor {
+    Strong {
+        protocol_hash: TypestateProtocolHash,
+        binding_plan_hash: TypestateBindingPlanHash,
+        subject_identity: StableSemanticIdentity,
+        violation_site_identity: StableSemanticIdentity,
+        scenario_set_hash: TypestateScenarioSetHash,
+        violation_hash: TypestateViolationHash,
+    },
+}
+
 impl RetainedSize for TypestatePolicyProjectionFacts {
     fn retained_size(&self) -> usize {
         size_of::<Self>()
@@ -1349,6 +1457,46 @@ impl TypestateFindingAnchor {
 
     pub fn weak(typed_key: OpaqueFindingKey) -> Self {
         Self::Weak(TypestateWeakAnchor { typed_key })
+    }
+
+    /// One anchor read back from a stored evaluation product.
+    ///
+    /// The stored `violation_hash` is not a field to trust: it is re-derived
+    /// here from the violation the same product carries, through the same
+    /// constructor a live projection uses, and a stored value that disagrees
+    /// is refused. Nothing downstream could tell a wrong anchor from a right
+    /// one -- the anchor is what a finding's identity is minted from, and the
+    /// identity is what a diff joins on.
+    pub(crate) fn try_from_stored(
+        stored: StoredTypestateFindingAnchor,
+        violation: &TypestateViolationEvidence,
+    ) -> Result<Self, FutureEvidenceError> {
+        let StoredTypestateFindingAnchor::Strong {
+            protocol_hash,
+            binding_plan_hash,
+            subject_identity,
+            violation_site_identity,
+            scenario_set_hash,
+            violation_hash,
+        } = stored;
+        let anchor = Self::strong(
+            protocol_hash,
+            binding_plan_hash,
+            subject_identity,
+            violation_site_identity,
+            scenario_set_hash,
+            violation,
+        )?;
+        let derived = anchor
+            .strong_fields()
+            .expect("a strong anchor was just constructed")
+            .violation_hash();
+        if derived != violation_hash {
+            return Err(FutureEvidenceError::ProjectionFactsHashMismatch {
+                analysis: "typestate_violation",
+            });
+        }
+        Ok(anchor)
     }
 
     pub const fn stability(&self) -> FindingIdentityStability {
@@ -2269,6 +2417,37 @@ serialize_string_identifier!(
     TypestateExpectationId,
 );
 
+/// The inverse of [`serialize_string_identifier`], for the identifiers a
+/// stored evaluation product names.
+///
+/// Every one goes back through `new`, which is the validating constructor that
+/// minted it: a stored identifier that no longer validates is a load error
+/// rather than an identifier this run would never have accepted.
+macro_rules! deserialize_string_identifier {
+    ($($type:ty),+ $(,)?) => {
+        $(
+            impl<'de> Deserialize<'de> for $type {
+                fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+                where
+                    D: Deserializer<'de>,
+                {
+                    let wire = String::deserialize(deserializer)?;
+                    Self::new(wire).map_err(de::Error::custom)
+                }
+            }
+        )+
+    };
+}
+
+deserialize_string_identifier!(
+    EndpointId,
+    PolicyCategoryId,
+    TaintEntryId,
+    TypestateStateId,
+    TypestateEventId,
+    TypestateExpectationId,
+);
+
 macro_rules! serialize_digest_identifier {
     ($($type:ty),+ $(,)?) => {
         $(
@@ -2463,6 +2642,196 @@ fn taint_system_entry_label(value: TaintSystemEntry) -> &'static str {
         TaintSystemEntry::LocalInput => "local_input",
         TaintSystemEntry::AdjacentNetwork => "adjacent_network",
         TaintSystemEntry::Physical => "physical",
+    }
+}
+
+/// The inverses of the label renderings above, for the values a stored
+/// typestate projection carries.
+///
+/// Each reads back exactly the label its `Serialize` writes and nothing else,
+/// so a wire spelling this crate never produced is a load error rather than a
+/// silently defaulted value.
+impl<'de> Deserialize<'de> for EndpointObservationPhase {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = String::deserialize(deserializer)?;
+        match wire.as_str() {
+            "at_match" => Ok(Self::AtMatch),
+            "before_call" => Ok(Self::BeforeCall),
+            "after_normal_return" => Ok(Self::AfterNormalReturn),
+            "after_exceptional_return" => Ok(Self::AfterExceptionalReturn),
+            other => Err(de::Error::custom(format!(
+                "`{other}` is not an endpoint observation phase"
+            ))),
+        }
+    }
+}
+
+/// The exit scope as its own wire value, which is how the events above carry
+/// it: `SerializableTypestateExitScope` writes the label, this reads it.
+struct TypestateExitScopeWire(TypestateExitScope);
+
+impl<'de> Deserialize<'de> for TypestateExitScopeWire {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = String::deserialize(deserializer)?;
+        match wire.as_str() {
+            "analysis_root" => Ok(Self(TypestateExitScope::AnalysisRoot)),
+            other => Err(de::Error::custom(format!(
+                "`{other}` is not a typestate exit scope"
+            ))),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for PolicySemanticEvent {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+        enum Wire {
+            NormalProcedureExit { scope: TypestateExitScopeWire },
+            ExceptionalProcedureExit { scope: TypestateExitScopeWire },
+        }
+
+        Ok(match Wire::deserialize(deserializer)? {
+            Wire::NormalProcedureExit { scope } => Self::NormalProcedureExit { scope: scope.0 },
+            Wire::ExceptionalProcedureExit { scope } => {
+                Self::ExceptionalProcedureExit { scope: scope.0 }
+            }
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for ResolvedCatalogIdentity {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Wire {
+            name: PolicyId,
+            version: u32,
+            semantic_hash: TaintCatalogHash,
+        }
+
+        let wire = Wire::deserialize(deserializer)?;
+        Self::try_new(wire.name, wire.version, wire.semantic_hash).map_err(de::Error::custom)
+    }
+}
+
+impl<'de> Deserialize<'de> for ResolvedEndpointIdentity {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+        enum Wire {
+            Local {
+                policy_id: PolicyId,
+                entry_id: TaintEntryId,
+            },
+            Catalog {
+                catalog: ResolvedCatalogIdentity,
+                entry_id: TaintEntryId,
+            },
+            MatchEndpoint {
+                endpoint_id: EndpointId,
+            },
+        }
+
+        Ok(match Wire::deserialize(deserializer)? {
+            Wire::Local {
+                policy_id,
+                entry_id,
+            } => Self::Local {
+                policy_id,
+                entry_id,
+            },
+            Wire::Catalog { catalog, entry_id } => Self::Catalog { catalog, entry_id },
+            Wire::MatchEndpoint { endpoint_id } => Self::MatchEndpoint { endpoint_id },
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for ResolvedTypestateTerminal {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+        enum Wire {
+            Endpoint {
+                endpoint: ResolvedEndpointIdentity,
+                phase: EndpointObservationPhase,
+            },
+            SemanticEvent {
+                event: PolicySemanticEvent,
+            },
+        }
+
+        Ok(match Wire::deserialize(deserializer)? {
+            Wire::Endpoint { endpoint, phase } => Self::Endpoint { endpoint, phase },
+            Wire::SemanticEvent { event } => Self::SemanticEvent { event },
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for TypestateViolationEvidence {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+        enum Wire {
+            ErrorTransition {
+                event_id: TypestateEventId,
+                endpoint: Option<ResolvedEndpointIdentity>,
+                from: TypestateStateId,
+                to: TypestateStateId,
+            },
+            TerminalExpectation {
+                expectation_id: TypestateExpectationId,
+                terminal: ResolvedTypestateTerminal,
+                observed_state: TypestateStateId,
+                expected_states: Vec<TypestateStateId>,
+            },
+        }
+
+        // Through the same normalization a live projection's violation goes
+        // through, so a stored expected-state set that is unsorted, oversized,
+        // or contains the observed state is a load error rather than evidence
+        // that would mint a violation hash nothing else agrees with.
+        match Wire::deserialize(deserializer)? {
+            Wire::ErrorTransition {
+                event_id,
+                endpoint,
+                from,
+                to,
+            } => Ok(Self::error_transition(event_id, endpoint, from, to)),
+            Wire::TerminalExpectation {
+                expectation_id,
+                terminal,
+                observed_state,
+                expected_states,
+            } => Self::try_terminal_expectation(
+                expectation_id,
+                terminal,
+                observed_state,
+                expected_states,
+            )
+            .map_err(de::Error::custom),
+        }
     }
 }
 

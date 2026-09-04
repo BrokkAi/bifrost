@@ -27,7 +27,9 @@
 use crate::compile_context::CppCompileContext;
 use crate::declarations::CppRecoveredExportClassIndex;
 use crate::graph::CppWorkspaceSource;
-use crate::graph::resolver::{CppClassDeclarationStrength, SourceUsingIndex};
+use crate::graph::resolver::{
+    CppClassDeclarationStrength, OrphanedNamespaceScopeIndex, SourceUsingIndex,
+};
 use crate::identity::CppCallableUnitRole;
 use crate::imports::IncludeTargetIndex;
 use brokk_bifrost_core::analyzer::capabilities::{TypeAliasProvider, TypeHierarchyProvider};
@@ -165,6 +167,20 @@ pub trait CppSource:
         token: QueryToken<'_>,
         file: &ProjectFile,
     ) -> Arc<CppRecoveredExportClassIndex>;
+
+    /// The namespaces C++ parse recovery dropped from `file`'s tree, resolved
+    /// once per file.
+    ///
+    /// Built by [`OrphanedNamespaceScopeIndex::build`], a pure function of the
+    /// file's parsed content, and empty for a file without parse errors. Both
+    /// lookup directions derive every lexical scope in the file through it, so
+    /// it is memoized on the analyzer like [`Self::source_using_index`] rather
+    /// than rebuilt per query or per reference (issue #1537).
+    fn orphaned_namespace_scopes(
+        &self,
+        token: QueryToken<'_>,
+        file: &ProjectFile,
+    ) -> Arc<OrphanedNamespaceScopeIndex>;
 
     /// The memoized answer of
     /// [`crate::graph::resolver::cpp_class_declaration_strength`] for one

@@ -159,6 +159,7 @@ impl DependencyPackAdapter for GoDependencyPackAdapter {
                     review_required: false,
                 },
                 carried_sources: Vec::new(),
+                cpp_portability: None,
                 shards: vec![AuthoredShard {
                     id: "declarations.external".to_owned(),
                     activation: request.activation,
@@ -277,6 +278,7 @@ impl GoModulePackProducer {
                 completeness,
                 safety: request.safety.clone(),
                 carried_sources: Vec::new(),
+                cpp_portability: None,
                 shards: vec![AuthoredShard {
                     id: "declarations.external".to_owned(),
                     activation,
@@ -2335,7 +2337,7 @@ fn declared_type_ids(types: &[TypeRef]) -> Vec<String> {
                 pending.extend(arguments);
             }
             TypeRef::Array { element }
-            | TypeRef::ByRef { element }
+            | TypeRef::ByRef { element, .. }
             | TypeRef::Pointer { element }
             | TypeRef::Slice { element }
             | TypeRef::FixedArray { element, .. }
@@ -2367,7 +2369,7 @@ fn type_ref_depth(reference: &TypeRef) -> usize {
                 pending.extend(arguments.iter().map(|argument| (argument, depth + 1)));
             }
             TypeRef::Array { element }
-            | TypeRef::ByRef { element }
+            | TypeRef::ByRef { element, .. }
             | TypeRef::Pointer { element }
             | TypeRef::Slice { element }
             | TypeRef::FixedArray { element, .. }
@@ -2664,6 +2666,7 @@ var privateValue int
                 review_required: false,
             },
             carried_sources: Vec::new(),
+            cpp_portability: None,
             shards: vec![AuthoredShard {
                 id: "go".to_owned(),
                 activation: vec![ActivationSelector {

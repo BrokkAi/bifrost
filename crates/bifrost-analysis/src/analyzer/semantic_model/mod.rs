@@ -26,9 +26,12 @@ pub use artifact::{
     CompiledProcedureTarget, CompiledResultContract, CompiledResultMemberContract,
     CompiledResultPredicate, CompiledSemanticModelPack, CompiledShard, CompiledShardArtifact,
     CompiledShardDescriptor, CompiledSummaryEffect, CompiledSummaryExitKind, CompiledSummaryInput,
-    CompiledSummaryLocation, CompiledSummaryLocationKind, CompiledSummaryOutput,
-    CompiledSummaryTransfer, DecodeLimits, PayloadKind, decode_manifest, decode_shard,
-    decode_shard_for_manifest,
+    CompiledSummaryLocation, CompiledSummaryLocationKind, CompiledSummaryMoveInvalidation,
+    CompiledSummaryOutput, CompiledSummaryTransfer, CompiledSummaryValuePreservation,
+    CompiledSummaryValueTransfer, CompiledSummaryValueTransferKind,
+    CompiledSummaryValueTransferLimitation, CompiledSummaryValueTransferLimitationKind,
+    CompiledSummaryValueTransferOperation, DecodeLimits, PayloadKind, decode_manifest,
+    decode_shard, decode_shard_for_manifest,
 };
 pub use authoring::*;
 pub use catalog::*;
@@ -49,9 +52,14 @@ pub use source::SourceFormat;
 pub(crate) use validate::is_canonical_relative_path;
 pub use validate::{Diagnostic, DiagnosticSeverity};
 
-/// Returns the version-one authoring schema as stable, pretty-printed JSON.
+/// Returns the current authoring schema as stable, pretty-printed JSON.
 pub fn authoring_json_schema() -> String {
-    let schema = schemars::schema_for!(AuthoredSemanticModelPack);
+    let mut schema = schemars::schema_for!(AuthoredSemanticModelPack);
+    let schema_object = schema.ensure_object();
+    schema_object.sort_keys();
+    for value in schema_object.values_mut() {
+        value.sort_all_objects();
+    }
     let mut rendered = serde_json::to_string_pretty(&schema).expect("JSON Schema is serializable");
     rendered.push('\n');
     rendered

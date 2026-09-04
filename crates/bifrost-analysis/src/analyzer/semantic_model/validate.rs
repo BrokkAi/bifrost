@@ -201,6 +201,9 @@ impl Validator {
                     .extend(summaries.iter().map(|summary| summary.id.clone()));
             }
         }
+        if let Some(evidence) = &pack.cpp_portability {
+            self.cpp_portability(evidence);
+        }
 
         let mut total_records = 0usize;
         for (index, shard) in pack.shards.iter().enumerate() {
@@ -305,6 +308,342 @@ impl Validator {
                 format!("{path}.artifact_sha256"),
                 "artifact digest must be 64 lowercase hexadecimal characters",
             );
+        }
+    }
+
+    fn cpp_portability(&mut self, evidence: &CppPortabilityEvidence) {
+        if evidence.resolution_contexts.is_empty() || evidence.symbols.is_empty() {
+            self.error(
+                "cpp_portability.empty",
+                "$.cpp_portability",
+                "C++ portability evidence requires a resolution context and portable symbols",
+            );
+        }
+        let mut contexts = HashMap::new();
+        for (index, context) in evidence.resolution_contexts.iter().enumerate() {
+            let path = format!("$.cpp_portability.resolution_contexts[{index}]");
+            if !is_lower_sha256(&context.context_digest) {
+                self.error(
+                    "cpp_portability.invalid_context_digest",
+                    format!("{path}.context_digest"),
+                    "context digest must be lowercase SHA-256",
+                );
+            }
+            let expected_context_digest =
+                super::csmi::canonical_digest(&super::csmi::csmi_resolution_context(context));
+            if !expected_context_digest
+                .as_ref()
+                .is_ok_and(|expected| expected == &context.context_digest)
+            {
+                self.error(
+                    "cpp_portability.context_digest_mismatch",
+                    format!("{path}.context_digest"),
+                    "context digest must equal the RFC 8785 resolution-context digest",
+                );
+            }
+            if contexts
+                .insert(context.context_digest.as_str(), context.language)
+                .is_some()
+            {
+                self.error(
+                    "cpp_portability.duplicate_context",
+                    format!("{path}.context_digest"),
+                    "resolution context digest is repeated",
+                );
+            }
+            if !is_lower_sha256(&context.compile_arguments_digest) {
+                self.error(
+                    "cpp_portability.invalid_arguments_digest",
+                    format!("{path}.compile_arguments_digest"),
+                    "compiler argument digest must be lowercase SHA-256",
+                );
+            }
+            self.text(
+                &format!("{path}.translation_unit"),
+                &context.translation_unit,
+            );
+            if context.direct_headers.is_empty() {
+                self.error(
+                    "cpp_portability.empty_headers",
+                    format!("{path}.direct_headers"),
+                    "a complete context must identify every directly reached header",
+                );
+            }
+            for (header_index, header) in context.direct_headers.iter().enumerate() {
+                let header_path = format!("{path}.direct_headers[{header_index}]");
+                self.text(&format!("{header_path}.include_name"), &header.include_name);
+                self.cpp_selector(&format!("{header_path}.artifact"), &header.artifact);
+            }
+        }
+        let mut symbol_ids = HashSet::new();
+        for (index, symbol) in evidence.symbols.iter().enumerate() {
+            let path = format!("$.cpp_portability.symbols[{index}]");
+            self.stable_reference(&format!("{path}.native_id"), &symbol.native_id);
+            if self.validate_references && !self.declaration_ids.contains(&symbol.native_id) {
+                self.error(
+                    "cpp_portability.unknown_symbol",
+                    format!("{path}.native_id"),
+                    "portable symbol must name a native declaration",
+                );
+            }
+            if !symbol_ids.insert(symbol.native_id.as_str()) {
+                self.error(
+                    "cpp_portability.duplicate_symbol",
+                    format!("{path}.native_id"),
+                    "portable symbol is repeated",
+                );
+            }
+            if symbol.key.scheme != CPP_DECLARATION_SCHEME
+                || symbol.key.scheme_version != CPP_DECLARATION_SCHEME_VERSION
+            {
+                self.error(
+                    "cpp_portability.identity_scheme",
+                    format!("{path}.key.scheme"),
+                    "portable symbols require csmi.cpp.declaration 0.1.0",
+                );
+            }
+            if symbol.key.artifact_selectors.is_empty() || symbol.key.descriptors.is_empty() {
+                self.error(
+                    "cpp_portability.incomplete_symbol",
+                    format!("{path}.key"),
+                    "portable symbols require exact artifacts and structured descriptors",
+                );
+            }
+            for (selector_index, selector) in symbol.key.artifact_selectors.iter().enumerate() {
+                self.cpp_selector(
+                    &format!("{path}.key.artifact_selectors[{selector_index}]"),
+                    selector,
+                );
+            }
+            for (descriptor_index, descriptor) in symbol.key.descriptors.iter().enumerate() {
+                let descriptor_path = format!("{path}.key.descriptors[{descriptor_index}]");
+                self.text(&format!("{descriptor_path}.name"), &descriptor.name);
+                self.text(
+                    &format!("{descriptor_path}.disambiguator"),
+                    &descriptor.disambiguator,
+                );
+                if descriptor.role == CppDescriptorRole::Callable
+                    && (!descriptor
+                        .disambiguator
+                        .starts_with(CPP_SIGNATURE_DISAMBIGUATOR_PREFIX)
+                        || !descriptor
+                            .disambiguator
+                            .strip_prefix(CPP_SIGNATURE_DISAMBIGUATOR_PREFIX)
+                            .is_some_and(is_lower_sha256))
+                {
+                    self.error(
+                        "cpp_portability.callable_disambiguator",
+                        format!("{descriptor_path}.disambiguator"),
+                        "callable descriptors require cppsig-0.1 plus lowercase SHA-256",
+                    );
+                }
+            }
+        }
+        for (index, alias) in evidence.type_aliases.iter().enumerate() {
+            let path = format!("$.cpp_portability.type_aliases[{index}]");
+            if self.validate_references && !symbol_ids.contains(alias.alias.as_str()) {
+                self.error(
+                    "cpp_portability.unknown_alias",
+                    format!("{path}.alias"),
+                    "alias must have a portable declaration key",
+                );
+            }
+            self.cpp_type(&format!("{path}.target"), &alias.target, &symbol_ids);
+            self.cpp_context_ref(
+                &format!("{path}.resolution_context"),
+                &alias.resolution_context,
+                &contexts,
+            );
+        }
+        let symbol_keys: HashMap<String, &CppPortableSymbolKey> = evidence
+            .symbols
+            .iter()
+            .map(|symbol| (symbol.native_id.clone(), &symbol.key))
+            .collect();
+        for (index, member) in evidence.special_members.iter().enumerate() {
+            let path = format!("$.cpp_portability.special_members[{index}]");
+            if self.validate_references
+                && (!symbol_ids.contains(member.owner.as_str())
+                    || !symbol_ids.contains(member.member.as_str()))
+            {
+                self.error(
+                    "cpp_portability.unknown_special_member",
+                    &path,
+                    "special member owner and member require portable symbol keys",
+                );
+            }
+            if self.validate_references
+                && self.member_owners.get(&member.member) != Some(&member.owner)
+            {
+                self.error(
+                    "cpp_portability.special_member_owner",
+                    format!("{path}.member"),
+                    "special member must be declared by its exact owner",
+                );
+            }
+            let expected = match member.operation {
+                CppSpecialMemberOperation::CopyConstructor => ImplicitOperation::CopyConstructor,
+                CppSpecialMemberOperation::CopyAssignment => ImplicitOperation::CopyAssignment,
+                CppSpecialMemberOperation::MoveConstructor => ImplicitOperation::MoveConstructor,
+            };
+            if self.validate_references
+                && self
+                    .member_operations
+                    .get(&member.member)
+                    .and_then(Option::as_ref)
+                    != Some(&expected)
+            {
+                self.error(
+                    "cpp_portability.special_member_operation",
+                    format!("{path}.operation"),
+                    "portable special-member operation must match the native declaration",
+                );
+            }
+            if member.signature.owner != member.owner {
+                self.error(
+                    "cpp_portability.signature_owner",
+                    format!("{path}.signature.owner"),
+                    "canonical signature owner must match the fact owner",
+                );
+            }
+            let expected_disambiguator =
+                super::csmi::csmi_cpp_signature(&member.signature, &symbol_keys)
+                    .and_then(|signature| {
+                        super::csmi::canonical_digest(&signature).map_err(|error| {
+                            super::csmi::CsmiExportError::Canonical(error.to_string())
+                        })
+                    })
+                    .map(|digest| format!("{CPP_SIGNATURE_DISAMBIGUATOR_PREFIX}{digest}"));
+            if !expected_disambiguator
+                .as_ref()
+                .is_ok_and(|expected| expected == &member.member_disambiguator)
+            {
+                self.error(
+                    "cpp_portability.member_disambiguator",
+                    format!("{path}.member_disambiguator"),
+                    "special member disambiguator must equal the RFC 8785 signature digest",
+                );
+            }
+            if !cpp_signature_matches_operation(member.operation, &member.signature, &member.owner)
+            {
+                self.error(
+                    "cpp_portability.signature_shape",
+                    format!("{path}.signature"),
+                    "canonical signature shape must match the special-member operation",
+                );
+            }
+            if let Some(receiver) = &member.signature.receiver {
+                self.cpp_type(&format!("{path}.signature.receiver"), receiver, &symbol_ids);
+            }
+            for (parameter_index, parameter) in member.signature.parameters.iter().enumerate() {
+                self.cpp_type(
+                    &format!("{path}.signature.parameters[{parameter_index}]"),
+                    parameter,
+                    &symbol_ids,
+                );
+            }
+            if let Some(result) = &member.signature.result {
+                self.cpp_type(&format!("{path}.signature.result"), result, &symbol_ids);
+            }
+            self.cpp_context_ref(
+                &format!("{path}.resolution_context"),
+                &member.resolution_context,
+                &contexts,
+            );
+        }
+    }
+
+    fn cpp_selector(&mut self, path: &str, selector: &CppArtifactSelector) {
+        self.text(&format!("{path}.purl"), &selector.purl);
+        if !selector.purl.starts_with("pkg:") || !selector.purl.contains('@') {
+            self.error(
+                "cpp_portability.invalid_purl",
+                format!("{path}.purl"),
+                "portable C++ artifacts require an exact versioned PURL",
+            );
+        }
+        if selector.digests.is_empty() {
+            self.error(
+                "cpp_portability.missing_digest",
+                format!("{path}.digests"),
+                "portable C++ artifacts require SHA-256 bytes",
+            );
+        }
+        for (index, digest) in selector.digests.iter().enumerate() {
+            if !is_lower_sha256(&digest.value) {
+                self.error(
+                    "cpp_portability.invalid_digest",
+                    format!("{path}.digests[{index}].value"),
+                    "artifact digest must be lowercase SHA-256",
+                );
+            }
+            self.text(
+                &format!("{path}.digests[{index}].coverage"),
+                &digest.coverage,
+            );
+        }
+    }
+
+    fn cpp_context_ref(
+        &mut self,
+        path: &str,
+        reference: &CppResolutionContextRef,
+        contexts: &HashMap<&str, CppLanguage>,
+    ) {
+        if reference.vocabulary != CPP_RESOLUTION_VOCABULARY
+            || reference.version != CPP_RESOLUTION_VERSION
+            || reference.language != CppLanguage::Cpp
+            || reference.header_closure != CppHeaderClosure::Complete
+            || contexts.get(reference.context_digest.as_str()) != Some(&CppLanguage::Cpp)
+        {
+            self.error(
+                "cpp_portability.invalid_context_reference",
+                path,
+                "C++ facts require an exact complete declared C/C++ resolution context",
+            );
+        }
+    }
+
+    fn cpp_type(&mut self, path: &str, value: &CppCanonicalType, symbols: &HashSet<&str>) {
+        let mut stack = vec![(path.to_owned(), value)];
+        while let Some((current_path, current)) = stack.pop() {
+            match current {
+                CppCanonicalType::Fundamental { .. } => {}
+                CppCanonicalType::Declared { symbol } => {
+                    if !symbols.contains(symbol.as_str()) {
+                        self.error(
+                            "cpp_portability.unknown_type_symbol",
+                            current_path,
+                            "canonical declared type is not portable",
+                        );
+                    }
+                }
+                CppCanonicalType::TemplateSpecialization { primary, arguments } => {
+                    if !symbols.contains(primary.as_str()) {
+                        self.error(
+                            "cpp_portability.unknown_template_primary",
+                            format!("{current_path}.primary"),
+                            "canonical template primary is not portable",
+                        );
+                    }
+                    for (index, argument) in arguments.iter().enumerate().rev() {
+                        stack.push((format!("{current_path}.arguments[{index}]"), argument));
+                    }
+                }
+                CppCanonicalType::Qualified { qualifiers, r#type } => {
+                    if qualifiers.windows(2).any(|pair| pair[0] >= pair[1]) {
+                        self.error(
+                            "cpp_portability.qualifier_order",
+                            format!("{current_path}.qualifiers"),
+                            "qualifiers must be unique and ascending",
+                        );
+                    }
+                    stack.push((format!("{current_path}.type"), r#type));
+                }
+                CppCanonicalType::Reference { referent, .. } => {
+                    stack.push((format!("{current_path}.referent"), referent))
+                }
+            }
         }
     }
 
@@ -444,12 +783,23 @@ impl Validator {
                         match operation {
                             ImplicitOperation::CopyConstructor
                             | ImplicitOperation::MoveConstructor
+                            | ImplicitOperation::ValuePreservingConstructor
                                 if !matches!(fact.member_kind, MemberKind::Constructor) =>
                             {
                                 self.error(
                                     "declaration.implicit_operation_requires_constructor",
                                     format!("{fact_path}.implicit_operation"),
-                                    "copy and move constructor roles require member_kind: constructor",
+                                    "constructor value-operation roles require member_kind: constructor",
+                                );
+                            }
+                            ImplicitOperation::CopyAssignment
+                            | ImplicitOperation::MoveAssignment
+                                if !matches!(fact.member_kind, MemberKind::Method) =>
+                            {
+                                self.error(
+                                    "declaration.implicit_assignment_requires_method",
+                                    format!("{fact_path}.implicit_operation"),
+                                    "copy and move assignment roles require member_kind: method",
                                 );
                             }
                             ImplicitOperation::ConversionOperator { target } => {
@@ -866,8 +1216,14 @@ impl Validator {
             ) {
                 self.error(
                     "summary.incompatible_exit_port",
-                    transfer_path,
+                    &transfer_path,
                     "normal exits cannot use exceptional_return and exceptional exits cannot use normal_return",
+                );
+            }
+            if let Some(value_transfer) = &transfer.value_transfer {
+                self.summary_value_transfer(
+                    &format!("{transfer_path}.value_transfer"),
+                    value_transfer,
                 );
             }
         }
@@ -1184,6 +1540,29 @@ impl Validator {
                 "summary.unbound_callee",
                 path,
                 format!("unknown procedure summary `{callee}`"),
+            );
+        }
+    }
+
+    fn summary_value_transfer(&mut self, path: &str, transfer: &SummaryValueTransfer) {
+        if let SummaryValueTransferOperation::Implicit { member } = &transfer.operation {
+            self.stable_reference(&format!("{path}.operation.member"), member);
+            if self.validate_references && !self.member_ids.contains(member) {
+                self.error(
+                    "summary.unbound_value_transfer_member",
+                    format!("{path}.operation.member"),
+                    format!("unknown member declaration id `{member}`"),
+                );
+            }
+        }
+        if let SummaryValueTransferOperation::Unknown { limitation } = &transfer.operation
+            && matches!(limitation.kind, SummaryValueTransferLimitationKind::Other)
+            && limitation.message.as_deref().is_none_or(str::is_empty)
+        {
+            self.error(
+                "summary.value_transfer_limitation_message_required",
+                format!("{path}.operation.limitation.message"),
+                "an `other` value-transfer limitation must include a non-empty message",
             );
         }
     }
@@ -1814,7 +2193,7 @@ impl Validator {
                     }
                 }
                 TypeRef::Array { element }
-                | TypeRef::ByRef { element }
+                | TypeRef::ByRef { element, .. }
                 | TypeRef::Pointer { element }
                 | TypeRef::Slice { element }
                 | TypeRef::Channel { element, .. } => {
@@ -2620,6 +2999,85 @@ impl Validator {
         self.diagnostics
             .push(Diagnostic::error(code, path, message));
     }
+}
+
+fn cpp_signature_matches_operation(
+    operation: CppSpecialMemberOperation,
+    signature: &CppCallableSignature,
+    owner: &str,
+) -> bool {
+    match operation {
+        CppSpecialMemberOperation::CopyConstructor => {
+            signature.callable_kind == CppCallableKind::Constructor
+                && signature.receiver.is_none()
+                && signature.result.is_none()
+                && signature.parameters.len() == 1
+                && cpp_reference_to_owner(
+                    &signature.parameters[0],
+                    CppReferenceKind::Lvalue,
+                    true,
+                    owner,
+                )
+        }
+        CppSpecialMemberOperation::CopyAssignment => {
+            signature.callable_kind == CppCallableKind::Method
+                && signature.receiver.as_ref().is_some_and(|value| {
+                    cpp_reference_to_owner(value, CppReferenceKind::Lvalue, false, owner)
+                })
+                && signature.parameters.len() == 1
+                && cpp_reference_to_owner(
+                    &signature.parameters[0],
+                    CppReferenceKind::Lvalue,
+                    true,
+                    owner,
+                )
+                && signature.result.as_ref().is_some_and(|value| {
+                    cpp_reference_to_owner(value, CppReferenceKind::Lvalue, false, owner)
+                })
+        }
+        CppSpecialMemberOperation::MoveConstructor => {
+            signature.callable_kind == CppCallableKind::Constructor
+                && signature.receiver.is_none()
+                && signature.result.is_none()
+                && signature.parameters.len() == 1
+                && cpp_reference_to_owner(
+                    &signature.parameters[0],
+                    CppReferenceKind::Rvalue,
+                    false,
+                    owner,
+                )
+        }
+    }
+}
+
+fn cpp_reference_to_owner(
+    value: &CppCanonicalType,
+    expected_kind: CppReferenceKind,
+    expect_const: bool,
+    owner: &str,
+) -> bool {
+    let CppCanonicalType::Reference {
+        reference_kind,
+        referent,
+    } = value
+    else {
+        return false;
+    };
+    if *reference_kind != expected_kind {
+        return false;
+    }
+    let referent = if expect_const {
+        let CppCanonicalType::Qualified { qualifiers, r#type } = referent.as_ref() else {
+            return false;
+        };
+        if qualifiers.as_slice() != [CppTypeQualifier::Const] {
+            return false;
+        }
+        r#type.as_ref()
+    } else {
+        referent.as_ref()
+    };
+    matches!(referent, CppCanonicalType::Declared { symbol } if symbol == owner)
 }
 
 #[derive(Debug, Clone, Copy)]

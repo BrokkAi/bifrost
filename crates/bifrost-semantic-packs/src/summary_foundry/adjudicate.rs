@@ -584,6 +584,7 @@ mod tests {
             input,
             exit_kind: AuthoredSummaryExitKind::Normal,
             output: AuthoredSummaryOutput::NormalReturn {},
+            value_transfer: None,
         }
     }
 

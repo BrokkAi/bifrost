@@ -132,6 +132,7 @@ impl RubyGemArchivePackProducer {
                 completeness,
                 safety: request.safety.clone(),
                 carried_sources: Vec::new(),
+                cpp_portability: None,
                 shards: vec![AuthoredShard {
                     id: "declarations.ruby.external".to_owned(),
                     activation,

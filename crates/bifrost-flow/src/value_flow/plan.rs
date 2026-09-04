@@ -3,7 +3,7 @@ use std::{cmp::Ordering, error::Error, fmt, hash::Hash, mem::size_of_val, sync::
 use crate::analyzer::semantic::{
     AbstractLocation, AbstractObject, AccessPathRoot, CallArgumentEndpoint, CallBinding,
     CallBindings, CallSiteHandle, CallSiteId, CallableTarget, CallableTargetResolution,
-    CandidateCoverage, ControlEdgeId, DeclarationLocator, DeclarationSegmentKind,
+    CandidateCoverage, ControlEdgeId, ControlEdgeKind, DeclarationLocator, DeclarationSegmentKind,
     DispatchBoundaryKind, EvidenceCompleteness, GuardFact, IcfgEdgeKind, MemoryLocationKind,
     ObjectCardinality, ProcedureHandle, ProcedureSemantics, ProgramPointHandle, ProgramPointId,
     ProofStatus, SemanticArtifact, SemanticArtifactKey, SemanticCapability, SemanticEffect,
@@ -20,15 +20,44 @@ use crate::dataflow::{
 use crate::hash::{HashMap, HashSet};
 
 use super::{
-    ValueFlowCarrier, ValueFlowCarrierId, ValueFlowCarrierKey, ValueFlowModelError,
-    ValueFlowObservationPhase, ValueFlowSinkId, ValueFlowSinkSpec, ValueFlowSourceId,
-    ValueFlowSourceSpec,
+    ValueFlowCarrier, ValueFlowCarrierId, ValueFlowCarrierKey, ValueFlowEventKey,
+    ValueFlowModelError, ValueFlowObservationPhase, ValueFlowSinkId, ValueFlowSinkSpec,
+    ValueFlowSourceId, ValueFlowSourceSpec,
 };
 
 pub const MAX_VALUE_FLOW_CARRIERS: usize = 262_144;
 pub const MAX_VALUE_FLOW_RELATIONS: usize = 1_000_000;
 pub const MAX_VALUE_FLOW_SOURCES: usize = 65_536;
 pub const MAX_VALUE_FLOW_SINKS: usize = 65_536;
+
+/// Remove selected source facts from one carrier while traversing one exact
+/// intraprocedural edge.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ValueFlowEdgeKillSpec {
+    pub point: ProgramPointHandle,
+    pub target: ProgramPointId,
+    pub kind: ControlEdgeKind,
+    pub carrier: ValueFlowCarrier,
+    pub sources: Vec<ValueFlowEventKey>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BoundValueFlowEdgeKill {
+    pub carrier: ValueFlowCarrierId,
+    pub sources: Box<[ValueFlowSourceId]>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct EdgeKillKey {
+    point: ProgramPointHandle,
+    target: ProgramPointId,
+    kind: ControlEdgeKind,
+}
+
+#[derive(Debug, Clone, Default)]
+struct EdgeKillIndex {
+    by_edge: HashMap<EdgeKillKey, Box<[BoundValueFlowEdgeKill]>>,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ValueFlowPlanLimits {
@@ -185,6 +214,15 @@ pub(crate) struct ValueFlowLocationBindingSummaryRule {
     carrier: ValueFlowCarrierKey,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct ValueFlowEdgeKillSummaryRule {
+    point: ProgramPointId,
+    target: ProgramPointId,
+    kind: ControlEdgeKind,
+    carrier: ValueFlowCarrierKey,
+    sources: Box<[ValueFlowEventKey]>,
+}
+
 /// Stable, procedure-local value-flow identity used by reusable client summaries.
 ///
 /// Source, sink, sanitizer, and transform matching are intentionally absent;
@@ -200,6 +238,7 @@ pub(crate) struct ValueFlowCarrierSummaryIdentity {
     curated_models: Box<[ValueFlowCuratedModelSummaryRule]>,
     fallback_rules: Box<[ValueFlowFallbackSummaryRule]>,
     location_bindings: Box<[ValueFlowLocationBindingSummaryRule]>,
+    edge_kills: Box<[ValueFlowEdgeKillSummaryRule]>,
 }
 
 impl ValueFlowCarrierSummaryIdentity {
@@ -253,6 +292,22 @@ impl ValueFlowCarrierSummaryIdentity {
                 .map(|binding| binding.carrier.retained_bytes())
                 .fold(0usize, usize::saturating_add),
         );
+        let edge_kills = size_of_val(self.edge_kills.as_ref()).saturating_add(
+            self.edge_kills
+                .iter()
+                .map(|kill| {
+                    kill.carrier
+                        .retained_bytes()
+                        .saturating_add(size_of_val(kill.sources.as_ref()))
+                        .saturating_add(
+                            kill.sources
+                                .iter()
+                                .map(ValueFlowEventKey::retained_bytes)
+                                .fold(0usize, usize::saturating_add),
+                        )
+                })
+                .fold(0usize, usize::saturating_add),
+        );
         std::mem::size_of::<Self>()
             .saturating_add(local)
             .saturating_add(calls)
@@ -267,6 +322,7 @@ impl ValueFlowCarrierSummaryIdentity {
             )
             .saturating_add(fallbacks)
             .saturating_add(location_bindings)
+            .saturating_add(edge_kills)
     }
 }
 
@@ -313,6 +369,17 @@ fn classify_snapshot_openness(
     sinks: &[ValueFlowSinkSpec],
 ) -> SnapshotOpenness {
     let procedure = snapshot.procedure();
+    // A typed gap may outrank an unproven retained relation in the oracle's
+    // top-level outcome, but refining that gap does not prove the relation.
+    // Preserve the relation's independent quality floor before considering
+    // whether the typed gaps can be discharged by this plan (#2835).
+    if snapshot
+        .relations()
+        .iter()
+        .any(|relation| !relation.is_proven_complete())
+    {
+        return SnapshotOpenness::Blocked(None);
+    }
     if crate::analyzer::semantic::workspace_oracle::value_flow_capabilities_are_open(procedure) {
         return SnapshotOpenness::Blocked(None);
     }
@@ -833,6 +900,30 @@ impl ObservationIndex {
     }
 }
 
+impl EdgeKillIndex {
+    fn retained_heap_bytes(&self) -> usize {
+        self.by_edge
+            .capacity()
+            .saturating_mul(
+                std::mem::size_of::<(EdgeKillKey, Box<[BoundValueFlowEdgeKill]>)>()
+                    .saturating_add(1),
+            )
+            .saturating_add(
+                self.by_edge
+                    .values()
+                    .map(|kills| {
+                        size_of_val(kills.as_ref()).saturating_add(
+                            kills
+                                .iter()
+                                .map(|kill| size_of_val(kill.sources.as_ref()))
+                                .fold(0usize, usize::saturating_add),
+                        )
+                    })
+                    .fold(0usize, usize::saturating_add),
+            )
+    }
+}
+
 fn reverse_index_heap_bytes<K>(index: &HashMap<K, Box<[usize]>>) -> usize {
     index
         .capacity()
@@ -874,6 +965,9 @@ pub struct ValueFlowPlan {
     sinks: Box<[BoundValueFlowSink]>,
     /// Derived point/phase lookup; observation identity remains `sinks`.
     sink_index: ObservationIndex,
+    edge_kills: Box<[ValueFlowEdgeKillSpec]>,
+    /// Derived dense-ID lookup; canonical identity remains `edge_kills`.
+    edge_kill_index: EdgeKillIndex,
     snapshot_procedures: Box<[ProcedureHandle]>,
     /// Derived from the same procedures the plan was built over, so it is
     /// deliberately absent from `PartialEq` and `Hash`: two plans that agree on
@@ -884,6 +978,17 @@ pub struct ValueFlowPlan {
     first_incomplete_cause: Option<ValueFlowIncompleteCause>,
     snapshot_discoveries: Box<[SnapshotDiscovery]>,
     non_snapshot_discovery_complete: bool,
+    /// Endpoint-only slice of `non_snapshot_discovery_complete`: whether every
+    /// source and sink spec is proven, complete, and entered. Binding-input
+    /// incompleteness is tracked per call in `incomplete_binding_calls` so a
+    /// curated model that claims a call's whole behavior can answer it at
+    /// result time.
+    endpoint_discovery_complete: bool,
+    /// Calls whose `CallBindings` input stayed incomplete. Discovery closes
+    /// only when each is answered by a curated model over a fully modeled
+    /// result boundary; without a curated model the plan stays exactly as
+    /// strict as the combined flag was.
+    incomplete_binding_calls: Box<[CallSiteHandle]>,
     ambiguous_dispatch: bool,
     discovery_complete: bool,
     structural_discovery_complete: bool,
@@ -906,6 +1011,7 @@ impl PartialEq for ValueFlowPlan {
             && self.summary_location_bindings == other.summary_location_bindings
             && self.sources == other.sources
             && self.sinks == other.sinks
+            && self.edge_kills == other.edge_kills
             && self.snapshot_procedures == other.snapshot_procedures
             && self.binding_pairs == other.binding_pairs
             && self.discovery_status == other.discovery_status
@@ -937,6 +1043,7 @@ impl Hash for ValueFlowPlan {
         self.summary_location_bindings.hash(state);
         self.sources.hash(state);
         self.sinks.hash(state);
+        self.edge_kills.hash(state);
         self.snapshot_procedures.hash(state);
         self.binding_pairs.hash(state);
         self.discovery_status.hash(state);
@@ -1038,12 +1145,24 @@ impl ValueFlowPlan {
         sources: Vec<ValueFlowSourceSpec>,
         sinks: Vec<ValueFlowSinkSpec>,
     ) -> Result<Self, ValueFlowPlanError> {
-        Self::with_call_behavior(
+        Self::try_new_with_edge_kills(root, snapshots, bindings, sources, sinks, Vec::new())
+    }
+
+    pub fn try_new_with_edge_kills(
+        root: ProcedureHandle,
+        snapshots: Vec<ValueFlowInput<ValueFlowSnapshot>>,
+        bindings: Vec<ValueFlowInput<CallBindings>>,
+        sources: Vec<ValueFlowSourceSpec>,
+        sinks: Vec<ValueFlowSinkSpec>,
+        edge_kills: Vec<ValueFlowEdgeKillSpec>,
+    ) -> Result<Self, ValueFlowPlanError> {
+        Self::with_call_behavior_and_edge_kills(
             root,
             snapshots,
             bindings,
             sources,
             sinks,
+            edge_kills,
             UnmodeledCallBehavior::default(),
         )
     }
@@ -1056,12 +1175,33 @@ impl ValueFlowPlan {
         sinks: Vec<ValueFlowSinkSpec>,
         unmodeled_call_behavior: UnmodeledCallBehavior,
     ) -> Result<Self, ValueFlowPlanError> {
-        Self::with_limits_and_call_behavior(
+        Self::with_call_behavior_and_edge_kills(
             root,
             snapshots,
             bindings,
             sources,
             sinks,
+            Vec::new(),
+            unmodeled_call_behavior,
+        )
+    }
+
+    pub fn with_call_behavior_and_edge_kills(
+        root: ProcedureHandle,
+        snapshots: Vec<ValueFlowInput<ValueFlowSnapshot>>,
+        bindings: Vec<ValueFlowInput<CallBindings>>,
+        sources: Vec<ValueFlowSourceSpec>,
+        sinks: Vec<ValueFlowSinkSpec>,
+        edge_kills: Vec<ValueFlowEdgeKillSpec>,
+        unmodeled_call_behavior: UnmodeledCallBehavior,
+    ) -> Result<Self, ValueFlowPlanError> {
+        Self::with_limits_and_call_behavior_and_edge_kills(
+            root,
+            snapshots,
+            bindings,
+            sources,
+            sinks,
+            edge_kills,
             ValueFlowPlanLimits::default(),
             unmodeled_call_behavior,
         )
@@ -1075,12 +1215,13 @@ impl ValueFlowPlan {
         sinks: Vec<ValueFlowSinkSpec>,
         limits: ValueFlowPlanLimits,
     ) -> Result<Self, ValueFlowPlanError> {
-        Self::with_limits_and_call_behavior(
+        Self::with_limits_and_call_behavior_and_edge_kills(
             root,
             snapshots,
             bindings,
             sources,
             sinks,
+            Vec::new(),
             limits,
             UnmodeledCallBehavior::default(),
         )
@@ -1088,10 +1229,33 @@ impl ValueFlowPlan {
 
     pub fn with_limits_and_call_behavior(
         root: ProcedureHandle,
+        snapshots: Vec<ValueFlowInput<ValueFlowSnapshot>>,
+        bindings: Vec<ValueFlowInput<CallBindings>>,
+        sources: Vec<ValueFlowSourceSpec>,
+        sinks: Vec<ValueFlowSinkSpec>,
+        limits: ValueFlowPlanLimits,
+        unmodeled_call_behavior: UnmodeledCallBehavior,
+    ) -> Result<Self, ValueFlowPlanError> {
+        Self::with_limits_and_call_behavior_and_edge_kills(
+            root,
+            snapshots,
+            bindings,
+            sources,
+            sinks,
+            Vec::new(),
+            limits,
+            unmodeled_call_behavior,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_limits_and_call_behavior_and_edge_kills(
+        root: ProcedureHandle,
         mut snapshots: Vec<ValueFlowInput<ValueFlowSnapshot>>,
         mut bindings: Vec<ValueFlowInput<CallBindings>>,
         mut sources: Vec<ValueFlowSourceSpec>,
         mut sinks: Vec<ValueFlowSinkSpec>,
+        mut edge_kills: Vec<ValueFlowEdgeKillSpec>,
         limits: ValueFlowPlanLimits,
         unmodeled_call_behavior: UnmodeledCallBehavior,
     ) -> Result<Self, ValueFlowPlanError> {
@@ -1109,6 +1273,12 @@ impl ValueFlowPlan {
         bindings.sort_by(|left, right| compare_bindings(left.value(), right.value()));
         sources.sort_by(|left, right| left.key().cmp(right.key()));
         sinks.sort_by(|left, right| left.key().cmp(right.key()));
+        for kill in &mut edge_kills {
+            kill.sources.sort();
+            kill.sources.dedup();
+        }
+        edge_kills.sort_by(compare_edge_kills);
+        edge_kills.dedup();
         if adjacent_duplicate(sources.iter().map(ValueFlowSourceSpec::key))
             || adjacent_duplicate(sinks.iter().map(ValueFlowSinkSpec::key))
         {
@@ -1142,7 +1312,25 @@ impl ValueFlowPlan {
             .iter()
             .map(|input| (input.value().call().clone(), input.value().callee().clone()))
             .collect::<Vec<_>>();
+        // An exhaustive candidate-specific receiver proof may also prove that
+        // resolver alternatives cannot be entered by that call. Preserve that
+        // negative identity evidence so an endpoint in an excluded anonymous
+        // sibling does not make an otherwise closed plan inconclusive. Merely
+        // mounting a lexical child still proves nothing: #2640 shapes without
+        // this explicit exclusion continue to report an unentered procedure.
+        let excluded = bindings
+            .iter()
+            .filter(|input| {
+                input.status().is_complete()
+                    && input.value().coverage() == CandidateCoverage::Exhaustive
+                    && !input.value().context().was_truncated()
+            })
+            .flat_map(|input| input.value().candidate().excluded_targets())
+            .map(ProcedureHandle::durable_key)
+            .collect::<HashSet<_>>();
         let mut non_snapshot_discovery_complete = true;
+        let mut endpoint_discovery_complete = true;
+        let mut incomplete_binding_calls: Vec<CallSiteHandle> = Vec::new();
         let mut binding_complete = HashMap::<CallSiteHandle, bool>::default();
         for input in &bindings {
             let complete = input.status().is_complete()
@@ -1286,6 +1474,13 @@ impl ValueFlowPlan {
                 && input.value().coverage() == CandidateCoverage::Exhaustive
                 && !input.value().context().was_truncated();
             non_snapshot_discovery_complete &= complete;
+            if !complete
+                && !incomplete_binding_calls
+                    .iter()
+                    .any(|call| compare_calls(call, input.value().call()) == Ordering::Equal)
+            {
+                incomplete_binding_calls.push(input.value().call().clone());
+            }
             discovery_complete &= complete;
             structural_discovery_complete &= !input.value().context().was_truncated();
             for binding in input.value().bindings() {
@@ -1301,19 +1496,21 @@ impl ValueFlowPlan {
             let evidence_complete = matches!(source.proof(), ProofStatus::Proven)
                 && matches!(source.completeness(), EvidenceCompleteness::Complete);
             let entered_procedure = entered.contains(&source.point().procedure().durable_key());
+            let excluded_procedure = excluded.contains(&source.point().procedure().durable_key());
             if first_incomplete_cause.is_none() {
                 if !evidence_complete {
                     first_incomplete_cause = Some(ValueFlowIncompleteCause::SourceEvidence {
                         point: source.point().clone(),
                     });
-                } else if !entered_procedure {
+                } else if !entered_procedure && !excluded_procedure {
                     first_incomplete_cause = Some(ValueFlowIncompleteCause::UnenteredProcedure {
                         procedure: source.point().procedure().clone(),
                     });
                 }
             }
-            let complete = evidence_complete && entered_procedure;
+            let complete = evidence_complete && (entered_procedure || excluded_procedure);
             non_snapshot_discovery_complete &= complete;
+            endpoint_discovery_complete &= complete;
             discovery_complete &= complete;
             structural_discovery_complete &= evidence_complete;
             carrier_candidates.push(source.carrier().clone());
@@ -1323,22 +1520,44 @@ impl ValueFlowPlan {
             let evidence_complete = matches!(sink.proof(), ProofStatus::Proven)
                 && matches!(sink.completeness(), EvidenceCompleteness::Complete);
             let entered_procedure = entered.contains(&sink.point().procedure().durable_key());
+            let excluded_procedure = excluded.contains(&sink.point().procedure().durable_key());
             if first_incomplete_cause.is_none() {
                 if !evidence_complete {
                     first_incomplete_cause = Some(ValueFlowIncompleteCause::SinkEvidence {
                         point: sink.point().clone(),
                     });
-                } else if !entered_procedure {
+                } else if !entered_procedure && !excluded_procedure {
                     first_incomplete_cause = Some(ValueFlowIncompleteCause::UnenteredProcedure {
                         procedure: sink.point().procedure().clone(),
                     });
                 }
             }
-            let complete = evidence_complete && entered_procedure;
+            let complete = evidence_complete && (entered_procedure || excluded_procedure);
             non_snapshot_discovery_complete &= complete;
+            endpoint_discovery_complete &= complete;
             discovery_complete &= complete;
             structural_discovery_complete &= evidence_complete;
             carrier_candidates.push(sink.carrier().clone());
+        }
+        for kill in &edge_kills {
+            validate_event(&kill.point, &kill.carrier, mount)?;
+            let edge_exists = kill
+                .point
+                .procedure()
+                .semantics()
+                .successor_edges(kill.point.id())
+                .any(|(_, edge)| edge.target_point == kill.target && edge.kind == kill.kind);
+            if !edge_exists
+                || kill.sources.is_empty()
+                || kill.sources.iter().any(|key| {
+                    sources
+                        .binary_search_by(|source| source.key().cmp(key))
+                        .is_err()
+                })
+            {
+                return Err(ValueFlowPlanError::InvalidEdgeKill);
+            }
+            carrier_candidates.push(kill.carrier.clone());
         }
         if relation_count > limits.max_relations {
             return Err(ValueFlowPlanError::LimitExceeded);
@@ -1429,6 +1648,7 @@ impl ValueFlowPlan {
                 })
             })
             .collect::<Result<Vec<_>, ValueFlowPlanError>>()?;
+        let edge_kill_index = build_edge_kill_index(&edge_kills, &carrier_ids, &bound_sources)?;
 
         let local_rule_reverse_index = build_local_rule_reverse_index(&local_rules);
         let call_rule_reverse_index = build_call_rule_reverse_index(&call_rules);
@@ -1461,6 +1681,8 @@ impl ValueFlowPlan {
             source_index,
             sinks: bound_sinks.into_boxed_slice(),
             sink_index,
+            edge_kills: edge_kills.into_boxed_slice(),
+            edge_kill_index,
             infeasible_points,
             snapshot_procedures: snapshot_procedures.into_boxed_slice(),
             binding_pairs: binding_pairs.into_boxed_slice(),
@@ -1468,6 +1690,8 @@ impl ValueFlowPlan {
             first_incomplete_cause,
             snapshot_discoveries: snapshot_discoveries.into_boxed_slice(),
             non_snapshot_discovery_complete,
+            endpoint_discovery_complete,
+            incomplete_binding_calls: incomplete_binding_calls.into_boxed_slice(),
             ambiguous_dispatch,
             discovery_complete,
             structural_discovery_complete,
@@ -1516,6 +1740,10 @@ impl ValueFlowPlan {
         for sink in &self.sinks {
             visit(sink.spec.point().procedure().artifact());
         }
+        for kill in &self.edge_kills {
+            visit(kill.point.procedure().artifact());
+            kill.carrier.for_each_retained_artifact(&mut visit);
+        }
         if let Some(cause) = &self.first_incomplete_cause {
             visit(cause.procedure().artifact());
             if let ValueFlowIncompleteCause::CallResolution { call, .. }
@@ -1563,6 +1791,20 @@ impl ValueFlowPlan {
                 .saturating_add(self.carrier_keys[sink.carrier.index()].retained_bytes())
                 .saturating_add(proof_heap_bytes(sink.spec.proof()))
                 .saturating_add(completeness_heap_bytes(sink.spec.completeness()))
+        });
+        let edge_kill_heap = self.edge_kills.iter().fold(0usize, |total, kill| {
+            total
+                .saturating_add(
+                    kill.sources
+                        .iter()
+                        .map(ValueFlowEventKey::retained_bytes)
+                        .fold(0usize, usize::saturating_add),
+                )
+                .saturating_add(
+                    kill.carrier
+                        .stable_key()
+                        .map_or(0, |key| key.retained_bytes()),
+                )
         });
 
         std::mem::size_of::<Self>()
@@ -1615,6 +1857,9 @@ impl ValueFlowPlan {
             .saturating_add(size_of_val(self.sinks.as_ref()))
             .saturating_add(self.sink_index.retained_heap_bytes())
             .saturating_add(sink_heap)
+            .saturating_add(size_of_val(self.edge_kills.as_ref()))
+            .saturating_add(edge_kill_heap)
+            .saturating_add(self.edge_kill_index.retained_heap_bytes())
             .saturating_add(size_of_val(self.snapshot_procedures.as_ref()))
             .saturating_add(size_of_val(self.binding_pairs.as_ref()))
             // Account for the plan-ownership Arc allocation and reference counts.
@@ -1650,8 +1895,12 @@ impl ValueFlowPlan {
         &self.external_summaries
     }
 
-    /// Install selector-bound curated models. Exactly one model may own a call
-    /// site; exact target summaries are still selected first during transfer.
+    /// Install selector-bound curated models, merging with any models already
+    /// installed (external-model and persistence-store declarations each
+    /// contribute their own). Exactly one model may own a call site -- two
+    /// declarations claiming one call, within or across categories, are a
+    /// duplicate -- and exact target summaries are still selected first
+    /// during transfer.
     pub fn with_curated_call_models(
         mut self,
         mut models: Vec<ValueFlowCuratedCallModel>,
@@ -1669,6 +1918,7 @@ impl ValueFlowPlan {
                 return Err(ValueFlowPlanError::StaleCallModel);
             }
         }
+        models.extend(self.curated_call_models.iter().cloned());
         models.sort_by(|left, right| compare_calls(&left.call, &right.call));
         if models.windows(2).any(|pair| pair[0].call == pair[1].call) {
             return Err(ValueFlowPlanError::DuplicateCallModel);
@@ -1797,6 +2047,17 @@ impl ValueFlowPlan {
             binding.port.hash(state);
             self.carrier_keys[binding.carrier.index()].hash(state);
         }
+        for kill in &self.edge_kills {
+            kill.point.hash(state);
+            kill.target.hash(state);
+            kill.kind.hash(state);
+            self.carrier_ids
+                .get(&kill.carrier)
+                .map(|id| &self.carrier_keys[id.index()])
+                .expect("a validated edge-kill carrier is bound")
+                .hash(state);
+            kill.sources.hash(state);
+        }
         self.snapshot_procedures.hash(state);
         self.binding_pairs.hash(state);
         self.discovery_status.hash(state);
@@ -1812,6 +2073,7 @@ impl ValueFlowPlan {
             && same_local_rules(self, other)
             && same_call_rules(self, other)
             && same_summary_location_bindings(self, other)
+            && self.edge_kills == other.edge_kills
             && self.snapshot_procedures == other.snapshot_procedures
             && self.binding_pairs == other.binding_pairs
             && self.discovery_status == other.discovery_status
@@ -1939,6 +2201,7 @@ impl ValueFlowPlan {
             point: sink.spec.point().clone(),
             phase: sink.spec.phase(),
         });
+        let edge_kill_index = build_edge_kill_index(&first.edge_kills, &carrier_ids, &sources)?;
 
         Ok(Self {
             root: first.root.clone(),
@@ -1959,6 +2222,8 @@ impl ValueFlowPlan {
             source_index,
             sinks: sinks.into_boxed_slice(),
             sink_index,
+            edge_kills: first.edge_kills.clone(),
+            edge_kill_index,
             infeasible_points: first.infeasible_points.clone(),
             snapshot_procedures: first.snapshot_procedures.clone(),
             binding_pairs: first.binding_pairs.clone(),
@@ -1970,6 +2235,22 @@ impl ValueFlowPlan {
             non_snapshot_discovery_complete: plans
                 .iter()
                 .all(|plan| plan.non_snapshot_discovery_complete),
+            endpoint_discovery_complete: plans.iter().all(|plan| plan.endpoint_discovery_complete),
+            incomplete_binding_calls: {
+                let mut calls: Vec<CallSiteHandle> = Vec::new();
+                for plan in plans {
+                    for call in plan.incomplete_binding_calls.iter() {
+                        if !calls
+                            .iter()
+                            .any(|known| compare_calls(known, call) == Ordering::Equal)
+                        {
+                            calls.push(call.clone());
+                        }
+                    }
+                }
+                calls.sort_by(compare_calls);
+                calls.into_boxed_slice()
+            },
             ambiguous_dispatch: plans.iter().any(|plan| plan.ambiguous_dispatch),
             discovery_complete: plans.iter().all(|plan| plan.discovery_complete),
             structural_discovery_complete: plans
@@ -2175,7 +2456,14 @@ impl ValueFlowPlan {
         result: &SummaryDataflowResult<Fact>,
         requirement: SummaryProofRequirement,
     ) -> bool {
-        self.non_snapshot_discovery_complete
+        self.endpoint_discovery_complete
+            && self.incomplete_binding_calls.iter().all(|call| {
+                // Only a curated model may answer an incomplete binding input:
+                // it is an authored claim about the call's whole behavior. An
+                // external pack summary keeps the pre-existing strictness.
+                self.curated_model_for_call(call).is_some()
+                    && self.call_boundaries_are_fully_modeled(result, call, requirement)
+            })
             && self
                 .snapshot_discoveries
                 .iter()
@@ -2224,7 +2512,21 @@ impl ValueFlowPlan {
                 }
             }
         }
-        saw_dispatch || allocation_call
+        // A fully bindable curated model answers a residual refinement call
+        // even when the run recorded no dispatch boundary for it: a plan that
+        // deliberately binds no callee for a modeled call (a policy-declared
+        // external model, #2691) leaves the call with neither a binding nor a
+        // boundary, and the model's transfers are the call's complete
+        // semantics, exactly as in `dispatch_boundary_is_fully_modeled`.
+        saw_dispatch
+            || allocation_call
+            || self.curated_model_for_call(call).is_some_and(|model| {
+                self.model_is_fully_bindable(
+                    call,
+                    model.transfers(),
+                    SummaryProofRequirement::Derived,
+                )
+            })
     }
 
     fn boundary_is_fully_modeled<Fact>(
@@ -2625,6 +2927,7 @@ impl ValueFlowPlan {
             curated_models: Vec<ValueFlowCuratedModelSummaryRule>,
             fallback_rules: Vec<ValueFlowFallbackSummaryRule>,
             location_bindings: Vec<ValueFlowLocationBindingSummaryRule>,
+            edge_kills: Vec<ValueFlowEdgeKillSummaryRule>,
         }
 
         let mut builders = HashMap::<ProcedureHandle, Builder>::default();
@@ -2707,6 +3010,24 @@ impl ValueFlowPlan {
                     carrier: self.carrier_keys[binding.carrier.index()].clone(),
                 });
         }
+        for kill in &self.edge_kills {
+            let carrier = self
+                .carrier_ids
+                .get(&kill.carrier)
+                .copied()
+                .expect("a validated edge-kill carrier is bound");
+            builders
+                .entry(kill.point.procedure().clone())
+                .or_default()
+                .edge_kills
+                .push(ValueFlowEdgeKillSummaryRule {
+                    point: kill.point.id(),
+                    target: kill.target,
+                    kind: kill.kind,
+                    carrier: self.carrier_keys[carrier.index()].clone(),
+                    sources: kill.sources.clone().into_boxed_slice(),
+                });
+        }
         builders
             .into_iter()
             .map(|(procedure, builder)| {
@@ -2732,6 +3053,7 @@ impl ValueFlowPlan {
                         curated_models: builder.curated_models.into_boxed_slice(),
                         fallback_rules: builder.fallback_rules.into_boxed_slice(),
                         location_bindings: builder.location_bindings.into_boxed_slice(),
+                        edge_kills: builder.edge_kills.into_boxed_slice(),
                     },
                 )
             })
@@ -2744,6 +3066,7 @@ impl ValueFlowPlan {
             .saturating_add(self.call_rules.len())
             .saturating_add(self.curated_call_models.len())
             .saturating_add(self.summary_location_bindings.len())
+            .saturating_add(self.edge_kills.len())
             .saturating_add(
                 self.fallback_profiles
                     .iter()
@@ -2909,7 +3232,7 @@ impl ValueFlowPlan {
                 kind,
                 input,
                 model.transfers(),
-                &[],
+                model.effects(),
                 true,
                 visitor,
             );
@@ -3248,6 +3571,26 @@ impl ValueFlowPlan {
         self.local_rules
             .iter()
             .filter(move |rule| feasible && &rule.point == point)
+    }
+
+    pub(crate) fn edge_kills(
+        &self,
+        point: &ProgramPointHandle,
+        target: ProgramPointId,
+        kind: ControlEdgeKind,
+    ) -> &[BoundValueFlowEdgeKill] {
+        self.edge_kill_index
+            .by_edge
+            .get(&EdgeKillKey {
+                point: point.clone(),
+                target,
+                kind,
+            })
+            .map_or(&[], Box::as_ref)
+    }
+
+    pub(crate) fn has_edge_kills(&self) -> bool {
+        !self.edge_kills.is_empty()
     }
 
     pub(crate) fn local_rule_views(
@@ -3761,6 +4104,7 @@ pub enum ValueFlowPlanError {
     ContextSensitiveInputUnsupported,
     InvalidCallArgumentLocation,
     DuplicateEventKey,
+    InvalidEdgeKill,
     DuplicateCallModel,
     StaleCallModel,
     InvalidSummaryLocationPort,
@@ -3793,6 +4137,9 @@ impl fmt::Display for ValueFlowPlanError {
                 formatter.write_str("call argument contains an invalid abstract location")
             }
             Self::DuplicateEventKey => formatter.write_str("duplicate value-flow event key"),
+            Self::InvalidEdgeKill => {
+                formatter.write_str("value-flow edge kill names an absent edge, source, or carrier")
+            }
             Self::DuplicateCallModel => {
                 formatter.write_str("multiple curated call models target the same call site")
             }
@@ -4491,6 +4838,59 @@ fn compare_procedures(left: &ProcedureHandle, right: &ProcedureHandle) -> Orderi
 
 fn compare_points(left: &ProgramPointHandle, right: &ProgramPointHandle) -> Ordering {
     compare_procedures(left.procedure(), right.procedure()).then_with(|| left.id().cmp(&right.id()))
+}
+
+fn compare_edge_kills(left: &ValueFlowEdgeKillSpec, right: &ValueFlowEdgeKillSpec) -> Ordering {
+    compare_points(&left.point, &right.point)
+        .then_with(|| left.target.cmp(&right.target))
+        .then_with(|| left.kind.label().cmp(right.kind.label()))
+        .then_with(|| {
+            left.carrier
+                .stable_key()
+                .ok()
+                .cmp(&right.carrier.stable_key().ok())
+        })
+        .then_with(|| left.sources.cmp(&right.sources))
+}
+
+fn build_edge_kill_index(
+    specs: &[ValueFlowEdgeKillSpec],
+    carrier_ids: &HashMap<ValueFlowCarrier, ValueFlowCarrierId>,
+    sources: &[BoundValueFlowSource],
+) -> Result<EdgeKillIndex, ValueFlowPlanError> {
+    let mut by_edge = HashMap::<EdgeKillKey, Vec<BoundValueFlowEdgeKill>>::default();
+    for spec in specs {
+        let carrier = *carrier_ids
+            .get(&spec.carrier)
+            .ok_or(ValueFlowPlanError::MissingCarrier)?;
+        let source_ids = spec
+            .sources
+            .iter()
+            .map(|key| {
+                sources
+                    .binary_search_by(|source| source.spec.key().cmp(key))
+                    .map(|index| sources[index].id)
+                    .map_err(|_| ValueFlowPlanError::InvalidEdgeKill)
+            })
+            .collect::<Result<Box<[_]>, _>>()?;
+        by_edge
+            .entry(EdgeKillKey {
+                point: spec.point.clone(),
+                target: spec.target,
+                kind: spec.kind,
+            })
+            .or_default()
+            .push(BoundValueFlowEdgeKill {
+                carrier,
+                sources: source_ids,
+            });
+    }
+    Ok(EdgeKillIndex {
+        by_edge: by_edge
+            .into_iter()
+            .map(|(key, kills)| (key, kills.into_boxed_slice()))
+            .collect(),
+    })
 }
 
 fn compare_calls(left: &CallSiteHandle, right: &CallSiteHandle) -> Ordering {

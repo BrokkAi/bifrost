@@ -2051,12 +2051,10 @@ ABSL_NAMESPACE_END
         }
         assert_eq!(
             visibility
-                .macro_environment_cursors
-                .lock()
-                .expect("C++ macro environment cursor cache poisoned")
-                .len(),
+                .macro_environment_checkpoint_build_count
+                .load(Ordering::Relaxed),
             1,
-            "one worker must retain one bounded forward cursor, not one snapshot per frontier"
+            "the file's events must be applied once into one shared checkpoint vector"
         );
         assert_eq!(
             visibility
@@ -2065,24 +2063,22 @@ ABSL_NAMESPACE_END
             1,
             "repeated uses of one macro binding must share one parsed replacement"
         );
-        assert_eq!(
-            visibility
-                .macro_event_application_count
-                .load(Ordering::Relaxed),
-            INCLUDED_EVENT_COUNT + EVENT_COUNT + 2,
-            "the include closure must replay once and sequential frontiers once each"
-        );
-        assert_eq!(
-            visibility
-                .macro_environment_copy_count
-                .load(Ordering::Relaxed),
-            0,
-            "sequential calls must mutate the uniquely held cursor environment in place"
+        let requests = visibility
+            .macro_environment_request_count
+            .load(Ordering::Relaxed);
+        let applications = visibility
+            .macro_event_application_count
+            .load(Ordering::Relaxed);
+        let bound =
+            INCLUDED_EVENT_COUNT + EVENT_COUNT + 2 + requests * MACRO_ENVIRONMENT_CHECKPOINT_STRIDE;
+        assert!(
+            applications <= bound,
+            "the include closure must replay once into the checkpoints and each of the {requests} requests must replay at most one stride: {applications} applications exceed {bound}"
         );
     }
 
     #[test]
-    fn concurrent_macro_arity_scans_do_not_share_a_locked_forward_cursor() {
+    fn concurrent_macro_arity_scans_share_one_checkpoint_build() {
         let temp = tempfile::tempdir().expect("temp dir");
         let root = temp.path().canonicalize().expect("canonical temp dir");
         let file = ProjectFile::new(root.clone(), "consumer.cpp");
@@ -2127,70 +2123,68 @@ ABSL_NAMESPACE_END
             &roots,
         );
 
-        // Hold this thread's cursor across the worker's complete macro/include replay. A
-        // file-global cursor blocks the worker here; a worker-local cursor lets it finish while
-        // all immutable syntax, macro-event, and include-protection cells remain shared.
-        let main_cursor = visibility.macro_environment_cursor_cell(&file);
-        let main_guard = main_cursor
-            .lock()
-            .expect("main macro environment cursor poisoned");
-        let (timely, eventual) = std::thread::scope(|scope| {
-            let (tx, rx) = std::sync::mpsc::channel();
-            let (ready_tx, ready_rx) = std::sync::mpsc::channel();
-            let worker_file = &file;
-            let worker_visibility = &visibility;
-            let worker = scope.spawn(move || {
-                let prepared = cpp
-                    .prepared_syntax(query_token, worker_file)
-                    .expect("prepared macro consumer");
-                let mut stack = vec![prepared.tree().root_node()];
-                let mut calls = Vec::new();
-                while let Some(node) = stack.pop() {
-                    if node.kind() == "call_expression"
-                        && node
-                            .child_by_field_name("function")
-                            .is_some_and(|function| {
-                                node_text(function, prepared.source()) == "target"
-                            })
-                    {
-                        calls.push(node);
-                    }
-                    for index in (0..node.named_child_count()).rev() {
-                        if let Some(child) = node.named_child(index) {
-                            stack.push(child);
+        // Two workers race for the same file's macro environment. The checkpoint vector that
+        // replaced the per-worker forward cursors is immutable once built, so both must reach
+        // the same exact and fail-closed evidence off one build, one prepared tree, and one
+        // parsed replacement.
+        const WORKER_COUNT: usize = 2;
+        let start = std::sync::Barrier::new(WORKER_COUNT);
+        let evidence_by_worker = std::thread::scope(|scope| {
+            let workers = (0..WORKER_COUNT)
+                .map(|_| {
+                    let worker_file = &file;
+                    let worker_visibility = &visibility;
+                    let start = &start;
+                    scope.spawn(move || {
+                        let prepared = cpp
+                            .prepared_syntax(query_token, worker_file)
+                            .expect("prepared macro consumer");
+                        let mut stack = vec![prepared.tree().root_node()];
+                        let mut calls = Vec::new();
+                        while let Some(node) = stack.pop() {
+                            if node.kind() == "call_expression"
+                                && node
+                                    .child_by_field_name("function")
+                                    .is_some_and(|function| {
+                                        node_text(function, prepared.source()) == "target"
+                                    })
+                            {
+                                calls.push(node);
+                            }
+                            for index in (0..node.named_child_count()).rev() {
+                                if let Some(child) = node.named_child(index) {
+                                    stack.push(child);
+                                }
+                            }
                         }
-                    }
-                }
-                calls.sort_by_key(Node::start_byte);
-                ready_tx
-                    .send(())
-                    .expect("signal macro worker ready to resolve arity");
-                let evidence = calls
-                    .into_iter()
-                    .map(|call| {
-                        worker_visibility.call_arity_evidence(worker_file, call, prepared.source())
+                        calls.sort_by_key(Node::start_byte);
+                        start.wait();
+                        calls
+                            .into_iter()
+                            .map(|call| {
+                                worker_visibility.call_arity_evidence(
+                                    worker_file,
+                                    call,
+                                    prepared.source(),
+                                )
+                            })
+                            .collect::<Vec<_>>()
                     })
-                    .collect::<Vec<_>>();
-                tx.send(evidence.clone()).expect("send macro evidence");
-                evidence
-            });
-            ready_rx.recv().expect("macro worker ready signal");
-            let timely = rx.recv_timeout(std::time::Duration::from_secs(5));
-            drop(main_guard);
-            let eventual = worker.join().expect("macro arity worker");
-            (timely, eventual)
+                })
+                .collect::<Vec<_>>();
+            workers
+                .into_iter()
+                .map(|worker| worker.join().expect("macro arity worker"))
+                .collect::<Vec<_>>()
         });
 
         let expected = vec![CallArityEvidence::Exact(2), CallArityEvidence::Unknown];
-        assert_eq!(
-            timely.as_ref().ok(),
-            Some(&expected),
-            "another target worker must not wait for this thread's forward cursor: {timely:?}"
-        );
-        assert_eq!(
-            eventual, expected,
-            "removing cross-worker serialization must preserve exact and fail-closed evidence"
-        );
+        for evidence in &evidence_by_worker {
+            assert_eq!(
+                evidence, &expected,
+                "a shared checkpoint vector must preserve exact and fail-closed evidence"
+            );
+        }
         assert_eq!(
             cpp.prepared_syntax_parse_count_for_test(&file),
             1,
@@ -2198,12 +2192,96 @@ ABSL_NAMESPACE_END
         );
         assert_eq!(
             visibility
-                .macro_environment_cursors
-                .lock()
-                .expect("C++ macro environment cursor cache poisoned")
-                .len(),
-            2,
-            "the participating workers must retain independent bounded cursors"
+                .macro_environment_checkpoint_build_count
+                .load(Ordering::Relaxed),
+            1,
+            "racing workers must share one checkpoint build per file, not one per worker"
+        );
+    }
+
+    /// The cost contract the checkpoints exist for: however the requested
+    /// positions jump around, one file costs its own event count once plus at
+    /// most one stride of replay per request (#1496).
+    #[test]
+    fn random_macro_environment_positions_replay_at_most_one_stride_each() {
+        const EVENT_COUNT: usize = 256;
+        const INCLUDED_EVENT_COUNT: usize = 40;
+        const REQUEST_COUNT: usize = 300;
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        let header = ProjectFile::new(root.clone(), "bank.h");
+        let mut header_source = String::from("#pragma once\n");
+        for index in 0..INCLUDED_EVENT_COUNT {
+            header_source.push_str(&format!("#define BANK_{index} {index}\n"));
+        }
+        header.write(&header_source).expect("write macro bank");
+        let file = ProjectFile::new(root.clone(), "positions.cpp");
+        let mut source = String::from("#include \"bank.h\"\n");
+        for index in 0..EVENT_COUNT {
+            source.push_str(&format!("#define EVENT_{index} {index}\n"));
+        }
+        file.write(&source).expect("write macro fixture");
+
+        let project = Arc::new(crate::analyzer::TestProject::new(
+            &root,
+            crate::analyzer::Language::Cpp,
+        ));
+        let workspace = crate::analyzer::WorkspaceAnalyzer::build_ephemeral_footgun(
+            project,
+            crate::analyzer::AnalyzerConfig::default(),
+        )
+        .expect("ephemeral workspace should build");
+        let cpp = resolve_analyzer::<CppAnalyzer>(workspace.analyzer()).expect("C++ analyzer");
+        let query_scope = crate::analyzer::AnalyzerQueryScope::new(workspace.analyzer());
+        let query_token = query_scope.token();
+        let roots = HashSet::from_iter([file.clone()]);
+        let visibility = VisibilityIndex::build(
+            cpp,
+            query_token,
+            &CppDispatch::new(workspace.analyzer(), query_token).source(),
+            &roots,
+        );
+
+        let event_bytes = {
+            let cell = visibility.macro_event_cell(&file);
+            drop(visibility.macro_environment(&file, 0));
+            cell.get()
+                .expect("prepared macro events")
+                .iter()
+                .map(MacroEvent::byte)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(event_bytes.len(), EVENT_COUNT + 1);
+
+        // A fixed linear congruential sequence, so the positions jump both ways
+        // and the pin replays identically on every run.
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        for _ in 0..REQUEST_COUNT {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            let position = (state >> 33) as usize % event_bytes.len();
+            drop(visibility.macro_environment(&file, event_bytes[position] + 1));
+        }
+
+        let requests = visibility
+            .macro_environment_request_count
+            .load(Ordering::Relaxed);
+        let applications = visibility
+            .macro_event_application_count
+            .load(Ordering::Relaxed);
+        let bound =
+            EVENT_COUNT + INCLUDED_EVENT_COUNT + 1 + requests * MACRO_ENVIRONMENT_CHECKPOINT_STRIDE;
+        assert!(
+            applications <= bound,
+            "{requests} requests at random positions applied {applications} events, above the {bound} the checkpoints promise"
+        );
+        assert_eq!(
+            visibility
+                .macro_environment_checkpoint_build_count
+                .load(Ordering::Relaxed),
+            1,
+            "the checkpoint vector must be built once for the requested file"
         );
     }
 

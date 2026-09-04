@@ -18,6 +18,7 @@ mod imports;
 pub(crate) mod lexical_scope;
 mod semantic;
 mod structural;
+mod type_flow;
 use crate::analyzer::QueryToken;
 use crate::analyzer::Range;
 
@@ -538,6 +539,10 @@ impl CodeUnitIndex for PythonAnalyzer {
         self.inner.definitions(fq_name)
     }
 
+    fn prefetch_definitions(&self, fq_names: &[String]) {
+        self.inner.prefetch_definitions(fq_names);
+    }
+
     fn direct_children(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
         self.inner.direct_children(code_unit)
     }
@@ -689,6 +694,10 @@ impl IAnalyzer for PythonAnalyzer {
 
     fn end_query(&self, context: &Arc<crate::analyzer::AnalyzerQueryContext>) {
         self.inner.end_query(context);
+    }
+
+    fn prefetch_definitions(&self, fq_names: &[String]) {
+        self.inner.prefetch_definitions(fq_names);
     }
 
     fn record_query_failure(&self, error: crate::analyzer::store::StoreError) {
@@ -896,6 +905,42 @@ impl IAnalyzer for PythonAnalyzer {
 
 #[cfg(any(test, feature = "test-support"))]
 impl crate::analyzer::AnalyzerTestHooks for PythonAnalyzer {
+    fn reset_relational_definition_batch_call_count_for_test(&self) {
+        self.inner
+            .test_hooks()
+            .reset_relational_definition_batch_call_count_for_test();
+    }
+
+    fn relational_definition_batch_call_count_for_test(&self) -> usize {
+        self.inner
+            .test_hooks()
+            .relational_definition_batch_call_count_for_test()
+    }
+
+    fn reset_definition_candidates_query_count_for_test(&self) {
+        self.inner
+            .test_hooks()
+            .reset_definition_candidates_query_count_for_test();
+    }
+
+    fn definition_candidates_query_count_for_test(&self) -> usize {
+        self.inner
+            .test_hooks()
+            .definition_candidates_query_count_for_test()
+    }
+
+    fn reset_definition_prefetch_batch_count_for_test(&self) {
+        self.inner
+            .test_hooks()
+            .reset_definition_prefetch_batch_count_for_test();
+    }
+
+    fn definition_prefetch_batch_count_for_test(&self) -> usize {
+        self.inner
+            .test_hooks()
+            .definition_prefetch_batch_count_for_test()
+    }
+
     fn reset_full_declaration_scan_count_for_test(&self) {
         self.inner
             .test_hooks()
@@ -996,6 +1041,10 @@ impl LanguageSupport for PythonSupport {
 
     fn structural_receiver(&self) -> Option<&'static dyn StructuralReceiverResolver> {
         Some(&PythonSupport)
+    }
+
+    fn type_flow_adapter(&self) -> Option<&'static dyn crate::analyzer::semantic::TypeFlowAdapter> {
+        Some(&type_flow::PythonTypeFlowAdapter)
     }
 
     /// Protected: these are the importer files of the target's inferred export names,

@@ -24,7 +24,7 @@ use crate::analyzer::tree_sitter_analyzer::{
 use crate::analyzer::{GoAnalyzer, Language, ProjectFile};
 use crate::hash::{HashMap, HashSet};
 
-const ADAPTER_VERSION: &[u8] = b"go-value-semantics-v44";
+const ADAPTER_VERSION: &[u8] = b"go-value-semantics-v45";
 
 impl_program_semantics_provider!(GoAnalyzer, GoSemanticLowerer);
 
@@ -2416,6 +2416,8 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
                 })
                 .unwrap_or(declaration);
             let metadata = self.value_mapping(builder, mapping_node)?;
+            let parameter_name = slot.unique_name().map(Box::<str>::from);
+            let passing_mode = slot.passing_mode;
             let value = if slot.receiver {
                 let value = self.session.add_value_with_metadata(
                     builder,
@@ -2431,6 +2433,8 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
                     SemanticValueKind::Parameter {
                         ordinal,
                         multiplicity: formal_multiplicity(slot.variadic),
+                        name: parameter_name,
+                        passing_mode,
                     },
                 )?;
                 ordinal = ordinal.checked_add(1).ok_or_else(|| {
@@ -3257,6 +3261,37 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
                 self.value_storage_kinds.get(&value).copied()
             }
             "composite_literal" => self.type_storage_kind(node.child_by_field_name("type")?, byte),
+            "selector_expression" => {
+                let operand = node.child_by_field_name("operand")?;
+                let field = node.child_by_field_name("field")?;
+                let field_name = nonempty_node_text(self.prepared.source(), field)?;
+                let declaration = self.expression_type_identity(operand, byte)?.declaration?;
+                let definition = self
+                    .named_type_definitions
+                    .values()
+                    .flatten()
+                    .find(|definition| definition.declaration == declaration)?;
+                let structure = go_file_underlying_type(
+                    definition.underlying,
+                    self.prepared.source(),
+                    self.named_type_definitions,
+                    byte,
+                )?;
+                named_children(structure)
+                    .into_iter()
+                    .filter(|child| child.kind() == "field_declaration_list")
+                    .flat_map(named_children)
+                    .filter(|child| child.kind() == "field_declaration")
+                    .find(|declaration| {
+                        children_by_field_name(*declaration, "name")
+                            .into_iter()
+                            .any(|name| {
+                                nonempty_node_text(self.prepared.source(), name) == Some(field_name)
+                            })
+                    })
+                    .and_then(|declaration| declaration.child_by_field_name("type"))
+                    .and_then(|kind| self.type_storage_kind(kind, byte))
+            }
             "slice_expression" => {
                 let operand = node.child_by_field_name("operand")?;
                 matches!(
@@ -6494,6 +6529,30 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
         let right = required_field(clause, "right")?;
         let left = clause.child_by_field_name("left");
         let test = self.point(builder, clause, Vec::new())?;
+        let iterable = self.expression_value(builder, right, self.expression_value_kind(right))?;
+        if self.expression_storage_kind(right, right.start_byte()) == Some(GoStorageKind::Map) {
+            let location = self.session.add_memory_location(
+                builder,
+                test,
+                MemoryLocationKind::Index {
+                    base: iterable,
+                    index: None,
+                    constant_index: None,
+                    identity: IndexedLocationIdentity::Aggregate,
+                },
+            )?;
+            let result = self.source_value(builder, clause, SemanticValueKind::Temporary)?;
+            self.append_effect(
+                builder,
+                test,
+                SemanticEffect::MemoryLoad {
+                    kind: MemoryAccessKind::Index,
+                    location,
+                    result,
+                },
+            )?;
+            self.add_unprojected_index_gap(builder, test, location, false)?;
+        }
         let body_entry = self.point(builder, body, Vec::new())?;
         let binding_entry = left
             .map(|left| self.point(builder, left, Vec::new()))
@@ -6588,8 +6647,6 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
             // value, so a `for x := range x` binder relates to the outer `x`
             // read as same-evaluation rather than serving it.
             let declares = direct_child_kind(clause, ":=");
-            let iterable =
-                self.expression_value(builder, right, self.expression_value_kind(right))?;
             for name_node in expression_sequence(left) {
                 let element =
                     self.source_value(builder, name_node, SemanticValueKind::Temporary)?;
@@ -7747,6 +7804,7 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
                         SemanticCallArgument {
                             value,
                             expansion: CallArgumentExpansion::Spread(ArgumentDomain::Positional),
+                            keyword: None,
                         }
                     } else {
                         SemanticCallArgument::direct(value, ArgumentDomain::Positional)
@@ -11715,10 +11773,10 @@ func choose(left chan<- int, right <-chan int) {
 
     #[test]
     fn range_forms_retain_all_source_local_normal_successors() {
-        let procedures = lower_fixture(
-            r#"package main
+        const SOURCE: &str = r#"package main
 
 type sequence func(func(int) bool)
+type collection struct { values map[int]int }
 
 func observe() {}
 func arrayRange(values [2]int) { for range values { observe() } }
@@ -11729,6 +11787,7 @@ func stringRange(values string) { for range values { observe() } }
 func channelRange(values <-chan int) { for range values { observe() } }
 func integerRange(values int) { for range values { observe() } }
 func functionRange(values sequence) { for range values { observe() } }
+func (values *collection) fieldMapRange() { for range values.values { observe() } }
 
 func controls(values []int, skip bool) {
 Loop:
@@ -11738,8 +11797,8 @@ Loop:
     }
     observe()
 }
-"#,
-        );
+"#;
+        let procedures = lower_fixture(SOURCE);
         let named = |name: &str| {
             procedures
                 .iter()
@@ -11796,6 +11855,96 @@ Loop:
                     edge.target_point == gap.point && edge.kind == ControlEdgeKind::LoopBack
                 }),
                 "{name} normal body completion must return to the range decision"
+            );
+        }
+
+        let map_range = named("mapRange");
+        let map_backing_reads = map_range
+            .points
+            .iter()
+            .flat_map(|point| &point.events)
+            .filter_map(|event| {
+                let SemanticEffect::MemoryLoad {
+                    kind: MemoryAccessKind::Index,
+                    location,
+                    ..
+                } = event.effect
+                else {
+                    return None;
+                };
+                let MemoryLocationKind::Index { identity, .. } =
+                    map_range.memory_locations[location.index()].kind
+                else {
+                    unreachable!("an index load has an index location")
+                };
+                (identity == IndexedLocationIdentity::Aggregate)
+                    .then(|| source_text(SOURCE, mapping_source_span(map_range, event.source)))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            map_backing_reads,
+            ["range values"],
+            "iterating a map is an ordinary read of its aggregate backing store"
+        );
+        let field_map_range = named("fieldMapRange");
+        let field_map_backing_reads = field_map_range
+            .points
+            .iter()
+            .flat_map(|point| &point.events)
+            .filter_map(|event| {
+                let SemanticEffect::MemoryLoad {
+                    kind: MemoryAccessKind::Index,
+                    location,
+                    ..
+                } = event.effect
+                else {
+                    return None;
+                };
+                matches!(
+                    field_map_range.memory_locations[location.index()].kind,
+                    MemoryLocationKind::Index {
+                        identity: IndexedLocationIdentity::Aggregate,
+                        ..
+                    }
+                )
+                .then(|| source_text(SOURCE, mapping_source_span(field_map_range, event.source)))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            field_map_backing_reads,
+            ["range values.values"],
+            "same-file field types retain map backing semantics"
+        );
+        for name in [
+            "arrayRange",
+            "pointerArrayRange",
+            "sliceRange",
+            "stringRange",
+            "channelRange",
+            "integerRange",
+            "functionRange",
+        ] {
+            let procedure = named(name);
+            assert!(
+                procedure
+                    .points
+                    .iter()
+                    .flat_map(|point| &point.events)
+                    .all(|event| match event.effect {
+                        SemanticEffect::MemoryLoad {
+                            kind: MemoryAccessKind::Index,
+                            location,
+                            ..
+                        } => !matches!(
+                            procedure.memory_locations[location.index()].kind,
+                            MemoryLocationKind::Index {
+                                identity: IndexedLocationIdentity::Aggregate,
+                                ..
+                            }
+                        ),
+                        _ => true,
+                    }),
+                "{name} must not acquire map-backing access semantics"
             );
         }
 

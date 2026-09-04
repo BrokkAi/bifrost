@@ -62,6 +62,19 @@ macro_rules! define_sha256_identity {
                 Self::from_lower_hex(value)
             }
         }
+
+        /// The inverse of the `Display` rendering every wire spelling of this
+        /// identity uses, so a stored evaluation product that names one is
+        /// read back as the same identity or as a load error.
+        impl<'de> serde::Deserialize<'de> for $name {
+            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                let wire = String::deserialize(deserializer)?;
+                Self::from_lower_hex(&wire).map_err(serde::de::Error::custom)
+            }
+        }
     };
 }
 
@@ -80,6 +93,16 @@ pub struct PolicySemanticHash([u8; 32]);
 impl PolicySemanticHash {
     pub const fn as_bytes(&self) -> &[u8; 32] {
         &self.0
+    }
+
+    /// The semantic hash these wire bytes spell.
+    ///
+    /// Crate-internal on purpose: a semantic hash is minted only by validated
+    /// `LoadedPolicy` construction, and this mints nothing. It exists for the
+    /// one reader that takes a finding back out of the analyzer cache, where
+    /// the hash the finding was published under is part of the stored value.
+    pub(crate) fn from_lower_hex(value: &str) -> Result<Self, Sha256ValueError> {
+        parse_lower_sha256(value).map(Self)
     }
 }
 
@@ -248,7 +271,8 @@ fn hash_fields<'a>(domain: &[u8], fields: impl IntoIterator<Item = &'a [u8]>) ->
 }
 
 fn hash_canonical_value(domain: &[u8], value: &Value) -> [u8; 32] {
-    let bytes = serde_json::to_vec(value).expect("serde_json::Value serialization is infallible");
+    let bytes = serde_json_canonicalizer::to_vec(value)
+        .expect("validated policy values have a canonical JSON encoding");
     hash_fields(domain, [bytes.as_slice()])
 }
 
@@ -309,6 +333,21 @@ mod tests {
 
         assert_ne!(source.as_bytes(), endpoint.as_bytes());
         assert_ne!(endpoint.as_bytes(), projection.as_bytes());
+    }
+
+    #[test]
+    fn canonical_value_hash_ignores_object_insertion_order() {
+        let mut ascending = serde_json::Map::new();
+        ascending.insert("alpha".to_owned(), Value::from(1));
+        ascending.insert("omega".to_owned(), Value::from(2));
+        let mut descending = serde_json::Map::new();
+        descending.insert("omega".to_owned(), Value::from(2));
+        descending.insert("alpha".to_owned(), Value::from(1));
+
+        assert_eq!(
+            hash_canonical_value(POLICY_SEMANTIC_DOMAIN, &Value::Object(ascending)),
+            hash_canonical_value(POLICY_SEMANTIC_DOMAIN, &Value::Object(descending))
+        );
     }
 
     #[test]

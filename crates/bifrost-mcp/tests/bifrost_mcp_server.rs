@@ -1447,9 +1447,40 @@ fn bifrost_mcp_run_policy_uses_the_active_snapshot_and_durable_suppressions() {
     );
     assert_eq!(attributed["result"]["isError"], false, "{attributed}");
     let attributed = &attributed["result"]["structuredContent"];
-    // The canonical report is identical to the unattributed run's: requested
-    // timings ride beside it, never inside it.
-    assert_eq!(attributed["report"], expected_report, "{attributed}");
+    // Requested timings ride beside the report as `stage_timings`, plus one
+    // per-policy split inside each run's work (`evaluation.elapsed_ms`,
+    // #2893). With that metric removed the report is the unattributed run's.
+    let mut report_without_timings = attributed["report"].clone();
+    let mut removed_timings = Vec::new();
+    for (index, run) in report_without_timings["runs"]
+        .as_array_mut()
+        .expect("attributed runs")
+        .iter_mut()
+        .enumerate()
+    {
+        let metrics = run["work"]["metrics"].as_array_mut().expect("work metrics");
+        removed_timings.extend(
+            metrics
+                .extract_if(.., |metric| metric["name"] == "evaluation.elapsed_ms")
+                .map(|metric| metric["unit"].clone()),
+        );
+        // The metric's own bytes count toward the run's retained size, so
+        // that one field is larger than the baseline's by the metric's
+        // serialized footprint.
+        let baseline_bytes = expected_report["runs"][index]["work"]["retained_report_bytes"]
+            .as_u64()
+            .expect("baseline retained bytes");
+        let attributed_bytes = run["work"]["retained_report_bytes"]
+            .as_u64()
+            .expect("attributed retained bytes");
+        assert!(
+            attributed_bytes > baseline_bytes,
+            "{attributed_bytes} vs {baseline_bytes}: {attributed}"
+        );
+        run["work"]["retained_report_bytes"] = json!(baseline_bytes);
+    }
+    assert_eq!(removed_timings, vec![json!("milliseconds")], "{attributed}");
+    assert_eq!(report_without_timings, expected_report, "{attributed}");
     assert_eq!(
         attributed["report"]["execution"]["stage_timings"],
         json!([])

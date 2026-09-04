@@ -34,9 +34,9 @@ pub use brokk_bifrost_analysis::{
     RustPackageApiArtifact, RustSelectedTarget, ScalaAnalyzer, SourceContent, SummaryInput,
     TestAssertionSmell, TestAssertionWeights, TestDetectionProvider, TestProject,
     TreeSitterAnalyzer, TypeAliasProvider, TypeHierarchyProvider, TypescriptAnalyzer,
-    WorkspaceAnalyzer, collect_workspace_files, resolve_php_semantic_pack_dependencies,
-    resolve_ruby_semantic_pack_dependencies, resolve_rust_semantic_pack_dependencies,
-    summarize_inputs,
+    WorkspaceAnalyzer, collect_workspace_files, ensure_global_rayon_pool,
+    resolve_php_semantic_pack_dependencies, resolve_ruby_semantic_pack_dependencies,
+    resolve_rust_semantic_pack_dependencies, summarize_inputs,
 };
 pub use brokk_bifrost_analysis::{
     analyzer, cache_db, cache_gc, cancellation, code_quality, compact_graph,
@@ -99,6 +99,9 @@ fn register_bifrost_semantic_model_packs(
 /// Exact source revision embedded into every binary from this Cargo build.
 /// Benchmark clients use it to reject a stale sibling MCP server.
 pub const BIFROST_BUILD_IDENTITY: &str = env!("BIFROST_BUILD_IDENTITY");
+
+/// Bifrost facade package version embedded into this Cargo build.
+pub const BIFROST_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub use brokk_bifrost_mcp::{ChangeDelta, ProjectChangeWatcher};
 pub use brokk_bifrost_mcp::{

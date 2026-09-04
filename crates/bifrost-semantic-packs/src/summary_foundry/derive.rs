@@ -19,16 +19,15 @@
 //! what makes the typed incompleteness meaningful: an entry never states a flow
 //! past a boundary it did not cross, and it records why it stopped.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use brokk_bifrost_analysis::analyzer::semantic::{
-    CallBindings, CallSiteId, CancellationToken, DeclarationLocator, DeclarationSegmentKind,
-    DispatchBoundaryKind, DispatchOracle, EvidenceCompleteness, OracleCallContext, ProcedureHandle,
-    ProcedureId, ProcedureKind, ProcedurePortHandle, ProgramPointHandle, ProgramPointId,
-    ProofStatus, SemanticArtifactKey, SemanticBudget, SemanticLocator, SemanticRequest,
-    SemanticValueKind, ValueFlowOracle, ValueFlowRelation, ValueFlowRelationKind,
+    CallBindings, CancellationToken, DeclarationLocator, DeclarationSegmentKind,
+    DispatchBoundaryKind, EvidenceCompleteness, ProcedureHandle, ProcedureKind,
+    ProcedurePortHandle, ProgramPointHandle, ProgramPointId, ProofStatus, SemanticBudget,
+    SemanticLocator, SemanticRequest, SemanticValueKind, ValueFlowRelation, ValueFlowRelationKind,
     ValueFlowSnapshot,
 };
 use brokk_bifrost_analysis::analyzer::semantic_model::{
@@ -41,9 +40,11 @@ use brokk_bifrost_flow::dataflow::{
     DataflowRequest, SemanticInputStatus, SolverBudget, SolverTermination, UnmodeledCallBehavior,
 };
 use brokk_bifrost_flow::value_flow::{
-    ValueFlowCarrier, ValueFlowCarrierKey, ValueFlowEventKey, ValueFlowEventKind, ValueFlowInput,
+    BindingCoverage, ClosureLimits, DispatchStatus, SkipReason, ValueFlowCarrier,
+    ValueFlowCarrierKey, ValueFlowEventKey, ValueFlowEventKind, ValueFlowInput,
     ValueFlowObservationPhase, ValueFlowPlan, ValueFlowPortKey, ValueFlowSelectorKey,
-    ValueFlowSinkSpec, ValueFlowSourceSpec, solve_value_flow_with_summaries,
+    ValueFlowSinkSpec, ValueFlowSourceSpec, discover_closure as discover_value_flow_closure,
+    solve_value_flow_with_summaries,
 };
 
 use super::FoundryError;
@@ -351,6 +352,7 @@ fn derive_procedure(
             input,
             exit_kind,
             output,
+            value_transfer: None,
         };
         if meeting.is_uncertain() {
             unproven_transfers += 1;
@@ -657,16 +659,10 @@ impl ClosureInputs {
     }
 }
 
-/// Walk the resolved call closure from `root`, collecting the plan's inputs and
-/// every typed reason the walk could not continue.
-///
-/// This is deliberately not the taint policy's `discover_value_flow`. That walk
-/// aborts on the first interrupted oracle outcome because a policy verdict must
-/// not rest on a partial input; this one records the interruption as typed
-/// incompleteness on the entry and keeps going, because a partial derivation
-/// that names its boundary is exactly the artifact this stage ships. A provider
-/// error is treated the same way: over a whole standard library it is a finding
-/// about one target, not a reason to stop deriving the rest.
+/// Fold the shared resolved-call closure into the foundry's boundary vocabulary.
+/// The shared walk records and continues past unavailable inputs; that is the
+/// foundry's desired behavior because a partial derivation that names its
+/// boundary is an artifact this stage can ship honestly.
 fn discover_closure(
     analyzer: &WorkspaceAnalyzer,
     root: &ProcedureHandle,
@@ -676,130 +672,82 @@ fn discover_closure(
     cancellation: &CancellationToken,
     boundaries: &mut BTreeSet<FoundryDerivationBoundary>,
 ) -> ClosureInputs {
-    let oracle = analyzer.semantic_oracle_provider();
-    let context = OracleCallContext::empty();
-    let mut pending = vec![root.clone()];
-    // The walk must recognize one procedure across two materializations of its
-    // artifact. The complete-artifact cache is byte-bounded, so a large file
-    // can be evicted and re-materialized while this closure is still being
-    // discovered, and `ProcedureHandle` equality compares the owning
-    // `Arc<SemanticArtifact>` by pointer. Keyed on the handle, the walk
-    // re-entered such a procedure once per instance: it paid for the relations
-    // again and pushed a second copy of the same snapshot, whose local rules
-    // then appeared twice in the plan the derivation solves.
-    let mut seen: HashSet<(SemanticArtifactKey, ProcedureId)> = HashSet::new();
-    // One binding is asked for once per calling procedure, call site, and
-    // callee. `CallSiteId` indexes its own procedure's dense call-site table,
-    // so it names a call site only beneath the procedure that owns it: the
-    // first call site of every procedure is `CallSiteId(0)`. Without the
-    // caller, two callers in one closure whose call sites share an index and a
-    // callee produce one key, and the second caller's bindings are dropped
-    // from the plan. That is missing derived output, stated silently.
-    let mut seen_bindings: HashSet<(
-        (SemanticArtifactKey, ProcedureId),
-        CallSiteId,
-        SemanticLocator,
-    )> = HashSet::new();
-    let mut snapshots = Vec::new();
-    let mut bindings = Vec::new();
-    let mut root_snapshot = None;
-    while let Some(procedure) = pending.pop() {
-        let procedure_key = procedure.durable_key();
-        if !seen.insert(procedure_key.clone()) {
-            continue;
-        }
-        if seen.len() > limits.max_closure_procedures {
-            boundaries.insert(FoundryDerivationBoundary::ClosureLimit {
-                limit: limits.max_closure_procedures as u32,
+    let closure = match discover_value_flow_closure(
+        analyzer,
+        root,
+        ClosureLimits {
+            max_procedures: limits.max_closure_procedures,
+        },
+        semantic_budget,
+        cancellation,
+    ) {
+        Ok(closure) => closure,
+        Err(error) => {
+            boundaries.insert(FoundryDerivationBoundary::EngineRejected {
+                detail: format!("relations: {error}"),
             });
-            break;
+            return ClosureInputs {
+                snapshots: Vec::new(),
+                bindings: Vec::new(),
+                procedures: 1,
+                root_snapshot: None,
+            };
         }
-
-        let outcome = match oracle.procedure_relations(
-            &procedure,
-            &context,
-            &mut SemanticRequest::new(semantic_budget, cancellation),
-        ) {
-            Ok(outcome) => outcome,
-            Err(error) => {
+    };
+    if closure.truncated {
+        boundaries.insert(FoundryDerivationBoundary::ClosureLimit {
+            limit: limits.max_closure_procedures as u32,
+        });
+    }
+    for snapshot in &closure.snapshots {
+        record_status(boundaries, snapshot.status());
+    }
+    for (_, reason) in &closure.skipped {
+        match reason {
+            SkipReason::ProviderError { detail } => {
                 boundaries.insert(FoundryDerivationBoundary::EngineRejected {
-                    detail: format!("relations: {error}"),
+                    detail: format!("relations: {detail}"),
                 });
-                continue;
             }
-        };
-        let status = SemanticInputStatus::from_outcome(&outcome);
-        record_status(boundaries, status);
-        let Some(snapshot) = outcome.available_value().cloned() else {
-            continue;
-        };
-        if &procedure == root {
-            root_snapshot = Some(snapshots.len());
+            SkipReason::RelationsUnavailable { status } => record_status(boundaries, *status),
         }
-        snapshots.push(ValueFlowInput::new(snapshot, status));
-
-        for call_row in procedure.semantics().call_sites() {
-            let call = procedure
-                .call_site_handle(call_row.id)
-                .expect("a live procedure owns each retained call site");
-            let dispatch = match oracle.resolve_call(
-                &call,
-                &mut SemanticRequest::new(semantic_budget, cancellation),
-            ) {
-                Ok(dispatch) => dispatch,
-                Err(error) => {
-                    boundaries.insert(FoundryDerivationBoundary::EngineRejected {
-                        detail: format!("dispatch: {error}"),
-                    });
-                    continue;
-                }
-            };
-            let dispatch_status = SemanticInputStatus::from_outcome(&dispatch);
-            record_status(boundaries, dispatch_status);
-            let Some(dispatch) = dispatch.available_value() else {
+    }
+    for coverage in closure.coverage.values() {
+        match &coverage.dispatch {
+            DispatchStatus::Resolved { status } => record_status(boundaries, *status),
+            DispatchStatus::Unavailable { status } => {
+                record_status(boundaries, *status);
                 boundaries.insert(FoundryDerivationBoundary::UnresolvedCall);
-                continue;
-            };
-            for boundary in dispatch.boundaries() {
-                boundaries.insert(classify_boundary(declarations, &boundary.kind));
             }
-            for candidate in dispatch.candidates() {
-                let key = (
-                    procedure_key.clone(),
-                    call.id(),
-                    candidate.target().semantics().locator().clone(),
-                );
-                if !seen_bindings.insert(key) {
-                    continue;
-                }
-                let outcome = match oracle.call_bindings(
-                    &call,
-                    candidate,
-                    &context,
-                    &mut SemanticRequest::new(semantic_budget, cancellation),
-                ) {
-                    Ok(outcome) => outcome,
-                    Err(error) => {
-                        boundaries.insert(FoundryDerivationBoundary::EngineRejected {
-                            detail: format!("binding: {error}"),
-                        });
-                        continue;
-                    }
-                };
-                let status = dispatch_status.merge(SemanticInputStatus::from_outcome(&outcome));
-                record_status(boundaries, status);
-                if let Some(binding) = outcome.available_value().cloned() {
-                    bindings.push(ValueFlowInput::new(binding, status));
-                    pending.push(candidate.target().clone());
+            DispatchStatus::ProviderError { detail } => {
+                boundaries.insert(FoundryDerivationBoundary::EngineRejected {
+                    detail: format!("dispatch: {detail}"),
+                });
+            }
+        }
+        for binding in &coverage.bindings {
+            match binding {
+                BindingCoverage::Answered { status } => record_status(boundaries, *status),
+                BindingCoverage::ProviderError { detail } => {
+                    boundaries.insert(FoundryDerivationBoundary::EngineRejected {
+                        detail: format!("binding: {detail}"),
+                    });
                 }
             }
         }
     }
+    for boundary in &closure.boundaries {
+        boundaries.insert(classify_boundary(declarations, &boundary.kind));
+    }
+    let procedures = closure
+        .procedures
+        .len()
+        .saturating_add(closure.skipped.len());
     ClosureInputs {
-        snapshots,
-        bindings,
-        procedures: seen.len(),
-        root_snapshot,
+        snapshots: closure.snapshots,
+        bindings: closure.bindings,
+        procedures,
+        root_snapshot: closure.root_snapshot,
     }
 }
 

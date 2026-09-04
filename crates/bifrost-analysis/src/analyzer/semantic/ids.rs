@@ -203,7 +203,7 @@ pub const SEMANTIC_IR_SCHEMA_DOMAIN: &[u8] = b"bifrost-language-neutral-semantic
 /// and every wire id derived from one rotates exactly once when this constant
 /// moves; that is a mechanical consequence of extending the IR, not a signal
 /// that anything else changed.
-pub const SEMANTIC_IR_SCHEMA_VERSION: u32 = 20;
+pub const SEMANTIC_IR_SCHEMA_VERSION: u32 = 22;
 
 impl SemanticIrVersion {
     /// The contract-owned fingerprint shared by every language adapter that
@@ -1161,10 +1161,10 @@ mod tests {
         let current = SemanticIrVersion::current();
         assert_eq!(
             current.to_string(),
-            "90eaced8a414637ec6673579e9a14450010663868885f685ba10771a0037927f"
+            "7eb1aa9df45fc1c32ef59a5892af30884789fb3eaea32f6a206a5eac6795419b"
         );
         assert_ne!(current.as_bytes(), &[0_u8; 32]);
-        assert_eq!(SEMANTIC_IR_SCHEMA_VERSION, 20);
+        assert_eq!(SEMANTIC_IR_SCHEMA_VERSION, 22);
     }
 
     fn digest(label: &str) -> StableDigest {

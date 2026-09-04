@@ -76,7 +76,7 @@ fn record_token_tree_qualified_hits(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
             RustTokenPathRole::Macro => RustReferenceNamespace::Macro,
             RustTokenPathRole::Value => {
                 let Some(namespace) =
-                    rust_unique_nominal_reference_namespace(ctx.rust, ctx.support, &segment.fqn)
+                    rust_unique_nominal_reference_namespace(ctx.support, &segment.fqn)
                 else {
                     continue;
                 };
@@ -315,9 +315,7 @@ fn structured_scoped_type_fqn(node: Node<'_>, ctx: &ScanCtx<'_>) -> Option<Strin
             .support
             .fqn(&owner_fqn)
             .into_iter()
-            .filter(|candidate| {
-                candidate.is_module() || candidate.is_class() || ctx.rust.is_type_alias(candidate)
-            })
+            .filter(|candidate| candidate.is_module() || candidate.is_class())
             .filter(|candidate| {
                 usage_declaration_visible_at(
                     ctx.rust,

@@ -499,12 +499,18 @@ fn write_value(writer: &mut dyn fmt::Write, value: &SemanticValue) -> fmt::Resul
         SemanticValueKind::Parameter {
             ordinal,
             multiplicity,
+            name,
+            passing_mode,
         } => {
             write!(
                 writer,
-                " :ordinal {ordinal} :multiplicity {}",
-                quoted(multiplicity.label())
+                " :ordinal {ordinal} :multiplicity {} :passing-mode {}",
+                quoted(multiplicity.label()),
+                quoted(passing_mode.label()),
             )?;
+            if let Some(name) = name {
+                write!(writer, " :name {}", quoted(name))?;
+            }
             if let FormalMultiplicity::Rest(domain) = multiplicity {
                 write!(writer, " :argument-domain {}", quoted(domain.label()))?;
                 if let ArgumentDomain::LanguageDefined(detail) = domain {
@@ -671,6 +677,9 @@ fn write_call_site(writer: &mut dyn fmt::Write, call_site: &SemanticCallSite) ->
             if let ArgumentDomain::LanguageDefined(detail) = domain {
                 write!(writer, " :language-domain {}", quoted(detail))?;
             }
+        }
+        if let Some(keyword) = &argument.keyword {
+            write!(writer, " :keyword {}", quoted(keyword))?;
         }
         writer.write_char(')')?;
     }

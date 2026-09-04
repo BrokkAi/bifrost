@@ -947,6 +947,88 @@ fn concurrent_access_conflict_steps_parse_and_lower_from_both_frontends() {
 }
 
 #[test]
+fn class_set_and_absent_member_steps_parse_and_lower_from_both_frontends() {
+    let query = parse_ok(json!({
+        "schema_version": 1,
+        "match": { "kind": "function", "name": "read_config" },
+        "steps": [
+            { "op": "procedure_of" },
+            { "op": "class_set" }
+        ]
+    }));
+    assert_eq!(
+        query.plan.steps,
+        vec![QueryStep::ProcedureOf, QueryStep::ClassSet]
+    );
+    assert_eq!(query.validate_steps().unwrap(), QueryValueKind::ClassSetRow);
+
+    for spelling in ["class-set", "class_set"] {
+        let rql = CodeQuery::from_sexp(&format!(
+            "({spelling} (procedure-of (function :name \"read_config\")))"
+        ))
+        .expect("class-set RQL should lower");
+        assert_eq!(rql.schema_version, SCHEMA_VERSION);
+        assert_eq!(rql.to_canonical_json(), query.to_canonical_json());
+    }
+
+    let finding = parse_ok(json!({
+        "schema_version": 1,
+        "match": { "kind": "function", "name": "read_config" },
+        "steps": [
+            { "op": "procedure_of" },
+            { "op": "absent_member" }
+        ]
+    }));
+    assert_eq!(
+        finding.plan.steps,
+        vec![QueryStep::ProcedureOf, QueryStep::AbsentMember]
+    );
+    assert_eq!(
+        finding.validate_steps().unwrap(),
+        QueryValueKind::AbsentMemberFinding
+    );
+
+    for spelling in ["absent-member", "absent_member"] {
+        let rql = CodeQuery::from_sexp(&format!(
+            "({spelling} (procedure-of (function :name \"read_config\")))"
+        ))
+        .expect("absent-member RQL should lower");
+        assert_eq!(rql.to_canonical_json(), finding.to_canonical_json());
+    }
+
+    // Both steps type only over procedures: a structural-match input is
+    // refused with the expected-input description.
+    let error = error_of(json!({
+        "match": { "kind": "class" },
+        "steps": [{ "op": "class_set" }]
+    }));
+    assert!(error.message.contains("procedure"), "{error:?}");
+}
+
+#[test]
+fn class_set_and_absent_member_reject_borrowed_options() {
+    // The steps carry no option axis, so a field borrowed from a sibling step
+    // is rejected on its own path rather than silently ignored.
+    let class_set = error_of(json!({
+        "match": { "kind": "function" },
+        "steps": [
+            { "op": "procedure_of" },
+            { "op": "class_set", "plan_ref": "test:flow" }
+        ]
+    }));
+    assert_eq!(class_set.path, "steps[1].plan_ref");
+
+    let absent_member = error_of(json!({
+        "match": { "kind": "function" },
+        "steps": [
+            { "op": "procedure_of" },
+            { "op": "absent_member", "max_steps": 8 }
+        ]
+    }));
+    assert_eq!(absent_member.path, "steps[1].max_steps");
+}
+
+#[test]
 fn detached_task_transfer_steps_parse_and_lower_from_both_frontends() {
     let query = parse_ok(json!({
         "schema_version": 1,

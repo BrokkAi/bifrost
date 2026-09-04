@@ -7,9 +7,13 @@ use super::artifact::{
     CompiledProcedureTarget, CompiledResultContract, CompiledResultMemberContract,
     CompiledResultPredicate, CompiledSemanticModelPack, CompiledShard, CompiledShardArtifact,
     CompiledShardDescriptor, CompiledSummaryEffect, CompiledSummaryExitKind, CompiledSummaryInput,
-    CompiledSummaryLocation, CompiledSummaryLocationKind, CompiledSummaryOutput,
-    CompiledSummaryTransfer, DecodeLimits, canonical_json, content_digest, manifest_content_digest,
-    manifest_semantic_digest, payload_inventory, routing_keys, semantic_digest, stored_digest,
+    CompiledSummaryLocation, CompiledSummaryLocationKind, CompiledSummaryMoveInvalidation,
+    CompiledSummaryOutput, CompiledSummaryTransfer, CompiledSummaryValuePreservation,
+    CompiledSummaryValueTransfer, CompiledSummaryValueTransferKind,
+    CompiledSummaryValueTransferLimitation, CompiledSummaryValueTransferLimitationKind,
+    CompiledSummaryValueTransferOperation, DecodeLimits, canonical_json, content_digest,
+    manifest_content_digest, manifest_semantic_digest, payload_inventory, routing_keys,
+    semantic_digest, stored_digest,
 };
 use super::model::*;
 use super::source::{SourceFormat, parse_source};
@@ -109,6 +113,7 @@ pub fn compile_pack(
             license: normalized.license.clone(),
             completeness: normalized.completeness,
             safety: normalized.safety.clone(),
+            cpp_portability: normalized.cpp_portability.clone(),
             payload: compile_payload(&normalized.pack_id, &shard.payload)
                 .map_err(artifact_diagnostic)?,
         };
@@ -185,6 +190,7 @@ pub fn compile_pack(
         license: normalized.license,
         completeness: normalized.completeness,
         safety: normalized.safety,
+        cpp_portability: normalized.cpp_portability,
         carried_sources: normalized.carried_sources,
         semantic_sha256: String::new(),
         content_sha256: String::new(),
@@ -334,6 +340,9 @@ pub(crate) fn normalize(mut pack: AuthoredSemanticModelPack) -> AuthoredSemantic
         }
     }
     pack.shards.sort_by(|left, right| left.id.cmp(&right.id));
+    if let Some(evidence) = &mut pack.cpp_portability {
+        evidence.normalize();
+    }
     pack
 }
 
@@ -445,6 +454,10 @@ fn compile_procedure_summary(
                     AuthoredSummaryExitKind::Exceptional => CompiledSummaryExitKind::Exceptional,
                 },
                 output: compile_summary_output(&transfer.output),
+                value_transfer: transfer
+                    .value_transfer
+                    .as_ref()
+                    .map(compile_summary_value_transfer),
             })
             .collect(),
         effects: summary.effects.iter().map(compile_summary_effect).collect(),
@@ -541,6 +554,89 @@ fn compile_procedure_summary(
             })
             .collect(),
     })
+}
+
+fn compile_summary_value_transfer(transfer: &SummaryValueTransfer) -> CompiledSummaryValueTransfer {
+    CompiledSummaryValueTransfer {
+        kind: match transfer.kind {
+            SummaryValueTransferKind::Copy {} => CompiledSummaryValueTransferKind::Copy {},
+            SummaryValueTransferKind::AggregateCopy {} => {
+                CompiledSummaryValueTransferKind::AggregateCopy {}
+            }
+            SummaryValueTransferKind::Move { invalidation } => {
+                CompiledSummaryValueTransferKind::Move {
+                    invalidation: match invalidation {
+                        SummaryMoveInvalidation::Invalidated => {
+                            CompiledSummaryMoveInvalidation::Invalidated
+                        }
+                        SummaryMoveInvalidation::Unknown => {
+                            CompiledSummaryMoveInvalidation::Unknown
+                        }
+                    },
+                }
+            }
+            SummaryValueTransferKind::Conversion { preservation } => {
+                CompiledSummaryValueTransferKind::Conversion {
+                    preservation: match preservation {
+                        SummaryValuePreservation::Identity => {
+                            CompiledSummaryValuePreservation::Identity
+                        }
+                        SummaryValuePreservation::Preserving => {
+                            CompiledSummaryValuePreservation::Preserving
+                        }
+                        SummaryValuePreservation::Changing => {
+                            CompiledSummaryValuePreservation::Changing
+                        }
+                        SummaryValuePreservation::Unknown => {
+                            CompiledSummaryValuePreservation::Unknown
+                        }
+                    },
+                }
+            }
+            SummaryValueTransferKind::Boxing {} => CompiledSummaryValueTransferKind::Boxing {},
+            SummaryValueTransferKind::Unboxing {} => CompiledSummaryValueTransferKind::Unboxing {},
+        },
+        operation: match &transfer.operation {
+            SummaryValueTransferOperation::None {} => {
+                CompiledSummaryValueTransferOperation::None {}
+            }
+            SummaryValueTransferOperation::Implicit { member } => {
+                CompiledSummaryValueTransferOperation::Implicit {
+                    member: member.clone(),
+                }
+            }
+            SummaryValueTransferOperation::Unknown { limitation } => {
+                CompiledSummaryValueTransferOperation::Unknown {
+                    limitation: CompiledSummaryValueTransferLimitation {
+                        kind: match limitation.kind {
+                            SummaryValueTransferLimitationKind::BudgetExhausted => {
+                                CompiledSummaryValueTransferLimitationKind::BudgetExhausted
+                            }
+                            SummaryValueTransferLimitationKind::Cancelled => {
+                                CompiledSummaryValueTransferLimitationKind::Cancelled
+                            }
+                            SummaryValueTransferLimitationKind::Unsupported => {
+                                CompiledSummaryValueTransferLimitationKind::Unsupported
+                            }
+                            SummaryValueTransferLimitationKind::UnresolvedIdentity => {
+                                CompiledSummaryValueTransferLimitationKind::UnresolvedIdentity
+                            }
+                            SummaryValueTransferLimitationKind::AmbiguousIdentity => {
+                                CompiledSummaryValueTransferLimitationKind::AmbiguousIdentity
+                            }
+                            SummaryValueTransferLimitationKind::IncompleteInput => {
+                                CompiledSummaryValueTransferLimitationKind::IncompleteInput
+                            }
+                            SummaryValueTransferLimitationKind::Other => {
+                                CompiledSummaryValueTransferLimitationKind::Other
+                            }
+                        },
+                        message: limitation.message.clone(),
+                    },
+                }
+            }
+        },
+    }
 }
 
 fn compile_result_predicate(predicate: AuthoredResultPredicate) -> CompiledResultPredicate {

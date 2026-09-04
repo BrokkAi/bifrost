@@ -678,10 +678,20 @@ mod tests {
             .expect("canonical external root");
         std::fs::write(external_root.join("vendor.hpp"), "class Vendor {};")
             .expect("external header");
-        let database = format!(
-            r#"[{{"directory":".","file":"src/main.cpp","arguments":["clang++","-I","{}","-I","include","-c","src/main.cpp"]}}]"#,
-            external_root.display()
-        );
+        let database = serde_json::json!([{
+            "directory": ".",
+            "file": "src/main.cpp",
+            "arguments": [
+                "clang++",
+                "-I",
+                external_root,
+                "-I",
+                "include",
+                "-c",
+                "src/main.cpp"
+            ]
+        }])
+        .to_string();
         let (_temp, project) = project_with_database(Some(&database));
         ProjectFile::new(project.root_path().to_path_buf(), "include/local.hpp")
             .write("class Local {};")
@@ -709,14 +719,19 @@ mod tests {
             .expect("first header");
         std::fs::write(second.join("vector"), "namespace std { class vector {}; }")
             .expect("second header");
-        let database = format!(
-            r#"[
-                {{"directory":".","file":"src/main.cpp","arguments":["clang++","-isystem","{}","-c","src/main.cpp"]}},
-                {{"directory":".","file":"src/main.cpp","arguments":["clang++","-isystem","{}","-c","src/main.cpp"]}}
-            ]"#,
-            first.display(),
-            second.display()
-        );
+        let database = serde_json::json!([
+            {
+                "directory": ".",
+                "file": "src/main.cpp",
+                "arguments": ["clang++", "-isystem", first, "-c", "src/main.cpp"]
+            },
+            {
+                "directory": ".",
+                "file": "src/main.cpp",
+                "arguments": ["clang++", "-isystem", second, "-c", "src/main.cpp"]
+            }
+        ])
+        .to_string();
         let (_temp, project) = project_with_database(Some(&database));
         let file = ProjectFile::new(project.root_path().to_path_buf(), "src/main.cpp");
 
@@ -733,10 +748,18 @@ mod tests {
         let root = external.path().canonicalize().expect("canonical root");
         std::fs::create_dir_all(root.join("include")).expect("include directory");
         std::fs::write(root.join("outside.hpp"), "class Outside {};").expect("outside header");
-        let database = format!(
-            r#"[{{"directory":".","file":"src/main.cpp","arguments":["clang++","-isystem","{}","-c","src/main.cpp"]}}]"#,
-            root.join("include").display()
-        );
+        let database = serde_json::json!([{
+            "directory": ".",
+            "file": "src/main.cpp",
+            "arguments": [
+                "clang++",
+                "-isystem",
+                root.join("include"),
+                "-c",
+                "src/main.cpp"
+            ]
+        }])
+        .to_string();
         let (_temp, project) = project_with_database(Some(&database));
         let file = ProjectFile::new(project.root_path().to_path_buf(), "src/main.cpp");
 

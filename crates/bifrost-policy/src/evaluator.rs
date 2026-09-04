@@ -23,19 +23,11 @@ use sha2::{Digest, Sha256};
 use brokk_bifrost_analysis::CancellationToken;
 use brokk_bifrost_analysis::analyzer::Range as AnalyzerRange;
 use brokk_bifrost_analysis::analyzer::common::language_for_file;
-use brokk_bifrost_analysis::analyzer::invalidation::{
-    ArtifactVerdict, BudgetMode, DerivedArtifactId, DerivedArtifactKind, InvalidationReason,
-    RetentionReason,
-};
-use brokk_bifrost_analysis::analyzer::read_ledger::ReadLedger;
-use brokk_bifrost_analysis::analyzer::semantic::{SemanticWork, WorkspaceRelativePath};
+use brokk_bifrost_analysis::analyzer::invalidation::BudgetMode;
+use brokk_bifrost_analysis::analyzer::semantic::WorkspaceRelativePath;
 use brokk_bifrost_analysis::analyzer::semantic_model::ActiveSemanticModelSnapshot;
-use brokk_bifrost_analysis::analyzer::usages::{CallRelationLimits, UsageHitSurface, UsageProof};
-use brokk_bifrost_analysis::analyzer::{
-    AnalyzerQueryScope, CodeUnit, HeadInputs, IAnalyzer, LookupMemo, LookupReplayLimits,
-    ProjectFile, ReadVerdict, WorkspaceAnalyzer, verify_read_set,
-};
-use brokk_bifrost_analysis::path_utils::rel_path_string;
+use brokk_bifrost_analysis::analyzer::usages::{UsageHitSurface, UsageProof};
+use brokk_bifrost_analysis::analyzer::{CodeUnit, IAnalyzer, ProjectFile, WorkspaceAnalyzer};
 use brokk_bifrost_flow::flow_state::{
     FileFlowState, FlowRelation, FlowStateAxis, FlowStateDerivation, FlowStateRequest, FlowSubject,
     StateEventClass, StateEventRow, flow_state_for_file,
@@ -61,13 +53,11 @@ use brokk_bifrost_rql::structural::search::{
 };
 use brokk_bifrost_rql::structural::search::{
     CodeQueryExecutionScope, CodeQueryStableOwnerDerivation, DetailedCodeQueryDomain,
-    DetailedCodeQueryEvidence, DetailedCodeQueryKey, UnitExecutionResult, UnitRowEvidence,
-    UnitRowIdentities, UnitRowIdentityCandidate, UnitRowItem, UnitRowItemProvenance,
-    UnitRowItemRef, UnitRowItemRefValue, UnitRowItemTerminal, UnitRowItemValue, UnitRowProvenance,
-    UnitRowProvenanceRef, execute_code_query_detailed_eager_index,
+    DetailedCodeQueryKey, UnitRowEvidence, UnitRowIdentities, UnitRowIdentityCandidate,
+    UnitRowItem, UnitRowItemProvenance, UnitRowItemRef, UnitRowItemRefValue, UnitRowItemTerminal,
+    UnitRowProvenance, UnitRowProvenanceRef, execute_code_query_detailed_eager_index,
     execute_code_query_detailed_eager_index_without_targets,
-    execute_code_query_detailed_eager_index_workspace, execute_code_query_unit, merge_unit_rows,
-    plan_seed_files,
+    execute_code_query_detailed_eager_index_workspace, execute_code_query_unit,
 };
 use brokk_bifrost_rql::structural::{BoundaryStatus, PrecedenceTier};
 use brokk_bifrost_rql::structural::{
@@ -77,8 +67,8 @@ use brokk_bifrost_rql::structural::{
 };
 use brokk_bifrost_rql::structural::{
     CodeQuery, CodeQueryCompletion, CodeQueryDiagnostic, CodeQueryDiagnosticCode,
-    CodeQueryDiagnosticImpact, CodeQueryExecutionLimits, CodeQueryExecutionWork, CodeQueryRange,
-    CodeQueryResultDetail, CodeQueryResultItem, CodeQueryResultValue, QueryValueKind,
+    CodeQueryDiagnosticImpact, CodeQueryExecutionWork, CodeQueryRange, CodeQueryResultDetail,
+    CodeQueryResultItem, CodeQueryResultValue, QueryValueKind,
 };
 use brokk_bifrost_rql::structural::{
     NormalizedKind, OccurrenceRow as InternalOccurrenceRow,
@@ -86,8 +76,8 @@ use brokk_bifrost_rql::structural::{
 };
 use brokk_bifrost_rql::{
     ArityConstraint, BindingOfOptions, CandidateFilter, CodeQueryPlan, CodeQueryPlanSource,
-    CodeQuerySeed, GenerationSiteSeed, OccurrenceSeed, Pattern, PlanPartitioning, QueryStep,
-    SCHEMA_VERSION, ScopeSeed, exact_path_globs,
+    CodeQuerySeed, GenerationSiteSeed, OccurrenceSeed, Pattern, QueryStep, SCHEMA_VERSION,
+    ScopeSeed, exact_path_globs,
 };
 use std::sync::Arc;
 
@@ -136,9 +126,12 @@ use super::projection::{
 };
 use super::resolved::{LoadedPolicy, ResolvedTaintPolicySpec, ResolvedTypestatePolicySpec};
 use super::retained::RetainedSize;
+use super::unit_execution::{
+    SeedPartition, UnitAttempt, UnitQueryExecution, UnitReuse, recompute_unit, sliced_query_units,
+};
 use super::units::{
-    IncrementalMode, PolicyIncrementalContext, PolicyIncrementalRun, PolicyUnit, PolicyUnitKey,
-    PolicyUnitProduct, UnitPartition, WidenReason,
+    PolicyIncrementalContext, PolicyIncrementalRun, PolicyUnit, PolicyUnitProduct, UnitPartition,
+    WidenReason,
 };
 
 const MATCH_SELECTOR_PATH: &str = "/analysis/selector";
@@ -437,6 +430,17 @@ pub(crate) trait TypestatePolicyEvaluator:
         context: &PolicyEvaluationContext<'_>,
         budget: &PolicyBudget,
     ) -> TypestateProjectionPayload;
+
+    /// What this adapter's sliced attempt did with its root units, taken once
+    /// per evaluation.
+    ///
+    /// `None` is an adapter that does not partition its work into units at
+    /// all, which the caller records as a whole-family run. The default is
+    /// `None` because a test fake solves whatever it is asked to and reuses
+    /// nothing.
+    fn take_unit_attempt(&self) -> Option<(UnitAttempt, Option<WidenReason>)> {
+        None
+    }
 }
 
 /// Built-in match evaluator with optional future-analysis adapters.
@@ -513,11 +517,12 @@ impl PolicyEvaluator for DefaultPolicyEvaluator<'_> {
         budget: &mut PolicyBudget,
     ) -> Result<PolicyRun, PolicyRunError> {
         let host_budget = *budget;
-        // Every family accounts for itself. Only the match family is sliced in
-        // this milestone, so the others state that they were evaluated whole
-        // rather than being absent from the review.
+        // Every family accounts for itself. The families that are sliced record
+        // their own attempt, whether or not it widened; the rest state here
+        // that they were evaluated whole rather than being absent from the
+        // review.
         if let Some(incremental) = context.incremental
-            && !matches!(policy.definition().analysis, PolicyAnalysis::Match { .. })
+            && !evaluates_by_unit(&policy.definition().analysis)
         {
             incremental.record_run(PolicyIncrementalRun::whole_family(
                 policy.definition().metadata.id.clone(),
@@ -579,93 +584,146 @@ impl PolicyEvaluator for DefaultPolicyEvaluator<'_> {
                 }
             }
             PolicyAnalysis::Typestate { .. } => {
-                let Some(spec) = policy.resolved_typestate() else {
-                    return failed_policy_run(
-                        policy,
-                        PolicyAnalysisType::Typestate,
-                        "loaded typestate policy is missing its resolved analysis specification",
-                        &host_budget,
-                    );
-                };
-                match self.typestate {
-                    Some(adapter) => {
-                        let compilation =
-                            match adapter.compilation_hashes(policy, spec, context, &host_budget) {
-                                Ok(compilation) => compilation,
-                                Err(TypestateCompilationFailure::Incomplete {
-                                    reasons,
-                                    message,
-                                    work,
-                                }) => {
-                                    *budget = host_budget;
-                                    return inconclusive_policy_run_many(
-                                        policy,
-                                        PolicyAnalysisType::Typestate,
-                                        reasons.into_vec(),
-                                        &message,
-                                        work,
-                                        &host_budget,
-                                    );
-                                }
-                                Err(TypestateCompilationFailure::Failed {
-                                    reason,
-                                    message,
-                                    work,
-                                }) => {
-                                    *budget = host_budget;
-                                    return failed_policy_run_with_reason(
-                                        policy,
-                                        PolicyAnalysisType::Typestate,
-                                        Vec::new(),
-                                        reason,
-                                        &message,
-                                        work,
-                                        &host_budget,
-                                    );
-                                }
-                            };
-                        let authority = match TypestateProjectionAuthority::from_loaded_compilation(
-                            policy,
-                            compilation.protocol_hash(),
-                            compilation.binding_plan_hash(),
-                        ) {
-                            Ok(authority) => authority,
-                            Err(_) => {
-                                *budget = host_budget;
-                                return failed_policy_run(
-                                    policy,
-                                    PolicyAnalysisType::Typestate,
-                                    "typestate projection authority could not be derived from the loaded policy",
-                                    &host_budget,
-                                );
-                            }
-                        };
-                        let payload = adapter.evaluate_typestate(
-                            &authority,
-                            policy,
-                            spec,
-                            context,
-                            &host_budget,
-                        );
-                        let batch = authority.seal_batch(payload);
-                        assemble_typestate_projection_batch(
-                            policy,
-                            &authority,
-                            batch,
-                            context,
-                            &host_budget,
-                        )
-                    }
-                    None => unsupported_policy_run(
-                        policy,
-                        PolicyAnalysisType::Typestate,
-                        PolicyCapability::TypestateEvaluation,
-                        "typestate policy evaluation requires an installed typestate adapter",
-                        &host_budget,
-                    ),
+                let run = self.evaluate_typestate_policy(policy, context, budget, host_budget);
+                // The typestate family accounts for its own attempt on every
+                // path, including the ones that never reach the adapter: a
+                // policy missing from the review would change the review's
+                // retained size between a reusing run and the forced-full run
+                // it must equal byte for byte.
+                if let Some(incremental) = context.incremental {
+                    let policy_id = policy.definition().metadata.id.clone();
+                    let review = match self
+                        .typestate
+                        .and_then(TypestatePolicyEvaluator::take_unit_attempt)
+                    {
+                        Some((attempt, reason)) => attempt.into_run(policy_id, reason),
+                        None => PolicyIncrementalRun::whole_family(policy_id),
+                    };
+                    note_incremental_run(&review, incremental);
+                    incremental.record_run(review);
                 }
+                run
             }
         }
+    }
+}
+
+impl DefaultPolicyEvaluator<'_> {
+    /// One typestate policy's evaluation, from its compile through its
+    /// projection batch.
+    ///
+    /// Lifted out of the `match` arm so that every path it can take -- a
+    /// missing specification, an incomplete compile, a refused authority, an
+    /// absent adapter -- returns to one place that records what this policy's
+    /// unit attempt did.
+    fn evaluate_typestate_policy(
+        &self,
+        policy: &LoadedPolicy,
+        context: &PolicyEvaluationContext<'_>,
+        budget: &mut PolicyBudget,
+        host_budget: PolicyBudget,
+    ) -> Result<PolicyRun, PolicyRunError> {
+        let Some(spec) = policy.resolved_typestate() else {
+            return failed_policy_run(
+                policy,
+                PolicyAnalysisType::Typestate,
+                "loaded typestate policy is missing its resolved analysis specification",
+                &host_budget,
+            );
+        };
+        match self.typestate {
+            Some(adapter) => {
+                let compilation =
+                    match adapter.compilation_hashes(policy, spec, context, &host_budget) {
+                        Ok(compilation) => compilation,
+                        Err(TypestateCompilationFailure::Incomplete {
+                            reasons,
+                            message,
+                            work,
+                        }) => {
+                            *budget = host_budget;
+                            return inconclusive_policy_run_many(
+                                policy,
+                                PolicyAnalysisType::Typestate,
+                                reasons.into_vec(),
+                                &message,
+                                work,
+                                &host_budget,
+                            );
+                        }
+                        Err(TypestateCompilationFailure::Failed {
+                            reason,
+                            message,
+                            work,
+                        }) => {
+                            *budget = host_budget;
+                            return failed_policy_run_with_reason(
+                                policy,
+                                PolicyAnalysisType::Typestate,
+                                Vec::new(),
+                                reason,
+                                &message,
+                                work,
+                                &host_budget,
+                            );
+                        }
+                    };
+                let authority = match TypestateProjectionAuthority::from_loaded_compilation(
+                    policy,
+                    compilation.protocol_hash(),
+                    compilation.binding_plan_hash(),
+                ) {
+                    Ok(authority) => authority,
+                    Err(_) => {
+                        *budget = host_budget;
+                        return failed_policy_run(
+                            policy,
+                            PolicyAnalysisType::Typestate,
+                            "typestate projection authority could not be derived from the loaded policy",
+                            &host_budget,
+                        );
+                    }
+                };
+                let payload =
+                    adapter.evaluate_typestate(&authority, policy, spec, context, &host_budget);
+                let batch = authority.seal_batch(payload);
+                assemble_typestate_projection_batch(
+                    policy,
+                    &authority,
+                    batch,
+                    context,
+                    &host_budget,
+                )
+            }
+            None => unsupported_policy_run(
+                policy,
+                PolicyAnalysisType::Typestate,
+                PolicyCapability::TypestateEvaluation,
+                "typestate policy evaluation requires an installed typestate adapter",
+                &host_budget,
+            ),
+        }
+    }
+}
+
+/// Whether this analysis records its own reuse review.
+///
+/// A family that is partitioned into evaluation units reports what its attempt
+/// did with them, including the reason it widened when it did; every other
+/// family is evaluated exactly as a run with no units evaluates it, and the
+/// caller says so once. A relational assertion is not sliced: its plan is
+/// evaluated over whole row vectors whose contributor indices are positional.
+const fn evaluates_by_unit(analysis: &PolicyAnalysis) -> bool {
+    match analysis {
+        // An assertion policy is sliced either way: a plain one by its subject
+        // selector and its per-file asserts, a relational one by its bindings.
+        PolicyAnalysis::Match { .. }
+        | PolicyAnalysis::Assertion { .. }
+        // A typestate policy is sliced by its solver roots: one unit per root
+        // procedure, whose product is what one iteration of the per-root loop
+        // appends.
+        | PolicyAnalysis::Typestate { .. } => true,
+        PolicyAnalysis::Taint { .. } | PolicyAnalysis::Flow { .. } => false,
     }
 }
 
@@ -691,37 +749,6 @@ fn evaluate_match_policy(
         context.organizational_risk,
         budget,
     )
-}
-
-/// Rebuild one match policy's run from the units it was merged from, with no
-/// analyzer and no execution.
-///
-/// This is the base half of a run that reused a persisted evaluation: the
-/// units are the base's own products, the merge is the one the base performed
-/// (its order is what the units arrive in), and everything after it -- ordinal
-/// assignment, identity, retention -- is the same code the base ran, over the
-/// same vector, under the budget the base was scaled to. Nothing here consults
-/// a workspace, which is what makes skipping the base build possible at all.
-pub(crate) fn match_run_from_units(
-    policy: &LoadedPolicy,
-    products: Vec<UnitExecutionResult>,
-    budget: &PolicyBudget,
-) -> Result<PolicyRun, PolicyRunError> {
-    let merged = merge_unit_rows(products);
-    let completion = merged.completion();
-    let evaluated = adapt_match_execution(
-        &policy.definition().metadata.id,
-        merged.items,
-        merged.evidence,
-        &merged.diagnostics,
-        completion,
-        merged.truncated,
-        merged.work,
-        budget,
-    );
-    // A base evaluation carries neither overlay: the base run is the head's
-    // stripped options, and both overlays are host inputs the base never had.
-    assemble_match_run(policy, evaluated, &[], &[], budget)
 }
 
 fn assemble_match_run(
@@ -2310,36 +2337,6 @@ pub(crate) struct EvaluatedMatchPolicy {
     pub(crate) work: PolicyWorkReport,
 }
 
-/// What one policy's sliced attempt did, whether or not it widened.
-#[derive(Debug, Default)]
-struct MatchUnitAttempt {
-    total: u64,
-    reused: u64,
-    recomputed: u64,
-    unbounded: u64,
-}
-
-impl MatchUnitAttempt {
-    fn into_run(
-        self,
-        policy_id: PolicyId,
-        widen_reason: Option<WidenReason>,
-    ) -> PolicyIncrementalRun {
-        PolicyIncrementalRun {
-            policy_id,
-            mode: match widen_reason {
-                None => IncrementalMode::Sliced,
-                Some(_) => IncrementalMode::Full,
-            },
-            units_total: self.total,
-            units_reused: self.reused,
-            units_recomputed: self.recomputed,
-            units_unbounded: self.unbounded,
-            widen_reason,
-        }
-    }
-}
-
 /// Evaluate one match policy unit by unit, or in full with a stated reason.
 ///
 /// Widening is never silent and never a diagnostic: the policy is evaluated
@@ -2351,7 +2348,7 @@ fn evaluate_match_policy_by_unit(
     context: &PolicyEvaluationContext<'_>,
     budget: &PolicyBudget,
 ) -> EvaluatedMatchPolicy {
-    let mut attempt = MatchUnitAttempt::default();
+    let mut attempt = UnitAttempt::default();
     let policy_id = policy.definition().metadata.id.clone();
     let (evaluated, reason) =
         match sliced_match_candidates(policy, incremental, context, budget, &mut attempt) {
@@ -2401,7 +2398,7 @@ fn sliced_match_candidates(
     incremental: &PolicyIncrementalContext<'_>,
     context: &PolicyEvaluationContext<'_>,
     budget: &PolicyBudget,
-    attempt: &mut MatchUnitAttempt,
+    attempt: &mut UnitAttempt,
 ) -> Result<EvaluatedMatchPolicy, WidenReason> {
     let query = match match_policy_query(policy) {
         Ok(query) => query,
@@ -2411,127 +2408,32 @@ fn sliced_match_candidates(
         Ok(executable) => executable,
         Err(refusal) => return Ok(refusal.into_run(budget)),
     };
-    if !PlanPartitioning::classify(&executable.plan).is_by_seed() {
-        return Err(WidenReason::PlanCrossesSeeds);
-    }
-    // A changed-fact set that could not be completed is smaller than the
-    // truth, and a smaller set would let a changed input pass verification.
-    if !incremental.changed().is_complete() {
-        return Err(WidenReason::ReverseDependencyEvidenceMissing);
-    }
-
     let limits = budget.query_limits();
     // Computed once per policy: every unit hands the same whole-workspace
     // enumeration to the scanners that still need it, which is what keeps
     // unit-wise execution linear in the file count.
     let workspace_files = context.analyzer.analyzed_files();
-    let seed_files = plan_seed_files(&executable.plan, &workspace_files);
-    attempt.total = u64::try_from(seed_files.len()).unwrap_or(u64::MAX);
-    let inputs = incremental.inputs();
-    let head_inputs = inputs.head_inputs(policy);
-    let replay_limits = lookup_replay_limits(&limits);
-    let mut memo = LookupMemo::new();
-    let mut products = Vec::with_capacity(seed_files.len());
-
-    let mut keys = Vec::with_capacity(seed_files.len());
-    for file in &seed_files {
-        let language = language_for_file(file);
-        let rel_path = rel_path_string(file);
-        let Some(blob) = incremental.changed().head_blob(language, &rel_path) else {
-            // Without the blob this path resolves to there is no content
-            // identity to key the unit by, which is missing evidence rather
-            // than evidence of sameness.
-            return Err(WidenReason::ReverseDependencyEvidenceMissing);
-        };
-        keys.push(inputs.unit_key(
-            policy,
-            UnitPartition::Seed {
-                language,
-                rel_path: Box::from(rel_path.as_str()),
-                blob,
-            },
-        ));
-    }
-    // Every key this policy will ask about, in one batch, before the first
-    // lookup: a persisted store answers one query instead of one per seed
-    // file. A store that cannot answer has said nothing about what was
-    // published, so the policy widens instead of reading its silence as
-    // absence.
-    if let Err(error) = incremental.store().borrow_mut().prefetch(&keys) {
-        brokk_bifrost_analysis::profiling::note_with(|| {
-            format!(
-                "policy.units policy={} store_error={error}",
-                policy.definition().metadata.id
-            )
-        });
-        return Err(WidenReason::ProductLoadFailed);
-    }
-
-    for (file, key) in seed_files.iter().zip(keys.iter()) {
-        let reused = reuse_published_unit(
-            incremental,
-            key,
-            &head_inputs,
-            replay_limits,
-            &limits,
-            &mut memo,
-        )?;
-        let (product, reads) = match reused {
-            Some(product) => {
-                attempt.reused = attempt.reused.saturating_add(1);
-                (product, None)
-            }
-            None => {
-                attempt.recomputed = attempt.recomputed.saturating_add(1);
-                let ledger = Arc::new(ReadLedger::new());
-                let product = {
-                    let _reads =
-                        AnalyzerQueryScope::with_read_ledger(context.analyzer, Arc::clone(&ledger));
-                    execute_code_query_unit(
-                        context.analyzer,
-                        &executable,
-                        limits,
-                        context.cancellation,
-                        CodeQueryExecutionScope::for_seed_files(
-                            std::slice::from_ref(file),
-                            &workspace_files,
-                        ),
-                    )
-                };
-                if !ledger.is_bounded() {
-                    attempt.unbounded = attempt.unbounded.saturating_add(1);
-                    return Err(WidenReason::UnitUnbounded);
-                }
-                (product, Some(ledger.keys()))
-            }
-        };
-        // Exhaustiveness is checked on the product rather than on how it was
-        // obtained: a unit that truncated or raised a diagnostic is not a
-        // partition of a whole execution, whichever run computed it.
-        if product.truncated {
-            return Err(WidenReason::UnitNotExhaustive);
-        }
-        if !product.diagnostics.is_empty() {
-            return Err(WidenReason::UnitDiagnostics);
-        }
-        if let Some(reads) = reads {
-            incremental.store().borrow_mut().publish(PolicyUnit::new(
-                key.clone(),
-                PolicyUnitProduct::Rows(product.clone()),
-                reads,
-                BudgetMode::Exhaustive,
-            ));
-        }
-        products.push(product);
-    }
-
-    let merged = merge_unit_rows(products);
-    if merged.reached_limit(&limits, executable.limit).is_some() {
-        return Err(WidenReason::MergedLimitReached);
-    }
+    let execution = UnitQueryExecution {
+        analyzer: context.analyzer,
+        // The whole match execution is analyzer-only, so its units are too.
+        workspace: None,
+        cancellation: context.cancellation,
+        limits,
+        workspace_files: &workspace_files,
+    };
+    let mut reuse = UnitReuse::new(policy, incremental, budget);
+    let sliced = sliced_query_units(
+        policy,
+        &executable,
+        &mut reuse,
+        &execution,
+        SeedPartition::seed,
+        attempt,
+    )?;
     // Every unit of this policy is published and merged, so this list is what
     // another run replays to reproduce the product without executing anything.
-    incremental.record_units(policy.definition().metadata.id.clone(), keys);
+    incremental.record_units(policy.definition().metadata.id.clone(), sliced.keys);
+    let merged = sliced.merged;
     let completion = merged.completion();
     Ok(adapt_match_execution(
         &policy.definition().metadata.id,
@@ -2543,69 +2445,6 @@ fn sliced_match_candidates(
         merged.work,
         budget,
     ))
-}
-
-/// Reuse one published unit's product, if the head still reads what it read.
-///
-/// `Ok(None)` means the unit must be recomputed: either nothing was published
-/// under its key, or a recorded read moved. `Err` means the whole policy must
-/// be evaluated, because a verification that cannot be completed is not a
-/// verification that failed.
-fn reuse_published_unit(
-    incremental: &PolicyIncrementalContext<'_>,
-    key: &PolicyUnitKey,
-    head_inputs: &HeadInputs,
-    replay_limits: LookupReplayLimits,
-    limits: &CodeQueryExecutionLimits,
-    memo: &mut LookupMemo,
-) -> Result<Option<UnitExecutionResult>, WidenReason> {
-    let store = incremental.store().borrow();
-    let Some(unit) = store.lookup(key) else {
-        return Ok(None);
-    };
-    if unit.budget_mode() != BudgetMode::Exhaustive {
-        return Err(WidenReason::UnitNotExhaustive);
-    }
-    // A whole evaluation of this policy may open `max_scanned_files` files,
-    // and every replayed lookup opens at least one, so a verification pass
-    // that needs more distinct answers than that has stopped being cheaper
-    // than the evaluation it is avoiding.
-    if memo.len() >= limits.max_scanned_files {
-        return Err(WidenReason::VerificationBudgetExceeded);
-    }
-    let artifact = DerivedArtifactId::new(
-        DerivedArtifactKind::PolicyEvaluationUnit,
-        unit.read_digest().digest(),
-    );
-    match verify_read_set(
-        incremental.workspace(),
-        incremental.changed(),
-        head_inputs,
-        unit.reads(),
-        replay_limits,
-        memo,
-    ) {
-        ReadVerdict::Unchanged => {
-            incremental.verdicts().record(ArtifactVerdict::Retained(
-                RetentionReason::InputsUnchanged { artifact },
-            ));
-            Ok(Some(unit.product().rows().clone()))
-        }
-        ReadVerdict::Changed(changed) => {
-            let missing = matches!(
-                changed.reason,
-                InvalidationReason::ReverseDependencyEvidenceMissing { .. }
-                    | InvalidationReason::ContentIdentityEvidenceMissing { .. }
-            );
-            incremental
-                .verdicts()
-                .record(ArtifactVerdict::Invalidated(changed.reason));
-            if missing {
-                return Err(WidenReason::ReverseDependencyEvidenceMissing);
-            }
-            Ok(None)
-        }
-    }
 }
 
 /// Evaluate one match policy in full and publish it as a single whole unit.
@@ -2630,23 +2469,26 @@ fn widened_match_candidates(
         Ok(executable) => executable,
         Err(refusal) => return refusal.into_run(budget),
     };
-    let ledger = Arc::new(ReadLedger::new());
-    let product = {
-        let _reads = AnalyzerQueryScope::with_read_ledger(context.analyzer, Arc::clone(&ledger));
+    let (product, reads) = recompute_unit(context.analyzer, || {
         execute_code_query_unit(
             context.analyzer,
+            // The whole match execution is analyzer-only, so its unit is too.
+            None,
             &executable,
             budget.query_limits(),
             context.cancellation,
             CodeQueryExecutionScope::whole_workspace(),
         )
-    };
-    if ledger.is_bounded() && !product.truncated && product.diagnostics.is_empty() {
+    });
+    if let Some(reads) = reads
+        && !product.truncated
+        && product.diagnostics.is_empty()
+    {
         let key = incremental.inputs().unit_key(policy, UnitPartition::Whole);
         incremental.store().borrow_mut().publish(PolicyUnit::new(
             key.clone(),
             PolicyUnitProduct::Rows(product.clone()),
-            ledger.keys(),
+            reads,
             BudgetMode::Exhaustive,
         ));
         incremental.record_units(policy.definition().metadata.id.clone(), vec![key]);
@@ -2667,25 +2509,6 @@ fn widened_match_candidates(
         product.work,
         budget,
     )
-}
-
-/// The limits a replayed lookup re-runs its funnel under.
-///
-/// The policy's own full lanes, not whatever a unit had left when it recorded
-/// the answer: a complete answer replays identically under limits at least as
-/// wide as the ones that produced it, and a narrower replay would report a
-/// budget artifact as a change.
-fn lookup_replay_limits(limits: &CodeQueryExecutionLimits) -> LookupReplayLimits {
-    LookupReplayLimits {
-        call_relations: CallRelationLimits {
-            max_files: limits.max_scanned_files,
-            max_source_bytes: limits.max_scanned_source_bytes,
-            max_candidates: limits.max_pipeline_rows,
-        },
-        max_usage_files: limits.max_scanned_files,
-        max_usages: limits.max_pipeline_rows,
-        semantic: SemanticWork::default_limits(),
-    }
 }
 
 /// The authored query of a match policy, or the failure that stops it.
@@ -2783,6 +2606,8 @@ fn executable_match_query(
             | QueryValueKind::NilnessOperation
             | QueryValueKind::SwitchCoverage
             | QueryValueKind::ConcurrentAccessConflict
+            | QueryValueKind::ClassSetRow
+            | QueryValueKind::AbsentMemberFinding
             | QueryValueKind::DetachedTaskTransfer
             | QueryValueKind::ProcedureEffect
             | QueryValueKind::CallableSignature
@@ -3147,12 +2972,8 @@ fn adapt_match_candidate(
 ) -> Result<EvaluatedMatchCandidate, ()> {
     let result_domain = match_domain(evidence.domain).ok_or(())?;
     let path = workspace_relative_path(&evidence.rel_path)?;
-    let (location, mut candidate_reasons, proof) = terminal_presentation(
-        &item.value,
-        evidence.domain,
-        &path,
-        evidence.byte_span.as_ref(),
-    )?;
+    let (location, mut candidate_reasons, proof) =
+        terminal_presentation(&item, evidence.domain, &path, evidence.byte_span.as_ref())?;
     candidate_reasons.extend(certainty_reasons(query_diagnostics, &evidence.provenance));
 
     let owner = match evidence.stable_owner_candidate.as_ref() {
@@ -3184,7 +3005,7 @@ fn adapt_match_candidate(
         None => OwnerCandidate::Absent,
     };
     let (terminal, terminal_identity_uncertain) = adapt_terminal_result(
-        &item.value,
+        &item,
         evidence.domain,
         &evidence.key,
         &evidence.identities,
@@ -3324,7 +3145,7 @@ struct StrongOrdinalKey {
 }
 
 fn terminal_presentation(
-    value: &UnitRowItemValue,
+    item: &UnitRowItem,
     expected_domain: DetailedCodeQueryDomain,
     expected_path: &WorkspaceRelativePath,
     byte_span: Option<&std::ops::Range<usize>>,
@@ -3332,12 +3153,13 @@ fn terminal_presentation(
     // An analysis-only row is refused before any field of it is read: it is a
     // projection over a call site or a declaration, and the finding anchors at
     // the row it names rather than at the projection.
-    let UnitRowItemValue::Presented {
+    let UnitRowItem {
         domain: actual_domain,
         path,
         range,
-        terminal,
-    } = value
+        terminal: Some(terminal),
+        ..
+    } = item
     else {
         return Err(());
     };
@@ -3473,19 +3295,19 @@ fn terminal_presentation(
 }
 
 fn adapt_terminal_result(
-    value: &UnitRowItemValue,
+    item: &UnitRowItem,
     expected_domain: DetailedCodeQueryDomain,
     key: &DetailedCodeQueryKey,
     identities: &UnitRowIdentities,
     expected_path: &WorkspaceRelativePath,
     location: &PolicySourceLocation,
 ) -> Result<(PolicyQueryResultRef, bool), ()> {
-    let UnitRowItemValue::Presented {
+    let UnitRowItem {
         path,
         range,
-        terminal,
+        terminal: Some(terminal),
         ..
-    } = value
+    } = item
     else {
         return Err(());
     };
@@ -3494,7 +3316,7 @@ fn adapt_terminal_result(
     }
     match (terminal, expected_domain, key, identities) {
         (
-            UnitRowItemTerminal::StructuralMatch { kind },
+            UnitRowItemTerminal::StructuralMatch { kind, .. },
             DetailedCodeQueryDomain::StructuralMatch,
             DetailedCodeQueryKey::StructuralMatch {
                 kind: detailed_kind,
@@ -4272,6 +4094,8 @@ fn match_domain(domain: DetailedCodeQueryDomain) -> Option<MatchResultDomain> {
         | DetailedCodeQueryDomain::NilnessOperation
         | DetailedCodeQueryDomain::SwitchCoverage
         | DetailedCodeQueryDomain::ConcurrentAccessConflict
+        | DetailedCodeQueryDomain::ClassSetRow
+        | DetailedCodeQueryDomain::AbsentMemberFinding
         | DetailedCodeQueryDomain::DetachedTaskTransfer
         | DetailedCodeQueryDomain::ProcedureEffect
         | DetailedCodeQueryDomain::CallableSignature
@@ -4573,6 +4397,10 @@ fn weak_finding_key(evidence: &UnitRowEvidence, path: &WorkspaceRelativePath) ->
         } => {
             update_hash(&mut hasher, id.as_bytes());
             update_hash(&mut hasher, root_procedure_id.as_bytes());
+        }
+        DetailedCodeQueryKey::ClassSetRow { id }
+        | DetailedCodeQueryKey::AbsentMemberFinding { id } => {
+            update_hash(&mut hasher, id.as_bytes());
         }
         DetailedCodeQueryKey::ProcedureEffect { id, procedure_id } => {
             update_hash(&mut hasher, id.as_bytes());

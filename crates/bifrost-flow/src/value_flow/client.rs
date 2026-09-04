@@ -423,6 +423,10 @@ impl DistributiveDataflowProblem for ValueFlowProblem<'_> {
         true
     }
 
+    fn call_replaced_by_model(&self, call: &crate::analyzer::semantic::CallSiteHandle) -> bool {
+        self.plan.curated_model_for_call(call).is_some()
+    }
+
     fn normal_flow(
         &self,
         edge: DataflowEdge<'_, Self::Fact>,
@@ -430,7 +434,17 @@ impl DistributiveDataflowProblem for ValueFlowProblem<'_> {
         out: &mut dyn DataflowOutput<Self::Fact>,
     ) {
         let mut meetings = Vec::new();
-        let active = self.apply_point(edge.source(), fact, &mut meetings);
+        let mut active = self.apply_point(edge.source(), fact, &mut meetings);
+        if let crate::analyzer::semantic::IcfgEdgeKind::Intraprocedural(kind) = edge.kind() {
+            let kills = self
+                .plan
+                .edge_kills(edge.source(), edge.target().id(), kind);
+            active.retain(|flow| {
+                !kills.iter().any(|kill| {
+                    kill.carrier == flow.carrier && kill.sources.binary_search(&flow.source).is_ok()
+                })
+            });
+        }
         self.emit_all(active, meetings, out);
     }
 

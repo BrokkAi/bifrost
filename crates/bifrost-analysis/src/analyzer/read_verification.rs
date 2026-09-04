@@ -437,6 +437,36 @@ impl Default for LookupReplayLimits {
     }
 }
 
+/// The head's answer to a recorded procedure-summary read.
+///
+/// The summary repository lives in `brokk-bifrost-flow`, which depends on this
+/// crate, so verification cannot reach it from here. Whoever owns the head's
+/// repository supplies this instead, and answers through the same lookup the
+/// recording was announced from, so both sides fold the same digest.
+pub trait SummaryAnswers {
+    /// The content digest the head retains under `identity`, or the ledger's
+    /// absent digest when it retains nothing.
+    ///
+    /// `None` is not absence. It says this head cannot be asked the question
+    /// at all -- no repository in hand, or more than one summary retained
+    /// under one identity -- which makes every unit that recorded a summary
+    /// read recompute, the sound direction.
+    fn summary_content(&self, identity: StableDigest) -> Option<StableDigest>;
+}
+
+/// The answer source for a verification holding no summary repository.
+///
+/// Every summary read it is asked about is unanswerable, so a unit that
+/// recorded one is recomputed.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoSummaryAnswers;
+
+impl SummaryAnswers for NoSummaryAnswers {
+    fn summary_content(&self, _identity: StableDigest) -> Option<StableDigest> {
+        None
+    }
+}
+
 /// Replayed lookup answers, keyed by the question that produced them.
 ///
 /// Verification asks the same question once per unit that recorded it, and a
@@ -469,11 +499,12 @@ impl LookupMemo {
         kind: LookupKind,
         question: &LookupQuestion,
         limits: LookupReplayLimits,
+        summaries: &dyn SummaryAnswers,
     ) -> Option<StableDigest> {
         if let Some(answer) = self.answers.get(&(kind, question.clone())) {
             return *answer;
         }
-        let answer = replay_lookup(head, kind, question, limits);
+        let answer = replay_lookup(head, kind, question, limits, summaries);
         self.answers.insert((kind, question.clone()), answer);
         answer
     }
@@ -496,6 +527,7 @@ pub fn replay_lookup(
     kind: LookupKind,
     question: &LookupQuestion,
     limits: LookupReplayLimits,
+    summaries: &dyn SummaryAnswers,
 ) -> Option<StableDigest> {
     let analyzer = head.analyzer();
     let scope = AnalyzerQueryScope::new(analyzer);
@@ -565,9 +597,20 @@ pub fn replay_lookup(
             Some(crate::analyzer::read_ledger::file_set_digest(&referencing))
         }
         LookupKind::Dispatch => replay_dispatch(head, question, limits),
-        // No producer records a summary key yet. Answering `None` here is the
-        // sound direction: a unit that somehow carried one is recomputed.
-        LookupKind::ProcedureSummary => None,
+        // The repository is not this crate's, so the answer comes from the
+        // caller that holds the head's, through the same lookup the recording
+        // was announced from.
+        LookupKind::ProcedureSummary => {
+            let LookupQuestion::Summary { identity } = question else {
+                debug_assert!(
+                    false,
+                    "a procedure-summary lookup recorded a {} question: {question:?}",
+                    question.stable_label()
+                );
+                return None;
+            };
+            summaries.summary_content(*identity)
+        }
     }
 }
 
@@ -790,12 +833,14 @@ const ARTIFACT_CURRENCY_SOURCE_BYTES: usize = usize::MAX;
 /// digest of the read set being verified. That identity is checkout-
 /// independent because every read key is, so the same unit verified against
 /// two head workspaces reports the same artifact.
+#[allow(clippy::too_many_arguments)]
 pub fn verify_read_set(
     head: &WorkspaceAnalyzer,
     changed: &ChangedFacts,
     inputs: &HeadInputs,
     keys: &[ReadKey],
     limits: LookupReplayLimits,
+    summaries: &dyn SummaryAnswers,
     memo: &mut LookupMemo,
 ) -> ReadVerdict {
     let unit = DerivedArtifactId::new(
@@ -841,11 +886,50 @@ pub fn verify_read_set(
                     )
                 }
             }
+            // A procedure-summary read is the one lookup whose absence is not
+            // evidence of a change. A head that has not solved anything
+            // retains no summary at all, so replaying every recorded summary
+            // read against a cold repository would answer absence for all of
+            // them and recompute every unit that ever crossed the summary
+            // funnel -- which is every typestate root. What carries the
+            // dependency instead is the closure the recorder names beside the
+            // summary: one `Artifact` key per member, verified by fingerprint
+            // against what the head would derive from those files now. So an
+            // absent or unanswerable summary lookup holds, and only a head
+            // that does retain a summary under the recorded identity, with
+            // different content, reports a change
+            // (`.agents/plans/impact-sliced-diff-base.md`, Decision Log (5b)).
+            ReadKey::Lookup {
+                kind: LookupKind::ProcedureSummary,
+                question,
+                digest,
+            } => match memo.answer(
+                head,
+                LookupKind::ProcedureSummary,
+                question,
+                limits,
+                summaries,
+            ) {
+                None => None,
+                Some(replayed)
+                    if replayed == crate::analyzer::read_ledger::absent_summary_digest() =>
+                {
+                    None
+                }
+                Some(replayed) if replayed != *digest => {
+                    Some(InvalidationReason::DependencyFingerprintChanged {
+                        artifact: unit,
+                        before: *digest,
+                        after: replayed,
+                    })
+                }
+                Some(_) => None,
+            },
             ReadKey::Lookup {
                 kind,
                 question,
                 digest,
-            } => match memo.answer(head, *kind, question, limits) {
+            } => match memo.answer(head, *kind, question, limits, summaries) {
                 // The head has no answer to the question that was asked, so
                 // nothing about it can be reused.
                 None => {
@@ -1101,6 +1185,7 @@ mod tests {
                 &inputs,
                 &keys,
                 LookupReplayLimits::default(),
+                &NoSummaryAnswers,
                 &mut LookupMemo::new(),
             ),
             ReadVerdict::Unchanged,
@@ -1123,6 +1208,7 @@ mod tests {
             &inputs,
             &keys,
             LookupReplayLimits::default(),
+            &NoSummaryAnswers,
             &mut LookupMemo::new(),
         );
         let changed = verdict

@@ -799,6 +799,8 @@ fn query_step_to_json(step: &QueryStep) -> Value {
         | QueryStep::NilnessOperations
         | QueryStep::SwitchCoverage
         | QueryStep::ConcurrentAccessConflicts
+        | QueryStep::ClassSet
+        | QueryStep::AbsentMember
         | QueryStep::DetachedTaskTransfers
         | QueryStep::ProcedureEffects
         | QueryStep::CallableSignature

@@ -31,7 +31,7 @@ const BASELINE_MIGRATION_VERSION: i64 = 18;
 // Version 25 belonged to a rejected local relational-key experiment. Skipping
 // it prevents an old experimental v25 store from being mistaken for this
 // schema; the version sequence is intentionally monotonic, not contiguous.
-const CURRENT_MIGRATION_VERSION: i64 = 36;
+const CURRENT_MIGRATION_VERSION: i64 = 42;
 pub const OPTIONAL_FACT_KIND_CPP_TEMPLATE_METADATA: i64 = 1;
 pub const OPTIONAL_FACT_KIND_RUBY_METHOD_DISPATCH_MODE: i64 = 2;
 pub const OPTIONAL_FACT_KIND_SCALA_TRAIT: i64 = 3;
@@ -70,6 +70,17 @@ const SIGNATURE_TYPE_PARAMETERS_RECORDED_SQL: &str =
     include_str!("../migrations/cache/0035-signature-type-parameters-recorded.sql");
 const POLICY_EVALUATION_UNITS_SQL: &str =
     include_str!("../migrations/cache/0036-policy-evaluation-units.sql");
+const POLICY_EVALUATION_IDENTITIES_SQL: &str =
+    include_str!("../migrations/cache/0037-policy-evaluation-identities.sql");
+const POLICY_ASSERT_FILE_UNITS_SQL: &str =
+    include_str!("../migrations/cache/0038-policy-assert-file-units.sql");
+const POLICY_BINDING_UNITS_SQL: &str =
+    include_str!("../migrations/cache/0039-policy-binding-units.sql");
+const STRUCTURAL_FACT_LABELS_FROM_REGISTRY_SQL: &str =
+    include_str!("../migrations/cache/0040-structural-fact-labels-from-registry.sql");
+const POLICY_ROOT_UNITS_SQL: &str = include_str!("../migrations/cache/0041-policy-root-units.sql");
+const POLICY_SELECTOR_UNITS_SQL: &str =
+    include_str!("../migrations/cache/0042-policy-selector-units.sql");
 
 // Migration 0023 spells the signature-metadata byte cap as the literal 8388608,
 // because a checked-in SQL file cannot interpolate a Rust constant. The two must
@@ -90,7 +101,7 @@ struct CacheMigration {
     sql: &'static str,
 }
 
-const CACHE_MIGRATIONS: [CacheMigration; 18] = [
+const CACHE_MIGRATIONS: [CacheMigration; 24] = [
     CacheMigration {
         version: 18,
         sql: CURRENT_BASELINE_SQL,
@@ -162,6 +173,30 @@ const CACHE_MIGRATIONS: [CacheMigration; 18] = [
     CacheMigration {
         version: 36,
         sql: POLICY_EVALUATION_UNITS_SQL,
+    },
+    CacheMigration {
+        version: 37,
+        sql: POLICY_EVALUATION_IDENTITIES_SQL,
+    },
+    CacheMigration {
+        version: 38,
+        sql: POLICY_ASSERT_FILE_UNITS_SQL,
+    },
+    CacheMigration {
+        version: 39,
+        sql: POLICY_BINDING_UNITS_SQL,
+    },
+    CacheMigration {
+        version: 40,
+        sql: STRUCTURAL_FACT_LABELS_FROM_REGISTRY_SQL,
+    },
+    CacheMigration {
+        version: 41,
+        sql: POLICY_ROOT_UNITS_SQL,
+    },
+    CacheMigration {
+        version: 42,
+        sql: POLICY_SELECTOR_UNITS_SQL,
     },
 ];
 
@@ -2418,13 +2453,14 @@ mod tests {
                VALUES('1111111111111111111111111111111111111111', 'java', 7);
              INSERT INTO policy_units(
                policy_semantic_hash, family, partition_kind, seed_rel_path,
-               seed_blob_oid, seed_blob_id, lang, configuration_fingerprint,
+               seed_blob_oid, partition_digest, seed_blob_id, lang,
+               configuration_fingerprint,
                active_model_set_hash, engine_epoch, completion, budget_mode,
                product_kind, product, read_set_digest, published_at
              ) VALUES(
                'aa11bb22cc33dd44ee55ff66007788990011223344556677889900aabbccddee',
                'match', 'seed', 'src/Main.java',
-               '1111111111111111111111111111111111111111',
+               '1111111111111111111111111111111111111111', '',
                (SELECT id FROM blobs
                   WHERE blob_oid = '1111111111111111111111111111111111111111'
                     AND lang = 'java'),
@@ -2444,12 +2480,13 @@ mod tests {
             .execute(
                 "INSERT INTO policy_units(
                    policy_semantic_hash, family, partition_kind, seed_rel_path,
-                   seed_blob_oid, configuration_fingerprint, active_model_set_hash,
+                   seed_blob_oid, partition_digest, configuration_fingerprint,
+                   active_model_set_hash,
                    engine_epoch, completion, budget_mode, product_kind, product,
                    read_set_digest, published_at
                  ) VALUES(
                    'aa11bb22cc33dd44ee55ff66007788990011223344556677889900aabbccddee',
-                   'match', 'whole', 'src/Main.java', '',
+                   'match', 'whole', 'src/Main.java', '', '',
                    'bb11bb22cc33dd44ee55ff66007788990011223344556677889900aabbccddee',
                    'cc11bb22cc33dd44ee55ff66007788990011223344556677889900aabbccddee',
                    'dd11bb22cc33dd44ee55ff66007788990011223344556677889900aabbccddee',
@@ -2459,6 +2496,87 @@ mod tests {
             )
             .unwrap_err();
         assert!(seeded_whole.to_string().contains("CHECK constraint failed"));
+
+        // An assert unit's question is narrower than the file it covers: it is
+        // keyed by the subject rows it asserted over, and a row without that
+        // digest would answer a question nobody asked. A file's findings are
+        // also not a query's rows, so the two kinds must agree.
+        for (partition_kind, partition_digest, product_kind) in [
+            ("assert_file", "", "assert_file"),
+            (
+                "assert_file",
+                "ee11bb22cc33dd44ee55ff66007788990011223344556677889900aabbccddee",
+                "rows",
+            ),
+            (
+                "seed",
+                "ee11bb22cc33dd44ee55ff66007788990011223344556677889900aabbccddee",
+                "rows",
+            ),
+            // A relational binding unit is keyed by the binding it executed,
+            // because one policy runs one query per binding over the same seed
+            // files; without it the second binding would read the first's rows.
+            // Its product is that query's rows, not a file's findings.
+            ("binding", "", "rows"),
+            (
+                "binding",
+                "ee11bb22cc33dd44ee55ff66007788990011223344556677889900aabbccddee",
+                "assert_file",
+            ),
+        ] {
+            let refused = conn
+                .execute(
+                    "INSERT INTO policy_units(
+                       policy_semantic_hash, family, partition_kind, seed_rel_path,
+                       seed_blob_oid, partition_digest, configuration_fingerprint,
+                       active_model_set_hash,
+                       engine_epoch, completion, budget_mode, product_kind, product,
+                       read_set_digest, published_at
+                     ) VALUES(
+                       'aa11bb22cc33dd44ee55ff66007788990011223344556677889900aabbccddee',
+                       'assertion', ?1, 'src/Other.java',
+                       '1111111111111111111111111111111111111111', ?2,
+                       'bb11bb22cc33dd44ee55ff66007788990011223344556677889900aabbccddee',
+                       'cc11bb22cc33dd44ee55ff66007788990011223344556677889900aabbccddee',
+                       'dd11bb22cc33dd44ee55ff66007788990011223344556677889900aabbccddee',
+                       'complete', 'exhaustive', ?3, '{}', zeroblob(32), 100
+                     )",
+                    rusqlite::params![partition_kind, partition_digest, product_kind],
+                )
+                .unwrap_err();
+            assert!(
+                refused.to_string().contains("CHECK constraint failed"),
+                "{partition_kind}/{product_kind}: {refused}"
+            );
+        }
+
+        // A binding unit is a seed unit narrowed by the binding it ran, so the
+        // partition the schema admits carries a file, a blob and that name's
+        // digest, and publishes rendered rows.
+        conn.execute(
+            "INSERT INTO policy_units(
+               policy_semantic_hash, family, partition_kind, seed_rel_path,
+               seed_blob_oid, partition_digest, seed_blob_id, lang,
+               configuration_fingerprint, active_model_set_hash, engine_epoch,
+               completion, budget_mode, product_kind, product, read_set_digest,
+               published_at
+             ) VALUES(
+               'aa11bb22cc33dd44ee55ff66007788990011223344556677889900aabbccddee',
+               'assertion', 'binding', 'src/Main.java',
+               '1111111111111111111111111111111111111111',
+               'ff11bb22cc33dd44ee55ff66007788990011223344556677889900aabbccddee',
+               (SELECT id FROM blobs
+                  WHERE blob_oid = '1111111111111111111111111111111111111111'
+                    AND lang = 'java'),
+               'java',
+               'bb11bb22cc33dd44ee55ff66007788990011223344556677889900aabbccddee',
+               'cc11bb22cc33dd44ee55ff66007788990011223344556677889900aabbccddee',
+               'dd11bb22cc33dd44ee55ff66007788990011223344556677889900aabbccddee',
+               'complete', 'exhaustive', 'rows', '{\"rows\":[]}', zeroblob(32), 100
+             )",
+            [],
+        )
+        .unwrap();
 
         // Only exhaustive, complete units are publishable at all.
         let bounded = conn
@@ -2487,8 +2605,7 @@ mod tests {
              INSERT INTO policy_evaluations(
                base_tree_oid, policy_set_digest, options_digest,
                configuration_fingerprint, active_model_set_hash, engine_epoch,
-               resolved_commit, analyzed_source_bytes, analyzed_file_count,
-               unit_count, published_at
+               resolved_commit, published_at
              ) VALUES(
                '2222222222222222222222222222222222222222',
                'aa11bb22cc33dd44ee55ff66007788990011223344556677889900aabbccddee',
@@ -2496,13 +2613,33 @@ mod tests {
                'cc11bb22cc33dd44ee55ff66007788990011223344556677889900aabbccddee',
                'dd11bb22cc33dd44ee55ff66007788990011223344556677889900aabbccddee',
                'ee11bb22cc33dd44ee55ff66007788990011223344556677889900aabbccddee',
-               '3333333333333333333333333333333333333333', 42, 1, 1, 100
+               '3333333333333333333333333333333333333333', 100
              );
-             INSERT INTO policy_evaluation_units(evaluation_id, policy_id, ordinal, unit_id)
-               VALUES((SELECT evaluation_id FROM policy_evaluations), 'test.policy', 0,
-                      (SELECT unit_id FROM policy_units));",
+             INSERT INTO policy_evaluation_units(evaluation_id, policy_id, unit_id)
+               VALUES((SELECT evaluation_id FROM policy_evaluations), 'test.policy',
+                      (SELECT unit_id FROM policy_units));
+             INSERT INTO policy_evaluation_identities(evaluation_id, policy_id, finding_id)
+               VALUES((SELECT evaluation_id FROM policy_evaluations), 'test.policy',
+                      zeroblob(32));",
         )
         .unwrap();
+
+        // A finding identity is a fixed-width digest. A truncated one would
+        // silently match nothing, which is a base finding reported as fixed
+        // and a head finding reported as new.
+        let short_identity = conn
+            .execute(
+                "INSERT INTO policy_evaluation_identities(evaluation_id, policy_id, finding_id)
+                 VALUES((SELECT evaluation_id FROM policy_evaluations), 'test.policy',
+                        zeroblob(16))",
+                [],
+            )
+            .unwrap_err();
+        assert!(
+            short_identity
+                .to_string()
+                .contains("CHECK constraint failed")
+        );
 
         conn.execute(
             "DELETE FROM blobs
@@ -2540,8 +2677,30 @@ mod tests {
             ))
             .unwrap(),
             1,
-            "the evaluation row survives its units, and its recorded unit count is what \
-             tells a reader the membership is no longer whole"
+            "the evaluation row survives its units: what it concluded does not depend on \
+             the per-file work that produced it"
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM policy_evaluation_identities",
+                [],
+                |row| row.get::<_, usize>(0)
+            )
+            .unwrap(),
+            1,
+            "and neither do the identities a later run joins against"
+        );
+
+        conn.execute("DELETE FROM policy_evaluations", []).unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM policy_evaluation_identities",
+                [],
+                |row| row.get::<_, usize>(0)
+            )
+            .unwrap(),
+            0,
+            "an identity belongs to its evaluation and goes with it"
         );
     }
 
@@ -2604,19 +2763,9 @@ mod tests {
         )
         .unwrap();
 
-        let invalid_kind = conn
-            .execute(
-                "INSERT INTO structural_fact_nodes(
-                   blob_id, node_id, kind, start_byte, end_byte, subtree_end
-                 ) VALUES(
-                   (SELECT id FROM blobs WHERE blob_oid = '1111111111111111111111111111111111111111' AND lang = 'java'), 1,
-                   'not_a_kind', 4, 5, 2
-                 )",
-                [],
-            )
-            .unwrap_err();
-        assert!(invalid_kind.to_string().contains("CHECK constraint failed"));
-
+        // Label validity is the registry's job, not the schema's (migration
+        // 0040): `from_label` rejects an unknown label at hydration and the
+        // insert site asserts the round-trip. The row-shape checks stay.
         let partial_call_site = conn
             .execute(
                 "UPDATE structural_fact_nodes SET call_coverage = 'exact'
@@ -4384,6 +4533,271 @@ mod tests {
             "the source stays readable for the checkouts still on it (issue #1589)"
         );
         assert!(staged_leftovers(cache_dir).is_empty());
+    }
+
+    /// Version 37 records what a base evaluation concluded, which a version-36
+    /// row does not carry. Such a row must not survive the upgrade: an absent
+    /// identity set reads exactly like an empty one, so a run that reused a
+    /// carried-forward evaluation would report every head finding as new. The
+    /// migration recreates the table, which is what makes that impossible by
+    /// construction rather than by a check somebody must remember to write.
+    ///
+    /// The units are content-keyed and do survive, because nothing about them
+    /// changed and the next run re-records its evaluation over them.
+    #[test]
+    fn v36_base_evaluations_do_not_survive_into_the_identity_schema() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache_dir = temp.path();
+        let older = store_path(cache_dir, 36);
+        create_store_at(&older, &migrations_through(36), 36);
+        let digest = "a".repeat(64);
+        let oid = "b".repeat(40);
+        {
+            let conn = Connection::open(&older).unwrap();
+            conn.execute(
+                "INSERT INTO policy_units(
+                     policy_semantic_hash, family, partition_kind, seed_rel_path,
+                     seed_blob_oid, seed_blob_id, lang, configuration_fingerprint,
+                     active_model_set_hash, engine_epoch, completion, budget_mode,
+                     product_kind, product, read_set_digest, published_at)
+                 VALUES (?1, 'match', 'whole', '', '', NULL, NULL, ?1, ?1, ?1,
+                         'complete', 'exhaustive', 'rows', '{}', ?2, 100)",
+                rusqlite::params![digest, vec![7_u8; 32]],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO policy_evaluations(
+                     base_tree_oid, policy_set_digest, options_digest,
+                     configuration_fingerprint, active_model_set_hash, engine_epoch,
+                     resolved_commit, analyzed_source_bytes, analyzed_file_count,
+                     unit_count, published_at)
+                 VALUES (?1, ?2, ?2, ?2, ?2, ?2, ?1, 10, 1, 1, 100)",
+                rusqlite::params![oid, digest],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO policy_evaluation_units(evaluation_id, policy_id, ordinal, unit_id)
+                 VALUES (1, 'test.policy', 0, 1)",
+                [],
+            )
+            .unwrap();
+        }
+
+        let conn = open_unified_connection(&current_store_path(cache_dir)).unwrap();
+
+        assert_eq!(
+            cache_migration_version(&conn).unwrap(),
+            CURRENT_MIGRATION_VERSION
+        );
+        let evaluations: i64 = conn
+            .query_row("SELECT COUNT(*) FROM policy_evaluations", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            evaluations, 0,
+            "an evaluation recorded before the identities existed is not a base a run may reuse"
+        );
+        let memberships: i64 = conn
+            .query_row("SELECT COUNT(*) FROM policy_evaluation_units", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(memberships, 0, "its memberships went with it");
+        let identities: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM policy_evaluation_identities",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(identities, 0, "the identity table exists and starts empty");
+        let units: i64 = conn
+            .query_row("SELECT COUNT(*) FROM policy_units", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            units, 0,
+            "0038 rebuilt `policy_units` for the assertion family's partition, \
+             so a unit written before it is gone; units are content-keyed, so \
+             the next run republishes whatever is still true"
+        );
+        assert!(quick_check_is_ok(&conn).unwrap());
+    }
+
+    /// Version 40 stops enumerating structural labels in the schema (#2922).
+    /// The rows a version-38 store holds are valid under the wider schema and
+    /// are carried across intact; the rebuilt tables' foreign keys still name
+    /// the rebuilt nodes table, so a blob delete cascades through every
+    /// structural row; and the labels the 0034 lists omitted now insert.
+    #[test]
+    fn v38_structural_fact_rows_survive_into_the_registry_label_schema() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache_dir = temp.path();
+        let older = store_path(cache_dir, 38);
+        create_store_at(&older, &migrations_through(38), 38);
+        let oid = seeded_oid("structural-labels");
+        let blob = format!("(SELECT id FROM blobs WHERE blob_oid = '{oid}' AND lang = 'rust')");
+        {
+            let conn = Connection::open(&older).unwrap();
+            conn.execute_batch(&format!(
+                "INSERT INTO analysis_epochs(lang, epoch, generation)
+                   VALUES('rust', 'test', 3);
+                 INSERT INTO blobs(blob_oid, lang, generation) VALUES('{oid}', 'rust', 3);
+                 INSERT INTO blob_meta(
+                   blob_id, lang, contains_tests, content_package,
+                   stored_unit_count, range_count, signature_count,
+                   signature_metadata_count, supertype_count, child_count,
+                   import_statement_count, type_identifier_count, is_complete
+                 ) VALUES({blob}, 'rust', 0, 'pkg', 0, 0, 0, 0, 0, 0, 0, 0, 1);
+                 INSERT INTO structural_fact_manifests(
+                   blob_id, facts_version, source_bytes, node_count,
+                   role_count, occurrence_role_count
+                 ) VALUES({blob}, 18, 12, 2, 1, 1);
+                 INSERT INTO structural_fact_nodes(
+                   blob_id, node_id, kind, start_byte, end_byte, subtree_end,
+                   call_kind, call_coverage, continues_callee_groups
+                 ) VALUES({blob}, 0, 'call', 0, 12, 2, 'function', 'exact', 0);
+                 INSERT INTO structural_fact_nodes(
+                   blob_id, node_id, kind, start_byte, end_byte, parent_node_id,
+                   name_start_byte, name_end_byte, subtree_end
+                 ) VALUES({blob}, 1, 'identifier', 0, 4, 0, 0, 4, 2);
+                 INSERT INTO structural_fact_roles(
+                   blob_id, source_node_id, ordinal, role, spread, target_node_id,
+                   target_start_byte, target_end_byte, name_start_byte, name_end_byte
+                 ) VALUES({blob}, 0, 0, 'callee', 0, 1, 0, 4, 0, 4);
+                 INSERT INTO structural_fact_occurrence_roles(
+                   blob_id, node_id, ordinal, role
+                 ) VALUES({blob}, 1, 0, 'value_reference');"
+            ))
+            .unwrap();
+        }
+
+        let conn = open_unified_connection(&current_store_path(cache_dir)).unwrap();
+        assert_eq!(
+            cache_migration_version(&conn).unwrap(),
+            CURRENT_MIGRATION_VERSION
+        );
+        let structural_rows = |conn: &Connection| {
+            conn.query_row(
+                "SELECT (SELECT COUNT(*) FROM structural_fact_manifests),
+                        (SELECT COUNT(*) FROM structural_fact_nodes),
+                        (SELECT COUNT(*) FROM structural_fact_roles),
+                        (SELECT COUNT(*) FROM structural_fact_occurrence_roles)",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                },
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            structural_rows(&conn),
+            (1, 2, 1, 1),
+            "every structural row is carried across the rebuild"
+        );
+        let carried = conn
+            .query_row(
+                &format!(
+                    "SELECT nodes.kind, nodes.parent_node_id, nodes.name_start_byte,
+                            roles.role, roles.target_node_id, occurrences.role
+                     FROM structural_fact_nodes AS nodes
+                     JOIN structural_fact_roles AS roles
+                       ON roles.blob_id = nodes.blob_id AND roles.target_node_id = nodes.node_id
+                     JOIN structural_fact_occurrence_roles AS occurrences
+                       ON occurrences.blob_id = nodes.blob_id AND occurrences.node_id = nodes.node_id
+                     WHERE nodes.blob_id = {blob} AND nodes.node_id = 1"
+                ),
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<i64>>(1)?,
+                        row.get::<_, Option<i64>>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, Option<i64>>(4)?,
+                        row.get::<_, String>(5)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            carried,
+            (
+                "identifier".to_owned(),
+                Some(0),
+                Some(0),
+                "callee".to_owned(),
+                Some(1),
+                "value_reference".to_owned()
+            ),
+            "column values, the parent link, and the role target survive"
+        );
+
+        // The labels the 0034 lists omitted insert like any other registry label.
+        conn.execute_batch(&format!(
+            "INSERT INTO structural_fact_nodes(
+               blob_id, node_id, kind, start_byte, end_byte, subtree_end
+             ) VALUES({blob}, 2, 'module', 0, 12, 3);
+             INSERT INTO structural_fact_nodes(
+               blob_id, node_id, kind, start_byte, end_byte, subtree_end
+             ) VALUES({blob}, 3, 'concurrent_spawn', 0, 12, 4);
+             INSERT INTO structural_fact_roles(
+               blob_id, source_node_id, ordinal, role, spread,
+               target_start_byte, target_end_byte
+             ) VALUES({blob}, 0, 1, 'operator', 0, 4, 6);"
+        ))
+        .unwrap();
+        // The row-shape checks that are not label enumerations are kept.
+        let partial_call_site = conn
+            .execute(
+                &format!(
+                    "UPDATE structural_fact_nodes SET call_coverage = 'exact'
+                     WHERE blob_id = {blob} AND node_id = 2"
+                ),
+                [],
+            )
+            .unwrap_err();
+        assert!(
+            partial_call_site
+                .to_string()
+                .contains("CHECK constraint failed")
+        );
+        // A role's source node must exist: the foreign keys were rewritten to
+        // the renamed nodes table rather than left naming a dropped one.
+        let orphan_role = conn
+            .execute(
+                &format!(
+                    "INSERT INTO structural_fact_roles(
+                       blob_id, source_node_id, ordinal, role, spread,
+                       target_start_byte, target_end_byte
+                     ) VALUES({blob}, 99, 0, 'callee', 0, 0, 1)"
+                ),
+                [],
+            )
+            .unwrap_err();
+        assert!(
+            orphan_role
+                .to_string()
+                .contains("FOREIGN KEY constraint failed"),
+            "{orphan_role}"
+        );
+
+        conn.execute(
+            &format!("DELETE FROM blobs WHERE blob_oid = '{oid}' AND lang = 'rust'"),
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            structural_rows(&conn),
+            (0, 0, 0, 0),
+            "deleting the parsed blob cascades through every rebuilt structural table"
+        );
+        assert!(quick_check_is_ok(&conn).unwrap());
     }
 
     /// Version 28 removes the opaque identity copy without forcing a warm

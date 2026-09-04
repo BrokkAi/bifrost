@@ -1476,6 +1476,12 @@ where
             return Ok(Some(SolverTermination::Cancelled));
         }
 
+        // A call whose callee a curated or policy model replaces keeps its
+        // caller-side continuations and its dispatch boundaries, but the
+        // solver must not descend into the callee: the model is the call's
+        // whole behavior, and mounting an intentionally opaque body would
+        // open the exact gaps the model exists to close.
+        let replaced = problem.call_replaced_by_model(&origin);
         if let Some(transfers) = outcome.available_value() {
             let call_to_return_edges = if newly_materialized {
                 let mut projected_edges = Vec::new();
@@ -1512,8 +1518,15 @@ where
                 // into the callee survive the call unchanged, which used to be
                 // carried only by the boundary edges of blanket dispatch gaps.
                 // The edges are the caller's own scaffolding, so their
-                // evidence is proven and complete.
-                if problem.resolved_call_to_return() && !transfers.transfers.is_empty() {
+                // evidence is proven and complete. A model-replaced call whose
+                // descent set was suppressed still needs them when no boundary
+                // arm projects a continuation of its own; a boundary-carrying
+                // replaced call keeps exactly its boundary edges, so the model
+                // transfer is applied once with the boundary's evidence.
+                if problem.resolved_call_to_return()
+                    && (!transfers.transfers.is_empty()
+                        || (replaced && transfers.boundaries.is_empty()))
+                {
                     for (kind, continuation) in [
                         (
                             IcfgEdgeKind::CallToNormalContinuation,
@@ -1587,7 +1600,9 @@ where
                 }
             }
 
-            for (transfer_index, transfer) in transfers.transfers.iter().enumerate() {
+            let descended: &[crate::analyzer::semantic::CallTransfer] =
+                if replaced { &[] } else { &transfers.transfers };
+            for (transfer_index, transfer) in descended.iter().enumerate() {
                 let edge = ProcedureIcfgEdge {
                     source: point.clone(),
                     target: transfer.callee_entry.clone(),

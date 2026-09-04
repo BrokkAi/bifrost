@@ -4,7 +4,10 @@
 //! `analyzer/cpp/adapter.rs` in `brokk-bifrost-analysis` drives
 //! [`CppVisitor`] out of `LanguageAdapter::parse_file`.
 
-use brokk_bifrost_core::analyzer::common::{node_source_text, parse_source_region};
+use crate::graph::resolver::OrphanedNamespaceScopeIndex;
+use brokk_bifrost_core::analyzer::common::{
+    node_source_text, parse_source_ranges_with_cancellation, parse_source_region,
+};
 use brokk_bifrost_core::analyzer::fq_name::{
     FqName, SegmentId, SegmentKind, joined_segments, normalize_joined, segment_interner,
 };
@@ -2133,21 +2136,34 @@ fn recovered_function_like_export_class_owner(
 /// a direct sibling identifier or inside the `ERROR` node the grammar produced
 /// for a `: public Base` fragment. The grammar leaves the `final` specifier and
 /// the access specifiers in the same position as the bases, so drop them.
-fn recovered_export_head_bases(node: Node<'_>, skip: &[Node<'_>], source: &str) -> Vec<String> {
+/// The bases a recovered function-like export-macro class head names between
+/// `after` (the end of the class name, or of the access specifier that stands
+/// in for it) and `before` (the start of the body, or of the `init_declarator`
+/// that carries it). Bases arrive as bare declarator fields and inside `ERROR`
+/// fragments, and one fragment can also hold the class name and `final`
+/// (`M1 M2 Name final : public A`), so each part is bounded by position rather
+/// than by the fragment that holds it.
+fn recovered_export_head_bases(
+    node: Node<'_>,
+    after: usize,
+    before: usize,
+    source: &str,
+) -> Vec<String> {
+    let within = |part: &Node<'_>| part.start_byte() >= after && part.end_byte() <= before;
     let mut bases = Vec::new();
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
-        if skip.iter().any(|skipped| same_node(child, *skipped)) {
-            continue;
-        }
         if child.kind() == "ERROR" {
             let mut error_cursor = child.walk();
             bases.extend(
                 child
                     .named_children(&mut error_cursor)
+                    .filter(within)
                     .filter_map(|part| recovered_malformed_base_name(part, source)),
             );
-        } else if let Some(base) = recovered_malformed_base_name(child, source) {
+        } else if within(&child)
+            && let Some(base) = recovered_malformed_base_name(child, source)
+        {
             bases.push(base);
         }
     }
@@ -2155,27 +2171,100 @@ fn recovered_export_head_bases(node: Node<'_>, skip: &[Node<'_>], source: &str) 
     bases
 }
 
+/// Whether `token` is the `final` that closes a recovered class head. The
+/// grammar keeps it as the `final` keyword when it recognised the head
+/// (`M1 M2 Name final : public A`) and as an `identifier` spelled `final` when
+/// it did not (`Name final {`, `OTHER_MACRO Name final : public A`).
+fn recovered_export_head_final(token: Node<'_>, source: &str) -> bool {
+    if token.is_named() {
+        token.kind() == "identifier" && node_text(token, source) == "final"
+    } else {
+        token.kind() == "final"
+    }
+}
+
+/// The class name of a recovered function-like export-macro class head, read by
+/// position rather than spelling (#2557). `node` is the sibling tree-sitter
+/// built from the head after `class MACRO(2, 0)`, and `tail` the child that
+/// carries the body. The head's tokens, in source order with `ERROR` fragments
+/// flattened, read `macros... name [final] [: bases...]`: the name is the last
+/// identifier before the head ends, and the head ends at `final`, at the base
+/// clause `:`, or at `tail`. Every identifier before the name is decoration
+/// (`class MACRO(2, 0) OTHER_MACRO Name`), and a class named in capitals
+/// (`X509_CA`) is a class name like any other.
+///
+/// A `MISSING` identifier is a zero-width node tree-sitter invented to close a
+/// rule, not a token of the source, so it is never the name.
+fn recovered_export_head_name<'tree>(
+    node: Node<'tree>,
+    tail: Node<'tree>,
+    source: &str,
+) -> Option<Node<'tree>> {
+    let mut tokens = Vec::new();
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.start_byte() >= tail.start_byte() {
+            break;
+        }
+        if child.kind() == "ERROR" {
+            let mut fragment_cursor = child.walk();
+            tokens.extend(child.children(&mut fragment_cursor));
+        } else {
+            tokens.push(child);
+        }
+    }
+    let mut name = None;
+    for token in tokens {
+        if recovered_export_head_final(token, source) || (!token.is_named() && token.kind() == ":")
+        {
+            break;
+        }
+        if token.is_named()
+            && !token.is_missing()
+            && matches!(
+                token.kind(),
+                "identifier" | "type_identifier" | "field_identifier"
+            )
+        {
+            name = Some(token);
+        }
+    }
+    name
+}
+
+/// The `init_declarator` whose `value` carries the class body when the grammar
+/// keeps a function-like export-macro class head as one `declaration`.
+fn recovered_export_init_declarator(declaration: Node<'_>) -> Option<Node<'_>> {
+    let mut cursor = declaration.walk();
+    declaration
+        .named_children(&mut cursor)
+        .find(|child| child.kind() == "init_declarator")
+}
+
 /// Read the bases and the initializer-list body of a `declaration`-shaped tail
 /// of a function-like export-macro class head. The grammar splits a base list
 /// across bare declarator fields, `ERROR` fragments, and one trailing
-/// `init_declarator` whose `value` is the class body. `head` is the child that
-/// carries the class identity rather than a base: the access specifier when the
-/// class name went to a statement label, and the class name itself otherwise.
+/// `init_declarator` whose `value` is the class body. `head_end` is where the
+/// class identity ends and the bases can begin: the end of the access specifier
+/// when the class name went to a statement label, and the end of the class name
+/// itself otherwise.
 fn recovered_export_declaration_tail<'tree>(
     declaration: Node<'tree>,
-    head: Node<'tree>,
+    head_end: usize,
     source: &str,
 ) -> Option<(Vec<String>, Node<'tree>)> {
-    let mut cursor = declaration.walk();
-    let init = declaration
-        .named_children(&mut cursor)
-        .find(|child| child.kind() == "init_declarator")?;
+    let init = recovered_export_init_declarator(declaration)?;
     let body = init.child_by_field_name("value")?;
     if body.kind() != "initializer_list" {
         return None;
     }
-    let mut bases = recovered_export_head_bases(declaration, &[head, init], source);
-    bases.extend(recovered_export_head_bases(init, &[body], source));
+    let mut bases = recovered_export_head_bases(declaration, head_end, init.start_byte(), source);
+    bases.extend(recovered_export_head_bases(
+        init,
+        init.start_byte(),
+        body.start_byte(),
+        source,
+    ));
     Some((bases, body))
 }
 
@@ -2190,10 +2279,14 @@ fn recover_function_like_export_class_pair(
     if class_node.kind() != "class_specifier" || cpp_body_node(class_node).is_some() {
         return None;
     }
-    let macro_name = class_node
+    // The identifier tree-sitter took for the class name is the export macro,
+    // a function-like invocation when the `(` of its argument list follows it
+    // directly inside the error. Spelling plays no part (#2557).
+    class_node
         .child_by_field_name("name")
         .and_then(|name| direct_identifier_name(name, source))?;
-    if !cpp_export_macro_token(&macro_name) {
+    let invocation = class_node.next_sibling()?;
+    if invocation.is_named() || invocation.kind() != "(" {
         return None;
     }
     let sibling = node.next_named_sibling()?;
@@ -2231,37 +2324,53 @@ fn recover_function_like_export_class_pair(
             ) {
                 return None;
             }
-            let (bases, body) = recovered_export_declaration_tail(declaration, access, source)?;
+            let (bases, body) =
+                recovered_export_declaration_tail(declaration, access.end_byte(), source)?;
             (name, (!bases.is_empty()).then_some(bases), body)
         }
-        // `class MACRO(2, 0) Name final { ... };` and
-        // `class MACRO(2, 0) Name final : public Base { ... };`. The class name
-        // lands in the `type` field, `final` in the declarator field, and every
-        // base in an `ERROR` fragment beside them.
+        // `class MACRO(2, 0) Name final { ... };`,
+        // `class MACRO(2, 0) Name final : public Base { ... };`, and
+        // `class MACRO(2, 0) OTHER_MACRO Name { ... };`. The head's identifiers
+        // spread over the `type` field, the declarator field, and `ERROR`
+        // fragments beside them; the name is the last one before the head ends.
         "function_definition" => {
-            let type_node = sibling.child_by_field_name("type")?;
             let body = sibling.child_by_field_name("body")?;
             if body.kind() != "compound_statement" {
                 return None;
             }
-            let name = direct_identifier_name(type_node, source)?;
-            let bases = recovered_export_head_bases(sibling, &[type_node, body], source);
-            (name, (!bases.is_empty()).then_some(bases), body)
+            let name_node = recovered_export_head_name(sibling, body, source)?;
+            let bases = recovered_export_head_bases(
+                sibling,
+                name_node.end_byte(),
+                body.start_byte(),
+                source,
+            );
+            (
+                normalize_cpp_whitespace(node_text(name_node, source)),
+                (!bases.is_empty()).then_some(bases),
+                body,
+            )
         }
         // `class MACRO(2, 0) Name final : public A, public B { ... };`. The
         // comma-separated base list makes the grammar keep the whole tail as one
-        // declaration whose `type` field is the class name.
+        // declaration whose trailing `init_declarator` carries the body.
         "declaration" => {
-            let type_node = sibling.child_by_field_name("type")?;
-            let name = direct_identifier_name(type_node, source)?;
-            let (bases, body) = recovered_export_declaration_tail(sibling, type_node, source)?;
-            (name, (!bases.is_empty()).then_some(bases), body)
+            let init = recovered_export_init_declarator(sibling)?;
+            let name_node = recovered_export_head_name(sibling, init, source)?;
+            let (bases, body) =
+                recovered_export_declaration_tail(sibling, name_node.end_byte(), source)?;
+            (
+                normalize_cpp_whitespace(node_text(name_node, source)),
+                (!bases.is_empty()).then_some(bases),
+                body,
+            )
         }
         _ => return None,
     };
-    if name.is_empty() || cpp_export_macro_token(&name) {
-        return None;
-    }
+    debug_assert!(
+        !name.is_empty(),
+        "a recovered class head names its class by an identifier token"
+    );
     let range = Range {
         start_byte: node.start_byte(),
         end_byte: sibling.end_byte(),
@@ -2311,14 +2420,22 @@ fn recover_embedded_function_like_export_classes(
         .filter(|child| !child.is_named() && child.kind() == "class")
     {
         let row = class_token.start_position().row;
-        let Some(macro_name) = nodes.iter().copied().find(|candidate| {
-            candidate.start_byte() >= class_token.end_byte()
-                && candidate.start_position().row == row
+        // The head after the `class` token reads `MACRO(args) macros... name
+        // [final] : bases`. The macro is the first identifier, a function-like
+        // invocation when its argument list is the next thing after it, and the
+        // name is the last identifier before the head ends at `final` or at the
+        // base clause `:`. Spelling plays no part (#2557).
+        let is_identifier = |candidate: &Node<'_>| {
+            !candidate.is_missing()
                 && matches!(
                     candidate.kind(),
                     "identifier" | "type_identifier" | "field_identifier"
                 )
-                && cpp_export_macro_token(&normalize_cpp_whitespace(node_text(*candidate, source)))
+        };
+        let Some(macro_name) = nodes.iter().copied().find(|candidate| {
+            candidate.start_byte() >= class_token.end_byte()
+                && candidate.start_position().row == row
+                && is_identifier(candidate)
         }) else {
             continue;
         };
@@ -2329,17 +2446,29 @@ fn recover_embedded_function_like_export_classes(
         }) else {
             continue;
         };
-        let Some(name_node) = nodes.iter().copied().find(|candidate| {
-            candidate.kind() == "identifier"
+        if nodes.iter().any(|candidate| {
+            is_identifier(candidate)
+                && candidate.start_byte() >= macro_name.end_byte()
+                && candidate.end_byte() <= arguments.start_byte()
+        }) {
+            continue;
+        }
+        let Some(head_end) = nodes.iter().copied().find(|candidate| {
+            candidate.start_byte() >= arguments.end_byte()
+                && (recovered_export_head_final(*candidate, source)
+                    || (!candidate.is_named() && candidate.kind() == ":"))
+        }) else {
+            continue;
+        };
+        let Some(name_node) = nodes.iter().copied().rfind(|candidate| {
+            is_identifier(candidate)
                 && candidate.start_byte() >= arguments.end_byte()
+                && candidate.end_byte() <= head_end.start_byte()
                 && candidate.start_position().row == row
         }) else {
             continue;
         };
         let name = normalize_cpp_whitespace(node_text(name_node, source));
-        if name.is_empty() || cpp_export_macro_token(&name) {
-            continue;
-        }
         let Some(base_initializer) = nodes.iter().copied().find(|candidate| {
             candidate.kind() == "field_initializer"
                 && candidate.start_byte() >= name_node.end_byte()
@@ -3193,6 +3322,12 @@ pub struct CppVisitor<'a> {
     /// `Widget$Inner`). Regions are rare (one per fragmented recovery), so a
     /// linear scan at visit time is fine.
     pub consumed_fragment_regions: Vec<(usize, usize)>,
+    /// The namespaces tree-sitter's error recovery closed early, by the byte
+    /// regions of the declarations it left outside them (issue #1537). The
+    /// container walk reads a declaration's package from its parsed ancestors,
+    /// which for those declarations stop short; see
+    /// [`CppVisitor::recovered_namespace_scope`].
+    pub orphaned_namespaces: OrphanedNamespaceScopeIndex,
     /// The namespace forward declarations already folded out of each tree this
     /// walk has asked [`CppVisitor::unique_earlier_namespace_forward`] about.
     /// Empty until the first question, which the overwhelming majority of files
@@ -3505,9 +3640,17 @@ impl<'a> CppVisitor<'a> {
     /// fragmented export-class recovery (#938); such nodes were already indexed
     /// as members of the recovered class by the region reparse.
     fn node_is_inside_consumed_fragment(&self, node: Node<'_>) -> bool {
+        self.byte_range_is_inside_consumed_fragment(node.start_byte(), node.end_byte())
+    }
+
+    /// Byte-range form of [`Self::node_is_inside_consumed_fragment`], for a
+    /// candidate a recovery is about to reparse but has not yet turned into a
+    /// node -- e.g. a prototype-macro candidate (#2932) already claimed by an
+    /// enclosing envelope's earlier scan.
+    fn byte_range_is_inside_consumed_fragment(&self, start: usize, end: usize) -> bool {
         self.consumed_fragment_regions
             .iter()
-            .any(|&(start, end)| node.start_byte() >= start && node.end_byte() <= end)
+            .any(|&(region_start, region_end)| start >= region_start && end <= region_end)
     }
 
     /// Drive the container work loop from an explicit seed scope to completion. The
@@ -3527,6 +3670,25 @@ impl<'a> CppVisitor<'a> {
         scope: ScopeInfo,
         ancestry: &ParentIndex<'tree>,
     ) {
+        // The container root is ordinarily a clean `translation_unit` (or, for
+        // a recovery's own reparse, one too), so it never reaches
+        // `visit_node`'s dispatch: `push_cpp_container_work` below pushes only
+        // its named CHILDREN as individual work, each of which goes through
+        // `visit_node` and so through the "declaration"/"ERROR" arms' K&R
+        // prototype-macro scan. But tree-sitter can make the root of an
+        // entire malformed parse itself kind `ERROR` rather than wrapping it
+        // in `translation_unit` -- ext/pg.h's own header collapses a run of
+        // five consecutive `_((...))` prototypes this way, flattening them
+        // into 20+ named children of a bare root `ERROR`, none of which
+        // individually holds one candidate's complete `identifier ( ( ... )
+        // ) ;` leaf sequence (issue #2932). Run the same scan on the
+        // container root itself first, so this one node is not the sole
+        // exception `visit_node`'s dispatch would otherwise make of it; the
+        // consumed-region gate in `drain_cpp_work` then skips any child the
+        // reparse already indexed.
+        if node.has_error() && matches!(node.kind(), "ERROR" | "declaration") {
+            self.visit_prototype_macro_declarations(node, &scope);
+        }
         self.drain_cpp_work(
             vec![CppWork::Container(CppContainer { node, scope })],
             ancestry,
@@ -3795,6 +3957,10 @@ impl<'a> CppVisitor<'a> {
             self.visit_node(node, &recovered_scope, stack, ancestry);
             return;
         }
+        if let Some(recovered_scope) = self.recovered_namespace_scope(node, scope) {
+            self.visit_node(node, &recovered_scope, stack, ancestry);
+            return;
+        }
         // Fragmented-class recovery below may consume a malformed function
         // envelope before the ordinary kind dispatch runs. Recover any
         // export-macro class embedded in that envelope first; the strict class
@@ -4040,6 +4206,11 @@ impl<'a> CppVisitor<'a> {
                     self.visit_macro_swallowed_function_declarations(node, scope);
                     self.visit_macro_wrapped_declarations(node, scope, ancestry);
                     self.visit_stranded_class_members(node, scope, ancestry);
+                    // K&R prototype-macro recovery (issue #2932) runs before
+                    // the envelope is walked as an ordinary container, so
+                    // the consumed-region gate in `drain_cpp_work` skips any
+                    // child node the reparse already indexed.
+                    self.visit_prototype_macro_declarations(node, scope);
                     stack.push(CppWork::Container(CppContainer {
                         node,
                         scope: scope.clone(),
@@ -4047,13 +4218,25 @@ impl<'a> CppVisitor<'a> {
                 }
             }
             "declaration" => {
+                if node.has_error() {
+                    self.visit_prototype_macro_declarations(node, scope);
+                    if self.node_is_inside_consumed_fragment(node) {
+                        // The whole declaration was a recovered K&R
+                        // prototype macro invocation (issue #2932); the
+                        // reparse above already indexed its Function.
+                        // Falling through to the ordinary declaration
+                        // visitor would additionally mint the swapped-field
+                        // wreckage this recovery exists to replace.
+                        return;
+                    }
+                }
                 if scope.class_unit.is_some()
                     && scope.declarations_are_fields
                     && scope.recovered_specialization_member_scope
                     && let Some(alias_name) =
                         recovered_using_declaration_alias_name(node, self.source)
                 {
-                    self.add_type_aliases(node, scope, vec![alias_name]);
+                    self.add_type_aliases(node, scope, vec![alias_name], ancestry);
                 } else {
                     self.visit_declaration(
                         node,
@@ -4062,6 +4245,24 @@ impl<'a> CppVisitor<'a> {
                         stack,
                         ancestry,
                     )
+                }
+            }
+            // A K&R prototype macro invocation with a pointer return type and a
+            // simple argument list parses with no ERROR node at all: tree-sitter
+            // reads `T *name _(( args ));` as a multiplication of a type by a
+            // call (`T * name_(...)`), wrapped in an `expression_statement`
+            // that `has_error()` only because of a `MISSING "::"` inside it
+            // (issue #2932). Nothing else mints a declaration from an
+            // `expression_statement` at declaration scope today, so there is
+            // no existing behavior to preserve here if this node is not the
+            // K&R shape; the admission gate inside
+            // `visit_prototype_macro_declarations` (exactly one clean function
+            // prototype spanning the recovered run) is what keeps this arm
+            // safe on an ordinary errorful expression statement that happens
+            // to contain nested parentheses.
+            "expression_statement" => {
+                if node.has_error() {
+                    self.visit_prototype_macro_declarations(node, scope);
                 }
             }
             "field_declaration" => self.visit_declaration(node, scope, true, stack, ancestry),
@@ -4433,6 +4634,159 @@ impl<'a> CppVisitor<'a> {
         true
     }
 
+    /// Recover a K&R-compatibility prototype macro invocation such as
+    /// ruby.h's `RET name _(( args ));` (issue #2932). The `_` macro --
+    /// spelled `__P`, `OF`, or `PROTO` in other pre-ANSI-C codebases -- is
+    /// defined only in headers outside this workspace (ruby's own
+    /// `ruby/defines.h`), so tree-sitter-cpp has no grammar production for
+    /// `name _((args))` and turns each such line into wreckage: a
+    /// `declaration` or `ERROR` node whose children mis-associate the
+    /// parameter list as siblings of the declared name. Before this
+    /// recovery, the ordinary declaration visitor read that wreckage as a
+    /// field with the type and name swapped (e.g. a field literally named
+    /// `VALUE`) and indexed no prototype for the real name at all.
+    ///
+    /// [`cpp_prototype_macro_candidates`] recognizes the shape from its leaf
+    /// (token) sequence alone: an `identifier` leaf followed by two `(`
+    /// leaves, whose inner pair's `)` is immediately followed by the outer
+    /// pair's `)` and then a live `;`. This is exactly the leaf sequence a
+    /// preprocessor's `#define _(args) args` expansion would leave behind,
+    /// so admitting it does not require knowing the macro's spelling or
+    /// that it is defined anywhere this analyzer can see -- nothing else
+    /// distinguishes a real invocation from a false positive, so the leaf
+    /// shape is the only gate. For each candidate this reparses the run
+    /// before the macro token (the return type and declared name), the
+    /// inner parenthesized argument list (keeping its own parentheses as
+    /// the sole parameter-list parens), and the terminating `;`, each at its
+    /// original byte offset, as one included-range parse: the parser's
+    /// equivalent of a preprocessor deleting the macro token and its
+    /// wrapping parentheses. The result is admitted only when it is exactly
+    /// one clean function prototype spanning the whole recovered run; a
+    /// `NORETURN(void f _(( ... )));`-style macro wrapping the entire
+    /// prototype does not match, because its matched `))` is followed by a
+    /// third `)` rather than `;`, and is deliberately left unrecovered
+    /// (YAGNI: no witness needs it yet).
+    ///
+    /// One envelope can hold more than one candidate -- tree-sitter can
+    /// swallow several consecutive `_((...))` lines into one `ERROR` -- so
+    /// this scans `node`'s whole leaf sequence and resumes past each
+    /// admitted candidate's `;` to look for the next one. A candidate whose
+    /// run already lies inside an earlier recovery's consumed region is
+    /// skipped without reparsing: the caller can rescan a nested `ERROR` or
+    /// `declaration` that an outer envelope's scan already claimed, and this
+    /// keeps that rescan from minting the same prototype twice.
+    fn visit_prototype_macro_declarations(&mut self, node: Node<'_>, scope: &ScopeInfo) {
+        for candidate in cpp_prototype_macro_candidates(node) {
+            let start = candidate.run_start;
+            let end = candidate.semicolon_end;
+            if self.byte_range_is_inside_consumed_fragment(start, end) {
+                continue;
+            }
+            let Some(tree) = parse_source_ranges_with_cancellation(
+                &tree_sitter_cpp::LANGUAGE.into(),
+                self.source,
+                &candidate.ranges(),
+                None,
+            ) else {
+                continue;
+            };
+            let root = tree.root_node();
+            let mut cursor = root.walk();
+            let declarations = root
+                .named_children(&mut cursor)
+                .filter(|child| child.kind() != "comment")
+                .collect::<Vec<_>>();
+            let [declaration] = declarations.as_slice() else {
+                continue;
+            };
+            if declaration.kind() != "declaration"
+                || declaration.has_error()
+                || declaration.start_byte() != start
+                || declaration.end_byte() != end
+                || declaration
+                    .child_by_field_name("declarator")
+                    .and_then(extract_function_declarator)
+                    .is_none()
+            {
+                continue;
+            }
+            let recovery = cpp_recovery_window(self.source, start, end);
+            // The reparsed region is its own tree, so this walk indexes it
+            // itself.
+            let reparsed_ancestry = ParentIndex::new(root);
+            self.record_recovered_declarations(recovery, |visitor| {
+                visitor.run_container_work(root, scope.clone(), &reparsed_ancestry);
+            });
+            self.consumed_fragment_regions.push((start, end));
+        }
+    }
+
+    /// Declare one Module per namespace level of `components` under
+    /// `package_name`, and return the innermost level's package name and
+    /// Module. A level an earlier definition already declared is reused.
+    fn declare_namespace_levels(
+        &mut self,
+        mut package_name: String,
+        components: Vec<String>,
+        node: Node<'_>,
+    ) -> (String, Option<CodeUnit>) {
+        let mut module = None;
+        for component in components {
+            let full_name = if package_name.is_empty() {
+                component
+            } else {
+                format!("{package_name}{CPP_PACKAGE_SEPARATOR}{component}")
+            };
+            let level = CodeUnit::new_fq(
+                self.file.clone(),
+                CodeUnitType::Module,
+                "",
+                full_name.clone(),
+                cpp_namespace_fq(&full_name),
+            );
+            if !self.parsed.contains_declaration(&level) {
+                self.add_declaration(level.clone(), node, None, None);
+            }
+            package_name = full_name;
+            module = Some(level);
+        }
+        (package_name, module)
+    }
+
+    /// The scope for a node that C++ parse recovery displaced out of the
+    /// namespaces enclosing it (issue #1537). When tree-sitter closes a
+    /// damaged namespace early, the rest of its body and possibly the rest of
+    /// the file lose the `namespace_definition` ancestors this walk reads a
+    /// package from; the recovered region names the complete enclosing path.
+    /// `None` when the walk's scope already names every enclosing namespace,
+    /// or names a path another recovery established that this one does not
+    /// extend.
+    fn recovered_namespace_scope(
+        &mut self,
+        node: Node<'_>,
+        scope: &ScopeInfo,
+    ) -> Option<ScopeInfo> {
+        let components = self
+            .orphaned_namespaces
+            .region_at(node.start_byte())?
+            .components
+            .clone();
+        let package_name = components.join(CPP_PACKAGE_SEPARATOR);
+        let extends = package_name.len() > scope.package_name.len()
+            && package_name.starts_with(scope.package_name.as_str())
+            && (scope.package_name.is_empty()
+                || package_name[scope.package_name.len()..].starts_with(CPP_PACKAGE_SEPARATOR));
+        if !extends {
+            return None;
+        }
+        let (package_name, module) = self.declare_namespace_levels(String::new(), components, node);
+        Some(ScopeInfo {
+            package_name,
+            module,
+            ..scope.clone()
+        })
+    }
+
     fn visit_namespace<'tree>(
         &mut self,
         node: Node<'tree>,
@@ -4468,31 +4822,12 @@ impl<'a> CppVisitor<'a> {
         // shorthand must declare `a` as well as `a::b` -- extracting only the
         // innermost level left the enclosing namespace undeclared and made the
         // two spellings of one construct disagree (issue #1878).
-        let mut package_name = if explicitly_global {
+        let package_name = if explicitly_global {
             String::new()
         } else {
             scope.package_name.clone()
         };
-        let mut module = None;
-        for component in components {
-            let full_name = if package_name.is_empty() {
-                component
-            } else {
-                format!("{package_name}::{component}")
-            };
-            let level = CodeUnit::new_fq(
-                self.file.clone(),
-                CodeUnitType::Module,
-                "",
-                full_name.clone(),
-                cpp_namespace_fq(&full_name),
-            );
-            if !self.parsed.contains_declaration(&level) {
-                self.add_declaration(level.clone(), node, None, None);
-            }
-            package_name = full_name;
-            module = Some(level);
-        }
+        let (package_name, module) = self.declare_namespace_levels(package_name, components, node);
 
         let namespace_scope = ScopeInfo {
             package_name,
@@ -5738,7 +6073,7 @@ impl<'a> CppVisitor<'a> {
         }
         let recovered_alias_names = recovered_type_alias_names(node, self.source);
         if !recovered_alias_names.is_empty() {
-            self.add_type_aliases(node, scope, recovered_alias_names);
+            self.add_type_aliases(node, scope, recovered_alias_names, ancestry);
             return;
         }
         if self.visit_c_anonymous_aggregate_declaration(node, scope, in_class_body, stack, ancestry)
@@ -6258,7 +6593,14 @@ impl<'a> CppVisitor<'a> {
                 .get(range.start_byte..range.end_byte)
                 .map(normalize_cpp_whitespace)
                 .unwrap_or_default();
-            self.record_type_aliases(node, scope, vec![recovered.name], signature, range);
+            self.record_type_aliases(
+                node,
+                scope,
+                vec![recovered.name],
+                signature,
+                range,
+                ancestry,
+            );
             return;
         }
 
@@ -6278,7 +6620,7 @@ impl<'a> CppVisitor<'a> {
         } else {
             None
         };
-        self.add_type_aliases(node, scope, alias_names);
+        self.add_type_aliases(node, scope, alias_names, ancestry);
         if let Some((body, alias_name)) = anonymous_aggregate {
             // The typedef alias is also the only user-visible identity of an
             // anonymous aggregate. Reuse it as the member owner instead of
@@ -6301,7 +6643,13 @@ impl<'a> CppVisitor<'a> {
         }
     }
 
-    fn add_type_aliases(&mut self, node: Node<'_>, scope: &ScopeInfo, alias_names: Vec<String>) {
+    fn add_type_aliases(
+        &mut self,
+        node: Node<'_>,
+        scope: &ScopeInfo,
+        alias_names: Vec<String>,
+        ancestry: &ParentIndex<'_>,
+    ) {
         let signature = normalize_cpp_whitespace(node_text(node, self.source));
         self.record_type_aliases(
             node,
@@ -6309,6 +6657,7 @@ impl<'a> CppVisitor<'a> {
             alias_names,
             signature,
             cpp_declaration_range(node),
+            ancestry,
         );
     }
 
@@ -6319,6 +6668,7 @@ impl<'a> CppVisitor<'a> {
         alias_names: Vec<String>,
         signature: String,
         range: Range,
+        ancestry: &ParentIndex<'_>,
     ) {
         if signature.is_empty() {
             return;
@@ -6335,8 +6685,15 @@ impl<'a> CppVisitor<'a> {
             // Declaration identity does not include the alias signature. Keep
             // each physical range so conditional aliases retain their guards.
             self.add_declaration_with_range(code_unit.clone(), range, None, None);
-            self.parsed
-                .add_signature(code_unit.clone(), signature.clone());
+            let lexical_scope = cpp_callable_lexical_scope(node, self.source, ancestry);
+            let underlying_type_identity = node.child_by_field_name("type").and_then(|type_node| {
+                cpp_structured_type_identity(type_node, self.source, &lexical_scope)
+            });
+            self.parsed.add_signature_with_metadata(
+                code_unit.clone(),
+                SignatureMetadata::new(signature.clone(), Vec::new())
+                    .with_underlying_type_identity(underlying_type_identity),
+            );
             if let Some(metadata) = &scope.template_metadata {
                 let mut metadata = metadata.clone();
                 metadata.primary_fq_name = code_unit.fq_name();
@@ -9562,7 +9919,23 @@ fn malformed_class_error_owner_name(node: Node<'_>, source: &str) -> Option<Stri
     has_body.then_some(name)
 }
 
-fn cpp_callable_return_type_identity<'tree>(
+/// The parser-derived return type of one callable declaration.
+///
+/// This accepts the enclosing declaration node so consumers do not need to
+/// duplicate the declarator-unwrapping rules before asking for the structured
+/// identity.
+pub fn cpp_callable_declaration_return_type_identity<'tree>(
+    callable: Node<'tree>,
+    source: &str,
+    ancestry: &ParentIndex<'tree>,
+) -> Option<StructuredTypeIdentity> {
+    let declarator = callable
+        .child_by_field_name("declarator")
+        .and_then(extract_function_declarator)?;
+    cpp_callable_return_type_identity(declarator, source, ancestry)
+}
+
+pub(crate) fn cpp_callable_return_type_identity<'tree>(
     function_declarator: Node<'tree>,
     source: &str,
     ancestry: &ParentIndex<'tree>,
@@ -9622,7 +9995,7 @@ fn cpp_callable_return_type_identity<'tree>(
         }
         match parent.kind() {
             "pointer_declarator" => wrappers.push(CppStructuredTypeWrapper::Pointer),
-            "reference_declarator" => wrappers.push(CppStructuredTypeWrapper::Reference),
+            "reference_declarator" => wrappers.push(cpp_reference_wrapper(parent)?),
             "array_declarator" => wrappers.push(CppStructuredTypeWrapper::Array),
             "init_declarator" | "parenthesized_declarator" | "attributed_declarator" => {}
             _ => return None,
@@ -9658,7 +10031,7 @@ fn cpp_structured_type_identity(
                     let mut cursor = current.walk();
                     for child in current.named_children(&mut cursor) {
                         if child.id() != type_node.id() {
-                            wrappers.extend(cpp_structured_declarator_wrappers(child));
+                            wrappers.extend(cpp_structured_declarator_wrappers(child)?);
                         }
                     }
                     work.push(Work::ApplyWrappers(wrappers));
@@ -9675,7 +10048,7 @@ fn cpp_structured_type_identity(
                     let child = current
                         .child_by_field_name("declarator")
                         .or_else(|| current.named_child(0))?;
-                    work.push(Work::Wrap(CppStructuredTypeWrapper::Reference));
+                    work.push(Work::Wrap(cpp_reference_wrapper(current)?));
                     work.push(Work::Visit(child));
                 }
                 "array_declarator" | "abstract_array_declarator" => {
@@ -9766,11 +10139,12 @@ fn cpp_structured_named_type(
 #[derive(Clone, Copy)]
 enum CppStructuredTypeWrapper {
     Pointer,
-    Reference,
+    LvalueReference,
+    RvalueReference,
     Array,
 }
 
-fn cpp_structured_declarator_wrappers(node: Node<'_>) -> Vec<CppStructuredTypeWrapper> {
+fn cpp_structured_declarator_wrappers(node: Node<'_>) -> Option<Vec<CppStructuredTypeWrapper>> {
     let mut wrappers = Vec::new();
     let mut current = node;
     loop {
@@ -9779,7 +10153,7 @@ fn cpp_structured_declarator_wrappers(node: Node<'_>) -> Vec<CppStructuredTypeWr
                 wrappers.push(CppStructuredTypeWrapper::Pointer)
             }
             "reference_declarator" | "abstract_reference_declarator" => {
-                wrappers.push(CppStructuredTypeWrapper::Reference)
+                wrappers.push(cpp_reference_wrapper(current)?);
             }
             "array_declarator" | "abstract_array_declarator" => {
                 wrappers.push(CppStructuredTypeWrapper::Array)
@@ -9794,7 +10168,16 @@ fn cpp_structured_declarator_wrappers(node: Node<'_>) -> Vec<CppStructuredTypeWr
         };
         current = child;
     }
-    wrappers
+    Some(wrappers)
+}
+
+fn cpp_reference_wrapper(node: Node<'_>) -> Option<CppStructuredTypeWrapper> {
+    node.children(&mut node.walk())
+        .find_map(|child| match child.kind() {
+            "&" => Some(CppStructuredTypeWrapper::LvalueReference),
+            "&&" => Some(CppStructuredTypeWrapper::RvalueReference),
+            _ => None,
+        })
 }
 
 fn cpp_wrap_structured_type(
@@ -9803,7 +10186,8 @@ fn cpp_wrap_structured_type(
 ) -> Option<StructuredTypeIdentity> {
     match wrapper {
         CppStructuredTypeWrapper::Pointer => identity.wrap_pointer(),
-        CppStructuredTypeWrapper::Reference => identity.wrap_reference(),
+        CppStructuredTypeWrapper::LvalueReference => identity.wrap_reference(),
+        CppStructuredTypeWrapper::RvalueReference => identity.wrap_rvalue_reference(),
         CppStructuredTypeWrapper::Array => identity.wrap_array(),
     }
 }
@@ -9815,7 +10199,8 @@ fn cpp_wrap_structured_type_node(
 ) -> Option<StructuredTypeNodeId> {
     match wrapper {
         CppStructuredTypeWrapper::Pointer => builder.pointer(inner),
-        CppStructuredTypeWrapper::Reference => builder.reference(inner),
+        CppStructuredTypeWrapper::LvalueReference => builder.reference(inner),
+        CppStructuredTypeWrapper::RvalueReference => builder.rvalue_reference(inner),
         CppStructuredTypeWrapper::Array => builder.array(inner),
     }
 }
@@ -9951,7 +10336,14 @@ fn cpp_callable_linkage<'tree>(
             }
             enclosed_by_class = true;
         }
-        if matches!(node.kind(), "function_definition" | "lambda_expression") {
+        // An export macro between `class` and the class name can make
+        // tree-sitter parse the entire class as a function definition. The
+        // structured recovery proves that this container is a named class
+        // scope, not a local callable scope.
+        if node.kind() == "lambda_expression"
+            || node.kind() == "function_definition"
+                && !is_recovered_exported_class_container(node, source)
+        {
             return CallableLinkage::Internal;
         }
         current = ancestry.parent(node);
@@ -10183,15 +10575,45 @@ pub fn cpp_callable_parameter_type_identities<'tree>(
         .collect()
 }
 
+/// The parser-derived type of one declared object or parameter.
+///
+/// The declaration owns the base `type` field while the individual declarator
+/// owns pointer, reference, and array wrappers. Keeping both nodes explicit
+/// lets callers distinguish several declarators in one declaration without
+/// reparsing a rendered signature.
+pub fn cpp_declaration_type_identity<'tree>(
+    declaration: Node<'tree>,
+    declarator: Node<'tree>,
+    source: &str,
+    ancestry: &ParentIndex<'tree>,
+) -> Option<StructuredTypeIdentity> {
+    let lexical_scope = cpp_callable_lexical_scope(declarator, source, ancestry);
+    cpp_declaration_type_identity_in_scope(declaration, Some(declarator), source, &lexical_scope)
+}
+
 fn cpp_parameter_type_identity(
     parameter: Node<'_>,
     source: &str,
     lexical_scope: &[String],
 ) -> Option<StructuredTypeIdentity> {
-    let type_node = parameter.child_by_field_name("type")?;
+    cpp_declaration_type_identity_in_scope(
+        parameter,
+        cpp_parameter_declarator(parameter),
+        source,
+        lexical_scope,
+    )
+}
+
+fn cpp_declaration_type_identity_in_scope(
+    declaration: Node<'_>,
+    declarator: Option<Node<'_>>,
+    source: &str,
+    lexical_scope: &[String],
+) -> Option<StructuredTypeIdentity> {
+    let type_node = declaration.child_by_field_name("type")?;
     let mut identity = cpp_structured_type_identity(type_node, source, lexical_scope)?;
-    if let Some(declarator) = cpp_parameter_declarator(parameter) {
-        for wrapper in cpp_structured_declarator_wrappers(declarator)
+    if let Some(declarator) = declarator {
+        for wrapper in cpp_structured_declarator_wrappers(declarator)?
             .into_iter()
             .rev()
         {
@@ -13070,6 +13492,176 @@ fn cpp_error_swallowed_function_declaration_range(node: Node<'_>) -> Option<(usi
     (start < node.start_byte()).then_some((start, semicolon.end_byte()))
 }
 
+/// One `RET name _(( args ));`-style K&R prototype-macro invocation
+/// recognized by [`cpp_prototype_macro_candidates`] (issue #2932): the three
+/// byte spans a clean reparse needs, in original-source order.
+struct PrototypeMacroCandidate {
+    /// Where the return type and declared name begin.
+    run_start: usize,
+    /// Byte just past the macro token identifier (`_`, `__P`, ...): the end
+    /// of the first reparse span.
+    identifier_start: usize,
+    /// The inner `(`'s start byte: the start of the second reparse span.
+    /// This paren is kept so the reparse sees exactly one parameter-list
+    /// paren pair.
+    inner_open_start: usize,
+    /// Byte just past the inner `)`: the end of the second reparse span.
+    inner_close_end: usize,
+    /// Byte just past the outer `)`: the start of the third reparse span.
+    outer_close_end: usize,
+    /// Byte just past the terminating `;`: the end of the third reparse
+    /// span, and of the whole candidate.
+    semicolon_end: usize,
+}
+
+impl PrototypeMacroCandidate {
+    /// The three spans [`parse_source_ranges_with_cancellation`] parses as
+    /// one included-range tree: the return type and name, the parenthesized
+    /// argument list, and the terminating `;`. The macro token and its outer
+    /// wrapping parenthesis are omitted -- deleting them is exactly what the
+    /// (absent) preprocessor macro expansion would do.
+    fn ranges(&self) -> [(usize, usize); 3] {
+        [
+            (self.run_start, self.identifier_start),
+            (self.inner_open_start, self.inner_close_end),
+            (self.outer_close_end, self.semicolon_end),
+        ]
+    }
+}
+
+/// Every leaf (childless) token under `node`, in source order, omitting
+/// zero-width MISSING tokens the parser inserted to complete a production.
+/// [`cpp_prototype_macro_candidates`] reads the prototype-macro shape from
+/// this sequence alone, because tree-sitter groups the surrounding nodes
+/// differently depending on the macro's return type and argument shapes
+/// (issue #2932) -- the leaf sequence is the one thing that stays the same
+/// across all of them.
+///
+/// Iterative (explicit stack) rather than recursive: an error-recovery walk
+/// must stay stack-safe over arbitrarily deep or wide malformed input.
+fn cpp_leaf_tokens(node: Node<'_>) -> Vec<Node<'_>> {
+    let mut leaves = Vec::new();
+    let mut stack = vec![node];
+    while let Some(current) = stack.pop() {
+        if current.child_count() == 0 {
+            if !current.is_missing() {
+                leaves.push(current);
+            }
+            continue;
+        }
+        let mut cursor = current.walk();
+        for child in current
+            .children(&mut cursor)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+        {
+            stack.push(child);
+        }
+    }
+    leaves
+}
+
+/// Scan `node`'s leaf sequence for every K&R prototype-macro candidate it
+/// holds. See [`CppVisitor::visit_prototype_macro_declarations`] for the
+/// admission shape and why the leaf sequence, rather than any particular
+/// node grouping, is the gate.
+fn cpp_prototype_macro_candidates(node: Node<'_>) -> Vec<PrototypeMacroCandidate> {
+    let leaves = cpp_leaf_tokens(node);
+    let mut candidates = Vec::new();
+    let mut i = 0;
+    while i + 2 < leaves.len() {
+        let identifier = leaves[i];
+        // The macro token is not always tree-sitter's plain `identifier`
+        // kind: when a neighboring line's wreckage absorbs a prototype, the
+        // token can be typed `type_identifier` (inside a `type_descriptor`),
+        // `field_identifier`, or `namespace_identifier` instead (issue
+        // #2932). The two-`(`-then-matching-`))`-then-`;` shape that follows
+        // is still the actual gate; widening the token kind only lets that
+        // gate see candidates it would otherwise skip entirely.
+        if !matches!(
+            identifier.kind(),
+            "identifier" | "type_identifier" | "field_identifier" | "namespace_identifier"
+        ) || leaves[i + 1].kind() != "("
+            || leaves[i + 2].kind() != "("
+        {
+            i += 1;
+            continue;
+        }
+        let inner_open = leaves[i + 2];
+        // Match the inner paren by depth over the leaves that follow it; its
+        // matching close must be followed immediately (skipping only
+        // already-omitted MISSING leaves) by the outer close and a live `;`.
+        let mut depth = 1i32;
+        let mut inner_close_index = None;
+        let mut j = i + 3;
+        while j < leaves.len() {
+            match leaves[j].kind() {
+                "(" => depth += 1,
+                ")" => {
+                    depth -= 1;
+                    if depth == 0 {
+                        inner_close_index = Some(j);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+            j += 1;
+        }
+        let (Some(inner_close_index), Some(&outer_close), Some(&semicolon)) = (
+            inner_close_index,
+            inner_close_index.and_then(|index| leaves.get(index + 1)),
+            inner_close_index.and_then(|index| leaves.get(index + 2)),
+        ) else {
+            i += 1;
+            continue;
+        };
+        if outer_close.kind() != ")" || semicolon.kind() != ";" {
+            i += 1;
+            continue;
+        }
+        // Walk backward over same-row leaves for the run start (mirrors
+        // `cpp_error_swallowed_function_declaration_range`'s sibling walk,
+        // over the flat leaf sequence instead of tree siblings, since the
+        // macro token nests at different depths across the observed
+        // shapes). Require at least one leaf before the identifier: a bare
+        // macro token at the start of the scanned node has no return type
+        // or name to recover.
+        if i == 0 {
+            i += 1;
+            continue;
+        }
+        let row = identifier.start_position().row;
+        let mut run_start = identifier.start_byte();
+        let mut k = i;
+        while k > 0 {
+            let previous = leaves[k - 1];
+            if previous.start_position().row != row || matches!(previous.kind(), ";" | "{" | "}") {
+                break;
+            }
+            run_start = previous.start_byte();
+            k -= 1;
+        }
+        if run_start == identifier.start_byte() {
+            i += 1;
+            continue;
+        }
+        candidates.push(PrototypeMacroCandidate {
+            run_start,
+            identifier_start: identifier.start_byte(),
+            inner_open_start: inner_open.start_byte(),
+            inner_close_end: leaves[inner_close_index].end_byte(),
+            outer_close_end: outer_close.end_byte(),
+            semicolon_end: semicolon.end_byte(),
+        });
+        // Resume scanning just past this candidate's `;`: one envelope can
+        // swallow several consecutive prototype-macro lines.
+        i = inner_close_index + 3;
+    }
+    candidates
+}
+
 fn cpp_macro_swallowed_declaration_envelope(node: Node<'_>, source: &str) -> bool {
     if !node.has_error() || !matches!(node.kind(), "ERROR" | "function_definition") {
         return false;
@@ -14558,6 +15150,348 @@ class PROJECT_API_ [[nodiscard]] Wrapper<int> : public internal::Base<int> {};
         identities
     }
 
+    /// #2932. Ruby C extensions (and many other pre-ANSI-C codebases)
+    /// declare prototypes with the K&R-compatibility macro idiom
+    /// `RET name _(( args ));`, where `_` is `#define`d only in ruby's own
+    /// headers -- undefined anywhere this workspace can see. Before this
+    /// recovery, tree-sitter-cpp's wreckage from that idiom was read as a
+    /// field with the type and name swapped (a field literally named
+    /// `VALUE`, or `int`, or the macro token `_`), and no Function was
+    /// indexed for the real prototype at all. Covers every return-type
+    /// shape the issue's investigation found: a plain type, an unnamed
+    /// pointer return (`t_pg_coder *`), `static`, `extern`, a `const void *`
+    /// parameter, `void` parameters, and named parameters (whose names must
+    /// still be dropped from the signature, matching every other C
+    /// signature this analyzer records). Two controls, unrelated to the
+    /// macro idiom, must be indexed exactly as before this change: an
+    /// ordinary clean top-level declaration that happens to nest
+    /// parentheses (`int x = f((1));`, indexed as a Field the same as any
+    /// other top-level C declaration -- deliberately named `x` to also
+    /// prove it does not collide with `t_typemap`'s field of the same
+    /// short name), and a real GNU `__attribute__` prototype, whose clean
+    /// grammar production never sets `has_error()` and so never reaches the
+    /// new scanner. Both controls are placed before any prototype-macro
+    /// line: tree-sitter's recovery for the pointer-return shape
+    /// (`t_pg_coder *pg_typemap_typecast_query_param`) produces a top-level
+    /// `ERROR` that can absorb an immediately following clean declaration's
+    /// tokens too (a pre-existing recovery gap this fix does not need to
+    /// close), so the controls sit where that absorption cannot reach them.
+    #[test]
+    fn c_prototype_macro_recovers_a_function_with_the_swapped_field_gone() {
+        let source = r#"typedef struct { int x; } t_typemap;
+int x = f((1));
+__attribute__((format(printf, 3, 4))) void pg_attr(int);
+VALUE pg_typemap_fit_to_result _(( VALUE, VALUE ));
+int pg_typemap_fit_to_copy_get _(( VALUE ));
+VALUE pg_typemap_result_value _(( t_typemap *, VALUE, int, int ));
+void pg_typemap_mark _(( void * ));
+void init_pg_type_map _(( void ));
+t_pg_coder *pg_typemap_typecast_query_param _(( t_typemap *, VALUE, int ));
+static VALUE pg_static _(( void ));
+extern VALUE pg_extern _(( VALUE, VALUE ));
+size_t pg_typemap_memsize _(( const void * ));
+VALUE pg_wrap_socket_io _(( int sd, VALUE self, VALUE *p_socket_io, int *p_ruby_sd ));
+"#;
+        let parsed = parse_cpp_declarations(source, "pg_type_map.h");
+        assert_eq!(
+            function_identities(&parsed),
+            vec![
+                ("init_pg_type_map".to_string(), "(void)".to_string()),
+                ("pg_attr".to_string(), "(int)".to_string()),
+                ("pg_extern".to_string(), "(VALUE, VALUE)".to_string()),
+                ("pg_static".to_string(), "(void)".to_string()),
+                (
+                    "pg_typemap_fit_to_copy_get".to_string(),
+                    "(VALUE)".to_string()
+                ),
+                (
+                    "pg_typemap_fit_to_result".to_string(),
+                    "(VALUE, VALUE)".to_string()
+                ),
+                ("pg_typemap_mark".to_string(), "(void *)".to_string()),
+                (
+                    "pg_typemap_memsize".to_string(),
+                    "(const void *)".to_string()
+                ),
+                (
+                    "pg_typemap_result_value".to_string(),
+                    "(t_typemap *, VALUE, int, int)".to_string()
+                ),
+                (
+                    "pg_typemap_typecast_query_param".to_string(),
+                    "(t_typemap *, VALUE, int)".to_string()
+                ),
+                (
+                    "pg_wrap_socket_io".to_string(),
+                    "(int, VALUE, VALUE *, int *)".to_string()
+                ),
+            ],
+            "{:#?}",
+            parsed.declarations()
+        );
+
+        let mut fields = parsed
+            .declarations()
+            .iter()
+            .filter(|unit| unit.is_field())
+            .map(|unit| unit.fq_name())
+            .collect::<Vec<_>>();
+        fields.sort();
+        assert_eq!(
+            fields,
+            vec!["t_typemap.x".to_string(), "x".to_string()],
+            "the only fields in the file are the struct member and the clean \
+             top-level `int x = f((1));` control; every prototype-macro line \
+             must be gone, not just outnumbered: {:#?}",
+            parsed.declarations()
+        );
+    }
+
+    /// #2932 follow-up. Two shapes the leaf-sequence scanner's first cut
+    /// missed, both found by replaying the real ruby-pg `ext/pg.h` (a fixer
+    /// user ran the fixed analyzer over the real header and reported these as
+    /// gaps in the scanner's trigger, not in the reparse):
+    ///
+    /// Gap 1: `T *name _(( args ));` with a pointer return type and a simple
+    /// argument list parses with no `ERROR` node at all -- tree-sitter reads
+    /// it as a multiplication of a type by a call
+    /// (`identifier "T" '*' call_expression{qualified_identifier{...}}`),
+    /// wrapped in an `expression_statement` that `has_error()` only because
+    /// of the `MISSING "::"` inside the `qualified_identifier`. Reproduced
+    /// here with a clean preceding line (`extern VALUE rb_mPG;`) so the
+    /// prototype is not merged into some other node's `ERROR` wreckage, and
+    /// with both a spaced (`PGconn *name`) and unspaced (`PGresult*
+    /// name`) pointer-return spelling.
+    ///
+    /// Gap 2: the macro token leaf is not always tree-sitter's plain
+    /// `identifier` kind. When a neighboring line's wreckage absorbs a
+    /// prototype, the token can come back typed `type_identifier` instead
+    /// (inside a `type_descriptor`). Reproduced with the exact three-line
+    /// block from `ext/pg.h` where this happens: the first and third lines'
+    /// own recovery swallows the second line's macro token as a
+    /// `type_identifier`.
+    #[test]
+    fn c_prototype_macro_recovers_pointer_return_expression_statements_and_type_identifier_macro_tokens()
+     {
+        let source = format!(
+            "extern VALUE rb_mPG;\n\
+             PGconn *pg_get_pgconn                                  _(( VALUE ));\n\
+             PGresult* pgresult_get                                 _(( VALUE ));\n\
+             {}",
+            r#"rb_encoding * pg_get_pg_encname_as_rb_encoding         _(( const char * ));
+const char * pg_get_rb_encoding_as_pg_encoding         _(( rb_encoding * ));
+rb_encoding *pg_conn_enc_get                           _(( PGconn * ));
+"#
+        );
+        let parsed = parse_cpp_declarations(&source, "pg_gaps.h");
+        assert_eq!(
+            function_identities(&parsed),
+            vec![
+                ("pg_conn_enc_get".to_string(), "(PGconn *)".to_string()),
+                (
+                    "pg_get_pg_encname_as_rb_encoding".to_string(),
+                    "(const char *)".to_string()
+                ),
+                ("pg_get_pgconn".to_string(), "(VALUE)".to_string()),
+                (
+                    "pg_get_rb_encoding_as_pg_encoding".to_string(),
+                    "(rb_encoding *)".to_string()
+                ),
+                ("pgresult_get".to_string(), "(VALUE)".to_string()),
+            ],
+            "{:#?}",
+            parsed.declarations()
+        );
+        let mut fields = parsed
+            .declarations()
+            .iter()
+            .filter(|unit| unit.is_field())
+            .map(|unit| unit.fq_name())
+            .collect::<Vec<_>>();
+        fields.sort();
+        assert_eq!(
+            fields,
+            vec!["rb_mPG".to_string()],
+            "the only field is the clean `extern VALUE rb_mPG;` control; a \
+             swapped-name/type field here means one of the two gaps \
+             regressed: {:#?}",
+            parsed.declarations()
+        );
+    }
+
+    /// #2932 acceptance. `ext/pg.h` lines 337-378 verbatim (the real ruby-pg
+    /// header, not a reduction): 22 `_((...))` prototypes across every
+    /// return-type and parameter shape this fix recovers, one
+    /// `#ifdef __GNUC__ / __attribute__((format(printf, 3, 4))) / #endif`
+    /// pair, and one `NORETURN(void pg_raise_conn_error _((...)));` line.
+    ///
+    /// `pg_raise_conn_error` is deliberately excluded from the expected list:
+    /// the `NORETURN(...)` macro wraps the *entire* prototype, so the
+    /// scanner's matched `))` is followed by a third `)` (`NORETURN`'s own
+    /// close) rather than by `;`, and the leaf-sequence gate correctly does
+    /// not match it. See the ExecPlan's Decision Log for why this is left
+    /// unrecovered (YAGNI: no witness needs it yet) rather than special-cased
+    /// to the `NORETURN` spelling.
+    ///
+    /// This exact line range also contains a `static inline` function
+    /// (`pgresult_get_this`) preceded by a `/* ... */` comment, which tree-
+    /// sitter's own cascading error recovery glues onto the *tail* of the
+    /// unrelated `pg_tuple_new` prototype's `ERROR` wreckage -- a full
+    /// function body ends up inside that `ERROR` node alongside malformed
+    /// leftovers, with no K&R leaf shape for this scanner (or any other
+    /// existing recovery in this file) to find. That is a separate,
+    /// pre-existing gap in how error recovery merges an unrelated clean
+    /// declaration into a preceding line's wreckage -- not a K&R
+    /// prototype-macro trigger gap -- so `pgresult_get_this` is also
+    /// deliberately excluded from the expected list here rather than
+    /// silently fixed by this change.
+    #[test]
+    fn c_prototype_macro_recovers_the_real_ruby_pg_header_block() {
+        let source = r#"VALUE pg_typemap_fit_to_result                         _(( VALUE, VALUE ));
+VALUE pg_typemap_fit_to_query                          _(( VALUE, VALUE ));
+int pg_typemap_fit_to_copy_get                         _(( VALUE ));
+VALUE pg_typemap_result_value                          _(( t_typemap *, VALUE, int, int ));
+t_pg_coder *pg_typemap_typecast_query_param            _(( t_typemap *, VALUE, int ));
+VALUE pg_typemap_typecast_copy_get                     _(( t_typemap *, VALUE, int, int, int ));
+void pg_typemap_mark                                   _(( void * ));
+size_t pg_typemap_memsize                              _(( const void * ));
+void pg_typemap_compact                                _(( void * ));
+
+PGconn *pg_get_pgconn                                  _(( VALUE ));
+t_pg_connection *pg_get_connection                     _(( VALUE ));
+VALUE pgconn_block                                     _(( int, VALUE *, VALUE ));
+#ifdef __GNUC__
+__attribute__((format(printf, 3, 4)))
+#endif
+NORETURN(void pg_raise_conn_error                      _(( VALUE klass, VALUE self, const char *format, ...)));
+VALUE pg_wrap_socket_io                                _(( int sd, VALUE self, VALUE *p_socket_io, int *p_ruby_sd ));
+void pg_unwrap_socket_io                               _(( VALUE self, VALUE *p_socket_io, int ruby_sd ));
+
+
+VALUE pg_new_result                                    _(( PGresult *, VALUE ));
+VALUE pg_new_result_autoclear                          _(( PGresult *, VALUE ));
+PGresult* pgresult_get                                 _(( VALUE ));
+VALUE pg_result_check                                  _(( VALUE ));
+VALUE pg_result_clear                                  _(( VALUE ));
+VALUE pg_tuple_new                                     _(( VALUE, int ));
+
+/*
+ * Fetch the data pointer for the result object
+ */
+static inline t_pg_result *
+pgresult_get_this( VALUE self )
+{
+	return RTYPEDDATA_DATA(self);
+}
+
+
+rb_encoding * pg_get_pg_encname_as_rb_encoding         _(( const char * ));
+const char * pg_get_rb_encoding_as_pg_encoding         _(( rb_encoding * ));
+rb_encoding *pg_conn_enc_get                           _(( PGconn * ));
+
+"#;
+        let parsed = parse_cpp_declarations(source, "pg.h");
+        assert_eq!(
+            function_identities(&parsed),
+            vec![
+                ("pg_conn_enc_get".to_string(), "(PGconn *)".to_string()),
+                ("pg_get_connection".to_string(), "(VALUE)".to_string()),
+                (
+                    "pg_get_pg_encname_as_rb_encoding".to_string(),
+                    "(const char *)".to_string()
+                ),
+                ("pg_get_pgconn".to_string(), "(VALUE)".to_string()),
+                (
+                    "pg_get_rb_encoding_as_pg_encoding".to_string(),
+                    "(rb_encoding *)".to_string()
+                ),
+                (
+                    "pg_new_result".to_string(),
+                    "(PGresult *, VALUE)".to_string()
+                ),
+                (
+                    "pg_new_result_autoclear".to_string(),
+                    "(PGresult *, VALUE)".to_string()
+                ),
+                ("pg_result_check".to_string(), "(VALUE)".to_string()),
+                ("pg_result_clear".to_string(), "(VALUE)".to_string()),
+                ("pg_tuple_new".to_string(), "(VALUE, int)".to_string()),
+                ("pg_typemap_compact".to_string(), "(void *)".to_string()),
+                (
+                    "pg_typemap_fit_to_copy_get".to_string(),
+                    "(VALUE)".to_string()
+                ),
+                (
+                    "pg_typemap_fit_to_query".to_string(),
+                    "(VALUE, VALUE)".to_string()
+                ),
+                (
+                    "pg_typemap_fit_to_result".to_string(),
+                    "(VALUE, VALUE)".to_string()
+                ),
+                ("pg_typemap_mark".to_string(), "(void *)".to_string()),
+                (
+                    "pg_typemap_memsize".to_string(),
+                    "(const void *)".to_string()
+                ),
+                (
+                    "pg_typemap_result_value".to_string(),
+                    "(t_typemap *, VALUE, int, int)".to_string()
+                ),
+                (
+                    "pg_typemap_typecast_copy_get".to_string(),
+                    "(t_typemap *, VALUE, int, int, int)".to_string()
+                ),
+                (
+                    "pg_typemap_typecast_query_param".to_string(),
+                    "(t_typemap *, VALUE, int)".to_string()
+                ),
+                (
+                    "pg_unwrap_socket_io".to_string(),
+                    "(VALUE, VALUE *, int)".to_string()
+                ),
+                (
+                    "pg_wrap_socket_io".to_string(),
+                    "(int, VALUE, VALUE *, int *)".to_string()
+                ),
+                (
+                    "pgconn_block".to_string(),
+                    "(int, VALUE *, VALUE)".to_string()
+                ),
+                ("pgresult_get".to_string(), "(VALUE)".to_string()),
+            ],
+            "{:#?}",
+            parsed.declarations()
+        );
+        assert!(
+            !function_identities(&parsed)
+                .iter()
+                .any(|(name, _)| name == "pg_raise_conn_error"),
+            "the NORETURN(...)-wrapped prototype must stay unrecovered: {:#?}",
+            parsed.declarations()
+        );
+        for bogus_name in ["VALUE", "_", "int"] {
+            assert!(
+                parsed
+                    .declarations()
+                    .iter()
+                    .all(|unit| unit.identifier() != bogus_name),
+                "no declaration may be named the swapped-field wreckage's \
+                 type or the macro token itself: {bogus_name:?} in {:#?}",
+                parsed.declarations()
+            );
+        }
+        assert!(
+            parsed
+                .declarations()
+                .iter()
+                .all(|unit| !unit.identifier().contains(' ')),
+            "no declaration name may contain a space (a sign the recovery \
+             read a type-plus-name run as one identifier): {:#?}",
+            parsed.declarations()
+        );
+    }
+
     /// #2552 shape 1. Tree-sitter glues an attribute-like macro that stands
     /// between `explicit` and a constructor name onto the name, producing a
     /// `qualified_identifier` whose `::` it had to invent. The declared member
@@ -15911,6 +16845,8 @@ class API_EXPORT : public Base {};
 class
 PN_CPP_CLASS_EXTERN Sender : public Link {
     Sender();
+    struct impl;
+    struct impl& get_impl() const;
 };
 class thread_ctx_t {};
 class ctx_t ZMQ_FINAL : public thread_ctx_t {
@@ -15963,6 +16899,19 @@ class ctx_t ZMQ_FINAL : public thread_ctx_t {
             parsed.raw_supertypes.get(sender),
             Some(&vec!["Link".to_string()]),
             "post-declarator export recovery must retain its displaced base"
+        );
+        let recovered_member = declarations
+            .iter()
+            .find(|unit| unit.is_function() && unit.fq_name() == "Sender.get_impl")
+            .unwrap_or_else(|| panic!("missing recovered Sender member: {declarations:#?}"));
+        assert_eq!(
+            parsed
+                .signature_metadata
+                .get(recovered_member)
+                .and_then(|metadata| metadata.first())
+                .and_then(SignatureMetadata::callable_linkage),
+            Some(CallableLinkage::External),
+            "a named recovered class's members have external linkage"
         );
         let ctx = declarations
             .iter()
@@ -16084,6 +17033,231 @@ class PROJECT_PUBLIC_API(2, 0) Woven : public Base, public Mixin {
                 .get(base)
                 .is_some_and(|ranges| !ranges.is_empty()),
             "the recovered base must retain a navigable declaration range"
+        );
+    }
+
+    #[test]
+    fn function_like_export_macro_classes_are_named_by_position_not_spelling() {
+        // #2557: the class name is the last identifier before the head ends
+        // (`final`, the base clause `:`, or the body), whatever its spelling.
+        // A class named in capitals (`X509_CA`) is a class, and an object-like
+        // macro before the name (`OTHER_MACRO Name`) is decoration. `Name` is
+        // the control whose spelling never mattered.
+        let source = r#"
+namespace api {
+class PROJECT_PUBLIC_API(2, 0) Base {
+  public:
+    Base();
+};
+class PROJECT_PUBLIC_API(2, 0) Mixin {
+  public:
+    Mixin();
+};
+class PROJECT_PUBLIC_API(2, 0) Name {
+  public:
+    Name();
+};
+class PROJECT_PUBLIC_API(2, 0) X509_CA final {
+  public:
+    X509_CA();
+};
+class PROJECT_PUBLIC_API(2, 0) HSS_LMS_KEY final : public Base, public Mixin {
+  public:
+    HSS_LMS_KEY();
+};
+class PROJECT_PUBLIC_API(2, 0) GOST_3410 : public Base {
+  public:
+    GOST_3410();
+};
+class PROJECT_PUBLIC_API(2, 0) PKCS11_RSA {
+  public:
+    PKCS11_RSA();
+};
+class PROJECT_PUBLIC_API(2, 0) OTHER_MACRO Plain {
+  public:
+    Plain();
+};
+class PROJECT_PUBLIC_API(2, 0) OTHER_MACRO Decorated final : public Base {
+  public:
+    Decorated();
+};
+class PROJECT_PUBLIC_API(2, 0) FIRST_MACRO SECOND_MACRO Layered final : public Base, public Mixin {
+  public:
+    Layered();
+};
+} // namespace api
+"#;
+        let parsed = parse_cpp_declarations(source, "positional-export.hpp");
+        let declarations = parsed.declarations();
+        let class_named = |name: &str| {
+            declarations
+                .iter()
+                .find(|unit| unit.is_class() && unit.fq_name() == name)
+                .unwrap_or_else(|| {
+                    panic!("missing function-like export macro class {name}: {declarations:#?}")
+                })
+        };
+        for (name, bases) in [
+            ("api.Name", None),
+            ("api.X509_CA", None),
+            ("api.HSS_LMS_KEY", Some(vec!["Base", "Mixin"])),
+            ("api.GOST_3410", Some(vec!["Base"])),
+            ("api.PKCS11_RSA", None),
+            ("api.Plain", None),
+            ("api.Decorated", Some(vec!["Base"])),
+            ("api.Layered", Some(vec!["Base", "Mixin"])),
+        ] {
+            let expected =
+                bases.map(|bases| bases.into_iter().map(str::to_string).collect::<Vec<_>>());
+            assert_eq!(
+                parsed.raw_supertypes.get(class_named(name)),
+                expected.as_ref(),
+                "{name}"
+            );
+        }
+        assert!(
+            declarations.iter().all(|unit| !matches!(
+                unit.identifier(),
+                "PROJECT_PUBLIC_API"
+                    | "OTHER_MACRO"
+                    | "FIRST_MACRO"
+                    | "SECOND_MACRO"
+                    | "final"
+                    | "public"
+            )),
+            "macros and head specifiers must not become declarations: {declarations:#?}"
+        );
+    }
+
+    #[test]
+    fn embedded_function_like_export_class_is_named_by_position_not_spelling() {
+        // The class embedded in a preceding malformed body follows the same
+        // rule (#2557): `X509_CA` is the class, `OTHER_MACRO` is decoration.
+        let fixture = |head: &str, name: &str| {
+            format!(
+                r#"
+namespace api {{
+class PROJECT_PUBLIC_API(2, 0) Exception : public std::exception {{
+   public:
+      /** Return a descriptive string. */
+      const char* what() const noexcept override {{ return m_msg.c_str(); }}
+
+      /** Return the type of error. */
+      virtual ErrorType error_type() const noexcept {{ return ErrorType::Unknown; }}
+
+      /** Return an associated error code. */
+      virtual int error_code() const noexcept {{ return 0; }}
+
+      /** Avoid throwing the base directly. */
+      explicit Exception(std::string_view msg);
+
+      /** Avoid throwing the base directly. */
+      Exception(const char* prefix, std::string_view msg);
+
+      /** Avoid throwing the base directly. */
+      Exception(std::string_view msg, const std::exception& e);
+
+   private:
+      std::string m_msg;
+}};
+
+class PROJECT_PUBLIC_API(2, 0) {head} : public Exception {{
+   public:
+      explicit {name}(std::string_view msg);
+
+      explicit {name}(std::string_view msg, std::string_view where);
+
+      {name}(std::string_view msg, const std::exception& e);
+
+      ErrorType error_type() const noexcept override {{ return ErrorType::InvalidArgument; }}
+}};
+}} // namespace api
+"#
+            )
+        };
+        for (head, name) in [("X509_CA", "X509_CA"), ("OTHER_MACRO Verdict", "Verdict")] {
+            let source = fixture(head, name);
+            let mut parser = Parser::new();
+            parser
+                .set_language(&tree_sitter_cpp::LANGUAGE.into())
+                .expect("set C++ grammar");
+            let tree = parser.parse(&source, None).expect("parse fixture");
+            let mut embedded = Vec::new();
+            let mut stack = vec![tree.root_node()];
+            while let Some(node) = stack.pop() {
+                embedded.extend(
+                    recover_embedded_function_like_export_classes(node, &source)
+                        .into_iter()
+                        .map(|recovered| (recovered.name, recovered.raw_supertypes)),
+                );
+                let mut cursor = node.walk();
+                stack.extend(node.named_children(&mut cursor));
+            }
+            assert!(
+                embedded.contains(&(name.to_string(), vec!["Exception".to_string()])),
+                "{head}: embedded recovery must name the class by position: {embedded:#?}\n{}",
+                tree.root_node().to_sexp()
+            );
+            assert!(
+                embedded
+                    .iter()
+                    .all(|(recovered, _)| recovered != "OTHER_MACRO"),
+                "{head}: the object-like macro is not a class: {embedded:#?}"
+            );
+
+            let parsed = parse_cpp_declarations(&source, "embedded-positional-export.hpp");
+            let declarations = parsed.declarations();
+            let class = declarations
+                .iter()
+                .find(|unit| unit.is_class() && unit.fq_name() == format!("api.{name}"))
+                .unwrap_or_else(|| panic!("{head}: missing embedded class: {declarations:#?}"));
+            assert_eq!(
+                parsed.raw_supertypes.get(class),
+                Some(&vec!["Exception".to_string()]),
+                "{head}"
+            );
+            assert!(
+                declarations
+                    .iter()
+                    .all(|unit| unit.identifier() != "OTHER_MACRO"),
+                "{head}: the object-like macro must not become a declaration: {declarations:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn function_like_export_class_head_with_virtual_qualified_bases_does_not_invent_a_name() {
+        // Botan's TPM2 keys (`tpm2_ecc.h`, `tpm2_rsa.h`). The grammar swallows
+        // the whole head into the `class MACRO(3, 6)` error, keeps the first
+        // base as the `type` of the following declaration, and closes that
+        // declaration with a zero-width `MISSING identifier`. Reading the head
+        // by position must not take that missing node for the class name: an
+        // empty name panics at `FqName` construction, which took the Botan
+        // corpus replay down (#2557). The class itself stays unrecovered here,
+        // and the bodyless `class PROJECT_PUBLIC_API` specifier still surfaces
+        // the way it did before this change.
+        let source = r#"
+namespace api {
+class PROJECT_PUBLIC_API(3, 6) EC_PublicKey final : public virtual Botan::TPM2::PublicKey,
+                                                    public virtual Botan::EC_PublicKey {
+   public:
+      std::string algo_name() const override { return "ECDSA"; }
+};
+} // namespace api
+"#;
+        let parsed = parse_cpp_declarations(source, "virtual-qualified-bases.hpp");
+        let declarations = parsed.declarations();
+        assert!(
+            declarations
+                .iter()
+                .all(|unit| !unit.identifier().is_empty()),
+            "no declaration may carry an empty name: {declarations:#?}"
+        );
+        assert!(
+            declarations
+                .iter()
+                .all(|unit| !matches!(unit.identifier(), "final" | "public" | "virtual")),
+            "macros and head specifiers must not become declarations: {declarations:#?}"
         );
     }
 

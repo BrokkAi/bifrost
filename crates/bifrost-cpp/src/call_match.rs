@@ -498,6 +498,38 @@ pub fn cpp_signature_trailing_qualifiers(signature: &str) -> &str {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CppRefQualifier {
+    Lvalue,
+    Rvalue,
+}
+
+/// The member ref-qualifier carried by an indexed identity signature.
+///
+/// Declaration extraction emits cv-qualifiers before the ref-qualifier, in
+/// the same order as the C++ declarator nodes. Reading that normalized product
+/// keeps call applicability on the declaration AST's answer without reparsing
+/// source text at every call site.
+pub fn cpp_signature_ref_qualifier(signature: &str) -> Option<CppRefQualifier> {
+    let mut suffix = cpp_signature_trailing_qualifiers(signature);
+    loop {
+        if let Some(rest) = suffix.strip_prefix("const ") {
+            suffix = rest;
+        } else if let Some(rest) = suffix.strip_prefix("volatile ") {
+            suffix = rest;
+        } else {
+            break;
+        }
+    }
+    if suffix == "&&" || suffix.starts_with("&& ") {
+        Some(CppRefQualifier::Rvalue)
+    } else if suffix == "&" || suffix.starts_with("& ") {
+        Some(CppRefQualifier::Lvalue)
+    } else {
+        None
+    }
+}
+
 fn cpp_parameter_name_token(token: &str) -> bool {
     let token = token.trim_start_matches('*').trim_start_matches('&').trim();
     token
@@ -877,5 +909,22 @@ mod tests {
             &|_, _| false,
         );
         assert_eq!(filtered, candidates);
+    }
+
+    #[test]
+    fn signature_ref_qualifier_comes_from_the_ast_normalized_suffix() {
+        assert_eq!(
+            cpp_signature_ref_qualifier("() const & noexcept"),
+            Some(CppRefQualifier::Lvalue)
+        );
+        assert_eq!(
+            cpp_signature_ref_qualifier("(int) volatile && noexcept"),
+            Some(CppRefQualifier::Rvalue)
+        );
+        assert_eq!(cpp_signature_ref_qualifier("() const noexcept"), None);
+        assert_eq!(
+            cpp_signature_ref_qualifier("() noexcept(left && right)"),
+            None
+        );
     }
 }

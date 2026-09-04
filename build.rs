@@ -1,8 +1,15 @@
 use std::io::Write;
+use std::path::Path;
 use std::process::Command;
 
+use serde::Deserialize;
+
 fn git_output(args: &[&str]) -> Option<String> {
-    let output = Command::new("git").args(args).output().ok()?;
+    let output = Command::new("git")
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .args(args)
+        .output()
+        .ok()?;
     output
         .status
         .success()
@@ -12,8 +19,34 @@ fn git_output(args: &[&str]) -> Option<String> {
 
 include!("src/build_identity_inputs.rs");
 
+#[derive(Deserialize)]
+struct CargoVcsInfo {
+    git: CargoVcsGit,
+}
+
+#[derive(Deserialize)]
+struct CargoVcsGit {
+    sha1: String,
+    dirty: bool,
+}
+
+fn cargo_vcs_identity(manifest_dir: &Path) -> Option<String> {
+    let contents = std::fs::read(manifest_dir.join(".cargo_vcs_info.json")).ok()?;
+    let info: CargoVcsInfo = serde_json::from_slice(&contents).ok()?;
+    let sha = info.git.sha1;
+    if sha.len() != 40 || !sha.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    if info.git.dirty {
+        Some(format!("{sha}-dirty.cargo-vcs"))
+    } else {
+        Some(sha)
+    }
+}
+
 fn dirty_fingerprint() -> Option<String> {
     let diff = Command::new("git")
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
         .args(
             ["diff", "--binary", "HEAD", "--"]
                 .iter()
@@ -25,6 +58,7 @@ fn dirty_fingerprint() -> Option<String> {
         return None;
     }
     let mut child = Command::new("git")
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
         .args(["hash-object", "--stdin"])
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
@@ -54,6 +88,7 @@ fn main() {
         println!("cargo:rerun-if-changed={path}");
     }
     println!("cargo:rerun-if-env-changed=BIFROST_BUILD_IDENTITY_OVERRIDE");
+    println!("cargo:rerun-if-changed=.cargo_vcs_info.json");
 
     let identity = std::env::var("BIFROST_BUILD_IDENTITY_OVERRIDE").unwrap_or_else(|_| {
         // The last commit that touched a compiled input, not HEAD. A shallow
@@ -65,13 +100,16 @@ fn main() {
         // passes the resolved value through BIFROST_BUILD_IDENTITY_OVERRIDE.
         let mut log_args = vec!["log", "-1", "--format=%H", "--"];
         log_args.extend_from_slice(COMPILED_INPUTS);
-        let commit = git_output(&log_args)
-            .or_else(|| git_output(&["rev-parse", "HEAD"]))
-            .unwrap_or_else(|| "unknown".to_string());
-        if let Some(fingerprint) = dirty_fingerprint() {
-            format!("{commit}-dirty.{fingerprint}")
+        let commit = git_output(&log_args).or_else(|| git_output(&["rev-parse", "HEAD"]));
+        if let Some(commit) = commit {
+            if let Some(fingerprint) = dirty_fingerprint() {
+                format!("{commit}-dirty.{fingerprint}")
+            } else {
+                commit
+            }
         } else {
-            commit
+            cargo_vcs_identity(Path::new(env!("CARGO_MANIFEST_DIR")))
+                .unwrap_or_else(|| "unknown".to_string())
         }
     });
     println!("cargo:rustc-env=BIFROST_BUILD_IDENTITY={identity}");

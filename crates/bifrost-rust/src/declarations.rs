@@ -57,6 +57,26 @@ fn rust_child_fq_base(parent: Option<&CodeUnit>, file: &ProjectFile) -> FqName {
 
 use crate::imports::{RustModuleAnchor, rust_imports_from_use_declaration};
 
+/// The `(short_name, fq)` identity every Rust type-namespace declaration
+/// carries: the owner's name extended by this declaration's own
+/// [`SegmentKind::Type`] segment.
+///
+/// `struct`, `enum`, `union`, `trait`, `type` alias, and `associated_type` all
+/// declare a type, so they all name themselves this way. Keeping the rule in
+/// one place is what stops an alias from drifting back onto the `Member`
+/// segment a `const` of the same name in the same owner uses (#2911).
+fn rust_type_declaration_identity(
+    file: &ProjectFile,
+    parent: Option<&CodeUnit>,
+    name: &str,
+) -> (String, FqName) {
+    let short_name = parent
+        .map(|parent| format!("{}.{}", parent.short_name(), name))
+        .unwrap_or_else(|| name.to_string());
+    let fq = rust_child_fq_base(parent, file).with_pushed(rust_segment(name, SegmentKind::Type));
+    (short_name, fq)
+}
+
 /// A member's structured name is built on its parent's, so it is anchored
 /// wherever the parent is. This matters for the synthesized owner of an
 /// `impl crate::Type` / `impl super::Type` block: without inheritance its
@@ -404,10 +424,7 @@ fn visit_rust_class_like(
     }
 
     let in_test_region = parent_in_test_region || rust_item_carries_test_attribute(node, source);
-    let short_name = parent
-        .map(|parent| format!("{}.{}", parent.short_name(), name))
-        .unwrap_or_else(|| name.to_string());
-    let fq = rust_child_fq_base(parent, file).with_pushed(rust_segment(name, SegmentKind::Type));
+    let (short_name, fq) = rust_type_declaration_identity(file, parent, name);
     let code_unit = CodeUnit::new_fq(
         file.clone(),
         CodeUnitType::Class,
@@ -1645,6 +1662,16 @@ fn rust_enum_variant_owner_identity(
     builder.finish(root)
 }
 
+/// Index a `type` alias or a trait/impl `associated_type` as the type
+/// declaration it is: a [`CodeUnitType::Class`] carrying a
+/// [`SegmentKind::Type`] segment, exactly what [`visit_rust_class_like`] mints
+/// for a `struct`, `enum`, `union`, or `trait`.
+///
+/// It used to mint a `Field`/`Member` unit, which is byte-for-byte what
+/// [`visit_rust_field`] mints for a `const` of the same name in the same owner.
+/// `declaration_id` hashes segment kinds, so `mod m { type Max = u32; const Max:
+/// u32 = 1; }` produced one CodeUnit instead of two and the `const` was
+/// unreachable (#2911).
 fn visit_rust_alias(
     file: &ProjectFile,
     source: &str,
@@ -1660,14 +1687,11 @@ fn visit_rust_alias(
         return None;
     }
     let in_test_region = parent_in_test_region || rust_item_carries_test_attribute(node, source);
-    let short_name = parent
-        .map(|parent| format!("{}.{}", parent.short_name(), name))
-        .unwrap_or_else(|| name.to_string());
-    let fq = rust_child_fq_base(parent, file).with_pushed(rust_segment(name, SegmentKind::Member));
+    let (short_name, fq) = rust_type_declaration_identity(file, parent, name);
     let code_unit = rust_inherit_package_anchor(
         CodeUnit::with_signature_and_fq(
             file.clone(),
-            CodeUnitType::Field,
+            CodeUnitType::Class,
             package_name.to_string(),
             short_name,
             rust_impl_member_identity_signature(node, source),
@@ -1937,7 +1961,7 @@ fn rust_declared_impl_owner(
         .declarations()
         .iter()
         .find(|unit| {
-            (unit.kind() == CodeUnitType::Class || parsed.type_aliases.contains(*unit))
+            unit.kind() == CodeUnitType::Class
                 && ((unit.package_name() == identity.package_name
                     && unit.short_name() == identity.short_name)
                     || unit.fq_name() == expected_fqn)

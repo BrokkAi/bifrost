@@ -48,9 +48,33 @@ pub(crate) fn retained_external_index_state(
 /// The overlay is the *dispatching* analyzer's, so this is built at the
 /// analysis-side shim where that analyzer is in hand, not inside a language
 /// analyzer that only knows its own generation.
-pub(crate) struct JvmOverlayModel(
-    pub(crate) Option<std::sync::Arc<crate::analyzer::semantic_model::SemanticModelOverlay>>,
-);
+pub(crate) struct JvmOverlayModel {
+    overlay: Option<std::sync::Arc<crate::analyzer::semantic_model::SemanticModelOverlay>>,
+    truncated_discovery: bool,
+}
+
+impl JvmOverlayModel {
+    /// Read the dispatching analyzer's published JVM external surface: the
+    /// overlay, and whether the discovery that produced it reached everything
+    /// the build declared (#2887).
+    ///
+    /// Java, Scala and Kotlin compile to one classpath, and the JVM ecosystem
+    /// publishes its one discovery evidence under every language it serves, so
+    /// the realm's truncation is whatever any of the three keys retained.
+    /// Asking all three -- the ecosystem's own language list, not a second
+    /// copy of it -- keeps this independent of which keys a publication used.
+    pub(crate) fn new(analyzer: &dyn crate::analyzer::IAnalyzer) -> Self {
+        let truncated_discovery = crate::analyzer::DependencyPackEcosystem::Jvm
+            .languages()
+            .iter()
+            .filter_map(|language| analyzer.dependency_discovery_evidence(*language))
+            .any(|evidence| evidence.truncated());
+        Self {
+            overlay: analyzer.semantic_model_overlay(),
+            truncated_discovery,
+        }
+    }
+}
 
 impl JvmActiveSemanticModel for JvmOverlayModel {
     fn is_published(&self) -> bool {
@@ -61,15 +85,19 @@ impl JvmActiveSemanticModel for JvmOverlayModel {
         // unrecognized-symbol errors for JDK types (#2678). Java, Scala and
         // Kotlin compile to one classpath, so a declaration surface published
         // for any of the three realms is the shared external surface.
-        self.0.as_ref().is_some_and(|overlay| {
+        self.overlay.as_ref().is_some_and(|overlay| {
             ["java", "scala", "kotlin"]
                 .iter()
                 .any(|language| overlay.publishes_declaration_surface_for(language))
         })
     }
 
+    fn discovery_truncated(&self) -> bool {
+        self.truncated_discovery
+    }
+
     fn qualified_name_disposition(&self, fqn: &str) -> JvmModelDisposition {
-        let Some(overlay) = self.0.as_ref() else {
+        let Some(overlay) = self.overlay.as_ref() else {
             return JvmModelDisposition::Absent;
         };
         // `symbols_named` posts every symbol under its simple name, its
@@ -95,7 +123,7 @@ impl JvmActiveSemanticModel for JvmOverlayModel {
     }
 
     fn extraction_gap(&self, fqn: &str) -> Option<brokk_bifrost_jvm::proof::JvmPackExtractionGap> {
-        let gap = self.0.as_ref()?.gapped(fqn)?;
+        let gap = self.overlay.as_ref()?.gapped(fqn)?;
         Some(brokk_bifrost_jvm::proof::JvmPackExtractionGap {
             pack_id: gap.pack_id.clone(),
             declaration: gap.declaration.clone(),
