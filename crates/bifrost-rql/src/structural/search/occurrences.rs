@@ -15,6 +15,7 @@ use super::super::occurrence_rows::{
     OccurrenceCompleteness, OccurrenceDerivationOptions, OccurrenceFileResult,
     OccurrenceIncompleteReason, OccurrenceRow, OccurrenceTarget,
     occurrences_for_file_with_options_and_roles,
+    occurrences_for_file_with_options_roles_and_ast_ids,
 };
 use super::super::occurrences::OccurrenceRole;
 use super::results::{
@@ -24,7 +25,24 @@ use crate::analyzer::{IAnalyzer, Language, ProjectFile};
 use crate::cancellation::CancellationToken;
 use crate::hash::{HashMap, HashSet};
 use brokk_bifrost_rql::OccurrenceFilter;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+
+/// Complete occurrence products retained by an explicitly scoped row-family
+/// session. Diagnostic suppression stays query-local in
+/// [`OccurrenceTraversalCache`]; only immutable producer output crosses query
+/// boundaries.
+#[derive(Default)]
+pub(super) struct OccurrenceTraversalStore {
+    files: HashMap<(ProjectFile, Vec<OccurrenceRole>), Arc<OccurrenceFileResult>>,
+    derivations: usize,
+    reuses: usize,
+}
+
+impl OccurrenceTraversalStore {
+    pub(super) fn stats(&self) -> (usize, usize) {
+        (self.derivations, self.reuses)
+    }
+}
 
 /// Per-request memo of derived occurrence rows plus the diagnostics already
 /// reported, so one file is derived once and one capability gap is reported
@@ -32,6 +50,8 @@ use std::sync::Arc;
 #[derive(Default)]
 pub(super) struct OccurrenceTraversalCache {
     files: HashMap<(ProjectFile, Vec<OccurrenceRole>), Arc<OccurrenceFileResult>>,
+    shared: Option<Arc<Mutex<OccurrenceTraversalStore>>>,
+    selected_ast_ids: Option<Arc<std::collections::HashSet<String>>>,
     reported: HashSet<(Language, OccurrenceRole, CodeQueryDiagnosticCode)>,
     reported_files: HashSet<(ProjectFile, CodeQueryDiagnosticCode)>,
     /// What this execution asked occurrence derivation for. One choice per
@@ -44,6 +64,41 @@ impl OccurrenceTraversalCache {
     pub(super) fn with_options(options: OccurrenceDerivationOptions) -> Self {
         Self {
             options,
+            ..Self::default()
+        }
+    }
+
+    pub(super) fn with_shared_store(
+        options: OccurrenceDerivationOptions,
+        shared: Arc<Mutex<OccurrenceTraversalStore>>,
+        selected_ast_ids: Option<Arc<std::collections::HashSet<String>>>,
+    ) -> Self {
+        Self {
+            options,
+            shared: Some(shared),
+            selected_ast_ids,
+            ..Self::default()
+        }
+    }
+
+    pub(super) fn with_selected_ast_ids(
+        options: OccurrenceDerivationOptions,
+        selected_ast_ids: Arc<std::collections::HashSet<String>>,
+    ) -> Self {
+        Self {
+            options,
+            selected_ast_ids: Some(selected_ast_ids),
+            ..Self::default()
+        }
+    }
+
+    /// A parallel seed branch gets fresh diagnostic suppression and local
+    /// lookups while retaining the parent query's immutable shared products.
+    pub(super) fn fork_empty(&self) -> Self {
+        Self {
+            options: self.options,
+            shared: self.shared.clone(),
+            selected_ast_ids: self.selected_ast_ids.clone(),
             ..Self::default()
         }
     }
@@ -66,16 +121,49 @@ impl OccurrenceTraversalCache {
         if let Some(cached) = self.files.get(&key) {
             return Some(Arc::clone(cached));
         }
+        if let Some(shared) = &self.shared {
+            let mut shared = shared
+                .lock()
+                .expect("a row-family occurrence cache lock is not poisoned");
+            if let Some(cached) = shared.files.get(&key).cloned() {
+                shared.reuses = shared.reuses.saturating_add(1);
+                self.files.insert(key, Arc::clone(&cached));
+                return Some(cached);
+            }
+        }
         let token = cancellation.cloned().unwrap_or_default();
-        let derived = occurrences_for_file_with_options_and_roles(
-            analyzer,
-            file,
-            self.options,
-            Some(&key.1),
-            &token,
-        )
+        let derived = match &self.selected_ast_ids {
+            Some(ast_ids) => occurrences_for_file_with_options_roles_and_ast_ids(
+                analyzer,
+                file,
+                self.options,
+                &key.1,
+                ast_ids,
+                &token,
+            ),
+            None => occurrences_for_file_with_options_and_roles(
+                analyzer,
+                file,
+                self.options,
+                Some(&key.1),
+                &token,
+            ),
+        }
         .ok()?;
-        let derived = Arc::new(derived);
+        let mut derived = Arc::new(derived);
+        if let Some(shared) = &self.shared {
+            let mut shared = shared
+                .lock()
+                .expect("a row-family occurrence cache lock is not poisoned");
+            shared.derivations = shared.derivations.saturating_add(1);
+            if key.1.iter().all(|role| derived.completeness.covers(*role)) {
+                if let Some(cached) = shared.files.get(&key).cloned() {
+                    derived = cached;
+                } else {
+                    shared.files.insert(key.clone(), Arc::clone(&derived));
+                }
+            }
+        }
         self.files.insert(key, Arc::clone(&derived));
         Some(derived)
     }

@@ -8,10 +8,13 @@
 //! Unknown is never read as an empty class set: merging preserves every
 //! reason, and a site's status degrades to the weakest any root reported.
 
+use std::sync::Arc;
+
 use crate::analyzer::semantic::{
     CancellationToken, SemanticBudget, SemanticRequest, SourceSpan, TypeFlowAdapter, UnknownReason,
     type_flow_adapter,
 };
+use crate::analyzer::semantic_model::ActiveSemanticModelSnapshot;
 use crate::analyzer::{Language, ProjectFile, WorkspaceAnalyzer};
 use crate::dataflow::{DataflowRequest, SolverBudget};
 use crate::hash::HashMap;
@@ -19,8 +22,8 @@ use crate::value_flow::ClosureLimits;
 
 use super::FieldSlotIndex;
 use super::solve::{
-    AbsentMemberFinding, ClassSetStatus, ReceiverClassSet, TypeFlowError, TypeFlowRootResult,
-    solve_type_flow_for_root,
+    AbsentMemberFinding, ClassSetStatus, FeedbackLimits, ReceiverClassSet, TypeFlowError,
+    TypeFlowRootResult, solve_type_flow_for_root,
 };
 
 /// Durable identity of one member access: the file, the receiver span, and
@@ -140,6 +143,17 @@ fn merge_class_set(existing: &mut ReceiverClassSet, incoming: ReceiverClassSet) 
             existing.classes.push((identity, origin));
         }
     }
+    for (identity, declaration) in incoming.member_declarations {
+        if !existing
+            .member_declarations
+            .iter()
+            .any(|(existing_identity, existing_declaration)| {
+                existing_identity == &identity && existing_declaration == &declaration
+            })
+        {
+            existing.member_declarations.push((identity, declaration));
+        }
+    }
     for reason in incoming.unknown {
         if !existing.unknown.contains(&reason) {
             existing.unknown.push(reason);
@@ -169,7 +183,7 @@ pub fn solve_type_flow_workspace(
     budget: SolverBudget,
     cancellation: &CancellationToken,
 ) -> Result<TypeFlowReport, TypeFlowError> {
-    let provider = workspace.icfg_provider();
+    let active_semantic_model_snapshot = workspace.analyzer().active_semantic_model_snapshot();
     let mut report = TypeFlowReport::default();
     for language in Language::ANALYZABLE {
         let Some(adapter) = type_flow_adapter(language) else {
@@ -181,20 +195,20 @@ pub fn solve_type_flow_workspace(
             limits,
             &budget,
             cancellation,
-            &provider,
+            active_semantic_model_snapshot.clone(),
             &mut report,
         )?;
     }
     Ok(report)
 }
 
-fn solve_language<Provider: crate::analyzer::semantic::IcfgProvider + ?Sized>(
+fn solve_language(
     workspace: &WorkspaceAnalyzer,
     adapter: &dyn TypeFlowAdapter,
     limits: ClosureLimits,
     budget: &SolverBudget,
     cancellation: &CancellationToken,
-    provider: &Provider,
+    active_semantic_model_snapshot: Option<Arc<ActiveSemanticModelSnapshot>>,
     report: &mut TypeFlowReport,
 ) -> Result<(), TypeFlowError> {
     let mut field_slot_budget = SemanticBudget::default();
@@ -234,8 +248,9 @@ fn solve_language<Provider: crate::analyzer::semantic::IcfgProvider + ?Sized>(
                 adapter,
                 &field_slots,
                 &root,
-                provider,
+                active_semantic_model_snapshot.clone(),
                 limits,
+                FeedbackLimits::default(),
                 &mut semantic_budget,
                 &mut request,
             ) {

@@ -92,6 +92,7 @@ pub use occurrence_rows::{
     OccurrenceCompleteness, OccurrenceDerivationOptions, OccurrenceFileResult,
     OccurrenceIncompleteReason, OccurrenceRow, OccurrenceTarget, OccurrencesCancelled,
     occurrences_for_file, occurrences_for_file_with_options,
+    occurrences_for_file_with_options_roles_and_ast_ids,
 };
 pub use occurrences::{
     ALL_OCCURRENCE_ROLES, NO_OCCURRENCE_ROLE_SUPPORT, Namespace, OccurrenceClass, OccurrenceRole,

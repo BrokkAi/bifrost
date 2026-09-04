@@ -37,7 +37,31 @@ use crate::analyzer::{IAnalyzer, Language, ProjectFile};
 use crate::cancellation::CancellationToken;
 use crate::hash::{HashMap, HashSet};
 use brokk_bifrost_rql::{BindingFilter, CandidateFilter, ScopeFilter};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+
+/// Complete environment products retained by an explicitly scoped row-family
+/// session. Query-local diagnostic suppression never enters this store.
+#[derive(Default)]
+pub(super) struct EnvironmentTraversalStore {
+    files: HashMap<ProjectFile, Arc<EnvironmentFileResult>>,
+    traced: HashMap<ProjectFile, Arc<OccurrenceFileResult>>,
+    joined_scopes: HashMap<ProjectFile, HashSet<u32>>,
+    environment_derivations: usize,
+    environment_reuses: usize,
+    traced_occurrence_derivations: usize,
+    traced_occurrence_reuses: usize,
+}
+
+impl EnvironmentTraversalStore {
+    pub(super) fn stats(&self) -> (usize, usize, usize, usize) {
+        (
+            self.environment_derivations,
+            self.environment_reuses,
+            self.traced_occurrence_derivations,
+            self.traced_occurrence_reuses,
+        )
+    }
+}
 
 /// Domain separator for a lexical scope row's stable id.
 const SCOPE_ID_DOMAIN: &[u8] = b"bifrost.code_query.lexical_scope.v1";
@@ -54,11 +78,75 @@ const CANDIDATE_HOP_ID_DOMAIN: &[u8] = b"bifrost.code_query.candidate_hop.v1";
 pub(super) struct EnvironmentTraversalCache {
     files: HashMap<ProjectFile, Arc<EnvironmentFileResult>>,
     traced: HashMap<ProjectFile, Arc<OccurrenceFileResult>>,
+    shared: Option<Arc<Mutex<EnvironmentTraversalStore>>>,
+    select_joined_scopes: bool,
     reported: HashSet<(ProjectFile, CodeQueryDiagnosticCode)>,
     reported_axes: HashSet<(Language, EnvironmentAxis)>,
 }
 
 impl EnvironmentTraversalCache {
+    pub(super) fn with_shared_store(
+        shared: Arc<Mutex<EnvironmentTraversalStore>>,
+        select_joined_scopes: bool,
+    ) -> Self {
+        Self {
+            shared: Some(shared),
+            select_joined_scopes,
+            ..Self::default()
+        }
+    }
+
+    /// A parallel seed branch gets fresh diagnostic suppression and local
+    /// lookups while retaining the parent query's immutable shared products.
+    pub(super) fn fork_empty(&self) -> Self {
+        Self {
+            shared: self.shared.clone(),
+            select_joined_scopes: self.select_joined_scopes,
+            ..Self::default()
+        }
+    }
+
+    /// Remember one declaring scope reached by a binding row. A later scope
+    /// seed in the same correlated batch can project exactly these rows while
+    /// retaining its ordinary scan and budget accounting.
+    pub(super) fn record_joined_scope(&mut self, file: &ProjectFile, scope: u32) {
+        if !self.select_joined_scopes {
+            return;
+        }
+        let Some(shared) = &self.shared else {
+            return;
+        };
+        shared
+            .lock()
+            .expect("a row-family environment cache lock is not poisoned")
+            .joined_scopes
+            .entry(file.clone())
+            .or_default()
+            .insert(scope);
+    }
+
+    /// `None` means the caller requested the ordinary exhaustive scope
+    /// projection. `Some` is the exact set reached by preceding binding rows,
+    /// including an empty set when no binding reached a scope.
+    pub(super) fn joined_scopes(&self, file: &ProjectFile) -> Option<HashSet<u32>> {
+        if !self.select_joined_scopes {
+            return None;
+        }
+        Some(
+            self.shared
+                .as_ref()
+                .and_then(|shared| {
+                    shared
+                        .lock()
+                        .expect("a row-family environment cache lock is not poisoned")
+                        .joined_scopes
+                        .get(file)
+                        .cloned()
+                })
+                .unwrap_or_default(),
+        )
+    }
+
     /// Derive (or replay) one file's lexical environment.
     ///
     /// `environment_for_file` takes no cancellation token because it resolves
@@ -72,7 +160,30 @@ impl EnvironmentTraversalCache {
         if let Some(cached) = self.files.get(file) {
             return Arc::clone(cached);
         }
-        let derived = Arc::new(environment_for_file(analyzer, file));
+        if let Some(shared) = &self.shared {
+            let mut shared = shared
+                .lock()
+                .expect("a row-family environment cache lock is not poisoned");
+            if let Some(cached) = shared.files.get(file).cloned() {
+                shared.environment_reuses = shared.environment_reuses.saturating_add(1);
+                self.files.insert(file.clone(), Arc::clone(&cached));
+                return cached;
+            }
+        }
+        let mut derived = Arc::new(environment_for_file(analyzer, file));
+        if let Some(shared) = &self.shared {
+            let mut shared = shared
+                .lock()
+                .expect("a row-family environment cache lock is not poisoned");
+            shared.environment_derivations = shared.environment_derivations.saturating_add(1);
+            if derived.completeness.is_complete() {
+                if let Some(cached) = shared.files.get(file).cloned() {
+                    derived = cached;
+                } else {
+                    shared.files.insert(file.clone(), Arc::clone(&derived));
+                }
+            }
+        }
         self.files.insert(file.clone(), Arc::clone(&derived));
         derived
     }
@@ -91,15 +202,40 @@ impl EnvironmentTraversalCache {
         if let Some(cached) = self.traced.get(file) {
             return Some(Arc::clone(cached));
         }
+        if let Some(shared) = &self.shared {
+            let mut shared = shared
+                .lock()
+                .expect("a row-family trace cache lock is not poisoned");
+            if let Some(cached) = shared.traced.get(file).cloned() {
+                shared.traced_occurrence_reuses = shared.traced_occurrence_reuses.saturating_add(1);
+                self.traced.insert(file.clone(), Arc::clone(&cached));
+                return Some(cached);
+            }
+        }
         let token = cancellation.cloned().unwrap_or_default();
-        let derived = occurrences_for_file_with_options(
-            analyzer,
-            file,
-            OccurrenceDerivationOptions::WITH_CANDIDATES,
-            &token,
-        )
-        .ok()?;
-        let derived = Arc::new(derived);
+        let mut derived = Arc::new(
+            occurrences_for_file_with_options(
+                analyzer,
+                file,
+                OccurrenceDerivationOptions::WITH_CANDIDATES,
+                &token,
+            )
+            .ok()?,
+        );
+        if let Some(shared) = &self.shared {
+            let mut shared = shared
+                .lock()
+                .expect("a row-family trace cache lock is not poisoned");
+            shared.traced_occurrence_derivations =
+                shared.traced_occurrence_derivations.saturating_add(1);
+            if derived.completeness.is_complete() {
+                if let Some(cached) = shared.traced.get(file).cloned() {
+                    derived = cached;
+                } else {
+                    shared.traced.insert(file.clone(), Arc::clone(&derived));
+                }
+            }
+        }
         self.traced.insert(file.clone(), Arc::clone(&derived));
         Some(derived)
     }

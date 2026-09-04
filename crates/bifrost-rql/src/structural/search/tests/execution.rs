@@ -15,6 +15,200 @@ use crate::cancellation::CancellationToken;
 use semver::Version;
 
 #[test]
+fn row_family_session_reuses_complete_occurrences_and_environment_across_queries() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let root = temp.path().canonicalize().expect("canonical root");
+    ProjectFile::new(root.clone(), PathBuf::from("app.rs"))
+        .write(
+            "fn run() {\n    let mut values = vec![2, 1];\n    loop {\n        values.sort();\n        break;\n    }\n}\n",
+        )
+        .expect("write source");
+    let analyzer = RustAnalyzer::from_project(TestProject::new(root, Language::Rust));
+    let queries = [
+        json!({
+            "languages": ["rust"],
+            "occurrences": { "role": ["receiver_position"] }
+        }),
+        json!({
+            "languages": ["rust"],
+            "occurrences": { "role": ["receiver_position"] },
+            "steps": [{ "op": "binding_of" }]
+        }),
+        json!({
+            "languages": ["rust"],
+            "scopes": {}
+        }),
+    ]
+    .map(|source| CodeQuery::from_json(&source).expect("row-family query"));
+    let mut session = CodeQueryRowFamilySession::default();
+
+    for query in &queries {
+        let expected = execute_code_query_detailed_eager_index_without_targets(
+            &analyzer,
+            query,
+            CodeQueryExecutionLimits::default(),
+            None,
+        );
+        let actual =
+            execute_code_query_detailed_eager_index_without_targets_with_row_family_session(
+                &analyzer,
+                query,
+                CodeQueryExecutionLimits::default(),
+                None,
+                &mut session,
+            );
+        assert_eq!(
+            serde_json::to_value(&actual.result).expect("cached result JSON"),
+            serde_json::to_value(&expected.result).expect("ordinary result JSON")
+        );
+    }
+
+    assert_eq!(
+        session.stats(),
+        CodeQueryRowFamilySessionStats {
+            occurrence_derivations: 1,
+            occurrence_reuses: 1,
+            environment_derivations: 1,
+            environment_reuses: 1,
+            traced_occurrence_derivations: 0,
+            traced_occurrence_reuses: 0,
+        }
+    );
+}
+
+#[test]
+fn row_family_session_materializes_only_joined_occurrence_ast_ids() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let root = temp.path().canonicalize().expect("canonical root");
+    ProjectFile::new(root.clone(), PathBuf::from("app.rs"))
+        .write(
+            "fn run() {\n    let mut values = vec![2, 1];\n    let mut other = vec![4, 3];\n    values.sort();\n    other.sort();\n}\n",
+        )
+        .expect("write source");
+    let analyzer = RustAnalyzer::from_project(TestProject::new(root, Language::Rust));
+    let occurrence_query = CodeQuery::from_json(&json!({
+        "languages": ["rust"],
+        "occurrences": { "role": ["receiver_position"] }
+    }))
+    .expect("occurrence query");
+    let binding_query = CodeQuery::from_json(&json!({
+        "languages": ["rust"],
+        "occurrences": { "role": ["receiver_position"] },
+        "steps": [{ "op": "binding_of" }]
+    }))
+    .expect("binding query");
+    let scope_query = CodeQuery::from_json(&json!({
+        "languages": ["rust"],
+        "scopes": {}
+    }))
+    .expect("scope query");
+    let ordinary = execute_code_query_detailed_eager_index_without_targets(
+        &analyzer,
+        &occurrence_query,
+        CodeQueryExecutionLimits::default(),
+        None,
+    );
+    let ordinary_occurrences: Vec<&CodeQueryOccurrence> = ordinary
+        .result
+        .results
+        .iter()
+        .filter_map(|item| match &item.value {
+            CodeQueryResultValue::Occurrence { value } => Some(value.as_ref()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(ordinary_occurrences.len(), 2);
+    let selected_ast_id = ordinary_occurrences[0].ast_id.clone();
+    let mut session = CodeQueryRowFamilySession::for_ast_ids(vec![selected_ast_id.clone()]);
+
+    let occurrences =
+        execute_code_query_detailed_eager_index_without_targets_with_row_family_session(
+            &analyzer,
+            &occurrence_query,
+            CodeQueryExecutionLimits::default(),
+            None,
+            &mut session,
+        );
+    let retained_ast_ids: Vec<&str> = occurrences
+        .result
+        .results
+        .iter()
+        .filter_map(|item| match &item.value {
+            CodeQueryResultValue::Occurrence { value } => Some(value.ast_id.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(retained_ast_ids, vec![selected_ast_id.as_str()]);
+
+    let bindings = execute_code_query_detailed_eager_index_without_targets_with_row_family_session(
+        &analyzer,
+        &binding_query,
+        CodeQueryExecutionLimits::default(),
+        None,
+        &mut session,
+    );
+    let reached: Vec<(&str, u32)> = bindings
+        .result
+        .results
+        .iter()
+        .filter_map(|item| match &item.value {
+            CodeQueryResultValue::Binding { value } => value
+                .reached_from_ast_id
+                .as_deref()
+                .map(|ast_id| (ast_id, value.declaring_scope_index)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(reached.len(), 1);
+    assert_eq!(reached[0].0, selected_ast_id);
+
+    let scopes = execute_code_query_detailed_eager_index_without_targets_with_row_family_session(
+        &analyzer,
+        &scope_query,
+        CodeQueryExecutionLimits::default(),
+        None,
+        &mut session,
+    );
+    let scope_indices: Vec<u32> = scopes
+        .result
+        .results
+        .iter()
+        .filter_map(|item| match &item.value {
+            CodeQueryResultValue::LexicalScope { value } => Some(value.index),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(scope_indices, vec![reached[0].1]);
+    assert_eq!(session.stats().occurrence_derivations, 1);
+    assert_eq!(session.stats().occurrence_reuses, 1);
+    assert_eq!(session.stats().environment_derivations, 1);
+    assert_eq!(session.stats().environment_reuses, 1);
+
+    assert_ne!(
+        reached[0].1, 0,
+        "the binding must live after the file scope for this budget fixture"
+    );
+    let limited_scopes =
+        execute_code_query_detailed_eager_index_without_targets_with_row_family_session(
+            &analyzer,
+            &scope_query,
+            CodeQueryExecutionLimits {
+                max_pipeline_rows: 1,
+                ..CodeQueryExecutionLimits::default()
+            },
+            None,
+            &mut session,
+        );
+    assert!(limited_scopes.result.results.is_empty());
+    assert!(limited_scopes.result.truncated);
+    assert_eq!(limited_scopes.work.pipeline_rows, 1);
+    assert!(limited_scopes.result.diagnostics.iter().any(|diagnostic| {
+        diagnostic.code == CodeQueryDiagnosticCode::EnvironmentRowBudgetExhausted
+            && diagnostic.impact == CodeQueryDiagnosticImpact::Incomplete
+    }));
+}
+
+#[test]
 fn where_globs_match_slash_normalized_paths() {
     let query = CodeQuery::from_json(&json!({
         "where": ["src/**/*.py"],
@@ -4816,6 +5010,104 @@ func unknownObjectsDistinctFields() int {
         (value.ordering, value.proof, value.coverage),
         ("unordered", "proven", "exhaustive"),
         "{select_default:#?}"
+    );
+}
+
+/// Spawning through a stable function-valued binding must reach the same
+/// exact conflict as spawning the literal in place, and a rebound binding must
+/// stay open instead of silently naming its first value.
+///
+/// `go check()` over a `check := func() { ... }` binding is the shape of
+/// bbolt's published `TestTx_Check_ReadOnly` reproducer. While Go proved a
+/// local target only for immediate literal syntax, that spawn resolved to
+/// nothing, so the solver built no task for the spawned body and compared no
+/// accesses at all -- an empty answer rather than a narrower one.
+#[test]
+fn go_spawn_through_a_stable_callable_binding_matches_the_literal_spawn() {
+    let project = InlineTestProject::with_language(Language::Go)
+        .file(
+            "main.go",
+            r#"package main
+
+func literalSpawn() int {
+    value := 0
+    go func() { value = 1 }()
+    return value
+}
+
+func aliasedSpawn() int {
+    value := 0
+    worker := func() { value = 1 }
+    go worker()
+    return value
+}
+
+func aliasedSynchronousCall() int {
+    value := 0
+    read := func() int { return value }
+    go func() { value = 1 }()
+    return read()
+}
+
+func reassignedSpawn(flag bool) int {
+    value := 0
+    worker := func() { value = 1 }
+    if flag {
+        worker = func() {}
+    }
+    go worker()
+    return value
+}
+"#,
+        )
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let conflicts_for = |name: &str| {
+        let query = CodeQuery::from_json(&json!({
+            "languages": ["go"],
+            "match": { "kind": "function", "name": name },
+            "steps": [
+                { "op": "procedure_of" },
+                { "op": "concurrent_access_conflicts" }
+            ],
+            "result_detail": "full"
+        }))
+        .expect("callable binding concurrent access query");
+        execute_workspace(
+            &workspace,
+            &brokk_bifrost_flow::FlowWorkspaceState::new(),
+            &query,
+        )
+    };
+
+    for name in ["literalSpawn", "aliasedSpawn", "aliasedSynchronousCall"] {
+        let result = conflicts_for(name);
+        assert_eq!(
+            result.completion(),
+            CodeQueryCompletion::Complete,
+            "{name}: {result:#?}"
+        );
+        let value = find_concurrent_relation(&result, |value| value.verdict == "conflict");
+        assert_eq!(
+            (value.ordering, value.proof, value.coverage),
+            ("unordered", "proven", "exhaustive"),
+            "{name}: {result:#?}"
+        );
+    }
+
+    let reassigned = conflicts_for("reassignedSpawn");
+    assert_ne!(
+        reassigned.completion(),
+        CodeQueryCompletion::Complete,
+        "a rebound callable leaves the spawn target open: {reassigned:#?}"
+    );
+    assert!(
+        !reassigned.results.iter().any(|item| matches!(
+            &item.value,
+            CodeQueryResultValue::ConcurrentAccessConflict { value }
+                if value.verdict == "conflict" && value.proof == "proven"
+        )),
+        "a rebound callable must not produce a proven conflict: {reassigned:#?}"
     );
 }
 

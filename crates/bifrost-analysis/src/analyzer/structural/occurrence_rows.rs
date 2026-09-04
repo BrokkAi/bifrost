@@ -39,6 +39,7 @@ use crate::analyzer::usages::get_definition::{
 };
 use crate::analyzer::{CodeUnit, IAnalyzer, ProjectFile, Range};
 use crate::cancellation::CancellationToken;
+use std::collections::HashSet;
 use std::sync::Arc;
 
 /// Domain separator for a single occurrence's stable id.
@@ -288,7 +289,35 @@ pub fn occurrences_for_file_with_options_and_roles(
     roles: Option<&[OccurrenceRole]>,
     cancellation: &CancellationToken,
 ) -> Result<OccurrenceFileResult, OccurrencesCancelled> {
-    occurrences_for_file_scoped(analyzer, file, options, roles, None, cancellation)
+    occurrences_for_file_scoped(analyzer, file, options, roles, None, None, cancellation)
+}
+
+/// Query-local occurrence derivation restricted to the exact AST identities a
+/// correlated consumer will join.
+///
+/// The facts arena is still inspected to prove which requested identities
+/// carry the requested roles, but source strings, enclosing declarations and
+/// targets are materialized only for matching nodes. Completeness remains the
+/// adapter's role-scoped account, so an absent requested identity is trusted
+/// only when every requested role is covered.
+#[doc(hidden)]
+pub fn occurrences_for_file_with_options_roles_and_ast_ids(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    options: OccurrenceDerivationOptions,
+    roles: &[OccurrenceRole],
+    ast_ids: &HashSet<String>,
+    cancellation: &CancellationToken,
+) -> Result<OccurrenceFileResult, OccurrencesCancelled> {
+    occurrences_for_file_scoped(
+        analyzer,
+        file,
+        options,
+        Some(roles),
+        Some(ast_ids),
+        None,
+        cancellation,
+    )
 }
 
 /// [`occurrences_for_file`], resolving targets only for reference rows that
@@ -313,6 +342,7 @@ pub fn occurrences_for_file_at_lines(
         file,
         OccurrenceDerivationOptions::ROWS_ONLY,
         None,
+        None,
         Some(lines),
         cancellation,
     )
@@ -323,6 +353,7 @@ fn occurrences_for_file_scoped(
     file: &ProjectFile,
     options: OccurrenceDerivationOptions,
     roles: Option<&[OccurrenceRole]>,
+    ast_ids: Option<&HashSet<String>>,
     lines: Option<&std::collections::BTreeSet<usize>>,
     cancellation: &CancellationToken,
 ) -> Result<OccurrenceFileResult, OccurrencesCancelled> {
@@ -354,7 +385,7 @@ fn occurrences_for_file_scoped(
         .map(OccurrenceIncompleteReason::RoleUnsupported)
         .collect();
 
-    let mut rows = classify_rows(spec, file, &facts, roles, &mut reasons);
+    let mut rows = classify_rows(spec, file, &facts, roles, ast_ids, &mut reasons);
     if cancellation.is_cancelled() {
         return Err(OccurrencesCancelled);
     }
@@ -413,6 +444,7 @@ fn classify_rows(
     file: &ProjectFile,
     facts: &FileFacts,
     selected_roles: Option<&[OccurrenceRole]>,
+    selected_ast_ids: Option<&HashSet<String>>,
     reasons: &mut Vec<OccurrenceIncompleteReason>,
 ) -> Vec<OccurrenceRow> {
     let content_identity = facts.source_identity();
@@ -421,7 +453,12 @@ fn classify_rows(
     for node in 0..facts.nodes().len() {
         let node = u32::try_from(node).expect("facts arena node count fits in u32");
         let roles = facts.occurrence_roles(node);
-        if roles.is_empty() {
+        if roles.is_empty()
+            || selected_roles
+                .is_some_and(|selected| !roles.iter().any(|role| selected.contains(role)))
+            || selected_ast_ids
+                .is_some_and(|selected| !selected.contains(&ast_id(content_identity, node)))
+        {
             continue;
         }
         let normalized = facts.node(node);

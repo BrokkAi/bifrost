@@ -62,6 +62,8 @@ export default defineConfig({
       components: {
         Header: './src/components/BifrostHeader.astro',
         Hero: './src/components/BifrostHero.astro',
+        ThemeProvider: './src/components/BifrostThemeProvider.astro',
+        ThemeSelect: './src/components/EmptyThemeSelect.astro',
       },
       favicon: '/favicon.png',
       editLink: {
@@ -160,6 +162,21 @@ export default defineConfig({
                 },
               ],
             },
+          ],
+        },
+        {
+          label: 'Design and Architecture',
+          items: [
+            { label: 'Overview', slug: 'design' },
+            { label: 'System Architecture', slug: 'design/system-architecture' },
+            { label: 'Identity and Language Front Ends', slug: 'design/identity-and-language-frontends' },
+            { label: 'Storage and Cache Strategy', slug: 'design/storage-and-cache' },
+            { label: 'Usage Analysis Engine', slug: 'design/usage-analysis' },
+            { label: 'Dataflow Engine', slug: 'design/dataflow-engine' },
+            { label: 'Semantic Models and Summaries', slug: 'design/semantic-models' },
+            { label: 'Evidence and Result Contract', slug: 'design/evidence-and-results' },
+            { label: 'Decisions and Outlook', slug: 'design/decisions-and-outlook' },
+            { label: 'Related Work', slug: 'design/related-work' },
           ],
         },
         {

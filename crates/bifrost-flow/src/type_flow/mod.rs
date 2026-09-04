@@ -19,10 +19,11 @@ mod plan;
 mod report;
 mod solve;
 
+pub use crate::analyzer::semantic::{SourceSite, SourceSiteKind};
 pub use field_slots::{FieldSlot, FieldSlotIndex};
-pub use plan::{MemberAccessSite, SourceSite, SourceSiteKind, TypeFlowPlan, TypeFlowPlanError};
+pub use plan::{MemberAccessSite, TypeFlowPlan, TypeFlowPlanError};
 pub use report::{TypeFlowReport, solve_type_flow_workspace};
 pub use solve::{
-    AbsentMemberFinding, ClassSetStatus, ReceiverClassSet, TypeFlowError, TypeFlowRootResult,
-    solve_type_flow_for_root,
+    AbsentMemberFinding, ClassSetStatus, FeedbackLimits, ReceiverClassSet, TypeFlowError,
+    TypeFlowRootResult, solve_type_flow_for_root,
 };

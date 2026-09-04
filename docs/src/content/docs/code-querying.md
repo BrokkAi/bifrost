@@ -99,18 +99,34 @@ For flow-sensitive state, `(flow-relations-of :relation [reaching] :certainty [e
 
 For bounded termination, `(rewrite-paths-of :outcome [cycle] (file-of (function :name "use_alias")))` answers "does this file make a supported rewrite chase loop?". A rewrite domain is a declared finite state space with a rewrite rule; the row states the semantic state key of every step, the bound the domain declared for itself, and how the chase ended. The three outcomes are separate claims and are never blurred: `converged` names the fixed point, `cycle` carries the ordered repeated-state witness that closes the loop, and `exceeded-budget` names only the work performed. Budget exhaustion is absence of evidence -- it is never reported as a cycle, and never as a clean convergence.
 
-The engine has one semantic query model: `CodeQuery`. Different input formats must lower into that same model before execution.
+The engine has one semantic query model: `CodeQuery`. The `query_code` operation
+executes that model; it is not the name of a second query language. Different
+input forms must become a validated `CodeQuery` before planning and execution.
 
 ## Query Representations
 
-Bifrost currently has two representations for `CodeQuery`:
+The terminology describes three layers:
 
-- [Rune Query Language](/rune-query-language/) is the experimental S-expression syntax used by the human REPL.
-- [JSON CodeQuery](/code-query-json/) is the canonical JSON representation used by `query_code` over MCP and by `:json` output in the REPL.
+| Form | Prefer it when | Trade-off and execution path |
+| --- | --- | --- |
+| [Rune Query Language (RQL)](/rune-query-language/) | A person is exploring, reviewing, or maintaining a query. Its compact S-expression nesting, comments, multiline input, and REPL/editor assistance favor hand authoring. | RQL is an experimental authoring syntax. It lowers to the canonical JSON shape and then validates as `CodeQuery`. MCP cannot accept raw RQL inline, but `query_file` can name a saved workspace `.rql` file. |
+| [JSON `CodeQuery`](/code-query-json/) | An agent, script, Python client, or other protocol client needs an explicit, schema-versioned payload. | JSON is more verbose to write by hand, but it is the stable machine-facing serialization. MCP accepts its fields inline through `query_code`, and `query_file` can name a saved `.json` query. |
+| Rust `CodeQuery` value | An in-process Rust embedding already owns query construction and execution. | The caller can parse or construct the typed model and use the lower-level execution API without a wire-format round trip. Deployed protocol-style behavior goes through `SearchToolsService`; protocol clients use JSON. |
 
-JSON is not a separate query language. It is the stable serialization of the `CodeQuery` model. RQL is a convenience language that compiles to that JSON-shaped model.
+RQL and JSON are frontends to the same typed model, planner, executor, result
+types, budgets, and completeness rules. Choosing one does not select a more
+powerful matcher or a different analysis. Use RQL for human authoring, JSON for
+machine integration, and the Rust value only for in-process embedding.
 
-See [JSON CodeQuery](/code-query-json/) for the complete schema, validation rules, result model, and copy-paste examples. See [Rune Query Language](/rune-query-language/) for interactive authoring and canonical JSON inspection. Use [Explain and Profile CodeQuery](/code-query-explain-profile/) to inspect logical sharing and physical selection before execution or collect opt-in operator, cache, budget, wait, and concurrency observations from one execution.
+See [JSON CodeQuery](/code-query-json/) for the complete schema, validation
+rules, result model, and copy-paste examples. See
+[Rune Query Language](/rune-query-language/) for interactive authoring and
+canonical JSON inspection, and [MCP query and RQL
+availability](/mcp/#query-and-rql-availability) for the exact inline and saved
+file surfaces. Use [Explain and Profile
+CodeQuery](/code-query-explain-profile/) to inspect logical sharing and physical
+selection before execution or collect opt-in operator, cache, budget, wait, and
+concurrency observations from one execution.
 
 For source-first walkthroughs, see the [per-language `query_code` tutorials](/code-query-tutorials/). Their fixtures, RQL and JSON forms, and exact results are exercised against the real structural adapters. To call `query_code` from an embedding application rather than from MCP or the REPL, see [Library Integration](/code-query-tutorials/library-integration/): it runs one canonical query through both `SearchToolsService::query_code_result(...)` and `SearchToolsClient.query_code(...)` and shows how each caller reads diagnostics, `truncated`, provenance completeness, and receiver `outcome` before making a completeness-sensitive claim.
 

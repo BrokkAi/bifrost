@@ -24,7 +24,7 @@ use crate::analyzer::tree_sitter_analyzer::{
 use crate::analyzer::{GoAnalyzer, Language, ProjectFile};
 use crate::hash::{HashMap, HashSet};
 
-const ADAPTER_VERSION: &[u8] = b"go-value-semantics-v45";
+const ADAPTER_VERSION: &[u8] = b"go-value-semantics-v46";
 
 impl_program_semantics_provider!(GoAnalyzer, GoSemanticLowerer);
 
@@ -61,6 +61,7 @@ impl ProgramSemanticsLowerer for GoSemanticLowerer {
             direct_struct_fields,
             named_type_definitions,
             method_inventory,
+            indirect_callable_targets,
             initial_work,
         ) = match enumerate_procedures(file, prepared, budget, cancellation)? {
             ProcedureEnumeration::Complete {
@@ -75,6 +76,7 @@ impl ProgramSemanticsLowerer for GoSemanticLowerer {
                 value.direct_struct_fields,
                 value.named_type_definitions,
                 value.method_inventory,
+                value.indirect_callable_targets,
                 initial_work,
             ),
             ProcedureEnumeration::ExceededBudget { exceeded, work } => {
@@ -147,6 +149,7 @@ impl ProgramSemanticsLowerer for GoSemanticLowerer {
                     &package_functions,
                     &method_inventory,
                     &procedure_targets,
+                    &indirect_callable_targets,
                     staged_budget,
                     cancellation,
                 )
@@ -336,6 +339,9 @@ struct GoProcedureInventory<'tree> {
     direct_struct_fields: DirectStructFields,
     named_type_definitions: GoNamedTypeDefinitions<'tree>,
     method_inventory: GoMethodInventory,
+    /// Callee AST node -> the function literal it provably denotes, for calls
+    /// made through a stable function-valued binding.
+    indirect_callable_targets: HashMap<usize, usize>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -641,7 +647,7 @@ fn enumerate_procedures<'tree>(
         Err(GoInventoryPrepassStop::Budget(stop)) => return Ok(stop.into_outcome()),
         Err(GoInventoryPrepassStop::Cancelled) => return Ok(inventory.cancelled()),
     };
-    if let Err(stop) = populate_capture_specs(
+    let indirect_callable_targets = match populate_capture_specs(
         &mut specs,
         prepared.source(),
         &direct_struct_fields,
@@ -650,11 +656,14 @@ fn enumerate_procedures<'tree>(
         &mut inventory,
         cancellation,
     ) {
-        return Ok(match stop {
-            GoInventoryPrepassStop::Budget(stop) => stop.into_outcome(),
-            GoInventoryPrepassStop::Cancelled => inventory.cancelled(),
-        });
-    }
+        Ok(targets) => targets,
+        Err(stop) => {
+            return Ok(match stop {
+                GoInventoryPrepassStop::Budget(stop) => stop.into_outcome(),
+                GoInventoryPrepassStop::Cancelled => inventory.cancelled(),
+            });
+        }
+    };
     Ok(inventory.complete(GoProcedureInventory {
         specs,
         package_shadowing,
@@ -663,6 +672,7 @@ fn enumerate_procedures<'tree>(
         direct_struct_fields,
         named_type_definitions,
         method_inventory,
+        indirect_callable_targets,
     }))
 }
 
@@ -767,7 +777,7 @@ fn populate_capture_specs<'tree>(
     method_inventory: &GoMethodInventory,
     inventory: &mut ProcedureInventoryBuilder<'_>,
     cancellation: &CancellationToken,
-) -> Result<(), GoInventoryPrepassStop> {
+) -> Result<HashMap<usize, usize>, GoInventoryPrepassStop> {
     charge_go_inventory_prepass(inventory, cancellation)?;
     let mut lexical_bindings = Vec::with_capacity(specs.len());
     for spec in specs.iter() {
@@ -928,7 +938,16 @@ fn populate_capture_specs<'tree>(
         spec.omitted_capture_names = omitted.into_boxed_slice();
         spec.call_exposure_origins = exposures.into_boxed_slice();
     }
-    Ok(())
+    // After the mutable-binding set is complete, so a binding assigned later
+    // in the same body cannot be read as stable here.
+    collect_indirect_callable_targets(
+        specs,
+        &lexical_bindings,
+        &capture_mutable_bindings,
+        source,
+        inventory,
+        cancellation,
+    )
 }
 
 fn collect_call_exposure_origins(
@@ -1211,6 +1230,10 @@ struct GoCallableLexicalBindings {
     receiver_types: HashMap<GoBindingIdentity, GoReceiverTypeProof>,
     storage_kinds: HashMap<GoBindingIdentity, GoStorageKind>,
     declaration_targets: HashMap<usize, GoResolvedBinding>,
+    /// The function literal a binding is exactly initialized with, for the
+    /// bindings that have one. Keyed by the literal's AST node so the caller
+    /// can reach the same `GoProcedureTarget` a direct literal call reaches.
+    callable_literals: HashMap<GoBindingIdentity, usize>,
 }
 
 fn visible_go_binding<T>(
@@ -1495,6 +1518,7 @@ fn go_callable_lexical_bindings(
         receiver_types: HashMap::default(),
         storage_kinds: HashMap::default(),
         declaration_targets: HashMap::default(),
+        callable_literals: HashMap::default(),
     };
     if let Some(layout) = formal_parameter_slots_for_owner(Language::Go, spec.callable, source) {
         for slot in layout.slots {
@@ -1679,6 +1703,15 @@ fn go_callable_lexical_bindings(
                 if let Some(receiver_type) = receiver_type {
                     bindings.receiver_types.insert(identity, receiver_type);
                 }
+                if exact_value_candidate
+                    && let Some(literal) = value_nodes
+                        .get(index)
+                        .copied()
+                        .map(transparent_parenthesized_expression)
+                        .filter(|value| value.kind() == "func_literal")
+                {
+                    bindings.callable_literals.insert(identity, literal.id());
+                }
             }
             let storage = node
                 .child_by_field_name("type")
@@ -1764,6 +1797,81 @@ fn immutable_captured_binding(
         .flatten()
         .any(|candidate| candidate.identity == identity && candidate.exact_value_candidate)
         && !capture_mutable_bindings.contains(&binding)
+}
+
+/// Prove the local callable a call denotes when its callee is a stable
+/// function-valued binding.
+///
+/// A call whose callee is written as a literal is already proven where it is
+/// lowered. Go just as routinely calls through a binding, and
+/// `check := func() { ... }; go check()` is the shape bbolt's own published
+/// `TestTx_Check_ReadOnly` reproducer uses. Leaving that unresolved hides the
+/// entire spawned body from every consumer of `declared_targets`, which for
+/// the concurrency solver means no task slice and therefore no comparison at
+/// all rather than a narrower one.
+///
+/// The claim is made only for a binding this prepass already proved stable:
+/// one short or const declaration whose value is a function literal, with no
+/// later assignment, no address escape, and no implicit pointer-method
+/// address. That is the same predicate exact value captures use, so a
+/// reassigned binding stays unresolved instead of naming its first value.
+fn collect_indirect_callable_targets(
+    specs: &[ProcedureSpec<'_>],
+    lexical_bindings: &[GoCallableLexicalBindings],
+    capture_mutable_bindings: &HashSet<GoResolvedBinding>,
+    source: &str,
+    inventory: &mut ProcedureInventoryBuilder<'_>,
+    cancellation: &CancellationToken,
+) -> Result<HashMap<usize, usize>, GoInventoryPrepassStop> {
+    let mut targets = HashMap::default();
+    for (procedure_index, spec) in specs.iter().enumerate() {
+        try_walk_named_tree_preorder(spec.body, true, |node| {
+            charge_go_inventory_prepass(inventory, cancellation)?;
+            if node != spec.body && is_go_callable_kind(node.kind()) {
+                return Ok(WalkControl::SkipChildren);
+            }
+            if node.kind() != "call_expression" {
+                return Ok(WalkControl::Continue);
+            }
+            let Some(callee) = node
+                .child_by_field_name("function")
+                .map(transparent_parenthesized_expression)
+                .filter(|callee| is_go_binding_reference_kind(callee.kind()))
+            else {
+                return Ok(WalkControl::Continue);
+            };
+            let Some(name) = node_text(source, callee).filter(|name| *name != "_") else {
+                return Ok(WalkControl::Continue);
+            };
+            let Some(binding) = resolve_go_binding(
+                specs,
+                lexical_bindings,
+                procedure_index,
+                name,
+                callee.start_byte(),
+                inventory,
+                cancellation,
+            )?
+            else {
+                return Ok(WalkControl::Continue);
+            };
+            if !immutable_captured_binding(lexical_bindings, binding, capture_mutable_bindings) {
+                return Ok(WalkControl::Continue);
+            }
+            let GoResolvedBinding::Local(identity) = binding else {
+                return Ok(WalkControl::Continue);
+            };
+            if let Some(literal) = lexical_bindings[identity.procedure.index()]
+                .callable_literals
+                .get(&identity)
+                .copied()
+            {
+                targets.insert(callee.id(), literal);
+            }
+            Ok(WalkControl::Continue)
+        })?;
+    }
+    Ok(targets)
 }
 
 fn resolve_go_binding(
@@ -2046,6 +2154,9 @@ struct LoweringContext<'tree, 'facts, 'targets, 'imports, 'procedure> {
     package_value_locators: &'imports HashMap<Box<str>, SemanticLocator>,
     method_inventory: &'imports GoMethodInventory,
     procedure_targets: &'imports HashMap<usize, GoProcedureTarget>,
+    /// Callee AST node -> the function literal it provably denotes, proven by
+    /// the prepass for calls through a stable function-valued binding.
+    indirect_callable_targets: &'imports HashMap<usize, usize>,
     package_shadowing: PredeclaredShadowing,
     predeclared_shadowed: PredeclaredShadowing,
 }
@@ -2167,6 +2278,7 @@ fn lower_procedure<'tree>(
     package_functions: &HashSet<Box<str>>,
     method_inventory: &GoMethodInventory,
     procedure_targets: &HashMap<usize, GoProcedureTarget>,
+    indirect_callable_targets: &HashMap<usize, usize>,
     budget: &SemanticBudget,
     cancellation: &CancellationToken,
 ) -> Result<(ProcedureSemanticsParts, SemanticWork), GoLoweringError> {
@@ -2236,6 +2348,7 @@ fn lower_procedure<'tree>(
         package_value_locators,
         method_inventory,
         procedure_targets,
+        indirect_callable_targets,
         package_shadowing,
         // Exact and omitted capture inventories below distinguish the
         // enclosing bindings a nested literal actually sees. Keep package and
@@ -7737,14 +7850,21 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
             CallableReferenceKind::Function
         };
         let direct_function = transparent_parenthesized_expression(function);
-        let resolution = if direct_function.kind() == "func_literal" {
-            self.procedure_targets
-                .get(&direct_function.id())
-                .map(|target| CallableTargetResolution::Proven(CallableTarget::Local(target.id)))
-                .unwrap_or(CallableTargetResolution::Unknown)
+        // A call denotes a local procedure either by immediate literal syntax
+        // or through a binding the prepass proved stable and function-valued.
+        // Both reach the same `GoProcedureTarget`, so the two spellings of one
+        // call cannot disagree about what it denotes.
+        let literal = if direct_function.kind() == "func_literal" {
+            Some(direct_function.id())
         } else {
-            CallableTargetResolution::Unknown
+            self.indirect_callable_targets
+                .get(&direct_function.id())
+                .copied()
         };
+        let resolution = literal
+            .and_then(|literal| self.procedure_targets.get(&literal))
+            .map(|target| CallableTargetResolution::Proven(CallableTarget::Local(target.id)))
+            .unwrap_or(CallableTargetResolution::Unknown);
         let metadata = self.metadata(invoke)?;
         if selector_resolution == Some(GoSelectorResolution::Unknown) {
             // The selector can still denote a function-valued field. Retain
@@ -10404,7 +10524,7 @@ func outer() {
     }
 
     #[test]
-    fn direct_func_literal_calls_name_their_exact_local_targets() {
+    fn literal_and_stable_alias_calls_name_their_exact_local_targets() {
         const SOURCE: &str = r#"package main
 func invoke(callback func()) {
     func() {}()
@@ -10451,14 +10571,65 @@ func invoke(callback func()) {
             );
         }
 
-        for expected in ["alias", "callback"] {
-            let call = call(expected);
-            assert_eq!(
-                call.declared_targets,
-                CallableTargetResolution::Unknown,
-                "identifier calls do not prove what callable value reaches them"
-            );
-        }
+        // A stable binding of a literal denotes that literal just as exactly
+        // as invoking it in place, and the target is the declared literal
+        // rather than anything at the call site.
+        let aliased = call("alias");
+        let CallableTargetResolution::Proven(CallableTarget::Local(target)) =
+            aliased.declared_targets
+        else {
+            panic!("a stable callable binding must have a proven local target: {aliased:#?}");
+        };
+        let target = procedures
+            .iter()
+            .find(|procedure| procedure.id == target)
+            .expect("proven local target names one published procedure");
+        let target_span = target.locator.anchor().span();
+        assert_eq!(source_text(SOURCE, target_span), "func() {}");
+        let alias_call_span = callee_span(aliased);
+        assert!(
+            target_span.end_byte() <= alias_call_span.start_byte(),
+            "the target is the literal the binding was declared with, not one at the call"
+        );
+
+        // A formal has no declaration in this procedure to prove anything
+        // about, so it must stay open rather than guess at its caller.
+        let parameter = call("callback");
+        assert_eq!(
+            parameter.declared_targets,
+            CallableTargetResolution::Unknown,
+            "a parameter call cannot prove what callable value reaches it"
+        );
+    }
+
+    /// The stability requirement, stated as its own case because it is the
+    /// only thing separating a proven alias from a wrong answer.
+    #[test]
+    fn a_reassigned_callable_binding_does_not_name_its_first_value() {
+        const SOURCE: &str = r#"package main
+func invoke(flag bool) {
+    worker := func() {}
+    if flag {
+        worker = func() {}
+    }
+    worker()
+}
+"#;
+        let procedures = lower_fixture(SOURCE);
+        let parent = procedures
+            .iter()
+            .find(|procedure| procedure.lexical_parent.is_none())
+            .expect("invoke procedure");
+        let worker = parent
+            .call_sites
+            .iter()
+            .find(|call| source_text(SOURCE, value_source_span(parent, call.callee)) == "worker")
+            .expect("the worker call");
+        assert_eq!(
+            worker.declared_targets,
+            CallableTargetResolution::Unknown,
+            "a rebound callable must not be reported as its first value"
+        );
     }
 
     #[test]

@@ -714,7 +714,7 @@ fn discover_closure(
     }
     for coverage in closure.coverage.values() {
         match &coverage.dispatch {
-            DispatchStatus::Resolved { status } => record_status(boundaries, *status),
+            DispatchStatus::Resolved { status, .. } => record_status(boundaries, *status),
             DispatchStatus::Unavailable { status } => {
                 record_status(boundaries, *status);
                 boundaries.insert(FoundryDerivationBoundary::UnresolvedCall);

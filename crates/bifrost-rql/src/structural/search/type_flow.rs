@@ -29,8 +29,8 @@ use crate::cancellation::CancellationToken;
 use crate::hash::HashMap;
 use brokk_bifrost_flow::dataflow::{DataflowRequest, SolverBudget};
 use brokk_bifrost_flow::type_flow::{
-    ClassSetStatus, FieldSlotIndex, TypeFlowError, TypeFlowPlanError, TypeFlowRootResult,
-    solve_type_flow_for_root,
+    ClassSetStatus, FeedbackLimits, FieldSlotIndex, TypeFlowError, TypeFlowPlanError,
+    TypeFlowRootResult, solve_type_flow_for_root,
 };
 use brokk_bifrost_flow::value_flow::ClosureLimits;
 
@@ -324,7 +324,7 @@ impl TypeFlowQueryState {
         };
         let provider = WorkspaceIcfgProvider::with_active_semantic_model_snapshot(
             workspace,
-            active_semantic_model_snapshot,
+            active_semantic_model_snapshot.clone(),
         );
         let provider_behavior = provider.behavior_identity();
         let field_slot_key = FieldSlotCacheKey {
@@ -423,8 +423,9 @@ impl TypeFlowQueryState {
                     adapter,
                     &field_slots,
                     &procedure.handle,
-                    &provider,
+                    active_semantic_model_snapshot,
                     CLOSURE_LIMITS,
+                    FeedbackLimits::default(),
                     &mut child_budget,
                     &mut request,
                 );

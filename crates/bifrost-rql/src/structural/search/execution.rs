@@ -815,6 +815,8 @@ pub(super) fn execute_parallel_seed_union(
     let access_mode = state.access_mode;
     let retained_value_census = state.retained_value_census.clone();
     let structural_index_session = state.structural_index_session.clone();
+    let occurrence_cache = state.occurrence_cache.fork_empty();
+    let environment_cache = state.environment_cache.fork_empty();
     let scheduler_workers = state.scheduler_workers;
     let base_budget = state.budget;
     let base_profile_branch = profile_branch.as_deref().unwrap_or_default().to_vec();
@@ -840,8 +842,8 @@ pub(super) fn execute_parallel_seed_union(
                     seed_scan_ledger: SeedScanLedger::default(),
                     indexed_declarations: IndexedDeclarations::default(),
                     reference_cache: ReferenceTraversalCache::default(),
-                    occurrence_cache: OccurrenceTraversalCache::default(),
-                    environment_cache: EnvironmentTraversalCache::default(),
+                    occurrence_cache: occurrence_cache.fork_empty(),
+                    environment_cache: environment_cache.fork_empty(),
                     materialization_cache: materialization::MaterializationTraversalCache::default(
                     ),
                     edge_cache: EdgeTraversalCache::default(),

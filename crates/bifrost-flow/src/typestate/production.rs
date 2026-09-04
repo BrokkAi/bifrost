@@ -41,11 +41,11 @@ use crate::analyzer::semantic::cfg_algorithms::{
 };
 use crate::analyzer::semantic::{
     CallBoundary, CallSiteId, IcfgProvider, IcfgProviderBehaviorIdentity, IndexedLocationIdentity,
-    LengthDelimitedDigest, MemoryLocationId, MemoryLocationKind, ProcedureHandle, SemanticCallSite,
-    SemanticEffect, SemanticExecutionBudget, SemanticExecutionBudgetCharge,
-    SemanticExecutionBudgetSnapshot, SemanticGapImpact, SemanticOutcome, SemanticProviderError,
-    SemanticRequest, SemanticValueKind, SemanticWork, SynchronizationOperation, ValueFlowKind,
-    ValueId,
+    LengthDelimitedDigest, MemoryLocationId, MemoryLocationKind, ProcedureHandle,
+    SemanticBudgetExceeded, SemanticCallSite, SemanticEffect, SemanticExecutionBudget,
+    SemanticExecutionBudgetCharge, SemanticExecutionBudgetSnapshot, SemanticGapImpact,
+    SemanticOutcome, SemanticProviderError, SemanticRequest, SemanticValueKind, SemanticWork,
+    SynchronizationOperation, ValueFlowKind, ValueId,
 };
 use crate::dataflow::{
     DataflowRequest, ProcedureSummaryIdentity, ProcedureSummaryKey,
@@ -1046,8 +1046,9 @@ impl ProductionSemanticSummarySet {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProductionSummaryProjectionError {
     Provider(SemanticProviderError),
-    IncompleteCallTransfers {
+    CallTransferBudgetExceeded {
         procedure: Box<ProcedureSummaryIdentity>,
+        exceeded: SemanticBudgetExceeded,
     },
     Cancelled,
     GraphBudgetExceeded,
@@ -1059,10 +1060,13 @@ impl fmt::Display for ProductionSummaryProjectionError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Provider(error) => write!(formatter, "semantic provider failed: {error}"),
-            Self::IncompleteCallTransfers { procedure } => write!(
+            Self::CallTransferBudgetExceeded {
+                procedure,
+                exceeded,
+            } => write!(
                 formatter,
-                "cannot cache incomplete call-transfer closure for {:?}",
-                procedure.declaration()
+                "cannot cache call-transfer closure for {:?}: {exceeded}",
+                procedure.declaration(),
             ),
             Self::Cancelled => formatter.write_str("semantic summary projection was cancelled"),
             Self::GraphBudgetExceeded => {
@@ -1081,10 +1085,8 @@ impl std::error::Error for ProductionSummaryProjectionError {
         match self {
             Self::Provider(error) => Some(error),
             Self::Validation(error) => Some(error),
-            Self::IncompleteCallTransfers { .. }
-            | Self::Cancelled
-            | Self::GraphBudgetExceeded
-            | Self::InvalidDependencyGraph => None,
+            Self::CallTransferBudgetExceeded { exceeded, .. } => Some(exceeded),
+            Self::Cancelled | Self::GraphBudgetExceeded | Self::InvalidDependencyGraph => None,
         }
     }
 }
@@ -1179,10 +1181,16 @@ where
                     )?);
                     continue;
                 }
-                SemanticOutcome::ExceededBudget { .. } | SemanticOutcome::Cancelled { .. } => {
-                    return Err(ProductionSummaryProjectionError::IncompleteCallTransfers {
-                        procedure: Box::new(summary_identity(&procedure, behavior)),
-                    });
+                SemanticOutcome::ExceededBudget { exceeded, .. } => {
+                    return Err(
+                        ProductionSummaryProjectionError::CallTransferBudgetExceeded {
+                            procedure: Box::new(summary_identity(&procedure, behavior)),
+                            exceeded,
+                        },
+                    );
+                }
+                SemanticOutcome::Cancelled { .. } => {
+                    return Err(ProductionSummaryProjectionError::Cancelled);
                 }
             };
             for (boundary_index, boundary) in value.boundaries.iter().enumerate() {

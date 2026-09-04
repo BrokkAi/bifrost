@@ -516,13 +516,17 @@ impl ExtensionWorkspace {
             ));
         }
         let values = request.limits;
-        let mut budget = SemanticBudget::default();
+        let mut budget_limits = SemanticBudget::default().limits();
+        budget_limits.source_bytes = usize::try_from(values.max_source_bytes).unwrap_or(usize::MAX);
+        let mut budget = SemanticBudget::new(budget_limits)
+            .expect("validated source limit preserves positive semantic budget limits");
         let mut semantic_request = SemanticRequest::new(&mut budget, cancellation.token());
         let materialized = self
             .analyzer
             .materialize_program_semantics(&file, &mut semantic_request)
             .map_err(|error| ExtensionError::Execution(error.to_string().into_boxed_str()))?;
         let completion = semantic_completion(&materialized);
+        let source_bytes = materialized.work().source_bytes as u64;
         let Some(artifact) = materialized.available_value() else {
             return Ok(with_tiers(
                 make_outcome(
@@ -532,7 +536,10 @@ impl ExtensionWorkspace {
                     &ExtensionLimits::default(),
                     operation,
                     stability,
-                    ExtensionWork::default(),
+                    ExtensionWork {
+                        source_bytes,
+                        ..Default::default()
+                    },
                 ),
                 &scope,
             ));
@@ -917,6 +924,7 @@ impl ExtensionWorkspace {
         let work = ExtensionWork {
             semantic_nodes: nodes.len() as u64,
             semantic_edges: edges.len() as u64,
+            source_bytes,
             traversal_steps: algorithm_work,
             ..Default::default()
         };
@@ -1381,7 +1389,7 @@ fn semantic_completion<T>(outcome: &SemanticOutcome<T>) -> ExtensionCompletion {
         },
         SemanticOutcome::Unproven { .. } => ExtensionCompletion::Unproven,
         SemanticOutcome::ExceededBudget { exceeded, .. } => ExtensionCompletion::ExceededBudget {
-            dimension: format!("{exceeded:?}").into_boxed_str(),
+            dimension: exceeded.dimension().label().into(),
         },
         SemanticOutcome::Cancelled { .. } => ExtensionCompletion::Cancelled,
     }

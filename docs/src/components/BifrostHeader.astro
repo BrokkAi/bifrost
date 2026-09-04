@@ -3,7 +3,6 @@ import LanguageSelect from '@astrojs/starlight/components/LanguageSelect.astro';
 import Search from '@astrojs/starlight/components/Search.astro';
 import SiteTitle from '@astrojs/starlight/components/SiteTitle.astro';
 import SocialIcons from '@astrojs/starlight/components/SocialIcons.astro';
-import ThemeSelect from '@astrojs/starlight/components/ThemeSelect.astro';
 import type { StarlightRouteData } from '@astrojs/starlight/route-data';
 
 const { siteTitleHref } = (Astro.locals as { starlightRoute: StarlightRouteData }).starlightRoute;
@@ -14,6 +13,7 @@ const navItems = [
 	{ label: 'MCP', slug: 'mcp/' },
 	{ label: 'LSP', slug: 'lsp/' },
 	{ label: 'Querying', slug: 'code-querying/' },
+	{ label: 'Design', slug: 'design/' },
 ];
 const currentPath = Astro.url.pathname.replace(/\/+$/, '/');
 ---
@@ -46,7 +46,6 @@ const currentPath = Astro.url.pathname.replace(/\/+$/, '/');
 	<div class="bifrost-header-search sl-flex print:hidden"><Search /></div>
 	<div class="bifrost-header-tools sl-hidden md:sl-flex print:hidden">
 		<div class="sl-flex social-icons"><SocialIcons /></div>
-		<ThemeSelect />
 		<LanguageSelect />
 	</div>
 </div>
@@ -177,10 +176,6 @@ const currentPath = Astro.url.pathname.replace(/\/+$/, '/');
 		.bifrost-header-tools {
 			align-items: center;
 			gap: var(--bifrost-space-3);
-		}
-
-		.bifrost-header-tools :global(starlight-theme-select select) {
-			padding-inline-start: calc(var(--sl-label-icon-size) + var(--sl-inline-padding) + 0.375rem);
 		}
 
 		/* A quiet chip, not a call to action. The red wash, red border, red

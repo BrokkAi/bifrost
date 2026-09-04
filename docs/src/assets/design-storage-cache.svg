@@ -1,0 +1,152 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1440 940" role="img" aria-labelledby="storage-title storage-desc">
+  <title id="storage-title">Bifrost storage and cache strategy</title>
+  <desc id="storage-desc">Two Git worktrees and an editor overlay feed a shared analysis pipeline. A build lock, parallel parsers, and one writer publish complete content facts and revisioned workspace projections to SQLite. WAL snapshot readers build complete bounded in-memory values. Semantic-pack objects remain in a separate catalog, while exact keys make stale state unreachable before garbage collection.</desc>
+  <defs>
+    <linearGradient id="storage-bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#081521"/>
+      <stop offset="1" stop-color="#102b36"/>
+    </linearGradient>
+    <linearGradient id="storage-panel" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#14343f"/>
+      <stop offset="1" stop-color="#0d222d"/>
+    </linearGradient>
+    <marker id="storage-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#66d4c2"/>
+    </marker>
+    <marker id="storage-arrow-warm" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#f6a85f"/>
+    </marker>
+    <filter id="storage-shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="6" stdDeviation="8" flood-color="#02070c" flood-opacity="0.38"/>
+    </filter>
+    <style>
+      .title { fill: #effaf8; font: 700 30px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+      .subtitle { fill: #b8d5d2; font: 400 17px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+      .section { fill: #66d4c2; font: 700 14px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; letter-spacing: 1.5px; }
+      .heading { fill: #effaf8; font: 700 20px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+      .label { fill: #effaf8; font: 600 16px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+      .body { fill: #b8d5d2; font: 400 14px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+      .tiny { fill: #9bb8b6; font: 400 13px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+      .warm { fill: #f6a85f; }
+      .panel { fill: url(#storage-panel); stroke: #3e7d7a; stroke-width: 1.5; }
+      .inner { fill: #0b1c26; stroke: #315f60; stroke-width: 1.25; }
+      .warm-panel { fill: #3b2b20; stroke: #b87942; stroke-width: 1.5; }
+      .flow { fill: none; stroke: #66d4c2; stroke-width: 2; marker-end: url(#storage-arrow); }
+      .warm-flow { fill: none; stroke: #f6a85f; stroke-width: 2; stroke-dasharray: 6 5; marker-end: url(#storage-arrow-warm); }
+      .divider { stroke: #315f60; stroke-width: 1; }
+    </style>
+  </defs>
+
+  <rect width="1440" height="940" rx="22" fill="url(#storage-bg)"/>
+  <text class="title" x="64" y="58">Storage and cache lifetimes</text>
+  <text class="subtitle" x="64" y="86">Share immutable content facts; isolate live workspace views; publish only complete derived values.</text>
+
+  <text class="section" x="64" y="126">SOURCE SNAPSHOTS</text>
+  <g filter="url(#storage-shadow)">
+    <rect class="panel" x="64" y="144" width="424" height="96" rx="12"/>
+    <rect class="panel" x="508" y="144" width="424" height="96" rx="12"/>
+    <rect class="warm-panel" x="952" y="144" width="424" height="96" rx="12"/>
+  </g>
+  <text class="heading" x="88" y="177">Git worktree A</text>
+  <text class="body" x="88" y="203">Revision maps paths to blob object IDs</text>
+  <text class="tiny" x="88" y="222">Shared bytes can reuse shared facts</text>
+  <text class="heading" x="532" y="177">Git worktree B</text>
+  <text class="body" x="532" y="203">Different revision and path projection</text>
+  <text class="tiny" x="532" y="222">No cross-worktree live-view leakage</text>
+  <text class="heading warm" x="976" y="177">Editor overlay</text>
+  <text class="body" x="976" y="203">Unsaved bytes belong to one snapshot</text>
+  <text class="tiny" x="976" y="222">Never published as committed disk content</text>
+
+  <path class="flow" d="M 276 240 V 272 H 368 V 304"/>
+  <path class="flow" d="M 720 240 V 272 H 368"/>
+  <path class="warm-flow" d="M 1164 240 V 272 H 1075 V 304"/>
+
+  <rect x="48" y="294" width="1344" height="422" rx="18" fill="#091923" stroke="#285153" stroke-width="1.5"/>
+  <text class="section" x="72" y="326">PERSISTED ANALYSIS PATH</text>
+
+  <g filter="url(#storage-shadow)">
+    <rect class="panel" x="72" y="346" width="286" height="334" rx="14"/>
+  </g>
+  <text class="heading" x="96" y="380">Build coordination</text>
+  <rect class="inner" x="96" y="402" width="238" height="64" rx="9"/>
+  <text class="label" x="116" y="429">Per-cache build lock</text>
+  <text class="tiny" x="116" y="450">One cold reconciliation at a time</text>
+  <path class="flow" d="M 215 466 V 490"/>
+  <rect class="inner" x="96" y="490" width="238" height="68" rx="9"/>
+  <text class="label" x="116" y="517">Parallel parse and extract</text>
+  <text class="tiny" x="116" y="538">Only missing compatible content</text>
+  <path class="flow" d="M 215 558 V 582"/>
+  <rect class="inner" x="96" y="582" width="238" height="70" rx="9"/>
+  <text class="label" x="116" y="609">Single writer actor</text>
+  <text class="tiny" x="116" y="630">Atomic complete fact publication</text>
+
+  <path class="flow" d="M 358 617 H 394"/>
+
+  <g filter="url(#storage-shadow)">
+    <rect class="panel" x="394" y="346" width="614" height="334" rx="14"/>
+  </g>
+  <text class="heading" x="418" y="380">Versioned SQLite analyzer store</text>
+  <text class="tiny" x="982" y="379" text-anchor="end">WAL + transactional publication</text>
+
+  <rect class="inner" x="418" y="402" width="270" height="112" rx="10"/>
+  <text class="section" x="438" y="428">CONTENT LAYER</text>
+  <text class="label" x="438" y="456">Blob identity + language epoch</text>
+  <text class="body" x="438" y="480">Declarations, imports, ranges, hierarchy</text>
+  <text class="tiny" x="438" y="500">Rows are selectable only when complete</text>
+
+  <rect class="inner" x="714" y="402" width="270" height="112" rx="10"/>
+  <text class="section" x="734" y="428">WORKSPACE PROJECTION</text>
+  <text class="label" x="734" y="456">Workspace + revision + relative path</text>
+  <text class="body" x="734" y="480">Path-to-content, mounts, and anchors</text>
+  <text class="tiny" x="734" y="500">Immutable mapping for one snapshot</text>
+
+  <path class="flow" d="M 688 458 H 714"/>
+
+  <rect x="418" y="542" width="566" height="96" rx="10" fill="#123037" stroke="#66d4c2" stroke-width="1.5"/>
+  <text class="section" x="438" y="570">SELECTED LIVE VIEWS</text>
+  <text class="label" x="438" y="598">Selected revision + active generation + complete content</text>
+  <text class="body" x="438" y="620">Old rows may remain on disk, but cannot enter the current query.</text>
+  <path class="flow" d="M 553 514 V 542"/>
+  <path class="flow" d="M 849 514 V 542"/>
+
+  <path class="flow" d="M 1008 590 H 1044"/>
+
+  <g filter="url(#storage-shadow)">
+    <rect class="panel" x="1044" y="346" width="324" height="334" rx="14"/>
+  </g>
+  <text class="heading" x="1068" y="380">Read and derive</text>
+  <rect class="inner" x="1068" y="402" width="276" height="78" rx="9"/>
+  <text class="label" x="1088" y="430">Bounded read-only pools</text>
+  <text class="body" x="1088" y="453">Committed WAL snapshot reads</text>
+  <path class="flow" d="M 1206 480 V 508"/>
+  <rect class="inner" x="1068" y="508" width="276" height="104" rx="9"/>
+  <text class="label" x="1088" y="536">Complete-value caches</text>
+  <text class="body" x="1088" y="560">Full dependency keys</text>
+  <text class="body" x="1088" y="581">Same-key single-flight construction</text>
+  <text class="tiny" x="1088" y="601">Byte bounded; eviction changes latency only</text>
+  <rect x="1068" y="628" width="276" height="28" rx="14" fill="#3b2b20" stroke="#b87942"/>
+  <text x="1206" y="647" text-anchor="middle" fill="#f6a85f" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="13" font-weight="700">PARTIAL WORK IS NEVER PUBLISHED</text>
+
+  <text class="section" x="64" y="760">SEPARATE LIFETIMES</text>
+  <g filter="url(#storage-shadow)">
+    <rect class="warm-panel" x="64" y="780" width="520" height="112" rx="14"/>
+    <rect class="panel" x="610" y="780" width="386" height="112" rx="14"/>
+    <rect class="panel" x="1022" y="780" width="354" height="112" rx="14"/>
+  </g>
+  <text class="heading warm" x="88" y="814">Semantic-pack catalog</text>
+  <text class="body" x="88" y="840">Separate SQLite metadata + SHA-256 object shards</text>
+  <text class="tiny" x="88" y="862">Exact input, producer, schema, and production key</text>
+  <text class="tiny" x="88" y="880">May be shared without sharing analyzer databases</text>
+
+  <text class="heading" x="634" y="814">Logical invalidation first</text>
+  <text class="body" x="634" y="840">New keys, revisions, and epochs make stale</text>
+  <text class="body" x="634" y="860">state unreachable before it is deleted.</text>
+  <text class="tiny" x="634" y="880">Selection is exact; retention may be conservative.</text>
+
+  <text class="heading" x="1046" y="814">Opportunistic GC</text>
+  <text class="body" x="1046" y="840">Protect reachable refs and worktrees;</text>
+  <text class="body" x="1046" y="860">reclaim stale rows and old stores later.</text>
+  <text class="tiny" x="1046" y="880">Best effort and outside the query contract</text>
+
+  <path class="flow" d="M 996 836 H 1022"/>
+</svg>

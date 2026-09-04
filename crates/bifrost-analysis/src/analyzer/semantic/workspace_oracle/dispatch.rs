@@ -16,16 +16,20 @@ use crate::analyzer::semantic::{
     CancellationToken, CandidateCoverage, ContentIdentity, DeclarationLocator, DeclarationSegment,
     DeclarationSegmentKind, DispatchBoundary, DispatchBoundaryKind, DispatchCandidate,
     DispatchExtensibility, DispatchOracle, DispatchResult, EvidenceCompleteness, EvidenceHandle,
-    ExactExternalFormalContract, ExactExternalProcedureTarget, HeapOracle, MemoryLocationKind,
-    ObjectCardinality, ObservationPhase, OracleCallContext, OracleLimits, OracleRelationArena,
-    OracleRelationId, OracleRelationOwner, OracleRelationRecord, OracleRelationSubject,
-    ProcedureHandle, ProcedureKind, ProcedureSemantics, ProofStatus, SemanticArtifact,
-    SemanticBudgetExceeded, SemanticCallSite, SemanticCapability, SemanticGap, SemanticGapImpact,
-    SemanticGapKind, SemanticGapSubject, SemanticLanguage, SemanticLocator, SemanticOutcome,
-    SemanticProviderError, SemanticRequest, SemanticRole, SemanticWork, SourceAnchor,
-    SourcePosition, SourceSpan, StableDigest, UnmaterializedExternalTarget, ValueAtPoint,
-    WorkspaceMountId, WorkspaceRelativePath, split_canonical_qualified_callee,
+    ExactExternalFormalContract, ExactExternalProcedureTarget, HeapOracle, MemberDeclaration,
+    MemoryLocationKind, ObjectCardinality, ObservationPhase, OracleCallContext, OracleLimits,
+    OracleRelationArena, OracleRelationId, OracleRelationOwner, OracleRelationRecord,
+    OracleRelationSubject, ProcedureHandle, ProcedureKind, ProcedureSemantics, ProofStatus,
+    SemanticArtifact, SemanticBudgetExceeded, SemanticCallSite, SemanticCapability, SemanticGap,
+    SemanticGapImpact, SemanticGapKind, SemanticGapSubject, SemanticLanguage, SemanticLocator,
+    SemanticOutcome, SemanticProviderError, SemanticRequest, SemanticRole, SemanticWork,
+    SourceAnchor, SourcePosition, SourceSpan, StableDigest, UnmaterializedExternalTarget,
+    ValueAtPoint, WorkspaceMountId, WorkspaceRelativePath, split_canonical_qualified_callee,
     unmaterialized_external_mount, unmaterialized_external_path,
+};
+use crate::analyzer::semantic_model::{
+    CompiledProcedureSummary, Completeness, ProcedureSummaryMemberKey,
+    SemanticModelMatchDisposition, SemanticModelSymbolKind,
 };
 use crate::analyzer::structural::resolution::{BoundaryStatus, MethodFamilyRelation};
 use crate::analyzer::usages::get_definition::{
@@ -79,7 +83,9 @@ impl CallableDefinitionIdentity {
 #[derive(Debug)]
 struct DispatchTargetGroup {
     representative: CodeUnit,
-    proof: UsageProof,
+    proof: ProofStatus,
+    completeness: EvidenceCompleteness,
+    receiver_hint: bool,
 }
 
 fn dispatch_target_groups(
@@ -98,14 +104,17 @@ fn dispatch_target_groups(
                 group.representative = target.definition;
             }
             if target.proof == UsageProof::Proven {
-                group.proof = UsageProof::Proven;
+                group.proof = ProofStatus::Proven;
+                group.completeness = EvidenceCompleteness::Complete;
             }
             continue;
         }
         index.insert(identity, groups.len());
         groups.push(DispatchTargetGroup {
             representative: target.definition,
-            proof: target.proof,
+            proof: proof_from_usage(target.proof),
+            completeness: completeness_from_usage(target.proof),
+            receiver_hint: false,
         });
     }
     groups
@@ -520,6 +529,86 @@ impl<'a> WorkspaceSemanticOracle<'a> {
             self.workspace.analyzer(),
             lookup.targets,
         ));
+        let ordinary_dispatch_is_only_unresolved = target_groups.is_empty()
+            && !lookup.truncated
+            && boundaries
+                .iter()
+                .all(|boundary| boundary.kind == DispatchBoundaryKind::Unresolved)
+            && (call_dispatch_gap.is_some() || !boundaries.is_empty());
+        let hinted_dispatch = ordinary_dispatch_is_only_unresolved
+            .then(|| self.dispatch_hints().for_call(call.procedure(), call.id()))
+            .flatten();
+        let mut hinted_arms_materialized = hinted_dispatch.is_some();
+        let mut hinted_external_targets = HashSet::<SemanticLocator>::default();
+        if let Some(hint_set) = hinted_dispatch {
+            let receiver_classes = hint_set
+                .hints()
+                .iter()
+                .map(|hint| hint.receiver_class().qualified_name())
+                .collect::<Vec<_>>();
+            let proof = if hint_set.singleton() {
+                ProofStatus::Proven
+            } else {
+                ProofStatus::Unproven(
+                    format!("target selected by propagated receiver classes {receiver_classes:?}")
+                        .into(),
+                )
+            };
+            let completeness = if hint_set.exhaustive() {
+                EvidenceCompleteness::Complete
+            } else {
+                EvidenceCompleteness::Partial(
+                    "propagated receiver classes do not cover every call arm".into(),
+                )
+            };
+            let mut declarations = HashSet::default();
+            for hint in hint_set.hints() {
+                match hint.declaration() {
+                    MemberDeclaration::Workspace(declaration) => {
+                        if declarations.insert(declaration.clone()) {
+                            target_groups.push_back(DispatchTargetGroup {
+                                representative: declaration.clone(),
+                                proof: proof.clone(),
+                                completeness: completeness.clone(),
+                                receiver_hint: true,
+                            });
+                        }
+                    }
+                    MemberDeclaration::External(declaration) => {
+                        let Some(targets) = hinted_external_member_targets(
+                            self,
+                            declaration,
+                            call_language,
+                            semantic_call,
+                        ) else {
+                            hinted_arms_materialized = false;
+                            continue;
+                        };
+                        for (target, summary_complete) in targets {
+                            hinted_arms_materialized &= summary_complete;
+                            hinted_external_targets.insert(target.locator().clone());
+                            boundaries.push(DispatchBoundary {
+                                kind: DispatchBoundaryKind::External(Some(
+                                    target.locator().clone(),
+                                )),
+                                exact_external_target: None,
+                                unmaterialized_external_target: Some(target),
+                                proof: proof.clone(),
+                                completeness: if summary_complete {
+                                    EvidenceCompleteness::Complete
+                                } else {
+                                    EvidenceCompleteness::Partial(
+                                        "propagated external receiver member has no complete authored procedure summary"
+                                            .into(),
+                                    )
+                                },
+                                provenance: Box::new([]),
+                            });
+                        }
+                    }
+                }
+            }
+        }
         // Every declaration this call has already queued, so a class-hierarchy
         // expansion (below) can never queue the same implementor twice and two
         // interfaces that declare the same member cannot loop.
@@ -587,9 +676,9 @@ impl<'a> WorkspaceSemanticOracle<'a> {
             // declaration/body expansion. Do not repeat it by global FQN here:
             // that would cross C/C++ link units and bypass dispatch work bounds.
             let mut matched_any = false;
-            let mut matched_quality = match group.proof {
-                UsageProof::Proven => DispatchQuality::Complete,
-                UsageProof::Unproven => DispatchQuality::Unproven,
+            let mut matched_quality = match &group.proof {
+                ProofStatus::Proven => DispatchQuality::Complete,
+                ProofStatus::Unproven(_) => DispatchQuality::Unproven,
             };
             let mut failure_quality = DispatchQuality::Complete;
             // Whether the declaration's own file was materialized completely.
@@ -618,8 +707,8 @@ impl<'a> WorkspaceSemanticOracle<'a> {
                         &value,
                         &mut candidates,
                         &mut candidate_indexes,
-                        proof_from_usage(group.proof),
-                        completeness_from_usage(group.proof),
+                        group.proof.clone(),
+                        group.completeness.clone(),
                         max_dispatch_targets,
                     );
                     matched_any |= has_match;
@@ -800,7 +889,7 @@ impl<'a> WorkspaceSemanticOracle<'a> {
                 // body-less arm), which already asks unconditionally. Only
                 // *acting* on a non-empty answer by widening the candidate
                 // set stays behind the flag.
-                if complete_materialization {
+                if complete_materialization && !group.receiver_hint {
                     if staged_request.charge_execution_traversal(1) {
                         matched_concrete_groups = true;
                         match virtual_dispatch_implementor_targets(
@@ -820,7 +909,14 @@ impl<'a> WorkspaceSemanticOracle<'a> {
                                         if queued_declarations.insert(overriding.clone()) {
                                             target_groups.push_back(DispatchTargetGroup {
                                                 representative: overriding,
-                                                proof: UsageProof::Unproven,
+                                                proof: ProofStatus::Unproven(
+                                                    "dispatch target is a possible override".into(),
+                                                ),
+                                                completeness: EvidenceCompleteness::Partial(
+                                                    "dispatch cannot prove one complete override target identity"
+                                                        .into(),
+                                                ),
+                                                receiver_hint: false,
                                             });
                                         }
                                     }
@@ -862,7 +958,7 @@ impl<'a> WorkspaceSemanticOracle<'a> {
                         )
                     }),
                     unmaterialized_external_target: None,
-                    proof: proof_from_usage(group.proof),
+                    proof: group.proof.clone(),
                     completeness: EvidenceCompleteness::Partial(
                         "equivalent callable declarations have no published workspace body".into(),
                     ),
@@ -883,7 +979,7 @@ impl<'a> WorkspaceSemanticOracle<'a> {
                 // pushed just above stays with them, so the answer says "the
                 // named callee has no body, and these are the members that
                 // could run" rather than claiming a resolved edge.
-                if complete_materialization {
+                if complete_materialization && !group.receiver_hint {
                     if staged_request.charge_execution_traversal(1) {
                         if let Some(implementors) = virtual_dispatch_implementor_targets(
                             self.workspace.analyzer(),
@@ -894,7 +990,14 @@ impl<'a> WorkspaceSemanticOracle<'a> {
                                 if queued_declarations.insert(implementor.clone()) {
                                     target_groups.push_back(DispatchTargetGroup {
                                         representative: implementor,
-                                        proof: UsageProof::Unproven,
+                                        proof: ProofStatus::Unproven(
+                                            "dispatch target is a possible implementor".into(),
+                                        ),
+                                        completeness: EvidenceCompleteness::Partial(
+                                            "dispatch cannot prove one complete implementor target identity"
+                                                .into(),
+                                        ),
+                                        receiver_hint: false,
                                     });
                                 }
                             }
@@ -941,6 +1044,29 @@ impl<'a> WorkspaceSemanticOracle<'a> {
                 merge_dispatch_quality(materialization_quality, DispatchQuality::Truncated);
         }
 
+        let hint_refinement_complete = hinted_dispatch.is_some_and(|hint_set| {
+            hint_set.exhaustive()
+                && hinted_arms_materialized
+                && materialization_exceeded.is_none()
+                && !final_candidates_truncated
+                && !request.cancellation.is_cancelled()
+                && boundaries.iter().all(|boundary| {
+                    boundary.kind == DispatchBoundaryKind::Unresolved
+                        || matches!(
+                            &boundary.kind,
+                            DispatchBoundaryKind::External(Some(target))
+                                if hinted_external_targets.contains(target)
+                                    && matches!(
+                                        boundary.completeness,
+                                        EvidenceCompleteness::Complete
+                                    )
+                        )
+                })
+        });
+        if hint_refinement_complete {
+            boundaries.retain(|boundary| boundary.kind != DispatchBoundaryKind::Unresolved);
+        }
+
         let (anonymous_receiver_refined, receiver_refinement_work) = self
             .refine_java_anonymous_receiver_dispatch(
                 call,
@@ -956,7 +1082,7 @@ impl<'a> WorkspaceSemanticOracle<'a> {
 
         let resolver_proven_external_static =
             resolver_proven_external_static_boundary(lookup.status, &candidates, &boundaries);
-        let call_dispatch_gap = (!anonymous_receiver_refined)
+        let call_dispatch_gap = (!anonymous_receiver_refined && !hint_refinement_complete)
             .then_some(call_dispatch_gap)
             .flatten()
             .filter(|gap| {
@@ -1099,7 +1225,10 @@ impl<'a> WorkspaceSemanticOracle<'a> {
             CandidateCoverage::Truncated
         } else if cancelled {
             CandidateCoverage::Open
-        } else if anonymous_receiver_refined || resolver_proven_external_static {
+        } else if anonymous_receiver_refined
+            || resolver_proven_external_static
+            || hint_refinement_complete
+        {
             CandidateCoverage::Exhaustive
         } else {
             dispatch_coverage(lookup.status, &boundaries)
@@ -2161,7 +2290,7 @@ fn unmaterialized_target_boundary(
         )?),
         exact_external_target: None,
         unmaterialized_external_target: None,
-        proof: proof_from_usage(target.proof),
+        proof: target.proof.clone(),
         completeness: EvidenceCompleteness::Partial(reason.into()),
         provenance: Box::new([]),
     })
@@ -2634,6 +2763,102 @@ fn low_level_boundary(
     }
 }
 
+fn hinted_external_member_targets(
+    oracle: &WorkspaceSemanticOracle<'_>,
+    declaration: &crate::analyzer::semantic::ExternalMemberDeclaration,
+    language: SemanticLanguage,
+    semantic_call: &SemanticCallSite,
+) -> Option<Vec<(UnmaterializedExternalTarget, bool)>> {
+    let overlay = oracle.semantic_model_overlay()?;
+    let arity = u32::try_from(semantic_call.arguments.len()).ok()?;
+    let mut targets = Vec::new();
+    for symbol_id in declaration.symbol_ids() {
+        let matched = overlay.symbols_with_id(symbol_id);
+        let [symbol] = matched.records.as_slice() else {
+            return None;
+        };
+        if !matches!(
+            symbol.kind,
+            SemanticModelSymbolKind::Constructor
+                | SemanticModelSymbolKind::Method
+                | SemanticModelSymbolKind::Function
+        ) || symbol.language != language.semantic_pack_label()
+        {
+            return None;
+        }
+        let owner_id = symbol.owner_id.as_deref()?;
+        let owners = overlay.symbols_with_id(owner_id);
+        let [owner] = owners.records.as_slice() else {
+            return None;
+        };
+        let target = modeled_unmaterialized_external(
+            &owner.qualified_name,
+            &symbol.name,
+            language,
+            arity,
+            symbol.has_receiver(),
+        )?;
+        let complete = hinted_external_summary_is_complete(oracle, &target);
+        targets.push((target, complete));
+    }
+    targets.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+    targets.dedup_by(|left, right| {
+        if left.0 == right.0 {
+            left.1 &= right.1;
+            true
+        } else {
+            false
+        }
+    });
+    (!targets.is_empty()).then_some(targets)
+}
+
+fn hinted_external_summary_is_complete(
+    oracle: &WorkspaceSemanticOracle<'_>,
+    target: &UnmaterializedExternalTarget,
+) -> bool {
+    let Some(active) = oracle.active_semantic_models() else {
+        return false;
+    };
+    let matched = active.procedure_summaries_for_member(ProcedureSummaryMemberKey::new(
+        target.language().semantic_pack_label(),
+        target.owner_fqn(),
+        target.member(),
+        target.has_receiver(),
+        target.arity(),
+    ));
+    match matched.disposition {
+        SemanticModelMatchDisposition::Unique => matches!(
+            matched.records.as_slice(),
+            [selected] if selected.record.completeness == Completeness::Complete
+        ),
+        SemanticModelMatchDisposition::Conflict => {
+            let Some((first, rest)) = matched.records.split_first() else {
+                return false;
+            };
+            first.record.completeness == Completeness::Complete
+                && !rest.is_empty()
+                && rest.iter().all(|other| {
+                    other.record.completeness == Completeness::Complete
+                        && external_flow_claims_agree(other.record, first.record)
+                })
+        }
+        SemanticModelMatchDisposition::Empty => false,
+    }
+}
+
+fn external_flow_claims_agree(
+    left: &CompiledProcedureSummary,
+    right: &CompiledProcedureSummary,
+) -> bool {
+    left.covers_overrides == right.covers_overrides
+        && left.normal_continuation_absent == right.normal_continuation_absent
+        && left.normal_result_count == right.normal_result_count
+        && left.locations == right.locations
+        && left.transfers == right.transfers
+        && left.effects == right.effects
+}
+
 fn unresolved_dispatch_boundary(status: DefinitionLookupStatus) -> DispatchBoundary {
     DispatchBoundary {
         kind: DispatchBoundaryKind::Unresolved,
@@ -2766,6 +2991,49 @@ fn synthetic_unmaterialized_external(
             locator,
         )
     })
+}
+
+fn modeled_unmaterialized_external(
+    owner_fqn: &str,
+    member: &str,
+    language: SemanticLanguage,
+    arity: u32,
+    has_receiver: bool,
+) -> Option<UnmaterializedExternalTarget> {
+    let anchor = zero_source_anchor();
+    let owner_segment = DeclarationSegment::named(
+        DeclarationSegmentKind::Type,
+        owner_fqn.to_owned(),
+        anchor,
+        0,
+    )
+    .ok()?;
+    let member_kind = if has_receiver {
+        DeclarationSegmentKind::Method
+    } else {
+        DeclarationSegmentKind::Function
+    };
+    let member_segment =
+        DeclarationSegment::named(member_kind, member.to_owned(), anchor, arity).ok()?;
+    let declaration = DeclarationLocator::new(vec![owner_segment, member_segment]).ok()?;
+    let locator = SemanticLocator::new(
+        unmaterialized_external_mount(),
+        unmaterialized_external_path(),
+        language,
+        declaration,
+        SemanticRole::Procedure,
+        anchor,
+    );
+    Some(
+        UnmaterializedExternalTarget::new_with_normalized_static_owner(
+            owner_fqn.to_owned(),
+            member.to_owned(),
+            arity,
+            has_receiver,
+            None,
+            locator,
+        ),
+    )
 }
 
 fn zero_source_anchor() -> SourceAnchor {
@@ -3643,8 +3911,10 @@ fn compare_locator_fields(left: &SemanticLocator, right: &SemanticLocator) -> Or
 mod tests {
     use super::*;
     use crate::analyzer::semantic::{
-        OracleLimitValues, OracleRelationKind, SemanticBudget, SemanticBudgetDimension,
-        SemanticGapDischarge, SemanticGapId, SemanticGapImpact, SemanticGapImpacts,
+        ClassIdentity, DispatchHint, DispatchHintCallSiteKey, DispatchHintSet, DispatchHints,
+        MemberDeclaration, OracleLimitValues, OracleRelationKind, SemanticBudget,
+        SemanticBudgetDimension, SemanticGapDischarge, SemanticGapId, SemanticGapImpact,
+        SemanticGapImpacts, SourceSite, SourceSiteKind, WorkspaceIcfgProvider,
     };
     use crate::analyzer::{
         AnalyzerConfig, CallableArity, Language, OverlayProject, ParameterMetadata, Project,
@@ -3748,6 +4018,86 @@ mod tests {
 
     fn semantic_call_handle() -> crate::analyzer::semantic::CallSiteHandle {
         semantic_call_fixture().1
+    }
+
+    #[test]
+    fn propagated_singleton_receiver_resolves_an_unresolved_python_member_call() {
+        let (fixture, call) = semantic_call_fixture_for_language(
+            Language::Python,
+            "hinted.py",
+            "class A:\n    def foo(self):\n        return 1\n\ndef caller(x):\n    return x.foo()\n",
+        );
+        let analyzer = fixture.analyzer.analyzer();
+        let file = ProjectFile::new(fixture.project_root(), "hinted.py");
+        let declarations = analyzer.get_declarations(&file);
+        let class = declarations
+            .iter()
+            .find(|declaration| declaration.is_class())
+            .cloned()
+            .expect("class A declaration");
+        let member = declarations
+            .into_iter()
+            .find(|definition| definition.terminal_name() == "foo")
+            .expect("A.foo declaration");
+        let mapping = call
+            .procedure()
+            .semantics()
+            .source_mapping(
+                call.procedure()
+                    .semantics()
+                    .call_site(call.id())
+                    .expect("live call")
+                    .source,
+            )
+            .expect("call source mapping");
+        let origin = SourceSite {
+            file,
+            span: mapping.locator.anchor().span(),
+            kind: SourceSiteKind::DeclaredParameter,
+        };
+        let hints = DispatchHints::new(vec![DispatchHintSet::new(
+            DispatchHintCallSiteKey::for_call(call.procedure(), call.id()),
+            vec![DispatchHint::new(
+                MemberDeclaration::Workspace(member),
+                ClassIdentity::Workspace(class),
+                origin,
+            )],
+            true,
+            true,
+        )]);
+        let provider = WorkspaceIcfgProvider::with_active_semantic_model_snapshot_and_hints(
+            &fixture.analyzer,
+            None,
+            hints,
+        );
+        let cancellation = CancellationToken::default();
+        let mut budget = SemanticBudget::default();
+        let outcome = provider
+            .resolve_call(&call, &mut SemanticRequest::new(&mut budget, &cancellation))
+            .expect("hinted dispatch");
+        let result = outcome.available_value().expect("hinted dispatch answer");
+
+        assert_eq!(result.coverage(), CandidateCoverage::Exhaustive);
+        assert_eq!(result.candidates().len(), 1, "{result:#?}");
+        assert!(matches!(result.candidates()[0].proof, ProofStatus::Proven));
+        assert_eq!(
+            result.candidates()[0]
+                .target()
+                .semantics()
+                .locator()
+                .declaration()
+                .segments()
+                .last()
+                .and_then(DeclarationSegment::name),
+            Some("foo")
+        );
+        assert!(
+            result
+                .boundaries()
+                .iter()
+                .all(|boundary| boundary.kind != DispatchBoundaryKind::Unresolved),
+            "{result:#?}"
+        );
     }
 
     #[test]

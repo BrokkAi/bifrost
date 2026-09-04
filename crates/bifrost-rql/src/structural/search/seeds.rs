@@ -682,6 +682,7 @@ pub(super) fn execute_environment_seed(
     let mut rows: Vec<PipelineRow> = Vec::new();
     let mut indexes: HashMap<PipelineKey, usize> = HashMap::default();
     let mut truncated = false;
+    let mut visited_rows = 0_usize;
     for file in files {
         if state
             .cancellation
@@ -704,30 +705,39 @@ pub(super) fn execute_environment_seed(
         state
             .environment_cache
             .report_completeness(&file, &result, required_axes, diagnostics);
-        let values: Vec<PipelineValue> = match kind {
+        let joined_scopes = state.environment_cache.joined_scopes(&file);
+        let values: Vec<(PipelineValue, bool)> = match kind {
             EnvironmentSeedKind::Scopes(filter) => environment::select_scopes(&result, filter)
                 .map(|index| {
-                    PipelineValue::LexicalScope(ScopeValue {
-                        file: file.clone(),
-                        result: Arc::clone(&result),
-                        index,
-                    })
+                    (
+                        PipelineValue::LexicalScope(ScopeValue {
+                            file: file.clone(),
+                            result: Arc::clone(&result),
+                            index,
+                        }),
+                        joined_scopes
+                            .as_ref()
+                            .is_none_or(|joined| joined.contains(&index)),
+                    )
                 })
                 .collect(),
             EnvironmentSeedKind::Bindings(filter) => environment::select_bindings(&result, filter)
                 .map(|index| {
-                    PipelineValue::Binding(BindingValue {
-                        file: file.clone(),
-                        result: Arc::clone(&result),
-                        index,
-                        shadowed: false,
-                        reached_from: None,
-                    })
+                    (
+                        PipelineValue::Binding(BindingValue {
+                            file: file.clone(),
+                            result: Arc::clone(&result),
+                            index,
+                            shadowed: false,
+                            reached_from: None,
+                        }),
+                        true,
+                    )
                 })
                 .collect(),
         };
-        for value in values {
-            if rows.len() >= desired_rows {
+        for (value, retain) in values {
+            if visited_rows >= desired_rows {
                 truncated = true;
                 diagnostics.push(CodeQueryDiagnostic {
                     code: CodeQueryDiagnosticCode::EnvironmentRowBudgetExhausted,
@@ -740,8 +750,11 @@ pub(super) fn execute_environment_seed(
                 });
                 break;
             }
+            visited_rows = visited_rows.saturating_add(1);
             state.budget.pipeline_rows = state.budget.pipeline_rows.saturating_add(1);
-            insert_pipeline_row(&mut rows, &mut indexes, value, Vec::new(), false);
+            if retain {
+                insert_pipeline_row(&mut rows, &mut indexes, value, Vec::new(), false);
+            }
         }
         if truncated {
             break;

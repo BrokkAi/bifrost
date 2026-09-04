@@ -217,7 +217,8 @@ pub(super) fn binding_of_expansions(
     // an answer *about one occurrence*, and a consumer that captured that token
     // joins on this rather than guessing which returned binding is theirs.
     let reached_from = row.ast_id();
-    let binding = |index: usize, shadowed: bool| {
+    let mut binding = |index: usize, shadowed: bool| {
+        environment_cache.record_joined_scope(&row.file, result.bindings[index].declaring_scope);
         pipeline_expansion(PipelineValue::Binding(BindingValue {
             file: row.file.clone(),
             result: Arc::clone(&result),

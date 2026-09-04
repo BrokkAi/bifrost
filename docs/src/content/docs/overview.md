@@ -13,6 +13,10 @@ Bifrost is designed to stay lean on real repositories, not just small demos. The
 
 More complex static analysis runs on demand when a tool call needs it. Results can be cached, but the source of truth stays incremental: file changes update the declaration index, and deeper relationship, usage, summary, or type analysis is recomputed only for the affected work. This architecture is intended to reduce long-lived memory and repeated work without trading correctness for raw text shortcuts; it is not itself a measured performance result. See [Evidence and Evaluation Methodology](/evaluation-evidence/) for the current public evidence and remaining benchmark gaps.
 
+The [Design and Architecture guide](/design/) explains the system layers,
+identity model, storage and cache strategy, usage and dataflow engines, semantic
+models, result contract, design decisions, outlook, and related work.
+
 ## Language Coverage
 
 Bifrost includes analyzers for Java, JavaScript, TypeScript, Rust, Go, Python, C, C++, C#, PHP, Scala, Ruby, and Kotlin.

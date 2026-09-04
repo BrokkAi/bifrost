@@ -15,27 +15,29 @@
 
 use std::error::Error;
 use std::fmt;
+use std::sync::Arc;
 
 use brokk_bifrost_core::profiling;
 
 use crate::analyzer::WorkspaceAnalyzer;
 use crate::analyzer::semantic::{
-    ClassAtom, ClassIdentity, IcfgProvider, MemberLookup, ProcedureHandle, SemanticBudget,
-    TypeFlowAdapter, UnknownReason,
+    ClassAtom, ClassIdentity, DispatchHint, DispatchHintCallSiteKey, DispatchHintSet,
+    DispatchHints, MemberAccessKind, MemberDeclaration, MemberLookup, ProcedureHandle,
+    SemanticBudget, SourceSite, TypeFlowAdapter, UnknownReason, WorkspaceIcfgProvider,
 };
+use crate::analyzer::semantic_model::ActiveSemanticModelSnapshot;
 use crate::dataflow::{
     DataflowRequest, PathQuality, SolverTermination, SummaryWitness, WitnessReconstructionLimits,
     WitnessRetentionLimits,
 };
 use crate::value_flow::{
-    ClosureLimits, ValueFlowCarrier, ValueFlowMeeting, ValueFlowSinkId, ValueFlowSinkOutcome,
-    ValueFlowSolveError, ValueFlowSummaryResult, solve_value_flow_with_witnesses,
+    ClosureLimits, ValueFlowCache, ValueFlowCarrier, ValueFlowMeeting, ValueFlowSinkId,
+    ValueFlowSinkOutcome, ValueFlowSolveError, ValueFlowSummaryResult, WorkspaceValueFlowProvider,
+    solve_value_flow_with_witnesses,
 };
 
 use super::FieldSlotIndex;
-use super::plan::{
-    MemberAccessSite, SourceSite, TypeFlowPlan, TypeFlowPlanError, uncovered_reason,
-};
+use super::plan::{MemberAccessSite, TypeFlowPlan, TypeFlowPlanError, uncovered_reason};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClassSetStatus {
@@ -85,6 +87,10 @@ impl ClassSetStatus {
 pub struct ReceiverClassSet {
     pub site: MemberAccessSite,
     pub classes: Vec<(ClassIdentity, SourceSite)>,
+    /// Exact declarations that proved a class in `classes` has this member.
+    /// Retained so feedback consumes the same lookup verdict that authorized
+    /// the Known set instead of repeating a language query.
+    pub member_declarations: Vec<(ClassIdentity, MemberDeclaration)>,
     pub unknown: Vec<UnknownReason>,
     pub status: ClassSetStatus,
 }
@@ -133,6 +139,34 @@ pub enum TypeFlowError {
     Cancelled,
 }
 
+/// Bound on discover-plan-solve passes for one root. One pass preserves the
+/// pre-feedback behavior; later passes consume receiver hints derived from the
+/// preceding result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct FeedbackLimits {
+    max_iterations: usize,
+}
+
+impl FeedbackLimits {
+    pub fn new(max_iterations: usize) -> Self {
+        assert!(
+            max_iterations > 0,
+            "type-flow feedback requires at least one solve iteration"
+        );
+        Self { max_iterations }
+    }
+
+    pub const fn max_iterations(self) -> usize {
+        self.max_iterations
+    }
+}
+
+impl Default for FeedbackLimits {
+    fn default() -> Self {
+        Self::new(3)
+    }
+}
+
 impl fmt::Display for TypeFlowError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -158,41 +192,122 @@ impl From<ValueFlowSolveError> for TypeFlowError {
     }
 }
 
-/// Build the plan for `root`, solve it against `provider`, and interpret
-/// every member-access sink.
+/// Repeatedly build and solve `root` against one captured semantic-model
+/// snapshot, feeding Known receiver classes into the next iteration's
+/// immutable dispatch hints until the table stops changing or the bound is
+/// reached.
 #[allow(clippy::too_many_arguments)]
-pub fn solve_type_flow_for_root<Provider: IcfgProvider + ?Sized>(
+pub fn solve_type_flow_for_root(
     workspace: &WorkspaceAnalyzer,
     adapter: &dyn TypeFlowAdapter,
     field_slots: &FieldSlotIndex,
     root: &ProcedureHandle,
-    provider: &Provider,
+    active_semantic_model_snapshot: Option<Arc<ActiveSemanticModelSnapshot>>,
     limits: ClosureLimits,
+    feedback_limits: FeedbackLimits,
     semantic_budget: &mut SemanticBudget,
     request: &mut DataflowRequest<'_>,
 ) -> Result<TypeFlowRootResult, TypeFlowError> {
-    let plan = TypeFlowPlan::build(
-        workspace,
-        adapter,
-        field_slots,
-        root,
-        limits,
-        semantic_budget,
-        request.cancellation,
-    )?;
-    let result = {
-        let _scope = profiling::scope("type_flow.solve");
-        solve_value_flow_with_witnesses(
+    let value_flow_cache = ValueFlowCache::default();
+    let mut dispatch_hints = DispatchHints::empty();
+    let mut previous = None;
+    for iteration in 0..feedback_limits.max_iterations() {
+        // A feedback pass is a speculative refinement of the preceding
+        // result. Stage its semantic charges so an exhausted refinement can
+        // fall back to that sound result without both degrading the answer
+        // and consuming work for a pass whose output is discarded.
+        let mut iteration_budget = semantic_budget.clone();
+        let provider = WorkspaceIcfgProvider::with_active_semantic_model_snapshot_and_hints(
+            workspace,
+            active_semantic_model_snapshot.clone(),
+            dispatch_hints.clone(),
+        );
+        let discovery_provider = WorkspaceValueFlowProvider::with_oracle(
+            provider.oracle().clone(),
+            value_flow_cache.clone(),
+        );
+        let plan = TypeFlowPlan::build(
+            workspace,
+            adapter,
+            field_slots,
             root,
-            provider,
-            plan.value_flow(),
-            WitnessRetentionLimits::new(1)
-                .expect("one alternative is a valid witness retention limit"),
-            semantic_budget,
-            request,
-        )?
-    };
-    Ok(interpret(workspace, adapter, root, &plan, &result))
+            &discovery_provider,
+            limits,
+            &mut iteration_budget,
+            request.cancellation,
+        )?;
+        let result = {
+            let _scope = profiling::scope("type_flow.solve");
+            solve_value_flow_with_witnesses(
+                root,
+                &provider,
+                plan.value_flow(),
+                WitnessRetentionLimits::new(1)
+                    .expect("one alternative is a valid witness retention limit"),
+                &mut iteration_budget,
+                request,
+            )?
+        };
+        let interpreted = interpret(workspace, adapter, root, &plan, &result);
+        if interpreted.semantic_budget_exhausted || !interpreted.complete {
+            if let Some(previous) = previous {
+                return Ok(previous);
+            }
+            *semantic_budget = iteration_budget;
+            return Ok(interpreted);
+        }
+        *semantic_budget = iteration_budget;
+        let next_hints = dispatch_hints.with_updates(dispatch_hint_updates(&plan, &interpreted));
+        if next_hints.digest() == dispatch_hints.digest()
+            || iteration + 1 == feedback_limits.max_iterations()
+        {
+            return Ok(interpreted);
+        }
+        previous = Some(interpreted);
+        dispatch_hints = next_hints;
+    }
+    unreachable!("FeedbackLimits requires at least one iteration")
+}
+
+fn dispatch_hint_updates(plan: &TypeFlowPlan, result: &TypeFlowRootResult) -> Vec<DispatchHintSet> {
+    let mut updates = Vec::new();
+    for set in &result.class_sets {
+        if set.status != ClassSetStatus::Known || set.site.kind != MemberAccessKind::Call {
+            continue;
+        }
+        let call = set
+            .site
+            .call
+            .expect("a call-shaped member sink retains its call-site ID");
+        if uncovered_reason(plan.coverage_of(&set.site.procedure, call))
+            != Some(UnknownReason::UnresolvedCall)
+        {
+            continue;
+        }
+        let hints = set
+            .member_declarations
+            .iter()
+            .map(|(class, declaration)| {
+                let origin = set
+                    .classes
+                    .iter()
+                    .find(|(candidate, _)| candidate == class)
+                    .map(|(_, origin)| origin.clone())
+                    .expect("a retained member declaration belongs to the receiver class set");
+                DispatchHint::new(declaration.clone(), class.clone(), origin)
+            })
+            .collect::<Vec<_>>();
+        if hints.is_empty() {
+            continue;
+        }
+        updates.push(DispatchHintSet::new(
+            DispatchHintCallSiteKey::for_call(&set.site.procedure, call),
+            hints,
+            true,
+            set.classes.len() == 1,
+        ));
+    }
+    updates
 }
 
 fn interpret(
@@ -228,6 +343,7 @@ fn interpret(
             ValueFlowSinkOutcome::NotReached if complete => ReceiverClassSet {
                 site,
                 classes: Vec::new(),
+                member_declarations: Vec::new(),
                 unknown: Vec::new(),
                 status: ClassSetStatus::NoInformation,
             },
@@ -240,6 +356,7 @@ fn interpret(
                 ReceiverClassSet {
                     site,
                     classes: Vec::new(),
+                    member_declarations: Vec::new(),
                     unknown: vec![unreached_reason(
                         plan,
                         sink_id,
@@ -252,10 +369,25 @@ fn interpret(
         };
         class_sets.push(set);
     }
+    let mut distinct_findings: Vec<AbsentMemberFinding> = Vec::new();
+    for finding in findings {
+        if let Some(existing) = distinct_findings.iter_mut().find(|existing| {
+            existing.site.file == finding.site.file
+                && existing.site.span == finding.site.span
+                && existing.site.member == finding.site.member
+                && existing.class == finding.class
+        }) {
+            if existing.witness.is_none() && finding.witness.is_some() {
+                existing.witness = finding.witness;
+            }
+        } else {
+            distinct_findings.push(finding);
+        }
+    }
     TypeFlowRootResult {
         root: root.clone(),
         class_sets,
-        findings,
+        findings: distinct_findings,
         complete,
         semantic_budget_exhausted,
     }
@@ -309,6 +441,7 @@ fn reached_class_set(
     // Parallel vecs: `classes[i]` was introduced by `class_meetings[i]`.
     let mut classes: Vec<(ClassIdentity, SourceSite)> = Vec::new();
     let mut class_meetings: Vec<&ValueFlowMeeting> = Vec::new();
+    let mut member_declarations = Vec::new();
     let mut unknown: Vec<UnknownReason> = Vec::new();
     for meeting in meetings {
         if meeting.is_uncertain() {
@@ -338,7 +471,9 @@ fn reached_class_set(
         let mut absent: Vec<usize> = Vec::new();
         for (index, (identity, _)) in classes.iter().enumerate() {
             match adapter.member_lookup(workspace, identity, &site.member) {
-                MemberLookup::Present => {}
+                MemberLookup::Present(declaration) => {
+                    member_declarations.push((identity.clone(), declaration));
+                }
                 MemberLookup::Absent => absent.push(index),
                 MemberLookup::Unknown(reason) => push_reason(&mut unknown, reason),
             }
@@ -361,6 +496,7 @@ fn reached_class_set(
     ReceiverClassSet {
         site,
         classes,
+        member_declarations,
         unknown,
         status,
     }

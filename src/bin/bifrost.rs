@@ -261,6 +261,7 @@ fn run_inner(
     let mut tool_sources = Vec::new();
     let mut diff_snapshot_object_dir: Option<PathBuf> = None;
     let mut query_file: Option<String> = None;
+    let mut workspace_scaled_limits = false;
     let mut render_options = McpRenderOptions::default();
     let mut no_line_numbers_seen = false;
     let mut policy_files = Vec::new();
@@ -378,6 +379,12 @@ fn run_inner(
                 if query_file.replace(value).is_some() {
                     return Err("--query-file may only be provided once".to_string());
                 }
+            }
+            "--workspace-scaled-limits" => {
+                if workspace_scaled_limits {
+                    return Err("--workspace-scaled-limits may only be provided once".to_string());
+                }
+                workspace_scaled_limits = true;
             }
             "--sources" => {
                 let value = args
@@ -621,10 +628,11 @@ fn run_inner(
             || mcp_mode.is_some()
             || no_line_numbers_seen
             || diff_snapshot_object_dir.is_some()
+            || workspace_scaled_limits
             || install
         {
             return Err(
-                "policy options cannot be combined with --install, --query-file, --tool, --args, --mcp, --lsp, or --repl, --no-line-numbers, or --diff-snapshot-object-dir"
+                "policy options cannot be combined with --install, --query-file, --tool, --args, --mcp, --lsp, --repl, --no-line-numbers, --workspace-scaled-limits, or --diff-snapshot-object-dir"
                     .to_string(),
             );
         }
@@ -814,6 +822,7 @@ fn run_inner(
             || diff_snapshot_object_dir.is_some()
             || query_file.is_some()
             || no_line_numbers_seen
+            || workspace_scaled_limits
         {
             return Err("--install cannot be combined with other options".to_string());
         }
@@ -844,8 +853,13 @@ fn run_inner(
             &[],
             render_options,
             None,
+            workspace_scaled_limits,
         )
         .map(|()| CliRunResult::Complete);
+    }
+
+    if workspace_scaled_limits {
+        return Err("--workspace-scaled-limits requires --query-file".to_string());
     }
 
     if let Some(tool_name) = tool_name {
@@ -862,6 +876,7 @@ fn run_inner(
             &tool_sources,
             render_options,
             diff_snapshot_object_dir,
+            false,
         )
         .map(|()| CliRunResult::Complete);
     }
@@ -1827,6 +1842,7 @@ fn run_tool(
     tool_sources: &[String],
     render_options: McpRenderOptions,
     diff_snapshot_object_dir: Option<PathBuf>,
+    workspace_scaled_limits: bool,
 ) -> Result<(), String> {
     let canonical_root = root
         .canonicalize()
@@ -1837,6 +1853,13 @@ fn run_tool(
     let service = match diff_snapshot_object_dir {
         Some(dir) => service.with_diff_snapshot_object_dir(dir),
         None => service,
+    };
+    // The one-shot CLI is the trusted host of its own query file, so it may
+    // grant the audited workspace's budget. An MCP client never can.
+    let service = if workspace_scaled_limits {
+        service.with_workspace_scaled_query_limits()
+    } else {
+        service
     };
     let cancellation = CancellationToken::new();
     #[cfg(unix)]
@@ -1925,6 +1948,11 @@ OPTIONS:
                            Optional; omission supplies {}, which suits get_active_workspace and
                            the default diff-tool worktree comparison.
     --query-file PATH      Run a workspace-relative .rql or .json CodeQuery directly.
+    --workspace-scaled-limits
+                           Run --query-file with the source-volume-scaled execution limits
+                           policy evaluation uses, instead of the interactive defaults. Only
+                           for a host that trusts its own query file: it is a CLI option, not
+                           a field the query document can set.
     --sources PATH         Restrict one-shot --tool or policy workspace construction to selected
                            files, directories, or globs. Repeatable. Explicit sources override
                            .bifrostignore.

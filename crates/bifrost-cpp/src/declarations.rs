@@ -2291,6 +2291,17 @@ fn recover_function_like_export_class_pair(
     }
     let sibling = node.next_named_sibling()?;
     let (name, raw_supertypes, body) = match sibling.kind() {
+        // At translation-unit scope tree-sitter can leave the malformed class
+        // head in one ERROR node and parse its body as the adjacent compound
+        // statement. The head still carries the export invocation, displaced
+        // class name, and optional `final` token in source order, so recover
+        // the name by the same positional rule as the other shapes.
+        "compound_statement" => (
+            recovered_export_head_name(node, sibling, source)
+                .map(|name| normalize_cpp_whitespace(node_text(name, source)))?,
+            None,
+            sibling,
+        ),
         "expression_statement" => {
             let compound = sibling.named_child(0)?;
             if compound.kind() != "compound_literal_expression" {
@@ -3645,8 +3656,8 @@ impl<'a> CppVisitor<'a> {
 
     /// Byte-range form of [`Self::node_is_inside_consumed_fragment`], for a
     /// candidate a recovery is about to reparse but has not yet turned into a
-    /// node -- e.g. a prototype-macro candidate (#2932) already claimed by an
-    /// enclosing envelope's earlier scan.
+    /// node -- e.g. a prototype-macro candidate (#2932) already claimed by a
+    /// prior structured recovery.
     fn byte_range_is_inside_consumed_fragment(&self, start: usize, end: usize) -> bool {
         self.consumed_fragment_regions
             .iter()
@@ -3670,25 +3681,6 @@ impl<'a> CppVisitor<'a> {
         scope: ScopeInfo,
         ancestry: &ParentIndex<'tree>,
     ) {
-        // The container root is ordinarily a clean `translation_unit` (or, for
-        // a recovery's own reparse, one too), so it never reaches
-        // `visit_node`'s dispatch: `push_cpp_container_work` below pushes only
-        // its named CHILDREN as individual work, each of which goes through
-        // `visit_node` and so through the "declaration"/"ERROR" arms' K&R
-        // prototype-macro scan. But tree-sitter can make the root of an
-        // entire malformed parse itself kind `ERROR` rather than wrapping it
-        // in `translation_unit` -- ext/pg.h's own header collapses a run of
-        // five consecutive `_((...))` prototypes this way, flattening them
-        // into 20+ named children of a bare root `ERROR`, none of which
-        // individually holds one candidate's complete `identifier ( ( ... )
-        // ) ;` leaf sequence (issue #2932). Run the same scan on the
-        // container root itself first, so this one node is not the sole
-        // exception `visit_node`'s dispatch would otherwise make of it; the
-        // consumed-region gate in `drain_cpp_work` then skips any child the
-        // reparse already indexed.
-        if node.has_error() && matches!(node.kind(), "ERROR" | "declaration") {
-            self.visit_prototype_macro_declarations(node, &scope);
-        }
         self.drain_cpp_work(
             vec![CppWork::Container(CppContainer { node, scope })],
             ancestry,
@@ -4206,11 +4198,6 @@ impl<'a> CppVisitor<'a> {
                     self.visit_macro_swallowed_function_declarations(node, scope);
                     self.visit_macro_wrapped_declarations(node, scope, ancestry);
                     self.visit_stranded_class_members(node, scope, ancestry);
-                    // K&R prototype-macro recovery (issue #2932) runs before
-                    // the envelope is walked as an ordinary container, so
-                    // the consumed-region gate in `drain_cpp_work` skips any
-                    // child node the reparse already indexed.
-                    self.visit_prototype_macro_declarations(node, scope);
                     stack.push(CppWork::Container(CppContainer {
                         node,
                         scope: scope.clone(),
@@ -4639,44 +4626,25 @@ impl<'a> CppVisitor<'a> {
     /// spelled `__P`, `OF`, or `PROTO` in other pre-ANSI-C codebases -- is
     /// defined only in headers outside this workspace (ruby's own
     /// `ruby/defines.h`), so tree-sitter-cpp has no grammar production for
-    /// `name _((args))` and turns each such line into wreckage: a
-    /// `declaration` or `ERROR` node whose children mis-associate the
-    /// parameter list as siblings of the declared name. Before this
+    /// `name _((args))` and turns each such line into a malformed
+    /// `declaration` or pointer-expression statement. Before this
     /// recovery, the ordinary declaration visitor read that wreckage as a
     /// field with the type and name swapped (e.g. a field literally named
     /// `VALUE`) and indexed no prototype for the real name at all.
     ///
-    /// [`cpp_prototype_macro_candidates`] recognizes the shape from its leaf
-    /// (token) sequence alone: an `identifier` leaf followed by two `(`
-    /// leaves, whose inner pair's `)` is immediately followed by the outer
-    /// pair's `)` and then a live `;`. This is exactly the leaf sequence a
-    /// preprocessor's `#define _(args) args` expansion would leave behind,
-    /// so admitting it does not require knowing the macro's spelling or
-    /// that it is defined anywhere this analyzer can see -- nothing else
-    /// distinguishes a real invocation from a false positive, so the leaf
-    /// shape is the only gate. For each candidate this reparses the run
-    /// before the macro token (the return type and declared name), the
-    /// inner parenthesized argument list (keeping its own parentheses as
-    /// the sole parameter-list parens), and the terminating `;`, each at its
-    /// original byte offset, as one included-range parse: the parser's
-    /// equivalent of a preprocessor deleting the macro token and its
-    /// wrapping parentheses. The result is admitted only when it is exactly
-    /// one clean function prototype spanning the whole recovered run; a
-    /// `NORETURN(void f _(( ... )));`-style macro wrapping the entire
-    /// prototype does not match, because its matched `))` is followed by a
-    /// third `)` rather than `;`, and is deliberately left unrecovered
-    /// (YAGNI: no witness needs it yet).
-    ///
-    /// One envelope can hold more than one candidate -- tree-sitter can
-    /// swallow several consecutive `_((...))` lines into one `ERROR` -- so
-    /// this scans `node`'s whole leaf sequence and resumes past each
-    /// admitted candidate's `;` to look for the next one. A candidate whose
-    /// run already lies inside an earlier recovery's consumed region is
-    /// skipped without reparsing: the caller can rescan a nested `ERROR` or
-    /// `declaration` that an outer envelope's scan already claimed, and this
-    /// keeps that rescan from minting the same prototype twice.
+    /// [`cpp_prototype_macro_candidates`] admits only parser-owned shapes that
+    /// preserve the declared name, a known one-argument compatibility macro,
+    /// the nested argument list, and a live terminator. It rejects arbitrary
+    /// identifiers and bare `ERROR` envelopes that flattened those relations;
+    /// guessing there previously turned malformed non-macro declarations into
+    /// invented functions. For each proven candidate this reparses the range
+    /// before the macro token, the inner parenthesized argument node, and the
+    /// terminating `;` as one included-range parse. That is the parser-native
+    /// equivalent of expanding `#define _(args) args` while retaining original
+    /// byte offsets. The result is admitted only when it is exactly one clean
+    /// function prototype spanning the recovered run.
     fn visit_prototype_macro_declarations(&mut self, node: Node<'_>, scope: &ScopeInfo) {
-        for candidate in cpp_prototype_macro_candidates(node) {
+        for candidate in cpp_prototype_macro_candidates(node, self.source) {
             let start = candidate.run_start;
             let end = candidate.semicolon_end;
             if self.byte_range_is_inside_consumed_fragment(start, end) {
@@ -13498,8 +13466,8 @@ fn cpp_error_swallowed_function_declaration_range(node: Node<'_>) -> Option<(usi
 struct PrototypeMacroCandidate {
     /// Where the return type and declared name begin.
     run_start: usize,
-    /// Byte just past the macro token identifier (`_`, `__P`, ...): the end
-    /// of the first reparse span.
+    /// Byte where the macro token identifier (`_`, `__P`, ...) begins: the
+    /// exclusive end of the first reparse span.
     identifier_start: usize,
     /// The inner `(`'s start byte: the start of the second reparse span.
     /// This paren is kept so the reparse sees exactly one parameter-list
@@ -13529,137 +13497,245 @@ impl PrototypeMacroCandidate {
     }
 }
 
-/// Every leaf (childless) token under `node`, in source order, omitting
-/// zero-width MISSING tokens the parser inserted to complete a production.
-/// [`cpp_prototype_macro_candidates`] reads the prototype-macro shape from
-/// this sequence alone, because tree-sitter groups the surrounding nodes
-/// differently depending on the macro's return type and argument shapes
-/// (issue #2932) -- the leaf sequence is the one thing that stays the same
-/// across all of them.
-///
-/// Iterative (explicit stack) rather than recursive: an error-recovery walk
-/// must stay stack-safe over arbitrarily deep or wide malformed input.
-fn cpp_leaf_tokens(node: Node<'_>) -> Vec<Node<'_>> {
-    let mut leaves = Vec::new();
-    let mut stack = vec![node];
-    while let Some(current) = stack.pop() {
-        if current.child_count() == 0 {
-            if !current.is_missing() {
-                leaves.push(current);
-            }
-            continue;
-        }
-        let mut cursor = current.walk();
-        for child in current
-            .children(&mut cursor)
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
-        {
-            stack.push(child);
-        }
-    }
-    leaves
+/// A live terminating semicolon owned directly by `node`.
+fn cpp_direct_semicolon(node: Node<'_>) -> Option<Node<'_>> {
+    node.child(node.child_count().checked_sub(1)?)
+        .filter(|child| child.kind() == ";" && !child.is_missing())
 }
 
-/// Scan `node`'s leaf sequence for every K&R prototype-macro candidate it
-/// holds. See [`CppVisitor::visit_prototype_macro_declarations`] for the
-/// admission shape and why the leaf sequence, rather than any particular
-/// node grouping, is the gate.
-fn cpp_prototype_macro_candidates(node: Node<'_>) -> Vec<PrototypeMacroCandidate> {
-    let leaves = cpp_leaf_tokens(node);
-    let mut candidates = Vec::new();
-    let mut i = 0;
-    while i + 2 < leaves.len() {
-        let identifier = leaves[i];
-        // The macro token is not always tree-sitter's plain `identifier`
-        // kind: when a neighboring line's wreckage absorbs a prototype, the
-        // token can be typed `type_identifier` (inside a `type_descriptor`),
-        // `field_identifier`, or `namespace_identifier` instead (issue
-        // #2932). The two-`(`-then-matching-`))`-then-`;` shape that follows
-        // is still the actual gate; widening the token kind only lets that
-        // gate see candidates it would otherwise skip entirely.
-        if !matches!(
-            identifier.kind(),
-            "identifier" | "type_identifier" | "field_identifier" | "namespace_identifier"
-        ) || leaves[i + 1].kind() != "("
-            || leaves[i + 2].kind() != "("
-        {
-            i += 1;
-            continue;
-        }
-        let inner_open = leaves[i + 2];
-        // Match the inner paren by depth over the leaves that follow it; its
-        // matching close must be followed immediately (skipping only
-        // already-omitted MISSING leaves) by the outer close and a live `;`.
-        let mut depth = 1i32;
-        let mut inner_close_index = None;
-        let mut j = i + 3;
-        while j < leaves.len() {
-            match leaves[j].kind() {
-                "(" => depth += 1,
-                ")" => {
-                    depth -= 1;
-                    if depth == 0 {
-                        inner_close_index = Some(j);
-                        break;
-                    }
-                }
-                _ => {}
-            }
-            j += 1;
-        }
-        let (Some(inner_close_index), Some(&outer_close), Some(&semicolon)) = (
-            inner_close_index,
-            inner_close_index.and_then(|index| leaves.get(index + 1)),
-            inner_close_index.and_then(|index| leaves.get(index + 2)),
-        ) else {
-            i += 1;
-            continue;
-        };
-        if outer_close.kind() != ")" || semicolon.kind() != ";" {
-            i += 1;
-            continue;
-        }
-        // Walk backward over same-row leaves for the run start (mirrors
-        // `cpp_error_swallowed_function_declaration_range`'s sibling walk,
-        // over the flat leaf sequence instead of tree siblings, since the
-        // macro token nests at different depths across the observed
-        // shapes). Require at least one leaf before the identifier: a bare
-        // macro token at the start of the scanned node has no return type
-        // or name to recover.
-        if i == 0 {
-            i += 1;
-            continue;
-        }
-        let row = identifier.start_position().row;
-        let mut run_start = identifier.start_byte();
-        let mut k = i;
-        while k > 0 {
-            let previous = leaves[k - 1];
-            if previous.start_position().row != row || matches!(previous.kind(), ";" | "{" | "}") {
-                break;
-            }
-            run_start = previous.start_byte();
-            k -= 1;
-        }
-        if run_start == identifier.start_byte() {
-            i += 1;
-            continue;
-        }
-        candidates.push(PrototypeMacroCandidate {
-            run_start,
-            identifier_start: identifier.start_byte(),
-            inner_open_start: inner_open.start_byte(),
-            inner_close_end: leaves[inner_close_index].end_byte(),
-            outer_close_end: outer_close.end_byte(),
-            semicolon_end: semicolon.end_byte(),
-        });
-        // Resume scanning just past this candidate's `;`: one envelope can
-        // swallow several consecutive prototype-macro lines.
-        i = inner_close_index + 3;
+/// The known pre-ANSI prototype macros whose expansion is exactly their one
+/// argument. The malformed CST cannot prove that an arbitrary identifier has
+/// that definition, so unknown spellings fail closed rather than turning an
+/// ordinary broken declaration into a Function (issue #2932).
+fn cpp_is_prototype_macro_identifier(node: Node<'_>, source: &str) -> bool {
+    matches!(
+        node.kind(),
+        "identifier" | "type_identifier" | "field_identifier" | "namespace_identifier"
+    ) && matches!(
+        normalize_cpp_whitespace(node_text(node, source)).as_str(),
+        "_" | "__P" | "OF" | "PROTO"
+    )
+}
+
+/// Read tree-sitter's recovery for `declared_name MACRO`: a
+/// `qualified_identifier` whose separator is MISSING, whose `scope` is the
+/// declared name, and whose `name` is a known prototype macro.
+fn cpp_prototype_macro_qualified_parts<'tree>(
+    node: Node<'tree>,
+    source: &str,
+) -> Option<(Node<'tree>, Node<'tree>)> {
+    if node.kind() != "qualified_identifier" {
+        return None;
     }
-    candidates
+    let declared_name = node
+        .child_by_field_name("scope")
+        .filter(|scope| matches!(scope.kind(), "namespace_identifier" | "identifier"))?;
+    let macro_name = macro_decorated_unqualified_name(node)?;
+    cpp_is_prototype_macro_identifier(macro_name, source).then_some((declared_name, macro_name))
+}
+
+/// The inner parenthesized node of tree-sitter's structured
+/// `MACRO((parameters))` argument list. Keeping this node's exact range drops
+/// the macro invocation's outer parentheses while retaining the one pair an
+/// ordinary function declarator needs. No delimiter search is involved: both
+/// pairs and their ownership come from the CST.
+fn cpp_prototype_macro_inner_arguments(arguments: Node<'_>) -> Option<Node<'_>> {
+    if arguments.kind() != "argument_list"
+        || arguments.named_child_count() != 1
+        || arguments.child_count() != 3
+        || arguments
+            .child(0)
+            .is_none_or(|open| open.kind() != "(" || open.is_missing())
+        || arguments
+            .child(2)
+            .is_none_or(|close| close.kind() != ")" || close.is_missing())
+    {
+        return None;
+    }
+    let inner = arguments.named_child(0)?;
+    let close_index = match inner.kind() {
+        "parenthesized_expression" => inner.child_count().checked_sub(1)?,
+        // tree-sitter completes the C++ cast production with a zero-width
+        // value after the live close parenthesis.
+        "cast_expression" => inner.child_count().checked_sub(2)?,
+        _ => return None,
+    };
+    (inner
+        .child(0)
+        .is_some_and(|open| open.kind() == "(" && !open.is_missing())
+        && inner
+            .child(close_index)
+            .is_some_and(|close| close.kind() == ")" && !close.is_missing()))
+    .then_some(inner)
+}
+
+fn cpp_prototype_macro_candidate_from_init_declaration(
+    declaration: Node<'_>,
+    source: &str,
+) -> Option<PrototypeMacroCandidate> {
+    let init = declaration
+        .child_by_field_name("declarator")
+        .filter(|declarator| declarator.kind() == "init_declarator")?;
+    let malformed_declarator = init.child_by_field_name("declarator")?;
+    let (declared_name, macro_name) = if malformed_declarator.kind() == "qualified_identifier" {
+        cpp_prototype_macro_qualified_parts(malformed_declarator, source)?
+    } else {
+        if !cpp_is_prototype_macro_identifier(malformed_declarator, source) {
+            return None;
+        }
+        let declared_name_error = init
+            .prev_named_sibling()
+            .filter(|previous| previous.kind() == "ERROR" && previous.named_child_count() == 1)?;
+        let declared_name = declared_name_error
+            .named_child(0)
+            .filter(|name| matches!(name.kind(), "identifier" | "field_identifier"))?;
+        (declared_name, malformed_declarator)
+    };
+    let arguments = init
+        .child_by_field_name("value")
+        .filter(|value| value.kind() == "argument_list")?;
+    let inner = cpp_prototype_macro_inner_arguments(arguments)?;
+    let semicolon = cpp_direct_semicolon(declaration)?;
+    let return_type = declaration.child_by_field_name("type")?;
+    if return_type.end_byte() > declared_name.start_byte()
+        || declared_name.end_byte() > macro_name.start_byte()
+        || macro_name.end_byte() > arguments.start_byte()
+        || arguments.end_byte() > semicolon.start_byte()
+    {
+        return None;
+    }
+    Some(PrototypeMacroCandidate {
+        run_start: declaration.start_byte(),
+        identifier_start: macro_name.start_byte(),
+        inner_open_start: inner.start_byte(),
+        inner_close_end: inner.end_byte(),
+        outer_close_end: arguments.end_byte(),
+        semicolon_end: semicolon.end_byte(),
+    })
+}
+
+fn cpp_prototype_macro_candidate_from_qualified_declaration(
+    declaration: Node<'_>,
+    source: &str,
+) -> Option<PrototypeMacroCandidate> {
+    let qualified = declaration
+        .child_by_field_name("declarator")
+        .filter(|declarator| declarator.kind() == "qualified_identifier")?;
+    let (_, macro_name) = cpp_prototype_macro_qualified_parts(qualified, source)?;
+    let open_error = qualified
+        .next_named_sibling()
+        .filter(|next| next.kind() == "ERROR")?;
+    let close_error = last_named_child(declaration)
+        .filter(|last| last.kind() == "ERROR" && !same_node(*last, open_error))?;
+    if open_error.child_count() < 3
+        || open_error
+            .child(0)
+            .is_none_or(|open| open.kind() != "(" || open.is_missing())
+        || open_error
+            .child(1)
+            .is_none_or(|open| open.kind() != "(" || open.is_missing())
+        || close_error.child_count() != 2
+        || close_error
+            .child(0)
+            .is_none_or(|close| close.kind() != ")" || close.is_missing())
+        || close_error
+            .child(1)
+            .is_none_or(|close| close.kind() != ")" || close.is_missing())
+    {
+        return None;
+    }
+    let inner_open = open_error.child(1)?;
+    let inner_close = close_error.child(0)?;
+    let outer_close = close_error.child(1)?;
+    let semicolon = cpp_direct_semicolon(declaration)?;
+    let return_type = declaration.child_by_field_name("type")?;
+    if return_type.end_byte() > qualified.start_byte()
+        || macro_name.end_byte() > open_error.start_byte()
+        || inner_open.start_byte() > inner_close.end_byte()
+        || inner_close.end_byte() > outer_close.start_byte()
+        || outer_close.end_byte() > semicolon.start_byte()
+    {
+        return None;
+    }
+    Some(PrototypeMacroCandidate {
+        run_start: declaration.start_byte(),
+        identifier_start: macro_name.start_byte(),
+        inner_open_start: inner_open.start_byte(),
+        inner_close_end: inner_close.end_byte(),
+        outer_close_end: outer_close.end_byte(),
+        semicolon_end: semicolon.end_byte(),
+    })
+}
+
+fn cpp_prototype_macro_candidate_from_pointer_expression(
+    statement: Node<'_>,
+    source: &str,
+) -> Option<PrototypeMacroCandidate> {
+    if statement.kind() != "expression_statement"
+        || statement.named_child_count() != 1
+        || !statement.has_error()
+    {
+        return None;
+    }
+    let expansion = statement
+        .named_child(0)
+        .filter(|child| child.kind() == "parameter_pack_expansion")?;
+    let binary = expansion
+        .child_by_field_name("pattern")
+        .filter(|pattern| pattern.kind() == "binary_expression")?;
+    if binary.child_count() != 3
+        || binary
+            .child(1)
+            .is_none_or(|operator| operator.kind() != "*" || operator.is_missing())
+        || expansion
+            .child(expansion.child_count().checked_sub(1)?)
+            .is_none_or(|ellipsis| ellipsis.kind() != "..." || !ellipsis.is_missing())
+    {
+        return None;
+    }
+    let return_type = binary.child_by_field_name("left")?;
+    let call = binary
+        .child_by_field_name("right")
+        .filter(|right| right.kind() == "call_expression")?;
+    let qualified = call.child_by_field_name("function")?;
+    let (declared_name, macro_name) = cpp_prototype_macro_qualified_parts(qualified, source)?;
+    let arguments = call
+        .child_by_field_name("arguments")
+        .filter(|arguments| arguments.kind() == "argument_list")?;
+    let inner = cpp_prototype_macro_inner_arguments(arguments)?;
+    let semicolon = cpp_direct_semicolon(statement)?;
+    if return_type.end_byte() > declared_name.start_byte()
+        || macro_name.end_byte() > arguments.start_byte()
+        || arguments.end_byte() > semicolon.start_byte()
+    {
+        return None;
+    }
+    Some(PrototypeMacroCandidate {
+        run_start: statement.start_byte(),
+        identifier_start: macro_name.start_byte(),
+        inner_open_start: inner.start_byte(),
+        inner_close_end: inner.end_byte(),
+        outer_close_end: arguments.end_byte(),
+        semicolon_end: semicolon.end_byte(),
+    })
+}
+
+/// Recover only CST shapes whose fields preserve the declaration name, macro
+/// invocation, nested argument list, and terminator. Arbitrary flattened
+/// `ERROR` wreckage stays unsupported rather than being interpreted through a
+/// token or delimiter scan (issue #2932).
+fn cpp_prototype_macro_candidates(node: Node<'_>, source: &str) -> Vec<PrototypeMacroCandidate> {
+    let candidate = match node.kind() {
+        "declaration" if node.has_error() => {
+            cpp_prototype_macro_candidate_from_init_declaration(node, source)
+                .or_else(|| cpp_prototype_macro_candidate_from_qualified_declaration(node, source))
+        }
+        "expression_statement" => {
+            cpp_prototype_macro_candidate_from_pointer_expression(node, source)
+        }
+        _ => None,
+    };
+    candidate.into_iter().collect()
 }
 
 fn cpp_macro_swallowed_declaration_envelope(node: Node<'_>, source: &str) -> bool {
@@ -15150,203 +15226,126 @@ class PROJECT_API_ [[nodiscard]] Wrapper<int> : public internal::Base<int> {};
         identities
     }
 
-    /// #2932. Ruby C extensions (and many other pre-ANSI-C codebases)
-    /// declare prototypes with the K&R-compatibility macro idiom
-    /// `RET name _(( args ));`, where `_` is `#define`d only in ruby's own
-    /// headers -- undefined anywhere this workspace can see. Before this
-    /// recovery, tree-sitter-cpp's wreckage from that idiom was read as a
-    /// field with the type and name swapped (a field literally named
-    /// `VALUE`, or `int`, or the macro token `_`), and no Function was
-    /// indexed for the real prototype at all. Covers every return-type
-    /// shape the issue's investigation found: a plain type, an unnamed
-    /// pointer return (`t_pg_coder *`), `static`, `extern`, a `const void *`
-    /// parameter, `void` parameters, and named parameters (whose names must
-    /// still be dropped from the signature, matching every other C
-    /// signature this analyzer records). Two controls, unrelated to the
-    /// macro idiom, must be indexed exactly as before this change: an
-    /// ordinary clean top-level declaration that happens to nest
-    /// parentheses (`int x = f((1));`, indexed as a Field the same as any
-    /// other top-level C declaration -- deliberately named `x` to also
-    /// prove it does not collide with `t_typemap`'s field of the same
-    /// short name), and a real GNU `__attribute__` prototype, whose clean
-    /// grammar production never sets `has_error()` and so never reaches the
-    /// new scanner. Both controls are placed before any prototype-macro
-    /// line: tree-sitter's recovery for the pointer-return shape
-    /// (`t_pg_coder *pg_typemap_typecast_query_param`) produces a top-level
-    /// `ERROR` that can absorb an immediately following clean declaration's
-    /// tokens too (a pre-existing recovery gap this fix does not need to
-    /// close), so the controls sit where that absorption cannot reach them.
+    /// #2932. Recover the parser-owned declaration shapes for known pre-ANSI
+    /// prototype macros. Each case is parsed independently so a preceding
+    /// malformed line cannot flatten the next declaration's fields into one
+    /// cascading `ERROR`; that shape has no structural proof and must fail
+    /// closed rather than fall back to a token scan. Parameter names are
+    /// dropped from signatures just as they are for ordinary C prototypes.
     #[test]
-    fn c_prototype_macro_recovers_a_function_with_the_swapped_field_gone() {
-        let source = r#"typedef struct { int x; } t_typemap;
-int x = f((1));
-__attribute__((format(printf, 3, 4))) void pg_attr(int);
-VALUE pg_typemap_fit_to_result _(( VALUE, VALUE ));
-int pg_typemap_fit_to_copy_get _(( VALUE ));
-VALUE pg_typemap_result_value _(( t_typemap *, VALUE, int, int ));
-void pg_typemap_mark _(( void * ));
-void init_pg_type_map _(( void ));
-t_pg_coder *pg_typemap_typecast_query_param _(( t_typemap *, VALUE, int ));
-static VALUE pg_static _(( void ));
-extern VALUE pg_extern _(( VALUE, VALUE ));
-size_t pg_typemap_memsize _(( const void * ));
-VALUE pg_wrap_socket_io _(( int sd, VALUE self, VALUE *p_socket_io, int *p_ruby_sd ));
-"#;
-        let parsed = parse_cpp_declarations(source, "pg_type_map.h");
-        assert_eq!(
-            function_identities(&parsed),
-            vec![
-                ("init_pg_type_map".to_string(), "(void)".to_string()),
-                ("pg_attr".to_string(), "(int)".to_string()),
-                ("pg_extern".to_string(), "(VALUE, VALUE)".to_string()),
-                ("pg_static".to_string(), "(void)".to_string()),
-                (
-                    "pg_typemap_fit_to_copy_get".to_string(),
-                    "(VALUE)".to_string()
-                ),
-                (
-                    "pg_typemap_fit_to_result".to_string(),
-                    "(VALUE, VALUE)".to_string()
-                ),
-                ("pg_typemap_mark".to_string(), "(void *)".to_string()),
-                (
-                    "pg_typemap_memsize".to_string(),
-                    "(const void *)".to_string()
-                ),
-                (
-                    "pg_typemap_result_value".to_string(),
-                    "(t_typemap *, VALUE, int, int)".to_string()
-                ),
-                (
-                    "pg_typemap_typecast_query_param".to_string(),
-                    "(t_typemap *, VALUE, int)".to_string()
-                ),
-                (
-                    "pg_wrap_socket_io".to_string(),
-                    "(int, VALUE, VALUE *, int *)".to_string()
-                ),
-            ],
-            "{:#?}",
-            parsed.declarations()
-        );
+    fn c_prototype_macro_recovers_parser_owned_declaration_shapes() {
+        let cases = [
+            (
+                "VALUE pg_typemap_fit_to_result _(( VALUE, VALUE ));",
+                "pg_typemap_fit_to_result",
+                "(VALUE, VALUE)",
+            ),
+            (
+                "VALUE pg_typemap_result_value _(( t_typemap *, VALUE, int, int ));",
+                "pg_typemap_result_value",
+                "(t_typemap *, VALUE, int, int)",
+            ),
+            (
+                "void pg_typemap_mark _(( void * ));",
+                "pg_typemap_mark",
+                "(void *)",
+            ),
+            (
+                "void init_pg_type_map _(( void ));",
+                "init_pg_type_map",
+                "(void)",
+            ),
+            ("static VALUE pg_static _(( void ));", "pg_static", "(void)"),
+            (
+                "extern VALUE pg_extern _(( VALUE, VALUE ));",
+                "pg_extern",
+                "(VALUE, VALUE)",
+            ),
+            (
+                "size_t pg_typemap_memsize _(( const void * ));",
+                "pg_typemap_memsize",
+                "(const void *)",
+            ),
+            (
+                "VALUE pg_wrap_socket_io _(( int sd, VALUE self, VALUE *p_socket_io, int *p_ruby_sd ));",
+                "pg_wrap_socket_io",
+                "(int, VALUE, VALUE *, int *)",
+            ),
+            ("VALUE pg_dunder __P(( VALUE ));", "pg_dunder", "(VALUE)"),
+            ("VALUE pg_of OF(( VALUE ));", "pg_of", "(VALUE)"),
+            ("VALUE pg_proto PROTO(( VALUE ));", "pg_proto", "(VALUE)"),
+        ];
 
-        let mut fields = parsed
-            .declarations()
-            .iter()
-            .filter(|unit| unit.is_field())
-            .map(|unit| unit.fq_name())
-            .collect::<Vec<_>>();
-        fields.sort();
-        assert_eq!(
-            fields,
-            vec!["t_typemap.x".to_string(), "x".to_string()],
-            "the only fields in the file are the struct member and the clean \
-             top-level `int x = f((1));` control; every prototype-macro line \
-             must be gone, not just outnumbered: {:#?}",
-            parsed.declarations()
-        );
+        for (index, (source, name, signature)) in cases.into_iter().enumerate() {
+            let parsed = parse_cpp_declarations(source, &format!("prototype_{index}.h"));
+            assert_eq!(
+                function_identities(&parsed),
+                vec![(name.to_string(), signature.to_string())],
+                "{source}: {:#?}",
+                parsed.declarations()
+            );
+            assert!(
+                parsed.declarations().iter().all(|unit| !unit.is_field()),
+                "{source} must not retain the malformed field: {:#?}",
+                parsed.declarations()
+            );
+        }
     }
 
-    /// #2932 follow-up. Two shapes the leaf-sequence scanner's first cut
-    /// missed, both found by replaying the real ruby-pg `ext/pg.h` (a fixer
-    /// user ran the fixed analyzer over the real header and reported these as
-    /// gaps in the scanner's trigger, not in the reparse):
-    ///
-    /// Gap 1: `T *name _(( args ));` with a pointer return type and a simple
+    /// #2932. `T *name _(( args ));` with a pointer return type and a simple
     /// argument list parses with no `ERROR` node at all -- tree-sitter reads
     /// it as a multiplication of a type by a call
     /// (`identifier "T" '*' call_expression{qualified_identifier{...}}`),
     /// wrapped in an `expression_statement` that `has_error()` only because
     /// of the `MISSING "::"` inside the `qualified_identifier`. Reproduced
-    /// here with a clean preceding line (`extern VALUE rb_mPG;`) so the
-    /// prototype is not merged into some other node's `ERROR` wreckage, and
-    /// with both a spaced (`PGconn *name`) and unspaced (`PGresult*
-    /// name`) pointer-return spelling.
-    ///
-    /// Gap 2: the macro token leaf is not always tree-sitter's plain
-    /// `identifier` kind. When a neighboring line's wreckage absorbs a
-    /// prototype, the token can come back typed `type_identifier` instead
-    /// (inside a `type_descriptor`). Reproduced with the exact three-line
-    /// block from `ext/pg.h` where this happens: the first and third lines'
-    /// own recovery swallows the second line's macro token as a
-    /// `type_identifier`.
+    /// here with a clean preceding field so the prototype remains the
+    /// parser-owned `expression_statement` this recovery requires.
     #[test]
-    fn c_prototype_macro_recovers_pointer_return_expression_statements_and_type_identifier_macro_tokens()
-     {
-        let source = format!(
-            "extern VALUE rb_mPG;\n\
-             PGconn *pg_get_pgconn                                  _(( VALUE ));\n\
-             PGresult* pgresult_get                                 _(( VALUE ));\n\
-             {}",
-            r#"rb_encoding * pg_get_pg_encname_as_rb_encoding         _(( const char * ));
-const char * pg_get_rb_encoding_as_pg_encoding         _(( rb_encoding * ));
-rb_encoding *pg_conn_enc_get                           _(( PGconn * ));
-"#
-        );
-        let parsed = parse_cpp_declarations(&source, "pg_gaps.h");
-        assert_eq!(
-            function_identities(&parsed),
-            vec![
-                ("pg_conn_enc_get".to_string(), "(PGconn *)".to_string()),
-                (
-                    "pg_get_pg_encname_as_rb_encoding".to_string(),
-                    "(const char *)".to_string()
-                ),
-                ("pg_get_pgconn".to_string(), "(VALUE)".to_string()),
-                (
-                    "pg_get_rb_encoding_as_pg_encoding".to_string(),
-                    "(rb_encoding *)".to_string()
-                ),
-                ("pgresult_get".to_string(), "(VALUE)".to_string()),
-            ],
-            "{:#?}",
-            parsed.declarations()
-        );
-        let mut fields = parsed
-            .declarations()
-            .iter()
-            .filter(|unit| unit.is_field())
-            .map(|unit| unit.fq_name())
-            .collect::<Vec<_>>();
-        fields.sort();
-        assert_eq!(
-            fields,
-            vec!["rb_mPG".to_string()],
-            "the only field is the clean `extern VALUE rb_mPG;` control; a \
-             swapped-name/type field here means one of the two gaps \
-             regressed: {:#?}",
-            parsed.declarations()
-        );
+    fn c_prototype_macro_recovers_pointer_return_expression_statements() {
+        let cases = [
+            (
+                "PGconn *pg_get_pgconn _(( VALUE ));",
+                "pg_get_pgconn",
+                "(VALUE)",
+            ),
+            (
+                "PGresult* pgresult_get _(( VALUE ));",
+                "pgresult_get",
+                "(VALUE)",
+            ),
+        ];
+        for (index, (prototype, name, signature)) in cases.into_iter().enumerate() {
+            let source = format!("extern VALUE rb_mPG;\n{prototype}\n");
+            let parsed = parse_cpp_declarations(&source, &format!("pointer_{index}.h"));
+            assert_eq!(
+                function_identities(&parsed),
+                vec![(name.to_string(), signature.to_string())],
+                "{source}: {:#?}",
+                parsed.declarations()
+            );
+            assert_eq!(
+                parsed
+                    .declarations()
+                    .iter()
+                    .filter(|unit| unit.is_field())
+                    .map(|unit| unit.fq_name())
+                    .collect::<Vec<_>>(),
+                vec!["rb_mPG".to_string()],
+                "{source}: {:#?}",
+                parsed.declarations()
+            );
+        }
     }
 
-    /// #2932 acceptance. `ext/pg.h` lines 337-378 verbatim (the real ruby-pg
-    /// header, not a reduction): 22 `_((...))` prototypes across every
-    /// return-type and parameter shape this fix recovers, one
-    /// `#ifdef __GNUC__ / __attribute__((format(printf, 3, 4))) / #endif`
-    /// pair, and one `NORETURN(void pg_raise_conn_error _((...)));` line.
-    ///
-    /// `pg_raise_conn_error` is deliberately excluded from the expected list:
-    /// the `NORETURN(...)` macro wraps the *entire* prototype, so the
-    /// scanner's matched `))` is followed by a third `)` (`NORETURN`'s own
-    /// close) rather than by `;`, and the leaf-sequence gate correctly does
-    /// not match it. See the ExecPlan's Decision Log for why this is left
-    /// unrecovered (YAGNI: no witness needs it yet) rather than special-cased
-    /// to the `NORETURN` spelling.
-    ///
-    /// This exact line range also contains a `static inline` function
-    /// (`pgresult_get_this`) preceded by a `/* ... */` comment, which tree-
-    /// sitter's own cascading error recovery glues onto the *tail* of the
-    /// unrelated `pg_tuple_new` prototype's `ERROR` wreckage -- a full
-    /// function body ends up inside that `ERROR` node alongside malformed
-    /// leftovers, with no K&R leaf shape for this scanner (or any other
-    /// existing recovery in this file) to find. That is a separate,
-    /// pre-existing gap in how error recovery merges an unrelated clean
-    /// declaration into a preceding line's wreckage -- not a K&R
-    /// prototype-macro trigger gap -- so `pgresult_get_this` is also
-    /// deliberately excluded from the expected list here rather than
-    /// silently fixed by this change.
+    /// #2932 acceptance. Keep the exact issue witness inside the surrounding
+    /// `ext/pg.h` block, where tree-sitter's cascading recovery produces both
+    /// field-preserving declaration shapes and ambiguous flattened `ERROR`
+    /// regions. The witnessed declaration must still become a Function and
+    /// its type must not survive as the name of a bogus Field. This test does
+    /// not claim that structurally flattened neighboring prototypes are safe
+    /// to recover.
     #[test]
-    fn c_prototype_macro_recovers_the_real_ruby_pg_header_block() {
+    fn c_prototype_macro_recovers_the_issue_witness_inside_the_real_ruby_pg_header_block() {
         let source = r#"VALUE pg_typemap_fit_to_result                         _(( VALUE, VALUE ));
 VALUE pg_typemap_fit_to_query                          _(( VALUE, VALUE ));
 int pg_typemap_fit_to_copy_get                         _(( VALUE ));
@@ -15391,103 +15390,20 @@ rb_encoding *pg_conn_enc_get                           _(( PGconn * ));
 
 "#;
         let parsed = parse_cpp_declarations(source, "pg.h");
-        assert_eq!(
-            function_identities(&parsed),
-            vec![
-                ("pg_conn_enc_get".to_string(), "(PGconn *)".to_string()),
-                ("pg_get_connection".to_string(), "(VALUE)".to_string()),
-                (
-                    "pg_get_pg_encname_as_rb_encoding".to_string(),
-                    "(const char *)".to_string()
-                ),
-                ("pg_get_pgconn".to_string(), "(VALUE)".to_string()),
-                (
-                    "pg_get_rb_encoding_as_pg_encoding".to_string(),
-                    "(rb_encoding *)".to_string()
-                ),
-                (
-                    "pg_new_result".to_string(),
-                    "(PGresult *, VALUE)".to_string()
-                ),
-                (
-                    "pg_new_result_autoclear".to_string(),
-                    "(PGresult *, VALUE)".to_string()
-                ),
-                ("pg_result_check".to_string(), "(VALUE)".to_string()),
-                ("pg_result_clear".to_string(), "(VALUE)".to_string()),
-                ("pg_tuple_new".to_string(), "(VALUE, int)".to_string()),
-                ("pg_typemap_compact".to_string(), "(void *)".to_string()),
-                (
-                    "pg_typemap_fit_to_copy_get".to_string(),
-                    "(VALUE)".to_string()
-                ),
-                (
-                    "pg_typemap_fit_to_query".to_string(),
-                    "(VALUE, VALUE)".to_string()
-                ),
-                (
-                    "pg_typemap_fit_to_result".to_string(),
-                    "(VALUE, VALUE)".to_string()
-                ),
-                ("pg_typemap_mark".to_string(), "(void *)".to_string()),
-                (
-                    "pg_typemap_memsize".to_string(),
-                    "(const void *)".to_string()
-                ),
-                (
-                    "pg_typemap_result_value".to_string(),
-                    "(t_typemap *, VALUE, int, int)".to_string()
-                ),
-                (
-                    "pg_typemap_typecast_copy_get".to_string(),
-                    "(t_typemap *, VALUE, int, int, int)".to_string()
-                ),
-                (
-                    "pg_typemap_typecast_query_param".to_string(),
-                    "(t_typemap *, VALUE, int)".to_string()
-                ),
-                (
-                    "pg_unwrap_socket_io".to_string(),
-                    "(VALUE, VALUE *, int)".to_string()
-                ),
-                (
-                    "pg_wrap_socket_io".to_string(),
-                    "(int, VALUE, VALUE *, int *)".to_string()
-                ),
-                (
-                    "pgconn_block".to_string(),
-                    "(int, VALUE *, VALUE)".to_string()
-                ),
-                ("pgresult_get".to_string(), "(VALUE)".to_string()),
-            ],
-            "{:#?}",
-            parsed.declarations()
-        );
         assert!(
-            !function_identities(&parsed)
+            function_identities(&parsed)
                 .iter()
-                .any(|(name, _)| name == "pg_raise_conn_error"),
-            "the NORETURN(...)-wrapped prototype must stay unrecovered: {:#?}",
+                .any(|(name, signature)| name == "pg_typemap_result_value"
+                    && signature == "(t_typemap *, VALUE, int, int)"),
+            "the real issue witness must be a Function with its C signature: {:#?}",
             parsed.declarations()
         );
-        for bogus_name in ["VALUE", "_", "int"] {
-            assert!(
-                parsed
-                    .declarations()
-                    .iter()
-                    .all(|unit| unit.identifier() != bogus_name),
-                "no declaration may be named the swapped-field wreckage's \
-                 type or the macro token itself: {bogus_name:?} in {:#?}",
-                parsed.declarations()
-            );
-        }
         assert!(
             parsed
                 .declarations()
                 .iter()
-                .all(|unit| !unit.identifier().contains(' ')),
-            "no declaration name may contain a space (a sign the recovery \
-             read a type-plus-name run as one identifier): {:#?}",
+                .all(|unit| !(unit.is_field() && unit.identifier() == "VALUE")),
+            "the issue witness must not leave its return type as a Field name: {:#?}",
             parsed.declarations()
         );
     }

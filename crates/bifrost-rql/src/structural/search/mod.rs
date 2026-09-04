@@ -166,6 +166,135 @@ mod units;
 mod value_flow;
 mod witness_projection;
 
+/// Deterministic work counters for one reusable row-family session.
+///
+/// These counters describe producer construction and reuse, not query budget
+/// charges. Each query keeps its independent scan and row budgets even when a
+/// complete immutable producer result can be replayed.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CodeQueryRowFamilySessionStats {
+    pub occurrence_derivations: usize,
+    pub occurrence_reuses: usize,
+    pub environment_derivations: usize,
+    pub environment_reuses: usize,
+    pub traced_occurrence_derivations: usize,
+    pub traced_occurrence_reuses: usize,
+}
+
+#[derive(Clone)]
+struct SharedRowFamilyStores {
+    occurrence: Option<Arc<Mutex<occurrences::OccurrenceTraversalStore>>>,
+    environment: Option<Arc<Mutex<environment::EnvironmentTraversalStore>>>,
+    selected_ast_ids: Option<Arc<std::collections::HashSet<String>>>,
+}
+
+/// Complete occurrence and lexical-environment products shared by a caller's
+/// explicitly bounded batch of structural queries.
+///
+/// Reuse is fail-closed: it requires an exact workspace content identity and
+/// matching occurrence derivation options. Incomplete and cancelled products
+/// remain query-local, as do diagnostic suppression, budgets and completion.
+/// A session created with [`CodeQueryRowFamilySession::for_ast_ids`] is a
+/// correlated batch: execute its `binding_of` query before its scope query so
+/// the latter can project the declaring scopes the former reached.
+#[doc(hidden)]
+pub struct CodeQueryRowFamilySession {
+    content: Option<WorkspaceContentIdentity>,
+    occurrence_options: Option<OccurrenceDerivationOptions>,
+    occurrence: Arc<Mutex<occurrences::OccurrenceTraversalStore>>,
+    environment: Arc<Mutex<environment::EnvironmentTraversalStore>>,
+    selected_ast_ids: Option<Arc<std::collections::HashSet<String>>>,
+}
+
+impl Default for CodeQueryRowFamilySession {
+    fn default() -> Self {
+        Self {
+            content: None,
+            occurrence_options: None,
+            occurrence: Arc::new(Mutex::new(occurrences::OccurrenceTraversalStore::default())),
+            environment: Arc::new(Mutex::new(environment::EnvironmentTraversalStore::default())),
+            selected_ast_ids: None,
+        }
+    }
+}
+
+impl CodeQueryRowFamilySession {
+    /// Create a session whose occurrence seeds can observe only the AST
+    /// identities a correlated caller will join. A scope seed in this session
+    /// projects declaring scopes recorded by preceding `binding_of` queries.
+    #[doc(hidden)]
+    pub fn for_ast_ids(ast_ids: Vec<String>) -> Self {
+        Self {
+            selected_ast_ids: Some(Arc::new(ast_ids.into_iter().collect())),
+            ..Self::default()
+        }
+    }
+
+    fn clear_products(&mut self) {
+        self.occurrence = Arc::new(Mutex::new(occurrences::OccurrenceTraversalStore::default()));
+        self.environment = Arc::new(Mutex::new(environment::EnvironmentTraversalStore::default()));
+        self.occurrence_options = None;
+    }
+
+    fn stores(
+        &mut self,
+        analyzer: &dyn IAnalyzer,
+        occurrence_options: OccurrenceDerivationOptions,
+    ) -> SharedRowFamilyStores {
+        let Some(content) = analyzer.workspace_content_identity() else {
+            self.content = None;
+            self.clear_products();
+            return SharedRowFamilyStores {
+                occurrence: None,
+                environment: None,
+                selected_ast_ids: self.selected_ast_ids.clone(),
+            };
+        };
+        if self.content != Some(content) {
+            self.clear_products();
+            self.content = Some(content);
+        }
+        if self.occurrence_options != Some(occurrence_options) {
+            self.occurrence =
+                Arc::new(Mutex::new(occurrences::OccurrenceTraversalStore::default()));
+            self.occurrence_options = Some(occurrence_options);
+        }
+        SharedRowFamilyStores {
+            occurrence: Some(Arc::clone(&self.occurrence)),
+            environment: Some(Arc::clone(&self.environment)),
+            selected_ast_ids: self.selected_ast_ids.clone(),
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn stats(&self) -> CodeQueryRowFamilySessionStats {
+        let (occurrence_derivations, occurrence_reuses) = self
+            .occurrence
+            .lock()
+            .expect("a row-family occurrence cache lock is not poisoned")
+            .stats();
+        let (
+            environment_derivations,
+            environment_reuses,
+            traced_occurrence_derivations,
+            traced_occurrence_reuses,
+        ) = self
+            .environment
+            .lock()
+            .expect("a row-family environment cache lock is not poisoned")
+            .stats();
+        CodeQueryRowFamilySessionStats {
+            occurrence_derivations,
+            occurrence_reuses,
+            environment_derivations,
+            environment_reuses,
+            traced_occurrence_derivations,
+            traced_occurrence_reuses,
+        }
+    }
+}
+
 // `apply_pipeline_step` below (this engine's own per-step dispatch) reaches
 // into `expansions` for its three graph-traversal entry points.
 use execution::*;
@@ -2647,6 +2776,47 @@ pub fn execute_code_query_detailed_eager_index(
     )
 }
 
+/// Eager structural execution that reuses complete row-family products across
+/// an explicitly bounded caller batch.
+#[doc(hidden)]
+pub fn execute_code_query_detailed_eager_index_with_row_family_session(
+    analyzer: &dyn IAnalyzer,
+    query: &CodeQuery,
+    limits: CodeQueryExecutionLimits,
+    cancellation: Option<&CancellationToken>,
+    row_family_session: &mut CodeQueryRowFamilySession,
+) -> DetailedCodeQueryResult {
+    let scope = AnalyzerQueryScope::new(analyzer);
+    let token = scope.token();
+    let access_mode = match benchmark_structural_access_mode() {
+        StructuralAccessMode::ScanOnly => StructuralAccessMode::ScanOnly,
+        _ => StructuralAccessMode::EagerAuto,
+    };
+    let stores = row_family_session.stores(analyzer, OccurrenceDerivationOptions::ROWS_ONLY);
+    execute_internal_with_analysis_strategy_and_row_family_session(
+        analyzer,
+        token,
+        None,
+        None,
+        None,
+        0,
+        query,
+        limits,
+        cancellation,
+        None,
+        false,
+        UnionExecutionStrategy::Auto,
+        CODE_QUERY_SCHEDULER_WORKERS,
+        access_mode,
+        OccurrenceDerivationOptions::ROWS_ONLY,
+        Some(stores),
+        None,
+        None,
+        CodeQueryExecutionScope::whole_workspace(),
+        None,
+    )
+}
+
 /// `execute_code_query_detailed_eager_index` for a caller that reads each
 /// occurrence row's identity, role and position but never its resolved target.
 ///
@@ -2685,6 +2855,47 @@ pub fn execute_code_query_detailed_eager_index_without_targets(
         CODE_QUERY_SCHEDULER_WORKERS,
         access_mode,
         OccurrenceDerivationOptions::IDENTITY_ONLY,
+        None,
+        None,
+        CodeQueryExecutionScope::whole_workspace(),
+        None,
+    )
+}
+
+/// Identity-only eager structural execution that reuses complete row-family
+/// products across an explicitly bounded caller batch.
+#[doc(hidden)]
+pub fn execute_code_query_detailed_eager_index_without_targets_with_row_family_session(
+    analyzer: &dyn IAnalyzer,
+    query: &CodeQuery,
+    limits: CodeQueryExecutionLimits,
+    cancellation: Option<&CancellationToken>,
+    row_family_session: &mut CodeQueryRowFamilySession,
+) -> DetailedCodeQueryResult {
+    let scope = AnalyzerQueryScope::new(analyzer);
+    let token = scope.token();
+    let access_mode = match benchmark_structural_access_mode() {
+        StructuralAccessMode::ScanOnly => StructuralAccessMode::ScanOnly,
+        _ => StructuralAccessMode::EagerAuto,
+    };
+    let stores = row_family_session.stores(analyzer, OccurrenceDerivationOptions::IDENTITY_ONLY);
+    execute_internal_with_analysis_strategy_and_row_family_session(
+        analyzer,
+        token,
+        None,
+        None,
+        None,
+        0,
+        query,
+        limits,
+        cancellation,
+        None,
+        false,
+        UnionExecutionStrategy::Auto,
+        CODE_QUERY_SCHEDULER_WORKERS,
+        access_mode,
+        OccurrenceDerivationOptions::IDENTITY_ONLY,
+        Some(stores),
         None,
         None,
         CodeQueryExecutionScope::whole_workspace(),
@@ -3061,6 +3272,55 @@ fn execute_internal_with_analysis_strategy(
     semantic_continuation: Option<SemanticQueryContinuation>,
     access_failure_out: Option<&mut Option<String>>,
     scope: CodeQueryExecutionScope<'_>,
+    row_keys_out: Option<&mut Vec<UnitRowKey>>,
+) -> DetailedCodeQueryResult {
+    execute_internal_with_analysis_strategy_and_row_family_session(
+        analyzer,
+        token,
+        workspace,
+        semantic_summaries,
+        analysis_context,
+        workspace_generation,
+        query,
+        limits,
+        cancellation,
+        receiver_budget_override,
+        capture_profile,
+        union_strategy,
+        scheduler_workers,
+        access_mode,
+        occurrence_options,
+        None,
+        semantic_continuation,
+        access_failure_out,
+        scope,
+        row_keys_out,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_internal_with_analysis_strategy_and_row_family_session(
+    analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
+    workspace: Option<&WorkspaceAnalyzer>,
+    semantic_summaries: Option<
+        Arc<brokk_bifrost_flow::dataflow::ProductionSemanticSummaryRepository>,
+    >,
+    analysis_context: Option<&QueryAnalysisContext>,
+    workspace_generation: u64,
+    query: &CodeQuery,
+    limits: CodeQueryExecutionLimits,
+    cancellation: Option<&CancellationToken>,
+    receiver_budget_override: Option<ReceiverAnalysisBudget>,
+    capture_profile: bool,
+    union_strategy: UnionExecutionStrategy,
+    scheduler_workers: usize,
+    access_mode: StructuralAccessMode,
+    occurrence_options: OccurrenceDerivationOptions,
+    row_family_stores: Option<SharedRowFamilyStores>,
+    semantic_continuation: Option<SemanticQueryContinuation>,
+    access_failure_out: Option<&mut Option<String>>,
+    scope: CodeQueryExecutionScope<'_>,
     mut row_keys_out: Option<&mut Vec<UnitRowKey>>,
 ) -> DetailedCodeQueryResult {
     let active_semantic_model_snapshot = analyzer.active_semantic_model_snapshot();
@@ -3120,6 +3380,35 @@ fn execute_internal_with_analysis_strategy(
     let active_models = active_semantic_model_snapshot
         .as_ref()
         .map(|snapshot| Arc::clone(snapshot.active_models()));
+    let (occurrence_cache, environment_cache) = row_family_stores.map_or_else(
+        || {
+            (
+                OccurrenceTraversalCache::with_options(occurrence_options),
+                EnvironmentTraversalCache::default(),
+            )
+        },
+        |stores| {
+            let select_joined_scopes = stores.selected_ast_ids.is_some();
+            let occurrence = match (stores.occurrence, stores.selected_ast_ids) {
+                (Some(shared), selected_ast_ids) => OccurrenceTraversalCache::with_shared_store(
+                    occurrence_options,
+                    shared,
+                    selected_ast_ids,
+                ),
+                (None, Some(selected_ast_ids)) => OccurrenceTraversalCache::with_selected_ast_ids(
+                    occurrence_options,
+                    selected_ast_ids,
+                ),
+                (None, None) => OccurrenceTraversalCache::with_options(occurrence_options),
+            };
+            let environment = stores
+                .environment
+                .map_or_else(EnvironmentTraversalCache::default, |shared| {
+                    EnvironmentTraversalCache::with_shared_store(shared, select_joined_scopes)
+                });
+            (occurrence, environment)
+        },
+    );
     let mut diagnostics = Vec::new();
     let mut state = QueryExecutionState {
         analyzer,
@@ -3133,8 +3422,8 @@ fn execute_internal_with_analysis_strategy(
         seed_scan_ledger: SeedScanLedger::default(),
         indexed_declarations: IndexedDeclarations::default(),
         reference_cache: ReferenceTraversalCache::default(),
-        occurrence_cache: OccurrenceTraversalCache::with_options(occurrence_options),
-        environment_cache: EnvironmentTraversalCache::default(),
+        occurrence_cache,
+        environment_cache,
         materialization_cache: materialization::MaterializationTraversalCache::default(),
         edge_cache: EdgeTraversalCache::default(),
         flow_state_cache: FlowStateTraversalCache::new(active_semantic_model_snapshot.clone()),

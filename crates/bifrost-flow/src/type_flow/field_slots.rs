@@ -11,7 +11,8 @@ use crate::analyzer::semantic::{
 use crate::analyzer::{ProjectFile, WorkspaceAnalyzer};
 use crate::hash::{HashMap, HashSet};
 
-use super::plan::{SourceSite, SourceSiteKind, TypeFlowPlanError};
+use super::plan::TypeFlowPlanError;
+use crate::analyzer::semantic::{SourceSite, SourceSiteKind};
 
 type FieldSlotKey = (ClassIdentity, Box<str>);
 type FieldSlotAtom = (ClassAtom, SourceSite);

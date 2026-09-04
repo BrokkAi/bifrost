@@ -1,0 +1,168 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1440 970" role="img" aria-labelledby="identity-title identity-desc">
+  <title id="identity-title">Bifrost identity and language front-end pipeline</title>
+  <desc id="identity-desc">Exact disk or overlay bytes pass through a Tree-sitter grammar and a language adapter. The adapter produces structured declarations, imports, hierarchy inputs, call shapes, and semantic locators. Language-specific resolution reports proven, ambiguous, incomplete, or unsupported outcomes. Declaration identities are source-facing, artifact keys prove cache validity, and dense graph IDs remain local to an owning artifact.</desc>
+  <defs>
+    <linearGradient id="identity-bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#081521"/>
+      <stop offset="1" stop-color="#102b36"/>
+    </linearGradient>
+    <linearGradient id="identity-panel" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#14343f"/>
+      <stop offset="1" stop-color="#0d222d"/>
+    </linearGradient>
+    <marker id="identity-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#66d4c2"/>
+    </marker>
+    <marker id="identity-arrow-warm" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#f6a85f"/>
+    </marker>
+    <filter id="identity-shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="6" stdDeviation="8" flood-color="#02070c" flood-opacity="0.38"/>
+    </filter>
+    <style>
+      .title { fill: #effaf8; font: 700 30px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+      .subtitle { fill: #b8d5d2; font: 400 17px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+      .section { fill: #66d4c2; font: 700 14px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; letter-spacing: 1.5px; }
+      .heading { fill: #effaf8; font: 700 20px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+      .label { fill: #effaf8; font: 600 16px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+      .body { fill: #b8d5d2; font: 400 14px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+      .tiny { fill: #9bb8b6; font: 400 13px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+      .warm { fill: #f6a85f; }
+      .panel { fill: url(#identity-panel); stroke: #3e7d7a; stroke-width: 1.5; }
+      .inner { fill: #0b1c26; stroke: #315f60; stroke-width: 1.25; }
+      .warm-panel { fill: #3b2b20; stroke: #b87942; stroke-width: 1.5; }
+      .flow { fill: none; stroke: #66d4c2; stroke-width: 2; marker-end: url(#identity-arrow); }
+      .warm-flow { fill: none; stroke: #f6a85f; stroke-width: 2; stroke-dasharray: 6 5; marker-end: url(#identity-arrow-warm); }
+      .branch { fill: none; stroke: #3e7d7a; stroke-width: 1.5; }
+    </style>
+  </defs>
+
+  <rect width="1440" height="970" rx="22" fill="url(#identity-bg)"/>
+  <text class="title" x="64" y="58">Identity and language front ends</text>
+  <text class="subtitle" x="64" y="86">One structural vocabulary, language-specific resolution, and no promotion of textual guesses into proof.</text>
+
+  <text class="section" x="64" y="126">FRONT-END PIPELINE</text>
+  <g filter="url(#identity-shadow)">
+    <rect class="warm-panel" x="64" y="146" width="286" height="126" rx="14"/>
+    <rect class="panel" x="374" y="146" width="286" height="126" rx="14"/>
+    <rect class="panel" x="684" y="146" width="318" height="126" rx="14"/>
+    <rect class="panel" x="1026" y="146" width="350" height="126" rx="14"/>
+  </g>
+
+  <text class="heading warm" x="88" y="180">Exact source snapshot</text>
+  <text class="body" x="88" y="207">Disk blob or unsaved overlay</text>
+  <text class="body" x="88" y="228">Possibly incomplete source</text>
+  <text class="tiny" x="88" y="251">Content identity travels with the bytes</text>
+
+  <text class="heading" x="398" y="180">Tree-sitter grammar</text>
+  <text class="body" x="398" y="207">Named nodes, fields, and ranges</text>
+  <text class="body" x="398" y="228">Error-tolerant concrete syntax tree</text>
+  <text class="tiny" x="398" y="251">Recovery regions remain visible</text>
+
+  <text class="heading" x="708" y="180">Language adapter</text>
+  <text class="body" x="708" y="207">Dialect and file classification</text>
+  <text class="body" x="708" y="228">AST-driven extraction and normalization</text>
+  <text class="tiny" x="708" y="251">Language capability is explicit</text>
+
+  <text class="heading" x="1050" y="180">Shared structured facts</text>
+  <text class="body" x="1050" y="207">Declarations, scopes, ranges, signatures</text>
+  <text class="body" x="1050" y="228">Imports, owners, supertypes, call shapes</text>
+  <text class="tiny" x="1050" y="251">Queryable without erasing language rules</text>
+
+  <path class="warm-flow" d="M 350 209 H 374"/>
+  <path class="flow" d="M 660 209 H 684"/>
+  <path class="flow" d="M 1002 209 H 1026"/>
+
+  <path class="branch" d="M 1201 272 V 306 H 430 V 332"/>
+  <path class="branch" d="M 1201 306 H 702 V 332"/>
+  <path class="branch" d="M 1201 306 V 332"/>
+
+  <text class="section" x="64" y="320">EXTRACTED REPRESENTATIONS</text>
+  <g filter="url(#identity-shadow)">
+    <rect class="panel" x="64" y="340" width="390" height="148" rx="14"/>
+    <rect class="panel" x="478" y="340" width="448" height="148" rx="14"/>
+    <rect class="panel" x="950" y="340" width="426" height="148" rx="14"/>
+  </g>
+
+  <text class="heading" x="88" y="376">Declaration model</text>
+  <text class="label" x="88" y="405">CodeUnit + DeclarationId</text>
+  <text class="body" x="88" y="429">Structured qualified-name segments</text>
+  <text class="body" x="88" y="450">Relative path, kind, owner, signature</text>
+  <text class="tiny" x="88" y="472">Rendered names are views, not identities</text>
+
+  <text class="heading" x="502" y="376">Resolution inputs</text>
+  <text class="label" x="502" y="405">Binders + scopes + ownership + hierarchy</text>
+  <text class="body" x="502" y="429">Receiver shapes and ordered arguments</text>
+  <text class="body" x="502" y="450">Parser-derived path and import segments</text>
+  <text class="tiny" x="502" y="472">Raw unresolved facts retain their status</text>
+
+  <text class="heading" x="974" y="376">Semantic source mapping</text>
+  <text class="label" x="974" y="405">Semantic locator + source anchor</text>
+  <text class="body" x="974" y="429">Remappable source-facing identity</text>
+  <text class="body" x="974" y="450">Separate full artifact validity key</text>
+  <text class="tiny" x="974" y="472">Compact graph IDs remain artifact-local</text>
+
+  <path class="flow" d="M 430 488 V 532"/>
+  <path class="flow" d="M 702 488 V 532"/>
+  <path class="flow" d="M 1163 488 V 532"/>
+
+  <text class="section" x="64" y="524">LANGUAGE-SPECIFIC RESOLUTION</text>
+  <g filter="url(#identity-shadow)">
+    <rect class="panel" x="64" y="544" width="1312" height="176" rx="14"/>
+  </g>
+
+  <rect class="inner" x="88" y="574" width="278" height="58" rx="9"/>
+  <text class="label" x="227" y="599" text-anchor="middle">Imports and lexical scope</text>
+  <text class="tiny" x="227" y="618" text-anchor="middle">Alias, namespace, package, visibility</text>
+
+  <rect class="inner" x="390" y="574" width="278" height="58" rx="9"/>
+  <text class="label" x="529" y="599" text-anchor="middle">Owners and hierarchy</text>
+  <text class="tiny" x="529" y="618" text-anchor="middle">Nested members, supertypes, exports</text>
+
+  <rect class="inner" x="692" y="574" width="278" height="58" rx="9"/>
+  <text class="label" x="831" y="599" text-anchor="middle">Receivers and call binding</text>
+  <text class="tiny" x="831" y="618" text-anchor="middle">Dispatch, applicability, actual-to-formal</text>
+
+  <rect class="warm-panel" x="994" y="574" width="358" height="58" rx="9"/>
+  <text class="label warm" x="1173" y="599" text-anchor="middle">Capability and request boundary</text>
+  <text class="tiny" x="1173" y="618" text-anchor="middle">Snapshot, scope, budget, cancellation</text>
+
+  <path class="branch" d="M 227 632 V 654 H 1173"/>
+  <path class="branch" d="M 529 632 V 654"/>
+  <path class="branch" d="M 831 632 V 654"/>
+  <path class="branch" d="M 1173 632 V 654"/>
+
+  <rect x="88" y="666" width="276" height="34" rx="17" fill="#123b39" stroke="#66d4c2"/>
+  <text x="226" y="688" text-anchor="middle" fill="#effaf8" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="14" font-weight="700">PROVEN UNIQUE OR PROVEN EDGE</text>
+  <rect x="390" y="666" width="276" height="34" rx="17" fill="#26363a" stroke="#7ba5a2"/>
+  <text x="528" y="688" text-anchor="middle" fill="#effaf8" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="14" font-weight="700">AMBIGUOUS CANDIDATE SET</text>
+  <rect x="692" y="666" width="276" height="34" rx="17" fill="#3b2b20" stroke="#b87942"/>
+  <text x="830" y="688" text-anchor="middle" fill="#f6a85f" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="14" font-weight="700">INCOMPLETE OR BUDGET-LIMITED</text>
+  <rect x="994" y="666" width="358" height="34" rx="17" fill="#3b2b20" stroke="#b87942"/>
+  <text x="1173" y="688" text-anchor="middle" fill="#f6a85f" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="14" font-weight="700">UNRESOLVED OR UNSUPPORTED</text>
+
+  <text class="section" x="64" y="766">IDENTITY LIFETIMES</text>
+  <g filter="url(#identity-shadow)">
+    <rect class="panel" x="64" y="786" width="390" height="112" rx="14"/>
+    <rect class="panel" x="478" y="786" width="448" height="112" rx="14"/>
+    <rect class="panel" x="950" y="786" width="426" height="112" rx="14"/>
+  </g>
+
+  <text class="heading" x="88" y="820">Source-facing identity</text>
+  <text class="body" x="88" y="846">DeclarationId and stable locator digest</text>
+  <text class="tiny" x="88" y="868">No absolute checkout root or local interner ID</text>
+  <text class="tiny" x="88" y="886">Changes when structured source identity changes</text>
+
+  <text class="heading" x="502" y="820">Cache-validity identity</text>
+  <text class="body" x="502" y="846">Content + adapter + IR + config + dependencies</text>
+  <text class="tiny" x="502" y="868">Proves that one immutable artifact can be reused</text>
+  <text class="tiny" x="502" y="886">Intentionally more sensitive than a locator</text>
+
+  <text class="heading" x="974" y="820">Artifact-local identity</text>
+  <text class="body" x="974" y="846">Dense procedure, block, value, and call-site IDs</text>
+  <text class="tiny" x="974" y="868">Fast only because the owning artifact gives meaning</text>
+  <text class="tiny" x="974" y="886">Never compare or persist without that owner</text>
+
+  <rect class="warm-panel" x="64" y="920" width="1312" height="30" rx="15"/>
+  <text x="720" y="940" text-anchor="middle" fill="#f6a85f" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="14" font-weight="700">DISPLAY TEXT AND RAW SNIPPETS MAY DISCOVER CANDIDATES; THEY DO NOT PROVE IDENTITY.</text>
+</svg>

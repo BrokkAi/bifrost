@@ -1103,6 +1103,11 @@ pub struct SearchToolsService {
     startup_index_warm: StartupIndexWarm,
     watcher_starter: WatcherStarter,
     diff_snapshot_object_dir: Option<PathBuf>,
+    /// Whether `query_code` may spend the source-volume-scaled budget policy
+    /// evaluation uses instead of the interactive defaults. Host configuration
+    /// for a trusted whole-workspace caller, never a tool argument: a query
+    /// document must not be able to raise its own limits.
+    workspace_scaled_query_limits: bool,
 }
 
 /// When a session pays for the expensive per-generation index builds.
@@ -2214,6 +2219,21 @@ impl SearchToolsService {
         self
     }
 
+    /// Let `query_code` scale its execution limits to the analyzed source
+    /// volume, exactly as policy evaluation does.
+    ///
+    /// The interactive defaults size one bounded request over an unknown
+    /// workspace. A whole-repository question asked by a trusted host -- the
+    /// one-shot CLI, or the private correctness corpus -- needs the audited
+    /// workspace's own budget instead, or it stops on a limit that describes
+    /// the request shape rather than the repository. This is host
+    /// configuration, never a tool argument.
+    #[must_use]
+    pub fn with_workspace_scaled_query_limits(mut self) -> Self {
+        self.workspace_scaled_query_limits = true;
+        self
+    }
+
     pub fn new(root: PathBuf) -> Result<Self, String> {
         Self::new_with_strategy(root, UpdateStrategy::WatchFiles)
     }
@@ -2404,6 +2424,7 @@ impl SearchToolsService {
             startup_index_warm: StartupIndexWarm::OnDemand,
             watcher_starter,
             diff_snapshot_object_dir: None,
+            workspace_scaled_query_limits: false,
         })
     }
 
@@ -3440,7 +3461,7 @@ impl SearchToolsService {
                 query_value_flows,
                 query_taint_results,
                 &query,
-                crate::rql::CodeQueryExecutionLimits::default(),
+                self.query_execution_limits(snapshot),
             );
         Ok((
             response,
@@ -3449,6 +3470,23 @@ impl SearchToolsService {
                 query_execution_ns: duration_ns(query_execution_started.elapsed()),
             },
         ))
+    }
+
+    /// The execution limits one `query_code` request runs under.
+    ///
+    /// Interactive callers keep the fixed defaults. A host that opted into
+    /// [`Self::with_workspace_scaled_query_limits`] gets the same
+    /// source-volume scaling policy evaluation computes, from this snapshot's
+    /// own analyzed files.
+    fn query_execution_limits(
+        &self,
+        snapshot: &WorkspaceQueryScope,
+    ) -> crate::rql::CodeQueryExecutionLimits {
+        if self.workspace_scaled_query_limits {
+            brokk_bifrost_policy::workspace_scaled_query_limits(snapshot)
+        } else {
+            crate::rql::CodeQueryExecutionLimits::default()
+        }
     }
 
     fn attach_query_code_request_timing(
@@ -3727,6 +3765,7 @@ impl SearchToolsService {
             startup_index_warm: StartupIndexWarm::OnDemand,
             watcher_starter,
             diff_snapshot_object_dir: None,
+            workspace_scaled_query_limits: false,
         })
     }
 
@@ -3774,6 +3813,7 @@ impl SearchToolsService {
             startup_index_warm: StartupIndexWarm::OnDemand,
             watcher_starter,
             diff_snapshot_object_dir: None,
+            workspace_scaled_query_limits: false,
         })
     }
 
@@ -3829,6 +3869,7 @@ impl SearchToolsService {
             startup_index_warm: StartupIndexWarm::OnDemand,
             watcher_starter,
             diff_snapshot_object_dir: None,
+            workspace_scaled_query_limits: false,
         }
     }
 
@@ -3891,6 +3932,7 @@ impl SearchToolsService {
             startup_index_warm: StartupIndexWarm::AtStartup,
             watcher_starter: production_watcher_starter(),
             diff_snapshot_object_dir: None,
+            workspace_scaled_query_limits: false,
         }
     }
 
@@ -4109,6 +4151,7 @@ impl SearchToolsService {
             startup_index_warm: StartupIndexWarm::AtStartup,
             watcher_starter,
             diff_snapshot_object_dir: None,
+            workspace_scaled_query_limits: false,
         })
     }
 
@@ -5702,6 +5745,7 @@ mod watcher_startup_tests {
             startup_index_warm: StartupIndexWarm::AtStartup,
             watcher_starter: starter,
             diff_snapshot_object_dir: None,
+            workspace_scaled_query_limits: false,
         }
     }
 
@@ -7205,6 +7249,83 @@ mod analyzer_failure_boundary_tests {
         assert!(error.message.contains("stale analyzer generation"));
     }
 
+    /// The trusted budget is reachable only by host configuration, it never
+    /// narrows a lane, and it removes the memory-shaped per-dimension estimate.
+    ///
+    /// That estimate is the whole reason this option exists. With no published
+    /// row table, `semantic_budget_limits` holds each retained-row lane to half
+    /// of `max_retained_bytes`, split across the row dimensions and priced at
+    /// each one's row size. For source mappings that is 33,288 rows regardless
+    /// of the repository, which is what stopped both pinned bbolt revisions at
+    /// 33,289 attempted mappings. Publishing the audited workspace's own table
+    /// is what lifts it, so assert on the table rather than on one number.
+    ///
+    /// The fixture is Python on purpose: the assertions are about limits, not
+    /// about any language, and a Java fixture would make this test pay a
+    /// minute of JDK semantic-pack activation for nothing.
+    #[test]
+    fn workspace_scaled_query_limits_are_host_configuration_and_never_narrow_a_lane() {
+        use crate::analyzer::semantic::SemanticBudgetDimension;
+        use crate::rql::CodeQuerySemanticRowLimits;
+
+        // The interactive per-dimension source-mapping allowance, measured on
+        // the pinned bbolt revisions.
+        const INTERACTIVE_SOURCE_MAPPING_ESTIMATE: usize = 33_288;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        std::fs::write(root.join("model.py"), "class Model:\n    pass\n").unwrap();
+        let (_project, workspace) = build_ephemeral_workspace(root.clone(), None).unwrap();
+        let document_root =
+            Arc::new(WorkspaceRoot::open(workspace.analyzer().project().root()).unwrap());
+        let scope = WorkspaceQueryScope::new(Arc::new(workspace), document_root, None);
+
+        let service = SearchToolsService::new_manual_ephemeral(root).unwrap();
+        let interactive = service.query_execution_limits(&scope);
+        let defaults = crate::rql::CodeQueryExecutionLimits::default();
+        assert_eq!(
+            interactive.semantic, defaults.semantic,
+            "a service nobody configured must keep the interactive defaults"
+        );
+        assert!(
+            interactive.semantic.rows_per_dimension.is_none(),
+            "the interactive defaults price no row lane: {:?}",
+            interactive.semantic
+        );
+
+        let trusted = service
+            .with_workspace_scaled_query_limits()
+            .query_execution_limits(&scope);
+        assert!(
+            trusted.semantic.rows_per_dimension.is_some(),
+            "a trusted host must get the audited workspace's own row table: {:?}",
+            trusted.semantic
+        );
+        assert!(
+            trusted
+                .semantic
+                .rows(SemanticBudgetDimension::SourceMappings)
+                > INTERACTIVE_SOURCE_MAPPING_ESTIMATE,
+            "the trusted lane must exceed the estimate that stopped bbolt: {:?}",
+            trusted.semantic
+        );
+        assert!(trusted.max_scanned_files >= defaults.max_scanned_files);
+        assert!(trusted.max_scanned_source_bytes >= defaults.max_scanned_source_bytes);
+        assert!(trusted.max_fact_nodes >= defaults.max_fact_nodes);
+        assert!(
+            trusted.semantic.max_materialized_files >= defaults.semantic.max_materialized_files
+        );
+        assert!(trusted.semantic.max_source_bytes >= defaults.semantic.max_source_bytes);
+        assert!(trusted.semantic.max_retained_bytes >= defaults.semantic.max_retained_bytes);
+        assert!(trusted.semantic.max_traversal_steps >= defaults.semantic.max_traversal_steps);
+        for dimension in CodeQuerySemanticRowLimits::ROW_DIMENSIONS {
+            assert!(
+                trusted.semantic.rows(dimension) >= defaults.semantic.rows(dimension),
+                "opting in narrowed {dimension:?}"
+            );
+        }
+    }
+
     #[test]
     fn query_finish_preserves_handler_error_over_recorded_store_failure() {
         let temp = tempfile::tempdir().unwrap();
@@ -7310,6 +7431,7 @@ public partial class MudDialogContainer
             startup_index_warm: StartupIndexWarm::OnDemand,
             watcher_starter: production_watcher_starter(),
             diff_snapshot_object_dir: None,
+            workspace_scaled_query_limits: false,
         }
     }
 
@@ -7544,6 +7666,7 @@ mod client_roots_tests {
             startup_index_warm: StartupIndexWarm::AtStartup,
             watcher_starter: production_watcher_starter(),
             diff_snapshot_object_dir: None,
+            workspace_scaled_query_limits: false,
         }
     }
 

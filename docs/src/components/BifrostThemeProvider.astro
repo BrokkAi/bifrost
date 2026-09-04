@@ -1,0 +1,12 @@
+---
+// Bifrost uses one branded dark color scheme.
+---
+
+<script is:inline>
+	document.documentElement.dataset.theme = 'dark';
+	try {
+		localStorage.removeItem('starlight-theme');
+	} catch {
+		// Storage can be unavailable in privacy-restricted contexts.
+	}
+</script>

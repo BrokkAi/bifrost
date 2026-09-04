@@ -19,44 +19,36 @@ use crate::analyzer::semantic::{
     GuardArmSide, GuardPredicate, MemberAccessKind, MemberAccessQuery, MemoryLocationKind,
     NarrowingVerdict, ProcedureHandle, ProcedurePortHandle, ProgramPointHandle, ProgramPointId,
     ProofStatus, SemanticBudget, SemanticCallSite, SemanticEffect, SemanticLocator,
-    SemanticProviderError, SemanticValueKind, SourceSpan, TypeFlowAdapter, UnknownReason,
+    SemanticProviderError, SemanticValueKind, SourceSite, SourceSiteKind, SourceSpan,
+    TypeFlowAdapter, UnknownReason,
 };
 use crate::analyzer::{ProjectFile, WorkspaceAnalyzer};
 use crate::dataflow::SemanticInputStatus;
+use crate::dataflow::{
+    ExternalSummaryCompatibilityKey, SummaryBehaviorKey, SummaryContextKey, SummarySchemaVersion,
+    SummarySemanticsVersion, UnmodeledCallBehavior,
+};
 use crate::hash::HashMap;
 use crate::value_flow::{
     BindingCoverage, CallSiteCoverage, ClosureLimits, DiscoveredClosure, DispatchStatus,
     DurableProcedureKey, ValueFlowCarrier, ValueFlowEdgeKillSpec, ValueFlowEventKey,
     ValueFlowEventKind, ValueFlowObservationPhase, ValueFlowPlan, ValueFlowPlanError,
-    ValueFlowSinkId, ValueFlowSinkSpec, ValueFlowSourceId, ValueFlowSourceSpec, discover_closure,
+    ValueFlowSinkId, ValueFlowSinkSpec, ValueFlowSourceId, ValueFlowSourceSpec,
+    WorkspaceValueFlowProvider, discover_closure_with,
 };
+use crate::{ProcedureSummaryBindingError, bind_active_unmaterialized_procedure_summaries};
 
 use super::field_slots::{FieldSlotIndex, receiver_values};
 use crate::scalar_state::BindingOriginIndex;
-
-/// Where one class-carrying source was seeded, for reporting.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SourceSite {
-    pub file: ProjectFile,
-    pub span: SourceSpan,
-    pub kind: SourceSiteKind,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SourceSiteKind {
-    ConstructorCall,
-    Literal,
-    ContainerLiteral,
-    DeclaredParameter,
-    RootReceiver,
-    Unknown,
-}
 
 /// One member access whose receiver's class set the solve computes.
 #[derive(Debug, Clone)]
 pub struct MemberAccessSite {
     pub procedure: ProcedureHandle,
     pub point: ProgramPointHandle,
+    /// Present exactly for a call-shaped access; load-shaped field access has
+    /// no call-site identity.
+    pub call: Option<CallSiteId>,
     pub file: ProjectFile,
     pub span: SourceSpan,
     pub member: Box<str>,
@@ -90,6 +82,7 @@ pub enum TypeFlowPlanError {
     WorkspaceEnumeration(std::io::Error),
     Cancelled,
     Flow(ValueFlowPlanError),
+    ExternalSummary(ProcedureSummaryBindingError),
 }
 
 impl fmt::Display for TypeFlowPlanError {
@@ -104,6 +97,12 @@ impl fmt::Display for TypeFlowPlanError {
             }
             Self::Cancelled => formatter.write_str("type-flow field-slot scan was cancelled"),
             Self::Flow(error) => write!(formatter, "type-flow value-flow plan failed: {error}"),
+            Self::ExternalSummary(error) => {
+                write!(
+                    formatter,
+                    "type-flow external summary binding failed: {error}"
+                )
+            }
         }
     }
 }
@@ -323,18 +322,20 @@ fn guard_edge_kills(
 }
 
 impl TypeFlowPlan {
+    #[allow(clippy::too_many_arguments)]
     pub fn build(
         workspace: &WorkspaceAnalyzer,
         adapter: &dyn TypeFlowAdapter,
         field_slots: &FieldSlotIndex,
         root: &ProcedureHandle,
+        provider: &WorkspaceValueFlowProvider<'_>,
         limits: ClosureLimits,
         semantic_budget: &mut SemanticBudget,
         cancellation: &CancellationToken,
     ) -> Result<Self, TypeFlowPlanError> {
         let closure = {
             let _scope = profiling::scope("type_flow.discovery");
-            discover_closure(workspace, root, limits, semantic_budget, cancellation)
+            discover_closure_with(provider, root, limits, semantic_budget, cancellation)
                 .map_err(TypeFlowPlanError::Discovery)?
         };
         let _scope = profiling::scope("type_flow.plan_build");
@@ -342,6 +343,13 @@ impl TypeFlowPlan {
             return Err(TypeFlowPlanError::RootRelationsUnavailable);
         }
         let root_key = root.durable_key();
+        let mut unmaterialized_external_targets = closure
+            .boundaries
+            .iter()
+            .filter_map(|boundary| boundary.unmaterialized_external_target().cloned())
+            .collect::<Vec<_>>();
+        unmaterialized_external_targets.sort_unstable();
+        unmaterialized_external_targets.dedup();
         let mut tables = SeedTables::new();
         for procedure in &closure.procedures {
             tables.ordinals.clear();
@@ -377,15 +385,45 @@ impl TypeFlowPlan {
             sites_by_key.insert(spec.key().clone(), site);
             sink_specs.push(spec);
         }
-        let value_flow = ValueFlowPlan::with_call_behavior_and_edge_kills(
+        let call_behavior = UnmodeledCallBehavior::Optimistic;
+        let mut value_flow = ValueFlowPlan::with_call_behavior_and_edge_kills(
             root.clone(),
             closure.snapshots,
             closure.bindings,
             source_specs,
             sink_specs,
             edge_kills,
-            crate::dataflow::UnmodeledCallBehavior::Optimistic,
+            call_behavior,
         )?;
+        if let Some(active) = provider.oracle().active_semantic_models()
+            && !unmaterialized_external_targets.is_empty()
+        {
+            let compatibility = ExternalSummaryCompatibilityKey::new(
+                SummarySchemaVersion::CURRENT,
+                SummarySemanticsVersion::hash_bytes(
+                    b"bifrost.production-value-flow.semantic-pack.v1",
+                ),
+                SummaryContextKey::hash_bytes(
+                    b"bifrost.production-value-flow.empty-call-context.v1",
+                ),
+                SummaryBehaviorKey::hash_bytes(
+                    b"bifrost.production-value-flow.external-boundary.v1",
+                )
+                .with_unmodeled_call_behavior(call_behavior),
+                root.artifact().key().dependencies(),
+                call_behavior,
+            );
+            if let Some(summaries) = bind_active_unmaterialized_procedure_summaries(
+                active,
+                &unmaterialized_external_targets,
+                root.artifact().key(),
+                compatibility,
+            )
+            .map_err(TypeFlowPlanError::ExternalSummary)?
+            {
+                value_flow = value_flow.with_external_summaries(summaries)?;
+            }
+        }
         let mut atoms = Vec::with_capacity(value_flow.sources().len());
         let mut source_sites = Vec::with_capacity(value_flow.sources().len());
         for (id, spec) in value_flow.sources() {
@@ -496,7 +534,16 @@ pub(crate) fn uncovered_reason(coverage: Option<&CallSiteCoverage>) -> Option<Un
                 })
             {
                 Some(UnknownReason::SemanticBudget)
-            } else if coverage.has_boundary || coverage.entered.is_empty() {
+            } else if coverage.has_uncovered_boundary
+                || (coverage.entered.is_empty()
+                    && !matches!(
+                        coverage.dispatch,
+                        DispatchStatus::Resolved {
+                            coverage: crate::analyzer::semantic::CandidateCoverage::Exhaustive,
+                            ..
+                        }
+                    ))
+            {
                 Some(UnknownReason::UnresolvedCall)
             } else {
                 None
@@ -508,7 +555,7 @@ pub(crate) fn uncovered_reason(coverage: Option<&CallSiteCoverage>) -> Option<Un
 
 fn dispatch_status(dispatch: &DispatchStatus) -> SemanticInputStatus {
     match dispatch {
-        DispatchStatus::Resolved { status } | DispatchStatus::Unavailable { status } => *status,
+        DispatchStatus::Resolved { status, .. } | DispatchStatus::Unavailable { status } => *status,
         DispatchStatus::ProviderError { .. } => SemanticInputStatus::Unknown,
     }
 }
@@ -830,6 +877,7 @@ fn seed_procedure(
                             *base,
                             member,
                             MemberAccessKind::Load,
+                            None,
                             tables,
                         );
                     }
@@ -971,6 +1019,7 @@ fn seed_call(
             receiver,
             member,
             MemberAccessKind::Call,
+            Some(call.id),
             tables,
         );
     }
@@ -1001,6 +1050,7 @@ fn seed_port(
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn push_member_sink(
     workspace: &WorkspaceAnalyzer,
     procedure: &ProcedureHandle,
@@ -1008,8 +1058,14 @@ fn push_member_sink(
     base: crate::analyzer::semantic::ValueId,
     member: Box<str>,
     kind: MemberAccessKind,
+    call: Option<CallSiteId>,
     tables: &mut SeedTables,
 ) {
+    assert_eq!(
+        matches!(kind, MemberAccessKind::Call),
+        call.is_some(),
+        "only a call-shaped member sink owns a call-site ID"
+    );
     let base_value = procedure
         .semantics()
         .value(base)
@@ -1033,6 +1089,7 @@ fn push_member_sink(
         MemberAccessSite {
             procedure: procedure.clone(),
             point: point.clone(),
+            call,
             file,
             span,
             member,
@@ -1072,7 +1129,7 @@ mod tests {
     fn coverage(dispatch: DispatchStatus, bindings: Vec<BindingCoverage>) -> CallSiteCoverage {
         CallSiteCoverage {
             entered: Vec::new(),
-            has_boundary: false,
+            has_uncovered_boundary: false,
             truncated: false,
             dispatch,
             bindings,
@@ -1095,6 +1152,7 @@ mod tests {
         let binding_budget = coverage(
             DispatchStatus::Resolved {
                 status: SemanticInputStatus::Complete,
+                coverage: crate::analyzer::semantic::CandidateCoverage::Open,
             },
             vec![BindingCoverage::Answered {
                 status: budget_status(),
@@ -1111,5 +1169,18 @@ mod tests {
             uncovered_reason(Some(&truncated_budget)),
             Some(UnknownReason::Truncated)
         );
+    }
+
+    #[test]
+    fn exhaustive_dispatch_with_no_target_is_covered() {
+        let absent_member = coverage(
+            DispatchStatus::Resolved {
+                status: SemanticInputStatus::Complete,
+                coverage: crate::analyzer::semantic::CandidateCoverage::Exhaustive,
+            },
+            Vec::new(),
+        );
+
+        assert_eq!(uncovered_reason(Some(&absent_member)), None);
     }
 }

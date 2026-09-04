@@ -1,0 +1,124 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="920" viewBox="0 0 1200 920" role="img" aria-labelledby="title desc">
+  <title id="title">Bifrost dataflow engine architecture</title>
+  <desc id="desc">Language front ends lower source into validated immutable semantic artifacts. A demand ICFG provider supplies either a context-expanded bounded snapshot or procedure-at-a-time summary tabulation. Both use a finite distributive fact contract, while summary mode also supports IDE-style edge functions. Value flow, taint, typestate, and type flow publish results with separate termination, coverage, path quality, and bounded witness information.</desc>
+  <defs>
+    <linearGradient id="flow-bg" x1="0" x2="1" y1="0" y2="1">
+      <stop stop-color="#081521"/>
+      <stop offset="1" stop-color="#102b36"/>
+    </linearGradient>
+    <filter id="flow-shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="5" stdDeviation="7" flood-color="#02070b" flood-opacity="0.45"/>
+    </filter>
+    <marker id="flow-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#66d4c2"/>
+    </marker>
+    <marker id="flow-warm-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#f6a85f"/>
+    </marker>
+    <style>
+      .label{font:600 21px 'JetBrains Mono',ui-monospace,monospace;fill:#effaf8}
+      .section{font:700 16px 'JetBrains Mono',ui-monospace,monospace;fill:#66d4c2;letter-spacing:1px}
+      .small{font:500 15px 'JetBrains Mono',ui-monospace,monospace;fill:#b8d5d2}
+      .tiny{font:500 13px 'JetBrains Mono',ui-monospace,monospace;fill:#9bb8b6}
+      .box{fill:#102b36;stroke:#3e7d7a;stroke-width:2}
+      .accent{fill:#133f43;stroke:#66d4c2;stroke-width:2}
+      .warm{fill:#3b2b20;stroke:#f6a85f;stroke-width:2}
+      .line{stroke:#66d4c2;stroke-width:3;fill:none;marker-end:url(#flow-arrow)}
+      .warm-line{stroke:#f6a85f;stroke-width:3;fill:none;marker-end:url(#flow-warm-arrow)}
+    </style>
+  </defs>
+
+  <rect width="1200" height="920" rx="22" fill="url(#flow-bg)"/>
+  <text x="60" y="54" class="label">BIFROST DATAFLOW: SEMANTICS, BOUNDS, EVIDENCE</text>
+
+  <g filter="url(#flow-shadow)">
+    <rect x="60" y="88" width="300" height="100" rx="14" class="box"/>
+    <text x="210" y="123" text-anchor="middle" class="label">Language front ends</text>
+    <text x="210" y="153" text-anchor="middle" class="small">Tree-sitter lowerers</text>
+    <text x="210" y="176" text-anchor="middle" class="tiny">language rules stay here</text>
+
+    <rect x="450" y="88" width="300" height="100" rx="14" class="accent"/>
+    <text x="600" y="123" text-anchor="middle" class="label">Semantic artifact</text>
+    <text x="600" y="153" text-anchor="middle" class="tiny">procedures | points | values | calls</text>
+    <text x="600" y="176" text-anchor="middle" class="tiny">immutable | validated | evidence</text>
+
+    <rect x="840" y="88" width="300" height="100" rx="14" class="accent"/>
+    <text x="990" y="123" text-anchor="middle" class="label">Demand ICFG provider</text>
+    <text x="990" y="153" text-anchor="middle" class="tiny">dispatch | binding | continuations</text>
+    <text x="990" y="176" text-anchor="middle" class="tiny">no eager whole-workspace supergraph</text>
+  </g>
+
+  <path d="M360 138 H450" class="line"/>
+  <path d="M750 138 H840" class="line"/>
+
+  <rect x="285" y="224" width="630" height="74" rx="13" class="box" filter="url(#flow-shadow)"/>
+  <text x="600" y="255" text-anchor="middle" class="label">Finite distributive problem contract</text>
+  <text x="600" y="281" text-anchor="middle" class="small">zero fact | normal | call | return | continuation | exceptional flow</text>
+
+  <path d="M990 188 V326 H875" class="line"/>
+  <path d="M600 298 V326 H325" class="line"/>
+  <path d="M600 298 V326 H875" class="line"/>
+
+  <text x="80" y="350" class="section">SNAPSHOT MODE</text>
+  <text x="650" y="350" class="section">SUMMARY MODE</text>
+
+  <g filter="url(#flow-shadow)">
+    <rect x="60" y="370" width="500" height="142" rx="15" class="accent"/>
+    <text x="310" y="405" text-anchor="middle" class="label">Bounded context-expanded ICFG</text>
+    <text x="310" y="435" text-anchor="middle" class="small">call depth | nodes | edges | explicit boundaries</text>
+    <text x="310" y="466" text-anchor="middle" class="small">deterministic forward or backward worklist</text>
+    <text x="310" y="492" text-anchor="middle" class="tiny">exploded state = snapshot node + fact</text>
+
+    <rect x="640" y="370" width="500" height="142" rx="15" class="accent"/>
+    <text x="890" y="405" text-anchor="middle" class="label">Procedure-at-a-time tabulation</text>
+    <text x="890" y="435" text-anchor="middle" class="small">on-demand edges | calls | exit profiles</text>
+    <text x="890" y="466" text-anchor="middle" class="small">query-local end summaries converge recursion</text>
+    <text x="890" y="492" text-anchor="middle" class="tiny">optional reusable summaries pass strict validity gates</text>
+  </g>
+
+  <path d="M310 512 V550" class="line"/>
+  <path d="M890 512 V535 H500 V550" class="line"/>
+
+  <g filter="url(#flow-shadow)">
+    <rect x="60" y="560" width="500" height="94" rx="14" class="box"/>
+    <text x="310" y="594" text-anchor="middle" class="label">IFDS-family fact propagation</text>
+    <text x="310" y="623" text-anchor="middle" class="small">intern | deduplicate | fixed point | path quality</text>
+
+    <rect x="640" y="560" width="500" height="94" rx="14" class="warm"/>
+    <text x="890" y="594" text-anchor="middle" class="label">IDE-style value propagation</text>
+    <text x="890" y="623" text-anchor="middle" class="small">edge functions | compose | meet | apply</text>
+  </g>
+
+  <path d="M890 512 V550" class="warm-line"/>
+  <path d="M310 654 V696 H190" class="line"/>
+  <path d="M310 654 V696 H470" class="line"/>
+  <path d="M890 654 V696 H750" class="warm-line"/>
+  <path d="M310 654 V680 H1030 V696" class="line"/>
+
+  <g filter="url(#flow-shadow)">
+    <rect x="60" y="706" width="250" height="88" rx="13" class="box"/>
+    <text x="185" y="741" text-anchor="middle" class="label">Value flow</text>
+    <text x="185" y="768" text-anchor="middle" class="tiny">carriers and meetings</text>
+
+    <rect x="330" y="706" width="250" height="88" rx="13" class="box"/>
+    <text x="455" y="741" text-anchor="middle" class="label">Typestate</text>
+    <text x="455" y="768" text-anchor="middle" class="tiny">finite protocols</text>
+
+    <rect x="620" y="706" width="250" height="88" rx="13" class="warm"/>
+    <text x="745" y="741" text-anchor="middle" class="label">Taint</text>
+    <text x="745" y="768" text-anchor="middle" class="tiny">class-set edge functions</text>
+
+    <rect x="890" y="706" width="250" height="88" rx="13" class="box"/>
+    <text x="1015" y="741" text-anchor="middle" class="label">Type flow</text>
+    <text x="1015" y="768" text-anchor="middle" class="tiny">class atoms via value flow</text>
+  </g>
+
+  <path d="M185 794 V826" class="line"/>
+  <path d="M455 794 V826" class="line"/>
+  <path d="M745 794 V826" class="line"/>
+  <path d="M1015 794 V826" class="line"/>
+
+  <rect x="60" y="836" width="1080" height="64" rx="13" fill="#0b2029" stroke="#f6a85f" stroke-width="2"/>
+  <text x="600" y="862" text-anchor="middle" class="small">EVIDENCE-AWARE RESULT</text>
+  <text x="600" y="886" text-anchor="middle" class="tiny">semantic status | solver termination | coverage boundaries | path-quality frontier | bounded witnesses</text>
+</svg>

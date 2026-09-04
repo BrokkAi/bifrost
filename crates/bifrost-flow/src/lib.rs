@@ -24,7 +24,7 @@ mod inline_project;
 pub use semantic_summary::{
     ExactProcedureSummaryBoundary, ExactProcedureSummaryParameter, ExactProcedureSummaryReceiver,
     ExactProcedureSummaryTargetBinding, ProcedureSummaryBindingError,
-    bind_compiled_procedure_summaries,
+    bind_active_unmaterialized_procedure_summaries, bind_compiled_procedure_summaries,
 };
 
 /// Reusable flow caches owned by one logical workspace.

@@ -52,11 +52,13 @@ use brokk_bifrost_rql::structural::search::{
     CodeQueryOccurrence, CodeQueryOccurrenceTarget, CodeQueryResolutionCandidate,
 };
 use brokk_bifrost_rql::structural::search::{
-    CodeQueryExecutionScope, CodeQueryStableOwnerDerivation, DetailedCodeQueryDomain,
-    DetailedCodeQueryKey, UnitRowEvidence, UnitRowIdentities, UnitRowIdentityCandidate,
-    UnitRowItem, UnitRowItemProvenance, UnitRowItemRef, UnitRowItemRefValue, UnitRowItemTerminal,
-    UnitRowProvenance, UnitRowProvenanceRef, execute_code_query_detailed_eager_index,
-    execute_code_query_detailed_eager_index_without_targets,
+    CodeQueryExecutionScope, CodeQueryRowFamilySession, CodeQueryStableOwnerDerivation,
+    DetailedCodeQueryDomain, DetailedCodeQueryKey, UnitRowEvidence, UnitRowIdentities,
+    UnitRowIdentityCandidate, UnitRowItem, UnitRowItemProvenance, UnitRowItemRef,
+    UnitRowItemRefValue, UnitRowItemTerminal, UnitRowProvenance, UnitRowProvenanceRef,
+    execute_code_query_detailed_eager_index,
+    execute_code_query_detailed_eager_index_with_row_family_session,
+    execute_code_query_detailed_eager_index_without_targets_with_row_family_session,
     execute_code_query_detailed_eager_index_workspace, execute_code_query_unit,
 };
 use brokk_bifrost_rql::structural::{BoundaryStatus, PrecedenceTier};

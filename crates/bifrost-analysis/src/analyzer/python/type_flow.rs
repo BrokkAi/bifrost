@@ -18,8 +18,9 @@ use tree_sitter::Node;
 use super::PythonAnalyzer;
 use crate::analyzer::lexical_definitions::{PythonMethodBinding, formal_parameter_slots_for_owner};
 use crate::analyzer::semantic::type_flow::{
-    ClassHierarchy, ClassIdentity, ClassSeed, DynamicFieldWrite, GuardArmSide, MemberAccessQuery,
-    MemberLookup, NarrowingVerdict, TypeFlowAdapter, UnknownReason,
+    ClassHierarchy, ClassIdentity, ClassSeed, DynamicFieldWrite, ExternalMemberDeclaration,
+    GuardArmSide, MemberAccessQuery, MemberDeclaration, MemberLookup, NarrowingVerdict,
+    TypeFlowAdapter, UnknownReason,
 };
 use crate::analyzer::semantic::{
     AllocationSite, GuardFact, GuardPredicate, MemoryLocationKind, ProcedureHandle, ProcedureKind,
@@ -56,6 +57,39 @@ fn overlay_of(workspace: &WorkspaceAnalyzer) -> Option<Arc<SemanticModelOverlay>
         .analyzer()
         .active_semantic_model_snapshot()
         .and_then(|snapshot| snapshot.semantic_model_overlay().cloned())
+}
+
+fn external_member_lookup(
+    overlay: &SemanticModelOverlay,
+    owner_id: &str,
+    member: &str,
+) -> MemberLookup {
+    let matched = overlay.member_target_on_owner(owner_id, member);
+    match matched.disposition {
+        SemanticModelMemberTargetDisposition::Unique => {
+            MemberLookup::Present(MemberDeclaration::External(ExternalMemberDeclaration::new(
+                matched
+                    .records
+                    .into_iter()
+                    .map(|record| Box::from(record.id.as_str())),
+            )))
+        }
+        SemanticModelMemberTargetDisposition::Conflict
+            if overlay.member_present_on_owner(owner_id, member) =>
+        {
+            MemberLookup::Present(MemberDeclaration::External(ExternalMemberDeclaration::new(
+                matched
+                    .records
+                    .into_iter()
+                    .map(|record| Box::from(record.id.as_str())),
+            )))
+        }
+        SemanticModelMemberTargetDisposition::Absent => MemberLookup::Absent,
+        SemanticModelMemberTargetDisposition::Incomplete
+        | SemanticModelMemberTargetDisposition::Conflict => {
+            MemberLookup::Unknown(UnknownReason::PackIncomplete)
+        }
+    }
 }
 
 fn file_for_locator(
@@ -433,12 +467,12 @@ impl PythonTypeFlowAdapter {
             }
         }
         for owner in std::iter::once(unit).chain(ancestors.iter()) {
-            if python
+            if let Some(declaration) = python
                 .direct_children(owner)
-                .iter()
-                .any(|child| child.terminal_name() == member)
+                .into_iter()
+                .find(|child| child.terminal_name() == member)
             {
-                return MemberLookup::Present;
+                return MemberLookup::Present(MemberDeclaration::Workspace(declaration));
             }
         }
         for base in &external_bases {
@@ -448,21 +482,10 @@ impl PythonTypeFlowAdapter {
             let Some(overlay) = overlay.as_deref() else {
                 unreachable!("an external base resolved only through the overlay")
             };
-            match overlay
-                .member_target_on_owner(symbol_id, member)
-                .disposition
-            {
-                SemanticModelMemberTargetDisposition::Unique => return MemberLookup::Present,
-                SemanticModelMemberTargetDisposition::Conflict
-                    if overlay.member_present_on_owner(symbol_id, member) =>
-                {
-                    return MemberLookup::Present;
-                }
-                SemanticModelMemberTargetDisposition::Incomplete
-                | SemanticModelMemberTargetDisposition::Conflict => {
-                    return MemberLookup::Unknown(UnknownReason::PackIncomplete);
-                }
-                SemanticModelMemberTargetDisposition::Absent => {}
+            match external_member_lookup(overlay, symbol_id, member) {
+                present @ MemberLookup::Present(_) => return present,
+                MemberLookup::Unknown(reason) => return MemberLookup::Unknown(reason),
+                MemberLookup::Absent => {}
             }
         }
         MemberLookup::Absent
@@ -702,22 +725,7 @@ impl TypeFlowAdapter for PythonTypeFlowAdapter {
                 let Some(overlay) = overlay_of(workspace) else {
                     return MemberLookup::Unknown(UnknownReason::ExternalNotModeled);
                 };
-                match overlay
-                    .member_target_on_owner(symbol_id, member)
-                    .disposition
-                {
-                    SemanticModelMemberTargetDisposition::Unique => MemberLookup::Present,
-                    SemanticModelMemberTargetDisposition::Conflict
-                        if overlay.member_present_on_owner(symbol_id, member) =>
-                    {
-                        MemberLookup::Present
-                    }
-                    SemanticModelMemberTargetDisposition::Absent => MemberLookup::Absent,
-                    SemanticModelMemberTargetDisposition::Incomplete
-                    | SemanticModelMemberTargetDisposition::Conflict => {
-                        MemberLookup::Unknown(UnknownReason::PackIncomplete)
-                    }
-                }
+                external_member_lookup(&overlay, symbol_id, member)
             }
         }
     }
@@ -916,7 +924,7 @@ impl TypeFlowAdapter for PythonTypeFlowAdapter {
                     return NarrowingVerdict::Unknown;
                 };
                 match self.member_lookup(workspace, atom, member) {
-                    MemberLookup::Present => true,
+                    MemberLookup::Present(_) => true,
                     MemberLookup::Absent => false,
                     MemberLookup::Unknown(_) => return NarrowingVerdict::Unknown,
                 }

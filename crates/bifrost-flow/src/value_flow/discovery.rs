@@ -20,9 +20,9 @@ use std::sync::Arc;
 
 use crate::analyzer::WorkspaceAnalyzer;
 use crate::analyzer::semantic::{
-    CallBindings, CallSiteId, CancellationToken, DispatchBoundary, DispatchBoundaryKind,
-    OracleCallContext, ProcedureHandle, ProcedureId, SemanticArtifactKey, SemanticBudget,
-    SemanticProviderError, SemanticRequest, ValueFlowSnapshot,
+    CallBindings, CallSiteId, CancellationToken, CandidateCoverage, DispatchBoundary,
+    DispatchBoundaryKind, OracleCallContext, ProcedureHandle, ProcedureId, SemanticArtifactKey,
+    SemanticBudget, SemanticProviderError, SemanticRequest, ValueFlowSnapshot,
 };
 use crate::dataflow::SemanticInputStatus;
 use crate::hash::{HashMap, HashSet};
@@ -45,9 +45,10 @@ pub struct CallSiteCoverage {
     /// Candidates whose bindings were obtained and whose procedures were
     /// queued for discovery.
     pub entered: Vec<ProcedureHandle>,
-    /// The dispatch answer named at least one arm that cannot be entered: an
-    /// external, unmaterialized, deferred, unresolved, or truncated target.
-    pub has_boundary: bool,
+    /// The dispatch answer named at least one arm that cannot be entered or
+    /// modeled completely. A proven external arm with complete authored
+    /// summary evidence remains in `boundaries` but does not set this bit.
+    pub has_uncovered_boundary: bool,
     /// The walk stopped before it could process at least one arm of this
     /// call: a truncated dispatch enumeration, or an entered candidate left
     /// unprocessed when the procedure cap was reached.
@@ -63,9 +64,16 @@ pub struct CallSiteCoverage {
 /// What happened when the walk requested one call site's dispatch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DispatchStatus {
-    Resolved { status: SemanticInputStatus },
-    Unavailable { status: SemanticInputStatus },
-    ProviderError { detail: String },
+    Resolved {
+        status: SemanticInputStatus,
+        coverage: CandidateCoverage,
+    },
+    Unavailable {
+        status: SemanticInputStatus,
+    },
+    ProviderError {
+        detail: String,
+    },
 }
 
 /// What happened when the walk requested one dispatch candidate's bindings.
@@ -282,7 +290,7 @@ pub fn discover_closure_with<P: ValueFlowProvider>(
                         (procedure_key.clone(), call_row.id),
                         CallSiteCoverage {
                             entered: Vec::new(),
-                            has_boundary: false,
+                            has_uncovered_boundary: false,
                             truncated: false,
                             dispatch: DispatchStatus::ProviderError {
                                 detail: error.to_string(),
@@ -300,7 +308,7 @@ pub fn discover_closure_with<P: ValueFlowProvider>(
                     (procedure_key.clone(), call_row.id),
                     CallSiteCoverage {
                         entered: Vec::new(),
-                        has_boundary: false,
+                        has_uncovered_boundary: false,
                         truncated: false,
                         dispatch: DispatchStatus::Unavailable {
                             status: dispatch_status,
@@ -316,13 +324,17 @@ pub fn discover_closure_with<P: ValueFlowProvider>(
                 coverage_key.clone(),
                 CallSiteCoverage {
                     entered: Vec::new(),
-                    has_boundary: !dispatch.boundaries().is_empty(),
+                    has_uncovered_boundary: dispatch
+                        .boundaries()
+                        .iter()
+                        .any(dispatch_boundary_is_uncovered),
                     truncated: dispatch
                         .boundaries()
                         .iter()
                         .any(|boundary| matches!(boundary.kind, DispatchBoundaryKind::Truncated)),
                     dispatch: DispatchStatus::Resolved {
                         status: dispatch_status,
+                        coverage: dispatch.coverage(),
                     },
                     bindings: Vec::new(),
                 },
@@ -413,6 +425,16 @@ pub fn discover_closure_with<P: ValueFlowProvider>(
     }
 
     Ok(closure)
+}
+
+fn dispatch_boundary_is_uncovered(boundary: &DispatchBoundary) -> bool {
+    !matches!(
+        (&boundary.kind, &boundary.completeness),
+        (
+            DispatchBoundaryKind::External(Some(_)),
+            crate::analyzer::semantic::EvidenceCompleteness::Complete
+        )
+    )
 }
 
 #[cfg(test)]

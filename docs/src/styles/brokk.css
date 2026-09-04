@@ -487,6 +487,41 @@ html[data-has-hero] .sl-markdown-content > .capability-deck {
   color: #ff6a5f;
 }
 
+/* Let architecture diagrams use the reading pane beyond the prose measure. */
+@media screen {
+  .main-pane:has(.sl-markdown-content > p > img[src*="design-"]) {
+    container-type: inline-size;
+  }
+
+  .sl-markdown-content > p > img[src*="design-"] {
+    --bifrost-diagram-width: min(
+      125%,
+      calc(100cqw - var(--sl-content-pad-x) - var(--sl-content-pad-x))
+    );
+
+    width: var(--bifrost-diagram-width);
+    max-width: none;
+    margin-inline-start: calc((100% - var(--bifrost-diagram-width)) / 2);
+  }
+}
+
+@media screen and (width >= 72rem) {
+  html[data-has-sidebar][data-has-toc]:has(
+      .sl-markdown-content > p > img[src*="design-"]
+    )
+    .right-sidebar-container {
+    flex: 0 0 var(--sl-sidebar-width);
+    width: var(--sl-sidebar-width);
+  }
+
+  html[data-has-sidebar][data-has-toc]
+    .main-pane:has(.sl-markdown-content > p > img[src*="design-"]) {
+    --sl-content-margin-inline: auto;
+
+    width: calc(100% - var(--sl-sidebar-width));
+  }
+}
+
 @media (width < 50rem) {
   :root {
     --sl-nav-height: 4.45rem;

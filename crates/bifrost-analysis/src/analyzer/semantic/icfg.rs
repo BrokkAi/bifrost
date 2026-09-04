@@ -22,8 +22,8 @@ use super::workspace_oracle::{
 use super::{
     CallContinuationKind, CallInvocationMode, CallSiteHandle, CallSiteId, CandidateCoverage,
     ControlContinuation, ControlEdgeKind, DeferredInvocationKind, DispatchBoundary,
-    DispatchBoundaryKind, DispatchOracle, DispatchResult, EvidenceCompleteness, EvidenceHandle,
-    FormalMultiplicity, LengthDelimitedDigest, OracleLimits, OracleRelationArena,
+    DispatchBoundaryKind, DispatchHints, DispatchOracle, DispatchResult, EvidenceCompleteness,
+    EvidenceHandle, FormalMultiplicity, LengthDelimitedDigest, OracleLimits, OracleRelationArena,
     OracleRelationHandle, OracleRelationId, OracleRelationKind, OracleRelationOwner,
     OracleRelationRecord, OracleRelationSubject, ProcedureHandle, ProcedureInvocationKind,
     ProgramPointHandle, ProgramPointId, ProofStatus, SemanticBudgetExceeded, SemanticCallSite,
@@ -34,13 +34,13 @@ use super::{
 
 const DEFAULT_ICFG_PROVIDER_BEHAVIOR_DOMAIN: &[u8] = b"bifrost-icfg-provider/default-behavior/v1";
 const WORKSPACE_ICFG_PROVIDER_BEHAVIOR_DOMAIN: &[u8] =
-    b"bifrost-icfg-provider/workspace-behavior/v3";
+    b"bifrost-icfg-provider/workspace-behavior/v4";
 /// The domain of the same behavior without the workspace's content identity.
 ///
 /// Its own domain rather than a shorter message under the one above, so that
 /// no read half can ever equal a full identity by accident.
 const WORKSPACE_ICFG_PROVIDER_READ_BEHAVIOR_DOMAIN: &[u8] =
-    b"bifrost-icfg-provider/workspace-read-behavior/v1";
+    b"bifrost-icfg-provider/workspace-read-behavior/v2";
 
 /// Whether this first authored non-return consumer has an unambiguous call
 /// identity and immediate-invocation contract for `language`.
@@ -110,6 +110,7 @@ impl IcfgProviderBehaviorIdentity {
         workspace: &WorkspaceAnalyzer,
         hierarchy_expansion: DispatchHierarchyExpansion,
         snapshot: Option<&ActiveSemanticModelSnapshot>,
+        dispatch_hints: StableDigest,
     ) -> Self {
         let mut digest = LengthDelimitedDigest::new(WORKSPACE_ICFG_PROVIDER_BEHAVIOR_DOMAIN);
         let mut read = LengthDelimitedDigest::new(WORKSPACE_ICFG_PROVIDER_READ_BEHAVIOR_DOMAIN);
@@ -143,6 +144,8 @@ impl IcfgProviderBehaviorIdentity {
                 }
                 None => digest.push(b"no-external-dispatch-surface"),
             }
+            digest.push(b"receiver-class-dispatch-hints");
+            digest.push(dispatch_hints.as_bytes());
         };
         push_engine_inputs(&mut digest);
         push_engine_inputs(&mut read);
@@ -429,15 +432,30 @@ impl<'a> WorkspaceIcfgProvider<'a> {
         workspace: &'a WorkspaceAnalyzer,
         snapshot: Option<Arc<ActiveSemanticModelSnapshot>>,
     ) -> Self {
-        let semantic_model_overlay = snapshot
-            .as_ref()
-            .and_then(|snapshot| snapshot.semantic_model_overlay().map(Arc::clone));
-        let oracle =
-            WorkspaceSemanticOracle::with_semantic_model_overlay(workspace, semantic_model_overlay);
+        Self::with_active_semantic_model_snapshot_and_hints(
+            workspace,
+            snapshot,
+            DispatchHints::empty(),
+        )
+    }
+
+    /// Bind this provider to one captured active-model snapshot and one
+    /// immutable receiver-class dispatch overlay.
+    pub fn with_active_semantic_model_snapshot_and_hints(
+        workspace: &'a WorkspaceAnalyzer,
+        snapshot: Option<Arc<ActiveSemanticModelSnapshot>>,
+        dispatch_hints: DispatchHints,
+    ) -> Self {
+        let oracle = WorkspaceSemanticOracle::with_dispatch_hints(
+            workspace,
+            snapshot.as_deref(),
+            dispatch_hints,
+        );
         let behavior_identity = IcfgProviderBehaviorIdentity::workspace(
             workspace,
             oracle.hierarchy_expansion(),
             snapshot.as_deref(),
+            oracle.dispatch_hints().digest(),
         );
         Self {
             oracle,
@@ -2998,8 +3016,8 @@ mod tests {
         CallableDefinitionIdentity, retain_dispatch_candidate,
     };
     use crate::analyzer::semantic::{
-        DeclarationSegment, DispatchCandidate, ProcedureKind, SemanticBudget, SemanticGapId,
-        SemanticGapImpacts,
+        DeclarationSegment, DispatchCandidate, DispatchHintCallSiteKey, DispatchHintSet,
+        ProcedureKind, SemanticBudget, SemanticGapId, SemanticGapImpacts,
     };
     use crate::analyzer::{CodeUnit, CodeUnitType, ProjectFile};
     use crate::cancellation::CancellationToken;
@@ -4504,6 +4522,73 @@ void raii_caller() {
     fn workspace_icfg_provider_remains_clone() {
         fn assert_clone<T: Clone>() {}
         assert_clone::<WorkspaceIcfgProvider<'static>>();
+    }
+
+    #[test]
+    fn dispatch_hint_order_is_canonical_and_separates_provider_behavior() {
+        let fixture = AnalyzerFixture::new_for_language(
+            Language::Python,
+            &[(
+                "caller.py",
+                "def caller(x):\n    x.first()\n    return x.second()\n",
+            )],
+        );
+        let file = ProjectFile::new(fixture.project_root(), "caller.py");
+        let cancellation = CancellationToken::default();
+        let mut budget = SemanticBudget::default();
+        let artifact = fixture
+            .analyzer
+            .materialize_program_semantics(
+                &file,
+                &mut SemanticRequest::new(&mut budget, &cancellation),
+            )
+            .expect("Python caller materialization")
+            .available_value()
+            .cloned()
+            .expect("Python caller artifact");
+        let procedure = artifact
+            .procedures()
+            .first()
+            .and_then(|procedure| artifact.procedure_handle(procedure.id()))
+            .expect("caller procedure");
+        let calls = procedure.semantics().call_sites();
+        assert_eq!(calls.len(), 2);
+        let first = DispatchHintSet::new(
+            DispatchHintCallSiteKey::for_call(&procedure, calls[0].id),
+            Vec::new(),
+            true,
+            true,
+        );
+        let second = DispatchHintSet::new(
+            DispatchHintCallSiteKey::for_call(&procedure, calls[1].id),
+            Vec::new(),
+            true,
+            true,
+        );
+        let forward = DispatchHints::new(vec![first.clone(), second.clone()]);
+        let reverse = DispatchHints::new(vec![second, first]);
+        assert_eq!(forward.digest(), reverse.digest());
+
+        let open = DispatchHints::new(vec![DispatchHintSet::new(
+            DispatchHintCallSiteKey::for_call(&procedure, calls[0].id),
+            Vec::new(),
+            false,
+            true,
+        )]);
+        assert_ne!(forward.digest(), open.digest());
+
+        let unhinted =
+            WorkspaceIcfgProvider::with_active_semantic_model_snapshot(&fixture.analyzer, None);
+        let hinted = WorkspaceIcfgProvider::with_active_semantic_model_snapshot_and_hints(
+            &fixture.analyzer,
+            None,
+            forward,
+        );
+        assert_ne!(unhinted.behavior_identity(), hinted.behavior_identity());
+        assert_ne!(
+            unhinted.behavior_identity().read_digest(),
+            hinted.behavior_identity().read_digest()
+        );
     }
 
     #[test]

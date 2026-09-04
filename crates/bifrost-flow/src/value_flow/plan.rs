@@ -3800,6 +3800,22 @@ mod tests {
     }
 
     #[test]
+    fn call_rule_quality_includes_dispatch_candidate_quality() {
+        let candidate_proof = ProofStatus::Unproven("multi-class dispatch".into());
+        let candidate_completeness =
+            EvidenceCompleteness::Partial("receiver set is incomplete".into());
+
+        assert_eq!(
+            merge_call_rule_proof(&candidate_proof, ProofStatus::Proven),
+            candidate_proof
+        );
+        assert_eq!(
+            merge_call_rule_completeness(&candidate_completeness, EvidenceCompleteness::Complete,),
+            candidate_completeness
+        );
+    }
+
+    #[test]
     fn only_carrierless_constant_parameters_are_vacuous_summary_inputs() {
         assert!(carrierless_summary_input_is_vacuous(
             &SummaryPort::Parameter(0),
@@ -4326,6 +4342,8 @@ fn append_call_rules(
     ids: &HashMap<ValueFlowCarrier, ValueFlowCarrierId>,
     output: &mut Vec<CallFlowRule>,
 ) -> Result<(), ValueFlowPlanError> {
+    let candidate_proof = bindings.candidate().proof();
+    let candidate_completeness = bindings.candidate().completeness();
     let mut append =
         |kind, source: ValueFlowCarrier, target: ValueFlowCarrier, proof, completeness| {
             output.push(CallFlowRule {
@@ -4334,8 +4352,8 @@ fn append_call_rules(
                 kind,
                 source: *ids.get(&source).ok_or(ValueFlowPlanError::MissingCarrier)?,
                 target: *ids.get(&target).ok_or(ValueFlowPlanError::MissingCarrier)?,
-                proof,
-                completeness,
+                proof: merge_call_rule_proof(candidate_proof, proof),
+                completeness: merge_call_rule_completeness(candidate_completeness, completeness),
             });
             Ok::<_, ValueFlowPlanError>(())
         };
@@ -4383,6 +4401,31 @@ fn append_call_rules(
         }
     }
     Ok(())
+}
+
+fn merge_call_rule_proof(candidate: &ProofStatus, binding: ProofStatus) -> ProofStatus {
+    match (candidate, binding) {
+        (ProofStatus::Proven, binding) => binding,
+        (candidate @ ProofStatus::Unproven(_), ProofStatus::Proven) => candidate.clone(),
+        (ProofStatus::Unproven(candidate), ProofStatus::Unproven(binding)) => {
+            ProofStatus::Unproven(format!("{candidate}; {binding}").into())
+        }
+    }
+}
+
+fn merge_call_rule_completeness(
+    candidate: &EvidenceCompleteness,
+    binding: EvidenceCompleteness,
+) -> EvidenceCompleteness {
+    match (candidate, binding) {
+        (EvidenceCompleteness::Complete, binding) => binding,
+        (candidate @ EvidenceCompleteness::Partial(_), EvidenceCompleteness::Complete) => {
+            candidate.clone()
+        }
+        (EvidenceCompleteness::Partial(candidate), EvidenceCompleteness::Partial(binding)) => {
+            EvidenceCompleteness::Partial(format!("{candidate}; {binding}").into())
+        }
+    }
 }
 
 fn build_local_rule_reverse_index(rules: &[LocalFlowRule]) -> LocalRuleReverseIndex {

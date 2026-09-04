@@ -5,7 +5,7 @@
 //! declaration from the compiled target's display strings.
 
 use std::cmp::Reverse;
-use std::collections::BinaryHeap;
+use std::collections::{BTreeMap, BinaryHeap};
 use std::fmt;
 
 use crate::analyzer::canonical_hash::{CanonicalHasher, parse_lower_sha256};
@@ -13,13 +13,13 @@ use crate::analyzer::semantic::cfg_algorithms::{
     CfgAlgorithmBudget, CfgAlgorithmRequest, DenseBidirectionalGraph, strongly_connected_components,
 };
 use crate::analyzer::semantic::{
-    SemanticArtifactKey, SemanticLocator, SemanticRole, StableDigest,
-    is_unmaterialized_external_artifact,
+    SemanticArtifactKey, SemanticLocator, SemanticRole, StableDigest, UnmaterializedExternalTarget,
+    authored_procedure_target_identity, is_unmaterialized_external_artifact,
 };
 use crate::cancellation::CancellationToken;
 use crate::dataflow::{
     ExternalSemanticSummarySet, ExternalSummaryCompatibilityKey, ExternalSummaryContentHash,
-    ExternalSummaryModelId, ExternalSummaryOrigin, ExternalSummarySetError,
+    ExternalSummaryModelId, ExternalSummaryOrigin, ExternalSummarySetError, ExternalSummaryTarget,
     ProcedureSummaryIdentity, ProcedureSummaryKey, SemanticProcedureSummary, SummaryCompleteness,
     SummaryConcurrencyAccessPath, SummaryConcurrencyAtomicOperation, SummaryConcurrencyEffect,
     SummaryConcurrencyEffectKind, SummaryConcurrencyLockMode, SummaryConcurrencyLockOperation,
@@ -28,12 +28,14 @@ use crate::dataflow::{
     SummaryLocationKey, SummaryOrigin, SummaryPort, SummaryRecursiveEdge, SummaryRecursiveGroupKey,
     SummaryTransfer, SummaryValidationError,
 };
-use crate::hash::{HashMap, map_with_capacity};
+use crate::hash::{HashMap, HashSet, map_with_capacity};
 
 use brokk_bifrost_analysis::analyzer::semantic_model::{
     CompiledAtomicOperation, CompiledConcurrencyEffect, CompiledLockMode, CompiledProcedureSummary,
     CompiledProcedureTarget, CompiledSummaryEffect, CompiledSummaryExitKind, CompiledSummaryInput,
     CompiledSummaryLocationKind, CompiledSummaryOutput, CompiledSummaryTransfer, Completeness,
+    ProcedureSummaryMatch, ProcedureSummaryMemberKey, ResolvedActiveSemanticModels,
+    SemanticModelMatchDisposition,
 };
 
 const LOCATION_KEY_DOMAIN: &[u8] = b"bifrost.semantic-model.procedure-summary.location.v1";
@@ -141,6 +143,9 @@ impl ExactProcedureSummaryTargetBinding {
 /// Fail-closed errors from compiled procedure-summary binding.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProcedureSummaryBindingError {
+    ActiveModelSelection {
+        detail: String,
+    },
     MissingBinding {
         summary_id: String,
     },
@@ -172,11 +177,15 @@ pub enum ProcedureSummaryBindingError {
         summary_id: String,
         source: SummaryValidationError,
     },
+    InvalidSummarySet {
+        source: ExternalSummarySetError,
+    },
 }
 
 impl fmt::Display for ProcedureSummaryBindingError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::ActiveModelSelection { detail } => formatter.write_str(detail),
             Self::MissingBinding { summary_id } => {
                 write!(
                     formatter,
@@ -228,6 +237,12 @@ impl fmt::Display for ProcedureSummaryBindingError {
                     "compiled summary `{summary_id}` lowered to invalid IR: {source}"
                 )
             }
+            Self::InvalidSummarySet { source } => {
+                write!(
+                    formatter,
+                    "bound external procedure-summary set is invalid: {source}"
+                )
+            }
         }
     }
 }
@@ -236,9 +251,277 @@ impl std::error::Error for ProcedureSummaryBindingError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::InvalidSummary { source, .. } => Some(source),
+            Self::InvalidSummarySet { source } => Some(source),
             _ => None,
         }
     }
+}
+
+struct SelectedUnmaterializedSummaryFamily {
+    language: String,
+    payload: Vec<CompiledProcedureSummary>,
+    root_ids: HashSet<String>,
+}
+
+/// Select and bind the activated procedure summaries that model exact
+/// unmaterialized external targets retained by dispatch.
+///
+/// The runtime owns target selection. This helper closes each selected
+/// summary's authored dependency graph, verifies every actual call-shape alias
+/// through the runtime's opaque binding, and then delegates lowering to the
+/// same pure binder used by policy analysis.
+pub fn bind_active_unmaterialized_procedure_summaries(
+    active: &ResolvedActiveSemanticModels,
+    targets: &[UnmaterializedExternalTarget],
+    root_artifact: &SemanticArtifactKey,
+    compatibility: ExternalSummaryCompatibilityKey,
+) -> Result<Option<ExternalSemanticSummarySet>, ProcedureSummaryBindingError> {
+    let mut families = HashMap::<usize, SelectedUnmaterializedSummaryFamily>::default();
+    for target in targets {
+        let matched = active.procedure_summaries_for_member(ProcedureSummaryMemberKey::new(
+            target.language().semantic_pack_label(),
+            target.owner_fqn(),
+            target.member(),
+            target.has_receiver(),
+            target.arity(),
+        ));
+        let Some(selected) = select_unmaterialized_flow_summary(&matched)? else {
+            continue;
+        };
+        let family = families
+            .entry(selected.payload.as_ptr() as usize)
+            .or_insert_with(|| SelectedUnmaterializedSummaryFamily {
+                language: selected.shard.manifest.language.clone(),
+                payload: selected.payload.to_vec(),
+                root_ids: HashSet::default(),
+            });
+        family.root_ids.insert(selected.record.id.clone());
+    }
+
+    let mut families = families.into_values().collect::<Vec<_>>();
+    families.sort_unstable_by(|left, right| {
+        left.language.cmp(&right.language).then_with(|| {
+            left.payload
+                .iter()
+                .map(|summary| (&summary.model_id, &summary.id))
+                .cmp(
+                    right
+                        .payload
+                        .iter()
+                        .map(|summary| (&summary.model_id, &summary.id)),
+                )
+        })
+    });
+    let mut aliases = Vec::new();
+    for family in families {
+        let by_id = family
+            .payload
+            .iter()
+            .map(|summary| (summary.id.as_str(), summary))
+            .collect::<HashMap<_, _>>();
+        let mut pending = family.root_ids.into_iter().collect::<Vec<_>>();
+        pending.sort_unstable_by(|left, right| right.cmp(left));
+        let mut selected_ids = HashSet::default();
+        while let Some(id) = pending.pop() {
+            if !selected_ids.insert(id.clone()) {
+                continue;
+            }
+            let summary = by_id.get(id.as_str()).ok_or_else(|| {
+                ProcedureSummaryBindingError::ActiveModelSelection {
+                    detail: format!(
+                        "activated procedure-summary dependency `{id}` is missing from its payload"
+                    ),
+                }
+            })?;
+            for effect in &summary.effects {
+                match effect {
+                    CompiledSummaryEffect::Call { callee, .. } => pending.push(callee.clone()),
+                    CompiledSummaryEffect::AmbiguousCall { candidates, .. } => {
+                        pending.extend(candidates.iter().cloned());
+                    }
+                    CompiledSummaryEffect::Allocation { .. }
+                    | CompiledSummaryEffect::Escape { .. }
+                    | CompiledSummaryEffect::UnknownCall { .. }
+                    | CompiledSummaryEffect::UnknownCallBoundary { .. }
+                    | CompiledSummaryEffect::Sanitize { .. } => {}
+                }
+            }
+        }
+        let summaries = family
+            .payload
+            .iter()
+            .filter(|summary| selected_ids.contains(&summary.id))
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut bindings = Vec::with_capacity(summaries.len());
+        let mut bindings_by_summary_target = BTreeMap::<
+            ExternalSummaryTarget,
+            Vec<brokk_bifrost_analysis::analyzer::semantic_model::UnmaterializedExternalSummaryCallShapeBinding>,
+        >::new();
+        for summary in &summaries {
+            let Some((owner, member)) =
+                authored_procedure_target_identity(&summary.target.path, &summary.target.symbol)
+            else {
+                return Err(ProcedureSummaryBindingError::TargetMismatch {
+                    summary_id: summary.id.clone(),
+                });
+            };
+            let mut applicable = Vec::new();
+            for target in targets.iter().filter(|target| {
+                target.language().semantic_pack_label() == family.language
+                    && target.has_receiver() == summary.target.has_receiver
+                    && summary.target.accepts_parameter_count(target.arity())
+                    && owner == target.owner_fqn()
+                    && member == target.member()
+            }) {
+                let matched =
+                    active.procedure_summaries_for_member(ProcedureSummaryMemberKey::new(
+                        target.language().semantic_pack_label(),
+                        target.owner_fqn(),
+                        target.member(),
+                        target.has_receiver(),
+                        target.arity(),
+                    ));
+                let Some(selected) = select_unmaterialized_flow_summary(&matched)? else {
+                    continue;
+                };
+                if selected.record.model_id == summary.model_id && selected.record.id == summary.id
+                {
+                    let binding =
+                        selected
+                            .bind_unmaterialized_call_shape(target)
+                            .ok_or_else(|| ProcedureSummaryBindingError::TargetMismatch {
+                                summary_id: summary.id.clone(),
+                            })?;
+                    applicable.push((target, binding));
+                }
+            }
+            applicable.sort_unstable_by(|left, right| left.0.cmp(right.0));
+            applicable.dedup_by(|left, right| left.0 == right.0);
+            let Some((target, first_binding)) = applicable.first() else {
+                return Err(ProcedureSummaryBindingError::MissingBinding {
+                    summary_id: summary.id.clone(),
+                });
+            };
+            let receiver = summary
+                .target
+                .has_receiver
+                .then_some(ExactProcedureSummaryReceiver);
+            let parameters = (0..summary.target.parameter_count)
+                .map(ExactProcedureSummaryParameter::new)
+                .collect();
+            let formal_locator = first_binding.formal_locator().clone();
+            let summary_locator =
+                ExternalSummaryTarget::internal_summary_locator(&formal_locator, &summary.model_id)
+                    .ok_or_else(|| ProcedureSummaryBindingError::TargetMismatch {
+                        summary_id: summary.id.clone(),
+                    })?;
+            let summary_target =
+                ExternalSummaryTarget::from_locator(&summary_locator).ok_or_else(|| {
+                    ProcedureSummaryBindingError::TargetMismatch {
+                        summary_id: summary.id.clone(),
+                    }
+                })?;
+            bindings.push(ExactProcedureSummaryTargetBinding::new(
+                summary.id.clone(),
+                summary.target.clone(),
+                target.provenance_artifact_key(root_artifact),
+                summary_locator,
+                ExactProcedureSummaryBoundary::new(receiver, parameters),
+            ));
+            let retained = bindings_by_summary_target
+                .entry(summary_target)
+                .or_default();
+            for (_, binding) in applicable {
+                debug_assert_eq!(binding.formal_locator(), &formal_locator);
+                retained.push(binding);
+            }
+        }
+        let set = bind_compiled_procedure_summaries(&summaries, bindings, compatibility)?;
+        for (summary_target, summary) in set.entries() {
+            let bindings = bindings_by_summary_target
+                .get(summary_target)
+                .ok_or_else(|| ProcedureSummaryBindingError::ActiveModelSelection {
+                    detail: format!(
+                        "lowered procedure summary at `{}:{:?}` lacks resolver-owned target aliases",
+                        summary_target.path().as_str(),
+                        summary_target.declaration()
+                    ),
+                })?;
+            aliases.extend(
+                bindings
+                    .iter()
+                    .cloned()
+                    .map(|binding| (binding, summary.clone())),
+            );
+        }
+    }
+
+    if aliases.is_empty() {
+        return Ok(None);
+    }
+    ExternalSemanticSummarySet::try_new_with_unmaterialized_call_shape_bindings(
+        Vec::new(),
+        aliases,
+        compatibility,
+    )
+    .map(Some)
+    .map_err(|source| ProcedureSummaryBindingError::InvalidSummarySet { source })
+}
+
+fn select_unmaterialized_flow_summary<'matched, 'model>(
+    matched: &'matched ProcedureSummaryMatch<'model>,
+) -> Result<
+    Option<
+        &'matched brokk_bifrost_analysis::analyzer::semantic_model::ActivatedProcedureSummary<
+            'model,
+        >,
+    >,
+    ProcedureSummaryBindingError,
+> {
+    match matched.disposition {
+        SemanticModelMatchDisposition::Empty if matched.records.is_empty() => Ok(None),
+        SemanticModelMatchDisposition::Empty => {
+            Err(ProcedureSummaryBindingError::ActiveModelSelection {
+                detail: "empty procedure-summary lookup returned records".to_owned(),
+            })
+        }
+        SemanticModelMatchDisposition::Unique => match matched.records.as_slice() {
+            [selected] => Ok(Some(selected)),
+            _ => Err(ProcedureSummaryBindingError::ActiveModelSelection {
+                detail: "unique procedure-summary lookup returned a non-unique record set"
+                    .to_owned(),
+            }),
+        },
+        SemanticModelMatchDisposition::Conflict => {
+            let Some((first, rest)) = matched.records.split_first() else {
+                return Err(ProcedureSummaryBindingError::ActiveModelSelection {
+                    detail: "conflicting procedure-summary lookup returned no records".to_owned(),
+                });
+            };
+            if rest.is_empty() {
+                return Err(ProcedureSummaryBindingError::ActiveModelSelection {
+                    detail: "conflicting procedure-summary lookup returned one record".to_owned(),
+                });
+            }
+            Ok(rest
+                .iter()
+                .all(|other| external_flow_claims_agree(other.record, first.record))
+                .then_some(first))
+        }
+    }
+}
+
+fn external_flow_claims_agree(
+    left: &CompiledProcedureSummary,
+    right: &CompiledProcedureSummary,
+) -> bool {
+    left.completeness == right.completeness
+        && left.covers_overrides == right.covers_overrides
+        && left.normal_result_count == right.normal_result_count
+        && left.locations == right.locations
+        && left.transfers == right.transfers
+        && left.effects == right.effects
 }
 
 /// Bind one already-selected compiled summary family to exact mounted procedures.

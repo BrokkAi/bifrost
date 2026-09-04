@@ -46,6 +46,7 @@ use brokk_bifrost_analysis::diff_analysis::{
 };
 use brokk_bifrost_analysis::schema_version::SchemaVersionOrigin;
 use brokk_bifrost_analysis::workspace_document::WorkspaceRoot;
+use brokk_bifrost_rql::structural::CodeQueryExecutionLimits;
 
 use super::baseline::{
     PolicyBaselineDocument, PolicyBaselineEntryReview, PolicyBaselineMatchState,
@@ -1308,6 +1309,25 @@ pub(crate) fn policy_budget_for_workspace(
         }
         None => budget,
     }
+}
+
+/// Query limits for one trusted whole-workspace code query.
+///
+/// A host that already trusts the query document -- a CLI invocation, or the
+/// private correctness corpus -- can ask for the same source-volume scaling
+/// that policy evaluation gets. The interactive `CodeQueryExecutionLimits`
+/// defaults size one bounded request over an unknown workspace, so on a real
+/// checkout they stop a whole-repository question well before it finishes: the
+/// pinned bbolt endpoint query attempted 33,289 source mappings against the
+/// fixed default of 33,288 and returned nothing.
+///
+/// This is deliberately the identical computation policy evaluation performs,
+/// not a second scaling rule, so the two entry points cannot drift. The
+/// allowance comes from the analyzed source volume and the host's decision to
+/// call this, never from the query document, which must not be able to raise
+/// its own limits.
+pub fn workspace_scaled_query_limits(workspace: &WorkspaceAnalyzer) -> CodeQueryExecutionLimits {
+    policy_budget_for_workspace(PolicyBudget::default(), Some(workspace)).query_limits()
 }
 
 /// Freeze the exact ready semantic-model publication produced by activation.

@@ -131,6 +131,7 @@ type AssertRowQueryExecutor = fn(
     &CodeQuery,
     brokk_bifrost_rql::structural::CodeQueryExecutionLimits,
     Option<&CancellationToken>,
+    &mut CodeQueryRowFamilySession,
 ) -> brokk_bifrost_rql::structural::search::DetailedCodeQueryResult;
 
 /// Everything one assert-file iteration reads that the run computed once from
@@ -222,9 +223,9 @@ impl<'a> AssertRunPlan<'a> {
             matches!(assertion, PolicyAssert::Occurrence(assertion) if assertion.require_target)
         });
         let execute_row_query: AssertRowQueryExecutor = if needs_occurrence_targets {
-            execute_code_query_detailed_eager_index
+            execute_code_query_detailed_eager_index_with_row_family_session
         } else {
-            execute_code_query_detailed_eager_index_without_targets
+            execute_code_query_detailed_eager_index_without_targets_with_row_family_session
         };
         let metadata = &policy.definition().metadata;
         let PolicyMessageSpec::Static { text } = &metadata.message else {
@@ -1248,6 +1249,11 @@ fn evaluate_assert_file(
     context: &PolicyEvaluationContext<'_>,
     budget: &PolicyBudget,
 ) -> Result<AssertFileProduct, Box<AssertFileFailure>> {
+    // One file's independent assertion queries ask the same occurrence and
+    // lexical-environment producers different relational questions. Their
+    // query budgets, diagnostics and completion stay separate; only complete
+    // immutable producer products live for this one file iteration.
+    let mut row_family_session = CodeQueryRowFamilySession::default();
     let mut file_work = CodeQueryExecutionWork::default();
     let mut file_failures: Vec<PolicyFailureReason> = Vec::new();
     let mut file_diagnostics: Vec<CodeQueryDiagnostic> = Vec::new();
@@ -1276,6 +1282,7 @@ fn evaluate_assert_file(
             &query,
             budget.query_limits(),
             context.cancellation,
+            &mut row_family_session,
         );
         file_incomplete.extend(incomplete_reasons(
             &outcome.result.completion(),
@@ -1292,6 +1299,28 @@ fn evaluate_assert_file(
         assigned_left_operands(&outcome.result.results)
             .any(|(_, range)| region_contains_any(&value_origin_regions, range))
     });
+    let mut joined_ast_ids: Vec<String> = file_subjects
+        .iter()
+        .flat_map(|subject| subject.captures.values())
+        .flatten()
+        .filter_map(|capture| capture.ast_id.clone())
+        .collect();
+    if let Some(outcome) = &assignment_outcome {
+        joined_ast_ids.extend(
+            assigned_left_operands(&outcome.result.results)
+                .filter(|(_, range)| region_contains_any(&value_origin_regions, *range))
+                .map(|(ast_id, _)| ast_id.to_owned()),
+        );
+    }
+    row_family_session = if plan.origin_shape_asserts.is_empty() {
+        CodeQueryRowFamilySession::for_ast_ids(joined_ast_ids)
+    } else {
+        // Origin-shape's iterable and assignment probes discover additional
+        // AST identities after these row queries are planned. Their
+        // occurrence domain remains exhaustive; narrowing it to subject
+        // captures would hide the origin rows the assert must inspect.
+        CodeQueryRowFamilySession::default()
+    };
     let mut binding_row_roles = plan.binding_row_roles.clone();
     if assignments_in_region {
         binding_row_roles.push(OccurrenceRole::ValueReference);
@@ -1378,6 +1407,7 @@ fn evaluate_assert_file(
             query,
             budget.query_limits(),
             context.cancellation,
+            &mut row_family_session,
         );
         file_incomplete.extend(incomplete_reasons(
             &outcome.result.completion(),
