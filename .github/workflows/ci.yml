@@ -32,15 +32,21 @@ jobs:
         run: cargo metadata --locked --no-deps --format-version 1
 
       - name: Run source-owned unit tests
+        env:
+          JAVA_HOME: ''
         run: cargo test --workspace --lib --locked
 
       - name: Run public doctests
         run: cargo test --workspace --doc --locked
 
       - name: Run MCP contract tests
+        env:
+          JAVA_HOME: ''
         run: cargo test -p brokk-bifrost-mcp --locked
 
       - name: Run LSP contract tests
+        env:
+          JAVA_HOME: ''
         run: cargo test -p brokk-bifrost-lsp --locked
 
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
