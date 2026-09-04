@@ -64,7 +64,11 @@ export function validateAgentPluginDirectory(pluginDir, expectedVersion) {
 
   const codexManifestPath = path.join(resolvedPluginDir, ".codex-plugin", "plugin.json");
   const codexManifest = readJson(codexManifestPath);
-  assert.equal(codexManifest.name, "brokk", `${codexManifestPath} must use Codex's stable package name`);
+  assert.equal(
+    codexManifest.name,
+    plugin.name,
+    `${codexManifestPath} name must match the portable plugin name`,
+  );
   assert.equal(codexManifest.version, expectedVersion, `${codexManifestPath} version must match Cargo.toml`);
   assert.equal(
     codexManifest.mcpServers,

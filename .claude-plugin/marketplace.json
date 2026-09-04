@@ -1,13 +1,13 @@
 {
-  "name": "bifrost",
-  "description": "Bifrost plugins for multi-language code intelligence and engineering workflows.",
+  "name": "brokk",
+  "description": "Brokk plugins for multi-language code intelligence and engineering workflows.",
   "owner": {
     "name": "Brokk",
     "url": "https://brokk.ai"
   },
   "plugins": [
     {
-      "name": "brokk",
+      "name": "bifrost",
       "source": "./plugins/bifrost-agent",
       "description": "Multi-language code intelligence and Brokk/Bifrost engineering workflows."
     }

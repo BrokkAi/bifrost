@@ -19,7 +19,7 @@ inputs:
       install and uses a release or debug `bifrost` binary from the checkout,
       otherwise the `bifrost` already on PATH.
     required: false
-    default: v0.10.7
+    default: v0.11.0
   policy-packs:
     description: Space-separated built-in pack IDs to run.
     required: false

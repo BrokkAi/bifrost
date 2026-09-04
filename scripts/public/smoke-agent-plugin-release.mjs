@@ -158,8 +158,8 @@ async function resolveCodexPluginLaunch(pluginRoot) {
   const manifest = JSON.parse(await fs.readFile(manifestPath, "utf8"));
   assert.equal(
     manifest.name,
-    "brokk",
-    `${manifestPath} must use Codex's stable package name`
+    "bifrost",
+    `${manifestPath} must use the Bifrost plugin name`
   );
   assert.equal(
     manifest.mcpServers,
@@ -193,6 +193,12 @@ async function resolveCodexPluginLaunch(pluginRoot) {
 
 async function resolveClaudePluginLaunch(pluginRoot) {
   const manifestPath = path.join(pluginRoot, ".claude-plugin", "plugin.json");
+  const manifest = JSON.parse(await fs.readFile(manifestPath, "utf8"));
+  assert.equal(
+    manifest.name,
+    "bifrost",
+    `${manifestPath} must use the Bifrost plugin name`
+  );
   const mcpConfigPath = path.join(pluginRoot, "claude-mcp.json");
   const mcpConfig = JSON.parse(await fs.readFile(mcpConfigPath, "utf8"));
   const server = mcpConfig.mcpServers?.bifrost;

@@ -116,8 +116,8 @@ export async function validatePublishedPackage(pluginDir, expectedVersion) {
     assert.equal(normalizeVersion(actual), version, `${label} must be for Bifrost ${version}`);
   }
   assert.equal(portable.name, "bifrost", "portable plugin must use the bifrost name");
-  assert.equal(codex.name, "brokk", "Codex plugin must use the stable brokk name");
-  assert.equal(claude.name, "brokk", "Claude plugin must use the stable brokk name");
+  assert.equal(codex.name, portable.name, "Codex plugin name must match the portable plugin");
+  assert.equal(claude.name, portable.name, "Claude plugin name must match the portable plugin");
 
   const portableServer = portableMcp.mcpServers?.bifrost;
   assert.equal(portableServer?.command, "./bin/bifrost-launcher.mjs");
@@ -166,8 +166,9 @@ export function assertPolicyCatalog(response, host) {
 }
 
 export function validateMarketplaceManifests(codexMarketplace, claudeMarketplace) {
-  const codexEntry = codexMarketplace.plugins?.find((plugin) => plugin.name === "brokk");
-  assert.ok(codexEntry, "Codex marketplace does not expose the brokk plugin");
+  assert.equal(codexMarketplace.name, "brokk", "Codex marketplace must use the Brokk owner namespace");
+  const codexEntry = codexMarketplace.plugins?.find((plugin) => plugin.name === "bifrost");
+  assert.ok(codexEntry, "Codex marketplace does not expose the bifrost plugin");
   assert.deepEqual(
     codexEntry.source,
     { source: "local", path: "./plugins/bifrost-agent" },
@@ -176,8 +177,9 @@ export function validateMarketplaceManifests(codexMarketplace, claudeMarketplace
   assert.equal(codexEntry.policy?.installation, "AVAILABLE");
   assert.equal(codexEntry.policy?.authentication, "ON_INSTALL");
 
-  const claudeEntry = claudeMarketplace.plugins?.find((plugin) => plugin.name === "brokk");
-  assert.ok(claudeEntry, "Claude marketplace does not expose the brokk plugin");
+  assert.equal(claudeMarketplace.name, "brokk", "Claude marketplace must use the Brokk owner namespace");
+  const claudeEntry = claudeMarketplace.plugins?.find((plugin) => plugin.name === "bifrost");
+  assert.ok(claudeEntry, "Claude marketplace does not expose the bifrost plugin");
   assert.equal(
     claudeEntry.source,
     "./plugins/bifrost-agent",

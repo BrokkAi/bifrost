@@ -15,11 +15,11 @@ use std::path::Path;
 use brokk_bifrost_core::profiling;
 
 use crate::analyzer::semantic::{
-    CallSiteId, CancellationToken, ClassAtom, ClassSeed, EvidenceCompleteness, GuardArmSide,
-    GuardPredicate, MemberAccessKind, MemberAccessQuery, MemoryLocationKind, NarrowingVerdict,
-    ProcedureHandle, ProcedurePortHandle, ProgramPointHandle, ProgramPointId, ProofStatus,
-    SemanticBudget, SemanticCallSite, SemanticEffect, SemanticLocator, SemanticProviderError,
-    SemanticValueKind, SourceSpan, TypeFlowAdapter, UnknownReason,
+    CallSiteId, CancellationToken, ClassAtom, ClassIdentity, ClassSeed, EvidenceCompleteness,
+    GuardArmSide, GuardPredicate, MemberAccessKind, MemberAccessQuery, MemoryLocationKind,
+    NarrowingVerdict, ProcedureHandle, ProcedurePortHandle, ProgramPointHandle, ProgramPointId,
+    ProofStatus, SemanticBudget, SemanticCallSite, SemanticEffect, SemanticLocator,
+    SemanticProviderError, SemanticValueKind, SourceSpan, TypeFlowAdapter, UnknownReason,
 };
 use crate::analyzer::{ProjectFile, WorkspaceAnalyzer};
 use crate::dataflow::SemanticInputStatus;
@@ -239,6 +239,19 @@ fn guard_edge_kills(
     sources: &[ValueFlowSourceSpec],
     atoms_by_key: &HashMap<ValueFlowEventKey, (ClassAtom, SourceSite)>,
 ) -> Vec<ValueFlowEdgeKillSpec> {
+    let mut sources_by_class = HashMap::<ClassIdentity, Vec<ValueFlowEventKey>>::default();
+    for source in sources {
+        let (ClassAtom::Class(atom), _) = atoms_by_key
+            .get(source.key())
+            .expect("every source spec retains its class atom")
+        else {
+            continue;
+        };
+        sources_by_class
+            .entry(atom.clone())
+            .or_default()
+            .push(source.key().clone());
+    }
     let mut kills = Vec::new();
     for procedure in procedures {
         let origins = BindingOriginIndex::new(procedure);
@@ -284,20 +297,14 @@ fn guard_edge_kills(
                 else {
                     continue;
                 };
-                let dropped = sources
-                    .iter()
-                    .filter_map(|source| {
-                        let (ClassAtom::Class(atom), _) = atoms_by_key
-                            .get(source.key())
-                            .expect("every source spec retains its class atom")
-                        else {
-                            return None;
-                        };
-                        (adapter.narrowing_verdict(workspace, procedure, guard, atom, side)
-                            == NarrowingVerdict::Drop)
-                            .then(|| source.key().clone())
-                    })
-                    .collect::<Vec<_>>();
+                let mut dropped = Vec::new();
+                for (atom, atom_sources) in &sources_by_class {
+                    if adapter.narrowing_verdict(workspace, procedure, guard, atom, side)
+                        == NarrowingVerdict::Drop
+                    {
+                        dropped.extend(atom_sources.iter().cloned());
+                    }
+                }
                 if !dropped.is_empty() {
                     kills.push(ValueFlowEdgeKillSpec {
                         point: procedure

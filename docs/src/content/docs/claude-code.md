@@ -26,9 +26,18 @@ Add the Brokk marketplace from GitHub, then install Bifrost:
 
 ```bash
 claude plugin marketplace add BrokkAi/bifrost --sparse .claude-plugin plugins
-claude plugin install brokk@bifrost
+claude plugin install bifrost@brokk
 claude plugin list
 claude mcp list
+```
+
+Releases that used the legacy `brokk@bifrost` coordinate inverted the project
+and owner names. Migrate an existing installation once before using the commands
+above, preserving the scope used for the old install:
+
+```bash
+claude plugin uninstall brokk@bifrost --scope user
+claude plugin marketplace remove bifrost
 ```
 
 Start a fresh Claude Code session after installing the plugin so the MCP and LSP server configurations are loaded at startup.
@@ -38,8 +47,8 @@ Bifrost plugin, refresh its marketplace metadata and update the installed
 package:
 
 ```bash
-claude plugin marketplace update bifrost
-claude plugin update brokk@bifrost --scope user
+claude plugin marketplace update brokk
+claude plugin update bifrost@brokk --scope user
 claude plugin list
 claude mcp list
 ```
@@ -50,8 +59,8 @@ If the plugin was installed with another scope, pass that original scope to
 
 The plugin automatically registers its packaged MCP and LSP servers, so do not add a duplicate manual MCP entry or separate Bifrost LSP plugin. The LSP launcher receives Claude Code's active project directory explicitly. Without an explicit `BIFROST_WORKSPACE_ROOT` or launcher `--root`, the MCP server requests the host-approved project directory through MCP roots and never uses the installed plugin directory as analyzer scope.
 
-`claude plugin list` should show `brokk@bifrost` enabled. `claude mcp list`
-should show `plugin:brokk:bifrost` connected. Bifrost 0.8.10 is the minimum
+`claude plugin list` should show `bifrost@brokk` enabled. `claude mcp list`
+should show `plugin:bifrost:bifrost` connected. Bifrost 0.8.10 is the minimum
 release with the Claude plugin-root launcher fix. If a v0.8.9 installation
 instead reports `posix_spawn './bin/bifrost-launcher.mjs'`, run the upgrade
 commands above, then reload plugins or start a fresh session. Claude caches
@@ -85,7 +94,7 @@ launcher independently of the project working directory:
 claude --plugin-dir plugins/bifrost-agent mcp list
 ```
 
-The local `plugin:brokk:bifrost` entry should report `Connected`.
+The local `plugin:bifrost:bifrost` entry should report `Connected`.
 
 Inspect `/plugin` to confirm the `bifrost` metadata and LSP server loaded without errors, then inspect `/mcp`. The packaged MCP server uses `symbol|extended`, so it exposes both symbol navigation and `query_code`. Ask Claude `What tools do you have access to?` and confirm that the built-in `LSP` tool is also available.
 
@@ -93,7 +102,7 @@ To test the repository as a local Claude Code marketplace, run:
 
 ```bash
 claude plugin marketplace add "$(pwd)"
-claude plugin install brokk@bifrost --scope local
+claude plugin install bifrost@brokk --scope local
 BIFROST_BINARY_PATH="$(pwd)/target/debug/bifrost" claude
 ```
 
@@ -121,8 +130,8 @@ Start a fresh Claude Code session in that checkout and use:
 Use only the Bifrost MCP server for this verification. Call search_symbols for claude_bifrost_host_probe_4f6f2b7, then call query_code with schema_version 1, languages ["rust"], match {"kind":"function","name":"claude_bifrost_host_probe_4f6f2b7"}, limit 10, and result_detail "full". Do not use terminal, file-reading, text-search, web, or any other tool. PASS only if both real structured results return src/claude_bifrost_host_probe_4f6f2b7.rs.
 ```
 
-A valid pass shows real `mcp__plugin_brokk_bifrost__search_symbols` and
-`mcp__plugin_brokk_bifrost__query_code` events with the same project-relative
+A valid pass shows real `mcp__plugin_bifrost_bifrost__search_symbols` and
+`mcp__plugin_bifrost_bifrost__query_code` events with the same project-relative
 path. Remove the temporary declaration after retaining the evidence.
 
 ## Validate Native LSP

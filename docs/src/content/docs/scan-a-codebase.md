@@ -132,7 +132,7 @@ gate) and `0` once they are fixed.
   `--policy-id`, or run your own `.rqlp` files with `--policy-file` --
   [CLI](/cli/).
 - Gate pull requests on only the findings they introduce with
-  `--diff-base` -- [CLI](/cli/#gate-only-on-new-findings---diff-base).
+  `--diff-base` -- [CLI](/cli/#gate-only-on-new-findings---diff-base---no-incremental).
 - Emit `--format sarif` and upload to GitHub code scanning with the reusable
   action -- [CI Gating with GitHub Actions](/ci-github-actions/).
 - Accept a reviewed finding with a suppressions file instead of deleting the

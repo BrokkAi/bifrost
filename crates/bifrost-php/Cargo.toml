@@ -16,7 +16,7 @@ publish = true
 name = "brokk_bifrost_php"
 
 [dependencies]
-brokk-bifrost-core = { path = "../bifrost-core", version = "=0.10.7" }
+brokk-bifrost-core = { path = "../bifrost-core", version = "=0.11.0" }
 mago-allocator = "=1.43.0"
 mago-database = "=1.43.0"
 mago-phpdoc-syntax = "=1.43.0"

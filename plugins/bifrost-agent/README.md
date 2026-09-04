@@ -10,10 +10,9 @@ None of these distributions bundles the Bifrost binary. The launcher resolves a
 released Bifrost binary and makes a multi-language code-analysis subset of the
 `bifrost` MCP tools discoverable through each host's plugin system.
 
-The Claude Code and Codex stable install name is `brokk`. Cursor uses the
-Cursor-facing plugin name `bifrost` so the package is discoverable as Bifrost in
-Cursor's Customize UI. The public marketplace namespace is `bifrost`, so
-Claude/Codex marketplace installs read as `brokk@bifrost` where the host exposes
+The plugin name is `bifrost` across the portable package, Claude Code, Codex,
+and Cursor. Brokk owns the `brokk` marketplace namespace, so Claude/Codex
+marketplace installs read as `bifrost@brokk` where the host exposes
 namespace-qualified install names.
 
 Claude Code starts
@@ -149,7 +148,7 @@ pi install "$(pwd)"
 After `@brokk/bifrost-agent` is published to npm, install a pinned release with:
 
 ```bash
-pi install npm:@brokk/bifrost-agent@0.10.7
+pi install npm:@brokk/bifrost-agent@0.11.0
 ```
 
 Run `/bifrost` in Pi's interactive TUI to configure Bifrost for the current
@@ -231,14 +230,18 @@ package:
 
 ```bash
 codex plugin marketplace add BrokkAi/bifrost --sparse .agents/plugins --sparse plugins
-codex plugin add brokk@bifrost
+codex plugin add bifrost@brokk
 ```
+
+The former `brokk@bifrost` coordinate inverted the project and owner names.
+Existing users must remove that installed plugin and its `bifrost` marketplace
+before adding this `brokk` marketplace and installing `bifrost@brokk`.
 
 For local development from a checkout, add the repository root instead:
 
 ```bash
 codex plugin marketplace add "$(pwd)"
-codex plugin add brokk@bifrost
+codex plugin add bifrost@brokk
 ```
 
 For a local checkout build, start Codex with this repository's debug binary
@@ -293,8 +296,12 @@ Add the Brokk marketplace from GitHub, then install Bifrost:
 
 ```bash
 claude plugin marketplace add BrokkAi/bifrost --sparse .claude-plugin plugins
-claude plugin install brokk@bifrost
+claude plugin install bifrost@brokk
 ```
+
+The former `brokk@bifrost` coordinate inverted the project and owner names.
+Existing users must uninstall that plugin and remove its `bifrost` marketplace
+before adding this `brokk` marketplace and installing `bifrost@brokk`.
 
 Start a fresh Claude Code session after installing the plugin so its MCP and
 native LSP server configurations are loaded at startup. The built-in `LSP`
@@ -322,7 +329,7 @@ To test the repository as a local Claude Code marketplace, run:
 
 ```bash
 claude plugin marketplace add "$(pwd)"
-claude plugin install brokk@bifrost --scope local
+claude plugin install bifrost@brokk --scope local
 BIFROST_BINARY_PATH="$(pwd)/target/debug/bifrost" claude
 ```
 

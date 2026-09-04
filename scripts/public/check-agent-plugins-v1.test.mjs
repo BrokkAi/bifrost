@@ -83,6 +83,19 @@ test("rejects a portable manifest version mismatch", async () => {
   });
 });
 
+test("rejects a Codex adapter name that differs from the portable plugin", async () => {
+  await withFixture(async (pluginDir) => {
+    const manifestPath = path.join(pluginDir, ".codex-plugin", "plugin.json");
+    const manifest = JSON.parse(await fs.readFile(manifestPath, "utf8"));
+    manifest.name = "brokk";
+    await fs.writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+    assert.throws(
+      () => validateAgentPluginDirectory(pluginDir, version),
+      /name must match the portable plugin name/,
+    );
+  });
+});
+
 test("rejects a nested portable skill", async () => {
   await withFixture(async (pluginDir) => {
     const nestedSkill = path.join(pluginDir, "skills", "sample", "nested");
@@ -149,7 +162,7 @@ function portableMcp() {
 
 function codexManifest() {
   return {
-    name: "brokk",
+    name: "bifrost",
     version,
     description: "Test Codex adapter.",
     author: { name: "Brokk", url: "https://brokk.ai" },

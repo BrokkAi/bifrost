@@ -21,6 +21,11 @@ if (claudeManifest.version !== cargoVersion) {
     `${claudeManifestPath} version ${claudeManifest.version} does not match Cargo.toml version ${cargoVersion}`,
   );
 }
+assert.deepStrictEqual(
+  claudeManifest.name,
+  "bifrost",
+  `${claudeManifestPath} should use the Bifrost plugin name`,
+);
 
 const codexManifestPath = "plugins/bifrost-agent/.codex-plugin/plugin.json";
 const codexManifest = JSON.parse(fs.readFileSync(codexManifestPath, "utf8"));
@@ -31,8 +36,8 @@ if (codexManifest.version !== cargoVersion) {
 }
 assert.deepStrictEqual(
   codexManifest.name,
-  "brokk",
-  `${codexManifestPath} should use Codex's stable package name`,
+  "bifrost",
+  `${codexManifestPath} should use the Bifrost plugin name`,
 );
 assert.deepStrictEqual(
   codexManifest.mcpServers,
@@ -361,11 +366,34 @@ const marketplacePath = ".agents/plugins/marketplace.json";
 // This marketplace is private-only and is absent from the public projection.
 // When present in the canonical checkout, it remains part of validation.
 if (fs.existsSync(marketplacePath)) {
-  JSON.parse(fs.readFileSync(marketplacePath, "utf8"));
+  const marketplace = JSON.parse(fs.readFileSync(marketplacePath, "utf8"));
+  assert.deepStrictEqual(marketplace.name, "brokk", `${marketplacePath} should use the Brokk owner namespace`);
+  const plugin = marketplace.plugins?.find((entry) => entry.name === codexManifest.name);
+  assert.ok(plugin, `${marketplacePath} should list the ${codexManifest.name} plugin`);
+  assert.deepStrictEqual(
+    plugin.source,
+    { source: "local", path: "./plugins/bifrost-agent" },
+    `${marketplacePath} should point at the shared plugin package`,
+  );
 }
 
 const claudeMarketplacePath = ".claude-plugin/marketplace.json";
-JSON.parse(fs.readFileSync(claudeMarketplacePath, "utf8"));
+const claudeMarketplace = JSON.parse(fs.readFileSync(claudeMarketplacePath, "utf8"));
+assert.deepStrictEqual(
+  claudeMarketplace.name,
+  "brokk",
+  `${claudeMarketplacePath} should use the Brokk owner namespace`,
+);
+const claudeMarketplacePlugin = claudeMarketplace.plugins?.find((plugin) => plugin.name === claudeManifest.name);
+assert.ok(
+  claudeMarketplacePlugin,
+  `${claudeMarketplacePath} should list the ${claudeManifest.name} plugin`,
+);
+assert.deepStrictEqual(
+  claudeMarketplacePlugin.source,
+  "./plugins/bifrost-agent",
+  `${claudeMarketplacePath} should point at the shared plugin package`,
+);
 
 const cursorMarketplacePath = ".cursor-plugin/marketplace.json";
 const cursorMarketplace = JSON.parse(fs.readFileSync(cursorMarketplacePath, "utf8"));

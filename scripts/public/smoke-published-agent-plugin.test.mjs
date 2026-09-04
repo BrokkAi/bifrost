@@ -98,22 +98,27 @@ test("requires the policy pack and at least one policy from a successful MCP cal
 
 test("requires both release-tag marketplace entries to point at the package", () => {
   const codex = {
+    name: "brokk",
     plugins: [
       {
-        name: "brokk",
+        name: "bifrost",
         source: { source: "local", path: "./plugins/bifrost-agent" },
         policy: { installation: "AVAILABLE", authentication: "ON_INSTALL" },
       },
     ],
   };
-  const claude = { plugins: [{ name: "brokk", source: "./plugins/bifrost-agent" }] };
+  const claude = { name: "brokk", plugins: [{ name: "bifrost", source: "./plugins/bifrost-agent" }] };
   assert.deepEqual(validateMarketplaceManifests(codex, claude).claude.source, "./plugins/bifrost-agent");
   assert.throws(
-    () => validateMarketplaceManifests({ plugins: [] }, claude),
-    /Codex marketplace/u,
+    () => validateMarketplaceManifests({ name: "brokk", plugins: [{ name: "brokk" }] }, claude),
+    /does not expose the bifrost plugin/u,
   );
   assert.throws(
-    () => validateMarketplaceManifests(codex, { plugins: [{ name: "brokk", source: "./wrong" }] }),
+    () => validateMarketplaceManifests(codex, { name: "brokk", plugins: [{ name: "bifrost", source: "./wrong" }] }),
     /Claude marketplace/u,
+  );
+  assert.throws(
+    () => validateMarketplaceManifests({ ...codex, name: "bifrost" }, claude),
+    /Brokk owner namespace/u,
   );
 });

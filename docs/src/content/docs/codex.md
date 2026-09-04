@@ -13,7 +13,16 @@ Add the Brokk marketplace from GitHub, then install Bifrost:
 
 ```bash
 codex plugin marketplace add BrokkAi/bifrost --sparse .agents/plugins --sparse plugins
-codex plugin add brokk@bifrost
+codex plugin add bifrost@brokk
+```
+
+Releases that used the legacy `brokk@bifrost` coordinate inverted the project
+and owner names. Migrate an existing installation once before using the commands
+above:
+
+```bash
+codex plugin remove brokk@bifrost
+codex plugin marketplace remove bifrost
 ```
 
 The package keeps root `plugin.json`, `mcp.json`, and `skills/` as the portable
@@ -31,18 +40,18 @@ Refresh an existing marketplace installation before testing a newly published
 Bifrost version:
 
 ```bash
-codex plugin marketplace upgrade bifrost
+codex plugin marketplace upgrade brokk
 codex plugin list
 ```
 
-Confirm that `brokk@bifrost` is installed, enabled, and reports the expected
+Confirm that `bifrost@brokk` is installed, enabled, and reports the expected
 version.
 
 For local development from a checkout, add this repository root instead:
 
 ```bash
 codex plugin marketplace add "$(pwd)"
-codex plugin add brokk@bifrost
+codex plugin add bifrost@brokk
 ```
 
 For a local checkout build, start Codex with the debug binary selected explicitly:
@@ -66,7 +75,7 @@ Installing the plugin automatically registers its packaged MCP server. Do not ad
 If the first launch needs to download the pinned Bifrost release, prepare it from a normal host shell before opening that fresh session:
 
 ```bash
-~/.codex/.tmp/marketplaces/bifrost/plugins/bifrost-agent/bin/bifrost-launcher.mjs prepare --json
+~/.codex/.tmp/marketplaces/brokk/plugins/bifrost-agent/bin/bifrost-launcher.mjs prepare --json
 ```
 
 Wait for `"status":"ready"`. This avoids discovering a download, release-pin, or network failure only after Codex has already fixed the task's callable tool surface.
@@ -113,7 +122,7 @@ Use the failure boundary to decide what to inspect next:
 
 | Observation | Boundary to inspect |
 | --- | --- |
-| `brokk@bifrost` is absent, disabled, or stale after a full restart | Marketplace installation and package enablement |
+| `bifrost@brokk` is absent, disabled, or stale after a full restart | Marketplace installation and package enablement |
 | Tool discovery returns no `mcp__bifrost` schemas | Plugin MCP registration, host policy, and desktop restart |
 | A direct guessed function call fails before an MCP event exists | Deferred tool discovery; run the tool search first |
 | Bifrost reports that it is not bound to a workspace | MCP roots or negotiated Codex sandbox-state metadata |

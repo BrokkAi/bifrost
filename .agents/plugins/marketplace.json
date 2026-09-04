@@ -1,11 +1,11 @@
 {
-  "name": "bifrost",
+  "name": "brokk",
   "interface": {
-    "displayName": "Bifrost"
+    "displayName": "Brokk"
   },
   "plugins": [
     {
-      "name": "brokk",
+      "name": "bifrost",
       "source": {
         "source": "local",
         "path": "./plugins/bifrost-agent"
