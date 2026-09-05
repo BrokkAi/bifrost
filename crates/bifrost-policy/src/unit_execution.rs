@@ -30,7 +30,8 @@ use brokk_bifrost_analysis::analyzer::semantic::SemanticWork;
 use brokk_bifrost_analysis::analyzer::usages::CallRelationLimits;
 use brokk_bifrost_analysis::analyzer::{
     AnalyzerQueryScope, HeadInputs, IAnalyzer, Language, LookupMemo, LookupReplayLimits,
-    NoSummaryAnswers, Oid, ProjectFile, ReadKey, ReadVerdict, WorkspaceAnalyzer, verify_read_set,
+    NoSummaryAnswers, Oid, ProjectFile, ReadKey, ReadVerdict, WorkspaceAnalyzer,
+    verify_read_set_for_artifact,
 };
 use brokk_bifrost_analysis::path_utils::rel_path_string;
 use brokk_bifrost_rql::PlanPartitioning;
@@ -201,7 +202,8 @@ impl<'a> UnitReuse<'a> {
             DerivedArtifactKind::PolicyEvaluationUnit,
             unit.read_digest().digest(),
         );
-        match verify_read_set(
+        match verify_read_set_for_artifact(
+            artifact,
             self.incremental.workspace(),
             self.incremental.changed(),
             &self.head_inputs,

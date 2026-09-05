@@ -1950,10 +1950,11 @@ fn canonical_external_callee(
     resolver_proven_external_identity: bool,
 ) -> Option<String> {
     // Kotlin writes package paths and receiver-expression chains with the same
-    // separator. A dotted source spelling proves no package root on its own;
-    // only the language resolver's external-member expansion may publish one
-    // as a bindable boundary identity (#2781).
-    if language == Language::Kotlin && !resolver_proven_external_identity {
+    // separator. PHP's reference range can likewise span an argument-unpack or
+    // concatenation expression. A source spelling proves no package or
+    // namespace root for either language; only resolver-owned evidence may
+    // publish an external identity (#2781, #2793).
+    if matches!(language, Language::Kotlin | Language::Php) && !resolver_proven_external_identity {
         return None;
     }
     let (owner, member) =
@@ -4763,6 +4764,51 @@ object Calls {
                 "a receiver-expression spelling is not a package-rooted identity"
             );
         }
+    }
+
+    #[test]
+    fn php_external_identity_comes_from_the_resolver_not_expression_text() {
+        let source = r#"<?php
+namespace App;
+
+function caller(string $input): string {
+    return PHP_EOL . substr(...[$input, 0, 1]);
+}
+"#;
+        let call = "substr(...[$input, 0, 1])";
+        let fixture = AnalyzerFixture::new_for_language(Language::Php, &[("App.php", source)]);
+        let scope = AnalyzerQueryScope::new(fixture.analyzer.analyzer());
+        let lookup = CallRelationService::dispatch_at_bounded(
+            fixture.analyzer.analyzer(),
+            scope.token(),
+            &ExactCallLocation {
+                file: ProjectFile::new(fixture.project_root(), "App.php"),
+                call_span: call_span(source, call),
+            },
+            Arc::from(source),
+            generous_limits(),
+            None,
+        );
+
+        assert!(lookup.targets.is_empty(), "{lookup:#?}");
+        assert_eq!(
+            lookup.boundaries,
+            vec![CallDispatchBoundaryKind::External {
+                callee_text: None,
+                normalized_static_owner: None,
+                external_callee_identity: Some(ResolverOwnedExternalCalleeIdentity::new(
+                    Language::Php,
+                    crate::analyzer::php::PHP_GLOBAL_NAMESPACE,
+                    "substr",
+                )),
+            }],
+            "the resolver-owned global identity must replace expression text without minting a target: {lookup:#?}"
+        );
+        assert_eq!(
+            canonical_external_callee(".PHP_EOL.substr", Language::Php, None, false),
+            None,
+            "a PHP expression spelling is never a bindable identity"
+        );
     }
 
     #[test]

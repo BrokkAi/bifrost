@@ -2,15 +2,20 @@ use crate::mcp_common::{McpRenderOptions, McpServerSpec, build_server_spec_with_
 use serde_json::Value;
 use std::collections::HashSet;
 
-const SEARCHTOOLS_ORDER: &[&str] = &[
-    "symbol",
-    "workspace",
-    "diff",
-    "extended",
-    "text",
-    "slopcop",
-    "cli",
-];
+const SEARCHTOOLS_ORDER: &[&str] = &["symbol", "workspace", "diff", "extended", "text", "slopcop"];
+
+/// The `--mcp` mode rejection for `cli` (issue #1116).
+///
+/// A 40-run BrokkBench sweep made zero agent calls to `classify_test_files`
+/// against dozens of calls to the symbol tools, so it is no longer part of
+/// any agent-facing toolset composition (`core`, `searchtools`, or a manual
+/// `|`-composition such as `symbol|cli`). It stays reachable for programmatic
+/// consumers -- `bifrost --tool classify_test_files` and the Rust/Python API
+/// -- which is why the message below points there instead of silently
+/// dropping the segment.
+const CLI_MODE_REJECTED: &str = "Unsupported server mode: cli (classify_test_files is a \
+    programmatic-only tool; it is not exposed to MCP agents. Run \
+    `bifrost --tool classify_test_files` or call it through the Rust or Python API instead)";
 
 const DISCOVERY_ROUTING_INSTRUCTIONS: &str = "Source-code analysis and repository navigation. Search this server for its advertised language-aware and repository-aware tools. Depending on the selected mode, tools cover symbols, structure, policies, quality, text, or workspace control. Use them when text search cannot reliably answer a structural or cross-file question. Check result completeness before you claim all results or no results.";
 
@@ -69,9 +74,10 @@ fn expand_toolset(
     resolution: &mut ServerSpecResolution,
 ) -> Result<(), String> {
     match name {
-        "symbol" | "workspace" | "diff" | "text" | "extended" | "slopcop" | "cli" => {
+        "symbol" | "workspace" | "diff" | "text" | "extended" | "slopcop" => {
             append_named_toolset(name, render_options, resolution)
         }
+        "cli" => Err(CLI_MODE_REJECTED.to_string()),
         "core" => {
             for alias in ["symbol", "workspace", "diff"] {
                 expand_toolset(alias, render_options, resolution)?;
@@ -131,7 +137,6 @@ fn discovery_instructions(effective_toolsets: &HashSet<String>) -> String {
             "slopcop" => {
                 " Code-quality tools find complexity, hotspots, clones, smells, dead code, secrets, and risky changes."
             }
-            "cli" => " Test-classification tools identify whether paths contain tests.",
             _ => unreachable!("SEARCHTOOLS_ORDER contains only registered toolsets"),
         };
         instructions.push_str(capability);
@@ -147,9 +152,20 @@ fn descriptors_for_toolset(name: &str, render_options: McpRenderOptions) -> Vec<
         "text" => crate::mcp_text::text_tool_descriptors(),
         "extended" => crate::mcp_extended::extended_tool_descriptors(),
         "slopcop" => crate::mcp_slopcop::slopcop_tool_descriptors(),
-        "cli" => crate::mcp_cli::cli_tool_descriptors(),
         other => panic!("unknown toolset requested from registry: {other}"),
     }
+}
+
+/// Descriptors for tools that exist only for programmatic, non-agent
+/// consumers: `bifrost --tool <name>` and the Rust/Python API.
+///
+/// `classify_test_files` is the sole entry (issue #1116). No `--mcp` toolset
+/// composition reaches it -- [`expand_toolset`] rejects `cli` outright -- so
+/// this is not part of [`resolve_server_spec`]. It exists so the one-shot CLI
+/// can still look up the tool's description and parameter schema for
+/// `bifrost --help classify_test_files`.
+pub fn single_shot_only_tool_descriptors() -> Vec<Value> {
+    crate::mcp_cli::cli_tool_descriptors()
 }
 
 #[cfg(test)]
@@ -256,6 +272,35 @@ mod tests {
             resolve_server_spec("nlp").unwrap_err(),
             "Unsupported server mode: nlp"
         );
+    }
+
+    /// `cli` is no longer an agent-facing toolset (issue #1116):
+    /// `classify_test_files` stays reachable only through
+    /// `bifrost --tool classify_test_files` and the Rust/Python API. A bare
+    /// `--mcp cli` and a `|`-composition that includes it must both fail with
+    /// a structured error naming the reason and the `--tool` path, not
+    /// silently produce a server that omits the segment.
+    #[test]
+    fn cli_mode_is_rejected_with_a_structured_error() {
+        let error = resolve_server_spec("cli").unwrap_err();
+        assert!(
+            error.contains("classify_test_files"),
+            "error should name the tool: {error}"
+        );
+        assert!(
+            error.contains("--tool classify_test_files"),
+            "error should point at the --tool path: {error}"
+        );
+
+        let composed = resolve_server_spec("symbol|cli").unwrap_err();
+        assert_eq!(composed, error, "a composition surfaces the same error");
+    }
+
+    #[test]
+    fn cli_is_absent_from_core_and_searchtools() {
+        assert!(!super::searchtools_toolset_order().contains(&"cli"));
+        assert!(!tool_names("searchtools").contains(&"classify_test_files".to_string()));
+        assert!(!tool_names("core").contains(&"classify_test_files".to_string()));
     }
 
     #[test]

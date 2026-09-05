@@ -13,6 +13,7 @@ use brokk_bifrost::mcp_common::McpRenderOptions;
 use brokk_bifrost::mcp_install::install_mcp_hosts;
 use brokk_bifrost::mcp_registry::{
     resolve_server_spec, resolve_server_spec_for_render_options, searchtools_toolset_order,
+    single_shot_only_tool_descriptors,
 };
 use brokk_bifrost::policy::{
     BuiltInPolicyCatalogManifest, BuiltInPolicySelection, ExplanationCandidate, ExplanationLimits,
@@ -2052,6 +2053,9 @@ MCP TOOLSETS (--mcp):
 
     let bottom = r#"    Combine toolsets with '|', e.g. --mcp symbol|workspace
     Run `bifrost --help <tool>` for a tool's description and parameters.
+    classify_test_files is programmatic-only: no toolset above exposes it to MCP
+    agents, but `bifrost --tool classify_test_files` and the Rust/Python API still
+    run it.
 
 EXAMPLES:
     # MCP server from the current directory, using the compatibility searchtools set:
@@ -2123,11 +2127,17 @@ fn print_toolset_line(toolset: &str, names: &[&str]) {
 }
 
 fn print_tool_help(name: &str) -> Result<(), String> {
-    // `searchtools` advertises every tool, so it is the lookup surface.
+    // `searchtools` advertises every agent-facing tool, so it is the primary
+    // lookup surface. A handful of tools are programmatic-only and never in
+    // an MCP toolset (`classify_test_files`, issue #1116); their descriptors
+    // live in `single_shot_only_tool_descriptors` instead, so `--help
+    // classify_test_files` and `--tool classify_test_files` still document
+    // and run it even though no `--mcp` mode exposes it.
     let spec = resolve_server_spec("searchtools")?;
     let descriptor = spec
         .tool_descriptors
-        .iter()
+        .into_iter()
+        .chain(single_shot_only_tool_descriptors())
         .find(|descriptor| descriptor.get("name").and_then(Value::as_str) == Some(name))
         .ok_or_else(|| {
             format!("unknown tool: {name}\nRun `bifrost --help` to list available tools.")

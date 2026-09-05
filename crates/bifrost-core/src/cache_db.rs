@@ -31,7 +31,7 @@ const BASELINE_MIGRATION_VERSION: i64 = 18;
 // Version 25 belonged to a rejected local relational-key experiment. Skipping
 // it prevents an old experimental v25 store from being mistaken for this
 // schema; the version sequence is intentionally monotonic, not contiguous.
-const CURRENT_MIGRATION_VERSION: i64 = 43;
+const CURRENT_MIGRATION_VERSION: i64 = 47;
 pub const OPTIONAL_FACT_KIND_CPP_TEMPLATE_METADATA: i64 = 1;
 pub const OPTIONAL_FACT_KIND_RUBY_METHOD_DISPATCH_MODE: i64 = 2;
 pub const OPTIONAL_FACT_KIND_SCALA_TRAIT: i64 = 3;
@@ -83,6 +83,14 @@ const POLICY_SELECTOR_UNITS_SQL: &str =
     include_str!("../migrations/cache/0042-policy-selector-units.sql");
 const SIGNATURE_RESULT_TYPE_IDENTITIES_SQL: &str =
     include_str!("../migrations/cache/0043-signature-result-type-identities.sql");
+const CLASS_SET_SUMMARIES_SQL: &str =
+    include_str!("../migrations/cache/0044-class-set-summaries.sql");
+const CLASS_SET_SUMMARY_EVIDENCE_SQL: &str =
+    include_str!("../migrations/cache/0045-class-set-summary-evidence.sql");
+const PATH_SYMBOL_LOOKUPS_SQL: &str =
+    include_str!("../migrations/cache/0046-path-symbol-lookups.sql");
+const CLASS_SET_SUMMARY_OWNER_LOCAL_LOOKUPS_SQL: &str =
+    include_str!("../migrations/cache/0047-class-set-summary-owner-local-lookups.sql");
 
 // Migration 0023 spells the signature-metadata byte cap as the literal 8388608,
 // because a checked-in SQL file cannot interpolate a Rust constant. The two must
@@ -103,7 +111,7 @@ struct CacheMigration {
     sql: &'static str,
 }
 
-const CACHE_MIGRATIONS: [CacheMigration; 25] = [
+const CACHE_MIGRATIONS: [CacheMigration; 29] = [
     CacheMigration {
         version: 18,
         sql: CURRENT_BASELINE_SQL,
@@ -203,6 +211,22 @@ const CACHE_MIGRATIONS: [CacheMigration; 25] = [
     CacheMigration {
         version: 43,
         sql: SIGNATURE_RESULT_TYPE_IDENTITIES_SQL,
+    },
+    CacheMigration {
+        version: 44,
+        sql: CLASS_SET_SUMMARIES_SQL,
+    },
+    CacheMigration {
+        version: 45,
+        sql: CLASS_SET_SUMMARY_EVIDENCE_SQL,
+    },
+    CacheMigration {
+        version: 46,
+        sql: PATH_SYMBOL_LOOKUPS_SQL,
+    },
+    CacheMigration {
+        version: 47,
+        sql: CLASS_SET_SUMMARY_OWNER_LOCAL_LOOKUPS_SQL,
     },
 ];
 
@@ -1555,6 +1579,25 @@ fn configure_connection_after_busy_timeout(conn: &mut Connection) -> Result<()> 
             ensure_wal_journal_mode(conn)
         })?;
     }
+    // Overwrite freed pages with zeros. This is not a privacy setting here; it
+    // is what keeps a WAL checkpoint from failing with SQLITE_CORRUPT after a
+    // transaction leaves a non-empty freelist under `auto_vacuum=INCREMENTAL`
+    // -- see `drain_free_pages` for the mechanism and
+    // `.agents/docs/store-vacuum-and-secure-delete-decision-2026-09.md` for the
+    // measurement that chose it (issue #2789).
+    //
+    // Spell the value, never number it. `PRAGMA secure_delete` parses its
+    // argument as a boolean unless the argument is the literal word FAST, so
+    // `secure_delete = 2` does not select FAST -- it sets full secure-delete
+    // and reads back as 1.
+    //
+    // FAST would be the wrong choice anyway. It sets only `BTS_OVERWRITE`,
+    // which clears deleted content inside pages that are being written and
+    // leaves freelist leaf pages out of the WAL, so it costs 30 percent more
+    // write bytes on a collection and still reproduces the checkpoint failure
+    // at both page sizes.
+    conn.pragma_update(None, "secure_delete", "ON")
+        .map_err(|err| format!("cache DB SQLite error: {err}"))?;
     conn.pragma_update(None, "foreign_keys", "ON")
         .map_err(|err| format!("cache DB SQLite error: {err}"))?;
     conn.pragma_update(None, "ignore_check_constraints", "OFF")
@@ -1782,61 +1825,71 @@ fn migrate_with_sql(conn: &mut Connection, migrations: &[CacheMigration]) -> Res
 /// Return the pages a migration freed to the filesystem, one incremental-vacuum
 /// step at a time, before anything else touches the store.
 ///
-/// This is a workaround for an upstream SQLite defect, and it is written down
-/// here because the symptom is alarming and the cause is not in this
-/// repository.
+/// A rewrite migration such as `0033-intern-blob-ids.sql` rebuilds every fact
+/// table, so it commits with a large freelist: on a cold Godot store the
+/// `code_units` rewrite alone leaves 5,471 free pages, 179 MB of a 830 MB file.
+/// Under `auto_vacuum=INCREMENTAL` nothing hands those pages back on its own.
+/// This loop does, for 0.7 to 0.9 seconds, and the store ends 45 MB smaller.
 ///
-/// After a WAL transaction that leaves a NON-EMPTY freelist in an
-/// `auto_vacuum=INCREMENTAL` database, SQLite fails every subsequent
-/// `PRAGMA wal_checkpoint` on that database with SQLITE_CORRUPT, "database disk
-/// image is malformed", for the life of the process -- while `integrity_check`
-/// reports `ok` and every read and write succeeds. A checkpoint that can never
-/// run means a WAL that grows without bound, so this is not cosmetic.
+/// The loop is needed because `incremental_vacuum(0)` frees one page per call
+/// on this build rather than the whole list, so a single call would leave the
+/// store almost as large as it was. Do not "simplify" it into one call.
 ///
-/// The trigger is neither this schema nor one SQLite release. A synthetic
-/// database -- create forty tables, insert a row in each, drop them all in one
-/// transaction -- reproduces it on 3.45.0, 3.46.0, 3.50.2, 3.53.2, 3.53.3, and
-/// 3.53.4 alike, at both 4 KiB and 32 KiB pages. It needs all four of
+/// This function used to carry a second job, and no longer does. After a WAL
+/// transaction that left a non-empty freelist in an `auto_vacuum=INCREMENTAL`
+/// database, SQLite failed every subsequent `PRAGMA wal_checkpoint` on that
+/// database with SQLITE_CORRUPT, "database disk image is malformed", for the
+/// life of the process -- while `integrity_check` reported `ok` and every read
+/// and write succeeded. A checkpoint that can never run means a WAL that grows
+/// without bound, so it was not cosmetic.
+///
+/// The trigger was neither this schema nor one SQLite release: a synthetic
+/// database -- forty tables created, filled, and dropped in one transaction --
+/// reproduces it on 3.45.0, 3.46.0, 3.50.2, 3.53.2, 3.53.3 and 3.53.4 alike, at
+/// both 4 KiB and 32 KiB pages. It needs all four of
 /// `auto_vacuum=INCREMENTAL`, WAL, a non-empty freelist, and a SQLite built
-/// without `SQLITE_SECURE_DELETE` -- `auto_vacuum=NONE`, `auto_vacuum=FULL`,
-/// and rollback-journal mode all checkpoint that same workload cleanly, and so
-/// does the identical amalgamation compiled with `SQLITE_SECURE_DELETE` or a
-/// connection that turns `PRAGMA secure_delete` on before the transaction.
+/// without `SQLITE_SECURE_DELETE`; `auto_vacuum=NONE`, `auto_vacuum=FULL` and
+/// rollback-journal mode all checkpoint that same workload cleanly.
 ///
 /// The mechanism is the database-size sanity check in `walCheckpoint`, not a
 /// real corrupt page. Under incremental auto-vacuum, `DROP TABLE` relocates the
 /// highest root page down into the slot it is vacating and then frees the
-/// vacated page. That page is clean when `freePage2` reaches it, so it is not
-/// on the dirty list and gets no WAL frame -- which is correct, because it is a
-/// freelist leaf whose content is meaningless. But the checkpointer then finds
+/// vacated page. That page is clean when `freePage2` reaches it, so it gets no
+/// WAL frame -- correct in itself, because it is a freelist leaf whose content
+/// is meaningless. The checkpointer then finds
 /// `nSize + 65536 + mxFrame*szPage < mxPage*szPage`, decides the WAL cannot
 /// account for the database's committed page count, and returns
-/// `SQLITE_CORRUPT`. `secure_delete` masks it because `freePage2`'s
-/// secure-delete branch calls `sqlite3PagerWrite` on every freed page, which
-/// dirties it and puts it back in the WAL. A distribution `sqlite3` binary
-/// checkpoints the same workload without complaint for that reason;
-/// `libsqlite3-sys` does not define `SQLITE_SECURE_DELETE`.
+/// `SQLITE_CORRUPT`.
+///
+/// The bundled amalgamation (3.53.2 through `libsqlite3-sys` 0.38) is built
+/// without `SQLITE_SECURE_DELETE`, so the store's own write connections now set
+/// `PRAGMA secure_delete = ON` instead
+/// (`configure_connection_after_busy_timeout`). That removes the fourth
+/// condition: `freePage2`'s secure-delete branch calls `sqlite3PagerWrite` on
+/// every freed page instead of `sqlite3PagerDontWrite`, so the page reaches the
+/// WAL and the arithmetic above adds up.
+///
+/// Closing it at the connection rather than by draining is deliberate, because
+/// on a real store the condition is latent rather than absent: measured on a
+/// cold Godot store, neither this migration's 5,471 free pages nor a full
+/// collection's 24,909 tripped the checkpoint, since the inequality depends on
+/// the ratio between the file on disk, the committed page count and the WAL.
+/// A future migration that lands in a different ratio would.
 ///
 /// `.agents/docs/sqlite-wal-incremental-vacuum-checkpoint-report.md` holds the
 /// standalone C reproduction, the measured page and frame counts behind that
-/// arithmetic, and the version matrix. Issue #2789 tracks whether to close the
-/// class structurally with `secure_delete` instead.
+/// arithmetic, and the version matrix.
+/// `.agents/docs/store-vacuum-and-secure-delete-decision-2026-09.md` holds the
+/// measurement that chose `secure_delete` over the alternatives and priced it
+/// (issues #2789 and #2790).
 ///
-/// What changed on our side is that migration 0033 rewrites every fact table,
-/// so it is the first migration in this chain to leave a freelist behind at
-/// all; every schema before it committed with `freelist_count = 0`.
-///
-/// One incremental-vacuum step is enough to clear the state, and draining the
-/// list is what a rewrite migration should do anyway: it hands the old schema's
-/// pages back to the filesystem instead of leaving the store permanently larger
-/// than its contents. The loop is needed because the same defect makes
-/// `incremental_vacuum(0)` free one page per call instead of all of them.
-///
-/// `free_pages_under_incremental_auto_vacuum_still_break_wal_checkpoints` is
-/// the tripwire: it pins the upstream condition, so it starts failing when a
-/// bundled-SQLite upgrade or a `secure_delete` policy makes this function
-/// unnecessary. Until then, do not "simplify" it into a single
-/// `incremental_vacuum(0)`.
+/// Two tests stand behind that. `free_pages_under_incremental_auto_vacuum_...`
+/// pins the upstream condition on a raw connection, so it starts failing when a
+/// bundled-SQLite upgrade fixes the defect;
+/// `store_connection_configuration_checkpoints_a_store_with_free_pages` pins
+/// that the store's own configuration does not meet the condition. Both must
+/// hold: the first says the defect is still real, the second says this store is
+/// no longer exposed to it.
 fn drain_free_pages(conn: &Connection) -> Result<()> {
     let mut previous = i64::MAX;
     loop {
@@ -2241,6 +2294,11 @@ mod tests {
     use std::thread;
 
     use super::*;
+    // The EXPLAIN QUERY PLAN pins below run their assertions once against a
+    // database with no planner statistics and once with the statistics
+    // captured from real corpus stores, because production carries the latter
+    // (issue #3016).
+    use crate::cache_gc::PlannerStatisticsState;
 
     /// A database with no Bifrost schema in it, in the store's own shape:
     /// incremental auto-vacuum, WAL, and one transaction that frees pages.
@@ -2275,15 +2333,21 @@ mod tests {
         conn
     }
 
-    /// The tripwire for `drain_free_pages`. See that function for the full
-    /// account: a bundled SQLite built without `SQLITE_SECURE_DELETE` cannot
-    /// checkpoint a WAL database that has a non-empty freelist under
-    /// incremental auto-vacuum, on every release from 3.45.0 through 3.53.4.
+    /// The tripwire for the upstream defect the store used to be exposed to. A
+    /// bundled SQLite built without `SQLITE_SECURE_DELETE` cannot checkpoint a
+    /// WAL database that has a non-empty freelist under incremental
+    /// auto-vacuum, on every release from 3.45.0 through 3.53.4, and this
+    /// connection is raw so it still meets that condition.
     ///
-    /// If the first half of this test fails, the upstream condition is gone --
-    /// delete `drain_free_pages`, its call sites, and this test. If the second
-    /// half fails, the drain no longer clears the state and the store is one
-    /// migration away from a WAL that grows without bound.
+    /// If the first half of this test fails, the upstream condition is gone and
+    /// the `secure_delete` pragma in `configure_connection_after_busy_timeout`
+    /// is no longer load-bearing -- it can go back to being a free choice, and
+    /// its own test with it. If the second half fails, draining no longer
+    /// clears the state.
+    ///
+    /// `store_connection_configuration_checkpoints_a_store_with_free_pages` is
+    /// the other half: it asserts that the store's own connections do not meet
+    /// the condition at all.
     #[test]
     fn free_pages_under_incremental_auto_vacuum_still_break_wal_checkpoints() {
         let temp = tempfile::tempdir().unwrap();
@@ -2315,6 +2379,61 @@ mod tests {
                 })
                 .unwrap();
             assert_eq!(busy, 0, "the drained store must checkpoint");
+        }
+    }
+
+    /// The store's own write-connection configuration must not meet the
+    /// condition the tripwire above pins: a transaction that leaves a
+    /// non-empty freelist must still checkpoint, undrained (issue #2789).
+    #[test]
+    fn store_connection_configuration_checkpoints_a_store_with_free_pages() {
+        let temp = tempfile::tempdir().unwrap();
+        for (index, page_size) in [4096u32, 32768].into_iter().enumerate() {
+            let path = temp.path().join(format!("configured{index}.db"));
+            let mut conn = Connection::open(&path).unwrap();
+            conn.pragma_update(None, "page_size", page_size).unwrap();
+            configure_connection(&mut conn).unwrap();
+            let secure_delete: i64 = conn
+                .query_row("PRAGMA secure_delete", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(
+                secure_delete, 1,
+                "the store's connections must run full secure-delete, not OFF (0) or FAST (2)"
+            );
+            let auto_vacuum: i64 = conn
+                .query_row("PRAGMA auto_vacuum", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(auto_vacuum, 2, "the workload needs incremental auto-vacuum");
+
+            let filler = "x".repeat(2000);
+            let mut sql = String::from("BEGIN;");
+            for table in 0..40 {
+                sql.push_str(&format!(
+                    "CREATE TABLE t{table}(a TEXT); INSERT INTO t{table}(a) VALUES('{filler}');"
+                ));
+            }
+            for table in 0..40 {
+                sql.push_str(&format!("DROP TABLE t{table};"));
+            }
+            sql.push_str("COMMIT;");
+            conn.execute_batch(&sql).unwrap();
+            let free: i64 = conn
+                .query_row("PRAGMA freelist_count", [], |row| row.get(0))
+                .unwrap();
+            assert!(free > 0, "the workload must leave pages on the freelist");
+
+            let busy = conn
+                .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "a {page_size}-byte-page store configured the production way must \
+                         checkpoint with {free} free pages, on SQLite {}: {error}",
+                        rusqlite::version()
+                    )
+                });
+            assert_eq!(busy, 0, "the checkpoint must complete");
         }
     }
 
@@ -2809,6 +2928,14 @@ mod tests {
 
     #[test]
     fn live_definition_views_enforce_publication_and_keep_indexed_lookups() {
+        for state in PlannerStatisticsState::BOTH {
+            live_definition_views_enforce_publication_and_keep_indexed_lookups_in(state);
+        }
+    }
+
+    fn live_definition_views_enforce_publication_and_keep_indexed_lookups_in(
+        state: PlannerStatisticsState,
+    ) {
         let conn = open_in_memory_cache();
         let live_oid = "1111111111111111111111111111111111111111";
         conn.execute_batch(
@@ -2867,6 +2994,7 @@ mod tests {
             );
         }
 
+        state.install(&conn);
         let plan = conn
             .prepare(
                 "EXPLAIN QUERY PLAN
@@ -2882,16 +3010,26 @@ mod tests {
         assert!(
             plan.iter()
                 .any(|step| step.contains("idx_code_units_lang_exact_fqn_declarations")),
-            "exact live declaration lookup must use its partial index: {plan:?}"
+            "exact live declaration lookup must use its partial index {state}: {plan:?}"
         );
         assert!(
             plan.iter().all(|step| !step.contains("SCAN units")),
-            "exact live declaration lookup must not scan code_units: {plan:?}"
+            "exact live declaration lookup must not scan code_units {state}: {plan:?}"
         );
     }
 
     #[test]
     fn revisioned_workspace_projection_enforces_temporal_identity_and_indexed_membership() {
+        for state in PlannerStatisticsState::BOTH {
+            revisioned_workspace_projection_enforces_temporal_identity_and_indexed_membership_in(
+                state,
+            );
+        }
+    }
+
+    fn revisioned_workspace_projection_enforces_temporal_identity_and_indexed_membership_in(
+        state: PlannerStatisticsState,
+    ) {
         let conn = open_in_memory_cache();
         conn.execute_batch(
             "INSERT INTO analysis_epochs(lang, epoch, generation)
@@ -2943,6 +3081,7 @@ mod tests {
         )
         .unwrap();
 
+        state.install(&conn);
         for (sql, expected_index) in [
             (
                 "SELECT file_version_id FROM workspace_file_versions
@@ -2974,12 +3113,12 @@ mod tests {
                 .unwrap();
             assert!(
                 plan.iter().any(|step| step.contains(expected_index)),
-                "relational lookup must use {expected_index}: {plan:?}"
+                "relational lookup must use {expected_index} {state}: {plan:?}"
             );
             assert!(
                 plan.iter()
                     .all(|step| !step.contains("SCAN workspace_file_versions")),
-                "snapshot lookup must not scan workspace_file_versions: {plan:?}"
+                "snapshot lookup must not scan workspace_file_versions {state}: {plan:?}"
             );
         }
 
@@ -4457,6 +4596,161 @@ mod tests {
             .into_iter()
             .filter(|migration| migration.version <= version)
             .collect()
+    }
+
+    #[test]
+    fn class_set_evidence_migration_discards_v44_rows_and_builds_exact_schema() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        configure_connection(&mut conn).unwrap();
+        migrate_with_sql(&mut conn, &migrations_through(44)).unwrap();
+        conn.execute(
+            "INSERT INTO blobs(blob_oid, lang, generation)
+             VALUES('1111111111111111111111111111111111111111', 'python', 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO class_set_summaries(
+               lookup_digest, procedure_read_identity, owner_rel_path, owner_blob_id, lang,
+               artifact_public_identity, artifact_content_identity, schema_version,
+               semantics_digest, context_digest, behavior_read_digest, dependency_digest,
+               carrier_digest, field_slots_digest, entry_fact_ordinal, fact_count, exit_count,
+               reached_count, dependency_count, read_count, charge_count, completion,
+               budget_mode, content_digest, published_at
+             ) SELECT
+               zeroblob(32), zeroblob(32), 'src/app.py', id, lang,
+               zeroblob(32), zeroblob(32), 1, zeroblob(32), zeroblob(32), zeroblob(32),
+               zeroblob(32), zeroblob(32), zeroblob(32), 0, 1, 1, 0, 0, 0, 1,
+               'complete', 'exhaustive', zeroblob(32), 0
+             FROM blobs",
+            [],
+        )
+        .unwrap();
+        conn.pragma_update(None, "user_version", 44).unwrap();
+
+        migrate_with_sql(&mut conn, &migrations_through(45)).unwrap();
+
+        assert_eq!(cache_migration_version(&conn).unwrap(), 45);
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM class_set_summaries", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+            0,
+            "v44 leaf-only rows must not masquerade as exact evidence"
+        );
+        for (table, column) in [
+            ("class_set_summaries", "procedure_lineage"),
+            ("class_set_summaries", "output_digest"),
+            (
+                "class_set_summary_dependencies",
+                "callee_entry_selector_digest",
+            ),
+            (
+                "class_set_summary_dependencies",
+                "consumed_child_lookup_digest",
+            ),
+            ("class_set_summary_reads", "subject"),
+            ("class_set_summary_reads", "digest"),
+        ] {
+            assert!(
+                column_exists(&conn, table, column).unwrap(),
+                "{table}.{column}"
+            );
+        }
+        assert!(!column_exists(&conn, "class_set_summaries", "procedure_read_identity").unwrap());
+        assert!(quick_check_is_ok(&conn).unwrap());
+    }
+
+    #[test]
+    fn class_set_owner_local_lookup_migration_discards_v1_rows() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        configure_connection(&mut conn).unwrap();
+        migrate_with_sql(&mut conn, &migrations_through(46)).unwrap();
+        conn.execute(
+            "INSERT INTO blobs(blob_oid, lang, generation)
+             VALUES('1111111111111111111111111111111111111111', 'python', 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO class_set_summaries(
+               lookup_digest, procedure_lineage, owner_rel_path, owner_blob_id, lang,
+               artifact_public_identity, artifact_content_identity, schema_version,
+               semantics_digest, context_digest, behavior_read_digest, dependency_digest,
+               carrier_digest, field_slots_digest, entry_fact_ordinal, fact_count, exit_count,
+               reached_count, dependency_count, read_count, charge_count, completion,
+               budget_mode, output_digest, content_digest, published_at
+             ) SELECT
+               zeroblob(32), zeroblob(32), 'src/app.py', id, lang,
+               zeroblob(32), zeroblob(32), 1, zeroblob(32), zeroblob(32), zeroblob(32),
+               zeroblob(32), zeroblob(32), zeroblob(32), 0, 1, 1, 1, 1, 1, 1,
+               'complete', 'exhaustive', zeroblob(32), zeroblob(32), 0
+             FROM blobs",
+            [],
+        )
+        .unwrap();
+        let summary_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO class_set_summary_facts
+             VALUES(?1, 0, 'zero', 'none', NULL, NULL, NULL, 0)",
+            [summary_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO class_set_summary_exits VALUES(?1, 0, 'normal', 0, 1)",
+            [summary_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO class_set_summary_reached VALUES(?1, 0, 0, 0, 1)",
+            [summary_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO class_set_summary_dependencies
+             VALUES(?1, 0, zeroblob(32), zeroblob(32), zeroblob(32), zeroblob(32))",
+            [summary_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO class_set_summary_reads(
+               summary_id, read_ordinal, key_digest, kind, family, languages, rel_path,
+               name, index_key, blob_oid, subject, start_byte, end_byte, digest
+             ) VALUES(?1, 0, zeroblob(32), 'models', NULL, NULL, NULL, NULL, NULL,
+                      NULL, NULL, NULL, NULL, zeroblob(32))",
+            [summary_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO class_set_summary_charges VALUES(?1, 'solver.callback_rows', 1)",
+            [summary_id],
+        )
+        .unwrap();
+        conn.pragma_update(None, "user_version", 46).unwrap();
+
+        migrate_with_sql(&mut conn, &migrations_through(47)).unwrap();
+
+        assert_eq!(cache_migration_version(&conn).unwrap(), 47);
+        for table in [
+            "class_set_summaries",
+            "class_set_summary_facts",
+            "class_set_summary_exits",
+            "class_set_summary_reached",
+            "class_set_summary_dependencies",
+            "class_set_summary_reads",
+            "class_set_summary_charges",
+        ] {
+            assert_eq!(
+                conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+                0,
+                "lookup-v1 rows must be removed from {table}"
+            );
+        }
+        assert!(quick_check_is_ok(&conn).unwrap());
     }
 
     /// The other schema that briefly shipped as version 30 while the

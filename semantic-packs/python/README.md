@@ -66,15 +66,27 @@ fidelity for the artifact the pack names, and the Python boundary judge reads
 it per module: a module this pack does not publish never reaches an absence
 verdict.
 
-`os.path` and `collections.abc` are re-export shims in typeshed. Their stubs
-spell `from posixpath import *` and `from _collections_abc import *`, and the
-producer records a wildcard re-export as the `*` binding rather than
-enumerating it. Both modules therefore publish the honest statement "this
-surface binds names the pack could not enumerate", and the Python boundary
-judge reports them as incomplete instead of proving a name absent. The
-modules the shims re-export from are pinned as well, so the declarations
-themselves are in the pack under their own module names: `posixpath.join`
-exists, `os.path.join` does not.
+`os.path`, `collections.abc`, `codecs`, and `struct` are re-export shims in
+typeshed. Their stubs spell `from ntpath import *`, `from posixpath import *`,
+`from _collections_abc import *`, `from _codecs import *`, and
+`from _struct import *`.
+
+The producer expands a wildcard whose module the same production carries. It
+binds the names that module's literal `__all__` lists, or every public name it
+binds when the module states no `__all__`, and it follows a chain of shims to
+the class that declares each name. `os.path` and `collections.abc` are
+expanded this way: `os.path.join` exists, and `collections.abc.MutableSet` is
+published as an alias of `typing.MutableSet`, so `builtins.set` resolves its
+base and a name that is not on `set` can be proved absent. A name a guarded
+wildcard binds keeps that condition, so the `os.path` names carry the
+`sys.platform` guard their branch states.
+
+`_codecs` and `_struct` are outside this pinned source set, so `codecs` and
+`struct` keep the `*` binding, which is the honest statement "this surface
+binds names the pack could not enumerate". The Python boundary judge reports
+those two modules as incomplete instead of proving a name absent. A module
+whose `__all__` this producer cannot read as a list of string literals keeps
+the marker for the same reason.
 
 Typeshed publishes overloaded methods as several records with one owner and
 name. The semantic-model overlay treats such records as one present member

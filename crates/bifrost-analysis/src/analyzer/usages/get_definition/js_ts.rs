@@ -5,6 +5,7 @@ use crate::analyzer::usages::js_ts_graph::{
     browser_global_property_shape, unbound_browser_global_property,
 };
 use crate::navigation::NavigationOperation;
+use brokk_bifrost_core::analyzer::structural::adapter_helpers::nearest_ancestor;
 use brokk_bifrost_js_ts::imports::{
     js_ts_module_identity, js_ts_module_specifier_probed_paths, require_call_module_specifier,
     resolve_js_ts_direct_import_candidates, resolve_js_ts_module_binding_candidates,
@@ -16,7 +17,7 @@ use brokk_bifrost_js_ts::syntax::{
     MAX_STATIC_IMPORT_BINDINGS_PER_NAME, destructured_property_key_source,
     direct_property_definitions, is_declaration_identifier, is_explicit_object_literal_key,
     is_export_alias_identifier, is_known_js_ts_global, js_program_is_external_module,
-    pattern_binder_identifiers, slice, static_member_property,
+    js_ts_statement_module_specifier, pattern_binder_identifiers, slice, static_member_property,
     typescript_enclosing_enum_initializer,
 };
 /// The receiver-owner / type-text cluster this route drives now lives beside the
@@ -490,6 +491,30 @@ pub(super) fn resolve_js_ts(
             DECLARATION_OR_IMPORT_SITE_DIAGNOSTIC_KIND,
             "JS/TS export aliases declare outward bindings and do not reference indexed definitions",
         );
+    }
+    // An import specifier and an `export ... from` specifier name something in
+    // the module the statement points at, not something bound in this file, so
+    // they are answered from the module specifier before the declaration-site
+    // terminals below claim them (#1648).
+    if let Some((module, target)) =
+        focused.and_then(|node| jsts_module_specifier_site(node, source))
+    {
+        return match target {
+            JsTsSpecifierTarget::Exported(name) => resolve_js_ts_module_binding(
+                file,
+                language,
+                &module,
+                name,
+                analyzer,
+                host,
+                support,
+                Some(aliases),
+                value_position,
+            ),
+            JsTsSpecifierTarget::Module => {
+                resolve_js_ts_module_as_namespace(analyzer, file, language, &module, Some(aliases))
+            }
+        };
     }
     // A renamed destructuring key is a property read on the destructured value,
     // so it is answered before the declaration terminal below claims the whole
@@ -1345,44 +1370,46 @@ fn resolve_js_ts_visible_namespace_bindings(
     let outcomes = bindings
         .into_iter()
         .map(|binding| {
-            let files = crate::analyzer::resolve_js_ts_module_specifier(
+            resolve_js_ts_module_as_namespace(
+                analyzer,
                 file,
-                &binding.module_specifier,
                 language,
+                &binding.module_specifier,
                 aliases,
-            );
-            if files.is_empty() {
-                record_unresolved_module_specifier(
-                    analyzer,
-                    file,
-                    language,
-                    &binding.module_specifier,
-                    aliases,
-                );
-                return gated_boundary(
-                    || !is_bare_js_ts_specifier(&binding.module_specifier),
-                    format!(
-                        "`{}` is a package import outside this partial workspace analysis",
-                        binding.module_specifier
-                    ),
-                    "no_indexed_definition",
-                    format!(
-                        "`{}` could not be resolved to a workspace JS/TS file",
-                        binding.module_specifier
-                    ),
-                );
-            }
-
-            let mut candidates = files
-                .into_iter()
-                .map(CodeUnit::file_scope)
-                .collect::<Vec<_>>();
-            sort_units(&mut candidates);
-            candidates.dedup();
-            js_ts_candidates_outcome(analyzer, candidates)
+            )
         })
         .collect::<Vec<_>>();
     merge_js_ts_binding_outcomes(analyzer, reference, outcomes, bindings_truncated)
+}
+
+/// The whole module a namespace binding names: the file scopes the module
+/// specifier resolves to. An unresolved specifier fails closed the same way a
+/// named binding does, so the two routes report one shape.
+fn resolve_js_ts_module_as_namespace(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    language: Language,
+    module: &str,
+    aliases: Option<&AliasResolver>,
+) -> DefinitionLookupOutcome {
+    let files = crate::analyzer::resolve_js_ts_module_specifier(file, module, language, aliases);
+    if files.is_empty() {
+        record_unresolved_module_specifier(analyzer, file, language, module, aliases);
+        return gated_boundary(
+            || !is_bare_js_ts_specifier(module),
+            format!("`{module}` is a package import outside this partial workspace analysis"),
+            "no_indexed_definition",
+            format!("`{module}` could not be resolved to a workspace JS/TS file"),
+        );
+    }
+
+    let mut candidates = files
+        .into_iter()
+        .map(CodeUnit::file_scope)
+        .collect::<Vec<_>>();
+    sort_units(&mut candidates);
+    candidates.dedup();
+    js_ts_candidates_outcome(analyzer, candidates)
 }
 
 fn merge_js_ts_binding_outcomes(
@@ -1701,6 +1728,64 @@ fn record_unresolved_module_specifier(
             language,
             rel_path_string(&candidate).as_str(),
         ));
+    }
+}
+
+/// What a JS/TS import or `export ... from` specifier token names in the module
+/// its statement points at.
+///
+/// The token is a specifier, not a reference to something in this file, so the
+/// answer is whatever the other module publishes under that name. Each variant
+/// carries the published thing, never a spelling in this file: `import { a as
+/// b }` binds `b` here but names `a` there, so both tokens of that clause ask
+/// the same question.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JsTsSpecifierTarget<'src> {
+    /// The name the target module exports: `import { name }`, `import { name as
+    /// alias }`, `export { name } from`, `export { name as alias } from`, and
+    /// `default` for `import name from`, which is the spelling
+    /// `resolve_js_ts_module_binding_candidates` already keys the default
+    /// export under.
+    Exported(&'src str),
+    /// The target module itself: `import * as ns from`.
+    Module,
+}
+
+/// Classify the focused token as an import or `export ... from` specifier and
+/// name the module its target comes from.
+///
+/// Every fact is a tree-sitter field: the specifier's `name` and `alias`
+/// fields, and the statement's `source` field. A local `export { x }` has no
+/// `source` field and is not this shape -- it resolves through whatever binds
+/// `x` in this file, which the ordinary reference route already answers -- and
+/// an `export ... from` alias is the outward binding this module declares, so
+/// it stays with the export-alias answer above rather than pointing at the
+/// origin (#1648).
+fn jsts_module_specifier_site<'src>(
+    node: Node<'_>,
+    source: &'src str,
+) -> Option<(String, JsTsSpecifierTarget<'src>)> {
+    let parent = node.parent()?;
+    let statement = nearest_ancestor(node, |kind| {
+        matches!(kind, "import_statement" | "export_statement")
+    })?;
+    let module = js_ts_statement_module_specifier(statement, source)?;
+    match parent.kind() {
+        "import_specifier" | "export_specifier" => {
+            debug_assert!(
+                !is_export_alias_identifier(node),
+                "the export-alias answer claims this token before the specifier route sees it: {node:?}"
+            );
+            let name = parent.child_by_field_name("name")?;
+            Some((module, JsTsSpecifierTarget::Exported(slice(name, source))))
+        }
+        "namespace_import" => Some((module, JsTsSpecifierTarget::Module)),
+        // The default binding is the one identifier that is a direct child of
+        // the clause; `named_imports` and `namespace_import` wrap the others.
+        "import_clause" if node.kind() == "identifier" => {
+            Some((module, JsTsSpecifierTarget::Exported("default")))
+        }
+        _ => None,
     }
 }
 

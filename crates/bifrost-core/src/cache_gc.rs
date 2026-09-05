@@ -117,6 +117,229 @@ fn automatic_gc_enabled(value: Option<&OsStr>) -> bool {
     )
 }
 
+/// How many rows `ANALYZE` may sample per index when refreshing the query
+/// planner's statistics.
+///
+/// SQLite chooses how to run each query -- which index to use, which table to
+/// read first -- from statistics it keeps in a table named `sqlite_stat1`.
+/// `ANALYZE` is what fills that table in. `PRAGMA analysis_limit = N` caps the
+/// per-index sample at about N rows instead of walking every index end to end.
+///
+/// Measured for issue #3016 on one workspace-built store per supported
+/// language (2026-09-04). On the largest, apache/shardingsphere at 244 MB and
+/// 86,841 code units, `ANALYZE` cost 1.047 s at this limit against 1.199 s
+/// unbounded; on a 137 MB C# store, 0.486 s against 0.596 s. The limit buys
+/// little at corpus sizes because the store's indexes are narrow, and it is
+/// kept as the bound for stores larger than anything the corpus holds. The
+/// full table is in
+/// `.agents/plans/issue-3016-analyzer-store-planner-statistics.md`.
+pub const PLANNER_ANALYSIS_LIMIT: i64 = 1000;
+
+/// Operator switch for the planner-statistics hooks, alongside
+/// `BIFROST_CACHE_GC`. Setting it to `0`, `off`, or `disabled` stops both the
+/// post-build and the post-GC refresh, which is how a statistics-free plan is
+/// reproduced.
+pub const STORE_STATISTICS_ENV: &str = "BIFROST_STORE_STATISTICS";
+
+/// What one planner-statistics refresh did, for the caller to log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlannerStatisticsRefresh {
+    pub elapsed: std::time::Duration,
+    pub stat1_rows: i64,
+}
+
+/// Whether the planner-statistics hooks may run. See [`STORE_STATISTICS_ENV`].
+pub fn planner_statistics_enabled() -> bool {
+    statistics_enabled(std::env::var_os(STORE_STATISTICS_ENV).as_deref())
+}
+
+fn statistics_enabled(value: Option<&OsStr>) -> bool {
+    !matches!(
+        value.and_then(OsStr::to_str),
+        Some("0" | "off" | "disabled")
+    )
+}
+
+/// Recompute the query planner's statistics for this cache database.
+///
+/// Reports how long `ANALYZE` took and how many `sqlite_stat1` rows the
+/// database carries afterwards, so the caller logs evidence rather than the
+/// bare fact that it ran.
+pub fn refresh_planner_statistics(conn: &Connection) -> Result<PlannerStatisticsRefresh, String> {
+    let started = std::time::Instant::now();
+    conn.pragma_update(None, "analysis_limit", PLANNER_ANALYSIS_LIMIT)
+        .map_err(|err| format!("planner statistics SQLite error: {err}"))?;
+    conn.execute_batch("ANALYZE;")
+        .map_err(|err| format!("planner statistics SQLite error: {err}"))?;
+    let elapsed = started.elapsed();
+    Ok(PlannerStatisticsRefresh {
+        elapsed,
+        stat1_rows: planner_statistics_row_count(conn)?,
+    })
+}
+
+/// How many `sqlite_stat1` rows the database carries, or zero when `ANALYZE`
+/// has never run: the table does not exist until it does.
+pub fn planner_statistics_row_count(conn: &Connection) -> Result<i64, String> {
+    let has_table: i64 = conn
+        .query_row(
+            "SELECT EXISTS(
+               SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'sqlite_stat1'
+             )",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|err| format!("planner statistics SQLite error: {err}"))?;
+    if has_table == 0 {
+        return Ok(0);
+    }
+    conn.query_row("SELECT count(*) FROM sqlite_stat1", [], |row| row.get(0))
+        .map_err(|err| format!("planner statistics SQLite error: {err}"))
+}
+
+/// Whether the stored statistics still describe this database.
+///
+/// The first field of a `sqlite_stat1` row is the table's exact row count at
+/// the time `ANALYZE` ran -- `analysis_limit` bounds the per-index sampling,
+/// not that total -- so comparing the recorded `blobs` count against the
+/// current one answers "has anything been persisted or collected since the
+/// last refresh?" exactly, with one indexed query and no new counter. Every
+/// persisted blob adds a `blobs` row and every collected blob removes one, so
+/// an unchanged count means the statistics are still the ones this store's
+/// content produced.
+pub fn planner_statistics_describe_database(conn: &Connection) -> Result<bool, String> {
+    if planner_statistics_row_count(conn)? == 0 {
+        // `ANALYZE` has never run here, or ran when the database held nothing.
+        return Ok(false);
+    }
+    // `ANALYZE` writes no row for an empty table, so a missing `blobs` entry
+    // means the last refresh saw no blobs, which is a recorded count of zero.
+    let recorded: i64 = conn
+        .query_row(
+            "SELECT COALESCE(
+               (SELECT CAST(substr(stat, 1, instr(stat || ' ', ' ') - 1) AS INTEGER)
+                FROM sqlite_stat1
+                WHERE tbl = 'blobs' AND idx IS NOT NULL
+                LIMIT 1),
+               0
+             )",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|err| format!("planner statistics SQLite error: {err}"))?;
+    Ok(recorded == total_blob_count_conn(conn)?)
+}
+
+/// Planner statistics captured from real corpus stores, one workspace build
+/// per supported language (issue #3016, 2026-09-04). The file's own header
+/// records which stores it came from and how the rows were merged.
+///
+/// The fixture lives in this crate, not in the analyzer store, because the
+/// pinned query plans it has to reproduce are spread across this crate's
+/// `cache_db` schema tests, the analyzer store's own tests, and the
+/// `suite_persistence` integration suite. One copy is the only way all three
+/// plan against the same cardinalities.
+#[cfg(any(test, feature = "test-support"))]
+const REPRESENTATIVE_SQLITE_STAT1: &str = include_str!("testdata/representative_sqlite_stat1.tsv");
+
+/// The two query-planner states every `EXPLAIN QUERY PLAN` pin in this
+/// repository must hold in.
+///
+/// A plan proved only against a database that has never run `ANALYZE` proves
+/// nothing about a repository that has been built, because the build hook
+/// leaves statistics behind. `Representative` installs the captured
+/// statistics, so the second run plans with cardinalities production has.
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlannerStatisticsState {
+    Absent,
+    Representative,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl PlannerStatisticsState {
+    /// Both states, in the order a pin should run them.
+    pub const BOTH: [Self; 2] = [Self::Absent, Self::Representative];
+
+    /// Put `conn` into this state.
+    ///
+    /// `Absent` asserts the state it names instead of assuming it, so a pin
+    /// cannot quietly run its statistics-free half against a database that
+    /// already carries statistics.
+    pub fn install(self, conn: &Connection) {
+        match self {
+            Self::Absent => assert_eq!(
+                planner_statistics_row_count(conn).expect("sqlite_stat1 row count"),
+                0,
+                "the statistics-free half of a plan pin needs a database that has never \
+                 run ANALYZE"
+            ),
+            Self::Representative => with_representative_statistics(conn),
+        }
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl std::fmt::Display for PlannerStatisticsState {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Absent => "with no planner statistics",
+            Self::Representative => "with representative planner statistics",
+        })
+    }
+}
+
+/// Make `conn`'s query planner read the captured corpus statistics.
+///
+/// `ANALYZE` on the database creates the `sqlite_stat1` table (empty, when the
+/// database holds no rows: `ANALYZE` writes no row for an empty table); the
+/// captured rows replace its contents; `ANALYZE sqlite_schema` reloads the
+/// planner's cached view of the table without recomputing anything. What the
+/// planner reads is `sqlite_stat1`, never the rows themselves, so this
+/// reproduces a real store's planning inputs without its data.
+///
+/// Rows naming a table or index this database does not have are skipped: the
+/// capture came from the analyzer store, and the same helper serves the
+/// semantic-pack catalog, whose schema shares none of it.
+#[cfg(any(test, feature = "test-support"))]
+pub fn with_representative_statistics(conn: &Connection) {
+    conn.execute_batch("ANALYZE;")
+        .expect("ANALYZE creates sqlite_stat1");
+    conn.execute("DELETE FROM sqlite_stat1", [])
+        .expect("clear sqlite_stat1");
+    let mut insert = conn
+        .prepare("INSERT INTO sqlite_stat1(tbl, idx, stat) VALUES(?1, ?2, ?3)")
+        .expect("prepare sqlite_stat1 insert");
+    for line in REPRESENTATIVE_SQLITE_STAT1.lines() {
+        let line = line.trim_end();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut fields = line.split('\t');
+        let (Some(tbl), Some(idx), Some(stat)) = (fields.next(), fields.next(), fields.next())
+        else {
+            panic!("captured statistics line is not tab-separated: {line}");
+        };
+        let idx = if idx.is_empty() { None } else { Some(idx) };
+        let known: i64 = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name = ?1)",
+                [idx.unwrap_or(tbl)],
+                |row| row.get(0),
+            )
+            .expect("schema membership");
+        if known == 0 {
+            continue;
+        }
+        insert
+            .execute(rusqlite::params![tbl, idx, stat])
+            .expect("insert captured statistics");
+    }
+    drop(insert);
+    conn.execute_batch("ANALYZE sqlite_schema;")
+        .expect("reload planner statistics");
+}
+
 fn sweep_with_claim(
     claim: &GcClaim,
     repo: &Repository,
@@ -173,6 +396,22 @@ fn sweep_with_claim(
         .map_err(|err| format!("cache GC SQLite error: {err}"))?;
     conn.pragma_update(None, "incremental_vacuum", 0)
         .map_err(|err| format!("cache GC SQLite error: {err}"))?;
+
+    // A collection that removed rows changed the cardinalities the planner
+    // reasons from, so the statistics it left behind now describe a database
+    // that no longer exists. Refreshing here is what keeps a collected store
+    // planning as well as a freshly built one (issue #3016).
+    if analyzer_dropped > 0 && planner_statistics_enabled() {
+        let evidence = refresh_planner_statistics(&conn)?;
+        crate::profiling::note_with(|| {
+            format!(
+                "cache_gc.planner_statistics refreshed after dropping {analyzer_dropped} rows: \
+                 {:.1} ms, {} sqlite_stat1 rows",
+                evidence.elapsed.as_secs_f64() * 1000.0,
+                evidence.stat1_rows
+            )
+        });
+    }
 
     let total_blobs_after = finish_gc(&claim.db_path)?;
     // Row collection and file collection answer the same question about

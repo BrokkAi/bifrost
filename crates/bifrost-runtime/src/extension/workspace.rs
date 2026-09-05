@@ -1,5 +1,12 @@
+use super::typestate::{
+    TypestateFindingKind as WireTypestateFindingKind, typestate_request_digest,
+};
 use super::*;
 use brokk_bifrost_analysis::analyzer::semantic::cfg_algorithms::ProcedureControlDependenceStop;
+use brokk_bifrost_analysis::analyzer::semantic::{
+    AbstractObject, AccessPathRoot, ObjectCardinality, ProcedureHandle, ProgramPointHandle,
+    ReturnTransferKind, SemanticCallSite, ValueId, WorkspaceIcfgProvider,
+};
 use brokk_bifrost_analysis::analyzer::semantic::{
     CandidateCoverage, EvidenceCompleteness, MoveInvalidation, OracleCallContext,
     ProcedureSemantics, ProofStatus, SemanticBudget, SemanticLocator, SemanticOutcome,
@@ -9,7 +16,21 @@ use brokk_bifrost_analysis::analyzer::semantic::{
 };
 use brokk_bifrost_analysis::analyzer::{
     AnalyzerConfig, AnalyzerQueryScope, FilesystemProject, InformationTier, OverlayProject,
-    Project, ProjectFile, WorkspaceAnalyzer,
+    Project, ProjectFile, WorkspaceAnalyzer, common::language_for_file,
+};
+use brokk_bifrost_flow::dataflow::{
+    DataflowRequest, SemanticInputStatus, SolverBudget, SolverTermination, SolverWork,
+    SummaryReadRecorder, SummaryWitnessStepKind, WitnessReconstructionLimits,
+};
+use brokk_bifrost_flow::typestate::{
+    BoundTypestateSubjectSpec, CompiledProtocol, ProductionTypestateExecutionContext,
+    ProtocolEventKey, ProtocolExpectationKey, ProtocolSpec, ProtocolStateKey,
+    TypestateBindingContext, TypestateBindingPlan, TypestateBindingQuality,
+    TypestateEventBindingSpec, TypestateFinding, TypestateFindingCertainty, TypestateFindingKind,
+    TypestateFindingLimits, TypestateInitialSeedSpec, TypestateObjectRole,
+    TypestateObservationSite, TypestateSubjectClassKey, TypestateSubjectKey,
+    TypestateTerminalBindingSpec, TypestateUncertainty, collect_summary_findings_with_limits,
+    solve_typestate_with_production_summaries,
 };
 use brokk_bifrost_flow::{FlowWorkspaceState, value_flow::ValueFlowCarrier};
 use brokk_bifrost_rql::{
@@ -277,17 +298,47 @@ impl ExtensionWorkspace {
             supertypes: build_tier_access.tier_access_count(InformationTier::Supertypes) as u64,
             usage_graph: build_tier_access.tier_access_count(InformationTier::UsageGraph) as u64,
         };
+        // Every semantic operation on this surface -- control flow, value
+        // dependence, and typestate -- is served by the same per-file
+        // execution-semantics provider, so all three rows are derived from
+        // whether this workspace actually has one for that language's files.
+        // Deriving beats a second hand-maintained table, which is what #2328
+        // found wrong with the operation list in the first place.
+        let mut semantic_languages = std::collections::BTreeSet::new();
+        for file in files.iter() {
+            if analyzer.program_semantics_provider_for_file(file).is_some() {
+                semantic_languages.insert(language_for_file(file));
+            }
+        }
         let languages = analyzer
             .analyzer()
             .languages()
             .into_iter()
-            .map(|language| LanguageCapabilityReport {
-                language: format!("{language:?}")
-                    .to_ascii_lowercase()
-                    .into_boxed_str(),
-                control_flow: CapabilitySupport::Complete,
-                value_dependence: CapabilitySupport::Partial,
-                typestate: CapabilitySupport::Unsupported,
+            .map(|language| {
+                let served = semantic_languages.contains(&language);
+                LanguageCapabilityReport {
+                    language: format!("{language:?}")
+                        .to_ascii_lowercase()
+                        .into_boxed_str(),
+                    control_flow: if served {
+                        CapabilitySupport::Complete
+                    } else {
+                        CapabilitySupport::Unsupported
+                    },
+                    // `Partial` for both derived operations: the lowering is
+                    // present, and how much of it a given procedure supports is
+                    // reported per request rather than promised here.
+                    value_dependence: if served {
+                        CapabilitySupport::Partial
+                    } else {
+                        CapabilitySupport::Unsupported
+                    },
+                    typestate: if served {
+                        CapabilitySupport::Partial
+                    } else {
+                        CapabilitySupport::Unsupported
+                    },
+                }
             })
             .collect::<Vec<_>>()
             .into_boxed_slice();
@@ -987,6 +1038,758 @@ impl ExtensionWorkspace {
             &scope,
         ))
     }
+
+    /// Answer one bounded typestate question about one procedure.
+    ///
+    /// The caller owns the automaton and every binding: the protocol document
+    /// is compiled for this request only, and each observation is a source span
+    /// the caller chose. That keeps the boundary handle-free, which is what
+    /// made the internal registration model unusable here, and it keeps the
+    /// answer bounded -- the analysis root is one procedure, the solver runs
+    /// under the request's own budget, and finding and witness retention are
+    /// caller limits rather than engine defaults.
+    pub fn typestate_check(
+        &self,
+        request: TypestateRequest,
+        cancellation: &ExtensionCancellation,
+    ) -> Result<ExtensionOutcome<TypestateSnapshot>, ExtensionError> {
+        self.validate(&request.compatibility, &request.expected_generation)?;
+        request
+            .validate()
+            .map_err(|error| ExtensionError::InvalidRequest(error.to_string().into()))?;
+        let stability = ApiStability::Experimental { since_minor: 1 };
+        let operation = TYPESTATE_OPERATION;
+        let echoed = ExtensionLimits::default();
+        if !matches!(request.scope, SemanticRelationScope::Procedure) {
+            return Err(ExtensionError::InvalidRequest(
+                "typestate serves the procedure scope only in this API version".into(),
+            ));
+        }
+        if cancellation.is_cancelled() {
+            return Ok(make_outcome(
+                None,
+                ExtensionCompletion::Cancelled,
+                &self.generation,
+                &echoed,
+                operation,
+                stability,
+                ExtensionWork::default(),
+            ));
+        }
+        let request_digest = typestate_request_digest(&request)
+            .map_err(|error| ExtensionError::Execution(error.to_string().into()))?;
+        // Compile before any analysis: an automaton that does not compile is a
+        // request error, and rejecting it here keeps a hostile document cheap.
+        let protocol_bytes = serde_json::to_vec(&request.protocol)
+            .map_err(|error| ExtensionError::InvalidRequest(error.to_string().into()))?;
+        let protocol = ProtocolSpec::from_json(&protocol_bytes)
+            .map_err(|error| {
+                ExtensionError::InvalidRequest(
+                    format!("invalid typestate protocol document: {error}").into(),
+                )
+            })?
+            .compile()
+            .map_err(|error| {
+                ExtensionError::InvalidRequest(
+                    format!("typestate protocol does not compile: {error}").into(),
+                )
+            })?;
+        let protocol_hash = StableDigest::parse(protocol.hash().to_string())
+            .expect("a protocol hash renders as lower-hex SHA-256");
+
+        // One request boundary around every analyzer read, for the same reason
+        // `semantic_relations` opens one: shared request memoization, and a
+        // tier report that is only truthful for work under an open scope.
+        let scope =
+            AnalyzerQueryScope::with_cancellation(self.analyzer.analyzer(), cancellation.token());
+        let project_root = self.analyzer.analyzer().project().root();
+        let seed_path = request.subject.acquisition.path.clone();
+        let file = ProjectFile::new(project_root.to_path_buf(), seed_path.as_str());
+        if self
+            .analyzer
+            .program_semantics_provider_for_file(&file)
+            .is_none()
+        {
+            return Ok(with_tiers(
+                make_outcome(
+                    None,
+                    ExtensionCompletion::Unsupported {
+                        capability: capability(operation),
+                    },
+                    &self.generation,
+                    &echoed,
+                    operation,
+                    stability,
+                    ExtensionWork::default(),
+                ),
+                &scope,
+            ));
+        }
+
+        let values = request.limits;
+        let mut budget_limits = SemanticBudget::default().limits();
+        budget_limits.source_bytes = usize::try_from(values.max_source_bytes).unwrap_or(usize::MAX);
+        let mut budget = SemanticBudget::new(budget_limits)
+            .expect("a validated source limit preserves positive semantic budget limits");
+        let materialized = {
+            let mut semantic_request = SemanticRequest::new(&mut budget, cancellation.token());
+            self.analyzer
+                .materialize_program_semantics(&file, &mut semantic_request)
+                .map_err(|error| ExtensionError::Execution(error.to_string().into_boxed_str()))?
+        };
+        let materialize_completion = semantic_completion(&materialized);
+        let source_bytes = materialized.work().source_bytes as u64;
+        let Some(artifact) = materialized.available_value() else {
+            return Ok(with_tiers(
+                make_outcome(
+                    None,
+                    materialize_completion,
+                    &self.generation,
+                    &echoed,
+                    operation,
+                    stability,
+                    ExtensionWork {
+                        source_bytes,
+                        ..Default::default()
+                    },
+                ),
+                &scope,
+            ));
+        };
+        let acquisition = &request.subject.acquisition;
+        let acquisition_start = u32::try_from(acquisition.start_utf8_byte).map_err(|_| {
+            ExtensionError::InvalidRequest("acquisition byte offset exceeds u32".into())
+        })?;
+        let procedure = artifact
+            .procedures()
+            .iter()
+            .filter(|procedure| {
+                let span = procedure.locator().anchor().span();
+                span.start_byte() <= acquisition_start && acquisition_start <= span.end_byte()
+            })
+            .min_by_key(|procedure| {
+                procedure.locator().anchor().span().end_byte()
+                    - procedure.locator().anchor().span().start_byte()
+            });
+        let Some(procedure) = procedure else {
+            return Ok(with_tiers(
+                make_outcome(
+                    None,
+                    ExtensionCompletion::Unknown,
+                    &self.generation,
+                    &echoed,
+                    operation,
+                    stability,
+                    ExtensionWork {
+                        source_bytes,
+                        ..Default::default()
+                    },
+                ),
+                &scope,
+            ));
+        };
+        let root = artifact
+            .procedure_handle(procedure.id())
+            .expect("a materialized artifact owns every procedure it lists");
+        let bindings = lower_typestate_bindings(&protocol, &request, procedure, &root)
+            .map_err(|error| ExtensionError::InvalidRequest(error.into()))?;
+
+        let solver_limits = clamp_solver_work(values.max_solver_steps);
+        let summaries = self.flow_state.typestate_summaries();
+        let summary_reads = SummaryReadRecorder::new(self.analyzer.analyzer());
+        let icfg = WorkspaceIcfgProvider::new(&self.analyzer);
+        let mut solver_budget = SolverBudget::new(solver_limits);
+        let mut dataflow_request = DataflowRequest::new(&mut solver_budget, cancellation.token());
+        let solved = solve_typestate_with_production_summaries(
+            summaries.as_ref(),
+            &summary_reads,
+            &root,
+            &[],
+            &icfg,
+            &icfg,
+            ProductionTypestateExecutionContext::Workspace,
+            &protocol,
+            &bindings,
+            &mut budget,
+            &mut dataflow_request,
+        )
+        .map_err(|error| ExtensionError::Execution(error.to_string().into_boxed_str()))?;
+
+        let mut boundaries: Vec<TypestateBoundary> = Vec::new();
+        match solved.result().result().termination() {
+            SolverTermination::FixedPoint => {}
+            SolverTermination::Cancelled => boundaries.push(TypestateBoundary {
+                kind: TypestateBoundaryKind::Cancelled,
+                message: "the typestate solver was cancelled".into(),
+                omitted: 0,
+            }),
+            SolverTermination::ExceededBudget(exceeded) => boundaries.push(TypestateBoundary {
+                kind: TypestateBoundaryKind::SolverWorkLimit,
+                message: exceeded.to_string().into_boxed_str(),
+                omitted: 0,
+            }),
+        }
+        if let SemanticInputStatus::ExceededBudget { exceeded } =
+            solved.result().result().coverage().semantic_status()
+        {
+            boundaries.push(TypestateBoundary {
+                kind: TypestateBoundaryKind::SemanticWorkLimit,
+                message: exceeded.to_string().into_boxed_str(),
+                omitted: 0,
+            });
+        }
+        let reached_rows = solved.result().result().reached().len() as u64;
+
+        let finding_limits = TypestateFindingLimits::with_witness_limits(
+            values.max_reached_rows as usize,
+            values.max_findings as usize,
+            WitnessReconstructionLimits::new(
+                values.max_witness_steps as usize,
+                values.max_witness_expansions as usize,
+            )
+            .expect("validated typestate witness limits are positive"),
+            values.max_total_witness_expansions as usize,
+            usize::try_from(values.max_witness_bytes).unwrap_or(usize::MAX),
+        )
+        .expect("validated typestate finding limits are within the engine bounds");
+        let report = collect_summary_findings_with_limits(
+            &protocol,
+            &bindings,
+            solved.result(),
+            finding_limits,
+            cancellation.token(),
+        )
+        .map_err(|error| ExtensionError::Execution(error.to_string().into_boxed_str()))?;
+
+        if report.omitted() > 0 {
+            boundaries.push(TypestateBoundary {
+                kind: TypestateBoundaryKind::FindingLimit,
+                message: "finding retention omitted at least one typestate finding".into(),
+                omitted: report.omitted() as u64,
+            });
+        }
+        if !report.analysis_complete() {
+            boundaries.push(TypestateBoundary {
+                kind: TypestateBoundaryKind::AnalysisIncomplete,
+                message: "typestate analysis retained incomplete semantic evidence".into(),
+                omitted: 0,
+            });
+        }
+
+        let mut findings = Vec::with_capacity(report.findings().len());
+        let mut omitted_witness_steps = 0_u64;
+        for finding in report.findings() {
+            let record = project_typestate_finding(&self.analyzer, &protocol, &bindings, finding)?;
+            omitted_witness_steps = omitted_witness_steps.saturating_add(
+                record
+                    .witnesses
+                    .iter()
+                    .map(|witness| witness.omitted_steps_lower_bound)
+                    .sum::<u64>(),
+            );
+            findings.push(record);
+        }
+        if omitted_witness_steps > 0 {
+            boundaries.push(TypestateBoundary {
+                kind: TypestateBoundaryKind::WitnessLimit,
+                message: "witness reconstruction omitted at least one step".into(),
+                omitted: omitted_witness_steps,
+            });
+        }
+
+        let cancelled = boundaries
+            .iter()
+            .any(|boundary| boundary.kind == TypestateBoundaryKind::Cancelled);
+        let budget_boundary = boundaries
+            .iter()
+            .find(|boundary| boundary.kind.is_budget())
+            .map(|boundary| boundary.kind);
+        let status = if cancelled {
+            SemanticRelationStatus::Cancelled
+        } else if budget_boundary.is_some() {
+            SemanticRelationStatus::BudgetBounded
+        } else if boundaries.is_empty() {
+            SemanticRelationStatus::Complete
+        } else {
+            SemanticRelationStatus::FrontierBounded
+        };
+        // A frontier-bounded typestate answer is `Unproven`, not
+        // `FrontierBounded`: the completion envelope's frontier kinds are the
+        // relation vocabulary, and this surface's frontier reasons are protocol
+        // reasons. Budget exhaustion stays actionable and names its dimension.
+        let completion = if cancelled {
+            ExtensionCompletion::Cancelled
+        } else if let Some(kind) = budget_boundary {
+            ExtensionCompletion::Truncated {
+                limit: kind.limit_label().into(),
+            }
+        } else if boundaries.is_empty() {
+            materialize_completion
+        } else {
+            ExtensionCompletion::Unproven
+        };
+        let snapshot = TypestateSnapshot::try_new(
+            self.generation.clone(),
+            request_digest,
+            protocol_hash,
+            status,
+            findings,
+            boundaries,
+        )
+        .map_err(|error| ExtensionError::Execution(error.to_string().into()))?;
+        let work = ExtensionWork {
+            result_items: snapshot.findings.len() as u64,
+            result_bytes: encode_typestate_snapshot_json(&snapshot)
+                .map(|bytes| bytes.len() as u64)
+                .unwrap_or(0),
+            semantic_nodes: reached_rows,
+            semantic_edges: bindings.event_bindings().len() as u64,
+            source_bytes,
+            traversal_steps: 0,
+        };
+        Ok(with_tiers(
+            make_outcome(
+                Some(snapshot),
+                completion,
+                &self.generation,
+                &echoed,
+                operation,
+                stability,
+                work,
+            ),
+            &scope,
+        ))
+    }
+}
+
+/// The per-dimension solver budget one typestate request buys.
+///
+/// A uniform caller value clamped elementwise to the engine's own limits, so a
+/// request can only ever narrow the bound. `a - (a - b)` under saturating
+/// subtraction is the elementwise minimum, which keeps the clamp total without
+/// a per-dimension setter the work vocabulary deliberately does not have.
+fn clamp_solver_work(max_solver_steps: u64) -> SolverWork {
+    let requested = SolverWork::uniform(usize::try_from(max_solver_steps).unwrap_or(usize::MAX));
+    let engine = SolverWork::default_limits();
+    engine.saturating_sub(engine.saturating_sub(requested))
+}
+
+/// Every call site one request span names, tightest match first.
+///
+/// One written call can lower to more than one semantic call site (a Java
+/// `finally` body lowers once per completion route), so this returns a set
+/// rather than a single site, and a caller's binding applies to all of them.
+/// The ranking prefers the smallest call that encloses the span, then the
+/// largest call the span itself encloses; nothing is matched by text.
+fn call_sites_for_span(
+    procedure: &ProcedureSemantics,
+    start: u32,
+    end: u32,
+) -> Vec<&SemanticCallSite> {
+    let bounds = |call: &SemanticCallSite| {
+        let span = procedure
+            .source_mapping(call.source)
+            .expect("a validated call site has a source mapping")
+            .locator
+            .anchor()
+            .span();
+        (span.start_byte(), span.end_byte())
+    };
+    let mut enclosing = procedure
+        .call_sites()
+        .iter()
+        .filter(|call| {
+            let (call_start, call_end) = bounds(call);
+            call_start <= start && end <= call_end
+        })
+        .collect::<Vec<_>>();
+    if !enclosing.is_empty() {
+        let tightest = enclosing
+            .iter()
+            .map(|call| {
+                let (call_start, call_end) = bounds(call);
+                call_end - call_start
+            })
+            .min()
+            .expect("a nonempty candidate set has a minimum width");
+        enclosing.retain(|call| {
+            let (call_start, call_end) = bounds(call);
+            call_end - call_start == tightest
+        });
+        return enclosing;
+    }
+    let mut enclosed = procedure
+        .call_sites()
+        .iter()
+        .filter(|call| {
+            let (call_start, call_end) = bounds(call);
+            start <= call_start && call_end <= end
+        })
+        .collect::<Vec<_>>();
+    if enclosed.is_empty() {
+        return enclosed;
+    }
+    let widest = enclosed
+        .iter()
+        .map(|call| {
+            let (call_start, call_end) = bounds(call);
+            call_end - call_start
+        })
+        .max()
+        .expect("a nonempty candidate set has a maximum width");
+    enclosed.retain(|call| {
+        let (call_start, call_end) = bounds(call);
+        call_end - call_start == widest
+    });
+    enclosed
+}
+
+/// The value one port names at one call site.
+fn port_value(call: &SemanticCallSite, port: TypestatePort) -> Option<ValueId> {
+    match port {
+        TypestatePort::Receiver => call.receiver,
+        TypestatePort::Argument { ordinal } => call
+            .arguments
+            .get(ordinal as usize)
+            .map(|argument| argument.value),
+        TypestatePort::NormalResult { ordinal } => call.normal_result(ordinal as usize),
+    }
+}
+
+const fn observation_role(role: TypestateRole) -> TypestateObjectRole {
+    match role {
+        TypestateRole::MatchedValue => TypestateObjectRole::MatchedValue,
+        TypestateRole::AllocationResult => TypestateObjectRole::AllocationResult,
+        TypestateRole::Receiver => TypestateObjectRole::Receiver,
+        TypestateRole::Argument => TypestateObjectRole::Argument,
+        TypestateRole::NormalReturn => TypestateObjectRole::NormalReturn,
+        TypestateRole::ExceptionalReturn => TypestateObjectRole::ExceptionalReturn,
+        TypestateRole::CurrentObject => TypestateObjectRole::CurrentObject,
+    }
+}
+
+/// Lower the caller's span-addressed bindings into one engine binding plan.
+///
+/// Every decision here is the caller's: the tracked object is the value the
+/// subject's own port names, each event observes exactly the sites its span
+/// resolves to, and terminals observe the root's own exits. Nothing is
+/// inferred, so this never introduces an observation the compiled protocol
+/// does not declare.
+fn lower_typestate_bindings(
+    protocol: &CompiledProtocol,
+    request: &TypestateRequest,
+    procedure: &ProcedureSemantics,
+    root: &ProcedureHandle,
+) -> Result<TypestateBindingPlan, String> {
+    let quality = TypestateBindingQuality::proven_unique();
+    let context = TypestateBindingContext::root();
+    let span_bounds = |span: &SourceSpan| -> Result<(u32, u32), String> {
+        let start = u32::try_from(span.start_utf8_byte)
+            .map_err(|_| "a source span byte offset exceeds u32".to_string())?;
+        let end = u32::try_from(span.end_utf8_byte)
+            .map_err(|_| "a source span byte offset exceeds u32".to_string())?;
+        Ok((start, end))
+    };
+
+    let (start, end) = span_bounds(&request.subject.acquisition)?;
+    let acquisitions = call_sites_for_span(procedure, start, end);
+    let [acquisition] = acquisitions.as_slice() else {
+        return Err(format!(
+            "the typestate subject span names {} call sites; it must name exactly one",
+            acquisitions.len()
+        ));
+    };
+    let value = port_value(acquisition, request.subject.port).ok_or_else(|| {
+        format!(
+            "the typestate subject port {:?} names no value at its acquisition call",
+            request.subject.port
+        )
+    })?;
+    let object =
+        AbstractObject::new(
+            AccessPathRoot::Value(root.value_handle(value).ok_or_else(|| {
+                "the subject value is not scoped to the analysis root".to_string()
+            })?),
+            ObjectCardinality::Singleton,
+        )
+        .map_err(|error| format!("the typestate subject is not a tracked object: {error}"))?;
+    let class = TypestateSubjectClassKey::new(request.subject.class.as_ref())
+        .map_err(|error| format!("invalid typestate subject class: {error}"))?;
+    let subject_key = TypestateSubjectKey::for_object(class.clone(), &object);
+
+    let point_site = |id| {
+        TypestateObservationSite::program_point(
+            root.point_handle(id)
+                .expect("a materialized procedure owns its own program points"),
+            context.clone(),
+        )
+    };
+    let site_for = |site: &TypestateSite| -> Result<Vec<TypestateObservationSite>, String> {
+        Ok(match site {
+            TypestateSite::ProcedureEntry => vec![point_site(procedure.entry_point())],
+            TypestateSite::NormalExit => vec![point_site(procedure.normal_exit_point())],
+            TypestateSite::ExceptionalExit => vec![point_site(procedure.exceptional_exit_point())],
+            TypestateSite::Call { span, .. } => {
+                let (start, end) = span_bounds(span)?;
+                let calls = call_sites_for_span(procedure, start, end);
+                if calls.is_empty() {
+                    return Err(format!(
+                        "no call site in the analysis root covers bytes {}..{} of {}",
+                        span.start_utf8_byte,
+                        span.end_utf8_byte,
+                        span.path.as_str()
+                    ));
+                }
+                calls
+                    .into_iter()
+                    .map(|call| {
+                        TypestateObservationSite::call_site(
+                            root.call_site_handle(call.id)
+                                .expect("a materialized procedure owns its own call sites"),
+                            context.clone(),
+                        )
+                    })
+                    .collect()
+            }
+        })
+    };
+
+    let seeds = vec![TypestateInitialSeedSpec::new(
+        subject_key.clone(),
+        ProtocolStateKey::new(request.subject.initial_state.as_ref())
+            .map_err(|error| format!("invalid typestate initial state: {error}"))?,
+        point_site(procedure.entry_point()),
+        TypestateObjectRole::MatchedValue,
+        quality.clone(),
+    )];
+
+    let mut events = Vec::new();
+    for binding in &request.events {
+        let key = ProtocolEventKey::new(binding.event.as_ref())
+            .map_err(|error| format!("invalid typestate event key: {error}"))?;
+        for site in site_for(&binding.site)? {
+            events.push(TypestateEventBindingSpec::new(
+                key.clone(),
+                subject_key.clone(),
+                site,
+                binding.order,
+                observation_role(binding.role),
+                quality.clone(),
+            ));
+        }
+    }
+
+    let mut terminals = Vec::new();
+    for binding in &request.terminals {
+        let key = ProtocolExpectationKey::new(binding.expectation.as_ref())
+            .map_err(|error| format!("invalid typestate expectation key: {error}"))?;
+        let point = match binding.exit {
+            TypestateExit::Normal => procedure.normal_exit_point(),
+            TypestateExit::Exceptional => procedure.exceptional_exit_point(),
+        };
+        terminals.push(TypestateTerminalBindingSpec::new(
+            key,
+            subject_key.clone(),
+            point_site(point),
+            TypestateObjectRole::CurrentObject,
+            quality.clone(),
+        ));
+    }
+
+    TypestateBindingPlan::try_new(
+        protocol,
+        vec![BoundTypestateSubjectSpec::new(class, object, quality)],
+        seeds,
+        events,
+        terminals,
+    )
+    .map_err(|error| format!("the typestate bindings do not form a plan: {error:?}"))
+}
+
+/// The workspace-relative, slash-normalized span one semantic locator denotes.
+fn locator_span(
+    analyzer: &WorkspaceAnalyzer,
+    locator: &SemanticLocator,
+) -> Result<SourceSpan, ExtensionError> {
+    let root = analyzer.analyzer().project().root();
+    let file = ProjectFile::new(root.to_path_buf(), locator.path().as_str());
+    let rel_path = brokk_bifrost_analysis::path_utils::rel_path_string(&file);
+    let span = locator.anchor().span();
+    Ok(SourceSpan {
+        path: NormalizedRelativePath::new(&rel_path)
+            .map_err(|error| ExtensionError::Execution(error.to_string().into_boxed_str()))?,
+        start_utf8_byte: span.start_byte() as u64,
+        end_utf8_byte: span.end_byte() as u64,
+    })
+}
+
+fn point_span(
+    analyzer: &WorkspaceAnalyzer,
+    handle: &ProgramPointHandle,
+) -> Result<SourceSpan, ExtensionError> {
+    let semantics = handle.procedure().semantics();
+    let point = semantics
+        .point(handle.id())
+        .expect("a validated witness point resolves in its own procedure");
+    let locator = &semantics
+        .source_mapping(point.source)
+        .expect("a validated witness point has a source mapping")
+        .locator;
+    locator_span(analyzer, locator)
+}
+
+/// Project one engine finding onto the wire, keeping every state, event, and
+/// expectation as the caller's own key rather than a dense engine id.
+fn project_typestate_finding(
+    analyzer: &WorkspaceAnalyzer,
+    protocol: &CompiledProtocol,
+    bindings: &TypestateBindingPlan,
+    finding: &TypestateFinding,
+) -> Result<TypestateFindingRecord, ExtensionError> {
+    let subject = bindings
+        .subject(finding.subject())
+        .expect("a validated finding subject resolves in its binding plan");
+    let state_key = |state| {
+        protocol
+            .state_key(state)
+            .expect("a validated finding state resolves")
+            .to_string()
+            .into_boxed_str()
+    };
+    let kind = match finding.kind() {
+        TypestateFindingKind::ErrorTransition {
+            event, from, to, ..
+        } => WireTypestateFindingKind::ErrorTransition {
+            event: protocol
+                .event(*event)
+                .expect("a validated finding event resolves")
+                .key()
+                .to_string()
+                .into_boxed_str(),
+            from_state: state_key(*from),
+            to_state: state_key(*to),
+        },
+        TypestateFindingKind::TerminalExpectation {
+            expectation,
+            actual_states,
+            ..
+        } => WireTypestateFindingKind::TerminalExpectation {
+            expectation: protocol
+                .terminal_expectation(*expectation)
+                .expect("a validated finding expectation resolves")
+                .key()
+                .to_string()
+                .into_boxed_str(),
+            actual_states: actual_states
+                .iter()
+                .map(|state| state_key(*state))
+                .collect(),
+        },
+    };
+    let evidence = finding.evidence();
+    let mut witnesses = Vec::with_capacity(finding.witnesses().len());
+    for finding_witness in finding.witnesses() {
+        let witness = finding_witness.witness();
+        let mut steps = Vec::with_capacity(witness.step_count());
+        for step in witness.steps() {
+            steps.push(TypestateWitnessStep {
+                kind: match step.kind() {
+                    SummaryWitnessStepKind::Seed => TypestateWitnessStepKind::Seed,
+                    SummaryWitnessStepKind::Edge(kind) => TypestateWitnessStepKind::Edge {
+                        edge_kind: kind.label().into(),
+                    },
+                    SummaryWitnessStepKind::EndSummaryGap(kind) => {
+                        TypestateWitnessStepKind::EndSummaryGap {
+                            return_kind: match kind {
+                                ReturnTransferKind::Normal => TypestateReturnKind::Normal,
+                                ReturnTransferKind::Exceptional => TypestateReturnKind::Exceptional,
+                            },
+                        }
+                    }
+                },
+                source: point_span(analyzer, step.source())?,
+                target: step
+                    .target()
+                    .map(|target| point_span(analyzer, target))
+                    .transpose()?,
+                proof: match step.proof() {
+                    ProofStatus::Proven => SemanticProof::Proven,
+                    ProofStatus::Unproven(reason) => SemanticProof::Unproven {
+                        reason: reason.clone(),
+                    },
+                },
+                completeness: match step.completeness() {
+                    EvidenceCompleteness::Complete => SemanticRelationCompleteness::Complete,
+                    EvidenceCompleteness::Partial(reason) => {
+                        SemanticRelationCompleteness::Partial {
+                            reason: reason.clone(),
+                        }
+                    }
+                },
+            });
+        }
+        witnesses.push(TypestateWitnessRecord {
+            observed_state: finding_witness
+                .observed_state()
+                .and_then(|state| protocol.state_key(state))
+                .map(|state| state.to_string().into_boxed_str()),
+            steps: steps.into_boxed_slice(),
+            truncated: witness.truncated(),
+            omitted_steps_lower_bound: witness.omitted_steps_lower_bound() as u64,
+        });
+    }
+    Ok(TypestateFindingRecord {
+        subject: TypestateSubjectIdentity {
+            class: subject.key().class().as_str().into(),
+            identity: subject.key().public_canonical_rendering().into_boxed_str(),
+        },
+        site: locator_span(analyzer, finding.site())?,
+        kind,
+        certainty: match finding.certainty() {
+            TypestateFindingCertainty::May => TypestateCertainty::May,
+            TypestateFindingCertainty::Must => TypestateCertainty::Must,
+            TypestateFindingCertainty::Inconclusive => TypestateCertainty::Inconclusive,
+        },
+        evidence: TypestateEvidence {
+            path_proven: evidence.path_proven(),
+            path_complete: evidence.path_complete(),
+            analysis_complete: evidence.analysis_complete(),
+            uncertainty: [
+                (
+                    TypestateUncertainty::AmbiguousDispatch,
+                    TypestateUncertaintyKind::AmbiguousDispatch,
+                ),
+                (
+                    TypestateUncertainty::UnknownCall,
+                    TypestateUncertaintyKind::UnknownCall,
+                ),
+                (
+                    TypestateUncertainty::ExternalCall,
+                    TypestateUncertaintyKind::ExternalCall,
+                ),
+                (
+                    TypestateUncertainty::Escape,
+                    TypestateUncertaintyKind::Escape,
+                ),
+                (
+                    TypestateUncertainty::IncompleteAnalysis,
+                    TypestateUncertaintyKind::IncompleteAnalysis,
+                ),
+                (
+                    TypestateUncertainty::UnmatchedEvent,
+                    TypestateUncertaintyKind::UnmatchedEvent,
+                ),
+            ]
+            .into_iter()
+            .filter_map(|(internal, wire)| {
+                evidence.uncertainty().contains(internal).then_some(wire)
+            })
+            .collect(),
+            abstained: evidence.abstained(),
+        },
+        witnesses: witnesses.into_boxed_slice(),
+        omitted_witnesses: finding.omitted_witnesses() as u64,
+    })
 }
 
 /// The caller-supplied dimensions one derivation exhausted, in the order it hit

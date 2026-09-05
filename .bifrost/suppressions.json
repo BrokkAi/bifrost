@@ -399,7 +399,7 @@
     },
     {
       "policy_id": "bifrost.performance.sleep-in-loop",
-      "finding_id": "9023637d55d7e09c98553086297431bfe8d433fb5fd2b4d08207bcb165ff9757",
+      "finding_id": "3c0df64c7b8ae16318ca159eafe9d5737bf0604c744cb0cdedbd58dae700aa3f",
       "path": "crates/bifrost-analysis/src/analyzer/store/mod.rs",
       "identity_stability": "strong",
       "status": "accepted",

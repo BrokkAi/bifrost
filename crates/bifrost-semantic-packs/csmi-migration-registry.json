@@ -1745,6 +1745,39 @@
       "classification": "not_a_semantic_model",
       "generation_strategy": "retain_native_artifact",
       "native_source_kind": "documentation",
+      "path": "semantic-packs/php/README.md",
+      "profiles": [],
+      "reason": "Documentation describes or governs native pack authoring; it is not a semantic model."
+    },
+    {
+      "asset_role": "license_notice",
+      "audit_status": "not_applicable",
+      "blockers": [],
+      "classification": "not_a_semantic_model",
+      "generation_strategy": "retain_native_artifact",
+      "native_source_kind": "license_notice",
+      "path": "semantic-packs/php/notices/phpstorm-stubs-2026.8.29.txt",
+      "profiles": [],
+      "reason": "License or notice text is provenance material, not a semantic model."
+    },
+    {
+      "asset_role": "artifact_descriptor",
+      "audit_status": "not_applicable",
+      "blockers": [],
+      "classification": "not_a_semantic_model",
+      "generation_strategy": "retain_native_artifact",
+      "native_source_kind": "artifact_descriptor",
+      "path": "semantic-packs/php/phpstorm-stubs-2026.8.29.json",
+      "profiles": [],
+      "reason": "Artifact acquisition and extraction instructions are inputs to model generation, not semantic model facts."
+    },
+    {
+      "asset_role": "documentation",
+      "audit_status": "not_applicable",
+      "blockers": [],
+      "classification": "not_a_semantic_model",
+      "generation_strategy": "retain_native_artifact",
+      "native_source_kind": "documentation",
       "path": "semantic-packs/python/README.md",
       "profiles": [],
       "reason": "Documentation describes or governs native pack authoring; it is not a semantic model."

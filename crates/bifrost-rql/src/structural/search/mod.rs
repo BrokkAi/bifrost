@@ -166,6 +166,23 @@ mod units;
 mod value_flow;
 mod witness_projection;
 
+#[derive(Clone)]
+struct SemanticFlowResources {
+    summaries: Arc<brokk_bifrost_flow::dataflow::ProductionSemanticSummaryRepository>,
+    value_flow_cache: brokk_bifrost_flow::value_flow::ValueFlowCache,
+    type_flow_summaries: brokk_bifrost_flow::type_flow::TypeFlowSummaryState,
+}
+
+impl SemanticFlowResources {
+    fn from_workspace_state(state: &brokk_bifrost_flow::FlowWorkspaceState) -> Self {
+        Self {
+            summaries: state.semantic_summaries(),
+            value_flow_cache: state.value_flow_cache(),
+            type_flow_summaries: state.type_flow_summaries(),
+        }
+    }
+}
+
 /// Deterministic work counters for one reusable row-family session.
 ///
 /// These counters describe producer construction and reuse, not query budget
@@ -2379,7 +2396,7 @@ pub fn execute_workspace_with_limits(
         workspace.analyzer(),
         token,
         Some(workspace),
-        Some(flow_state.semantic_summaries()),
+        Some(SemanticFlowResources::from_workspace_state(flow_state)),
         None,
         0,
         query,
@@ -2641,8 +2658,7 @@ fn execute_request_internal(
     } else {
         None
     };
-    let semantic_summaries =
-        flow_state.map(brokk_bifrost_flow::FlowWorkspaceState::semantic_summaries);
+    let semantic_flow_resources = flow_state.map(SemanticFlowResources::from_workspace_state);
     let workspace_generation = registrations.map_or(0, |(generation, _, _, _)| generation);
     match query.execution_mode {
         CodeQueryExecutionMode::Results => {
@@ -2650,7 +2666,7 @@ fn execute_request_internal(
                 analyzer,
                 token,
                 workspace,
-                semantic_summaries.clone(),
+                semantic_flow_resources.clone(),
                 analysis_context.as_ref(),
                 workspace_generation,
                 query,
@@ -2685,7 +2701,7 @@ fn execute_request_internal(
                 analyzer,
                 token,
                 workspace,
-                semantic_summaries,
+                semantic_flow_resources,
                 analysis_context.as_ref(),
                 workspace_generation,
                 query,
@@ -3169,9 +3185,7 @@ fn execute_internal_with_analysis(
     analyzer: &dyn IAnalyzer,
     token: QueryToken<'_>,
     workspace: Option<&WorkspaceAnalyzer>,
-    semantic_summaries: Option<
-        Arc<brokk_bifrost_flow::dataflow::ProductionSemanticSummaryRepository>,
-    >,
+    semantic_flow_resources: Option<SemanticFlowResources>,
     analysis_context: Option<&QueryAnalysisContext>,
     workspace_generation: u64,
     query: &CodeQuery,
@@ -3184,7 +3198,7 @@ fn execute_internal_with_analysis(
         analyzer,
         token,
         workspace,
-        semantic_summaries,
+        semantic_flow_resources,
         analysis_context,
         workspace_generation,
         query,
@@ -3255,9 +3269,7 @@ fn execute_internal_with_analysis_strategy(
     analyzer: &dyn IAnalyzer,
     token: QueryToken<'_>,
     workspace: Option<&WorkspaceAnalyzer>,
-    semantic_summaries: Option<
-        Arc<brokk_bifrost_flow::dataflow::ProductionSemanticSummaryRepository>,
-    >,
+    semantic_flow_resources: Option<SemanticFlowResources>,
     analysis_context: Option<&QueryAnalysisContext>,
     workspace_generation: u64,
     query: &CodeQuery,
@@ -3278,7 +3290,7 @@ fn execute_internal_with_analysis_strategy(
         analyzer,
         token,
         workspace,
-        semantic_summaries,
+        semantic_flow_resources,
         analysis_context,
         workspace_generation,
         query,
@@ -3303,9 +3315,7 @@ fn execute_internal_with_analysis_strategy_and_row_family_session(
     analyzer: &dyn IAnalyzer,
     token: QueryToken<'_>,
     workspace: Option<&WorkspaceAnalyzer>,
-    semantic_summaries: Option<
-        Arc<brokk_bifrost_flow::dataflow::ProductionSemanticSummaryRepository>,
-    >,
+    semantic_flow_resources: Option<SemanticFlowResources>,
     analysis_context: Option<&QueryAnalysisContext>,
     workspace_generation: u64,
     query: &CodeQuery,
@@ -3323,6 +3333,15 @@ fn execute_internal_with_analysis_strategy_and_row_family_session(
     scope: CodeQueryExecutionScope<'_>,
     mut row_keys_out: Option<&mut Vec<UnitRowKey>>,
 ) -> DetailedCodeQueryResult {
+    let semantic_summaries = semantic_flow_resources
+        .as_ref()
+        .map(|resources| Arc::clone(&resources.summaries));
+    let value_flow_cache = semantic_flow_resources
+        .as_ref()
+        .map(|resources| resources.value_flow_cache.clone());
+    let type_flow_summaries = semantic_flow_resources
+        .as_ref()
+        .map(|resources| resources.type_flow_summaries.clone());
     let active_semantic_model_snapshot = analyzer.active_semantic_model_snapshot();
     // Keep every resolver read in this query on the same semantic-model
     // publication. Passing `None` deliberately freezes the absence so a pack
@@ -3446,6 +3465,8 @@ fn execute_internal_with_analysis_strategy_and_row_family_session(
                     analysis_context,
                     active_semantic_model_snapshot,
                     semantic_summaries.clone(),
+                    value_flow_cache.clone(),
+                    type_flow_summaries.clone(),
                     &continuation.parent_scope,
                     continuation.child_semantic_limits,
                     continuation.execution_before,
@@ -3463,6 +3484,8 @@ fn execute_internal_with_analysis_strategy_and_row_family_session(
                     analysis_context,
                     active_semantic_model_snapshot,
                     semantic_summaries,
+                    value_flow_cache,
+                    type_flow_summaries,
                 ),
             }
         }),

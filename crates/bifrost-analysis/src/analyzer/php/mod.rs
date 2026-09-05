@@ -14,6 +14,7 @@ mod clones;
 pub mod dependency_discovery;
 pub(crate) mod diagnostics;
 mod external;
+mod imports;
 mod semantic;
 mod source_artifact;
 mod structural;
@@ -22,7 +23,8 @@ pub use dependency_discovery::{
     PHP_MAX_AUTOLOAD_RULES_PER_PACKAGE, resolve_php_semantic_pack_dependencies,
 };
 pub use external::{
-    ComposerPackagePackProducer, ComposerPinnedAutoloadRule, PhpDependencyPackAdapter,
+    ComposerPackagePackProducer, ComposerPinnedAutoloadRule, PhpDeclarationStubPackProducer,
+    PhpDependencyPackAdapter,
 };
 
 use crate::analyzer::QueryToken;
@@ -47,14 +49,16 @@ use crate::analyzer::usages::php_graph::{
     build_php_usage_edges, build_rooted_php_usage_edges, dead_code_bulk_eligibility,
 };
 use crate::analyzer::usages::workspace_graph::UsageEcosystem;
-use crate::analyzer::weighted_cache::{build_weighted_cache, weight_code_unit_vec_by_unit};
+use crate::analyzer::weighted_cache::{
+    build_weighted_cache, weight_code_unit_set, weight_code_unit_vec_by_unit,
+};
 use crate::analyzer::{
     AnalyzerConfig, AnalyzerStoreContext, BuildProgress, CodeUnit, DescendantIndexScope,
     DescendantIndexVariant, DirectDescendantIndex, ForwardQueryProvider, IAnalyzer,
-    KeyedPoolSafeMemo, Language, Project, ProjectFile, Range, SignatureMetadata,
-    TestAssertionSmell, TestAssertionWeights, TestDetectionProvider, TreeSitterAnalyzer,
-    TypeHierarchyProvider, build_direct_descendant_index, descendants_from_variant_index,
-    resolve_analyzer,
+    ImportAnalysisProvider, KeyedPoolSafeMemo, Language, PoolSafeMemo, Project, ProjectFile, Range,
+    SignatureMetadata, TestAssertionSmell, TestAssertionWeights, TestDetectionProvider,
+    TreeSitterAnalyzer, TypeHierarchyProvider, build_direct_descendant_index,
+    descendants_from_variant_index, resolve_analyzer,
 };
 use crate::hash::{HashMap, HashSet};
 use crate::{CloneSmell, CloneSmellWeights};
@@ -63,13 +67,13 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 pub(crate) use adapter::PhpAdapter;
+pub(crate) use source_artifact::PHP_GLOBAL_NAMESPACE;
 // The parked bounded-definition route (`usages/get_definition/php.rs`) resolves
 // these through the module, so the chain now runs crate -> shim -> parked file
 // rather than the other way around.
 pub(crate) use brokk_bifrost_php::aliases::{
-    PhpDeclaredType, php_dynamic_type_keyword_node, php_file_context_from_tree_at,
-    resolve_php_constant_node, resolve_php_function_node, resolve_php_type_node,
-    resolve_php_type_node_arms,
+    PhpDeclaredType, php_dynamic_type_keyword_node, resolve_php_constant_node,
+    resolve_php_function_node, resolve_php_type_node, resolve_php_type_node_arms,
 };
 // PHP's four public alias names keep their historical `crate::analyzer::` paths
 // even though they now live in `brokk-bifrost-php` -- the `brokk_bifrost_go::packages`
@@ -100,6 +104,16 @@ pub struct PhpAnalyzer {
     /// most, because the exclusion verdict is a pure function of the analyzer
     /// and the file.
     direct_descendant_index: Arc<KeyedPoolSafeMemo<DescendantIndexVariant, DirectDescendantIndex>>,
+    /// The declarations of other files that one file's persisted import names
+    /// resolve to, keyed by file because the persisted names are. An entry
+    /// depends on the whole workspace's declarations, not only on its own
+    /// file's blob, so both cells are built fresh by `update` rather than
+    /// invalidated per changed file -- the same lifetime `direct_ancestors`
+    /// has.
+    imported_code_units: Cache<ProjectFile, Arc<HashSet<CodeUnit>>>,
+    /// Which files import each file, inverted from `imported_code_units` over
+    /// the whole workspace in one pass.
+    reverse_import_index: Arc<PoolSafeMemo<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>>,
     composer_autoload: Arc<PhpComposerAutoload>,
 }
 
@@ -154,6 +168,8 @@ impl PhpAnalyzer {
             memo_budget,
             direct_ancestors: build_weighted_cache(memo_budget / 8, weight_code_unit_vec_by_unit),
             direct_descendant_index: Arc::new(KeyedPoolSafeMemo::new()),
+            imported_code_units: build_weighted_cache(memo_budget / 8, weight_code_unit_set),
+            reverse_import_index: Arc::new(PoolSafeMemo::new()),
             composer_autoload,
         }
     }
@@ -620,6 +636,10 @@ impl IAnalyzer for PhpAnalyzer {
     }
 
     fn type_hierarchy_provider(&self) -> Option<&dyn TypeHierarchyProvider> {
+        Some(self)
+    }
+
+    fn import_analysis_provider(&self) -> Option<&dyn ImportAnalysisProvider> {
         Some(self)
     }
 

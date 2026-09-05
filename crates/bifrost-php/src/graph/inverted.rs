@@ -33,16 +33,16 @@ use super::resolver::node_text;
 use super::syntax::{
     assignment_value_type_fq_name, captured_local_scope_bindings, declared_instance_callable,
     declared_instance_field, direct_variable_receiver_type_fq_names,
-    instance_receiver_type_fq_name, is_local_scope, object_creation_type, seed_assignment_binding,
-    seed_parameter_types, static_member_parts, static_scope_type_fq_name, variable_identifier,
+    instance_receiver_type_fq_name, instanceof_type_node, is_local_scope, object_creation_type,
+    seed_assignment_binding, seed_parameter_types, static_member_parts, static_scope_type_fq_name,
+    variable_identifier,
 };
 use crate::aliases::{
-    PhpCallableCandidates, PhpFileContext, resolve_php_constant, resolve_php_function,
+    PhpCallableCandidates, PhpFileContextIndex, resolve_php_constant, resolve_php_function,
     resolve_php_type_arms,
 };
 use crate::graph::PhpGraphSource;
 use crate::graph_support::PhpSource;
-use crate::graph_support::php_file_context_from_source;
 use brokk_bifrost_core::analyzer::usages::inverted_edges::{
     ClassRangeIndex, FileEdgeScanInput, PerFileEdges, classify_reference_node,
 };
@@ -65,11 +65,13 @@ pub fn scan_php_file(
     file: &ProjectFile,
     input: &FileEdgeScanInput<'_>,
 ) -> PerFileEdges {
-    let ctx = php_file_context_from_source(php, file, input.source);
+    let Some(contexts) = PhpFileContextIndex::from_tree(input.root(), input.source, || true) else {
+        return PerFileEdges::default();
+    };
     let mut scan = PhpScan {
         analyzer,
         php,
-        ctx,
+        contexts,
         source: input.source,
         class_ranges: ClassRangeIndex::build(analyzer.index, file),
         input,
@@ -83,7 +85,7 @@ pub fn scan_php_file(
 struct PhpScan<'a> {
     analyzer: PhpGraphSource<'a>,
     php: &'a dyn PhpSource,
-    ctx: PhpFileContext,
+    contexts: PhpFileContextIndex,
     source: &'a str,
     class_ranges: ClassRangeIndex,
     input: &'a FileEdgeScanInput<'a>,
@@ -95,8 +97,8 @@ impl PhpScan<'_> {
     /// one owner per edge, so a multi-arm answer fails closed when it is read;
     /// seeding the whole set keeps this surface's interpretation identical to
     /// the forward one.
-    fn resolve_type_arm_fqns(&self, text: &str) -> Vec<String> {
-        resolve_php_type_arms(text, &self.ctx)
+    fn resolve_type_arm_fqns(&self, text: &str, byte: usize) -> Vec<String> {
+        resolve_php_type_arms(text, self.contexts.context_at(byte))
     }
 
     fn resolve_type_reference_fqn(&self, node: Node<'_>) -> Option<String> {
@@ -104,7 +106,7 @@ impl PhpScan<'_> {
             self.php,
             self.analyzer,
             node_text(node, self.source),
-            &self.ctx,
+            self.contexts.context_at(node.start_byte()),
             self.enclosing_class(node.start_byte()),
         )
     }
@@ -193,8 +195,10 @@ fn record_reference(
         "function_call_expression" => {
             if let Some(name_node) = node.child_by_field_name("function")
                 && matches!(name_node.kind(), "name" | "qualified_name")
-                && let Some(candidates) =
-                    resolve_php_function(node_text(name_node, scan.source), &scan.ctx)
+                && let Some(candidates) = resolve_php_function(
+                    node_text(name_node, scan.source),
+                    scan.contexts.context_at(name_node.start_byte()),
+                )
             {
                 let fqn = scan.bound_callable(&candidates);
                 scan.record(fqn, name_node);
@@ -365,8 +369,10 @@ fn record_reference(
             {
                 scan.record(fqn, node);
             } else if is_bare_constant_reference(node)
-                && let Some(candidates) =
-                    resolve_php_constant(node_text(node, scan.source), &scan.ctx)
+                && let Some(candidates) = resolve_php_constant(
+                    node_text(node, scan.source),
+                    scan.contexts.context_at(node.start_byte()),
+                )
             {
                 let fqn = scan.bound_callable(&candidates);
                 scan.record(fqn, node);
@@ -384,7 +390,7 @@ fn scope_class_fqn(scope: Node<'_>, scan: &PhpScan<'_>) -> Option<String> {
         scan.php,
         scan.analyzer,
         text,
-        &scan.ctx,
+        scan.contexts.context_at(scope.start_byte()),
         scan.enclosing_class(scope.start_byte()),
     )
 }
@@ -402,7 +408,7 @@ fn receiver_type_fqn(
         scan.analyzer,
         object,
         scan.source,
-        &scan.ctx,
+        scan.contexts.context_at(object.start_byte()),
         bindings,
         |start, _end| scan.enclosing_class(start).map(str::to_string),
     )
@@ -454,13 +460,13 @@ fn seed_parameters(
                 scan.php,
                 scan.analyzer,
                 raw,
-                &scan.ctx,
+                scan.contexts.context_at(node.start_byte()),
                 scan.enclosing_class(node.start_byte()),
             )
             .into_iter()
             .collect()
         } else {
-            scan.resolve_type_arm_fqns(raw)
+            scan.resolve_type_arm_fqns(raw, node.start_byte())
         }
     });
 }
@@ -479,7 +485,7 @@ fn seed_assignment(
             scan.analyzer,
             right,
             scan.source,
-            &scan.ctx,
+            scan.contexts.context_at(right.start_byte()),
             bindings,
             |start, _end| scan.enclosing_class(start).map(str::to_string),
         )
@@ -494,14 +500,9 @@ fn is_in_object_creation(node: Node<'_>) -> bool {
 }
 
 fn is_instanceof_type_name(node: Node<'_>) -> bool {
-    let Some(parent) = node.parent() else {
-        return false;
-    };
-    parent.kind() == "binary_expression"
-        && parent
-            .child_by_field_name("operator")
-            .is_some_and(|operator| operator.kind() == "instanceof")
-        && parent.child_by_field_name("right").is_some_and(|right| {
+    node.parent()
+        .and_then(instanceof_type_node)
+        .is_some_and(|right| {
             right.start_byte() <= node.start_byte() && node.end_byte() <= right.end_byte()
         })
 }

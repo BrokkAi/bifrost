@@ -176,6 +176,71 @@ pub struct SummaryIncomingCall {
     witness_owner: Option<Arc<()>>,
 }
 
+/// One witness-independent transfer from a caller entry to an exact callee entry.
+///
+/// Unlike [`SummaryIncomingCall`], this row is retained even when witness
+/// retention is disabled. It is result topology rather than evidence: clients
+/// can use it to relate callee-relative observations back to the caller entry
+/// whose call produced the callee fact without paying for witness storage.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SummaryEntryTransfer {
+    source: SummaryEntry,
+    target: SummaryEntry,
+    call_point: ProgramPointHandle,
+    call_fact: FactId,
+    origin: CallSiteHandle,
+    path_qualities: PathQualityFrontier,
+}
+
+impl SummaryEntryTransfer {
+    pub(crate) fn new(
+        source: SummaryEntry,
+        target: SummaryEntry,
+        call_point: ProgramPointHandle,
+        call_fact: FactId,
+        origin: CallSiteHandle,
+        path_qualities: PathQualityFrontier,
+    ) -> Self {
+        debug_assert_eq!(
+            source.procedure(),
+            call_point.procedure(),
+            "an entry transfer call point must belong to its source procedure"
+        );
+        Self {
+            source,
+            target,
+            call_point,
+            call_fact,
+            origin,
+            path_qualities,
+        }
+    }
+
+    pub const fn source(&self) -> &SummaryEntry {
+        &self.source
+    }
+
+    pub const fn target(&self) -> &SummaryEntry {
+        &self.target
+    }
+
+    pub const fn call_point(&self) -> &ProgramPointHandle {
+        &self.call_point
+    }
+
+    pub const fn call_fact(&self) -> FactId {
+        self.call_fact
+    }
+
+    pub const fn origin(&self) -> &CallSiteHandle {
+        &self.origin
+    }
+
+    pub const fn path_qualities(&self) -> PathQualityFrontier {
+        self.path_qualities
+    }
+}
+
 impl PartialEq for SummaryIncomingCall {
     fn eq(&self, other: &Self) -> bool {
         self.callee == other.callee
@@ -685,6 +750,7 @@ pub struct SummaryDataflowResult<Fact> {
     facts: Box<[Fact]>,
     reached: Box<[SummaryReachedFact]>,
     end_summaries: Box<[TabulationEndSummary]>,
+    entry_transfers: Box<[SummaryEntryTransfer]>,
     incoming_calls: Box<[SummaryIncomingCall]>,
     coverage: SummaryCoverage,
     termination: SolverTermination,
@@ -701,6 +767,7 @@ impl<Fact> SummaryDataflowResult<Fact> {
         facts: Vec<Fact>,
         mut reached: Vec<SummaryReachedFact>,
         mut end_summaries: Vec<TabulationEndSummary>,
+        mut entry_transfers: Vec<SummaryEntryTransfer>,
         mut incoming_calls: Vec<SummaryIncomingCall>,
         coverage: SummaryCoverage,
         termination: SolverTermination,
@@ -714,6 +781,8 @@ impl<Fact> SummaryDataflowResult<Fact> {
         reached.dedup();
         end_summaries.sort_by(compare_end_summaries);
         end_summaries.dedup();
+        entry_transfers.sort_by(compare_entry_transfers);
+        entry_transfers.dedup();
         incoming_calls.sort_by(compare_incoming_calls);
         incoming_calls.dedup();
 
@@ -721,6 +790,7 @@ impl<Fact> SummaryDataflowResult<Fact> {
             facts: facts.into_boxed_slice(),
             reached: reached.into_boxed_slice(),
             end_summaries: end_summaries.into_boxed_slice(),
+            entry_transfers: entry_transfers.into_boxed_slice(),
             incoming_calls: incoming_calls.into_boxed_slice(),
             coverage,
             termination,
@@ -746,6 +816,15 @@ impl<Fact> SummaryDataflowResult<Fact> {
 
     pub fn end_summaries(&self) -> &[TabulationEndSummary] {
         &self.end_summaries
+    }
+
+    /// Every exact caller-entry to callee-entry transfer, in deterministic order.
+    ///
+    /// These rows are retained independently of witnesses. A witness-disabled
+    /// solve therefore exposes call topology here while continuing to expose no
+    /// [`SummaryIncomingCall`] rows.
+    pub fn entry_transfers(&self) -> &[SummaryEntryTransfer] {
+        &self.entry_transfers
     }
 
     /// Every call that produced a callee entry fact, in deterministic order.
@@ -798,6 +877,7 @@ impl<Fact> SummaryDataflowResult<Fact> {
             .saturating_add(size_of_val(self.facts()))
             .saturating_add(size_of_val(self.reached()))
             .saturating_add(size_of_val(self.end_summaries()))
+            .saturating_add(size_of_val(self.entry_transfers()))
             .saturating_add(size_of_val(self.coverage.unproven_edges()))
             .saturating_add(size_of_val(self.coverage.partial_edges()))
             .saturating_add(size_of_val(self.coverage.boundaries()))
@@ -1167,6 +1247,25 @@ fn compare_incoming_calls(left: &SummaryIncomingCall, right: &SummaryIncomingCal
         .then_with(|| left.call_point().id().cmp(&right.call_point().id()))
         .then_with(|| left.call_fact().cmp(&right.call_fact()))
         .then_with(|| compare_call_sites(left.origin(), right.origin()))
+}
+
+fn compare_entry_transfers(left: &SummaryEntryTransfer, right: &SummaryEntryTransfer) -> Ordering {
+    compare_entries(left.target(), right.target())
+        .then_with(|| compare_entries(left.source(), right.source()))
+        .then_with(|| left.call_point().id().cmp(&right.call_point().id()))
+        .then_with(|| left.call_fact().cmp(&right.call_fact()))
+        .then_with(|| compare_call_sites(left.origin(), right.origin()))
+        .then_with(|| {
+            PathQuality::ALL
+                .into_iter()
+                .map(|quality| {
+                    left.path_qualities()
+                        .contains(quality)
+                        .cmp(&right.path_qualities().contains(quality))
+                })
+                .find(|ordering| *ordering != Ordering::Equal)
+                .unwrap_or(Ordering::Equal)
+        })
 }
 
 fn compare_summary_edges(left: &SummaryEdge, right: &SummaryEdge) -> Ordering {

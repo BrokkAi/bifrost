@@ -653,14 +653,17 @@ impl StructuralSpec for JsTsStructuralSpec {
 
     fn identity_route_support(&self) -> &IdentityRouteSupport {
         // `export { x }` resolves through the local binding (including an
-        // imported one) to the origin declaration, so the export relation has
-        // a producer. Import specifiers and `export ... from` specifiers
-        // resolve to NoDefinition today -- a resolver gap, not a modeling
-        // choice -- so the import, alias and re-export relations stay
-        // unclaimed until the resolver answers them (see the #1475 ExecPlan
-        // Decision Log, M3, and its follow-up issue).
+        // imported one) to the origin declaration, and since #1648 an import
+        // specifier and an `export ... from` specifier resolve to the target
+        // module's declaration as well, so the import, alias and re-export
+        // relations all have a producer (the gap the #1475 ExecPlan Decision
+        // Log, M3, recorded is closed). `export * from` still names no token,
+        // and so contributes no row rather than an unclaimed relation.
         static SUPPORT: IdentityRouteSupport = DEEP_IDENTITY_AXES
             .supported_relation(RouteHopKind::Export)
+            .supported_relation(RouteHopKind::Import)
+            .supported_relation(RouteHopKind::Alias)
+            .supported_relation(RouteHopKind::ReExport)
             .supported_relation(RouteHopKind::NestedOwner);
         &SUPPORT
     }

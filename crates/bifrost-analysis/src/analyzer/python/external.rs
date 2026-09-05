@@ -380,6 +380,7 @@ impl PythonArtifactPackProducer {
         let mut diagnostics = BoundedProducerDiagnostics::new(limits);
         let mut types = Vec::new();
         let mut members = Vec::new();
+        let mut surfaces = Vec::new();
         for entry in artifact.source_entries() {
             if cancellation.is_some_and(CancellationToken::is_cancelled) {
                 diagnostics.error(
@@ -423,6 +424,7 @@ impl PythonArtifactPackProducer {
                 &mut diagnostics,
             );
             collector.collect(tree.root_node(), cancellation);
+            surfaces.push(collector.module_surface());
             types.extend(collector.types);
             members.extend(collector.members);
         }
@@ -441,6 +443,15 @@ impl PythonArtifactPackProducer {
                 suppressed_diagnostics,
             };
         }
+        // Only a whole source set can say what a wildcard re-export binds, so
+        // this is the one production stage that sees every module at once.
+        expand_wildcard_reexports(
+            &mut surfaces,
+            &mut types,
+            &mut members,
+            limits,
+            &mut diagnostics,
+        );
         dedup_declarations(&mut types, &mut members);
         resolve_hierarchy_references(&mut types);
         let (diagnostics, suppressed_diagnostics) = diagnostics.finish();
@@ -659,6 +670,41 @@ struct PythonApiCollector<'a, 'd> {
     /// expression. The optional target is `None` when a binding is known but
     /// does not identify one declared type.
     hierarchy_bindings: std::collections::HashMap<String, HierarchyBinding>,
+    /// Every `from m import *` this file spells, kept beside the
+    /// [`PYTHON_UNENUMERATED_BINDING`] marker it recorded so a production that
+    /// also collects `m` can replace the marker with the names the wildcard
+    /// really binds (#2958).
+    wildcard_imports: Vec<WildcardImport>,
+    /// Surfaces that bind names no cross-module pass can enumerate: an import
+    /// form that spells no bound name, or a wildcard outside module scope.
+    unenumerable_owners: std::collections::HashSet<String>,
+    /// What this module's `__all__` statements say it exports.
+    exports: ModuleExports,
+}
+
+/// One `from m import *` a collected surface carries.
+#[derive(Debug, Clone)]
+struct WildcardImport {
+    /// The absolute module the wildcard reads, or `None` when a relative
+    /// spelling resolved to no module.
+    target_module: Option<String>,
+    /// The condition of the conditional block the wildcard sits in.
+    guard: Option<DeclarationGuard>,
+}
+
+/// What a module states about the names `from <module> import *` binds.
+///
+/// Python binds `__all__` when the module defines it and every public name
+/// otherwise, so a module that lists `__all__` in a form this producer cannot
+/// read leaves its wildcard consumers unenumerable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ModuleExports {
+    /// No `__all__` statement: `import *` binds every public name.
+    PublicNames,
+    /// Every name the module's literal `__all__` statements list.
+    Listed(Vec<String>),
+    /// An `__all__` this producer could not read as a list of string literals.
+    Unreadable,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -706,6 +752,21 @@ const MAX_GUARD_CONDITION_DEPTH: usize = 32;
 /// stop the whole environment from activating.
 pub(crate) const PYTHON_UNENUMERATED_BINDING: &str = "*";
 
+/// The module-level name whose value states which names `import *` binds.
+const PYTHON_MODULE_EXPORTS: &str = "__all__";
+
+/// Read a list or tuple of plain string literals, which is the only `__all__`
+/// form whose export set is a fact rather than a guess.
+fn python_string_list_literal(node: Node<'_>, source: &str) -> Option<Vec<String>> {
+    if !matches!(node.kind(), "list" | "tuple") {
+        return None;
+    }
+    named_children(node)
+        .filter(|child| child.kind() != "comment")
+        .map(|child| python_plain_string_literal(child, source).map(str::to_owned))
+        .collect()
+}
+
 impl<'a, 'd> PythonApiCollector<'a, 'd> {
     fn new(
         module: &'a str,
@@ -727,6 +788,9 @@ impl<'a, 'd> PythonApiCollector<'a, 'd> {
             guards: Vec::new(),
             imported_names: std::collections::HashMap::new(),
             hierarchy_bindings: std::collections::HashMap::new(),
+            wildcard_imports: Vec::new(),
+            unenumerable_owners: std::collections::HashSet::new(),
+            exports: ModuleExports::PublicNames,
         };
         collector.push_type(
             module.to_owned(),
@@ -994,6 +1058,9 @@ impl<'a, 'd> PythonApiCollector<'a, 'd> {
         let Some(name) = node_identifier(Some(left), self.source) else {
             return;
         };
+        if name == PYTHON_MODULE_EXPORTS && owner == self.module {
+            self.record_module_exports(assignment);
+        }
         self.record_hierarchy_binding(owner, &name, None, guard, false);
         if assignment
             .child_by_field_name("type")
@@ -1026,6 +1093,31 @@ impl<'a, 'd> PythonApiCollector<'a, 'd> {
         );
     }
 
+    /// Read what one `__all__` statement adds to this module's export set.
+    ///
+    /// Python binds the names `__all__` lists when a module defines it, so the
+    /// export set is what a wildcard consumer needs. Only a list or tuple of
+    /// plain string literals is readable; every other form leaves the export
+    /// set unreadable rather than guessed, which keeps the wildcard marker on
+    /// every module that reads this one.
+    fn record_module_exports(&mut self, assignment: Node<'_>) {
+        if self.exports == ModuleExports::Unreadable {
+            return;
+        }
+        let Some(listed) = assignment
+            .child_by_field_name("right")
+            .and_then(|right| python_string_list_literal(right, self.source))
+        else {
+            self.exports = ModuleExports::Unreadable;
+            return;
+        };
+        match &mut self.exports {
+            ModuleExports::PublicNames => self.exports = ModuleExports::Listed(listed),
+            ModuleExports::Listed(names) => names.extend(listed),
+            ModuleExports::Unreadable => {}
+        }
+    }
+
     /// An import inside a module or class body binds a name on that surface:
     /// `from .sessions import Session` in `requests/__init__.pyi` is how
     /// `requests.Session` exists at all. One artifact is produced without a
@@ -1034,12 +1126,18 @@ impl<'a, 'd> PythonApiCollector<'a, 'd> {
     /// that name" -- and recording it is what makes a surface marked complete
     /// actually complete.
     ///
-    /// A wildcard binds a set this producer cannot enumerate, and so does a
-    /// form that spells no single bound name. Either one is recorded as the
+    /// A wildcard binds a set one file cannot enumerate, and so does a form
+    /// that spells no single bound name. Either one is recorded as the
     /// [`PYTHON_UNENUMERATED_BINDING`] member, which is not a Python
     /// identifier and so can never be confused with a real name. A consumer
     /// that finds it knows this surface binds more than it lists, and that a
     /// name missing from it is therefore not proof of absence.
+    ///
+    /// A wildcard also keeps the module it reads, so a production that
+    /// collects that module can expand the wildcard into the names it really
+    /// binds and drop the marker (#2958). A wildcard outside module scope
+    /// binds into a surface no module-level export set describes, so it leaves
+    /// that owner unenumerable.
     fn visit_import(&mut self, node: Node<'_>, owner: &str, guard: Option<usize>) {
         for import in
             brokk_bifrost_python::imports::python_import_infos_from_node(node, self.source)
@@ -1051,6 +1149,14 @@ impl<'a, 'd> PythonApiCollector<'a, 'd> {
             };
             if name != PYTHON_UNENUMERATED_BINDING {
                 self.record_hierarchy_binding(owner, name, hierarchy_target, guard, false);
+            } else if import.is_wildcard && owner == self.module {
+                let target_module = self.wildcard_target_module(&import);
+                self.wildcard_imports.push(WildcardImport {
+                    target_module,
+                    guard: self.guard_of(guard).cloned(),
+                });
+            } else {
+                self.unenumerable_owners.insert(owner.to_owned());
             }
             // Two branches of a `try`/`except ImportError` pair bind the same
             // name; recording it twice would mint one identity twice and mark
@@ -1097,17 +1203,42 @@ impl<'a, 'd> PythonApiCollector<'a, 'd> {
                 wildcard: false,
                 ..
             } => {
-                let package = if self.path.file_stem().is_some_and(|stem| stem == "__init__") {
-                    self.module
-                } else {
-                    self.module
-                        .rsplit_once('.')
-                        .map_or("", |(package, _)| package)
-                };
-                let module = resolve_python_relative_module_from_package(package, &module)?;
+                let module =
+                    resolve_python_relative_module_from_package(self.current_package(), &module)?;
                 Some(format!("{module}.{name}"))
             }
             PythonImportDetails::FromImport { wildcard: true, .. } => None,
+        }
+    }
+
+    /// The absolute module a `from m import *` reads, resolved through the
+    /// same package identity a named import resolves through.
+    fn wildcard_target_module(&self, import: &crate::analyzer::ImportInfo) -> Option<String> {
+        use brokk_bifrost_python::imports::{
+            PythonImportDetails, python_import_details, resolve_python_relative_module_from_package,
+        };
+
+        let PythonImportDetails::FromImport {
+            module,
+            wildcard: true,
+            ..
+        } = python_import_details(import)?
+        else {
+            return None;
+        };
+        resolve_python_relative_module_from_package(self.current_package(), &module)
+    }
+
+    /// The package a relative import in this file resolves against. A package
+    /// `__init__` is its own package; any other module resolves against the
+    /// package that contains it.
+    fn current_package(&self) -> &str {
+        if self.path.file_stem().is_some_and(|stem| stem == "__init__") {
+            self.module
+        } else {
+            self.module
+                .rsplit_once('.')
+                .map_or("", |(package, _)| package)
         }
     }
 
@@ -1212,6 +1343,42 @@ impl<'a, 'd> PythonApiCollector<'a, 'd> {
             scope = current.rsplit_once('.').map(|(parent, _)| parent);
         }
         None
+    }
+
+    /// This file's module-level surface, in the form the production's
+    /// cross-module wildcard expansion reads.
+    ///
+    /// Every module-level binding is already recorded for hierarchy
+    /// resolution, keyed by `owner.name`; a module-level key is one whose
+    /// remainder after this module's own name is a single identifier.
+    fn module_surface(&self) -> CollectedModuleSurface {
+        let prefix = format!("{}.", self.module);
+        let bindings = self
+            .hierarchy_bindings
+            .iter()
+            .filter_map(|(key, binding)| {
+                let name = key.strip_prefix(&prefix)?;
+                if name.contains('.') {
+                    return None;
+                }
+                Some((
+                    name.to_owned(),
+                    ModuleBinding {
+                        target: binding.target.clone(),
+                        guard: self.guard_of(binding.guard).cloned(),
+                        expanded: false,
+                    },
+                ))
+            })
+            .collect();
+        CollectedModuleSurface {
+            module: self.module.to_owned(),
+            locator_path: self.locator_path.clone(),
+            bindings,
+            exports: self.exports.clone(),
+            wildcards: self.wildcard_imports.clone(),
+            opaque: self.unenumerable_owners.contains(self.module),
+        }
     }
 
     /// `Protocol` and `Generic` are typing-only class construction markers,
@@ -1327,56 +1494,341 @@ impl<'a, 'd> PythonApiCollector<'a, 'd> {
             return;
         }
         let guard = self.guard_of(guard).cloned();
-        let owner_id = type_declaration_id(TypeIdentity {
-            ecosystem: "python",
-            name: &owner,
-        });
-        let parameters = signature
-            .as_ref()
-            .map(|signature| signature.parameters.clone())
-            .unwrap_or_default();
-        let parameter_types = parameters
-            .iter()
-            .map(|parameter| parameter.r#type.clone())
-            .collect::<Vec<_>>();
-        let return_type = signature
-            .as_ref()
-            .and_then(|signature| signature.returns.as_ref());
-        let id = member_declaration_id(MemberIdentity {
-            owner_id: &owner_id,
-            kind: member_kind,
-            is_static,
-            parameter_arity: parameter_types.len(),
-            name: &name,
-            generic_arity: signature
-                .as_ref()
-                .map_or(0, |signature| signature.type_parameters.len()),
-            parameter_types: &parameter_types,
-            parameter_variadics: &[],
-            return_type,
-        });
-        self.members.push(MemberFact {
-            id,
-            owner: owner_id,
-            name: name.clone(),
+        self.members.push(member_fact(
+            &owner,
+            &name,
             member_kind,
-            visibility: python_visibility(&name),
             is_static,
-            is_abstract: false,
-            is_virtual: false,
-            implicit_operation: None,
-            callable_family_complete: false,
             signature,
-            receiver: None,
-            extension_receiver: None,
-            extension_receiver_constraints: Vec::new(),
-            aliases: Vec::new(),
+            &self.locator_path,
             guard,
-            locator: Locator::Artifact {
-                path: self.locator_path.clone(),
-                symbol: format!("{owner}.{name}"),
-            },
+        ));
+    }
+}
+
+/// One member declaration of a Python surface, with the identity its owner,
+/// kind, and signature determine.
+fn member_fact(
+    owner: &str,
+    name: &str,
+    member_kind: MemberKind,
+    is_static: bool,
+    signature: Option<Signature>,
+    locator_path: &str,
+    guard: Option<DeclarationGuard>,
+) -> MemberFact {
+    let owner_id = type_declaration_id(TypeIdentity {
+        ecosystem: "python",
+        name: owner,
+    });
+    let parameter_types = signature
+        .as_ref()
+        .map(|signature| {
+            signature
+                .parameters
+                .iter()
+                .map(|parameter| parameter.r#type.clone())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let id = member_declaration_id(MemberIdentity {
+        owner_id: &owner_id,
+        kind: member_kind,
+        is_static,
+        parameter_arity: parameter_types.len(),
+        name,
+        generic_arity: signature
+            .as_ref()
+            .map_or(0, |signature| signature.type_parameters.len()),
+        parameter_types: &parameter_types,
+        parameter_variadics: &[],
+        return_type: signature
+            .as_ref()
+            .and_then(|signature| signature.returns.as_ref()),
+    });
+    MemberFact {
+        id,
+        owner: owner_id,
+        name: name.to_owned(),
+        member_kind,
+        visibility: python_visibility(name),
+        is_static,
+        is_abstract: false,
+        is_virtual: false,
+        implicit_operation: None,
+        callable_family_complete: false,
+        signature,
+        receiver: None,
+        extension_receiver: None,
+        extension_receiver_constraints: Vec::new(),
+        aliases: Vec::new(),
+        guard,
+        locator: Locator::Artifact {
+            path: locator_path.to_owned(),
+            symbol: format!("{owner}.{name}"),
+        },
+    }
+}
+
+/// One collected module's module-level surface, kept beside its declarations
+/// so a production can expand the wildcard re-exports its modules read from
+/// one another (#2958).
+struct CollectedModuleSurface {
+    module: String,
+    locator_path: String,
+    /// Every module-level name this surface binds.
+    bindings: std::collections::HashMap<String, ModuleBinding>,
+    exports: ModuleExports,
+    wildcards: Vec<WildcardImport>,
+    /// True when this surface binds names no expansion can enumerate.
+    opaque: bool,
+}
+
+/// One module-level name a surface binds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ModuleBinding {
+    /// The qualified declaration the name refers to, or `None` when the
+    /// binding names no declared type.
+    target: Option<String>,
+    guard: Option<DeclarationGuard>,
+    /// True when a wildcard expansion produced this binding, so the production
+    /// still has to publish it.
+    expanded: bool,
+}
+
+/// Expand every `from m import *` whose `m` this production also collected.
+///
+/// Python binds the names `m.__all__` lists when `m` defines it, and every
+/// public name of `m` otherwise, including the names `m` itself re-exports.
+/// Each expanded name is published on the reading module as the binding a
+/// named import of it would have produced, and, when it names a type this
+/// production declares, as a qualified alias of that type: a wildcard chain
+/// such as `collections.abc -> _collections_abc -> typing.MutableSet` then
+/// ends at the declaring class, and a hierarchy edge to
+/// `collections.abc.MutableSet` resolves.
+///
+/// Wildcards chain, so names propagate to a fixed point. The
+/// [`PYTHON_UNENUMERATED_BINDING`] marker survives only where a surface really
+/// binds more than it lists: a wildcard whose module this production does not
+/// carry, an `__all__` this producer cannot read, or an `__all__` naming a
+/// name the module does not bind.
+fn expand_wildcard_reexports(
+    surfaces: &mut [CollectedModuleSurface],
+    types: &mut [TypeFact],
+    members: &mut Vec<MemberFact>,
+    limits: &ArtifactProducerLimits,
+    diagnostics: &mut BoundedProducerDiagnostics,
+) {
+    let modules = surfaces
+        .iter()
+        .enumerate()
+        .map(|(index, surface)| (surface.module.clone(), index))
+        .collect::<std::collections::HashMap<_, _>>();
+
+    // Names first: a wildcard's source module can itself gain names from a
+    // wildcard, so one pass over the surfaces is not enough.
+    loop {
+        let mut gains = Vec::new();
+        for (consumer, surface) in surfaces.iter().enumerate() {
+            for wildcard in &surface.wildcards {
+                let Some(&source) = wildcard
+                    .target_module
+                    .as_ref()
+                    .and_then(|module| modules.get(module))
+                else {
+                    continue;
+                };
+                if source == consumer {
+                    continue;
+                }
+                for (name, binding) in exported_bindings(&surfaces[source]) {
+                    let guard = conjoined_guard(wildcard.guard.clone(), binding.guard.clone());
+                    let gained = match surface.bindings.get(name) {
+                        // An explicit binding on the reading module names the
+                        // declaration itself; a wildcard never overrides it.
+                        Some(existing) if !existing.expanded => continue,
+                        Some(existing) => ModuleBinding {
+                            target: (existing.target == binding.target)
+                                .then(|| existing.target.clone())
+                                .flatten(),
+                            guard: DeclarationGuard::union(existing.guard.clone(), guard),
+                            expanded: true,
+                        },
+                        None => ModuleBinding {
+                            target: binding.target.clone(),
+                            guard,
+                            expanded: true,
+                        },
+                    };
+                    if surface.bindings.get(name) != Some(&gained) {
+                        gains.push((consumer, name.clone(), gained));
+                    }
+                }
+            }
+        }
+        if gains.is_empty() {
+            break;
+        }
+        for (consumer, name, binding) in gains {
+            surfaces[consumer].bindings.insert(name, binding);
+        }
+    }
+
+    // Then enumerability, which the expanded name sets decide. A surface earns
+    // it only from evidence, so a wildcard cycle stays unenumerable rather
+    // than declaring itself complete.
+    let mut enumerable = vec![false; surfaces.len()];
+    loop {
+        let mut changed = false;
+        for (index, surface) in surfaces.iter().enumerate() {
+            if enumerable[index] || !exports_enumerable(surface, &modules, &enumerable) {
+                continue;
+            }
+            enumerable[index] = true;
+            changed = true;
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    let mut alias_targets = std::collections::HashMap::<&str, Vec<usize>>::new();
+    for (index, fact) in types.iter().enumerate() {
+        alias_targets
+            .entry(fact.name.as_str())
+            .or_default()
+            .push(index);
+    }
+    let mut aliases = Vec::new();
+    let mut enumerated_owners = std::collections::HashSet::new();
+    for surface in surfaces.iter() {
+        let mut expanded = surface
+            .bindings
+            .iter()
+            .filter(|(_, binding)| binding.expanded)
+            .collect::<Vec<_>>();
+        expanded.sort_by_key(|(name, _)| *name);
+        if types
+            .len()
+            .saturating_add(members.len())
+            .saturating_add(expanded.len())
+            > limits.max_records
+        {
+            diagnostics.error(
+                "limit.records",
+                Some(surface.locator_path.clone()),
+                format!(
+                    "Python wildcard re-export expansion exceeds declaration limit {}",
+                    limits.max_records
+                ),
+            );
+            return;
+        }
+        for (name, binding) in expanded {
+            members.push(member_fact(
+                &surface.module,
+                name,
+                MemberKind::Constant,
+                false,
+                None,
+                &surface.locator_path,
+                binding.guard.clone(),
+            ));
+            let alias = format!("{}.{}", surface.module, name);
+            if let Some(target) = &binding.target
+                && *target != alias
+                && let Some(declarations) = alias_targets.get(target.as_str())
+            {
+                for declaration in declarations {
+                    aliases.push((*declaration, alias.clone()));
+                }
+            }
+        }
+        // The marker states that a surface binds more than it lists. Once
+        // every wildcard of a module is expanded, it lists everything.
+        if !surface.wildcards.is_empty() && bindings_complete(surface, &modules, &enumerable) {
+            enumerated_owners.insert(type_declaration_id(TypeIdentity {
+                ecosystem: "python",
+                name: &surface.module,
+            }));
+        }
+    }
+    for (declaration, alias) in aliases {
+        types[declaration].aliases.push(alias);
+    }
+    for fact in types.iter_mut() {
+        fact.aliases.sort();
+        fact.aliases.dedup();
+    }
+    if !enumerated_owners.is_empty() {
+        members.retain(|member| {
+            member.name != PYTHON_UNENUMERATED_BINDING || !enumerated_owners.contains(&member.owner)
         });
+    }
+}
+
+/// The names `from <module> import *` binds, as far as the module states them.
+fn exported_bindings(surface: &CollectedModuleSurface) -> Vec<(&String, &ModuleBinding)> {
+    match &surface.exports {
+        // An unreadable `__all__` states nothing about the export set, so this
+        // module publishes no name through a wildcard rather than a guess.
+        ModuleExports::Unreadable => Vec::new(),
+        ModuleExports::Listed(names) => names
+            .iter()
+            .filter_map(|name| surface.bindings.get_key_value(name))
+            .collect(),
+        ModuleExports::PublicNames => surface
+            .bindings
+            .iter()
+            .filter(|(name, _)| !name.starts_with('_'))
+            .collect(),
+    }
+}
+
+/// Whether every name this surface binds is known: nothing else on it binds
+/// names out of view, and every wildcard it reads has an enumerable module.
+fn bindings_complete(
+    surface: &CollectedModuleSurface,
+    modules: &std::collections::HashMap<String, usize>,
+    enumerable: &[bool],
+) -> bool {
+    !surface.opaque
+        && surface.wildcards.iter().all(|wildcard| {
+            wildcard
+                .target_module
+                .as_ref()
+                .and_then(|module| modules.get(module))
+                .is_some_and(|source| enumerable[*source])
+        })
+}
+
+/// Whether the names `from <module> import *` binds are all known.
+fn exports_enumerable(
+    surface: &CollectedModuleSurface,
+    modules: &std::collections::HashMap<String, usize>,
+    enumerable: &[bool],
+) -> bool {
+    bindings_complete(surface, modules, enumerable)
+        && match &surface.exports {
+            ModuleExports::Unreadable => false,
+            ModuleExports::PublicNames => true,
+            ModuleExports::Listed(names) => {
+                names.iter().all(|name| surface.bindings.contains_key(name))
+            }
+        }
+}
+
+/// The condition that holds where both conditions hold. A name reached through
+/// a guarded wildcard exists only where the wildcard is taken and the module
+/// it reads declares the name.
+fn conjoined_guard(
+    left: Option<DeclarationGuard>,
+    right: Option<DeclarationGuard>,
+) -> Option<DeclarationGuard> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left.and(&right)),
+        (Some(guard), None) | (None, Some(guard)) => Some(guard),
+        (None, None) => None,
     }
 }
 
@@ -3192,6 +3644,257 @@ mod tests {
             TypeRef::Named { ref name, .. } if name == "absent.Missing"
         ));
         compile_pack(&pack, &CompilerOptions::default()).unwrap();
+    }
+
+    /// Produce one pack from an inline stub source set, the way the pinned
+    /// typeshed selection is produced.
+    fn produce_stub_set(files: &[(&str, &str)]) -> ArtifactProduction {
+        let fixture = tempdir().unwrap();
+        for (relative, source) in files {
+            let path = fixture.path().join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, source).unwrap();
+        }
+        let artifact = read_exact_source_set(
+            fixture.path(),
+            &files
+                .iter()
+                .map(|(relative, _)| (*relative).into())
+                .collect::<Vec<_>>(),
+            32,
+            16,
+            &ArtifactProducerLimits::default(),
+        )
+        .unwrap();
+        PythonArtifactPackProducer.produce_loaded_source_set(
+            &ArtifactProductionRequest {
+                path: fixture.path().to_owned(),
+                artifact_kind: ExternalArtifactKind::PythonStub,
+                pack_id: "python-wildcard-fixture".to_owned(),
+                pack_version: "1.0.0".to_owned(),
+                ecosystem: "python".to_owned(),
+                compatibility: Compatibility {
+                    bifrost: format!("={}", env!("CARGO_PKG_VERSION")),
+                    toolchains: Vec::new(),
+                },
+                activation: vec![ActivationSelector {
+                    package: None,
+                    module: None,
+                    toolchain: None,
+                    targets: Vec::new(),
+                    configurations: Vec::new(),
+                    artifact_sha256: None,
+                }],
+                provenance: Provenance {
+                    source: "fixture".to_owned(),
+                    revision: None,
+                },
+                license: "Apache-2.0".to_owned(),
+                safety: Safety {
+                    generated_code_only: false,
+                    review_required: false,
+                },
+            },
+            &ArtifactProducerLimits::default(),
+            None,
+            &artifact,
+        )
+    }
+
+    fn declaration_facts(production: &ArtifactProduction) -> (&[TypeFact], &[MemberFact]) {
+        match &production.pack.as_ref().unwrap().shards[0].payload {
+            AuthoredPayload::DeclarationFacts { types, members, .. } => (types, members),
+            payload => panic!("declaration facts: {payload:#?}"),
+        }
+    }
+
+    /// Every member name one module owns, sorted.
+    fn module_members<'a>(members: &'a [MemberFact], module: &str) -> Vec<&'a str> {
+        let owner = type_declaration_id(TypeIdentity {
+            ecosystem: "python",
+            name: module,
+        });
+        let mut names = members
+            .iter()
+            .filter(|member| member.owner == owner)
+            .map(|member| member.name.as_str())
+            .collect::<Vec<_>>();
+        names.sort_unstable();
+        names
+    }
+
+    fn type_aliases<'a>(types: &'a [TypeFact], name: &str) -> &'a [String] {
+        &types
+            .iter()
+            .find(|fact| fact.name == name)
+            .unwrap_or_else(|| panic!("`{name}` is declared"))
+            .aliases
+    }
+
+    const WILDCARD_IMPL: &str =
+        "from typing import MutableSet as MutableSet\n\nclass Own: ...\n\n_private: int\n";
+
+    #[test]
+    fn a_wildcard_shim_publishes_the_public_names_its_source_module_exports() {
+        let production = produce_stub_set(&[
+            ("shim.pyi", "from _impl import *\n"),
+            ("_impl.pyi", WILDCARD_IMPL),
+            ("typing.pyi", "class MutableSet: ...\n"),
+        ]);
+        assert!(
+            production.diagnostics.is_empty(),
+            "{:#?}",
+            production.diagnostics
+        );
+        let (types, members) = declaration_facts(&production);
+        assert_eq!(
+            module_members(members, "shim"),
+            vec!["MutableSet", "Own"],
+            "a wildcard binds the exported public names and nothing else"
+        );
+        assert_eq!(
+            type_aliases(types, "typing.MutableSet"),
+            ["shim.MutableSet"],
+            "a re-export chain ends at the declaring class"
+        );
+        assert_eq!(
+            type_aliases(types, "_impl.Own"),
+            ["shim.Own"],
+            "a re-exported local class is published under the shim's name"
+        );
+    }
+
+    #[test]
+    fn a_literal_dunder_all_decides_what_a_wildcard_binds() {
+        let production = produce_stub_set(&[
+            ("shim.pyi", "from _impl import *\n"),
+            (
+                "_impl.pyi",
+                &format!("__all__ = [\"Own\"]\n{WILDCARD_IMPL}"),
+            ),
+            ("typing.pyi", "class MutableSet: ...\n"),
+        ]);
+        let (types, members) = declaration_facts(&production);
+        assert_eq!(
+            module_members(members, "shim"),
+            vec!["Own"],
+            "`__all__` states the whole export set"
+        );
+        assert!(
+            type_aliases(types, "typing.MutableSet").is_empty(),
+            "a name `__all__` withholds is not re-exported"
+        );
+    }
+
+    #[test]
+    fn a_wildcard_this_production_cannot_read_keeps_the_unenumerated_marker() {
+        let outside = produce_stub_set(&[
+            ("shim.pyi", "from outside import *\n"),
+            ("_impl.pyi", WILDCARD_IMPL),
+            ("typing.pyi", "class MutableSet: ...\n"),
+        ]);
+        let (_, members) = declaration_facts(&outside);
+        assert_eq!(
+            module_members(members, "shim"),
+            vec![PYTHON_UNENUMERATED_BINDING],
+            "a wildcard whose module the production does not carry stays unenumerated"
+        );
+
+        let unreadable = produce_stub_set(&[
+            ("shim.pyi", "from _impl import *\n"),
+            (
+                "_impl.pyi",
+                &format!("__all__ = list(_names)\n{WILDCARD_IMPL}"),
+            ),
+            ("typing.pyi", "class MutableSet: ...\n"),
+        ]);
+        let (_, members) = declaration_facts(&unreadable);
+        assert_eq!(
+            module_members(members, "shim"),
+            vec![PYTHON_UNENUMERATED_BINDING],
+            "an `__all__` this producer cannot read states no export set"
+        );
+    }
+
+    #[test]
+    fn wildcards_chain_to_the_same_declaring_targets() {
+        let production = produce_stub_set(&[
+            ("shim2.pyi", "from shim import *\n"),
+            ("shim.pyi", "from _impl import *\n"),
+            ("_impl.pyi", WILDCARD_IMPL),
+            ("typing.pyi", "class MutableSet: ...\n"),
+        ]);
+        let (types, members) = declaration_facts(&production);
+        assert_eq!(module_members(members, "shim2"), vec!["MutableSet", "Own"]);
+        assert_eq!(
+            type_aliases(types, "typing.MutableSet"),
+            ["shim.MutableSet", "shim2.MutableSet"],
+            "every module in the chain names the declaring class"
+        );
+        assert_eq!(type_aliases(types, "_impl.Own"), ["shim.Own", "shim2.Own"]);
+    }
+
+    #[test]
+    fn a_guarded_wildcard_carries_its_condition_onto_the_names_it_binds() {
+        let production = produce_stub_set(&[
+            (
+                "shim.pyi",
+                "import sys\n\nif sys.platform == \"win32\":\n    from _impl import *\n",
+            ),
+            ("_impl.pyi", WILDCARD_IMPL),
+            ("typing.pyi", "class MutableSet: ...\n"),
+        ]);
+        let (_, members) = declaration_facts(&production);
+        let owner = type_declaration_id(TypeIdentity {
+            ecosystem: "python",
+            name: "shim",
+        });
+        let own = members
+            .iter()
+            .find(|member| member.owner == owner && member.name == "Own")
+            .expect("the guarded wildcard still binds `Own`");
+        assert_eq!(
+            own.guard
+                .as_ref()
+                .map(|guard| guard.required_targets.clone()),
+            Some(vec!["win32".to_owned()]),
+            "{own:#?}"
+        );
+    }
+
+    #[test]
+    fn a_hierarchy_edge_through_a_wildcard_shim_names_the_declaring_class() {
+        let production = produce_stub_set(&[
+            ("shim.pyi", "from _impl import *\n"),
+            ("_impl.pyi", WILDCARD_IMPL),
+            ("typing.pyi", "class MutableSet: ...\n"),
+            (
+                "user.pyi",
+                "from shim import MutableSet\n\nclass Uses(MutableSet): ...\n",
+            ),
+        ]);
+        let (types, _) = declaration_facts(&production);
+        let uses = types
+            .iter()
+            .find(|fact| fact.name == "user.Uses")
+            .expect("`user.Uses` is declared");
+        assert!(
+            matches!(
+                &uses.hierarchy[0].target,
+                TypeRef::Named { name, .. } if name == "shim.MutableSet"
+            ),
+            "{:#?}",
+            uses.hierarchy
+        );
+        assert!(
+            type_aliases(types, "typing.MutableSet").contains(&"shim.MutableSet".to_owned()),
+            "the overlay resolves that edge through the re-export alias"
+        );
+        compile_pack(
+            production.pack.as_ref().unwrap(),
+            &CompilerOptions::default(),
+        )
+        .unwrap();
     }
 
     #[test]

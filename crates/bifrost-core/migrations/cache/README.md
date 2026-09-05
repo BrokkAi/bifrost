@@ -193,3 +193,32 @@ change is a CHECK constraint, so the table is recreated with
 `policy_unit_reads` and `policy_evaluation_units`; nothing is carried across,
 because units are content-keyed and the next run republishes what is still
 true.
+
+Migration `0045-class-set-summary-evidence.sql` replaces the derived class-set
+summary family added by migration 0044. Version 44 admitted only leaf rows and
+therefore stored placeholder dependency and read records that could not prove
+a non-leaf row reusable. The replacement records a caller-visible output
+digest, exact callee lineage/entry/output/lookup evidence, and the analyzer's
+lossless structured read-key vocabulary. Reverse indexes support later
+invalidation without enabling that operational policy yet. No version-44
+class-set row is carried forward: the family is derived cache data, and
+rebuilding prevents an old row from appearing complete under the stronger
+contract.
+
+Migration `0046-path-symbol-lookups.sql` gives the path-derived module rows the
+indexes their lookups need and takes three language names out of the view SQL.
+`workspace_file_path_symbol_rows` carried indexes on `exact_fqn` and
+`normalized_fqn` only, while the definition-lookup views read `short_name` as
+`identifier` and `package_name` as `exact_parent_tail`, so every exact-name,
+structural, identifier, and package-types question against a Python,
+JavaScript, or TypeScript workspace had nothing to seek and the planner walked
+every live file of the language once per request. `_short` and `_package` are
+the two seeks those shapes were missing. The new `requires_imports` column
+records per row whether the row counts only when its file has an import
+statement, which the old `workspace_path_symbols` view decided by naming
+'javascript', 'typescript:ts', and 'typescript:tsx' in SQL; that duplicated the
+adapter hook `path_synthetic_module_requires_imports()` as string literals in
+the schema. The one-time `UPDATE` names those three keys once, which a
+migration may do because it describes history, and every row written afterwards
+carries what the adapter said.
+

@@ -76,8 +76,8 @@ pub fn install_bifrost_semantic_model_packs() -> Result<(), String> {
                 register_bifrost_semantic_model_packs,
             )
             .map_err(str::to_owned)?;
-            brokk_bifrost_analysis::analyzer::semantic_model::set_generated_production_acquisition_hook(
-                Some(brokk_bifrost_semantic_packs::download::acquire_generated_production),
+            brokk_bifrost_analysis::analyzer::semantic_model::set_semantic_pack_acquisition_hook(
+                Some(brokk_bifrost_semantic_packs::download::acquire_semantic_pack),
             );
             Ok(())
         })

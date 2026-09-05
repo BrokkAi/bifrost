@@ -1708,7 +1708,7 @@ fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     // enclosing class for inherited nested-type lookup.
     if ctx
         .visibility
-        .parser_alias_resolves_to_type(&ctx.analyzer, ctx.file, text, &ctx.spec.target)
+        .parser_alias_resolves_to_type(ctx.file, text, &ctx.spec.target)
     {
         *ctx.raw_match_count += 1;
         push_type_hit(type_reference_hit_node(hit_node), ctx);
@@ -5393,12 +5393,10 @@ fn target_guided_missing_alias_rhs_type_leaf<'tree>(
                 .iter()
                 .filter_map(|alias| ctx.visibility.alias_target(alias))
                 .any(|target| same_visible_symbol(&target, &ctx.spec.target));
-            let alias_resolves = ctx.visibility.parser_alias_resolves_to_type(
-                &ctx.analyzer,
-                ctx.file,
-                name,
-                &ctx.spec.target,
-            ) || canonical_alias_target;
+            let alias_resolves =
+                ctx.visibility
+                    .parser_alias_resolves_to_type(ctx.file, name, &ctx.spec.target)
+                    || canonical_alias_target;
             if saw_qualified
                 && saw_dependent
                 && saw_type_descriptor

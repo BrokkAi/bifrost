@@ -9,7 +9,7 @@ use crate::analyzer::{CodeUnit, DeclarationId, IAnalyzer, Language, ProjectFile,
 use crate::cancellation::CancellationToken;
 use crate::hash::{HashMap, HashSet};
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::ffi::OsStr;
 
 type CatalogDeclaration = (CodeUnit, Option<Range>);
@@ -78,12 +78,22 @@ pub(crate) struct WorkspaceUsageNodeKey {
 }
 
 impl WorkspaceUsageNodeKey {
-    pub(crate) fn for_declaration(unit: &CodeUnit) -> Self {
-        let ecosystem = UsageEcosystem::of(language_for_target(unit));
+    /// The node key for a declaration whose identity the caller already holds.
+    ///
+    /// `CodeUnit::declaration_id` is a SHA-256 over every identity field and
+    /// `fq_name` is an owned copy of the rendered name. The catalog computes
+    /// both once per inventory row while grouping, so it passes them in here
+    /// rather than paying for either a second time.
+    fn with_identity(
+        unit: &CodeUnit,
+        ecosystem: UsageEcosystem,
+        id: DeclarationId,
+        fqn: String,
+    ) -> Self {
         Self {
-            id: unit.declaration_id(),
+            id,
             ecosystem,
-            fqn: unit.fq_name(),
+            fqn,
             defining_file: ecosystem.is_module_scoped().then(|| unit.source().clone()),
         }
     }
@@ -253,11 +263,35 @@ impl WorkspaceUsageCatalog {
             .expect("uncancelled rooted workspace usage catalog construction")
     }
 
+    /// Group an enumerated declaration inventory into graph nodes.
+    ///
+    /// The whole-workspace inventory is hundreds of thousands of rows on a
+    /// monorepo, and each row's `declaration_id` is a SHA-256 over every
+    /// identity field. This makes one identity pass over the row set and
+    /// carries the result through the group key, the node key, and the node's
+    /// identity list, where the ordered-map grouping it replaces hashed each
+    /// row roughly three times, copied each rendered name twice, and allocated
+    /// one `Vec` per group -- almost every group on a real workspace holds one
+    /// row, because only C++ and C# omit the exact identity from the key
+    /// (#2935).
+    ///
+    /// This stays sequential deliberately. The phase is allocation-bound, not
+    /// hash-bound: a Rayon version of exactly this grouping, measured on the
+    /// pinned 205,209-row Kubernetes inventory, spent 72 s of CPU to produce
+    /// the same catalog in 1.42 s of wall time that the sequential pass
+    /// produces in 1.28 s using 1.31 s of CPU. Distributing per-node
+    /// allocation across 120 threads buys contention, not throughput.
+    ///
+    /// The result is identical to the ordered-map grouping, not merely
+    /// equivalent: `sort_by` is stable, so rows sharing one group key keep the
+    /// enumeration order the map gave them, groups are visited in group-key
+    /// order, and `min_by` returns the first minimal element, which is what
+    /// sorting a group and taking its head selected.
     pub(crate) fn from_declarations(
         declarations: Vec<CatalogDeclaration>,
         cancellation: &CancellationToken,
     ) -> Option<Self> {
-        #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+        #[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
         struct GroupKey {
             ecosystem: UsageEcosystem,
             fqn: String,
@@ -266,63 +300,95 @@ impl WorkspaceUsageCatalog {
             exact_declaration: Option<DeclarationId>,
         }
 
-        let mut grouped: BTreeMap<GroupKey, Vec<CatalogDeclaration>> = BTreeMap::new();
+        /// One inventory row with its group key and declaration identity
+        /// already computed, so no later pass has to hash it again.
+        ///
+        /// The identity is an `Option` because node construction moves it into
+        /// the node's identity list rather than cloning a second 64-character
+        /// digest per row.
+        struct KeyedDeclaration {
+            key: GroupKey,
+            id: Option<DeclarationId>,
+            unit: CodeUnit,
+            range: Option<Range>,
+        }
+
+        let mut keyed: Vec<KeyedDeclaration> = Vec::with_capacity(declarations.len());
         for (unit, range) in declarations {
             if cancellation.is_cancelled() {
                 return None;
             }
-            if is_graph_declaration(&unit) {
-                let ecosystem = UsageEcosystem::of(language_for_target(&unit));
-                let exact_declaration =
-                    (!matches!(ecosystem, UsageEcosystem::Cpp | UsageEcosystem::CSharp))
-                        .then(|| unit.declaration_id());
-                grouped
-                    .entry(GroupKey {
-                        ecosystem,
-                        fqn: unit.fq_name(),
-                        kind: unit.kind(),
-                        signature: unit.signature().map(str::to_string),
-                        exact_declaration,
-                    })
-                    .or_default()
-                    .push((unit, range));
+            if !is_graph_declaration(&unit) {
+                continue;
             }
+            let ecosystem = UsageEcosystem::of(language_for_target(&unit));
+            let id = declaration_identity(&unit);
+            // C++ and C# merge redeclarations of one entity, so their group key
+            // deliberately omits the exact declaration identity.
+            let exact_declaration =
+                (!matches!(ecosystem, UsageEcosystem::Cpp | UsageEcosystem::CSharp))
+                    .then(|| id.clone());
+            keyed.push(KeyedDeclaration {
+                key: GroupKey {
+                    ecosystem,
+                    fqn: unit.fq_name_str().to_string(),
+                    kind: unit.kind(),
+                    signature: unit.signature().map(str::to_string),
+                    exact_declaration,
+                },
+                id: Some(id),
+                unit,
+                range,
+            });
         }
+        keyed.sort_by(|left, right| left.key.cmp(&right.key));
 
-        let mut nodes = Vec::with_capacity(grouped.len());
-        for (_, mut declarations) in grouped {
+        let mut nodes: Vec<WorkspaceUsageNode> = Vec::new();
+        for group in keyed.chunk_by_mut(|left, right| left.key == right.key) {
             if cancellation.is_cancelled() {
                 return None;
             }
-            declarations.sort_by(|(left, left_range), (right, right_range)| {
-                left.source()
-                    .cmp(right.source())
-                    .then_with(|| {
-                        left_range
-                            .map(|range| range.start_line)
-                            .cmp(&right_range.map(|range| range.start_line))
-                    })
-                    .then_with(|| left.signature().cmp(&right.signature()))
-            });
-            let (primary, primary_range) = declarations
-                .first()
-                .expect("catalog groups are never empty")
-                .clone();
-            let key = WorkspaceUsageNodeKey::for_declaration(&primary);
-            let mut declaration_files: Vec<_> = declarations
+            let primary_index = group
                 .iter()
-                .map(|(unit, _)| unit.source().clone())
+                .enumerate()
+                .min_by(|(_, left), (_, right)| {
+                    left.unit
+                        .source()
+                        .cmp(right.unit.source())
+                        .then_with(|| {
+                            left.range
+                                .map(|range| range.start_line)
+                                .cmp(&right.range.map(|range| range.start_line))
+                        })
+                        .then_with(|| left.unit.signature().cmp(&right.unit.signature()))
+                })
+                .map(|(index, _)| index)
+                .expect("catalog groups are never empty");
+            let mut declaration_files: Vec<_> = group
+                .iter()
+                .map(|declaration| declaration.unit.source().clone())
                 .collect();
             declaration_files.sort();
             declaration_files.dedup();
-            let mut declaration_ids = declarations
-                .iter()
-                .map(|(unit, _)| unit.declaration_id())
-                .collect::<Vec<_>>();
+            let primary = group[primary_index].unit.clone();
+            let primary_range = group[primary_index].range;
+            let ecosystem = group[primary_index].key.ecosystem;
+            let fqn = std::mem::take(&mut group[primary_index].key.fqn);
+            let primary_id = group[primary_index]
+                .id
+                .take()
+                .expect("a row's identity is taken once");
+            let mut declaration_ids = Vec::with_capacity(group.len());
+            declaration_ids.push(primary_id.clone());
+            for declaration in group.iter_mut() {
+                if let Some(id) = declaration.id.take() {
+                    declaration_ids.push(id);
+                }
+            }
             declaration_ids.sort();
             declaration_ids.dedup();
             nodes.push(WorkspaceUsageNode {
-                key,
+                key: WorkspaceUsageNodeKey::with_identity(&primary, ecosystem, primary_id, fqn),
                 primary,
                 primary_range,
                 declaration_files,
@@ -402,6 +468,22 @@ static CATALOG_FILES_ENUMERATED: std::sync::atomic::AtomicUsize =
 #[cfg(test)]
 static CATALOG_CANCEL_AFTER_FILE: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(usize::MAX);
+/// Declaration identities computed while building a catalog.
+///
+/// `CodeUnit::declaration_id` is a SHA-256 over every identity field, and the
+/// grouping used to compute one per row for each place the identity was
+/// needed. This is the cost shape the catalog pins: one identity per inventory
+/// row, not one per row per use of that identity.
+#[cfg(test)]
+static CATALOG_DECLARATION_IDENTITIES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// The declaration identity of `unit`, counted for the cost-shape pin.
+fn declaration_identity(unit: &CodeUnit) -> DeclarationId {
+    #[cfg(test)]
+    CATALOG_DECLARATION_IDENTITIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    unit.declaration_id()
+}
 
 fn primary_range(ranges: &[Range]) -> Option<Range> {
     ranges.iter().copied().min_by_key(range_key)
@@ -696,6 +778,7 @@ mod tests {
     use crate::analyzer::{
         AnalyzerDelegate, JavaAnalyzer, KotlinAnalyzer, MultiAnalyzer, ScalaAnalyzer, TestProject,
     };
+    use std::collections::BTreeMap;
     use std::sync::Arc;
 
     static CATALOG_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -781,11 +864,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn parallel_catalog_enumeration_matches_authoritative_inventory_in_file_sized_work_units() {
-        let _guard = CATALOG_TEST_LOCK.lock().unwrap();
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().canonicalize().unwrap();
+    /// A persisted multi-language workspace, analyzed twice so the second
+    /// analyzer reads the same cache-backed summary projections a warm real
+    /// workspace reads.
+    fn persisted_multilanguage_analyzer(root: std::path::PathBuf) -> MultiAnalyzer {
         ProjectFile::new(root.clone(), "module-info.java")
             .write("module example.module {}\n")
             .unwrap();
@@ -836,7 +918,40 @@ mod tests {
         // The first generation persists the fixture. The second exercises the
         // same cache-backed summary projections used by a warm real workspace.
         drop(make_analyzer());
-        let analyzer = make_analyzer();
+        make_analyzer()
+    }
+
+    /// Every catalog field a graph consumer can observe on one node.
+    type CatalogNodeFields = (
+        WorkspaceUsageNodeKey,
+        CodeUnit,
+        Option<Range>,
+        Vec<ProjectFile>,
+        Vec<DeclarationId>,
+    );
+
+    fn catalog_node_fields(catalog: &WorkspaceUsageCatalog) -> Vec<CatalogNodeFields> {
+        catalog
+            .nodes
+            .iter()
+            .map(|node| {
+                (
+                    node.key.clone(),
+                    node.primary.clone(),
+                    node.primary_range,
+                    node.declaration_files.clone(),
+                    node.declaration_ids.clone(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn parallel_catalog_enumeration_matches_authoritative_inventory_in_file_sized_work_units() {
+        let _guard = CATALOG_TEST_LOCK.lock().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let analyzer = persisted_multilanguage_analyzer(root);
 
         let mut authoritative = analyzer.all_declarations_with_primary_ranges();
         for file in analyzer.analyzed_files() {
@@ -855,32 +970,8 @@ mod tests {
 
         CATALOG_FILES_ENUMERATED.store(0, std::sync::atomic::Ordering::Relaxed);
         let actual = WorkspaceUsageCatalog::build(&analyzer);
-        let expected_nodes = expected
-            .nodes
-            .iter()
-            .map(|node| {
-                (
-                    node.key.clone(),
-                    node.primary.clone(),
-                    node.primary_range,
-                    node.declaration_files.clone(),
-                    node.declaration_ids.clone(),
-                )
-            })
-            .collect::<Vec<_>>();
-        let actual_nodes = actual
-            .nodes
-            .iter()
-            .map(|node| {
-                (
-                    node.key.clone(),
-                    node.primary.clone(),
-                    node.primary_range,
-                    node.declaration_files.clone(),
-                    node.declaration_ids.clone(),
-                )
-            })
-            .collect::<Vec<_>>();
+        let expected_nodes = catalog_node_fields(&expected);
+        let actual_nodes = catalog_node_fields(&actual);
         assert_eq!(
             actual_nodes, expected_nodes,
             "per-file enumeration must preserve exact catalog identity, ranges, duplicates, and order"
@@ -933,5 +1024,256 @@ mod tests {
             "cancellation after one completed file must discard every parallel batch"
         );
         CATALOG_CANCEL_AFTER_FILE.store(usize::MAX, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The grouping this file replaced, written out as an independent oracle.
+    ///
+    /// This is the sequential `BTreeMap` walk `from_declarations` used before
+    /// #2935: one ordered map keyed by ecosystem, rendered name, kind,
+    /// signature, and exact declaration identity; each group sorted by source
+    /// file, primary start line, and signature; the head of that sort as the
+    /// node's primary; nodes ordered by declaration identity.
+    fn reference_catalog_nodes(declarations: Vec<CatalogDeclaration>) -> Vec<CatalogNodeFields> {
+        #[derive(PartialEq, Eq, PartialOrd, Ord)]
+        struct ReferenceGroupKey {
+            ecosystem: UsageEcosystem,
+            fqn: String,
+            kind: crate::analyzer::CodeUnitType,
+            signature: Option<String>,
+            exact_declaration: Option<DeclarationId>,
+        }
+
+        let mut grouped: BTreeMap<ReferenceGroupKey, Vec<CatalogDeclaration>> = BTreeMap::new();
+        for (unit, range) in declarations {
+            if !is_graph_declaration(&unit) {
+                continue;
+            }
+            let ecosystem = UsageEcosystem::of(language_for_target(&unit));
+            let exact_declaration =
+                (!matches!(ecosystem, UsageEcosystem::Cpp | UsageEcosystem::CSharp))
+                    .then(|| unit.declaration_id());
+            grouped
+                .entry(ReferenceGroupKey {
+                    ecosystem,
+                    fqn: unit.fq_name(),
+                    kind: unit.kind(),
+                    signature: unit.signature().map(str::to_string),
+                    exact_declaration,
+                })
+                .or_default()
+                .push((unit, range));
+        }
+
+        let mut nodes = Vec::with_capacity(grouped.len());
+        for (_, mut declarations) in grouped {
+            declarations.sort_by(|(left, left_range), (right, right_range)| {
+                left.source()
+                    .cmp(right.source())
+                    .then_with(|| {
+                        left_range
+                            .map(|range| range.start_line)
+                            .cmp(&right_range.map(|range| range.start_line))
+                    })
+                    .then_with(|| left.signature().cmp(&right.signature()))
+            });
+            let (primary, primary_range) = declarations.first().expect("non-empty group").clone();
+            let ecosystem = UsageEcosystem::of(language_for_target(&primary));
+            let key = WorkspaceUsageNodeKey {
+                id: primary.declaration_id(),
+                ecosystem,
+                fqn: primary.fq_name(),
+                defining_file: ecosystem
+                    .is_module_scoped()
+                    .then(|| primary.source().clone()),
+            };
+            let mut declaration_files: Vec<_> = declarations
+                .iter()
+                .map(|(unit, _)| unit.source().clone())
+                .collect();
+            declaration_files.sort();
+            declaration_files.dedup();
+            let mut declaration_ids: Vec<_> = declarations
+                .iter()
+                .map(|(unit, _)| unit.declaration_id())
+                .collect();
+            declaration_ids.sort();
+            declaration_ids.dedup();
+            nodes.push((
+                key,
+                primary,
+                primary_range,
+                declaration_files,
+                declaration_ids,
+            ));
+        }
+        nodes.sort_by(|left, right| left.0.id.cmp(&right.0.id));
+        nodes
+    }
+
+    /// Two C++ declarations of one entity, in a header and its translation
+    /// unit.
+    ///
+    /// C++ and C# omit the exact declaration identity from the group key, so
+    /// these land in one node. That is the only shape that exercises duplicate
+    /// grouping, primary selection among several rows, and the file/identity
+    /// deduplication -- the JVM fixture's rows are all exact identities, so
+    /// every one of its groups holds exactly one row.
+    fn cpp_redeclaration_pair(root: &std::path::Path) -> Vec<CatalogDeclaration> {
+        let signature = Some("void Widget::draw()".to_string());
+        let declaration = |rel_path: &str, start_line: usize| {
+            (
+                CodeUnit::with_signature(
+                    ProjectFile::new(root.to_path_buf(), rel_path),
+                    crate::analyzer::CodeUnitType::Function,
+                    "widgets",
+                    "Widget.draw",
+                    signature.clone(),
+                    false,
+                ),
+                Some(Range {
+                    start_byte: start_line * 40,
+                    end_byte: start_line * 40 + 20,
+                    start_line,
+                    end_line: start_line,
+                }),
+            )
+        };
+        // Deliberately enumerated header first while `lib/widget.cpp` sorts
+        // first, so primary selection is decided by source order and not by
+        // the order the rows arrived in.
+        vec![
+            declaration("lib/widget.h", 4),
+            declaration("lib/widget.cpp", 12),
+        ]
+    }
+
+    /// The inventory the parity and cost-shape tests group: every persisted
+    /// declaration of the multi-language fixture, its Java module descriptor,
+    /// and one C++ redeclaration pair.
+    fn parity_inventory(
+        analyzer: &MultiAnalyzer,
+        root: &std::path::Path,
+    ) -> Vec<CatalogDeclaration> {
+        let mut declarations = analyzer.all_declarations_with_primary_ranges();
+        for file in analyzer.analyzed_files() {
+            if is_java_module_descriptor_file(&file) {
+                let file_scope = CodeUnit::file_scope(file.clone());
+                let range = analyzer
+                    .ranges(&file_scope)
+                    .into_iter()
+                    .min_by_key(range_key);
+                declarations.push((file_scope, range));
+            }
+        }
+        declarations.extend(cpp_redeclaration_pair(root));
+        declarations
+    }
+
+    #[test]
+    fn catalog_grouping_matches_the_ordered_map_reference_grouping() {
+        let _guard = CATALOG_TEST_LOCK.lock().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let analyzer = persisted_multilanguage_analyzer(root.clone());
+        let declarations = parity_inventory(&analyzer, &root);
+        assert!(
+            declarations.len() > 8,
+            "the parity fixture must carry enough rows to exercise grouping: {declarations:?}"
+        );
+
+        let expected = reference_catalog_nodes(declarations.clone());
+        let actual =
+            WorkspaceUsageCatalog::from_declarations(declarations, &CancellationToken::default())
+                .expect("uncancelled catalog");
+
+        assert_eq!(
+            catalog_node_fields(&actual),
+            expected,
+            "the grouping rewrite must reproduce the ordered-map grouping exactly: identity, \
+             primary, primary range, duplicate files, duplicate identities, and node order"
+        );
+
+        // The C++ redeclarations are one node whose primary is the header, and
+        // the node is reachable by either declaration identity.
+        let merged = actual
+            .nodes
+            .iter()
+            .find(|node| node.declaration_files.len() == 2)
+            .expect("the C++ redeclaration pair must group into one node");
+        assert_eq!(
+            merged.primary.source().rel_path(),
+            std::path::Path::new("lib/widget.cpp"),
+            "primary selection must take the first declaration in source order, not enumeration \
+             order: {files:?}",
+            files = merged.declaration_files
+        );
+        assert_eq!(merged.declaration_ids.len(), 2, "{:?}", merged.primary);
+        for id in &merged.declaration_ids {
+            assert_eq!(
+                actual.index_for_id(id),
+                actual.index_for_id(&merged.key.id),
+                "every identity in a merged node must index that node"
+            );
+        }
+    }
+
+    /// The cost shape the parallel grouping exists to fix.
+    ///
+    /// The ordered-map grouping hashed each row's declaration identity about
+    /// three times -- once for the group key, once for the node key, once for
+    /// the node's identity list -- and `declaration_id` is a SHA-256 over
+    /// every identity field. Grouping now makes one identity pass over the row
+    /// set and carries the result through, so this pins one identity per graph
+    /// declaration and no more.
+    #[test]
+    fn catalog_grouping_makes_one_identity_pass_over_the_row_set() {
+        let _guard = CATALOG_TEST_LOCK.lock().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let analyzer = persisted_multilanguage_analyzer(root.clone());
+        let declarations = parity_inventory(&analyzer, &root);
+        let graph_rows = declarations
+            .iter()
+            .filter(|(unit, _)| is_graph_declaration(unit))
+            .count();
+        assert!(graph_rows > 0, "the fixture must produce graph rows");
+
+        CATALOG_DECLARATION_IDENTITIES.store(0, std::sync::atomic::Ordering::Relaxed);
+        let catalog =
+            WorkspaceUsageCatalog::from_declarations(declarations, &CancellationToken::default())
+                .expect("uncancelled catalog");
+        assert_eq!(
+            CATALOG_DECLARATION_IDENTITIES.load(std::sync::atomic::Ordering::Relaxed),
+            graph_rows,
+            "grouping {} rows into {} nodes must compute exactly one declaration identity per row",
+            graph_rows,
+            catalog.nodes.len()
+        );
+    }
+
+    /// Grouping is complete-or-nothing, like enumeration.
+    ///
+    /// The token trips after a fixed number of checks, so it cancels while
+    /// grouping is partway through the row set.
+    #[test]
+    fn catalog_grouping_publishes_nothing_when_the_token_trips_partway() {
+        let _guard = CATALOG_TEST_LOCK.lock().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let analyzer = persisted_multilanguage_analyzer(root.clone());
+        let declarations = parity_inventory(&analyzer, &root);
+
+        let token = CancellationToken::cancel_after_checks_for_test(3);
+        assert!(
+            WorkspaceUsageCatalog::from_declarations(declarations.clone(), &token).is_none(),
+            "a token that trips partway through grouping must discard the whole catalog"
+        );
+
+        // The same rows still build a complete catalog once nothing cancels,
+        // so the check above failed on cancellation and not on the fixture.
+        assert!(
+            WorkspaceUsageCatalog::from_declarations(declarations, &CancellationToken::default())
+                .is_some()
+        );
     }
 }

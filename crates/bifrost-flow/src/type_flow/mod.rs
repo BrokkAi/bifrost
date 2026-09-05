@@ -18,12 +18,14 @@ mod field_slots;
 mod plan;
 mod report;
 mod solve;
+mod summary;
 
 pub use crate::analyzer::semantic::{SourceSite, SourceSiteKind};
 pub use field_slots::{FieldSlot, FieldSlotIndex};
-pub use plan::{MemberAccessSite, TypeFlowPlan, TypeFlowPlanError};
+pub use plan::{MemberAccessSite, ProcedureDispatchReadContract, TypeFlowPlan, TypeFlowPlanError};
 pub use report::{TypeFlowReport, solve_type_flow_workspace};
 pub use solve::{
     AbsentMemberFinding, ClassSetStatus, FeedbackLimits, ReceiverClassSet, TypeFlowError,
     TypeFlowRootResult, solve_type_flow_for_root,
 };
+pub use summary::TypeFlowSummaryState;

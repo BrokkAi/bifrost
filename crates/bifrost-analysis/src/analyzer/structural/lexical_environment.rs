@@ -34,7 +34,7 @@ use super::occurrence_rows::ast_id;
 use super::occurrences::{Namespace, OccurrenceRole};
 use super::resolution::{
     BindingKind, BoundaryStatus, DeclaredVisibility, EnvironmentAxis, HoistingClass,
-    LexicalEnvironmentSupport,
+    ImportActivation, LexicalEnvironmentSupport,
 };
 use super::spec::StructuralSpec;
 use crate::analyzer::common::language_for_file;
@@ -421,12 +421,12 @@ pub fn environment_for_file(analyzer: &dyn IAnalyzer, file: &ProjectFile) -> Env
     }
     if support.is_supported(EnvironmentAxis::ImportBinders) && !scopes.is_empty() {
         bindings.extend(import_binder_rows(
+            spec,
             analyzer,
             token,
             file,
             &facts,
             &scopes,
-            language,
             &mut reasons,
         ));
     }
@@ -630,12 +630,12 @@ fn binding_rows(
 /// an import's tokens as `ImportTarget`/`ImportAlias`, never as `Binder`, so
 /// the two row sources are disjoint by construction.
 fn import_binder_rows(
+    spec: &dyn StructuralSpec,
     analyzer: &dyn IAnalyzer,
     token: QueryToken<'_>,
     file: &ProjectFile,
     facts: &FileFacts,
     scopes: &[ScopeRow],
-    language: Language,
     reasons: &mut Vec<EnvironmentIncompleteReason>,
 ) -> Vec<BindingRow> {
     let Some(provider) = analyzer.import_analysis_provider_for_file(file) else {
@@ -661,10 +661,28 @@ fn import_binder_rows(
             .as_ref()
             .map_or(0, |path| path.declaration_start_byte);
         let declaring_scope = import_scope(import, scopes);
-        let node = import_binder_node(facts, declaration_start, local_name, import.binder_span);
-        let range = node.map_or(scopes[declaring_scope as usize].range, |node| {
-            facts.node(node).range
+        let scope = &scopes[declaring_scope as usize];
+        let declaration = import_declaration_fact(facts, declaration_start);
+        let node = declaration.and_then(|declaration| {
+            import_binder_node(facts, declaration, local_name, import.binder_span)
         });
+        let range = node.map_or(scope.range, |node| facts.node(node).range);
+        // Which bytes the imported name is in effect over is the adapter's
+        // answer, not this layer's: a Scala block-local import starts at the
+        // import statement where every other language's import is in effect
+        // over its whole scope. An import whose declaration is not a fact of
+        // this file has no position to activate from, so it keeps the
+        // scope-wide interval rather than a guessed one.
+        let activation = declaration.map_or_else(
+            || ImportActivation::scope_wide(scope.range),
+            |declaration| {
+                spec.import_binder_activation(
+                    facts.node(declaration).range,
+                    scope.range,
+                    scope.anchor.kind(),
+                )
+            },
+        );
         rows.push(BindingRow {
             file: file.clone(),
             content_identity,
@@ -672,13 +690,9 @@ fn import_binder_rows(
             range,
             name: local_name.to_owned(),
             kind: BindingKind::ImportBinder,
-            // An import is in effect over the whole scope it is written in,
-            // whatever the position of the reference: every claimed language
-            // either hoists imports to the top of their scope or requires
-            // them there.
-            hoisting: HoistingClass::ScopeWide,
+            hoisting: activation.hoisting,
             declaring_scope,
-            activation: scopes[declaring_scope as usize].range,
+            activation: activation.activation,
             source_order: 0,
             visibility: DeclaredVisibility::Unknown,
             import: Some(ImportBinderDetail {
@@ -695,7 +709,7 @@ fn import_binder_rows(
                     .map(|path| path.segments.clone())
                     .unwrap_or_default(),
                 wildcard: import.is_wildcard,
-                wildcard_ambiguous: wildcard_ambiguity(language, import, wildcard_count),
+                wildcard_ambiguous: wildcard_ambiguity(spec.language(), import, wildcard_count),
                 boundary: BoundaryStatus::ExternalUnknown,
             }),
         });
@@ -761,36 +775,45 @@ fn import_scope(import: &ImportInfo, scopes: &[ScopeRow]) -> u32 {
         .map_or(0, |scope| scope.index)
 }
 
+/// The arena node of the import declaration that starts at
+/// `declaration_start`, which is both the subtree a binder token is looked for
+/// inside and the interval the adapter states an activation from.
+///
+/// `None` when the declaration is not a fact of this file, which is the case
+/// for an import whose parser recorded no structured path: the row then has no
+/// start byte to be found by.
+fn import_declaration_fact(facts: &FileFacts, declaration_start: usize) -> Option<u32> {
+    (0..facts.nodes().len())
+        .map(|node| u32::try_from(node).expect("facts arena node count fits in u32"))
+        .find(|&node| {
+            let normalized = facts.node(node);
+            normalized.kind == NormalizedKind::Import
+                && normalized.range.start_byte == declaration_start
+        })
+}
+
 /// The arena node of the token that spells an import's local name, so an
 /// import binding carries the same AST identity as any other row over that
 /// token. `None` when the import's local name is not spelled by a classified
 /// token (a wildcard has no local name token, and a desugared tail may sit
 /// inside a compound path node).
 ///
-/// The candidate set is structural: the import declaration is found by its own
-/// start byte, and only tokens inside that declaration's arena subtree that
-/// carry an import role are considered. When the adapter recorded the binder
-/// token's byte span on `ImportInfo` (#1600), the binder is the candidate at
-/// exactly that span -- a purely structural join. Only when the adapter
-/// recorded no span does choosing fall back to a spelling comparison: a
-/// statement that introduces several names (`from pkg import alpha, beta`)
-/// yields several `ImportInfo` rows sharing one declaration start, and the
-/// name is then all that tells them apart. The fallback never leaves the
-/// declaration it is about.
+/// The candidate set is structural: only tokens inside the `import`
+/// declaration's arena subtree that carry an import role are considered. When
+/// the adapter recorded the binder token's byte span on `ImportInfo` (#1600),
+/// the binder is the candidate at exactly that span -- a purely structural
+/// join. Only when the adapter recorded no span does choosing fall back to a
+/// spelling comparison: a statement that introduces several names (`from pkg
+/// import alpha, beta`) yields several `ImportInfo` rows sharing one
+/// declaration start, and the name is then all that tells them apart. The
+/// fallback never leaves the declaration it is about.
 fn import_binder_node(
     facts: &FileFacts,
-    declaration_start: usize,
+    import: u32,
     local_name: &str,
     binder_span: Option<Span>,
 ) -> Option<u32> {
     let source = facts.source();
-    let import = (0..facts.nodes().len())
-        .map(|node| u32::try_from(node).expect("facts arena node count fits in u32"))
-        .find(|&node| {
-            let normalized = facts.node(node);
-            normalized.kind == NormalizedKind::Import
-                && normalized.range.start_byte == declaration_start
-        })?;
     (import + 1..facts.subtree_end(import)).find(|&node| {
         let roles = facts.occurrence_roles(node);
         let alias_or_target = roles.contains(&OccurrenceRole::ImportAlias)
@@ -1326,6 +1349,13 @@ mod tests {
         let alpha = binding(&env, "alpha");
         assert_eq!(beta.kind, BindingKind::ImportBinder);
         assert_eq!(alpha.kind, BindingKind::ImportBinder);
+        // Both rows keep the scope-wide interval the shared default states:
+        // Python does not override `import_binder_activation`, so #2925 left
+        // its rows exactly as they were.
+        assert_eq!(beta.hoisting, HoistingClass::ScopeWide);
+        assert_eq!(alpha.hoisting, HoistingClass::ScopeWide);
+        assert_eq!(beta.activation, env.scopes[0].range);
+        assert_eq!(alpha.activation, env.scopes[0].range);
         assert_eq!(
             beta.range.start_byte,
             fixture.at("beta,"),
@@ -1339,6 +1369,59 @@ mod tests {
         assert_ne!(
             beta.node, alpha.node,
             "two rows of one declaration keep distinct AST identities"
+        );
+    }
+
+    /// The activation an import binder carries is the adapter's answer
+    /// (#2925), and every adapter but Scala's takes the scope-wide default.
+    /// A Python `import` written inside a function body is the sharpest pin
+    /// on that default: its declaring scope is the body block, and the row
+    /// still covers the whole block rather than starting at the statement.
+    #[test]
+    fn a_python_function_local_import_keeps_the_scope_wide_default() {
+        let source = concat!(
+            "def render(path):\n",
+            "    import os\n",
+            "    return os.path.join(path)\n",
+        );
+        let fixture = Fixture::new(Language::Python, "src/app.py", source);
+        let env = fixture.environment();
+
+        let os = binding(&env, "os");
+        assert_eq!(os.kind, BindingKind::ImportBinder);
+        assert_eq!(os.hoisting, HoistingClass::ScopeWide);
+        let block = env.scope(os.declaring_scope);
+        assert_eq!(
+            os.activation, block.range,
+            "the row covers its whole declaring scope: {block:?}"
+        );
+        assert_eq!(
+            reached(&env, "os", fixture.at("os.path.join")).node,
+            os.node
+        );
+    }
+
+    /// The same pin for TypeScript, whose imports are hoisted module bindings.
+    #[test]
+    fn a_typescript_import_binder_keeps_the_scope_wide_default() {
+        let source = concat!(
+            "import { helper } from \"./helper\";\n",
+            "\n",
+            "export function render(label: string): string {\n",
+            "    return helper(label);\n",
+            "}\n",
+        );
+        let fixture = Fixture::new(Language::TypeScript, "src/app.ts", source);
+        let env = fixture.environment();
+
+        let helper = binding(&env, "helper");
+        assert_eq!(helper.kind, BindingKind::ImportBinder);
+        assert_eq!(helper.hoisting, HoistingClass::ScopeWide);
+        assert_eq!(helper.declaring_scope, 0);
+        assert_eq!(helper.activation, env.scopes[0].range);
+        assert_eq!(
+            reached(&env, "helper", fixture.at("helper(label)")).node,
+            helper.node
         );
     }
 
@@ -1563,6 +1646,155 @@ mod tests {
             Some(NormalizedKind::Method)
         );
         assert!(env.package.syntactic, "Scala spells its package in source");
+    }
+
+    /// A Scala `import` is a statement, so one written inside a block is in
+    /// effect from the import onward and not from the block's first byte. A
+    /// file-level import stays scope-wide, which is what every other language
+    /// reports for every import (#2925).
+    #[test]
+    fn a_scala_block_local_import_is_in_effect_only_below_the_import() {
+        let source = concat!(
+            "package app\n",
+            "\n",
+            "import scala.util.Try\n",
+            "\n",
+            "object Host {\n",
+            "  def run(seed: Int): Int = {\n",
+            "    val guarded = Try(seed).getOrElse(0)\n",
+            "    import scala.math.max\n",
+            "    max(guarded, 2)\n",
+            "  }\n",
+            "}\n",
+        );
+        let fixture = Fixture::new(Language::Scala, "src/Host.scala", source);
+        let env = fixture.environment();
+        assert!(env.completeness.is_complete(), "{:?}", env.completeness);
+
+        let file_level = binding(&env, "Try");
+        assert_eq!(file_level.kind, BindingKind::ImportBinder);
+        assert_eq!(file_level.hoisting, HoistingClass::ScopeWide);
+        assert_eq!(file_level.declaring_scope, 0);
+        assert_eq!(file_level.activation, env.scopes[0].range);
+
+        let block_local = binding(&env, "max");
+        assert_eq!(block_local.kind, BindingKind::ImportBinder);
+        assert_eq!(block_local.hoisting, HoistingClass::SourceOrder);
+        let block = env.scope(block_local.declaring_scope);
+        assert_eq!(
+            block.anchor.kind(),
+            Some(NormalizedKind::Block),
+            "a block-local import is declared in the block: {block:?}"
+        );
+        assert_eq!(
+            block_local.activation.start_byte,
+            fixture.at("import scala.math.max") + "import scala.math.max".len(),
+            "the import is in effect from the end of its own statement"
+        );
+        assert_eq!(block_local.activation.end_byte, block.range.end_byte);
+
+        assert_eq!(
+            binding_of(&env, "max", fixture.at("Try(seed)"), None),
+            BindingOfOutcome::NoBinding,
+            "a read above the import reaches no binding of the imported name"
+        );
+        assert_eq!(
+            reached(&env, "max", fixture.at("max(guarded")).node,
+            block_local.node,
+            "a read below the import reaches it"
+        );
+        assert_eq!(
+            reached(&env, "Try", fixture.at("Try(seed)")).node,
+            file_level.node,
+            "the file-level import reaches the whole file"
+        );
+    }
+
+    /// A `given` and an `extension` are scopes of their own, so their
+    /// parameters bind inside the definition rather than being excluded as
+    /// members of the template they are written in (#2925).
+    #[test]
+    fn scala_given_and_extension_parameters_bind_inside_their_definition() {
+        let source = concat!(
+            "package app\n",
+            "\n",
+            "trait Ord[T]\n",
+            "\n",
+            "object Host {\n",
+            "  given ordering(using base: Int): Ord[Int] = build(base)\n",
+            "\n",
+            "  extension (value: String) {\n",
+            "    def twice(sep: String): String = value + sep + value\n",
+            "  }\n",
+            "}\n",
+        );
+        let fixture = Fixture::new(Language::Scala, "src/Host.scala", source);
+        let env = fixture.environment();
+        assert!(env.completeness.is_complete(), "{:?}", env.completeness);
+
+        let template = env
+            .scopes
+            .iter()
+            .find(|scope| scope.anchor.kind() == Some(NormalizedKind::Class))
+            .unwrap_or_else(|| panic!("the object is a scope: {:?}", env.scopes));
+
+        let base = binding(&env, "base");
+        assert_eq!(base.kind, BindingKind::Parameter);
+        assert_eq!(base.hoisting, HoistingClass::ScopeWide);
+        let given = env.scope(base.declaring_scope);
+        assert_ne!(
+            given.index, template.index,
+            "a given parameter is not a member of the enclosing object: {given:?}"
+        );
+        assert_eq!(
+            &source[given.range.start_byte..given.range.end_byte],
+            "given ordering(using base: Int): Ord[Int] = build(base)"
+        );
+        assert_eq!(base.activation, given.range);
+
+        let value = binding(&env, "value");
+        assert_eq!(value.kind, BindingKind::Parameter);
+        assert_eq!(value.hoisting, HoistingClass::ScopeWide);
+        let extension = env.scope(value.declaring_scope);
+        assert_ne!(
+            extension.index, template.index,
+            "an extension parameter is not a member of the enclosing object: {extension:?}"
+        );
+        assert!(
+            source[extension.range.start_byte..extension.range.end_byte]
+                .starts_with("extension (value: String)"),
+            "the extension group is the scope: {extension:?}"
+        );
+        assert_eq!(value.activation, extension.range);
+
+        let sep = binding(&env, "sep");
+        assert_eq!(sep.kind, BindingKind::Parameter);
+        assert_eq!(
+            env.scope(sep.declaring_scope).anchor.kind(),
+            Some(NormalizedKind::Method),
+            "the extension method scopes its own parameters"
+        );
+
+        assert_eq!(
+            reached(&env, "base", fixture.at("build(base)") + "build(".len()).node,
+            base.node,
+            "the given parameter is reached in the given's body"
+        );
+        assert_eq!(
+            binding_of(&env, "base", fixture.at("value + sep"), None),
+            BindingOfOutcome::NoBinding,
+            "and nowhere else"
+        );
+        assert_eq!(
+            reached(&env, "value", fixture.at("value + sep")).node,
+            value.node,
+            "the extension parameter is reached in the extension method's body"
+        );
+        assert_eq!(
+            binding_of(&env, "value", fixture.at("build(base)"), None),
+            BindingOfOutcome::NoBinding,
+            "and nowhere else"
+        );
     }
 
     /// An adapter that declares no environment support reports every axis

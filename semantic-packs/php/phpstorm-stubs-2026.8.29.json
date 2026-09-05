@@ -1,0 +1,141 @@
+{
+  "schema_version": 1,
+  "pack_id": "bifrost.php-builtin",
+  "pack_version": "2026.9.4",
+  "ecosystem": "php",
+  "kind": {
+    "artifact_kind": "php_declaration_stub",
+    "stubs": [
+      "Core/Core.php",
+      "Core/Core_c.php",
+      "Core/Core_d.php",
+      "PDO/PDO.php",
+      "Reflection/PropertyHookType.php",
+      "Reflection/Reflection.php",
+      "Reflection/ReflectionAttribute.php",
+      "Reflection/ReflectionClass.php",
+      "Reflection/ReflectionClassConstant.php",
+      "Reflection/ReflectionConstant.php",
+      "Reflection/ReflectionEnum.php",
+      "Reflection/ReflectionEnumBackedCase.php",
+      "Reflection/ReflectionEnumUnitCase.php",
+      "Reflection/ReflectionException.php",
+      "Reflection/ReflectionExtension.php",
+      "Reflection/ReflectionFiber.php",
+      "Reflection/ReflectionFunction.php",
+      "Reflection/ReflectionFunctionAbstract.php",
+      "Reflection/ReflectionGenerator.php",
+      "Reflection/ReflectionIntersectionType.php",
+      "Reflection/ReflectionMethod.php",
+      "Reflection/ReflectionNamedType.php",
+      "Reflection/ReflectionObject.php",
+      "Reflection/ReflectionParameter.php",
+      "Reflection/ReflectionProperty.php",
+      "Reflection/ReflectionReference.php",
+      "Reflection/ReflectionType.php",
+      "Reflection/ReflectionUnionType.php",
+      "Reflection/ReflectionZendExtension.php",
+      "Reflection/Reflector.php",
+      "SPL/SPL.php",
+      "SPL/SPL_c1.php",
+      "SPL/SPL_f.php",
+      "ctype/ctype.php",
+      "date/date.php",
+      "date/date_c.php",
+      "date/date_d.php",
+      "intl/IntlChar.php",
+      "intl/IntlDatePatternGenerator.php",
+      "intl/IntlListFormatter.php",
+      "intl/IntlNumberRangeFormatter.php",
+      "intl/intl.php",
+      "json/json.php",
+      "mbstring/mbstring.php",
+      "pcre/pcre.php",
+      "redis/Redis.php",
+      "redis/RedisArray.php",
+      "redis/RedisCluster.php",
+      "redis/RedisSentinel.php",
+      "standard/_standard_manual.php",
+      "standard/basic.php",
+      "standard/password.php",
+      "standard/standard_0.php",
+      "standard/standard_1.php",
+      "standard/standard_10.php",
+      "standard/standard_2.php",
+      "standard/standard_3.php",
+      "standard/standard_4.php",
+      "standard/standard_5.php",
+      "standard/standard_6.php",
+      "standard/standard_7.php",
+      "standard/standard_8.php",
+      "standard/standard_9.php",
+      "standard/standard_defines.php",
+      "standard/streams.php"
+    ]
+  },
+  "artifact": {
+    "file_name": "phpstorm-stubs-748ab87d1625",
+    "sha256": "270cfce465ac9e1de4abaa4f1facf70982f1becf70e040635f0519bd4a773bb9",
+    "url": "https://github.com/JetBrains/phpstorm-stubs/archive/748ab87d16253a5b5d648b5fe4dae1ff4152bb03.tar.gz",
+    "container": null
+  },
+  "compatibility": {
+    "bifrost": ">=0.11.0, <1.0.0",
+    "toolchains": [
+      {
+        "name": "php",
+        "requirement": ">=8.0.0, <9.0.0"
+      }
+    ]
+  },
+  "activation": [
+    {
+      "toolchain": {
+        "name": "php",
+        "version": ">=8.0.0, <9.0.0"
+      },
+      "targets": [],
+      "configurations": []
+    }
+  ],
+  "provenance": {
+    "source": "https://github.com/JetBrains/phpstorm-stubs",
+    "revision": "748ab87d16253a5b5d648b5fe4dae1ff4152bb03"
+  },
+  "license": "Apache-2.0",
+  "safety": {
+    "generated_code_only": false,
+    "review_required": false
+  },
+  "notices": [
+    "notices/phpstorm-stubs-2026.8.29.txt"
+  ],
+  "measurement_activation": {
+    "toolchain": {
+      "name": "php",
+      "version": "=8.3.0"
+    },
+    "targets": [],
+    "configurations": []
+  },
+  "measurement_queries": [
+    {
+      "kind": "type",
+      "name": "PDO"
+    },
+    {
+      "kind": "type",
+      "name": "Redis"
+    },
+    {
+      "kind": "member",
+      "owner": "PDO",
+      "name": "prepare"
+    },
+    {
+      "kind": "member",
+      "owner": "_php_global_",
+      "name": "substr"
+    }
+  ]
+}

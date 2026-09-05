@@ -281,6 +281,50 @@ pub struct BindingActivation {
     pub activation: Range,
 }
 
+/// When the local name an import introduces starts being in effect, and over
+/// which bytes.
+///
+/// An import binder's [`BindingKind`] is never in question -- it is always
+/// [`BindingKind::ImportBinder`] -- so this states only the two things a
+/// language decides. Most languages either hoist an import over the whole
+/// scope it is written in or require it at that scope's top, which is why
+/// [`Self::scope_wide`] is the trait default. Scala is the exception the shape
+/// exists for: an `import` written inside a block is in effect from the import
+/// statement to the end of that block, not from the block's first byte
+/// (#2925).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ImportActivation {
+    pub hoisting: HoistingClass,
+    /// The byte interval in which the imported name is in effect. Always
+    /// contained in the declaring scope's range.
+    pub activation: Range,
+}
+
+impl ImportActivation {
+    /// In effect over the whole scope the import is written in, whatever the
+    /// position of the reference.
+    pub const fn scope_wide(scope: Range) -> Self {
+        Self {
+            hoisting: HoistingClass::ScopeWide,
+            activation: scope,
+        }
+    }
+
+    /// In effect from the end of the import declaration to the end of the
+    /// scope it is written in, which is what a block-local import states.
+    pub const fn from_declaration(declaration: Range, scope: Range) -> Self {
+        Self {
+            hoisting: HoistingClass::SourceOrder,
+            activation: Range {
+                start_byte: declaration.end_byte,
+                end_byte: scope.end_byte,
+                start_line: declaration.end_line,
+                end_line: scope.end_line,
+            },
+        }
+    }
+}
+
 /// What happened to one candidate the resolver considered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

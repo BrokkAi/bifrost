@@ -1228,12 +1228,9 @@ mod tests {
         assert!(inner_to_outer, "rows: {:?}", rows.rows);
     }
 
-    /// A JS facade that imports a name and exports it produces an export
-    /// row whose target is the origin declaration in the other file — the
-    /// resolver follows the local import binding across files. The
-    /// single-statement `export ... from` form resolves to nothing today (a
-    /// resolver gap the adapter's unclaimed re-export relation records), so
-    /// this fixture pins the two-statement facade shape.
+    /// A JS facade that imports a name and exports it produces both an import
+    /// row for the specifier and an export row for the re-publication, each
+    /// pointing at the origin declaration in the other file.
     #[test]
     fn js_export_of_imported_name_reaches_the_origin() {
         let fixture = Fixture::new(
@@ -1253,10 +1250,76 @@ mod tests {
             panic!("export target must be a declaration");
         };
         assert_eq!(target.source(), &fixture.files[1]);
-        assert!(
-            !rows.completeness.covers(RouteHopKind::ReExport),
-            "the unclaimed re-export relation must not read as covered"
+
+        let imports = rows_of_kind(&rows, RouteHopKind::Import);
+        assert_eq!(imports.len(), 1, "rows: {:?}", rows.rows);
+        let RouteEndpoint::Declaration(imported) = &imports[0].to else {
+            panic!("import target must be a declaration");
+        };
+        assert_eq!(imported.source(), &fixture.files[1]);
+    }
+
+    /// The one-statement facade. Its specifier resolves through the module
+    /// specifier to the origin (#1648), so the file states one re-export row
+    /// and no plain import row: the adapter classifies a token under an
+    /// `export ... from` as a re-export, not an import.
+    #[test]
+    fn js_one_statement_facade_yields_a_reexport_row() {
+        let fixture = Fixture::new(
+            Language::JavaScript,
+            &[
+                ("index.js", "export { widget } from './widget.js';\n"),
+                ("widget.js", "export function widget() { return 1; }\n"),
+            ],
         );
+        let rows = fixture.rows(0);
+        assert!(
+            rows.completeness.covers(RouteHopKind::ReExport),
+            "the re-export relation is claimed: {:?}",
+            rows.completeness
+        );
+        let reexports = rows_of_kind(&rows, RouteHopKind::ReExport);
+        assert_eq!(reexports.len(), 1, "rows: {:?}", rows.rows);
+        let RouteEndpoint::Declaration(target) = &reexports[0].to else {
+            panic!("re-export target must be a declaration");
+        };
+        assert_eq!(target.source(), &fixture.files[1]);
+        assert!(
+            rows_of_kind(&rows, RouteHopKind::Import).is_empty(),
+            "an `export ... from` token is a re-export, not an import: {:?}",
+            rows.rows
+        );
+    }
+
+    /// `import { a as b }` respells one target, so the alias token gets its
+    /// own row beside the import row, both pointing at the origin.
+    #[test]
+    fn js_aliased_import_yields_import_and_alias_rows() {
+        let fixture = Fixture::new(
+            Language::JavaScript,
+            &[
+                (
+                    "index.js",
+                    "import { widget as thing } from './widget.js';\nexport function run() { return thing(); }\n",
+                ),
+                ("widget.js", "export function widget() { return 1; }\n"),
+            ],
+        );
+        let rows = fixture.rows(0);
+        let imports = rows_of_kind(&rows, RouteHopKind::Import);
+        assert_eq!(imports.len(), 1, "rows: {:?}", rows.rows);
+
+        let aliases = rows_of_kind(&rows, RouteHopKind::Alias);
+        assert_eq!(aliases.len(), 1, "rows: {:?}", rows.rows);
+        let RouteEndpoint::Site { name, range, .. } = &aliases[0].from else {
+            panic!("an import alias is a site, not a declaration");
+        };
+        assert_eq!(name, "thing");
+        assert_eq!(range.start_byte, fixture.at(0, "thing }"));
+        let RouteEndpoint::Declaration(target) = &aliases[0].to else {
+            panic!("alias target must be a declaration");
+        };
+        assert_eq!(target.source(), &fixture.files[1]);
     }
 
     /// The Python facade fixture of issue #1649: a package with an

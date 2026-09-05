@@ -36,6 +36,7 @@ use brokk_bifrost_core::analyzer::model::{
     StructuredTypeIdentityBuilder, StructuredTypeName,
 };
 use brokk_bifrost_core::analyzer::parsed_file::ParsedFile;
+use brokk_bifrost_core::analyzer::symbol_path::strip_backtick_quotes;
 use brokk_bifrost_core::analyzer::tree_walk::{
     first_named_child_of_kind as first_named_child, has_token_child,
     named_children as named_children_of,
@@ -54,11 +55,12 @@ fn kotlin_segment(text: &str, kind: SegmentKind) -> SegmentId {
 /// test method names). The backticks are quoting syntax, not part of the name,
 /// so they must not reach an interned segment — otherwise the declaration is
 /// unreachable by its real spelling.
+///
+/// The stripping rule is shared with the selector side
+/// ([`strip_backtick_quotes`]) so a client-typed `` pkg.`my test` `` normalizes
+/// to the same segment text this walk interns (#2219).
 pub fn kotlin_identifier_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
-    let text = node_text_trimmed(node, source);
-    text.strip_prefix('`')
-        .and_then(|text| text.strip_suffix('`'))
-        .unwrap_or(text)
+    strip_backtick_quotes(node_text_trimmed(node, source))
 }
 
 /// Build the structured package prefix for a Kotlin declaration: each dotted

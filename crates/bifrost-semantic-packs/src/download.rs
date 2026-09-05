@@ -1,10 +1,17 @@
-//! Opt-in acquisition of exact generated semantic-pack productions.
+//! Opt-in acquisition of semantic packs from the release bundle.
 //!
 //! The downloader is deliberately downstream of analysis. Analysis supplies
-//! the catalog and exact generated-production key; this module only downloads,
-//! verifies, and installs a release bundle. Analysis re-reads the generated
-//! production after the hook returns, so a downloaded bundle cannot bypass
-//! catalog validation.
+//! the catalog and one [`AcquisitionRequest`] naming what it could not build
+//! locally: an exact generated production, or a declared dependency that has
+//! no artifact to produce from at all (#2957). This module only downloads,
+//! verifies, and installs a release bundle. Analysis re-reads the catalog
+//! after the hook returns, so a downloaded bundle cannot bypass catalog
+//! validation.
+//!
+//! One release archive carries every shipped pack and every shipped generated
+//! production, so the request never selects an asset: it decides whether to
+//! fetch at all, and then names what installing the bundle was supposed to
+//! make available.
 
 use std::collections::HashSet;
 use std::error::Error;
@@ -16,9 +23,7 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
-use brokk_bifrost_analysis::analyzer::semantic_model::{
-    GeneratedProductionKey, SemanticPackCatalog,
-};
+use brokk_bifrost_analysis::analyzer::semantic_model::{AcquisitionRequest, SemanticPackCatalog};
 use flate2::read::GzDecoder;
 use sha2::{Digest, Sha256};
 use tar::Archive;
@@ -68,16 +73,17 @@ impl DownloadMode {
     }
 }
 
-/// Attempt to acquire the exact generated production requested by analysis.
+/// Attempt to acquire the semantic pack requested by analysis.
 ///
 /// This function is suitable for registration with
-/// `set_generated_production_acquisition_hook`. It returns successfully when
+/// `set_semantic_pack_acquisition_hook`. It returns successfully when
 /// acquisition is disabled, because disabled downloading is an intentional
-/// local-generation fallback. For every other path, only a verified catalog
-/// lookup can turn the attempt into a hit.
-pub fn acquire_generated_production(
+/// local fallback: an exact generated production is produced locally instead,
+/// and a declared dependency stays unavailable. For every other path, only a
+/// verified catalog lookup can turn the attempt into a hit.
+pub fn acquire_semantic_pack(
     catalog: &SemanticPackCatalog,
-    key: &GeneratedProductionKey,
+    request: &AcquisitionRequest<'_>,
 ) -> Result<(), String> {
     if DownloadMode::from_env() == DownloadMode::Off {
         return Ok(());
@@ -88,13 +94,14 @@ pub fn acquire_generated_production(
         return Err("semantic-pack download was already attempted for this catalog".to_owned());
     }
 
-    acquire_with_transport(catalog, key, &UreqTransport::new()).map_err(|error| error.to_string())
+    acquire_with_transport(catalog, request, &UreqTransport::new())
+        .map_err(|error| error.to_string())
 }
 
 #[cfg(test)]
 fn acquire_with_mode(
     catalog: &SemanticPackCatalog,
-    key: &GeneratedProductionKey,
+    request: &AcquisitionRequest<'_>,
     mode: DownloadMode,
     transport: &dyn HttpTransport,
 ) -> Result<(), DownloadError> {
@@ -107,7 +114,7 @@ fn acquire_with_mode(
             "semantic-pack download was already attempted for this catalog",
         ));
     }
-    acquire_with_transport(catalog, key, transport)
+    acquire_with_transport(catalog, request, transport)
 }
 
 fn canonical_catalog_root(catalog: &SemanticPackCatalog) -> Result<PathBuf, DownloadError> {
@@ -169,7 +176,7 @@ impl HttpTransport for UreqTransport {
 
 fn acquire_with_transport(
     catalog: &SemanticPackCatalog,
-    key: &GeneratedProductionKey,
+    request: &AcquisitionRequest<'_>,
     transport: &dyn HttpTransport,
 ) -> Result<(), DownloadError> {
     let archive_url = release_asset_url(ARCHIVE_NAME);
@@ -183,7 +190,7 @@ fn acquire_with_transport(
     let cache_dir = cache_dir(&catalog_root, &expected_digest);
 
     if cache_dir.exists() {
-        install_verified_bundle(&cache_dir, catalog, key)?;
+        install_verified_bundle(&cache_dir, catalog, request)?;
         return Ok(());
     }
 
@@ -215,7 +222,7 @@ fn acquire_with_transport(
         // and Windows report that race with different io::ErrorKind values;
         // the immutable bundle verifier is authoritative for either case.
         if cache_dir.is_dir() {
-            return install_verified_bundle(&cache_dir, catalog, key);
+            return install_verified_bundle(&cache_dir, catalog, request);
         }
         return Err(DownloadError::new(format!(
             "publish semantic-pack cache {}: {error}",
@@ -223,7 +230,7 @@ fn acquire_with_transport(
         )));
     }
 
-    install_verified_bundle(&cache_dir, catalog, key)
+    install_verified_bundle(&cache_dir, catalog, request)
 }
 
 fn release_asset_url(asset_name: &str) -> String {
@@ -237,23 +244,45 @@ fn cache_dir(catalog_root: &Path, archive_digest: &str) -> PathBuf {
         .join(archive_digest)
 }
 
+/// Install every pack the verified bundle carries, then report whether the
+/// request analysis made is now satisfiable.
+///
+/// The bundle is installed whole either way. The request only decides what
+/// counts as a hit, and this check is advisory: analysis re-reads the catalog
+/// through its own verified path and remains authoritative.
 fn install_verified_bundle(
     bundle_root: &Path,
     catalog: &SemanticPackCatalog,
-    key: &GeneratedProductionKey,
+    request: &AcquisitionRequest<'_>,
 ) -> Result<(), DownloadError> {
     crate::release_bundle::verify_release_bundle(bundle_root).map_err(|error| {
         DownloadError::new(format!("verify cached semantic-pack bundle: {error}"))
     })?;
     crate::release_bundle::install_release_bundle(bundle_root, catalog)
         .map_err(|error| DownloadError::new(format!("install semantic-pack bundle: {error}")))?;
-    match catalog.generated_production(key).map_err(|error| {
-        DownloadError::new(format!("check acquired generated production: {error}"))
-    })? {
-        Some(_) => Ok(()),
-        None => Err(DownloadError::new(
-            "verified semantic-pack bundle did not install the requested generated production",
-        )),
+    match request {
+        AcquisitionRequest::GeneratedProduction(key) => {
+            match catalog.generated_production(key).map_err(|error| {
+                DownloadError::new(format!("check acquired generated production: {error}"))
+            })? {
+                Some(_) => Ok(()),
+                None => Err(DownloadError::new(
+                    "verified semantic-pack bundle did not install the requested generated production",
+                )),
+            }
+        }
+        AcquisitionRequest::DeclaredPack(query) => {
+            let candidates = catalog.dependency_candidates(query).map_err(|error| {
+                DownloadError::new(format!("check acquired declared dependency pack: {error}"))
+            })?;
+            if candidates.is_empty() {
+                return Err(DownloadError::new(format!(
+                    "verified semantic-pack bundle installed no {} pack for {:?}",
+                    query.ecosystem, query
+                )));
+            }
+            Ok(())
+        }
     }
 }
 
@@ -507,7 +536,8 @@ mod tests {
         PinnedPackKind, PinnedPackSpec, generate_release_bundle,
     };
     use brokk_bifrost_analysis::analyzer::semantic_model::{
-        ActivationSelector, Compatibility, NameSelector, Provenance, Safety, VersionConstraint,
+        ActivationSelector, CatalogCoordinate, Compatibility, GeneratedProductionKey, NameSelector,
+        Provenance, Safety, SemanticPackSelectorQuery, VersionConstraint,
     };
     use flate2::Compression;
     use flate2::write::GzEncoder;
@@ -747,6 +777,27 @@ mod tests {
         }
     }
 
+    /// The evidence-only query analysis builds for an artifact-less declared
+    /// dependency. The bundle fixture pins `jdk` to 21.0.8, so a different
+    /// version names a coordinate the bundle does not carry.
+    fn declared_pack_query(version: &str) -> SemanticPackSelectorQuery {
+        SemanticPackSelectorQuery {
+            language: "java".to_owned(),
+            ecosystem: "jdk".to_owned(),
+            package: None,
+            module: None,
+            toolchain: Some(CatalogCoordinate {
+                name: "jdk".to_owned(),
+                version: Some(semver::Version::parse(version).expect("toolchain version parses")),
+            }),
+            target: None,
+            configuration: None,
+            artifact_sha256: None,
+            bifrost_version: semver::Version::parse(RELEASE_VERSION)
+                .expect("Bifrost package version must be semantic"),
+        }
+    }
+
     fn test_key() -> GeneratedProductionKey {
         GeneratedProductionKey::new(
             "0".repeat(64),
@@ -766,7 +817,13 @@ mod tests {
         assert_eq!(DownloadMode::from_env_value(Some("on")), DownloadMode::On);
         let catalog = SemanticPackCatalog::open_ephemeral(Default::default()).unwrap();
         let transport = FakeTransport::new(HashMap::new());
-        acquire_with_mode(&catalog, &test_key(), DownloadMode::Off, &transport).unwrap();
+        acquire_with_mode(
+            &catalog,
+            &AcquisitionRequest::GeneratedProduction(&test_key()),
+            DownloadMode::Off,
+            &transport,
+        )
+        .unwrap();
         assert!(transport.requests.lock().unwrap().is_empty());
     }
 
@@ -783,7 +840,13 @@ mod tests {
             (archive_url.clone(), fixture.archive.clone()),
         ]));
 
-        acquire_with_mode(&catalog, &fixture.key, DownloadMode::On, &transport).unwrap();
+        acquire_with_mode(
+            &catalog,
+            &AcquisitionRequest::GeneratedProduction(&fixture.key),
+            DownloadMode::On,
+            &transport,
+        )
+        .unwrap();
 
         assert_eq!(
             transport.requests.lock().unwrap().as_slice(),
@@ -808,6 +871,76 @@ mod tests {
         assert!(cached.join("SHA256SUMS").is_file());
     }
 
+    /// A declared dependency has no artifact and so no generated-production
+    /// key (#2957). The request names the selector query instead, the whole
+    /// bundle is still installed, and the query decides only what counts as a
+    /// hit afterwards.
+    #[test]
+    fn fake_transport_installs_the_bundle_for_a_declared_pack_request() {
+        let fixture = generated_bundle_fixture();
+        let catalog = SemanticPackCatalog::open_ephemeral(Default::default()).unwrap();
+        let archive_digest = hex_digest(&fixture.archive);
+        let archive_url = release_asset_url(ARCHIVE_NAME);
+        let checksum_url = release_asset_url(CHECKSUM_NAME);
+        let checksum = format!("{archive_digest}  {ARCHIVE_NAME}\n").into_bytes();
+        let transport = FakeTransport::new(HashMap::from([
+            (checksum_url.clone(), checksum),
+            (archive_url.clone(), fixture.archive.clone()),
+        ]));
+        let query = declared_pack_query("21.0.8");
+
+        acquire_with_mode(
+            &catalog,
+            &AcquisitionRequest::DeclaredPack(&query),
+            DownloadMode::On,
+            &transport,
+        )
+        .unwrap();
+
+        assert_eq!(
+            transport.requests.lock().unwrap().as_slice(),
+            &[checksum_url, archive_url]
+        );
+        assert!(!catalog.dependency_candidates(&query).unwrap().is_empty());
+        // Installing the bundle is the whole answer: the generated production
+        // the same bundle carries is installed too, without being asked for.
+        assert!(
+            catalog
+                .generated_production(&fixture.key)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    /// The bundle is installed either way, so a request the bundle cannot
+    /// satisfy is reported rather than silently counted as a hit.
+    #[test]
+    fn a_declared_pack_request_the_bundle_cannot_satisfy_is_an_error() {
+        let fixture = generated_bundle_fixture();
+        let catalog = SemanticPackCatalog::open_ephemeral(Default::default()).unwrap();
+        let archive_digest = hex_digest(&fixture.archive);
+        let checksum = format!("{archive_digest}  {ARCHIVE_NAME}\n").into_bytes();
+        let transport = FakeTransport::new(HashMap::from([
+            (release_asset_url(CHECKSUM_NAME), checksum),
+            (release_asset_url(ARCHIVE_NAME), fixture.archive.clone()),
+        ]));
+        let query = declared_pack_query("17.0.10");
+
+        let error = acquire_with_mode(
+            &catalog,
+            &AcquisitionRequest::DeclaredPack(&query),
+            DownloadMode::On,
+            &transport,
+        )
+        .unwrap_err();
+
+        assert!(
+            error.to_string().contains("installed no jdk pack"),
+            "{error}"
+        );
+        assert!(catalog.dependency_candidates(&query).unwrap().is_empty());
+    }
+
     #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
     #[test]
     fn checksum_mismatch_does_not_install_requested_generated_production() {
@@ -822,7 +955,15 @@ mod tests {
             ),
             (archive_url, fixture.archive.clone()),
         ]));
-        assert!(acquire_with_mode(&catalog, &fixture.key, DownloadMode::On, &transport).is_err());
+        assert!(
+            acquire_with_mode(
+                &catalog,
+                &AcquisitionRequest::GeneratedProduction(&fixture.key),
+                DownloadMode::On,
+                &transport,
+            )
+            .is_err()
+        );
         assert!(
             catalog
                 .generated_production(&fixture.key)
@@ -849,7 +990,15 @@ mod tests {
             ),
             (archive_url, archive),
         ]));
-        assert!(acquire_with_mode(&catalog, &fixture.key, DownloadMode::On, &transport).is_err());
+        assert!(
+            acquire_with_mode(
+                &catalog,
+                &AcquisitionRequest::GeneratedProduction(&fixture.key),
+                DownloadMode::On,
+                &transport,
+            )
+            .is_err()
+        );
         assert!(
             catalog
                 .generated_production(&fixture.key)

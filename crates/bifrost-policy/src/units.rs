@@ -53,6 +53,33 @@ use super::resolved::LoadedPolicy;
 /// produced with them.
 const NO_ACTIVE_MODELS: &str = "bifrost-policy-unit:no-active-models:v1";
 
+/// This crate's own revision, folded into the engine epoch beside the
+/// analyzer's parser epochs.
+///
+/// The analyzer epoch says which parsers derived the facts a unit read. It
+/// says nothing about how this crate shapes a published product or composes a
+/// finding identity, and a run must read back neither from an older engine.
+/// Bump this whenever a change makes either something this engine would no
+/// longer mint.
+///
+/// The current value is #2968, which took the compiled binding-plan hash out
+/// of a typestate finding's identity. Both persisted shapes moved with it: a
+/// published root product carries a typestate anchor field this engine no
+/// longer accepts, and a recorded base evaluation carries typestate identities
+/// this engine no longer mints. The second is the one a reader could not see.
+/// Nothing detects it -- the recorded identities simply never join the head's,
+/// so every unchanged violation reports as `fixed` and `new` forever, against
+/// exactly the bases this change exists to fix.
+const POLICY_SUBSTRATE_EPOCH: &str = "bifrost-policy-unit:substrate:2968-typestate-identity";
+
+/// The epoch every unit key and the evaluation row key carry.
+fn policy_substrate_epoch() -> StableDigest {
+    StableDigest::sha256(format!(
+        "{POLICY_SUBSTRATE_EPOCH}\u{1}{}",
+        analysis_epoch_digest()
+    ))
+}
+
 /// Which partition of the workspace one unit covers.
 ///
 /// A `Seed` unit is keyed by the file its seed enumeration walked and the blob
@@ -1038,7 +1065,8 @@ pub fn unit_of_row(
 /// The three non-source inputs every unit key and every verification carries.
 ///
 /// Read once per evaluated workspace, because all three are properties of the
-/// analyzer and the run's model activation rather than of any one policy.
+/// engine, the analyzer and the run's model activation rather than of any one
+/// policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WorkspaceUnitInputs {
     configuration: StableDigest,
@@ -1062,7 +1090,7 @@ impl WorkspaceUnitInputs {
                 || StableDigest::sha256(NO_ACTIVE_MODELS),
                 |models| StableDigest::sha256(models.active_models().active_model_set_hash()),
             ),
-            epoch: analysis_epoch_digest(),
+            epoch: policy_substrate_epoch(),
         }
     }
 

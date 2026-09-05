@@ -32,7 +32,7 @@ use brokk_bifrost_flow::type_flow::{
     ClassSetStatus, FeedbackLimits, FieldSlotIndex, TypeFlowError, TypeFlowPlanError,
     TypeFlowRootResult, solve_type_flow_for_root,
 };
-use brokk_bifrost_flow::value_flow::ClosureLimits;
+use brokk_bifrost_flow::value_flow::{ClosureLimits, ValueFlowCache, ValueFlowCacheStatsSnapshot};
 
 /// Bound on the procedures one root's discovered closure may hold, matching
 /// the engine's own integration-test budget.
@@ -64,13 +64,41 @@ enum CachedTypeFlowAnalysis {
     Failed,
 }
 
-#[derive(Default)]
 pub(super) struct TypeFlowQueryState {
+    value_flow_cache: ValueFlowCache,
+    summary_state: brokk_bifrost_flow::type_flow::TypeFlowSummaryState,
+    provider_stats_baseline: ValueFlowCacheStatsSnapshot,
     cache: HashMap<TypeFlowCacheKey, CachedTypeFlowAnalysis>,
     field_slots: HashMap<FieldSlotCacheKey, Option<Arc<FieldSlotIndex>>>,
     diagnostics: Vec<CodeQueryDiagnostic>,
     work: CodeQueryTypeFlowWork,
     semantic_budget_exhausted: bool,
+}
+
+impl Default for TypeFlowQueryState {
+    fn default() -> Self {
+        Self::new(ValueFlowCache::default(), Default::default())
+    }
+}
+
+impl TypeFlowQueryState {
+    pub(super) fn new(
+        value_flow_cache: ValueFlowCache,
+        summary_state: brokk_bifrost_flow::type_flow::TypeFlowSummaryState,
+    ) -> Self {
+        let value_flow_cache = value_flow_cache.with_fresh_stats();
+        let provider_stats_baseline = value_flow_cache.stats();
+        Self {
+            value_flow_cache,
+            summary_state,
+            provider_stats_baseline,
+            cache: HashMap::default(),
+            field_slots: HashMap::default(),
+            diagnostics: Vec::new(),
+            work: CodeQueryTypeFlowWork::default(),
+            semantic_budget_exhausted: false,
+        }
+    }
 }
 
 /// One member access site's merged answer: the classes and Unknown reasons of
@@ -426,6 +454,8 @@ impl TypeFlowQueryState {
                     active_semantic_model_snapshot,
                     CLOSURE_LIMITS,
                     FeedbackLimits::default(),
+                    self.value_flow_cache.clone(),
+                    self.summary_state.clone(),
                     &mut child_budget,
                     &mut request,
                 );
@@ -450,6 +480,18 @@ impl TypeFlowQueryState {
                 }
                 match outcome {
                     Ok(result) => {
+                        self.work.summary_cache_hits = self
+                            .work
+                            .summary_cache_hits
+                            .saturating_add(result.reusable_summary_hits as u64);
+                        self.work.summary_cache_misses = self
+                            .work
+                            .summary_cache_misses
+                            .saturating_add(result.reusable_summary_misses as u64);
+                        self.work.published_summaries = self
+                            .work
+                            .published_summaries
+                            .saturating_add(result.published_summaries as u64);
                         if result.semantic_budget_exhausted {
                             self.semantic_budget_exhausted = true;
                             self.push_diagnostic(
@@ -513,8 +555,20 @@ impl TypeFlowQueryState {
         std::mem::take(&mut self.diagnostics)
     }
 
-    pub(super) const fn work(&self) -> CodeQueryTypeFlowWork {
-        self.work
+    pub(super) fn work(&self) -> CodeQueryTypeFlowWork {
+        let provider = self
+            .value_flow_cache
+            .stats()
+            .saturating_sub(self.provider_stats_baseline);
+        CodeQueryTypeFlowWork {
+            snapshot_cache_hits: provider.snapshot_hits,
+            snapshot_cache_misses: provider.snapshot_misses,
+            dispatch_cache_hits: provider.dispatch_hits,
+            dispatch_cache_misses: provider.dispatch_misses,
+            binding_cache_hits: provider.binding_hits,
+            binding_cache_misses: provider.binding_misses,
+            ..self.work
+        }
     }
 
     pub(super) const fn semantic_budget_exhausted(&self) -> bool {

@@ -6,6 +6,8 @@
 
 use tree_sitter::Node;
 
+use brokk_bifrost_rust::declarations::{rust_node_text, rust_nominal_type_path};
+
 use crate::analyzer::lexical_definitions::formal_parameter_slots_for_owner;
 use crate::analyzer::semantic::cfg::{
     CleanupRegionId, CompletionKind, CompletionRequest, CompletionRoute, ProcedureCfgBuilder,
@@ -20,7 +22,8 @@ use crate::analyzer::tree_sitter_analyzer::{
 use crate::analyzer::{DispatchExtensibility, Language, ProjectFile, RustAnalyzer};
 use crate::hash::{HashMap, HashSet};
 
-const ADAPTER_VERSION: &[u8] = b"rust-value-semantics-v6";
+const ADAPTER_VERSION: &[u8] = b"rust-value-semantics-v9";
+const RUST_REPEAT_ARRAY_ELEMENT_CAP: u128 = 1024;
 
 impl_program_semantics_provider!(RustAnalyzer, RustSemanticLowerer);
 
@@ -184,6 +187,21 @@ fn enumerate_procedures<'tree>(
             return Ok(stop.into_outcome());
         }
         let child_path = frame.declaration_path;
+        let mut container_body_scope = None;
+        if let Some(segment_kind) = declaration_container_kind(frame.node) {
+            let name = declaration_container_name(prepared.source(), frame.node);
+            let anchor =
+                source_anchor(frame.node, 0).map_err(SemanticProviderError::invalid_identity)?;
+            let container_path = inventory.push_container(
+                frame.declaration_path,
+                segment_kind,
+                name.as_deref(),
+                anchor,
+            )?;
+            if let Some(body) = frame.node.child_by_field_name("body") {
+                container_body_scope = Some((body.id(), container_path));
+            }
+        }
         let mut callable_body_scope = None;
 
         if let Some((kind, segment_kind, body, properties)) =
@@ -215,6 +233,10 @@ fn enumerate_procedures<'tree>(
 
         let children = named_children(frame.node);
         for child in children.into_iter().rev() {
+            let child_path = container_body_scope
+                .filter(|(body_id, _)| *body_id == child.id())
+                .map(|(_, path)| path)
+                .unwrap_or(child_path);
             let (lexical_parent, declaration_path) = callable_body_scope
                 .filter(|(body_id, _, _)| *body_id == child.id())
                 .map(|(_, procedure, path)| (Some(procedure), path))
@@ -228,6 +250,84 @@ fn enumerate_procedures<'tree>(
     }
 
     Ok(inventory.complete(specs))
+}
+
+fn declaration_container_kind(node: Node<'_>) -> Option<DeclarationSegmentKind> {
+    match node.kind() {
+        "mod_item" => Some(DeclarationSegmentKind::Namespace),
+        "trait_item" | "impl_item" => Some(DeclarationSegmentKind::Type),
+        _ => None,
+    }
+}
+
+fn declaration_container_name(source: &str, node: Node<'_>) -> Option<Box<str>> {
+    match node.kind() {
+        "mod_item" | "trait_item" => node
+            .child_by_field_name("name")
+            .map(|name| rust_node_text(name, source).trim())
+            .filter(|name| !name.is_empty())
+            .map(Box::<str>::from),
+        "impl_item" => impl_target_owner_name(source, node),
+        _ => None,
+    }
+}
+
+fn impl_target_owner_name(source: &str, impl_item: Node<'_>) -> Option<Box<str>> {
+    let target = impl_item.child_by_field_name("type")?;
+    if !is_nominal_impl_target_shape(target) {
+        return None;
+    }
+    let path = rust_nominal_type_path(target, source)?;
+    if path
+        .first()
+        .is_some_and(|name| impl_declares_type_parameter(impl_item, source, name))
+    {
+        return None;
+    }
+    Some(path.join(".").into_boxed_str())
+}
+
+fn is_nominal_impl_target_shape(node: Node<'_>) -> bool {
+    match node.kind() {
+        "identifier" | "type_identifier" => true,
+        "generic_type" => node
+            .child_by_field_name("type")
+            .is_some_and(is_nominal_impl_target_shape),
+        "scoped_identifier" | "scoped_type_identifier" => {
+            node.child_by_field_name("name")
+                .is_some_and(|name| matches!(name.kind(), "identifier" | "type_identifier"))
+                && node
+                    .child_by_field_name("path")
+                    .is_none_or(is_nominal_impl_target_path)
+        }
+        _ => false,
+    }
+}
+
+fn is_nominal_impl_target_path(node: Node<'_>) -> bool {
+    match node.kind() {
+        "crate" | "self" | "super" | "identifier" | "type_identifier" => true,
+        "scoped_identifier" | "scoped_type_identifier" => {
+            node.child_by_field_name("name")
+                .is_some_and(|name| matches!(name.kind(), "identifier" | "type_identifier"))
+                && node
+                    .child_by_field_name("path")
+                    .is_none_or(is_nominal_impl_target_path)
+        }
+        _ => false,
+    }
+}
+
+fn impl_declares_type_parameter(impl_item: Node<'_>, source: &str, target: &str) -> bool {
+    let Some(parameters) = impl_item.child_by_field_name("type_parameters") else {
+        return false;
+    };
+    named_children(parameters).into_iter().any(|parameter| {
+        parameter.kind() == "type_parameter"
+            && parameter
+                .child_by_field_name("name")
+                .is_some_and(|name| rust_node_text(name, source).trim() == target)
+    })
 }
 
 fn callable_name(source: &str, node: Node<'_>) -> Option<Box<str>> {
@@ -446,9 +546,9 @@ struct LoweringContext<'tree, 'targets> {
     /// struct this file does not state, interned once per name per procedure
     /// so a store and a load of the same name still meet.
     field_locators: HashMap<Box<str>, SemanticLocator>,
-    /// One value per distinct constant index text, so `values[0]` written and
-    /// `values[0]` read name the same index value.
-    constant_index_values: HashMap<Box<str>, ValueId>,
+    /// One value per distinct constant index magnitude, so equivalent integer
+    /// literal spellings name the same index value.
+    constant_index_values: HashMap<u128, ValueId>,
     parameter_cleanup_required: bool,
     receiver: Option<ValueId>,
     next_cleanup_region: usize,
@@ -785,34 +885,43 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             }
             // A `for` pattern binds a local too. Without it the loop variable
             // resolved to nothing inside the body, so an element read there
-            // began a fresh unrelated value.
+            // began a fresh unrelated value. A destructuring pattern binds one
+            // local per component, so `for (key, value) in map` mints two
+            // (#2705); binding only the single-identifier form left both names
+            // unbound and silently dropped every flow through such a loop.
             if node.kind() == "for_expression"
                 && let Some(pattern) = node.child_by_field_name("pattern")
-                && let Some(name) = identity_binding_identifier(pattern)
-                && let Some(text) = node_text(self.source, name)
                 && let Some(body) = node.child_by_field_name("body")
             {
-                let metadata = self.value_mapping(builder, name)?;
-                let value = self.session.add_value_with_metadata(
-                    builder,
-                    metadata,
-                    SemanticValueKind::Local,
-                )?;
-                self.locals
-                    .entry(text.into())
-                    .or_default()
-                    .push(LocalBinding {
-                        declaration_start: name.start_byte(),
-                        visible_from: body.start_byte(),
-                        scope_start: body.start_byte(),
-                        scope_end: body.end_byte(),
-                        value,
-                    });
-                if node
+                // An element proven non-dropping makes each component of that
+                // element non-dropping too: destructuring moves out of a value
+                // that owns no destructor.
+                let element_is_non_dropping = node
                     .child_by_field_name("value")
-                    .is_some_and(rust_iteration_element_is_definitely_non_dropping)
-                {
-                    self.definitely_non_dropping.insert(value);
+                    .is_some_and(rust_iteration_element_is_definitely_non_dropping);
+                for name in rust_pattern_binding_identifiers(pattern) {
+                    let Some(text) = node_text(self.source, name) else {
+                        continue;
+                    };
+                    let metadata = self.value_mapping(builder, name)?;
+                    let value = self.session.add_value_with_metadata(
+                        builder,
+                        metadata,
+                        SemanticValueKind::Local,
+                    )?;
+                    self.locals
+                        .entry(text.into())
+                        .or_default()
+                        .push(LocalBinding {
+                            declaration_start: name.start_byte(),
+                            visible_from: body.start_byte(),
+                            scope_start: body.start_byte(),
+                            scope_end: body.end_byte(),
+                            value,
+                        });
+                    if element_is_non_dropping {
+                        self.definitely_non_dropping.insert(value);
+                    }
                 }
             }
             Ok(WalkControl::Continue)
@@ -1032,31 +1141,89 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         Ok(())
     }
 
-    /// The index value of `base[index]`, when the index is a constant.
+    /// The index value of `base[index]`, when the index is a Rust integer
+    /// literal whose magnitude can be represented in `u128`.
     ///
     /// A store and a load meet on an exact index only when both name the same
-    /// value, so one value is interned per distinct index text. A non-constant
-    /// index has no proven identity here and yields `None`, which the caller
-    /// turns into an `Any` index plus an index-memory gap.
+    /// value, so one value is interned per distinct numeric magnitude. A
+    /// non-literal or unrepresentable index has no proven identity here and
+    /// yields `None`, which the caller turns into an `Any` index plus an
+    /// index-memory gap.
+    fn canonical_integer_index_value(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+    ) -> Result<Option<(ValueId, u128)>, RustLoweringError> {
+        let Some(index) = rust_integer_literal_value(self.source, node) else {
+            return Ok(None);
+        };
+        if let Some(value) = self.constant_index_values.get(&index).copied() {
+            self.expression_values.insert(node.id(), value);
+            return Ok(Some((value, index)));
+        }
+        let value =
+            self.expression_value(builder, node, SemanticValueKind::UnsignedInteger(index))?;
+        self.constant_index_values.insert(index, value);
+        Ok(Some((value, index)))
+    }
+
+    fn array_ordinal_value(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        ordinal: u128,
+    ) -> Result<ValueId, RustLoweringError> {
+        if let Some(value) = self.constant_index_values.get(&ordinal).copied() {
+            return Ok(value);
+        }
+        let metadata = self.value_mapping(builder, node)?;
+        let value = self.session.add_value_with_metadata(
+            builder,
+            metadata,
+            SemanticValueKind::UnsignedInteger(ordinal),
+        )?;
+        self.constant_index_values.insert(ordinal, value);
+        Ok(value)
+    }
+
+    fn emit_array_element_store(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        point: ProgramPointId,
+        array: Node<'tree>,
+        base: ValueId,
+        ordinal: u128,
+        value: ValueId,
+    ) -> Result<(), RustLoweringError> {
+        let index = self.array_ordinal_value(builder, array, ordinal)?;
+        let location = self.session.add_memory_location(
+            builder,
+            point,
+            MemoryLocationKind::Index {
+                base,
+                index: Some(index),
+                constant_index: Some(ordinal),
+                identity: crate::analyzer::semantic::IndexedLocationIdentity::Element,
+            },
+        )?;
+        self.append_effect(
+            builder,
+            point,
+            SemanticEffect::MemoryStore {
+                kind: MemoryAccessKind::Index,
+                location,
+                value,
+            },
+        )?;
+        Ok(())
+    }
+
     fn index_value(
         &mut self,
         builder: &mut ProcedureCfgBuilder,
         node: Node<'tree>,
-    ) -> Result<Option<ValueId>, RustLoweringError> {
-        if !matches!(expression_value_kind(node), SemanticValueKind::Constant) {
-            return Ok(None);
-        }
-        let Some(text) = node_text(self.source, node) else {
-            return Ok(None);
-        };
-        if let Some(value) = self.constant_index_values.get(text) {
-            let value = *value;
-            self.expression_values.insert(node.id(), value);
-            return Ok(Some(value));
-        }
-        let value = self.expression_value(builder, node, SemanticValueKind::Constant)?;
-        self.constant_index_values.insert(text.into(), value);
-        Ok(Some(value))
+    ) -> Result<Option<(ValueId, u128)>, RustLoweringError> {
+        self.canonical_integer_index_value(builder, node)
     }
 
     fn add_dynamic_index_gap(
@@ -1075,6 +1242,26 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 .with(SemanticGapImpact::Aliasing),
             SemanticGapKind::Unsupported,
             "Rust dynamic index identity is not proven",
+        )?;
+        Ok(())
+    }
+
+    fn add_repeat_array_gap(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        point: ProgramPointId,
+        location: MemoryLocationId,
+    ) -> Result<(), RustLoweringError> {
+        self.session.add_gap_with_impacts(
+            builder,
+            point,
+            SemanticGapSubject::MemoryLocation(location),
+            SemanticCapability::IndexMemory,
+            SemanticGapImpacts::single(SemanticGapImpact::HeapRead)
+                .with(SemanticGapImpact::HeapWrite)
+                .with(SemanticGapImpact::Aliasing),
+            SemanticGapKind::Unsupported,
+            "Rust repeated-array length is not a bounded integer literal, so precise element stores are not materialized",
         )?;
         Ok(())
     }
@@ -1849,15 +2036,9 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 scope,
                 stack,
             ),
-            "array_expression" => self.allocation_expression(
-                builder,
-                node,
-                AllocationKind::Array,
-                entry,
-                next,
-                scope,
-                stack,
-            ),
+            "array_expression" => {
+                self.array_allocation_expression(builder, node, entry, next, scope, stack)
+            }
             "assignment_expression" => {
                 self.assignment_expression(builder, node, entry, next, scope, stack)
             }
@@ -2033,6 +2214,105 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
     }
 
     #[allow(clippy::too_many_arguments)]
+    fn array_allocation_expression(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        entry: ProgramPointId,
+        next: EdgeTarget,
+        scope: ScopeFrameId,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(), RustLoweringError> {
+        let terminal = self.point(builder, node, Vec::new())?;
+        let result = self.expression_value(builder, node, SemanticValueKind::Temporary)?;
+        self.session
+            .add_allocation(builder, terminal, result, AllocationKind::Array)?;
+        let elements = rust_array_initializer_elements(node);
+        if let Some(length_node) = node.child_by_field_name("length") {
+            let Some(element) = elements.first() else {
+                return Err(RustLoweringError::Invalid(
+                    "Rust repeated array expression is missing its initializer".into(),
+                ));
+            };
+            match rust_integer_literal_value(self.source, length_node) {
+                Some(length) if length <= RUST_REPEAT_ARRAY_ELEMENT_CAP => {
+                    if length != 0 {
+                        let value = self.expression_value(
+                            builder,
+                            *element,
+                            expression_value_kind(*element),
+                        )?;
+                        for ordinal in 0..length {
+                            self.emit_array_element_store(
+                                builder, terminal, node, result, ordinal, value,
+                            )?;
+                        }
+                    }
+                    // A bounded repeat initializer evaluates one structured
+                    // value and writes it to each known ordinal. These precise
+                    // stores let later writes kill one element without
+                    // retaining a whole-array flow.
+                }
+                _ => {
+                    let value =
+                        self.expression_value(builder, *element, expression_value_kind(*element))?;
+                    let location = self.session.add_memory_location(
+                        builder,
+                        terminal,
+                        MemoryLocationKind::Index {
+                            base: result,
+                            index: None,
+                            constant_index: None,
+                            identity: crate::analyzer::semantic::IndexedLocationIdentity::Aggregate,
+                        },
+                    )?;
+                    self.append_effect(
+                        builder,
+                        terminal,
+                        SemanticEffect::MemoryStore {
+                            kind: MemoryAccessKind::Index,
+                            location,
+                            value,
+                        },
+                    )?;
+                    // An unbounded repeat still initializes every element from
+                    // this one value, so aggregate flow reaches exact indexed
+                    // reads without expanding stores. The typed gap keeps
+                    // nonliteral and over-cap lengths from claiming complete
+                    // absence evidence. The fresh allocation result keeps
+                    // separate arrays distinct.
+                    self.session.append_language_defined_value_flows(
+                        builder,
+                        terminal,
+                        [value],
+                        result,
+                    )?;
+                    self.add_repeat_array_gap(builder, terminal, location)?;
+                }
+            }
+        } else {
+            for (ordinal, element) in elements.into_iter().enumerate() {
+                let ordinal = u128::try_from(ordinal).map_err(|_| {
+                    RustLoweringError::Invalid("Rust array literal has too many elements".into())
+                })?;
+                let value =
+                    self.expression_value(builder, element, expression_value_kind(element))?;
+                self.emit_array_element_store(builder, terminal, node, result, ordinal, value)?;
+            }
+        }
+        self.edge(builder, terminal, next)?;
+        let children = runtime_expression_children(node);
+        self.schedule_expressions(
+            builder,
+            entry,
+            &children,
+            EdgeTarget::normal(terminal),
+            scope,
+            stack,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn assignment_expression(
         &mut self,
         builder: &mut ProcedureCfgBuilder,
@@ -2149,14 +2429,18 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     };
                     let base_value =
                         self.expression_value(builder, *base, expression_value_kind(*base))?;
-                    let index = self.index_value(builder, *index_node)?;
+                    let indexed = self.index_value(builder, *index_node)?;
+                    let (index, constant_index) = indexed
+                        .map_or((None, None), |(value, constant_index)| {
+                            (Some(value), Some(constant_index))
+                        });
                     let location = self.session.add_memory_location(
                         builder,
                         terminal,
                         MemoryLocationKind::Index {
                             base: base_value,
                             index,
-                            constant_index: None,
+                            constant_index,
                             identity: crate::analyzer::semantic::IndexedLocationIdentity::Element,
                         },
                     )?;
@@ -2447,14 +2731,17 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let access = self.point(builder, node, Vec::new())?;
         let result = self.expression_value(builder, node, expression_value_kind(node))?;
         let base_value = self.expression_value(builder, *base, expression_value_kind(*base))?;
-        let index = self.index_value(builder, *index_node)?;
+        let indexed = self.index_value(builder, *index_node)?;
+        let (index, constant_index) = indexed.map_or((None, None), |(value, constant_index)| {
+            (Some(value), Some(constant_index))
+        });
         let location = self.session.add_memory_location(
             builder,
             access,
             MemoryLocationKind::Index {
                 base: base_value,
                 index,
-                constant_index: None,
+                constant_index,
                 identity: crate::analyzer::semantic::IndexedLocationIdentity::Element,
             },
         )?;
@@ -2886,30 +3173,40 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             },
         );
         let body_scope = self.push_cleanup_scope(builder, loop_scope)?;
-        // The element the pattern binds is a value of this procedure like any
-        // other: it derives from the iterable. Publishing that element-of
-        // relation is what carries a tainted collection into a loop body.
-        let pattern = node.child_by_field_name("pattern");
-        let element = pattern
-            .and_then(identity_binding_identifier)
-            .and_then(|name| {
+        // The values the pattern binds are values of this procedure like any
+        // other: each derives from the iterable. Publishing that element-of
+        // relation is what carries a tainted collection into a loop body. A
+        // destructuring pattern binds one value per component and every one of
+        // them derives from the iterable, so `for (key, value) in map` publishes
+        // two element-of flows rather than none (#2705).
+        let elements = node
+            .child_by_field_name("pattern")
+            .map(rust_pattern_binding_identifiers)
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|name| {
                 node_text(self.source, name)
                     .and_then(|text| self.local_declaration_value(text, name.start_byte()))
-            });
-        if let Some(element) = element {
+            })
+            .collect::<Vec<_>>();
+        if !elements.is_empty() {
             let iterable_value =
                 self.expression_value(builder, iterable, expression_value_kind(iterable))?;
-            self.session.append_language_defined_value_flows(
-                builder,
-                body_entry,
-                [iterable_value],
-                element,
-            )?;
+            for element in &elements {
+                self.session.append_language_defined_value_flows(
+                    builder,
+                    body_entry,
+                    [iterable_value],
+                    *element,
+                )?;
+            }
         }
         // A pattern that binds a primitive element runs no destructor, exactly
         // as for a `let`.
-        let element_may_drop =
-            element.is_none_or(|element| !self.definitely_non_dropping.contains(&element));
+        let element_may_drop = elements.is_empty()
+            || elements
+                .iter()
+                .any(|element| !self.definitely_non_dropping.contains(element));
         if element_may_drop {
             self.add_drop_omission_gaps(
                 builder,
@@ -3295,12 +3592,20 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
     fn macro_boundary(
         &mut self,
         builder: &mut ProcedureCfgBuilder,
-        _node: Node<'tree>,
+        node: Node<'tree>,
         entry: ProgramPointId,
     ) -> Result<(), RustLoweringError> {
+        // Keep macro-expansion uncertainty on a source-mapped boundary for the
+        // invocation itself. The incoming point may carry a distinct gap (for
+        // example, implicit Drop uncertainty for a match-arm binding), so
+        // publishing the macro rows there would violate GapIndex's one-row
+        // contract and conflate the two semantic causes. No continuation is
+        // fabricated after an opaque expansion.
+        let boundary = self.point(builder, node, Vec::new())?;
+        self.edge(builder, entry, EdgeTarget::normal(boundary))?;
         self.add_gap(
             builder,
-            entry,
+            boundary,
             SemanticGapSubject::Point,
             SemanticCapability::NormalControlFlow,
             SemanticGapKind::Unsupported,
@@ -3308,7 +3613,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         )?;
         self.add_gap(
             builder,
-            entry,
+            boundary,
             SemanticGapSubject::Point,
             SemanticCapability::Calls,
             SemanticGapKind::Unsupported,
@@ -3316,7 +3621,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         )?;
         self.add_gap(
             builder,
-            entry,
+            boundary,
             SemanticGapSubject::Point,
             SemanticCapability::ExceptionalControlFlow,
             SemanticGapKind::Unsupported,
@@ -3324,7 +3629,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         )?;
         self.add_gap(
             builder,
-            entry,
+            boundary,
             SemanticGapSubject::Point,
             SemanticCapability::NonLocalControl,
             SemanticGapKind::Unsupported,
@@ -3332,7 +3637,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         )?;
         self.add_gap(
             builder,
-            entry,
+            boundary,
             SemanticGapSubject::Point,
             SemanticCapability::CleanupControlFlow,
             SemanticGapKind::Unsupported,
@@ -3340,7 +3645,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         )?;
         self.add_gap(
             builder,
-            entry,
+            boundary,
             SemanticGapSubject::Point,
             SemanticCapability::ResourceManagement,
             SemanticGapKind::Unsupported,
@@ -3923,15 +4228,38 @@ fn is_wildcard_pattern(pattern: Node<'_>) -> bool {
 /// unit variant written bare (`None`) is indistinguishable from a binding in
 /// the syntax alone and is counted as binding, which only adds a gap.
 fn rust_pattern_binds_value(pattern: Node<'_>) -> bool {
+    !rust_pattern_binding_identifiers(pattern).is_empty()
+}
+
+/// Every identifier this pattern binds, in source order.
+///
+/// One `identifier`, possibly wrapped in `mut` or `ref`, is the common case. A
+/// tuple, slice, or struct pattern binds one identifier per component, which is
+/// the shape `for (key, value) in map` writes (#2705): before this, such a
+/// pattern bound nothing at all, so the loop body's `value` began a fresh
+/// unrelated value and the iterable's contents stopped flowing into the body.
+///
+/// The exclusions are the same ones [`rust_pattern_binds_value`] always
+/// applied: a `match_pattern`'s `condition` is a guard expression rather than a
+/// pattern, a struct or tuple-struct pattern's `type` names the variant, and a
+/// `scoped_identifier` is a path. A unit variant written bare (`None`) is
+/// indistinguishable from a binding in the syntax alone and is counted as one,
+/// which only adds a value nothing reads.
+///
+/// The walk is an explicit stack: pattern nesting in a source file is
+/// unbounded.
+fn rust_pattern_binding_identifiers(pattern: Node<'_>) -> Vec<Node<'_>> {
+    let mut bindings = Vec::new();
     let mut pending = vec![pattern];
     while let Some(current) = pending.pop() {
         match current.kind() {
-            "identifier" => return true,
+            "identifier" => {
+                bindings.push(current);
+                continue;
+            }
             "scoped_identifier" => continue,
             _ => {}
         }
-        // A `match_pattern`'s `condition` is a guard expression, not a pattern,
-        // and a struct or tuple-struct pattern's `type` names the variant.
         let excluded = ["type", "condition"]
             .into_iter()
             .filter_map(|field| current.child_by_field_name(field))
@@ -3943,7 +4271,8 @@ fn rust_pattern_binds_value(pattern: Node<'_>) -> bool {
                 .filter(|child| !excluded.contains(&child.id())),
         );
     }
-    false
+    bindings.sort_by_key(Node::start_byte);
+    bindings
 }
 
 fn rust_local_scope(node: Node<'_>) -> Option<(usize, usize)> {
@@ -4338,6 +4667,67 @@ fn rust_operation_can_abort(node: Node<'_>) -> bool {
     }
 }
 
+/// The non-negative magnitude of one tree-sitter-classified Rust integer
+/// literal. Rust permits decimal, binary, octal, and hexadecimal forms,
+/// optional `_` separators, and an optional integer type suffix. Decoding the
+/// token payload canonicalizes equivalent spellings without interpreting any
+/// surrounding source or macro text.
+fn rust_integer_literal_value(source: &str, node: Node<'_>) -> Option<u128> {
+    if node.kind() != "integer_literal" {
+        return None;
+    }
+    let text = node_text(source, node)?;
+    let bytes = text.as_bytes();
+    let (radix, start) = if bytes.starts_with(b"0b") {
+        (2, 2)
+    } else if bytes.starts_with(b"0o") {
+        (8, 2)
+    } else if bytes.starts_with(b"0x") {
+        (16, 2)
+    } else {
+        (10, 0)
+    };
+    let mut offset = start;
+    let mut digits = 0;
+    let mut value = 0u128;
+    while let Some(byte) = bytes.get(offset).copied() {
+        if byte == b'_' {
+            offset += 1;
+            continue;
+        }
+        let Some(digit) = char::from(byte).to_digit(radix) else {
+            break;
+        };
+        value = value
+            .checked_mul(u128::from(radix))?
+            .checked_add(u128::from(digit))?;
+        digits += 1;
+        offset += 1;
+    }
+    if digits == 0 {
+        return None;
+    }
+    let suffix = text.get(offset..)?;
+    if !matches!(
+        suffix,
+        "" | "u8"
+            | "i8"
+            | "u16"
+            | "i16"
+            | "u32"
+            | "i32"
+            | "u64"
+            | "i64"
+            | "u128"
+            | "i128"
+            | "isize"
+            | "usize"
+    ) {
+        return None;
+    }
+    Some(value)
+}
+
 fn rust_parameters_may_require_drop(callable: Node<'_>) -> bool {
     callable
         .child_by_field_name("parameters")
@@ -4347,6 +4737,19 @@ fn rust_parameters_may_require_drop(callable: Node<'_>) -> bool {
                 .into_iter()
                 .any(|parameter| !rust_parameter_is_definitely_non_dropping(parameter))
         })
+}
+
+/// The runtime initializer expression(s) represented by a Rust array
+/// expression. A named `length` field is the grammar's repeat-array form,
+/// `[value; length]`; it has one initializer rather than a list of elements.
+fn rust_array_initializer_elements(node: Node<'_>) -> Vec<Node<'_>> {
+    debug_assert_eq!(node.kind(), "array_expression");
+    let length = node.child_by_field_name("length");
+    named_children(node)
+        .into_iter()
+        .filter(|child| !is_compile_time_syntax(child.kind()))
+        .filter(|child| length.is_none_or(|length| child.id() != length.id()))
+        .collect()
 }
 
 fn runtime_expression_children(node: Node<'_>) -> Vec<Node<'_>> {

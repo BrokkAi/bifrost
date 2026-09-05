@@ -1,8 +1,11 @@
+pub mod class_set_summaries;
 pub mod epoch;
 pub mod gc;
 pub mod liveness;
+pub mod planner_statistics;
 pub mod policy_units;
 pub mod query;
+mod read_keys;
 mod relational_query;
 pub(crate) mod writer;
 pub(crate) use relational_query::RelationalStoreOutcome;
@@ -273,14 +276,14 @@ AND EXISTS (
 
 const EXACT_PATH_SYMBOL_FQN_SQL: &str =
     "SELECT lang, rel_path, blob_oid, kind, package_name, short_name,
-           exact_fqn, normalized_fqn
-    FROM workspace_path_symbol_exact_names
+           exact_fqn, normalized_fqn, requires_imports
+    FROM live_path_symbol_names
     WHERE lang = ?1 AND exact_fqn = ?2
     ORDER BY rel_path, exact_fqn";
 const NORMALIZED_PATH_SYMBOL_FQN_SQL: &str =
     "SELECT lang, rel_path, blob_oid, kind, package_name, short_name,
-           exact_fqn, normalized_fqn
-    FROM workspace_path_symbol_normalized_names
+           exact_fqn, normalized_fqn, requires_imports
+    FROM live_path_symbol_names
     WHERE lang = ?1 AND normalized_fqn = ?2
     ORDER BY rel_path, exact_fqn";
 const REVISIONED_WORKSPACE_VIEWS_SQL: &str = include_str!("revisioned_workspace_views.sql");
@@ -1003,6 +1006,12 @@ pub(crate) struct PathSymbolRow {
     pub(crate) short_name: String,
     pub(crate) exact_fqn: String,
     pub(crate) normalized_fqn: String,
+    /// Whether this row only counts when its file has an import statement.
+    /// A static property of the language's adapter
+    /// (`path_synthetic_module_requires_imports`), stored per row so
+    /// `live_path_symbol_names` can gate on a column instead of naming
+    /// languages in SQL.
+    pub(crate) requires_imports: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1078,6 +1087,7 @@ fn decode_path_symbol_row(
         short_name: row.get(offset + 4)?,
         exact_fqn: row.get(offset + 5)?,
         normalized_fqn: row.get(offset + 6)?,
+        requires_imports: row.get::<_, i64>(offset + 7)? == 1,
     })
 }
 
@@ -1380,8 +1390,8 @@ fn insert_workspace_file_projection_rows(
         let mut insert = tx.prepare_cached(
             "INSERT INTO workspace_file_path_symbol_rows(
                file_version_id, kind, package_name, short_name,
-               exact_fqn, normalized_fqn
-             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
+               exact_fqn, normalized_fqn, requires_imports
+             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         )?;
         for row in &projection.path_symbols {
             insert.execute(params![
@@ -1391,6 +1401,7 @@ fn insert_workspace_file_projection_rows(
                 row.short_name,
                 row.exact_fqn,
                 row.normalized_fqn,
+                i64::from(row.requires_imports),
             ])?;
         }
     }
@@ -13011,10 +13022,13 @@ fn stored_blob_cascade_costs_conn(
             let (ordinal, blob_present, meta_present, logical_rows, payload_bytes) = row?;
             chunk_costs[ordinal] = match (blob_present, meta_present, payload_bytes) {
                 (false, _, _) => StoredCascadeCost::Missing,
-                (true, false, _) => StoredCascadeCost::Known(PersistedMutationCost {
-                    logical_rows: 1,
-                    payload_bytes: 0,
-                }),
+                (true, false, Some(payload_bytes)) => {
+                    StoredCascadeCost::Known(PersistedMutationCost {
+                        logical_rows,
+                        payload_bytes,
+                    })
+                }
+                (true, false, None) => StoredCascadeCost::Legacy,
                 (true, true, Some(payload_bytes)) => {
                     StoredCascadeCost::Known(PersistedMutationCost {
                         logical_rows,
@@ -13048,13 +13062,15 @@ fn stored_blob_cascade_costs_sql(key_count: usize) -> String {
         .map(|ordinal| format!("({ordinal}, ?, ?)"))
         .collect::<Vec<_>>()
         .join(", ");
+    let class_set_rows = class_set_summary_cascade_rows_sql("blob.id");
+    let class_set_bytes = class_set_summary_cascade_payload_bytes_sql("blob.id");
     format!(
         "WITH requested(ordinal, blob_oid, lang) AS (VALUES {requested})
          SELECT requested.ordinal,
            blob.id IS NOT NULL,
            meta.blob_id IS NOT NULL,
            CASE WHEN blob.id IS NULL THEN 0
-             WHEN meta.blob_id IS NULL THEN 1
+             WHEN meta.blob_id IS NULL THEN 1 + {class_set_rows}
              ELSE 2 + meta.stored_unit_count + meta.range_count + meta.signature_count
                + meta.signature_metadata_count
                + meta.supertype_count + meta.child_count
@@ -13080,8 +13096,12 @@ fn stored_blob_cascade_costs_sql(key_count: usize) -> String {
                   WHERE facts.blob_id = meta.blob_id)
                + (SELECT COUNT(*) FROM structural_fact_occurrence_roles AS facts
                   WHERE facts.blob_id = meta.blob_id)
-               + CASE WHEN costs.blob_id IS NULL THEN 0 ELSE 1 END END,
-           costs.payload_bytes
+               + CASE WHEN costs.blob_id IS NULL THEN 0 ELSE 1 END
+               + {class_set_rows} END,
+           CASE WHEN blob.id IS NULL THEN 0
+             WHEN meta.blob_id IS NULL THEN {class_set_bytes}
+             WHEN costs.payload_bytes IS NULL THEN NULL
+             ELSE costs.payload_bytes + {class_set_bytes} END
          FROM requested
          LEFT JOIN blobs AS blob
            ON blob.blob_oid = requested.blob_oid AND blob.lang = requested.lang
@@ -13090,6 +13110,94 @@ fn stored_blob_cascade_costs_sql(key_count: usize) -> String {
          LEFT JOIN blob_payload_costs AS costs
            ON costs.blob_id = meta.blob_id"
     )
+}
+
+fn class_set_summary_cascade_rows_sql(blob_id: &str) -> String {
+    let child_rows = [
+        "class_set_summary_facts",
+        "class_set_summary_exits",
+        "class_set_summary_reached",
+        "class_set_summary_dependencies",
+        "class_set_summary_reads",
+        "class_set_summary_charges",
+    ]
+    .map(|table| {
+        format!(
+            "(SELECT COUNT(*) FROM {table} AS child_cost
+              JOIN class_set_summaries AS summary_cost
+                ON summary_cost.summary_id = child_cost.summary_id
+              WHERE summary_cost.owner_blob_id = {blob_id})"
+        )
+    })
+    .join(" + ");
+    format!(
+        "(SELECT COUNT(*) FROM class_set_summaries AS summary_cost
+          WHERE summary_cost.owner_blob_id = {blob_id}) + {child_rows}"
+    )
+}
+
+fn class_set_summary_cascade_payload_bytes_sql(blob_id: &str) -> String {
+    let header = format!(
+        "COALESCE((SELECT SUM(
+            length(lookup_digest) + length(procedure_lineage)
+            + length(CAST(owner_rel_path AS BLOB)) + length(CAST(lang AS BLOB))
+            + length(artifact_public_identity) + length(artifact_content_identity)
+            + length(semantics_digest) + length(context_digest)
+            + length(behavior_read_digest) + length(dependency_digest)
+            + length(carrier_digest) + length(field_slots_digest)
+            + length(CAST(completion AS BLOB)) + length(CAST(budget_mode AS BLOB))
+            + length(output_digest) + length(content_digest))
+          FROM class_set_summaries AS summary_cost
+          WHERE summary_cost.owner_blob_id = {blob_id}), 0)"
+    );
+    let child_payloads = [
+        (
+            "class_set_summary_facts",
+            "length(CAST(child_cost.fact_kind AS BLOB))
+             + length(CAST(child_cost.source_kind AS BLOB))
+             + COALESCE(length(child_cost.source_event_key), 0)
+             + COALESCE(length(child_cost.carrier_key), 0)
+             + COALESCE(length(child_cost.sink_event_key), 0)",
+        ),
+        (
+            "class_set_summary_exits",
+            "length(CAST(child_cost.exit_kind AS BLOB))",
+        ),
+        ("class_set_summary_reached", "0"),
+        (
+            "class_set_summary_dependencies",
+            "length(child_cost.callee_procedure_lineage)
+             + length(child_cost.callee_entry_selector_digest)
+             + length(child_cost.expected_output_digest)
+             + length(child_cost.consumed_child_lookup_digest)",
+        ),
+        (
+            "class_set_summary_reads",
+            "length(child_cost.key_digest) + length(CAST(child_cost.kind AS BLOB))
+             + COALESCE(length(CAST(child_cost.family AS BLOB)), 0)
+             + COALESCE(length(CAST(child_cost.languages AS BLOB)), 0)
+             + COALESCE(length(CAST(child_cost.rel_path AS BLOB)), 0)
+             + COALESCE(length(CAST(child_cost.name AS BLOB)), 0)
+             + COALESCE(length(child_cost.index_key), 0)
+             + COALESCE(length(CAST(child_cost.blob_oid AS BLOB)), 0)
+             + COALESCE(length(child_cost.subject), 0)
+             + COALESCE(length(child_cost.digest), 0)",
+        ),
+        (
+            "class_set_summary_charges",
+            "length(CAST(child_cost.charge_kind AS BLOB))",
+        ),
+    ]
+    .map(|(table, payload)| {
+        format!(
+            "COALESCE((SELECT SUM({payload}) FROM {table} AS child_cost
+              JOIN class_set_summaries AS summary_cost
+                ON summary_cost.summary_id = child_cost.summary_id
+              WHERE summary_cost.owner_blob_id = {blob_id}), 0)"
+        )
+    })
+    .join(" + ");
+    format!("{header} + {child_payloads}")
 }
 
 fn persisted_blob_mutation_cost_fallback_statement(
@@ -13114,6 +13222,8 @@ fn persisted_blob_mutation_cost_fallback_sql() -> &'static str {
     // `SEARCH unit_signature_metadata USING PRIMARY KEY`.
     static SQL: LazyLock<String> = LazyLock::new(|| {
         let signature_metadata_bytes = signature_metadata_row_bytes_sql("unit_signature_metadata");
+        let class_set_rows = class_set_summary_cascade_rows_sql("blob.id");
+        let class_set_bytes = class_set_summary_cascade_payload_bytes_sql("blob.id");
         format!(
             "SELECT
        1 + CASE WHEN meta.blob_id IS NULL THEN 0 ELSE
@@ -13141,7 +13251,8 @@ fn persisted_blob_mutation_cost_fallback_sql() -> &'static str {
            + (SELECT COUNT(*) FROM structural_fact_roles AS facts
               WHERE facts.blob_id = meta.blob_id)
            + (SELECT COUNT(*) FROM structural_fact_occurrence_roles AS facts
-              WHERE facts.blob_id = meta.blob_id) END,
+              WHERE facts.blob_id = meta.blob_id) END
+         + {class_set_rows},
        CASE WHEN meta.blob_id IS NULL THEN 0 ELSE
          length(CAST(meta.content_package AS BLOB))
            + COALESCE((SELECT SUM(
@@ -13201,6 +13312,7 @@ fn persisted_blob_mutation_cost_fallback_sql() -> &'static str {
            + COALESCE((SELECT SUM(length(CAST(role AS BLOB)))
                FROM structural_fact_occurrence_roles
                WHERE blob_id = blob.id), 0) END
+         + {class_set_bytes}
      FROM blobs AS blob
      LEFT JOIN blob_meta AS meta
        ON meta.blob_id = blob.id
@@ -14414,6 +14526,11 @@ mod tests {
     use std::time::Instant;
 
     use super::*;
+    // The EXPLAIN QUERY PLAN pins below take their SQL and bindings from the
+    // pinned-query registry in `planner_statistics`, so each pinned statement
+    // is written once, and run each assertion in both planner-statistics
+    // states (issue #3016).
+    use super::planner_statistics::tests::{explain_pin, pinned};
     use crate::analyzer::cpp::CppAdapter;
     use crate::analyzer::csharp::CSharpAdapter;
     use crate::analyzer::go::GoAdapter;
@@ -14428,6 +14545,7 @@ mod tests {
     use crate::analyzer::tree_sitter_analyzer::ParsedFile;
     use crate::analyzer::typescript::TypescriptAdapter;
     use crate::gitblob::test_repo::{commit_all, init_repo};
+    use brokk_bifrost_core::cache_gc::PlannerStatisticsState;
     use git2::ObjectType;
     use tree_sitter::Parser;
 
@@ -14894,56 +15012,38 @@ mod tests {
     /// on a table measured at two million rows.
     #[test]
     fn signature_metadata_readers_seek_the_primary_key() {
+        for state in PlannerStatisticsState::BOTH {
+            signature_metadata_readers_seek_the_primary_key_in(state);
+        }
+    }
+
+    fn signature_metadata_readers_seek_the_primary_key_in(state: PlannerStatisticsState) {
         let store = AnalyzerStore::open_ephemeral().unwrap();
         let conn = store.conn.lock().expect("store mutex");
-        let explain = |sql: &str, parameters: &[&str]| {
-            let mut statement = conn
-                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
-                .expect("prepare plan");
-            statement
-                .query_map(params_from_iter(parameters.iter().copied()), |row| {
-                    row.get::<_, String>(3)
-                })
-                .unwrap()
-                .collect::<std::result::Result<Vec<_>, _>>()
-                .unwrap()
-        };
+        state.install(&conn);
 
-        let columns = signature_metadata_value_columns_sql("metadata");
-        let batch_plan = explain(
-            &format!(
-                "SELECT keys.blob_oid, metadata.unit_key, {columns}
-                 FROM blobs AS keys
-                 JOIN unit_signature_metadata AS metadata ON metadata.blob_id = keys.id
-                 WHERE keys.lang = ? AND keys.blob_oid IN (?, ?)
-                 ORDER BY keys.blob_oid, metadata.unit_key, metadata.ordinal"
-            ),
-            &["java", "oid-a", "oid-b"],
-        );
+        let batch_plan = explain_pin(&conn, &pinned("signature_metadata_batch_reader"));
         assert!(
             batch_plan
                 .iter()
                 .any(|detail| detail.contains("SEARCH metadata USING PRIMARY KEY")),
-            "the batch reader must seek the primary key: {batch_plan:#?}"
+            "the batch reader must seek the primary key {state}: {batch_plan:#?}"
         );
         assert!(
             batch_plan.iter().all(|detail| !detail.contains("SCAN")),
-            "the batch reader must not scan any table: {batch_plan:#?}"
+            "the batch reader must not scan any table {state}: {batch_plan:#?}"
         );
 
-        let joined_plan = explain(
-            signature_metadata_for_unit_limited_sql(),
-            &["oid-a", "java", "a.B", "1", "B", "sig", "0", "10"],
-        );
+        let joined_plan = explain_pin(&conn, &pinned("signature_metadata_for_unit_limited"));
         assert!(
             joined_plan
                 .iter()
                 .any(|detail| detail.contains("SEARCH metadata USING PRIMARY KEY")),
-            "the joined reader must seek the primary key: {joined_plan:#?}"
+            "the joined reader must seek the primary key {state}: {joined_plan:#?}"
         );
         assert!(
             joined_plan.iter().all(|detail| !detail.contains("SCAN")),
-            "the joined reader must not scan any table: {joined_plan:#?}"
+            "the joined reader must not scan any table {state}: {joined_plan:#?}"
         );
     }
 
@@ -14969,36 +15069,35 @@ mod tests {
 
     #[test]
     fn enclosing_declaration_file_projection_uses_ordered_primary_keys() {
+        for state in PlannerStatisticsState::BOTH {
+            enclosing_declaration_file_projection_uses_ordered_primary_keys_in(state);
+        }
+    }
+
+    fn enclosing_declaration_file_projection_uses_ordered_primary_keys_in(
+        state: PlannerStatisticsState,
+    ) {
         let store = AnalyzerStore::open_ephemeral().unwrap();
         let conn = store.conn.lock().expect("store mutex");
-        let mut statement = conn
-            .prepare(&format!(
-                "EXPLAIN QUERY PLAN {}",
-                enclosing_declarations_for_file_sql()
-            ))
-            .expect("prepare plan");
-        let plan = statement
-            .query_map(params![TEST_OID, "rust"], |row| row.get::<_, String>(3))
-            .unwrap()
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .unwrap();
+        state.install(&conn);
+        let plan = explain_pin(&conn, &pinned("enclosing_declarations_for_file"));
 
         for table in ["units", "meta", "ranges"] {
             assert!(
                 plan.iter()
                     .any(|detail| detail.contains(&format!("SEARCH {table} USING PRIMARY KEY"))),
-                "enclosing declaration projection must seek {table}: {plan:#?}"
+                "enclosing declaration projection must seek {table} {state}: {plan:#?}"
             );
             assert!(
                 plan.iter()
                     .all(|detail| !detail.contains(&format!("SCAN {table}"))),
-                "enclosing declaration projection must not scan {table}: {plan:#?}"
+                "enclosing declaration projection must not scan {table} {state}: {plan:#?}"
             );
         }
         assert!(
             plan.iter()
                 .all(|detail| !detail.contains("USE TEMP B-TREE")),
-            "the primary-key order must satisfy the projection ORDER BY: {plan:#?}"
+            "the primary-key order must satisfy the projection ORDER BY {state}: {plan:#?}"
         );
     }
 
@@ -16420,31 +16519,32 @@ mod tests {
 
     #[test]
     fn relational_structural_fact_hydration_seeks_primary_keys() {
+        for state in PlannerStatisticsState::BOTH {
+            relational_structural_fact_hydration_seeks_primary_keys_in(state);
+        }
+    }
+
+    fn relational_structural_fact_hydration_seeks_primary_keys_in(state: PlannerStatisticsState) {
         let store = AnalyzerStore::open_ephemeral().unwrap();
         let conn = store.conn.lock().expect("store mutex");
-        for (table, order_by) in [
-            ("structural_fact_nodes", "node_id"),
-            ("structural_fact_roles", "source_node_id, ordinal"),
-            ("structural_fact_occurrence_roles", "node_id, ordinal"),
+        state.install(&conn);
+        for table in [
+            "structural_fact_nodes",
+            "structural_fact_roles",
+            "structural_fact_occurrence_roles",
         ] {
-            let plan = conn
-                .prepare(&format!(
-                    "EXPLAIN QUERY PLAN SELECT * FROM {table}
-                     WHERE blob_id = ?1 ORDER BY {order_by}"
-                ))
-                .unwrap()
-                .query_map([0_i64], |row| row.get::<_, String>(3))
-                .unwrap()
-                .collect::<std::result::Result<Vec<_>, _>>()
-                .unwrap();
+            let plan = explain_pin(
+                &conn,
+                &pinned(&format!("structural_fact_hydration_{table}")),
+            );
             assert!(
                 plan.iter()
                     .any(|step| step.contains(&format!("SEARCH {table} USING PRIMARY KEY"))),
-                "structural fact hydration must seek {table}: {plan:?}"
+                "structural fact hydration must seek {table} {state}: {plan:?}"
             );
             assert!(
                 plan.iter().all(|step| !step.contains("SCAN")),
-                "structural fact hydration must not scan tables: {plan:?}"
+                "structural fact hydration must not scan tables {state}: {plan:?}"
             );
         }
     }
@@ -16794,69 +16894,56 @@ mod tests {
     /// ones (issue #2316).
     #[test]
     fn search_candidate_name_plan_is_driven_by_the_live_blob_set() {
+        for state in PlannerStatisticsState::BOTH {
+            search_candidate_name_plan_is_driven_by_the_live_blob_set_in(state);
+        }
+    }
+
+    fn search_candidate_name_plan_is_driven_by_the_live_blob_set_in(state: PlannerStatisticsState) {
         let store = AnalyzerStore::open_ephemeral().unwrap();
         let conn = store.conn.lock().expect("store mutex");
         sync_active_blob_oids(&conn, &[]).unwrap();
-        let langs = vec!["rust".to_string(), "python".to_string()];
-        let plan_for = |required_literals: Option<&[Vec<String>]>| {
-            let (sql, literals) = search_candidate_name_rows_sql(&langs, required_literals);
-            let mut statement = conn
-                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
-                .expect("prepare plan");
-            let parameters = langs
-                .iter()
-                .chain(literals.iter())
-                .map(String::as_str)
-                .collect::<Vec<_>>();
-            statement
-                .query_map(params_from_iter(parameters), |row| row.get::<_, String>(3))
-                .unwrap()
-                .collect::<std::result::Result<Vec<_>, _>>()
-                .unwrap()
-        };
+        state.install(&conn);
 
-        let unfiltered = plan_for(None);
-        let prefiltered = plan_for(Some(&[
-            vec!["valueflow".to_string()],
-            vec!["taint".to_string()],
-        ]));
+        let unfiltered = explain_pin(&conn, &pinned("search_candidate_name_rows_unfiltered"));
+        let prefiltered = explain_pin(&conn, &pinned("search_candidate_name_rows_prefiltered"));
         assert_eq!(
             unfiltered, prefiltered,
-            "the prefilter must not change the plan"
+            "the prefilter must not change the plan {state}"
         );
         assert!(
             prefiltered.iter().any(|detail| detail
                 .contains("SEARCH keys USING COVERING INDEX sqlite_autoindex_blobs_1")),
-            "each live blob OID must intern through the unique index: {prefiltered:#?}"
+            "each live blob OID must intern through the unique index {state}: {prefiltered:#?}"
         );
         assert!(
             prefiltered
                 .iter()
                 .any(|detail| detail.contains("SEARCH units USING PRIMARY KEY")),
-            "declarations must be sought per live blob: {prefiltered:#?}"
+            "declarations must be sought per live blob {state}: {prefiltered:#?}"
         );
         assert!(
             !prefiltered
                 .iter()
                 .any(|detail| detail.contains("SCAN units")),
-            "the declaration table must never be scanned: {prefiltered:#?}"
+            "the declaration table must never be scanned {state}: {prefiltered:#?}"
         );
     }
 
     #[test]
     fn search_candidate_key_plan_is_driven_by_the_requested_blob() {
+        for state in PlannerStatisticsState::BOTH {
+            search_candidate_key_plan_is_driven_by_the_requested_blob_in(state);
+        }
+    }
+
+    fn search_candidate_key_plan_is_driven_by_the_requested_blob_in(state: PlannerStatisticsState) {
         let store = AnalyzerStore::open_ephemeral().unwrap();
         let conn = store.conn.lock().expect("store mutex");
-        let sql = search_candidate_key_set_sql(1);
-        let plan = conn
-            .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
-            .expect("prepare plan")
-            .query_map(params!["java", TEST_OID, 0_i64], |row| {
-                row.get::<_, String>(3)
-            })
-            .unwrap()
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .unwrap();
+        state.install(&conn);
+        let query = pinned("search_candidate_key_set");
+        let sql = &query.sql;
+        let plan = explain_pin(&conn, &query);
 
         let blob_seek = plan
             .iter()
@@ -16865,25 +16952,27 @@ mod tests {
                     "SEARCH keys USING COVERING INDEX sqlite_autoindex_blobs_1 (blob_oid=? AND lang=?)",
                 )
             })
-            .unwrap_or_else(|| panic!("the by-key query must seek the blob OID: {plan:#?}"));
+            .unwrap_or_else(|| panic!("the by-key query must seek the blob OID {state}: {plan:#?}"));
         let unit_seek = plan
             .iter()
             .position(|detail| {
                 detail.contains("SEARCH units USING PRIMARY KEY (blob_id=? AND unit_key=?)")
             })
-            .unwrap_or_else(|| panic!("the by-key query must seek code_units by blob: {plan:#?}"));
+            .unwrap_or_else(|| {
+                panic!("the by-key query must seek code_units by blob {state}: {plan:#?}")
+            });
         assert!(
             blob_seek < unit_seek,
-            "the requested blob must drive its code_units probe: {plan:#?}"
+            "the requested blob must drive its code_units probe {state}: {plan:#?}"
         );
         assert!(
             plan.iter().all(|detail| !detail.contains("SCAN units")),
-            "the by-key query must not scan code_units: {plan:#?}"
+            "the by-key query must not scan code_units {state}: {plan:#?}"
         );
         assert!(
             plan.iter()
                 .all(|detail| !detail.contains("idx_code_units_lang_identifier_lookup")),
-            "the by-key query must not fall back to the language-wide index: {plan:#?}"
+            "the by-key query must not fall back to the language-wide index {state}: {plan:#?}"
         );
         assert!(
             sql.contains("requested.blob_oid")
@@ -17282,6 +17371,7 @@ mod tests {
             short_name: "model".to_string(),
             exact_fqn: "pkg.model".to_string(),
             normalized_fqn: "pkg.model".to_string(),
+            requires_imports: false,
         };
 
         store
@@ -17366,6 +17456,7 @@ mod tests {
             short_name: "Old".into(),
             exact_fqn: "pkg.Old".into(),
             normalized_fqn: "pkg.Old".into(),
+            requires_imports: false,
         });
         let old_members = [old_a.rel_path.clone(), old_b.rel_path.clone()].map(|rel_path| {
             WorkspacePackageFileRow {
@@ -17416,6 +17507,7 @@ mod tests {
             short_name: "New".into(),
             exact_fqn: "next.New".into(),
             normalized_fqn: "next.New".into(),
+            requires_imports: false,
         });
         let new_members = [new_a.rel_path.clone(), new_c.rel_path.clone()].map(|rel_path| {
             WorkspacePackageFileRow {
@@ -17474,7 +17566,12 @@ mod tests {
                 ("workspace_package_files", 2),
                 ("workspace_package_edges", 1),
                 ("workspace_file_anchors", 2),
-                ("path_symbol_units", 2),
+                (
+                    "main.workspace_file_path_symbol_rows AS rows
+                     JOIN workspace_files AS files
+                       ON files.file_id = rows.file_version_id",
+                    2,
+                ),
             ] {
                 let count = conn
                     .query_row(&format!("SELECT COUNT(*) FROM {relation}"), [], |row| {
@@ -17544,6 +17641,7 @@ mod tests {
                 short_name: format!("File{index}"),
                 exact_fqn: format!("example.File{index}"),
                 normalized_fqn: format!("example.File{index}"),
+                requires_imports: false,
             })
             .collect::<Vec<_>>();
         let first = store
@@ -17723,42 +17821,40 @@ mod tests {
     /// charged 56.2 us per key on the firefox cold start.
     #[test]
     fn read_path_membership_query_seeks_keys_without_reading_fact_tables() {
+        for state in PlannerStatisticsState::BOTH {
+            read_path_membership_query_seeks_keys_without_reading_fact_tables_in(state);
+        }
+    }
+
+    fn read_path_membership_query_seeks_keys_without_reading_fact_tables_in(
+        state: PlannerStatisticsState,
+    ) {
         let store = AnalyzerStore::open_ephemeral().unwrap();
         let conn = store.conn.lock().expect("store mutex");
-        let sql = parsed_blob_keys_sql(2, "", read_path_parsed_blob_condition());
-        let mut statement = conn
-            .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
-            .expect("prepare plan");
-        let parameters = vec![None::<String>; 4];
-        let plan = statement
-            .query_map(params_from_iter(parameters.iter()), |row| {
-                row.get::<_, String>(3)
-            })
-            .unwrap()
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .unwrap();
+        state.install(&conn);
+        let plan = explain_pin(&conn, &pinned("read_path_parsed_blob_membership"));
 
         assert!(
             plan.iter().any(|detail| detail
                 .contains("SEARCH keys USING COVERING INDEX sqlite_autoindex_blobs_1")),
             "the (blob_oid, lang) pair must intern through the unique index, and \
              that index covers the id it returns, so this seek never reads the \
-             blobs table itself: {plan:#?}"
+             blobs table itself {state}: {plan:#?}"
         );
         assert!(
             plan.iter()
                 .any(|detail| detail.contains("SEARCH meta USING PRIMARY KEY")),
-            "the interned key must seek blob_meta: {plan:#?}"
+            "the interned key must seek blob_meta {state}: {plan:#?}"
         );
         assert!(
             plan.iter()
                 .any(|detail| detail.contains("SEARCH active_blob USING INTEGER PRIMARY KEY")),
-            "the active-generation check must seek blobs by its rowid id: {plan:#?}"
+            "the active-generation check must seek blobs by its rowid id {state}: {plan:#?}"
         );
         for table in verified_fact_tables() {
             assert!(
                 !plan.iter().any(|detail| detail.contains(table)),
-                "the read-path plan must not touch {table}: {plan:#?}"
+                "the read-path plan must not touch {table} {state}: {plan:#?}"
             );
         }
     }
@@ -17769,35 +17865,33 @@ mod tests {
     /// it, and scanning the fact table because the join lost its key.
     #[test]
     fn bulk_fact_reads_seek_the_intern_index_and_then_the_fact_primary_key() {
+        for state in PlannerStatisticsState::BOTH {
+            bulk_fact_reads_seek_the_intern_index_and_then_the_fact_primary_key_in(state);
+        }
+    }
+
+    fn bulk_fact_reads_seek_the_intern_index_and_then_the_fact_primary_key_in(
+        state: PlannerStatisticsState,
+    ) {
         let store = AnalyzerStore::open_ephemeral().unwrap();
         let conn = store.conn.lock().expect("store mutex");
-        let chunk = ["a".to_string(), "b".to_string()];
-        let sql = ranges_bulk_sql(&chunk_placeholders(&chunk));
-        let parameters = chunk_params("rust", &chunk);
-        let plan = conn
-            .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
-            .expect("prepare plan")
-            .query_map(params_from_iter(parameters.iter()), |row| {
-                row.get::<_, String>(3)
-            })
-            .unwrap()
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .unwrap();
+        state.install(&conn);
+        let plan = explain_pin(&conn, &pinned("ranges_bulk"));
 
         assert!(
             plan.iter().any(|detail| detail
                 .contains("SEARCH keys USING COVERING INDEX sqlite_autoindex_blobs_1")),
             "the requested OIDs must seek the intern index, which covers the id \
-             it returns: {plan:#?}"
+             it returns {state}: {plan:#?}"
         );
         assert!(
             plan.iter()
                 .any(|detail| detail.contains("SEARCH facts USING PRIMARY KEY")),
-            "each interned id must range-scan unit_ranges by its own key: {plan:#?}"
+            "each interned id must range-scan unit_ranges by its own key {state}: {plan:#?}"
         );
         assert!(
             plan.iter().all(|detail| !detail.contains("SCAN")),
-            "no relation in a bulk fact read may be scanned: {plan:#?}"
+            "no relation in a bulk fact read may be scanned {state}: {plan:#?}"
         );
     }
 
@@ -17826,72 +17920,61 @@ mod tests {
 
     #[test]
     fn path_symbol_name_lookups_use_their_fqn_indexes() {
+        for state in PlannerStatisticsState::BOTH {
+            path_symbol_name_lookups_use_their_fqn_indexes_in(state);
+        }
+    }
+
+    fn path_symbol_name_lookups_use_their_fqn_indexes_in(state: PlannerStatisticsState) {
         let store = AnalyzerStore::open_ephemeral().unwrap();
         let conn = store.conn.lock().expect("store mutex");
         store
             .select_writer_workspace_snapshots(&conn, &HashMap::default())
             .unwrap();
-        for (sql, expected_index) in [
+        state.install(&conn);
+        for (name, expected_index) in [
             (
-                EXACT_PATH_SYMBOL_FQN_SQL,
+                "exact_path_symbol_fqn",
                 "idx_workspace_file_path_symbol_rows_exact",
             ),
             (
-                NORMALIZED_PATH_SYMBOL_FQN_SQL,
+                "normalized_path_symbol_fqn",
                 "idx_workspace_file_path_symbol_rows_normalized",
             ),
         ] {
-            let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
-            let plan = stmt
-                .query_map(params!["python", "pkg.service"], |row| {
-                    row.get::<_, String>(3)
-                })
-                .unwrap()
-                .collect::<std::result::Result<Vec<_>, _>>()
-                .unwrap();
+            let plan = explain_pin(&conn, &pinned(name));
             assert!(
                 plan.iter().any(|detail| detail.contains(expected_index)),
-                "expected path-name lookup to use {expected_index}, got {plan:?}"
+                "expected path-name lookup to use {expected_index} {state}, got {plan:?}"
             );
             assert!(
-                plan.iter().all(|detail| !detail.contains("SCAN symbols")),
-                "path-name lookup must not scan path_symbol_units: {plan:?}"
+                plan.iter().all(|detail| !detail.contains("SCAN rows")),
+                "path-name lookup must not scan the path-symbol rows {state}: {plan:?}"
             );
         }
     }
 
     #[test]
     fn workspace_snapshot_identity_is_a_primary_key_point_query() {
+        for state in PlannerStatisticsState::BOTH {
+            workspace_snapshot_identity_is_a_primary_key_point_query_in(state);
+        }
+    }
+
+    fn workspace_snapshot_identity_is_a_primary_key_point_query_in(state: PlannerStatisticsState) {
         let store = AnalyzerStore::open_ephemeral().unwrap();
         let conn = store.conn.lock().expect("store mutex");
-        let mut statement = conn
-            .prepare(
-                "EXPLAIN QUERY PLAN
-                 SELECT revision FROM workspace_heads
-                 WHERE workspace_id = ?1 AND lang = ?2 AND generation = ?3",
-            )
-            .unwrap();
-        let plan = statement
-            .query_map(
-                params![
-                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-                    "python",
-                    0,
-                ],
-                |row| row.get::<_, String>(3),
-            )
-            .unwrap()
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .unwrap();
+        state.install(&conn);
+        let plan = explain_pin(&conn, &pinned("workspace_snapshot_identity"));
         assert!(
             plan.iter()
                 .any(|detail| detail.contains("SEARCH workspace_heads USING PRIMARY KEY")),
-            "workspace identity must seek the snapshot primary key: {plan:?}"
+            "workspace identity must seek the snapshot primary key {state}: {plan:?}"
         );
         assert!(
             plan.iter()
                 .all(|detail| !detail.contains("SCAN workspace_heads")),
-            "workspace identity must not scan heads: {plan:?}"
+            "workspace identity must not scan heads {state}: {plan:?}"
         );
     }
 
@@ -20113,6 +20196,56 @@ mod tests {
         );
     }
 
+    /// #1713: PHP now records the FQ names a file imports in
+    /// `type_identifiers`, and it wrote no row of that family before. A blob
+    /// persisted under the prior epoch deserializes as "this file imports
+    /// nothing", which is indistinguishable from a file that truly imports
+    /// nothing, so the salt is the only thing that retires it.
+    #[test]
+    fn php_imported_type_names_epoch_invalidates_prior_parsed_blobs() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let file = write_file(
+            temp.path(),
+            "RouteCollector.php",
+            "<?php\nnamespace FastRoute;\n\nclass RouteCollector {\n    public function __construct(RouteParser $parser) {}\n}\n",
+        );
+        let state = Arc::new(parse_state(&PhpAdapter, &file));
+        assert!(
+            state.type_identifiers.contains("FastRoute.RouteParser"),
+            "the current walk records the same-namespace import: {:?}",
+            state.type_identifiers
+        );
+        let oid = oid_for(state.source.as_bytes());
+        let store = AnalyzerStore::open_ephemeral().unwrap();
+        let prior_epoch = epoch::php_epoch_before_imported_type_names();
+        let prior_generation = store
+            .ensure_language_epoch_value("php", &prior_epoch)
+            .unwrap();
+        store
+            .write_parsed_blob_at_generation(
+                oid,
+                "php",
+                prior_generation,
+                &PhpAdapter,
+                state.as_ref(),
+            )
+            .unwrap();
+        assert!(store.contains_parsed_blob(oid, "php").unwrap());
+
+        let current_generation = store
+            .ensure_language_epoch(Language::Php, &tree_sitter_php::LANGUAGE_PHP.into())
+            .unwrap();
+
+        assert_ne!(current_generation, prior_generation);
+        assert!(!store.contains_parsed_blob(oid, "php").unwrap());
+        assert_eq!(
+            store
+                .missing_parsed_blob_keys(&[(oid, "php".to_string())])
+                .unwrap(),
+            vec![(oid, "php".to_string())]
+        );
+    }
+
     #[test]
     fn scala_scalachess_fqn_recovery_epoch_invalidates_stale_rows_and_reuses_current() {
         let temp = tempfile::TempDir::new().unwrap();
@@ -20418,6 +20551,7 @@ mod tests {
             short_name: "Model".to_string(),
             exact_fqn: "Model".to_string(),
             normalized_fqn: "Model".to_string(),
+            requires_imports: false,
         };
         store
             .sync_workspace_snapshot(
@@ -20483,6 +20617,7 @@ mod tests {
             short_name: "Model".to_string(),
             exact_fqn: "Model".to_string(),
             normalized_fqn: "Model".to_string(),
+            requires_imports: false,
         };
         store
             .sync_workspace_snapshot(
@@ -21120,24 +21255,17 @@ mod tests {
 
     #[test]
     fn replacement_cost_set_uses_only_bounded_primary_key_probes() {
+        for state in PlannerStatisticsState::BOTH {
+            replacement_cost_set_uses_only_bounded_primary_key_probes_in(state);
+        }
+    }
+
+    fn replacement_cost_set_uses_only_bounded_primary_key_probes_in(state: PlannerStatisticsState) {
         let store = AnalyzerStore::open_ephemeral().unwrap();
         let conn = store.conn.lock().expect("store mutex");
-        let explain = |query: &str, parameters: &[&str]| {
-            let sql = format!("EXPLAIN QUERY PLAN {query}");
-            let mut statement = conn.prepare(&sql).unwrap();
-            statement
-                .query_map(params_from_iter(parameters.iter().copied()), |row| {
-                    row.get::<_, String>(3)
-                })
-                .unwrap()
-                .collect::<std::result::Result<Vec<_>, _>>()
-                .unwrap()
-        };
+        state.install(&conn);
 
-        let fast_plan = explain(
-            &stored_blob_cascade_costs_sql(3),
-            &["oid-a", "java", "oid-b", "java", "oid-a", "java"],
-        );
+        let fast_plan = explain_pin(&conn, &pinned("stored_blob_cascade_costs"));
         for table in ["blob", "meta", "costs"] {
             let keyed = if table == "blob" {
                 format!("SEARCH {table} USING COVERING INDEX sqlite_autoindex_blobs_1")
@@ -21146,26 +21274,23 @@ mod tests {
             };
             assert!(
                 fast_plan.iter().any(|detail| detail.contains(&keyed)),
-                "set lookup for {table} must seek its own key: {fast_plan:#?}"
+                "set lookup for {table} must seek its own key {state}: {fast_plan:#?}"
             );
             assert!(
                 fast_plan
                     .iter()
                     .all(|detail| !detail.contains(&format!("SCAN {table}"))),
-                "set lookup must not scan persisted table {table}: {fast_plan:#?}"
+                "set lookup must not scan persisted table {table} {state}: {fast_plan:#?}"
             );
         }
         assert!(
             fast_plan
                 .iter()
                 .all(|detail| !detail.contains("USE TEMP B-TREE")),
-            "set lookup must not materialize grouping or ordering state: {fast_plan:#?}"
+            "set lookup must not materialize grouping or ordering state {state}: {fast_plan:#?}"
         );
 
-        let fallback_plan = explain(
-            persisted_blob_mutation_cost_fallback_sql(),
-            &["oid-a", "java"],
-        );
+        let fallback_plan = explain_pin(&conn, &pinned("persisted_blob_mutation_cost_fallback"));
         for table in [
             "blob",
             "meta",
@@ -21185,106 +21310,84 @@ mod tests {
             };
             assert!(
                 fallback_plan.iter().any(|detail| detail.contains(&keyed)),
-                "legacy replacement-cost branch for {table} must seek its own key: {fallback_plan:#?}"
+                "legacy replacement-cost branch for {table} must seek its own key {state}: {fallback_plan:#?}"
             );
             assert!(
                 fallback_plan
                     .iter()
                     .all(|detail| !detail.contains(&format!("SCAN {table}"))),
-                "legacy replacement-cost branch for {table} must not scan: {fallback_plan:#?}"
+                "legacy replacement-cost branch for {table} must not scan {state}: {fallback_plan:#?}"
             );
         }
         assert!(
             fallback_plan
                 .iter()
                 .all(|detail| !detail.contains("USE TEMP B-TREE")),
-            "legacy replacement-cost fallback must not materialize grouping state: {fallback_plan:#?}"
+            "legacy replacement-cost fallback must not materialize grouping state {state}: {fallback_plan:#?}"
         );
     }
 
     #[test]
     fn relational_fq_loaders_use_only_ordered_primary_key_probes() {
+        for state in PlannerStatisticsState::BOTH {
+            relational_fq_loaders_use_only_ordered_primary_key_probes_in(state);
+        }
+    }
+
+    fn relational_fq_loaders_use_only_ordered_primary_key_probes_in(state: PlannerStatisticsState) {
         let store = AnalyzerStore::open_ephemeral().unwrap();
         let conn = store.conn.lock().expect("store mutex");
-        let explain = |sql: String, parameters: Vec<rusqlite::types::Value>| {
-            let mut statement = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
-            statement
-                .query_map(params_from_iter(parameters.iter()), |row| {
-                    row.get::<_, String>(3)
-                })
-                .unwrap()
-                .collect::<std::result::Result<Vec<_>, _>>()
-                .unwrap()
-        };
+        state.install(&conn);
 
-        let candidate_plan = explain(
-            candidate_fq_segments_sql(16),
-            vec![rusqlite::types::Value::Null; 16 * 4],
-        );
+        let candidate_plan = explain_pin(&conn, &pinned("candidate_fq_segments_16"));
         assert!(
             candidate_plan
                 .iter()
                 .any(|detail| detail.contains("SEARCH segments USING PRIMARY KEY")),
-            "candidate batches must seek the segment primary key: {candidate_plan:#?}"
+            "candidate batches must seek the segment primary key {state}: {candidate_plan:#?}"
         );
         assert!(
             candidate_plan.iter().all(|detail| {
                 !detail.contains("SCAN segments") && !detail.contains("USE TEMP B-TREE")
             }),
-            "candidate batches must not scan or sort persisted rows: {candidate_plan:#?}"
+            "candidate batches must not scan or sort persisted rows {state}: {candidate_plan:#?}"
         );
 
-        let range_plan = explain(
-            raw_unit_fq_segments_sql("?, ?"),
-            vec![
-                rusqlite::types::Value::Text("java".to_string()),
-                rusqlite::types::Value::Text("oid-a".to_string()),
-                rusqlite::types::Value::Text("oid-b".to_string()),
-            ],
-        );
+        let range_plan = explain_pin(&conn, &pinned("raw_unit_fq_segments"));
         assert!(
             range_plan
                 .iter()
                 .any(|detail| detail.contains("SEARCH facts USING PRIMARY KEY")),
-            "file batches must seek the segment primary key: {range_plan:#?}"
+            "file batches must seek the segment primary key {state}: {range_plan:#?}"
         );
         assert!(
             range_plan.iter().all(|detail| {
                 !detail.contains("SCAN code_unit_fq_segments")
                     && !detail.contains("USE TEMP B-TREE")
             }),
-            "file batches must not scan or sort persisted rows: {range_plan:#?}"
+            "file batches must not scan or sort persisted rows {state}: {range_plan:#?}"
         );
     }
 
     #[test]
     fn limited_candidate_cost_uses_parent_segment_bytes_without_child_probe() {
+        for state in PlannerStatisticsState::BOTH {
+            limited_candidate_cost_uses_parent_segment_bytes_without_child_probe_in(state);
+        }
+    }
+
+    fn limited_candidate_cost_uses_parent_segment_bytes_without_child_probe_in(
+        state: PlannerStatisticsState,
+    ) {
         let store = AnalyzerStore::open_ephemeral().unwrap();
         let conn = store.conn.lock().expect("store mutex");
-        let sql = format!(
-            "EXPLAIN QUERY PLAN {} LIMIT ?4",
-            limited_identifier_candidate_for_blob_sql()
-        );
-        let plan = conn
-            .prepare(&sql)
-            .unwrap()
-            .query_map(
-                params![
-                    "java",
-                    "Widget",
-                    "0123456789012345678901234567890123456789",
-                    16_i64
-                ],
-                |row| row.get::<_, String>(3),
-            )
-            .unwrap()
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .unwrap();
+        state.install(&conn);
+        let plan = explain_pin(&conn, &pinned("limited_identifier_candidate_for_blob"));
 
         assert!(
             plan.iter()
                 .all(|detail| !detail.contains("code_unit_fq_segments")),
-            "header admission must use the parent byte count without touching segment rows: {plan:#?}"
+            "header admission must use the parent byte count without touching segment rows {state}: {plan:#?}"
         );
         assert!(
             plan.iter().all(|detail| {
@@ -21292,122 +21395,89 @@ mod tests {
                     && !detail.contains("SCAN units")
                     && !detail.contains("SCAN meta")
             }),
-            "the limited read must not scan a persisted parent or child table: {plan:#?}"
+            "the limited read must not scan a persisted parent or child table {state}: {plan:#?}"
         );
 
-        let component_sql = point_component_definition_candidate_sql(
-            true,
-            RenderedTailMatch::Exact,
-            "units.in_declarations = 1",
-        );
-        let header_plan = conn
-            .prepare(&format!("EXPLAIN QUERY PLAN {component_sql}"))
-            .unwrap()
-            .query_map(params!["java", 0_i64, "pkg", "Widget"], |row| {
-                row.get::<_, String>(3)
-            })
-            .unwrap()
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .unwrap();
+        let header_plan = explain_pin(&conn, &pinned("point_component_definition_candidate_exact"));
         assert!(
             header_plan
                 .iter()
                 .all(|detail| !detail.contains("code_unit_fq_segments")),
-            "component candidate headers must not hydrate child segments: {header_plan:#?}"
+            "component candidate headers must not hydrate child segments {state}: {header_plan:#?}"
         );
         assert!(
             header_plan.iter().any(|detail| {
                 detail.contains("idx_workspace_file_anchor_rows_package")
                     && detail.contains("package_name=?")
             }),
-            "mounted lookup must seek the request prefix: {header_plan:#?}"
+            "mounted lookup must seek the request prefix {state}: {header_plan:#?}"
         );
         assert!(
             header_plan
                 .iter()
                 .any(|detail| detail.contains("idx_code_units_anchored_blob_exact_tail")),
-            "mounted lookup must seek the request tail inside the selected blob: {header_plan:#?}"
+            "mounted lookup must seek the request tail inside the selected blob {state}: {header_plan:#?}"
         );
         assert_anchor_package_seek_is_outermost(
             &header_plan,
             "idx_code_units_anchored_blob_exact_tail",
-            "the anchored component point lookup",
+            &format!("the anchored component point lookup {state}"),
         );
         assert!(
             header_plan.iter().all(|detail| {
                 !detail.contains("SCAN units") && !detail.contains("SCAN anchors")
             }),
-            "component lookup must not enumerate a short-name candidate set: {header_plan:#?}"
+            "component lookup must not enumerate a short-name candidate set {state}: {header_plan:#?}"
         );
         assert!(
             header_plan
                 .iter()
                 .all(|detail| !detail.contains("USE TEMP B-TREE")),
-            "point lookup has no SQL ordering contract and must not sort: {header_plan:#?}"
+            "point lookup has no SQL ordering contract and must not sort {state}: {header_plan:#?}"
         );
 
-        let stable_sql = point_component_definition_candidate_sql(
-            false,
-            RenderedTailMatch::Exact,
-            "units.in_declarations = 1",
+        let stable_plan = explain_pin(
+            &conn,
+            &pinned("point_component_definition_candidate_stable"),
         );
-        let stable_plan = conn
-            .prepare(&format!("EXPLAIN QUERY PLAN {stable_sql}"))
-            .unwrap()
-            .query_map(params!["java", 0_i64, "pkg.Widget"], |row| {
-                row.get::<_, String>(3)
-            })
-            .unwrap()
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .unwrap();
         assert!(
             stable_plan
                 .iter()
                 .any(|detail| detail.contains("idx_code_units_stable_exact_tail")),
-            "stable component lookup must seek the complete request tail: {stable_plan:#?}"
+            "stable component lookup must seek the complete request tail {state}: {stable_plan:#?}"
         );
         assert!(
             stable_plan
                 .iter()
                 .all(|detail| !detail.contains("SCAN units")),
-            "stable component lookup must not enumerate language units: {stable_plan:#?}"
+            "stable component lookup must not enumerate language units {state}: {stable_plan:#?}"
         );
     }
 
     #[test]
     fn limited_candidate_order_terms_survive_materialization() {
+        for state in PlannerStatisticsState::BOTH {
+            limited_candidate_order_terms_survive_materialization_in(state);
+        }
+    }
+
+    fn limited_candidate_order_terms_survive_materialization_in(state: PlannerStatisticsState) {
         let store = AnalyzerStore::open_ephemeral().unwrap();
         let conn = store.conn.lock().expect("store mutex");
-        let sql = direct_children_limited_candidate_sql();
+        state.install(&conn);
+        let query = pinned("direct_children_limited_candidate");
+        let sql = &query.sql;
         assert!(
             sql.contains("edge.ordinal AS result_order_0")
                 && sql.contains("child.unit_key AS result_order_1")
                 && sql.contains("ORDER BY bounded.result_order_0, bounded.result_order_1"),
             "join-owned ordering terms must be projected through the bounded relation: {sql}"
         );
-        let plan = conn
-            .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
-            .unwrap()
-            .query_map(
-                params![
-                    "0123456789012345678901234567890123456789",
-                    "scala",
-                    "app.Child",
-                    0_i64,
-                    "Child",
-                    Option::<String>::None,
-                    0_i64,
-                    1_i64,
-                ],
-                |row| row.get::<_, String>(3),
-            )
-            .unwrap()
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .unwrap();
+        let plan = explain_pin(&conn, &query);
         assert!(
             plan.iter()
                 .any(|detail| detail.contains("SEARCH edge USING PRIMARY KEY")),
-            "the bounded direct-child query must retain its ordered edge relation: {plan:#?}"
+            "the bounded direct-child query must retain its ordered edge relation {state}: {plan:#?}"
         );
     }
 
@@ -21529,57 +21599,41 @@ mod tests {
 
     #[test]
     fn anchored_definition_lookups_seek_the_anchor_package_outermost() {
+        for state in PlannerStatisticsState::BOTH {
+            anchored_definition_lookups_seek_the_anchor_package_outermost_in(state);
+        }
+    }
+
+    fn anchored_definition_lookups_seek_the_anchor_package_outermost_in(
+        state: PlannerStatisticsState,
+    ) {
         let store = AnalyzerStore::open_ephemeral().unwrap();
         let conn = store.conn.lock().expect("store mutex");
-        let membership = "units.in_declarations = 1";
-        let explain = |sql: &str, parameters: &[rusqlite::types::Value]| {
-            conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
-                .unwrap()
-                .query_map(params_from_iter(parameters.iter()), |row| {
-                    row.get::<_, String>(3)
-                })
-                .unwrap()
-                .collect::<std::result::Result<Vec<_>, _>>()
-                .unwrap()
-        };
-        let text = |value: &str| rusqlite::types::Value::Text(value.to_string());
-        let generation = rusqlite::types::Value::Integer(0);
+        state.install(&conn);
 
-        assert_anchor_package_seek_is_outermost(
-            &explain(
-                point_anchor_only_definition_candidate_sql(membership),
-                &[text("java"), generation.clone(), text("pkg")],
+        for (name, unit_relation, label) in [
+            (
+                "point_anchor_only_definition_candidate",
+                "SEARCH units USING PRIMARY KEY",
+                "the anchor-only point lookup",
             ),
-            "SEARCH units USING PRIMARY KEY",
-            "the anchor-only point lookup",
-        );
-
-        let request_json = text("[[0,\"pkg\",\"Widget\",0,1]]");
-        assert_anchor_package_seek_is_outermost(
-            &explain(
-                &batch_component_definition_candidate_sql(
-                    true,
-                    RenderedTailMatch::Exact,
-                    membership,
-                ),
-                &[request_json, text("java"), generation.clone()],
+            (
+                "batch_component_definition_candidate",
+                "idx_code_units_anchored_blob_exact_tail",
+                "the anchored batch component lookup",
             ),
-            "idx_code_units_anchored_blob_exact_tail",
-            "the anchored batch component lookup",
-        );
-
-        assert_anchor_package_seek_is_outermost(
-            &explain(
-                &batch_anchor_only_definition_candidate_sql(membership),
-                &[
-                    text("[[0,\"pkg\",\"\",0,1]]"),
-                    text("java"),
-                    generation.clone(),
-                ],
+            (
+                "batch_anchor_only_definition_candidate",
+                "SEARCH units USING PRIMARY KEY",
+                "the anchor-only batch lookup",
             ),
-            "SEARCH units USING PRIMARY KEY",
-            "the anchor-only batch lookup",
-        );
+        ] {
+            assert_anchor_package_seek_is_outermost(
+                &explain_pin(&conn, &pinned(name)),
+                unit_relation,
+                &format!("{label} {state}"),
+            );
+        }
     }
 
     #[test]
@@ -21608,41 +21662,77 @@ mod tests {
     // workspace's own files and seek each blob's units by primary key.
     #[test]
     fn mounted_declaration_scan_seeks_live_workspace_files() {
+        for state in PlannerStatisticsState::BOTH {
+            mounted_declaration_scan_seeks_live_workspace_files_in(state);
+        }
+    }
+
+    fn mounted_declaration_scan_seeks_live_workspace_files_in(state: PlannerStatisticsState) {
         let store = AnalyzerStore::open_ephemeral().unwrap();
         let conn = store.conn.lock().expect("store mutex");
-        let sql = format!("EXPLAIN QUERY PLAN {}", mounted_declaration_sql());
-        let mut statement = conn.prepare(&sql).unwrap();
-        let plan = statement
-            .query_map(params_from_iter(["csharp"]), |row| row.get::<_, String>(3))
-            .unwrap()
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .unwrap();
+        state.install(&conn);
+        let plan = explain_pin(&conn, &pinned("mounted_declaration_scan"));
 
         assert!(
             plan.iter()
                 .any(|detail| detail.contains("SEARCH units USING PRIMARY KEY")),
-            "each mounted file's declarations must be a primary-key range: {plan:#?}"
+            "each mounted file's declarations must be a primary-key range {state}: {plan:#?}"
         );
         assert!(
             plan.iter().all(|detail| !detail.contains("SCAN units")),
-            "the mounted-declaration scan must never read code_units end to end: {plan:#?}"
+            "the mounted-declaration scan must never read code_units end to end {state}: {plan:#?}"
         );
         assert!(
             plan.iter().all(|detail| !detail.contains("AUTOMATIC")),
-            "the mounted-declaration scan must not build a transient index: {plan:#?}"
+            "the mounted-declaration scan must not build a transient index {state}: {plan:#?}"
         );
         assert!(
             plan.iter().all(|detail| !detail.contains("CO-ROUTINE")),
-            "the mounted-declaration scan must not materialize a compound view: {plan:#?}"
+            "the mounted-declaration scan must not materialize a compound view {state}: {plan:#?}"
         );
         assert!(
             plan.iter().all(|detail| !detail.contains("TEMP B-TREE")),
-            "the caller sorts in Rust, so the query must not sort: {plan:#?}"
+            "the caller sorts in Rust, so the query must not sort {state}: {plan:#?}"
         );
         assert!(
             plan.iter()
                 .all(|detail| !detail.contains("workspace_file_path_symbol_rows")),
-            "the path-symbol arm is discarded by the caller and must not be read: {plan:#?}"
+            "the path-symbol arm is discarded by the caller and must not be read {state}: {plan:#?}"
+        );
+        // The workspace's own file versions are the outermost relation this
+        // query is meant to walk, but they must be reached through a snapshot
+        // range, never read end to end. `workspace_file_versions` holds every
+        // workspace's rows: on a cache several worktrees share, a bare scan
+        // reads all of them and filters, once per language. Both pinned states
+        // reach it through one of the two selective entry points -- the
+        // snapshot index range, or the live-blob set of
+        // `idx_blobs_lang_generation` -- so requiring one of them costs the
+        // query nothing and forbids the shared-cache regression.
+        //
+        // A real single-workspace store can legitimately plan a bare `SCAN
+        // versions` here, and that is not a regression. Its statistics say
+        // every row shares one (workspace_id, lang, generation) -- #3016
+        // measured `789 789 789 789` for this index on tokio-rs/tokio -- so
+        // the snapshot range covers the whole table and scanning it is the
+        // cheaper way to read the same rows. Editing only that store's
+        // `sqlite_stat1` to describe ten workspaces' worth of file versions
+        // (`7890 789 789 789 1 1 1 1`), changing nothing else, puts the plan
+        // straight back to
+        // `SEARCH versions USING INDEX idx_workspace_file_versions_snapshot_blob`.
+        // The planner adapts on its own; what has to be pinned is the shape
+        // where the choice matters, and the captured fixture carries it
+        // (9,687 rows, 1,001 per snapshot prefix).
+        assert!(
+            plan.iter().all(|detail| detail.trim() != "SCAN versions"),
+            "the mounted-declaration scan must not read workspace_file_versions end to end {state}: {plan:#?}"
+        );
+        assert!(
+            plan.iter().any(|detail| {
+                detail.contains("idx_workspace_file_versions_snapshot_blob")
+                    || detail.contains("idx_blobs_lang_generation")
+            }),
+            "the mounted-declaration scan must enter through the snapshot range or the \
+             live-blob set {state}: {plan:#?}"
         );
     }
 
@@ -21653,91 +21743,77 @@ mod tests {
     // uses. See that function's comment for what SQLite does without the hint.
     #[test]
     fn hydration_chunks_seek_the_segment_primary_key() {
+        for state in PlannerStatisticsState::BOTH {
+            hydration_chunks_seek_the_segment_primary_key_in(state);
+        }
+    }
+
+    fn hydration_chunks_seek_the_segment_primary_key_in(state: PlannerStatisticsState) {
         let store = AnalyzerStore::open_ephemeral().unwrap();
         let conn = store.conn.lock().expect("store mutex");
+        state.install(&conn);
         for arity in [1usize, 16, 64, 256, 400] {
-            let sql = format!("EXPLAIN QUERY PLAN {}", candidate_fq_segments_sql(arity));
-            let bindings = (0..arity * 4)
-                .map(|_| rusqlite::types::Value::Null)
-                .collect::<Vec<_>>();
-            let plan = conn
-                .prepare(&sql)
-                .unwrap()
-                .query_map(params_from_iter(bindings.iter()), |row| {
-                    row.get::<_, String>(3)
-                })
-                .unwrap()
-                .collect::<std::result::Result<Vec<_>, _>>()
-                .unwrap();
+            let plan = explain_pin(&conn, &pinned(&format!("candidate_fq_segments_{arity}")));
 
             assert!(
                 plan.iter().any(|detail| detail
                     .contains("SEARCH segments USING PRIMARY KEY (blob_id=? AND unit_key=?)")),
-                "a {arity}-key chunk must seek the segment primary key: {plan:#?}"
+                "a {arity}-key chunk must seek the segment primary key {state}: {plan:#?}"
             );
             assert!(
                 plan.iter().all(|detail| !detail.contains("AUTOMATIC")),
-                "a {arity}-key chunk must not build a transient index over the segment table: {plan:#?}"
+                "a {arity}-key chunk must not build a transient index over the segment table {state}: {plan:#?}"
             );
         }
     }
 
     #[test]
     fn identifier_prefix_lookup_seeks_the_identifier_index() {
+        for state in PlannerStatisticsState::BOTH {
+            identifier_prefix_lookup_seeks_the_identifier_index_in(state);
+        }
+    }
+
+    fn identifier_prefix_lookup_seeks_the_identifier_index_in(state: PlannerStatisticsState) {
         let store = AnalyzerStore::open_ephemeral().unwrap();
         let conn = store.conn.lock().expect("store mutex");
-        let sql = format!("EXPLAIN QUERY PLAN {}", identifier_prefix_candidate_sql());
-        let mut statement = conn.prepare(&sql).unwrap();
-        let plan = statement
-            .query_map(params_from_iter(["csharp", "Widget`", "Widgeta"]), |row| {
-                row.get::<_, String>(3)
-            })
-            .unwrap()
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .unwrap();
+        state.install(&conn);
+        let plan = explain_pin(&conn, &pinned("identifier_prefix_candidate"));
 
         assert!(
             plan.iter().any(|detail| detail
                 .contains("SEARCH units USING INDEX idx_code_units_lang_identifier_lookup")),
-            "the prefix range must seek the identifier index: {plan:#?}"
+            "the prefix range must seek the identifier index {state}: {plan:#?}"
         );
         assert!(
             plan.iter().all(|detail| !detail.contains("SCAN units")),
-            "the prefix range must never scan code_units: {plan:#?}"
+            "the prefix range must never scan code_units {state}: {plan:#?}"
         );
     }
 
     #[test]
     fn file_identifier_lookup_seeks_identifier_index_before_blob_key_filter() {
+        for state in PlannerStatisticsState::BOTH {
+            file_identifier_lookup_seeks_identifier_index_before_blob_key_filter_in(state);
+        }
+    }
+
+    fn file_identifier_lookup_seeks_identifier_index_before_blob_key_filter_in(
+        state: PlannerStatisticsState,
+    ) {
         let store = AnalyzerStore::open_ephemeral().unwrap();
         let conn = store.conn.lock().expect("store mutex");
-        let sql = format!(
-            "EXPLAIN QUERY PLAN {} LIMIT ?4",
-            limited_identifier_candidate_for_blob_sql()
-        );
-        let mut statement = conn.prepare(&sql).unwrap();
-        let plan = statement
-            .query_map(
-                params![
-                    "rust",
-                    "Widget",
-                    "0123456789012345678901234567890123456789",
-                    16_i64
-                ],
-                |row| row.get::<_, String>(3),
-            )
-            .unwrap()
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .unwrap();
+        state.install(&conn);
+        let plan = explain_pin(&conn, &pinned("limited_identifier_candidate_for_blob"));
 
         assert!(
             plan.iter().any(|detail| detail
                 .contains("SEARCH units USING INDEX idx_code_units_lang_identifier_lookup")),
-            "file-scoped lookup must seek the identifier index: {plan:#?}"
+            "file-scoped lookup must seek the identifier index {state}: {plan:#?}"
         );
         assert!(
             plan.iter().all(|detail| !detail.contains("SCAN units")),
-            "file-scoped lookup must never scan code_units: {plan:#?}"
+            "file-scoped lookup must never scan code_units {state}: {plan:#?}"
         );
     }
 
@@ -23799,101 +23875,80 @@ mod tests {
     /// they must not need an ordering b-tree either.
     #[test]
     fn import_reads_use_the_import_primary_keys() {
+        for state in PlannerStatisticsState::BOTH {
+            import_reads_use_the_import_primary_keys_in(state);
+        }
+    }
+
+    fn import_reads_use_the_import_primary_keys_in(state: PlannerStatisticsState) {
         let store = AnalyzerStore::open_ephemeral().unwrap();
         let conn = store.conn.lock().expect("store mutex");
-        let explain = |query: &str, parameters: &[&str]| {
-            let sql = format!("EXPLAIN QUERY PLAN {query}");
-            let mut statement = conn.prepare(&sql).unwrap();
-            statement
-                .query_map(params_from_iter(parameters.iter().copied()), |row| {
-                    row.get::<_, String>(3)
-                })
-                .unwrap()
-                .collect::<std::result::Result<Vec<_>, _>>()
-                .unwrap()
-        };
+        state.install(&conn);
 
-        let per_blob = explain(
-            &format!(
-                "SELECT {IMPORT_STATEMENT_COLUMNS} FROM import_statements
-                 WHERE blob_id = (SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = ?2)
-                 ORDER BY ordinal"
-            ),
-            &[TEST_OID, "rust"],
-        );
+        let per_blob = explain_pin(&conn, &pinned("import_statements_per_blob"));
         assert!(
             per_blob
                 .iter()
                 .any(|detail| detail.contains("SEARCH import_statements USING PRIMARY KEY")),
-            "{per_blob:#?}"
+            "{state}: {per_blob:#?}"
         );
         assert!(
             per_blob
                 .iter()
                 .all(|detail| !detail.contains("SCAN import_statements")
                     && !detail.contains("USE TEMP B-TREE")),
-            "{per_blob:#?}"
+            "{state}: {per_blob:#?}"
         );
 
-        for (table, value_columns) in [
-            ("import_path_segments", "segment"),
-            ("import_lexical_prefixes", "prefix"),
-            ("import_lexical_scopes", "start_byte, end_byte"),
+        for table in [
+            "import_path_segments",
+            "import_lexical_prefixes",
+            "import_lexical_scopes",
         ] {
-            let plan = explain(
-                &format!(
-                    "SELECT keys.blob_oid, facts.ordinal, {value_columns}
-                     FROM blobs AS keys
-                     JOIN {table} AS facts ON facts.blob_id = keys.id
-                     WHERE keys.lang = ? AND keys.blob_oid IN (?, ?)
-                     ORDER BY keys.blob_oid, facts.ordinal"
-                ),
-                &["rust", TEST_OID, TEST_OID],
-            );
+            let plan = explain_pin(&conn, &pinned(&format!("import_child_{table}")));
             assert!(
                 plan.iter()
                     .any(|detail| detail.contains("SEARCH facts USING PRIMARY KEY")),
-                "{table}: {plan:#?}"
+                "{table} {state}: {plan:#?}"
             );
             assert!(
                 plan.iter().any(|detail| detail
                     .contains("SEARCH keys USING COVERING INDEX sqlite_autoindex_blobs_1")),
-                "{table}: {plan:#?}"
+                "{table} {state}: {plan:#?}"
             );
             assert!(
                 plan.iter()
                     .all(|detail| !detail.contains("SCAN") && !detail.contains("USE TEMP B-TREE")),
-                "{table}: {plan:#?}"
+                "{table} {state}: {plan:#?}"
             );
         }
     }
 
     #[test]
     fn workspace_package_fact_batch_seeks_each_requested_blob() {
+        for state in PlannerStatisticsState::BOTH {
+            workspace_package_fact_batch_seeks_each_requested_blob_in(state);
+        }
+    }
+
+    fn workspace_package_fact_batch_seeks_each_requested_blob_in(state: PlannerStatisticsState) {
         let store = AnalyzerStore::open_ephemeral().unwrap();
         let conn = store.conn.lock().expect("store mutex");
-        let sql = workspace_content_package_facts_sql(2);
-        let mut statement = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
-        let plan = statement
-            .query_map(params_from_iter(["java", TEST_OID, TEST_OID]), |row| {
-                row.get::<_, String>(3)
-            })
-            .unwrap()
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .unwrap();
+        state.install(&conn);
+        let plan = explain_pin(&conn, &pinned("workspace_content_package_facts"));
         assert!(
             plan.iter().any(|detail| {
                 detail.contains("SEARCH units USING PRIMARY KEY")
                     || detail.contains("SEARCH code_units USING PRIMARY KEY")
             }),
-            "package facts must seek the requested blob keys: {plan:#?}"
+            "package facts must seek the requested blob keys {state}: {plan:#?}"
         );
         assert!(
             plan.iter().any(|detail| {
                 detail.contains("SEARCH segments USING PRIMARY KEY")
                     || detail.contains("SEARCH code_unit_fq_segments USING PRIMARY KEY")
             }),
-            "package segments must seek the selected declaration keys: {plan:#?}"
+            "package segments must seek the selected declaration keys {state}: {plan:#?}"
         );
         assert!(
             plan.iter().all(|detail| {
@@ -23904,7 +23959,7 @@ mod tests {
                     && !detail.contains("SCAN segments")
                     && !detail.contains("SCAN code_unit_fq_segments")
             }),
-            "package-fact batching must not scan persisted fact tables: {plan:#?}"
+            "package-fact batching must not scan persisted fact tables {state}: {plan:#?}"
         );
     }
 
@@ -24009,98 +24064,82 @@ mod tests {
 
     #[test]
     fn reverse_reference_candidates_use_name_first_indexes() {
+        for state in PlannerStatisticsState::BOTH {
+            reverse_reference_candidates_use_name_first_indexes_in(state);
+        }
+    }
+
+    fn reverse_reference_candidates_use_name_first_indexes_in(state: PlannerStatisticsState) {
         let store = AnalyzerStore::open_ephemeral().unwrap();
         let conn = store.conn.lock().expect("store mutex");
         store
             .select_writer_workspace_snapshots(&conn, &HashMap::default())
             .unwrap();
-        sync_reverse_reference_lookup_keys(
-            &conn,
-            &["Target".to_string()].into_iter().collect(),
-            &["pkg".to_string()].into_iter().collect(),
-            &["Target".to_string()].into_iter().collect(),
-        )
-        .unwrap();
-        let explain = |sql: &str| {
-            let mut statement = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
-            statement
-                .query_map(["java"], |row| row.get::<_, String>(3))
-                .unwrap()
-                .collect::<std::result::Result<Vec<_>, _>>()
-                .unwrap()
-        };
+        super::planner_statistics::tests::prepare_pin_context(&conn);
+        state.install(&conn);
 
-        let imports = explain(REVERSE_IMPORT_CANDIDATE_BLOBS_SQL);
+        let imports = explain_pin(&conn, &pinned("reverse_import_candidate_blobs"));
         assert!(
             imports.iter().any(|detail| {
                 detail.contains(
                     "SEARCH segments USING COVERING INDEX idx_import_path_segments_by_segment",
                 )
             }),
-            "reverse import lookup must seek the requested segment: {imports:#?}"
+            "reverse import lookup must seek the requested segment {state}: {imports:#?}"
         );
         assert!(
             imports
                 .iter()
                 .all(|detail| !detail.contains("SCAN segments")),
-            "reverse import lookup must not scan import_path_segments: {imports:#?}"
+            "reverse import lookup must not scan import_path_segments {state}: {imports:#?}"
         );
         assert!(
             imports
                 .iter()
                 .any(|detail| { detail.contains("idx_workspace_file_versions_snapshot_blob") }),
-            "reverse import lookup must seek snapshot membership by blob: {imports:#?}"
+            "reverse import lookup must seek snapshot membership by blob {state}: {imports:#?}"
         );
 
-        let identifiers = explain(REVERSE_TYPE_CANDIDATE_BLOBS_SQL);
+        let identifiers = explain_pin(&conn, &pinned("reverse_type_candidate_blobs"));
         assert!(
             identifiers.iter().any(|detail| {
                 detail.contains(
                     "SEARCH identifiers USING COVERING INDEX idx_reference_identifiers_by_identifier",
                 )
             }),
-            "reverse type lookup must seek the requested identifier: {identifiers:#?}"
+            "reverse type lookup must seek the requested identifier {state}: {identifiers:#?}"
         );
         assert!(
             identifiers
                 .iter()
                 .all(|detail| !detail.contains("SCAN identifiers")),
-            "reverse type lookup must not scan reference_identifiers: {identifiers:#?}"
+            "reverse type lookup must not scan reference_identifiers {state}: {identifiers:#?}"
         );
 
-        let mut statement = conn
-            .prepare(&format!(
-                "EXPLAIN QUERY PLAN {REVERSE_IDENTIFIER_CANDIDATE_PATHS_SQL}"
-            ))
-            .unwrap();
-        let paths = statement
-            .query_map(["java"], |row| row.get::<_, String>(3))
-            .unwrap()
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .unwrap();
+        let paths = explain_pin(&conn, &pinned("reverse_identifier_candidate_paths"));
         assert!(
             paths.iter().any(|detail| detail.contains(
                 "SEARCH identifiers USING COVERING INDEX idx_reference_identifiers_by_identifier"
             )),
-            "reverse path lookup must seek the requested identifier: {paths:#?}"
+            "reverse path lookup must seek the requested identifier {state}: {paths:#?}"
         );
         assert!(
             paths
                 .iter()
                 .any(|detail| detail.contains("idx_workspace_file_versions_snapshot_blob")),
-            "reverse path lookup must seek snapshot membership by blob: {paths:#?}"
+            "reverse path lookup must seek snapshot membership by blob {state}: {paths:#?}"
         );
         assert!(
             paths.iter().all(|detail| {
                 !detail.contains("SCAN identifiers") && !detail.contains("SCAN files")
             }),
-            "reverse path lookup must not scan persisted facts: {paths:#?}"
+            "reverse path lookup must not scan persisted facts {state}: {paths:#?}"
         );
         assert!(
             identifiers
                 .iter()
                 .any(|detail| { detail.contains("idx_workspace_file_versions_snapshot_blob") }),
-            "reverse type lookup must seek snapshot membership by blob: {identifiers:#?}"
+            "reverse type lookup must seek snapshot membership by blob {state}: {identifiers:#?}"
         );
     }
 
@@ -24861,18 +24900,18 @@ mod tests {
 
     #[test]
     fn rust_module_import_candidates_seek_occurrences_then_blob_import_rows() {
+        for state in PlannerStatisticsState::BOTH {
+            rust_module_import_candidates_seek_occurrences_then_blob_import_rows_in(state);
+        }
+    }
+
+    fn rust_module_import_candidates_seek_occurrences_then_blob_import_rows_in(
+        state: PlannerStatisticsState,
+    ) {
         let store = AnalyzerStore::open_ephemeral().unwrap();
         let conn = store.conn.lock().expect("store mutex");
-        let mut statement = conn
-            .prepare(&format!(
-                "EXPLAIN QUERY PLAN {RUST_MODULE_IMPORT_CANDIDATE_BLOBS_SQL}"
-            ))
-            .expect("prepare plan");
-        let plan = statement
-            .query_map(params!["rust", "semantic"], |row| row.get::<_, String>(3))
-            .unwrap()
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .unwrap();
+        state.install(&conn);
+        let plan = explain_pin(&conn, &pinned("rust_module_import_candidate_blobs"));
 
         assert!(
             plan.iter().any(|detail| {
@@ -24880,18 +24919,18 @@ mod tests {
                     "SEARCH occurrence USING COVERING INDEX idx_rust_identifier_occurrences",
                 )
             }),
-            "the exact component must seek the occurrence index: {plan:#?}"
+            "the exact component must seek the occurrence index {state}: {plan:#?}"
         );
         assert!(
             plan.iter()
                 .any(|detail| detail.contains("SEARCH import_target USING PRIMARY KEY")),
-            "each candidate blob must range-read its own import rows: {plan:#?}"
+            "each candidate blob must range-read its own import rows {state}: {plan:#?}"
         );
         assert!(
             !plan
                 .iter()
                 .any(|detail| detail.contains("SCAN import_target")),
-            "the query must not scan the workspace import table: {plan:#?}"
+            "the query must not scan the workspace import table {state}: {plan:#?}"
         );
     }
 

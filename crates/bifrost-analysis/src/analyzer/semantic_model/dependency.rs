@@ -449,38 +449,50 @@ pub enum DependencyProductionFailure {
     },
 }
 
-/// A process-wide, host-installed attempt to acquire one exact generated
-/// production. The callback may install bytes into `catalog`, but cannot hand
-/// a pack directly to preparation. Preparation always re-reads the catalog
-/// after this hook, which keeps catalog verification authoritative.
-pub type GeneratedProductionAcquisitionHook =
-    fn(&SemanticPackCatalog, &GeneratedProductionKey) -> Result<(), String>;
-
-static GENERATED_PRODUCTION_ACQUISITION_HOOK: OnceLock<
-    RwLock<Option<GeneratedProductionAcquisitionHook>>,
-> = OnceLock::new();
-
-fn acquisition_hook_slot() -> &'static RwLock<Option<GeneratedProductionAcquisitionHook>> {
-    GENERATED_PRODUCTION_ACQUISITION_HOOK.get_or_init(|| RwLock::new(None))
+/// What one host-installed acquisition attempt is being asked for.
+///
+/// Both kinds name a catalog entry that preparation could not build locally.
+/// An exact generated production is named by its key, because it is produced
+/// from artifacts this workspace holds. A declared dependency has no local
+/// artifact at all, so the only thing that identifies the pack it needs is the
+/// evidence-only selector query preparation would use to select it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AcquisitionRequest<'a> {
+    GeneratedProduction(&'a GeneratedProductionKey),
+    DeclaredPack(&'a SemanticPackSelectorQuery),
 }
 
-/// Install or clear the process-wide exact-production acquisition hook.
+/// A process-wide, host-installed attempt to acquire one semantic pack. The
+/// callback may install bytes into `catalog`, but cannot hand a pack directly
+/// to preparation. Preparation always re-reads the catalog after this hook,
+/// which keeps catalog verification authoritative.
+pub type SemanticPackAcquisitionHook =
+    fn(&SemanticPackCatalog, &AcquisitionRequest<'_>) -> Result<(), String>;
+
+static SEMANTIC_PACK_ACQUISITION_HOOK: OnceLock<RwLock<Option<SemanticPackAcquisitionHook>>> =
+    OnceLock::new();
+
+fn acquisition_hook_slot() -> &'static RwLock<Option<SemanticPackAcquisitionHook>> {
+    SEMANTIC_PACK_ACQUISITION_HOOK.get_or_init(|| RwLock::new(None))
+}
+
+/// Install or clear the process-wide semantic-pack acquisition hook.
 ///
 /// The previous hook is returned so a caller that temporarily owns process
 /// configuration, such as a test harness, can restore it exactly.
-pub fn set_generated_production_acquisition_hook(
-    hook: Option<GeneratedProductionAcquisitionHook>,
-) -> Option<GeneratedProductionAcquisitionHook> {
+pub fn set_semantic_pack_acquisition_hook(
+    hook: Option<SemanticPackAcquisitionHook>,
+) -> Option<SemanticPackAcquisitionHook> {
     let mut slot = acquisition_hook_slot()
         .write()
-        .expect("generated-production acquisition hook mutex poisoned");
+        .expect("semantic-pack acquisition hook mutex poisoned");
     std::mem::replace(&mut *slot, hook)
 }
 
-fn generated_production_acquisition_hook() -> Option<GeneratedProductionAcquisitionHook> {
+fn semantic_pack_acquisition_hook() -> Option<SemanticPackAcquisitionHook> {
     *acquisition_hook_slot()
         .read()
-        .expect("generated-production acquisition hook mutex poisoned")
+        .expect("semantic-pack acquisition hook mutex poisoned")
 }
 
 pub trait DependencyPackAdapter {
@@ -1037,41 +1049,21 @@ pub fn prepare_dependency_semantic_packs(
             continue;
         }
         if dependency.artifacts.is_empty() || !adapter.can_produce(dependency) {
-            match compatible_installed_pack(catalog, dependency, &mut diagnostics) {
+            match resolve_declared_dependency_pack(
+                catalog,
+                dependency,
+                cancellation,
+                &mut diagnostics,
+            ) {
                 Ok(Some(installed)) => {
                     evidence.push(installed.evidence.clone());
                     installed_packs.push(installed);
                     profile.installed_packs += 1;
                 }
-                // No usable pack. Distinguish "a pack exists for another
-                // version of this exact coordinate" from "no pack at all":
-                // the near miss names the installed and required versions so
-                // a version mismatch is attributable, never silent (#1884).
-                Ok(None) => match installed_pack_query(dependency)
-                    .map(|query| catalog.version_near_misses(&query))
-                {
-                    Some(Ok(near_misses)) if !near_misses.is_empty() => {
-                        for near_miss in near_misses {
-                            diagnostics.error(
-                                "dependency.pack_version_mismatch",
-                                Some(&dependency.id),
-                                None,
-                                near_miss.describe(),
-                            );
-                        }
-                    }
-                    Some(Err(error)) => {
-                        diagnostics.catalog(Some(&dependency.id), "catalog.lookup", error)
-                    }
-                    Some(Ok(_)) | None => diagnostics.error(
-                        "dependency.pack_unavailable",
-                        Some(&dependency.id),
-                        None,
-                        "resolved dependency has no exact locally producible artifact or compatible installed semantic pack",
-                    ),
-                },
-                Err(error) => {
-                    diagnostics.catalog(Some(&dependency.id), "catalog.lookup", error)
+                Ok(None) => {}
+                Err(DeclaredPackCancelled) => {
+                    cancelled = true;
+                    break;
                 }
             }
             continue;
@@ -1299,12 +1291,12 @@ pub fn prepare_dependency_semantic_packs(
             }
         }
 
-        if let Some(acquire) = generated_production_acquisition_hook() {
+        if let Some(acquire) = semantic_pack_acquisition_hook() {
             if is_cancelled(cancellation) {
                 cancelled = true;
                 break;
             }
-            if let Err(error) = acquire(catalog, &key) {
+            if let Err(error) = acquire(catalog, &AcquisitionRequest::GeneratedProduction(&key)) {
                 diagnostics.warning(
                     "production.acquire",
                     Some(&dependency.id),
@@ -1636,6 +1628,110 @@ fn reusable_generated_pack(
         status: DependencyPackPreparationStatus::Reused,
         evidence: activation_evidence(dependency, input_digest),
     }))
+}
+
+const PACK_UNAVAILABLE_MESSAGE: &str = "resolved dependency has no exact locally producible artifact or compatible installed \
+     semantic pack";
+
+/// The artifact-less dependency route observed cancellation and stopped
+/// before it could resolve anything. Preparation stops with it.
+struct DeclaredPackCancelled;
+
+/// Resolve one dependency that preparation cannot produce locally, either
+/// because it carries no artifact or because the adapter refuses it.
+///
+/// A declared toolchain dependency, such as the CPython version a
+/// `pyproject.toml` requires or the PHP version a `composer.json` requires, is
+/// the shape that has no artifact at all: nothing about it can form a
+/// generated-production key, so the exact-production acquisition route can
+/// never reach it (#2957). The acquisition hook is therefore offered the
+/// evidence-only selector query instead, and, exactly as on the generated
+/// route, the provider can only attempt installation: the catalog is re-read
+/// through the ordinary verified path afterwards.
+fn resolve_declared_dependency_pack(
+    catalog: &SemanticPackCatalog,
+    dependency: &ResolvedDependency,
+    cancellation: Option<&CancellationToken>,
+    diagnostics: &mut BoundedDependencyDiagnostics,
+) -> Result<Option<PreparedInstalledDependencyPack>, DeclaredPackCancelled> {
+    match compatible_installed_pack(catalog, dependency, diagnostics) {
+        Ok(Some(installed)) => return Ok(Some(installed)),
+        Ok(None) => {}
+        Err(error) => {
+            diagnostics.catalog(Some(&dependency.id), "catalog.lookup", error);
+            return Ok(None);
+        }
+    }
+
+    // No usable pack. Distinguish "a pack exists for another version of this
+    // exact coordinate" from "no pack at all": the near miss names the
+    // installed and required versions so a version mismatch is attributable,
+    // never silent (#1884). A near miss is also not an acquisition case: the
+    // release bundle already supplied a pack for this coordinate, and the
+    // version the workspace declares is what does not match.
+    let Some(query) = installed_pack_query(dependency) else {
+        diagnostics.error(
+            "dependency.pack_unavailable",
+            Some(&dependency.id),
+            None,
+            PACK_UNAVAILABLE_MESSAGE,
+        );
+        return Ok(None);
+    };
+    let near_misses = match catalog.version_near_misses(&query) {
+        Ok(near_misses) => near_misses,
+        Err(error) => {
+            diagnostics.catalog(Some(&dependency.id), "catalog.lookup", error);
+            return Ok(None);
+        }
+    };
+    if !near_misses.is_empty() {
+        for near_miss in near_misses {
+            diagnostics.error(
+                "dependency.pack_version_mismatch",
+                Some(&dependency.id),
+                None,
+                near_miss.describe(),
+            );
+        }
+        return Ok(None);
+    }
+
+    let Some(acquire) = semantic_pack_acquisition_hook() else {
+        diagnostics.error(
+            "dependency.pack_unavailable",
+            Some(&dependency.id),
+            None,
+            PACK_UNAVAILABLE_MESSAGE,
+        );
+        return Ok(None);
+    };
+    if is_cancelled(cancellation) {
+        return Err(DeclaredPackCancelled);
+    }
+    if let Err(error) = acquire(catalog, &AcquisitionRequest::DeclaredPack(&query)) {
+        diagnostics.warning(
+            "dependency.acquire",
+            Some(&dependency.id),
+            format!("could not acquire declared dependency semantic pack: {error}"),
+        );
+    }
+    match compatible_installed_pack(catalog, dependency, diagnostics) {
+        Ok(Some(installed)) => Ok(Some(installed)),
+        Ok(None) => {
+            diagnostics.error(
+                "dependency.pack_unavailable",
+                Some(&dependency.id),
+                None,
+                PACK_UNAVAILABLE_MESSAGE,
+            );
+            Ok(None)
+        }
+        Err(error) => {
+            diagnostics.catalog(Some(&dependency.id), "catalog.lookup", error);
+            Ok(None)
+        }
+    }
 }
 
 /// The evidence-only catalog query for one dependency, or `None` when the
@@ -2037,6 +2133,7 @@ fn artifact_kind_name(kind: ExternalArtifactKind) -> &'static str {
         ExternalArtifactKind::PythonSource => "python_source",
         ExternalArtifactKind::RubyGemArchive => "ruby_gem_archive",
         ExternalArtifactKind::ComposerPackageSourceSet => "composer_package_source_set",
+        ExternalArtifactKind::PhpDeclarationStub => "php_declaration_stub",
         ExternalArtifactKind::CppHeaderSourceSet => "cpp_header_source_set",
     }
 }
@@ -2380,5 +2477,415 @@ mod bounded_dependency_diagnostics_tests {
         assert_eq!(codes(&diagnostics), vec!["first", "second", "third"]);
         assert_eq!(suppressed, SuppressedDiagnostics::default());
         assert_eq!(suppressed.total(), 0);
+    }
+}
+
+#[cfg(test)]
+mod declared_pack_acquisition_tests {
+    use super::*;
+    use crate::analyzer::semantic_model::{
+        CatalogCoordinate, CatalogOptions, CompiledSemanticModelPack, DurablePackSource,
+        DurablePackSourceKind, SourceFormat, compile_source,
+    };
+    use semver::Version;
+    use std::sync::Mutex;
+
+    /// A complete CPython standard-library pack that activates for the whole
+    /// `>=3.10.0, <3.15.0` range the shipped typeshed pack declares, so a
+    /// workspace that pins 3.10.0 from `requires-python` selects it.
+    const CPYTHON_PACK: &str = r#"{
+  "schema_version": 2,
+  "pack_id": "fixture.python-stdlib",
+  "version": "2026.9.4",
+  "producer": { "name": "bifrost-fixture", "version": "1.0.0" },
+  "language": "python",
+  "ecosystem": "python",
+  "compatibility": {
+    "bifrost": ">=0.8.0, <1.0.0",
+    "toolchains": [{ "name": "cpython", "requirement": ">=3.10.0, <3.15.0" }]
+  },
+  "provenance": { "source": "checked-in test source", "revision": "fixture-v1" },
+  "license": "Apache-2.0",
+  "completeness": "complete",
+  "safety": { "generated_code_only": false, "review_required": false },
+  "shards": [{
+    "id": "python.stdlib",
+    "activation": [{
+      "toolchain": { "name": "cpython", "version": ">=3.10.0, <3.15.0" }
+    }],
+    "payload": {
+      "kind": "declaration_facts",
+      "types": [{
+        "id": "python.types-nonetype",
+        "name": "types.NoneType",
+        "type_kind": "class",
+        "visibility": "public",
+        "type_parameters": [],
+        "hierarchy": [],
+        "aliases": [],
+        "extension_surfaces": [],
+        "locator": {
+          "kind": "artifact",
+          "path": "stdlib/types.pyi",
+          "symbol": "types.NoneType"
+        }
+      }],
+      "members": [],
+      "relations": []
+    }
+  }]
+}"#;
+
+    /// What the fixture hook does when preparation reaches it. The behavior is
+    /// an enum rather than a set of flags so exactly one of the three
+    /// acquisition outcomes is selected at a time.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum HookBehavior {
+        RecordOnly,
+        Fail,
+        Install,
+    }
+
+    static HOOK_GUARD: Mutex<()> = Mutex::new(());
+    static HOOK_REQUESTS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    static HOOK_BEHAVIOR: Mutex<HookBehavior> = Mutex::new(HookBehavior::RecordOnly);
+
+    fn recording_hook(
+        catalog: &SemanticPackCatalog,
+        request: &AcquisitionRequest<'_>,
+    ) -> Result<(), String> {
+        let description = match request {
+            AcquisitionRequest::GeneratedProduction(key) => {
+                format!("generated:{}", key.production_digest())
+            }
+            AcquisitionRequest::DeclaredPack(query) => {
+                let toolchain = query
+                    .toolchain
+                    .as_ref()
+                    .expect("declared toolchain dependency query carries a toolchain coordinate");
+                let version = toolchain
+                    .version
+                    .as_ref()
+                    .expect("declared toolchain dependency query carries an exact version");
+                format!("declared:{}:{}@{version}", query.ecosystem, toolchain.name)
+            }
+        };
+        HOOK_REQUESTS
+            .lock()
+            .expect("fixture hook request log poisoned")
+            .push(description);
+        match *HOOK_BEHAVIOR
+            .lock()
+            .expect("fixture hook behavior poisoned")
+        {
+            HookBehavior::RecordOnly => Ok(()),
+            HookBehavior::Fail => Err("fixture acquisition unavailable".to_owned()),
+            HookBehavior::Install => install_fixture_pack(catalog, &compiled_pack(CPYTHON_PACK)),
+        }
+    }
+
+    fn compiled_pack(source: &str) -> CompiledSemanticModelPack {
+        compile_source(
+            SourceFormat::Json,
+            source.as_bytes(),
+            &CompilerOptions::default(),
+        )
+        .unwrap_or_else(|diagnostics| panic!("fixture compilation failed: {diagnostics:#?}"))
+    }
+
+    fn install_fixture_pack(
+        catalog: &SemanticPackCatalog,
+        pack: &CompiledSemanticModelPack,
+    ) -> Result<(), String> {
+        catalog
+            .install(
+                pack,
+                &DurablePackSource {
+                    kind: DurablePackSourceKind::PreShipped,
+                    source_id: format!("test:{}@{}", pack.manifest.pack_id, pack.manifest.version),
+                },
+            )
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
+    /// The exact shape `declared_python_stdlib_dependency` produces for a
+    /// `pyproject.toml` that states `requires-python = ">=3.10"`: a toolchain
+    /// coordinate and no artifact at all, so no generated-production key can
+    /// ever be formed for it (#2957).
+    fn declared_python_dependency() -> ResolvedDependency {
+        ResolvedDependency {
+            id: "python:stdlib:declared:cpython:3.10.0".to_owned(),
+            evidence: SemanticModelActivationEvidence {
+                language: "python".to_owned(),
+                ecosystem: "python".to_owned(),
+                package: None,
+                module: None,
+                toolchain: Some(CatalogCoordinate {
+                    name: "cpython".to_owned(),
+                    version: Some(Version::new(3, 10, 0)),
+                }),
+                target: None,
+                configuration: None,
+                artifact_sha256: None,
+            },
+            provenance: Vec::new(),
+            artifacts: Vec::new(),
+            scope: DependencyScope::Unknown,
+            declared_by: None,
+        }
+    }
+
+    /// The PHP twin declared under #2374. It reaches the same route: an
+    /// artifact-less toolchain coordinate that only an installed pack can
+    /// satisfy.
+    fn declared_php_dependency() -> ResolvedDependency {
+        ResolvedDependency {
+            id: "php:runtime:declared:php:8.2.0".to_owned(),
+            evidence: SemanticModelActivationEvidence {
+                language: "php".to_owned(),
+                ecosystem: "php".to_owned(),
+                package: None,
+                module: None,
+                toolchain: Some(CatalogCoordinate {
+                    name: "php".to_owned(),
+                    version: Some(Version::new(8, 2, 0)),
+                }),
+                target: None,
+                configuration: None,
+                artifact_sha256: None,
+            },
+            provenance: Vec::new(),
+            artifacts: Vec::new(),
+            scope: DependencyScope::Unknown,
+            declared_by: None,
+        }
+    }
+
+    struct NeverProducingAdapter;
+
+    impl DependencyPackAdapter for NeverProducingAdapter {
+        fn adapter_name(&self) -> &str {
+            "fixture-declared"
+        }
+
+        fn adapter_version(&self) -> &str {
+            "1"
+        }
+
+        fn producer(&self) -> Producer {
+            Producer {
+                name: "fixture-declared".to_owned(),
+                version: "1".to_owned(),
+            }
+        }
+
+        fn produce(
+            &self,
+            _dependency: &ResolvedDependency,
+            _artifacts: &[ExactDependencyArtifact],
+            _limits: &ArtifactProducerLimits,
+            _cancellation: Option<&CancellationToken>,
+        ) -> DependencyPackProduction {
+            unimplemented!("an artifact-less dependency never reaches production")
+        }
+    }
+
+    struct HookFixture<'a> {
+        _guard: std::sync::MutexGuard<'a, ()>,
+        previous: Option<SemanticPackAcquisitionHook>,
+    }
+
+    impl HookFixture<'_> {
+        fn install(behavior: HookBehavior) -> Self {
+            let guard = HOOK_GUARD
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            HOOK_REQUESTS
+                .lock()
+                .expect("fixture hook request log poisoned")
+                .clear();
+            *HOOK_BEHAVIOR
+                .lock()
+                .expect("fixture hook behavior poisoned") = behavior;
+            let previous = set_semantic_pack_acquisition_hook(Some(recording_hook));
+            Self {
+                _guard: guard,
+                previous,
+            }
+        }
+
+        fn requests(&self) -> Vec<String> {
+            HOOK_REQUESTS
+                .lock()
+                .expect("fixture hook request log poisoned")
+                .clone()
+        }
+    }
+
+    impl Drop for HookFixture<'_> {
+        fn drop(&mut self) {
+            set_semantic_pack_acquisition_hook(self.previous);
+        }
+    }
+
+    fn prepare(
+        catalog: &SemanticPackCatalog,
+        dependency: ResolvedDependency,
+    ) -> DependencyPackPreparationOutcome {
+        prepare_dependency_semantic_packs(
+            catalog,
+            &NeverProducingAdapter,
+            &[dependency],
+            &DependencyPackLimits::default(),
+            None,
+        )
+    }
+
+    fn codes(outcome: &DependencyPackPreparationOutcome) -> Vec<&str> {
+        outcome
+            .diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.code.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn artifact_less_dependency_without_an_installed_pack_reaches_the_hook_once() {
+        let fixture = HookFixture::install(HookBehavior::RecordOnly);
+        let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
+
+        let outcome = prepare(&catalog, declared_python_dependency());
+
+        assert_eq!(fixture.requests(), vec!["declared:python:cpython@3.10.0"]);
+        assert_eq!(outcome.installed_packs.len(), 0);
+        assert_eq!(
+            codes(&outcome),
+            vec![
+                "dependency.pack_unavailable",
+                "preparation.unaccounted-dependency"
+            ]
+        );
+    }
+
+    #[test]
+    fn declared_php_runtime_dependency_reaches_the_hook() {
+        let fixture = HookFixture::install(HookBehavior::RecordOnly);
+        let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
+
+        let outcome = prepare(&catalog, declared_php_dependency());
+
+        assert_eq!(fixture.requests(), vec!["declared:php:php@8.2.0"]);
+        assert_eq!(
+            codes(&outcome),
+            vec![
+                "dependency.pack_unavailable",
+                "preparation.unaccounted-dependency"
+            ]
+        );
+    }
+
+    #[test]
+    fn an_installed_compatible_pack_never_reaches_the_hook() {
+        let fixture = HookFixture::install(HookBehavior::RecordOnly);
+        let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
+        install_fixture_pack(&catalog, &compiled_pack(CPYTHON_PACK)).unwrap();
+
+        let outcome = prepare(&catalog, declared_python_dependency());
+
+        assert!(fixture.requests().is_empty());
+        assert_eq!(outcome.installed_packs.len(), 1);
+        assert!(outcome.diagnostics.is_empty(), "{:#?}", outcome.diagnostics);
+    }
+
+    #[test]
+    fn a_version_near_miss_never_reaches_the_hook() {
+        let fixture = HookFixture::install(HookBehavior::RecordOnly);
+        let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
+        let narrowed = CPYTHON_PACK.replace(">=3.10.0, <3.15.0", "=3.13.0");
+        install_fixture_pack(&catalog, &compiled_pack(&narrowed)).unwrap();
+
+        let outcome = prepare(&catalog, declared_python_dependency());
+
+        assert!(fixture.requests().is_empty());
+        assert_eq!(outcome.installed_packs.len(), 0);
+        assert_eq!(
+            codes(&outcome),
+            vec![
+                "dependency.pack_version_mismatch",
+                "preparation.unaccounted-dependency"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_hook_that_installs_the_pack_yields_an_installed_dependency_pack() {
+        let fixture = HookFixture::install(HookBehavior::Install);
+        let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
+
+        let outcome = prepare(&catalog, declared_python_dependency());
+
+        assert_eq!(fixture.requests(), vec!["declared:python:cpython@3.10.0"]);
+        assert!(outcome.diagnostics.is_empty(), "{:#?}", outcome.diagnostics);
+        assert_eq!(outcome.profile.installed_packs, 1);
+        assert_eq!(outcome.installed_packs.len(), 1);
+        let installed = &outcome.installed_packs[0];
+        assert!(installed.activation_ready);
+        assert_eq!(installed.completeness, Completeness::Complete);
+        assert_eq!(
+            installed.evidence,
+            declared_python_dependency().evidence,
+            "the installed pack carries the declared dependency's activation evidence"
+        );
+        assert_eq!(
+            outcome.evidence,
+            vec![declared_python_dependency().evidence]
+        );
+    }
+
+    #[test]
+    fn a_failed_acquisition_warns_and_leaves_the_dependency_unavailable() {
+        let fixture = HookFixture::install(HookBehavior::Fail);
+        let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
+
+        let outcome = prepare(&catalog, declared_python_dependency());
+
+        assert_eq!(fixture.requests(), vec!["declared:python:cpython@3.10.0"]);
+        assert_eq!(
+            codes(&outcome),
+            vec![
+                "dependency.acquire",
+                "dependency.pack_unavailable",
+                "preparation.unaccounted-dependency"
+            ]
+        );
+        assert_eq!(
+            outcome.diagnostics[0].severity,
+            DependencyPackDiagnosticSeverity::Warning
+        );
+        assert_eq!(outcome.installed_packs.len(), 0);
+    }
+
+    #[test]
+    fn a_disabled_hook_is_not_a_warning() {
+        let _guard = HOOK_GUARD
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous = set_semantic_pack_acquisition_hook(None);
+        let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
+
+        let outcome = prepare(&catalog, declared_python_dependency());
+
+        set_semantic_pack_acquisition_hook(previous);
+        // The unaccounted-dependency warning is the ordinary tail accounting
+        // for a dependency that produced no pack. A disabled hook adds nothing
+        // of its own: no acquisition attempt was made, so nothing failed.
+        assert_eq!(
+            codes(&outcome),
+            vec![
+                "dependency.pack_unavailable",
+                "preparation.unaccounted-dependency"
+            ]
+        );
     }
 }

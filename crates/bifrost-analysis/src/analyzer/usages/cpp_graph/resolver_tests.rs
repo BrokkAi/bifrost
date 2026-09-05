@@ -8,8 +8,8 @@
 
 use crate::analyzer::usages::cpp_graph::CppDispatch;
 use crate::analyzer::{
-    CodeUnit, CodeUnitIndex, CodeUnitType, CppAnalyzer, ProjectFile, QueryScope, QueryToken,
-    resolve_analyzer,
+    AnalyzerTestHooks, CodeUnit, CodeUnitIndex, CodeUnitType, CppAnalyzer, ProjectFile, QueryScope,
+    QueryToken, resolve_analyzer,
 };
 use brokk_bifrost_core::analyzer::model::{
     CallableArity, CppTemplateExpression, CppTemplateParameterMetadata, CppTemplateTerm,
@@ -967,7 +967,7 @@ ABSL_NAMESPACE_END
         let root = temp.path().canonicalize().expect("canonical temp dir");
         fs::write(
             root.join("types.h"),
-            "struct Hidden {};\nusing Public = Hidden;\n",
+            "struct Hidden {};\nusing Public = Hidden;\nusing AlsoPublic = Hidden;\n",
         )
         .expect("write types header");
         fs::write(
@@ -995,6 +995,20 @@ ABSL_NAMESPACE_END
         assert!(
             visibility.parser_alias_name_may_resolve_to_target(&consumer, "Public", hidden,),
             "an encountered parser alias must still resolve to its target"
+        );
+        let files_after_first_alias = visibility.parser_alias_fallback_file_count_for_test();
+        assert!(
+            visibility.parser_alias_name_may_resolve_to_target(&consumer, "Public", hidden,),
+            "a repeated parser alias lookup must retain its match"
+        );
+        assert_eq!(
+            visibility.parser_alias_fallback_file_count_for_test(),
+            files_after_first_alias,
+            "a repeated alias spelling for one target must reuse the visible-file traversal"
+        );
+        assert!(
+            visibility.parser_alias_name_may_resolve_to_target(&consumer, "AlsoPublic", hidden,),
+            "another parser alias spelling must still resolve to its target"
         );
     }
 
@@ -2928,6 +2942,119 @@ ABSL_NAMESPACE_END
             !arity.accepts(0),
             "required parameter must remain enforced: {arity:?}"
         );
+    }
+
+    #[test]
+    fn same_logical_callable_uses_stored_comparable_name_candidates() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        let header = root.join("api.hpp");
+        let body = root.join("api.cpp");
+        let consumer = root.join("consumer.cpp");
+        fs::write(
+            &header,
+            "namespace api { class Value {}; void consume(Value value); }\n",
+        )
+        .expect("write declaration fixture");
+        fs::write(
+            &body,
+            "#include \"api.hpp\"\nvoid api::consume(api::Value value) {}\n",
+        )
+        .expect("write definition fixture");
+        fs::write(
+            &consumer,
+            "#include \"api.hpp\"\nvoid use() { api::Value value; api::consume(value); }\n",
+        )
+        .expect("write consumer fixture");
+
+        let analyzer = CppAnalyzer::from_project(crate::analyzer::TestProject::new(
+            &root,
+            crate::analyzer::Language::Cpp,
+        ));
+        let header_file = ProjectFile::new(root.clone(), "api.hpp");
+        let body_file = ProjectFile::new(root.clone(), "api.cpp");
+        let header_consume = analyzer
+            .get_all_declarations()
+            .into_iter()
+            .find(|unit| {
+                unit.is_function()
+                    && unit.identifier() == "consume"
+                    && unit.source() == &header_file
+            })
+            .expect("header declaration");
+        let body_consume = analyzer
+            .get_all_declarations()
+            .into_iter()
+            .find(|unit| {
+                unit.is_function() && unit.identifier() == "consume" && unit.source() == &body_file
+            })
+            .expect("out-of-line definition");
+        assert_eq!(header_consume.fq_name(), body_consume.fq_name());
+        assert_ne!(header_consume.signature(), body_consume.signature());
+
+        let query_scope = crate::analyzer::AnalyzerQueryScope::new(&analyzer);
+        let token = query_scope.token();
+        let graph = CppGraphSource::from_source(&analyzer, token);
+        let visibility = VisibilityIndex::build(
+            &analyzer,
+            token,
+            &graph,
+            &HashSet::from_iter([ProjectFile::new(root, "consumer.cpp")]),
+        );
+        analyzer.reset_relational_definition_batch_call_count_for_test();
+
+        assert!(visibility.same_logical_callable(&graph, &header_consume, &body_consume));
+        assert!(visibility.same_logical_callable(&graph, &header_consume, &body_consume));
+        assert_eq!(
+            analyzer.relational_definition_batch_call_count_for_test(),
+            0,
+            "comparable type-name resolution must not materialize generated fields through relational batches"
+        );
+    }
+
+    #[test]
+    fn visibility_build_reuses_identifier_candidates_across_roots() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        fs::write(root.join("shared.h"), "struct Shared {};\n").expect("write shared header");
+        fs::write(
+            root.join("first.cpp"),
+            "#include \"shared.h\"\nShared *first;\n",
+        )
+        .expect("write first consumer");
+        fs::write(
+            root.join("second.cpp"),
+            "#include \"shared.h\"\nShared *second;\n",
+        )
+        .expect("write second consumer");
+
+        let analyzer = CppAnalyzer::from_project(crate::analyzer::TestProject::new(
+            &root,
+            crate::analyzer::Language::Cpp,
+        ));
+        let query_scope = crate::analyzer::AnalyzerQueryScope::new(&analyzer);
+        let token = query_scope.token();
+        let graph = CppGraphSource::from_source(&analyzer, token);
+        let first_file = ProjectFile::new(root.clone(), "first.cpp");
+        let second_file = ProjectFile::new(root, "second.cpp");
+        let visibility = VisibilityIndex::build(
+            &analyzer,
+            token,
+            &graph,
+            &HashSet::from_iter([first_file.clone(), second_file]),
+        );
+
+        assert_eq!(
+            visibility.visibility_identifier_lookup_count(),
+            3,
+            "the shared `Shared` spelling and each root's variable spelling must each query once"
+        );
+        assert_eq!(
+            visibility.visibility_identifier_batch_count(),
+            2,
+            "each root contributes one batch while the shared spelling remains memoized"
+        );
+        assert_eq!(visibility.type_candidates(&first_file, "Shared").len(), 1);
     }
 
     #[test]

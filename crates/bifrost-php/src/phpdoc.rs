@@ -141,6 +141,31 @@ fn reference_identifier(kind: &ReferenceKind<'_>) -> Option<String> {
         .map(str::to_string)
 }
 
+/// Whether a docblock states members that no PHP declaration states:
+/// `@method`, `@property`, `@property-read`, or `@property-write`.
+///
+/// Bifrost synthesizes no declaration from these tags. A caller that publishes
+/// a type carrying them must therefore report the type's surface as read
+/// incompletely, so that a name's absence from the published surface is never
+/// mistaken for proof that the type does not declare it.
+pub fn declares_docblock_only_members(comment: &str) -> bool {
+    with_document(comment, |document| {
+        document
+            .tags()
+            .any(|tag| {
+                matches!(
+                    tag.value,
+                    TagValue::Method(_)
+                        | TagValue::Property(_)
+                        | TagValue::PropertyRead(_)
+                        | TagValue::PropertyWrite(_)
+                )
+            })
+            .then_some(())
+    })
+    .is_some()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

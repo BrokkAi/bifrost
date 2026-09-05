@@ -1,5 +1,6 @@
 use super::contracts::assert_serial_profile_reconciles;
 use super::*;
+use crate::analyzer::CodeUnitIndex;
 use crate::analyzer::semantic::{
     SemanticBudget, SemanticBudgetDimension, SemanticEffect, SemanticRequest, SemanticValueKind,
     ValueFlowKind,
@@ -1100,6 +1101,96 @@ fn profile_marks_unsupported_seed_materialization_and_replay_incomplete() {
     }));
 }
 
+#[derive(Clone)]
+struct ImportUnsupportedAnalyzer {
+    inner: PhpAnalyzer,
+}
+
+impl CodeUnitIndex for ImportUnsupportedAnalyzer {
+    fn project(&self) -> &dyn crate::analyzer::Project {
+        CodeUnitIndex::project(&self.inner)
+    }
+
+    fn languages(&self) -> BTreeSet<Language> {
+        CodeUnitIndex::languages(&self.inner)
+    }
+
+    fn all_declarations(&self) -> Box<dyn Iterator<Item = CodeUnit> + '_> {
+        CodeUnitIndex::all_declarations(&self.inner)
+    }
+
+    fn search_definitions(&self, pattern: &str, auto_quote: bool) -> BTreeSet<CodeUnit> {
+        CodeUnitIndex::search_definitions(&self.inner, pattern, auto_quote)
+    }
+
+    fn enclosing_code_unit(&self, file: &ProjectFile, range: &Range) -> Option<CodeUnit> {
+        CodeUnitIndex::enclosing_code_unit(&self.inner, file, range)
+    }
+
+    fn enclosing_code_unit_for_lines(
+        &self,
+        file: &ProjectFile,
+        start_line: usize,
+        end_line: usize,
+    ) -> Option<CodeUnit> {
+        CodeUnitIndex::enclosing_code_unit_for_lines(&self.inner, file, start_line, end_line)
+    }
+
+    fn get_skeleton(&self, code_unit: &CodeUnit) -> Option<String> {
+        CodeUnitIndex::get_skeleton(&self.inner, code_unit)
+    }
+
+    fn get_skeleton_header(&self, code_unit: &CodeUnit) -> Option<String> {
+        CodeUnitIndex::get_skeleton_header(&self.inner, code_unit)
+    }
+
+    fn get_source(&self, code_unit: &CodeUnit, include_comments: bool) -> Option<String> {
+        CodeUnitIndex::get_source(&self.inner, code_unit, include_comments)
+    }
+
+    fn get_sources(&self, code_unit: &CodeUnit, include_comments: bool) -> BTreeSet<String> {
+        CodeUnitIndex::get_sources(&self.inner, code_unit, include_comments)
+    }
+}
+
+impl IAnalyzer for ImportUnsupportedAnalyzer {
+    fn update(&self, changed_files: &BTreeSet<ProjectFile>) -> Self {
+        Self {
+            inner: IAnalyzer::update(&self.inner, changed_files),
+        }
+    }
+
+    fn update_all(&self) -> Self {
+        Self {
+            inner: IAnalyzer::update_all(&self.inner),
+        }
+    }
+
+    fn extract_call_receiver(&self, reference: &str) -> Option<String> {
+        IAnalyzer::extract_call_receiver(&self.inner, reference)
+    }
+
+    fn is_access_expression(&self, file: &ProjectFile, start_byte: usize, end_byte: usize) -> bool {
+        IAnalyzer::is_access_expression(&self.inner, file, start_byte, end_byte)
+    }
+
+    fn find_nearest_declaration(
+        &self,
+        file: &ProjectFile,
+        start_byte: usize,
+        end_byte: usize,
+        ident: &str,
+    ) -> Option<crate::analyzer::DeclarationInfo> {
+        IAnalyzer::find_nearest_declaration(&self.inner, file, start_byte, end_byte, ident)
+    }
+
+    fn structural_fact_providers(
+        &self,
+    ) -> Vec<&dyn crate::analyzer::structural::StructuralFactProvider> {
+        IAnalyzer::structural_fact_providers(&self.inner)
+    }
+}
+
 #[test]
 fn profile_marks_unsupported_import_builds_and_replays_incomplete() {
     let temp = tempfile::tempdir().expect("temp dir");
@@ -1107,7 +1198,13 @@ fn profile_marks_unsupported_import_builds_and_replays_incomplete() {
     ProjectFile::new(root.clone(), PathBuf::from("app.php"))
         .write("<?php\nfunction target() {}\n")
         .expect("write source");
-    let analyzer = PhpAnalyzer::from_project(TestProject::new(root, Language::Php));
+    // Every shipped language now has an import provider. Hide PHP's provider
+    // behind a test adapter while retaining its real structural facts so this
+    // remains a capability-gap test instead of depending on a stale matrix.
+    let analyzer = ImportUnsupportedAnalyzer {
+        inner: PhpAnalyzer::from_project(TestProject::new(root, Language::Php)),
+    };
+    assert!(analyzer.import_analysis_provider().is_none());
     let imports = json!({
         "match": { "kind": "function", "name": "target" },
         "steps": [{ "op": "file_of" }, { "op": "imports_of" }]
@@ -5187,6 +5284,173 @@ func multiResultReceiver() int {
     }
 }
 
+/// A race on a variable declared in another package must be found, and the
+/// two occurrences must be recognised as one storage.
+///
+/// Go's semantic adapter declares no intra-file dependencies, so it cannot
+/// read the declaring file and records `pkg.Name` as an occurrence with its
+/// identity marked unresolved. While that occurrence was dropped entirely, a
+/// cross-package race produced no accesses, no compared pair, and no open
+/// reason, so the shipped policy reported a clean and complete run on a racy
+/// program. Every multi-package Go repository was affected.
+#[test]
+fn go_conflicts_resolve_a_variable_declared_in_another_package() {
+    let project = InlineTestProject::with_language(Language::Go)
+        .file(
+            "go.mod",
+            "module example.com/xpkg
+
+go 1.22
+",
+        )
+        .file(
+            "inner/inner.go",
+            "package inner
+
+var Shared int
+
+var Other int
+",
+        )
+        .file(
+            "main.go",
+            r#"package main
+
+import "example.com/xpkg/inner"
+
+func racesOnImportedVar() int {
+    go func() { inner.Shared = 1 }()
+    return inner.Shared
+}
+
+func distinctImportedVars() int {
+    go func() { inner.Shared = 1 }()
+    return inner.Other
+}
+"#,
+        )
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let conflicts_for = |name: &str| {
+        let query = CodeQuery::from_json(&json!({
+            "languages": ["go"],
+            "match": { "kind": "function", "name": name },
+            "steps": [
+                { "op": "procedure_of" },
+                { "op": "concurrent_access_conflicts" }
+            ],
+            "result_detail": "full"
+        }))
+        .expect("imported package variable concurrent access query");
+        execute_workspace(
+            &workspace,
+            &brokk_bifrost_flow::FlowWorkspaceState::new(),
+            &query,
+        )
+    };
+
+    let raced = conflicts_for("racesOnImportedVar");
+    let value = find_concurrent_relation(&raced, |value| value.verdict == "conflict");
+    assert_eq!(
+        (value.ordering, value.proof, value.coverage),
+        ("unordered", "proven", "exhaustive"),
+        "{raced:#?}"
+    );
+
+    // Resolving to the declaration must separate two variables of one package,
+    // not merge everything reached through the same import.
+    let distinct = conflicts_for("distinctImportedVars");
+    assert!(
+        !distinct.results.iter().any(|item| matches!(
+            &item.value,
+            CodeQueryResultValue::ConcurrentAccessConflict { value }
+                if value.verdict == "conflict"
+        )),
+        "distinct imported variables must not alias: {distinct:#?}"
+    );
+}
+
+/// A race on a package variable declared in another file of the same package
+/// must be found, and two distinct such variables must stay apart.
+///
+/// `package_value_locators` is filled by walking one file, so a variable
+/// declared elsewhere in the package was absent from it and its occurrences
+/// became no location and no access at all. The race was missed with nothing
+/// reported open, which is the shape bbolt's traversal hits at every hop
+/// between `tx.go`, `bucket.go` and `node.go`.
+#[test]
+fn go_conflicts_resolve_a_package_variable_declared_in_another_file() {
+    let project = InlineTestProject::with_language(Language::Go)
+        .file("go.mod", "module example.com/crossfile\n\ngo 1.22\n")
+        .file(
+            "state.go",
+            r#"package main
+
+var counter int
+
+var other int
+
+func bumpCounter() { counter = 1 }
+
+func bumpOther() { other = 1 }
+"#,
+        )
+        .file(
+            "main.go",
+            r#"package main
+
+func racesOnCrossFileVar() int {
+    go bumpCounter()
+    return counter
+}
+
+func distinctCrossFileVars() int {
+    go bumpOther()
+    return counter
+}
+"#,
+        )
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let conflicts_for = |name: &str| {
+        let query = CodeQuery::from_json(&json!({
+            "languages": ["go"],
+            "match": { "kind": "function", "name": name },
+            "steps": [
+                { "op": "procedure_of" },
+                { "op": "concurrent_access_conflicts" }
+            ],
+            "result_detail": "full"
+        }))
+        .expect("cross-file package variable concurrent access query");
+        execute_workspace(
+            &workspace,
+            &brokk_bifrost_flow::FlowWorkspaceState::new(),
+            &query,
+        )
+    };
+
+    let raced = conflicts_for("racesOnCrossFileVar");
+    let value = find_concurrent_relation(&raced, |value| value.verdict == "conflict");
+    assert_eq!(
+        (value.ordering, value.proof, value.coverage),
+        ("unordered", "proven", "exhaustive"),
+        "{raced:#?}"
+    );
+
+    // Resolving to the declaration is what separates two variables of one
+    // file; giving every unresolved name one identity would merge them.
+    let distinct = conflicts_for("distinctCrossFileVars");
+    assert!(
+        !distinct.results.iter().any(|item| matches!(
+            &item.value,
+            CodeQueryResultValue::ConcurrentAccessConflict { value }
+                if value.verdict == "conflict"
+        )),
+        "distinct cross-file variables must not alias: {distinct:#?}"
+    );
+}
+
 #[test]
 fn go_concurrent_access_conflicts_close_summarized_recursive_slices() {
     let project = InlineTestProject::with_language(Language::Go)
@@ -8911,8 +9175,51 @@ fn class_set_and_absent_member_share_one_solve_per_input_procedure() {
     assert_eq!(type_flow.field_slot_builds, 1, "{type_flow:#?}");
     assert_eq!(type_flow.solves, 2, "{type_flow:#?}");
     assert_eq!(type_flow.cache_hits, 0, "{type_flow:#?}");
+    assert!(type_flow.snapshot_cache_hits > 0, "{type_flow:#?}");
+    assert!(type_flow.snapshot_cache_misses > 0, "{type_flow:#?}");
+    assert!(type_flow.dispatch_cache_hits > 0, "{type_flow:#?}");
+    assert!(type_flow.dispatch_cache_misses > 0, "{type_flow:#?}");
     assert_eq!(type_flow.finding_rows, 1, "{type_flow:#?}");
     assert_eq!(type_flow.failed_solves, 0, "{type_flow:#?}");
+}
+
+#[test]
+fn class_set_reuses_provider_acquisition_across_queries_without_changing_rows() {
+    let (_project, workspace) = type_flow_workspace();
+    let flow_state = brokk_bifrost_flow::FlowWorkspaceState::new();
+    let query = CodeQuery::from_json(&json!({
+        "execution_mode": "profile",
+        "languages": ["python"],
+        "match": { "kind": "function", "name": "read_config" },
+        "steps": [
+            { "op": "procedure_of" },
+            { "op": "class_set" }
+        ],
+        "result_detail": "full"
+    }))
+    .expect("profile query");
+
+    let first = execute_workspace_request(&workspace, &flow_state, &query);
+    let second = execute_workspace_request(&workspace, &flow_state, &query);
+    let (CodeQueryResponse::Profile(first), CodeQueryResponse::Profile(second)) = (first, second)
+    else {
+        panic!("profile-mode queries return profiles");
+    };
+
+    assert_eq!(
+        serde_json::to_value(&first.result.results).expect("first rows serialize"),
+        serde_json::to_value(&second.result.results).expect("second rows serialize"),
+        "provider-cache warmth must not change canonical result rows"
+    );
+    let cold = first.work.semantic.type_flow;
+    let warm = second.work.semantic.type_flow;
+    assert!(cold.snapshot_cache_misses > 0, "{cold:#?}");
+    assert!(cold.dispatch_cache_misses > 0, "{cold:#?}");
+    assert!(warm.snapshot_cache_hits > 0, "{warm:#?}");
+    assert!(warm.dispatch_cache_hits > 0, "{warm:#?}");
+    assert_eq!(warm.snapshot_cache_misses, 0, "{warm:#?}");
+    assert_eq!(warm.dispatch_cache_misses, 0, "{warm:#?}");
+    assert_eq!(warm.binding_cache_misses, 0, "{warm:#?}");
 }
 
 /// A language with no registered adapter is an explicit unsupported

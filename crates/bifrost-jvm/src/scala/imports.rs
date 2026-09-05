@@ -373,7 +373,12 @@ fn scala_node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
 }
 
 pub fn is_scala_importable_top_level(unit: &CodeUnit) -> bool {
-    if unit.short_name().contains('.') {
+    // "Top level" is a statement about segment count, not about the rendered
+    // spelling: a Scala backtick-quoted name may itself contain a `.`
+    // (`` `zio.ZIO` ``), and asking the string made such a class look like a
+    // member of a package-named owner, so nothing could import or reach it
+    // (#2219).
+    if unit.declaration_segment_count() > 1 {
         return false;
     }
     unit.is_class() || unit.is_function() || unit.is_field()

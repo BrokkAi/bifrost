@@ -3,11 +3,17 @@ use crate::analyzer::BoundedDefinitionLookup;
 use crate::analyzer::CodeUnitIndex;
 use crate::analyzer::ForwardQueryProvider;
 use crate::analyzer::TypeHierarchyProvider;
+use crate::analyzer::php::diagnostics::{
+    PHP_GLOBAL_NAMESPACE_OWNER, PhpOverlayMember, PhpOverlayType, php_overlay_member,
+    php_overlay_type,
+};
 use crate::analyzer::php::{
-    PhpDeclaredType, php_dynamic_type_keyword_node, php_file_context_from_tree_at,
+    PHP_GLOBAL_NAMESPACE, PhpDeclaredType, php_dynamic_type_keyword_node,
     resolve_php_constant_node, resolve_php_function_node, resolve_php_type_node,
     resolve_php_type_node_arms,
 };
+use crate::analyzer::semantic::ResolverOwnedExternalCalleeIdentity;
+use crate::analyzer::semantic_model::SemanticModelOverlay;
 use crate::analyzer::usages::local_inference::SymbolResolution;
 use crate::analyzer::usages::php_graph::syntax::{
     PhpMagicSurface, anonymous_function_capture_names, captured_local_scope_bindings,
@@ -28,10 +34,9 @@ use crate::analyzer::usages::php_graph::{
     PhpAnalyzerFacts, php_dynamic_type_keyword, php_graph_source, resolve_php_type_arms,
 };
 use crate::analyzer::usages::target_kind::TypeLookupTargetKind;
+use brokk_bifrost_php::aliases::{PhpFileContextIndex, php_file_context_from_tree_at};
 use brokk_bifrost_php::graph::PhpCallableFacts;
-use brokk_bifrost_php::graph_support::{
-    php_direct_declared_class_parent, php_file_context_from_source, php_is_interface,
-};
+use brokk_bifrost_php::graph_support::{php_direct_declared_class_parent, php_is_interface};
 use brokk_bifrost_php::phpdoc::{
     return_element_type as phpdoc_return_element_type,
     return_nominal_type as phpdoc_return_nominal_type, var_element_type as phpdoc_var_element_type,
@@ -285,6 +290,47 @@ fn php_expression_type_fqn(
     }
 }
 
+pub(super) struct PhpDefinitionResolution {
+    pub(super) outcome: DefinitionLookupOutcome,
+    pub(super) external_callee_identity: Option<ResolverOwnedExternalCalleeIdentity>,
+}
+
+#[derive(Default)]
+struct PhpCallEvidence {
+    external_callee_identity: Option<ResolverOwnedExternalCalleeIdentity>,
+}
+
+impl PhpCallEvidence {
+    fn record_external_member(&mut self, owner_fqn: &str, member: &str) {
+        let identity = ResolverOwnedExternalCalleeIdentity::new(
+            Language::Php,
+            owner_fqn.to_owned(),
+            member.to_owned(),
+        );
+        debug_assert!(
+            self.external_callee_identity
+                .as_ref()
+                .is_none_or(|existing| existing == &identity),
+            "one PHP call cannot resolve to conflicting external identities"
+        );
+        self.external_callee_identity = Some(identity);
+    }
+
+    fn record_external_callable(&mut self, callable_fqn: &str) {
+        let segments =
+            crate::analyzer::symbol_lookup::parse_symbol_path(Language::Php, callable_fqn);
+        let Some((member, owner_segments)) = segments.split_last() else {
+            return;
+        };
+        let owner = if owner_segments.is_empty() {
+            PHP_GLOBAL_NAMESPACE.to_owned()
+        } else {
+            owner_segments.join(".")
+        };
+        self.record_external_member(&owner, member);
+    }
+}
+
 pub(super) fn resolve_php(
     analyzer: &dyn IAnalyzer,
     support: &dyn BoundedDefinitionLookup,
@@ -292,8 +338,22 @@ pub(super) fn resolve_php(
     source: &str,
     tree: Option<&Tree>,
     site: &ResolvedReferenceSite,
-) -> DefinitionLookupOutcome {
-    resolve_php_with_session(analyzer, support, file, source, tree, site, None)
+) -> PhpDefinitionResolution {
+    let mut call_evidence = PhpCallEvidence::default();
+    let outcome = resolve_php_with_session(
+        analyzer,
+        support,
+        file,
+        source,
+        tree,
+        site,
+        None,
+        Some(&mut call_evidence),
+    );
+    PhpDefinitionResolution {
+        outcome,
+        external_callee_identity: call_evidence.external_callee_identity,
+    }
 }
 
 pub(crate) fn resolve_php_bounded(
@@ -313,8 +373,16 @@ pub(crate) fn resolve_php_bounded(
         ));
     };
     let support = PhpDefinitionProvider::new(php, &session);
-    let outcome =
-        resolve_php_with_session(analyzer, &support, file, source, tree, site, Some(&session));
+    let outcome = resolve_php_with_session(
+        analyzer,
+        &support,
+        file,
+        source,
+        tree,
+        site,
+        Some(&session),
+        None,
+    );
     session.finish(outcome)
 }
 
@@ -327,10 +395,16 @@ fn resolve_php_with_session(
     tree: Option<&Tree>,
     site: &ResolvedReferenceSite,
     session: Option<&ResolutionSession>,
+    call_evidence: Option<&mut PhpCallEvidence>,
 ) -> DefinitionLookupOutcome {
     let Some(php) = resolve_analyzer::<PhpAnalyzer>(analyzer) else {
         return no_definition("php_analyzer_unavailable", "PHP analyzer is unavailable");
     };
+    // The activated packs, read once for this reference. A workspace with no
+    // active pack holds `None` here, which is what keeps every PHP boundary
+    // outcome below byte-identical to the #2030 behavior.
+    let overlay = analyzer.semantic_model_overlay();
+    let overlay = overlay.as_deref();
     let Some(tree) = tree else {
         return no_definition("php_parse_failed", "PHP source could not be parsed");
     };
@@ -376,7 +450,13 @@ fn resolve_php_with_session(
             (ctx, enclosing)
         }
         None => {
-            let ctx = php_file_context_from_source(php, file, source);
+            let Some(contexts) = PhpFileContextIndex::from_tree(root, source, || true) else {
+                return no_definition(
+                    "php_resolution_interrupted",
+                    "PHP namespace/import lookup was interrupted",
+                );
+            };
+            let ctx = contexts.context_at(site.range.start_byte).clone();
             let class_ranges = analyzer.class_range_index(file);
             let enclosing = PhpEnclosingType::from_index(&class_ranges, site.range.start_byte);
             (ctx, enclosing)
@@ -425,7 +505,7 @@ fn resolve_php_with_session(
             } else {
                 resolve_php_type(&raw, &ctx)
             };
-            php_fqn_outcome(support, owner, &raw)
+            php_fqn_outcome(support, overlay, owner, &raw)
         }
         Some(PhpReferenceNode::Function(name_node)) => {
             let raw = php_qualified_candidate_text_with_session(name_node, source, session);
@@ -434,7 +514,7 @@ fn resolve_php_with_session(
             } else {
                 resolve_php_function(&raw, &ctx)
             };
-            php_callable_outcome(support, candidates, &raw)
+            php_callable_outcome(support, overlay, candidates, &raw, call_evidence)
         }
         Some(PhpReferenceNode::Constant(name_node)) => {
             let raw = php_qualified_candidate_text_with_session(name_node, source, session);
@@ -443,7 +523,7 @@ fn resolve_php_with_session(
             } else {
                 resolve_php_constant(&raw, &ctx)
             };
-            php_callable_outcome(support, candidates, &raw)
+            php_callable_outcome(support, overlay, candidates, &raw, None)
         }
         Some(PhpReferenceNode::StaticMember { scope, name, kind }) => {
             let member = php_node_text(name, source).trim_start_matches('$');
@@ -464,11 +544,15 @@ fn resolve_php_with_session(
             php_member_outcome(
                 php,
                 support,
-                PhpReceiverOwners::nominal(owner.into_iter().collect()),
-                member,
-                access,
-                kind,
+                PhpMemberResolution {
+                    overlay,
+                    owners: PhpReceiverOwners::nominal(owner.into_iter().collect()),
+                    member,
+                    access,
+                    kind,
+                },
                 session,
+                call_evidence,
             )
         }
         Some(PhpReferenceNode::InstanceMember { object, name, kind }) => {
@@ -496,11 +580,15 @@ fn resolve_php_with_session(
             php_member_outcome(
                 php,
                 support,
-                owners,
-                member,
-                PhpMemberAccess::Instance,
-                kind,
+                PhpMemberResolution {
+                    overlay,
+                    owners,
+                    member,
+                    access: PhpMemberAccess::Instance,
+                    kind,
+                },
                 session,
+                call_evidence,
             )
         }
         None => no_definition(
@@ -968,6 +1056,7 @@ fn php_qualified_candidate_text_with_session(
 
 fn php_fqn_outcome(
     support: &dyn BoundedDefinitionLookup,
+    overlay: Option<&SemanticModelOverlay>,
     fqn: Option<String>,
     raw: &str,
 ) -> DefinitionLookupOutcome {
@@ -981,7 +1070,65 @@ fn php_fqn_outcome(
     if !candidates.is_empty() {
         return candidates_outcome(candidates);
     }
+    // A type this workspace does not declare may still be one an activated
+    // pack publishes: `\PDO`, `\Redis`, `IntlDateFormatter`. Ask the packs
+    // before falling back to the undifferentiated boundary.
+    if let Some(outcome) = php_overlay_type_boundary(overlay, &fqn) {
+        return outcome;
+    }
     php_unindexed_fqn_outcome(support, &fqn, raw)
+}
+
+/// The boundary outcome an activated pack's *type* declaration supports, or
+/// `None` when no pack publishes the name.
+///
+/// A pack that publishes a type is a complete answer for a type reference: the
+/// declaration exists and the trace can name it. There is no absence verdict
+/// here, because no PHP pack claims to publish every type PHP has.
+fn php_overlay_type_boundary(
+    overlay: Option<&SemanticModelOverlay>,
+    fqn: &str,
+) -> Option<DefinitionLookupOutcome> {
+    let PhpOverlayType::Indexed(target) = php_overlay_type(overlay, fqn) else {
+        return None;
+    };
+    // gated upstream: the workspace declaration lookup above found nothing, so
+    // this reference has already left the workspace. The overlay hit is the
+    // proof of where it went, and `gated_boundary`'s workspace check would
+    // only re-ask the question the empty candidate list already answered.
+    trace::record_named_boundary_with_target(fqn.to_owned(), target);
+    Some(boundary_unchecked(format!(
+        "`{fqn}` is declared by an activated PHP semantic pack"
+    )))
+}
+
+/// The boundary outcome an activated pack supports for one member of one
+/// owner, or `None` when the packs prove nothing.
+fn php_overlay_member_boundary(
+    overlay: Option<&SemanticModelOverlay>,
+    owner: &str,
+    member: &str,
+) -> Option<DefinitionLookupOutcome> {
+    match php_overlay_member(overlay, owner, member) {
+        PhpOverlayMember::Indexed(target) => {
+            // gated upstream, as in `php_overlay_type_boundary`.
+            trace::record_named_boundary_with_target(format!("{owner}.{member}"), target);
+            Some(boundary_unchecked(format!(
+                "`{owner}.{member}` is declared by an activated PHP semantic pack"
+            )))
+        }
+        PhpOverlayMember::DeclaredAbsent => {
+            // The packs publish the owner and its whole inherited surface with
+            // no gap, and the member is not on it. That is a boundary with no
+            // target: the reference left the workspace and the published
+            // surface does not answer it.
+            trace::record_named_boundary_declared_unindexed(format!("{owner}.{member}"));
+            Some(boundary_unchecked(format!(
+                "`{member}` is not on the surface an activated PHP semantic pack publishes for `{owner}`"
+            )))
+        }
+        PhpOverlayMember::Unknown => None,
+    }
 }
 
 /// [`php_fqn_outcome`] over PHP's ordered function/constant candidates.
@@ -993,8 +1140,10 @@ fn php_fqn_outcome(
 /// against `Monolog.substr`, a name PHP never looks for (#1866).
 fn php_callable_outcome(
     support: &dyn BoundedDefinitionLookup,
+    overlay: Option<&SemanticModelOverlay>,
     candidates: Option<PhpCallableCandidates>,
     raw: &str,
+    call_evidence: Option<&mut PhpCallEvidence>,
 ) -> DefinitionLookupOutcome {
     let Some(candidates) = candidates else {
         return no_definition(
@@ -1008,7 +1157,23 @@ fn php_callable_outcome(
             return candidates_outcome(units);
         }
     }
-    php_unindexed_fqn_outcome(support, candidates.last(), raw)
+    // PHP falls back from the caller's namespace to the global one, so an
+    // unqualified `substr(...)` ends at a global-namespace name. The activated
+    // packs publish PHP's builtin functions and constants as members of the
+    // global-namespace scaffold, which is where that fallback lands.
+    let last = candidates.last();
+    let outcome = if !last.contains('.') {
+        php_overlay_member_boundary(overlay, PHP_GLOBAL_NAMESPACE_OWNER, last)
+            .unwrap_or_else(|| php_unindexed_fqn_outcome(support, last, raw))
+    } else {
+        php_unindexed_fqn_outcome(support, last, raw)
+    };
+    if outcome.status == DefinitionLookupStatus::UnresolvableImportBoundary
+        && let Some(call_evidence) = call_evidence
+    {
+        call_evidence.record_external_callable(last);
+    }
+    outcome
 }
 
 fn php_unindexed_fqn_outcome(
@@ -1095,6 +1260,14 @@ impl PhpReceiverOwners {
     }
 }
 
+struct PhpMemberResolution<'a> {
+    overlay: Option<&'a SemanticModelOverlay>,
+    owners: PhpReceiverOwners,
+    member: &'a str,
+    access: PhpMemberAccess,
+    kind: PhpMemberKind,
+}
+
 /// The definition outcome for one PHP member reference, given what its receiver
 /// proves.
 ///
@@ -1106,12 +1279,17 @@ impl PhpReceiverOwners {
 fn php_member_outcome(
     php: &PhpAnalyzer,
     support: &dyn BoundedDefinitionLookup,
-    owners: PhpReceiverOwners,
-    member: &str,
-    access: PhpMemberAccess,
-    kind: PhpMemberKind,
+    resolution: PhpMemberResolution<'_>,
     session: Option<&ResolutionSession>,
+    call_evidence: Option<&mut PhpCallEvidence>,
 ) -> DefinitionLookupOutcome {
+    let PhpMemberResolution {
+        overlay,
+        owners,
+        member,
+        access,
+        kind,
+    } = resolution;
     let owners = match owners {
         PhpReceiverOwners::Unknown => {
             return no_definition(
@@ -1148,9 +1326,18 @@ fn php_member_outcome(
     );
     match owners.as_slice() {
         [owner] => {
-            php_single_owner_member_outcome(php, support, owner, member, access, kind, session)
+            let outcome = php_single_owner_member_outcome(
+                php, support, overlay, owner, member, access, kind, session,
+            );
+            if matches!(kind, PhpMemberKind::Callable)
+                && outcome.status == DefinitionLookupStatus::UnresolvableImportBoundary
+                && let Some(call_evidence) = call_evidence
+            {
+                call_evidence.record_external_member(owner, member);
+            }
+            outcome
         }
-        _ => php_union_owner_member_outcome(php, support, &owners, member, kind, session),
+        _ => php_union_owner_member_outcome(php, support, overlay, &owners, member, kind, session),
     }
 }
 
@@ -1165,9 +1352,11 @@ fn php_member_outcome(
 /// No member attribution is staged here: `PhpMemberTrace` is rooted at one base
 /// owner and its hierarchy routes are relative to that root, so a merged
 /// multi-owner answer has no single route to record.
+#[allow(clippy::too_many_arguments)]
 fn php_union_owner_member_outcome(
     php: &PhpAnalyzer,
     support: &dyn BoundedDefinitionLookup,
+    overlay: Option<&SemanticModelOverlay>,
     owners: &[String],
     member: &str,
     kind: PhpMemberKind,
@@ -1186,6 +1375,21 @@ fn php_union_owner_member_outcome(
     sort_units(&mut candidates);
     candidates.dedup();
     let arms = owners.join("`, `");
+    if candidates.is_empty() {
+        // Exactly one arm answered by an activated pack is the answer. Two or
+        // more competing pack answers is the same ambiguity a workspace union
+        // states, so no single target can be named and the arm-by-arm probe
+        // stops rather than choosing one.
+        let answered = owners
+            .iter()
+            .filter_map(|owner| php_overlay_member_boundary(overlay, owner, member))
+            .collect::<Vec<_>>();
+        if let [_] = answered.as_slice()
+            && let Some(outcome) = answered.into_iter().next()
+        {
+            return outcome;
+        }
+    }
     match candidates.len() {
         0 => gated_boundary(
             // gated on the owner's workspace-namespace check fused into
@@ -1213,9 +1417,11 @@ fn php_union_owner_member_outcome(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn php_single_owner_member_outcome(
     php: &PhpAnalyzer,
     support: &dyn BoundedDefinitionLookup,
+    overlay: Option<&SemanticModelOverlay>,
     owner: &str,
     member: &str,
     access: PhpMemberAccess,
@@ -1263,6 +1469,14 @@ fn php_single_owner_member_outcome(
                 "PHP member `{member}` is resolved at run time: `{owner}` declares no `{member}` and resolves absent members through `{magic}`"
             ),
         );
+    }
+    // The workspace declares neither the member nor an inherited one, and the
+    // owner answers no absent member at run time. If an activated pack
+    // publishes the owner, it -- not the undifferentiated boundary below -- is
+    // the answer: either it declares the member, or it publishes the owner's
+    // whole surface and the member is not on it.
+    if let Some(outcome) = php_overlay_member_boundary(overlay, &owner, member) {
+        return outcome;
     }
     // gated on the owner's workspace-namespace check fused into
     // `php_crosses_unindexed_boundary` (its negation is the workspace gate).
@@ -3549,6 +3763,107 @@ mod tests {
         }
     }
 
+    fn php_call_resolution(
+        fixture: &AnalyzerFixture,
+        source: &str,
+        file: &ProjectFile,
+        needle: &str,
+        text: &str,
+    ) -> PhpDefinitionResolution {
+        let tree = parse_php_tree(source).expect("PHP tree");
+        let php =
+            resolve_analyzer::<PhpAnalyzer>(fixture.analyzer.analyzer()).expect("PHP analyzer");
+        let session = ResolutionSession::bounded(ReceiverAnalysisBudget::default(), None);
+        let support = PhpDefinitionProvider::new(php, &session);
+        resolve_php(
+            fixture.analyzer.analyzer(),
+            &support,
+            file,
+            source,
+            Some(&tree),
+            &php_site(source, file, needle, text),
+        )
+    }
+
+    #[test]
+    fn external_call_identity_requires_one_structured_php_owner_and_literal_member() {
+        let source = r#"<?php
+namespace App;
+
+use function Vendor\Package\external_fn as imported_fn;
+
+final class Caller {
+    public function external(\PDO $pdo, string $input): void {
+        substr(...[$input, 0, 1]);
+        imported_fn($input);
+        \Vendor\Package\External::run($input);
+        $pdo->query("SELECT 1");
+    }
+
+    public function nearMisses($unknown, \PDO|\Redis $ambiguous, string $name): void {
+        workspace_helper();
+        $unknown->query("SELECT 1");
+        $ambiguous->run();
+        $pdo = new \PDO("sqlite::memory:");
+        $pdo->$name("SELECT 1");
+    }
+}
+"#;
+        let global = r#"<?php
+function workspace_helper(): void {}
+"#;
+        let fixture = AnalyzerFixture::new_for_language(
+            Language::Php,
+            &[("App.php", source), ("Global.php", global)],
+        );
+        let file = ProjectFile::new(fixture.project_root(), "App.php");
+
+        for (needle, text, owner, member) in [
+            ("substr(...", "substr", PHP_GLOBAL_NAMESPACE, "substr"),
+            (
+                "imported_fn($input)",
+                "imported_fn",
+                "Vendor.Package",
+                "external_fn",
+            ),
+            (
+                "External::run($input)",
+                "run",
+                "Vendor.Package.External",
+                "run",
+            ),
+            ("$pdo->query", "query", "PDO", "query"),
+        ] {
+            let resolution = php_call_resolution(&fixture, source, &file, needle, text);
+            assert_eq!(
+                resolution.outcome.status,
+                DefinitionLookupStatus::UnresolvableImportBoundary,
+                "{needle}: {:#?}",
+                resolution.outcome
+            );
+            let identity = resolution
+                .external_callee_identity
+                .unwrap_or_else(|| panic!("{needle} has no external identity"));
+            assert_eq!(identity.language(), Language::Php, "{needle}");
+            assert_eq!(identity.owner_fqn(), owner, "{needle}");
+            assert_eq!(identity.member(), member, "{needle}");
+        }
+
+        for (needle, text) in [
+            ("workspace_helper()", "workspace_helper"),
+            ("$unknown->query", "query"),
+            ("$ambiguous->run", "run"),
+            ("$pdo->$name", "$name"),
+        ] {
+            let resolution = php_call_resolution(&fixture, source, &file, needle, text);
+            assert!(
+                resolution.external_callee_identity.is_none(),
+                "{needle} must stay identityless: {:#?}",
+                resolution.outcome
+            );
+        }
+    }
+
     fn declared_php_type_outcome(
         fixture: &AnalyzerFixture,
         callable_fqn: &str,
@@ -3583,8 +3898,9 @@ new DirectTarget();
 "#;
         let tree = parse_php_tree(source).expect("PHP tree");
         let byte = source.find("new DirectTarget").expect("reference");
-        let ctx = php_file_context_from_tree_at(tree.root_node(), source, byte, || true)
+        let contexts = PhpFileContextIndex::from_tree(tree.root_node(), source, || true)
             .expect("complete structured context");
+        let ctx = contexts.context_at(byte);
 
         assert_eq!(ctx.namespace, "App");
         assert_eq!(

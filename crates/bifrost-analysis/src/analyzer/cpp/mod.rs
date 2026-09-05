@@ -419,7 +419,7 @@ impl CppAnalyzer {
         if !field.is_field() || !field.is_synthetic() {
             return None;
         }
-        self.all_macro_composed_fields()
+        self.macro_composed_fields(field.source())
             .iter()
             .find(|candidate| candidate.unit == *field)
             .map(|candidate| candidate.owner.clone())
@@ -1200,14 +1200,22 @@ impl CppSource for CppAnalyzer {
     }
 
     fn visibility_identifier_candidates(&self, identifier: &str) -> BTreeSet<CodeUnit> {
-        let mut candidates = self.inner.lookup_candidates_by_identifier(identifier);
-        candidates.extend(
-            self.all_macro_composed_fields()
-                .iter()
-                .filter(|field| field.unit.identifier() == identifier)
-                .map(|field| field.unit.clone()),
-        );
-        candidates
+        // This lookup discovers include-visible source files; generated macro
+        // fields cannot introduce one. Their owning aggregate's stored type
+        // declaration selects the same source, whose declaration read then
+        // materializes its macro fields. Enumerating generated fields here
+        // would build them for every file in the workspace before the bounded
+        // include filter can discard unrelated sources (#3024).
+        self.inner.lookup_candidates_by_identifier(identifier)
+    }
+
+    fn visibility_identifier_candidates_batch(
+        &self,
+        identifiers: &HashSet<String>,
+        cancellation: Option<&crate::CancellationToken>,
+    ) -> HashMap<String, BTreeSet<CodeUnit>> {
+        self.inner
+            .lookup_declarations_by_identifiers(identifiers, cancellation)
     }
 
     fn stored_callable_unit_role(&self, callable: &CodeUnit) -> CppCallableUnitRole {
@@ -1721,7 +1729,7 @@ impl CodeUnitIndex for CppAnalyzer {
 
     fn get_source(&self, code_unit: &CodeUnit, include_comments: bool) -> Option<String> {
         if let Some(field) = self
-            .all_macro_composed_fields()
+            .macro_composed_fields(code_unit.source())
             .iter()
             .find(|candidate| candidate.unit == *code_unit)
         {
@@ -1877,6 +1885,27 @@ impl IAnalyzer for CppAnalyzer {
                                 .0
                         })
                         .unwrap_or_default();
+                    let macro_fields_can_match = match &request.query {
+                        crate::analyzer::RelationalDefinitionQuery::ExactName
+                        | crate::analyzer::RelationalDefinitionQuery::NormalizedName => {
+                            request.name.full_name().segments().len() > 1
+                        }
+                        crate::analyzer::RelationalDefinitionQuery::StructuralChildren
+                        | crate::analyzer::RelationalDefinitionQuery::StructuralMembers {
+                            ..
+                        }
+                        | crate::analyzer::RelationalDefinitionQuery::VisibleMembers { .. }
+                        | crate::analyzer::RelationalDefinitionQuery::Identifier { .. }
+                        | crate::analyzer::RelationalDefinitionQuery::IdentifierPrefix { .. } => {
+                            true
+                        }
+                        _ => false,
+                    };
+                    if !macro_fields_can_match {
+                        units.sort();
+                        units.dedup();
+                        continue;
+                    }
                     let Some(macro_composed_fields) =
                         self.all_macro_composed_fields_while(cancellation)
                     else {

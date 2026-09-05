@@ -113,6 +113,22 @@ impl PathQualityFrontier {
         self.contains(PathQuality::PROVEN_COMPLETE)
     }
 
+    /// Conjoin every concrete prefix and suffix quality and retain their
+    /// component-wise nondominated frontier.
+    ///
+    /// This composes two sets of realizable path segments without combining
+    /// proof from one path with completeness from another. An empty frontier
+    /// has no realizable segment and therefore annihilates the composition.
+    pub(crate) fn conjoin(self, suffix: Self) -> Self {
+        let mut combined = Self::default();
+        for prefix_quality in self.iter() {
+            for suffix_quality in suffix.iter() {
+                combined.insert(prefix_quality.conjoin(suffix_quality));
+            }
+        }
+        combined
+    }
+
     /// Insert one concrete path quality and discard only qualities it
     /// component-wise dominates. Returns whether the frontier changed.
     pub(crate) fn insert(&mut self, candidate: PathQuality) -> bool {
@@ -224,5 +240,42 @@ mod tests {
             ),
             PathQuality::UNPROVEN_COMPLETE
         );
+    }
+
+    #[test]
+    fn every_quality_frontier_pair_conjoins_to_the_exact_nondominated_frontier() {
+        let frontier = |qualities: &[PathQuality]| {
+            let mut frontier = PathQualityFrontier::default();
+            for &quality in qualities {
+                frontier.insert(quality);
+            }
+            frontier
+        };
+        let frontiers = [
+            frontier(&[]),
+            frontier(&[PathQuality::PROVEN_COMPLETE]),
+            frontier(&[PathQuality::PROVEN_PARTIAL]),
+            frontier(&[PathQuality::UNPROVEN_COMPLETE]),
+            frontier(&[PathQuality::UNPROVEN_PARTIAL]),
+            frontier(&[PathQuality::PROVEN_PARTIAL, PathQuality::UNPROVEN_COMPLETE]),
+        ];
+        let expected = [
+            [0, 0, 0, 0, 0, 0],
+            [0, 1, 2, 3, 4, 5],
+            [0, 2, 2, 4, 4, 2],
+            [0, 3, 4, 3, 4, 3],
+            [0, 4, 4, 4, 4, 4],
+            [0, 5, 2, 3, 4, 5],
+        ];
+
+        for (prefix_index, prefix) in frontiers.iter().copied().enumerate() {
+            for (suffix_index, suffix) in frontiers.iter().copied().enumerate() {
+                assert_eq!(
+                    prefix.conjoin(suffix),
+                    frontiers[expected[prefix_index][suffix_index]],
+                    "frontier pair ({prefix_index}, {suffix_index})",
+                );
+            }
+        }
     }
 }

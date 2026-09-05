@@ -112,8 +112,9 @@ pub use resolution::{
     CALLABLE_APPLICABILITY_ONLY_SUPPORT, CandidateOutcome, DEEP_LEXICAL_ENVIRONMENT_SUPPORT,
     DEEP_LEXICAL_ENVIRONMENT_SUPPORT_WITH_CALLABLE_APPLICABILITY,
     DEEP_LEXICAL_ENVIRONMENT_SUPPORT_WITH_REJECTIONS, DeclaredVisibility, EnvironmentAxis,
-    EnvironmentSupport, HierarchyRelation, HoistingClass, LexicalEnvironmentSupport,
-    MemberDispatchTier, NO_LEXICAL_ENVIRONMENT_SUPPORT, PrecedenceTier, RejectionReason,
+    EnvironmentSupport, HierarchyRelation, HoistingClass, ImportActivation,
+    LexicalEnvironmentSupport, MemberDispatchTier, NO_LEXICAL_ENVIRONMENT_SUPPORT, PrecedenceTier,
+    RejectionReason,
 };
 pub use routes::{
     ALL_CANONICAL_SEGMENT_KINDS, ALL_IDENTITY_AXES, ALL_ROUTE_HOP_KINDS, ALL_ROUTE_TERMINATIONS,

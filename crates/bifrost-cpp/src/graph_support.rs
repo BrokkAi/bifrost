@@ -37,6 +37,8 @@ use brokk_bifrost_core::analyzer::model::{CppFieldLinkage, CppTemplateMetadata};
 use brokk_bifrost_core::analyzer::prepared_syntax::PreparedSyntaxTree;
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_core::analyzer::{CodeUnit, CodeUnitIndex, ProjectFile};
+use brokk_bifrost_core::cancellation::CancellationToken;
+use brokk_bifrost_core::hash::{HashMap, HashSet};
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
@@ -59,6 +61,24 @@ pub trait CppSource:
     /// reconciliation.
     fn visibility_identifier_candidates(&self, identifier: &str) -> BTreeSet<CodeUnit> {
         self.lookup_candidates_by_identifier(identifier)
+    }
+
+    /// Batched form of [`Self::visibility_identifier_candidates`].
+    fn visibility_identifier_candidates_batch(
+        &self,
+        identifiers: &HashSet<String>,
+        cancellation: Option<&CancellationToken>,
+    ) -> HashMap<String, BTreeSet<CodeUnit>> {
+        identifiers
+            .iter()
+            .take_while(|_| !cancellation.is_some_and(CancellationToken::is_cancelled))
+            .map(|identifier| {
+                (
+                    identifier.clone(),
+                    self.visibility_identifier_candidates(identifier),
+                )
+            })
+            .collect()
     }
 
     /// The callable role recorded for a physical stored declaration, without

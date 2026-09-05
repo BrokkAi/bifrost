@@ -238,9 +238,10 @@ When standard roots or sandbox-state metadata controls a rootless connection, `a
 | `extended` | `query_code`, `list_policies`, `run_policy`, `explain_policy`, `get_symbol_locations`, `get_symbol_ancestors`, `most_relevant_files` |
 | `text` | `get_file_contents`, `search_file_contents`, `find_files_containing` |
 | `slopcop` | `compute_cyclomatic_complexity`, `compute_cognitive_complexity`, `report_comment_density_for_code_unit`, `report_exception_handling_smells`, `report_comment_density_for_files`, `analyze_git_hotspots`, `report_test_assertion_smells`, `report_structural_clone_smells`, `report_long_method_and_god_object_smells`, `report_dead_code_and_unused_abstraction_smells`, `report_secret_like_code` |
-| `cli` | `classify_test_files` |
 
-`core` expands to `symbol|workspace|diff`. `searchtools` expands to every toolset above in registry order: `symbol|workspace|diff|extended|text|slopcop|cli`.
+`core` expands to `symbol|workspace|diff`. `searchtools` expands to every toolset above in registry order: `symbol|workspace|diff|extended|text|slopcop`.
+
+`classify_test_files` is not part of any toolset above. A 40-run BrokkBench sweep made zero agent calls to it against dozens of calls to the symbol tools, and the MCP surface is kept narrow for small models sensitive to tool-schema size, so it is programmatic-only (issue #1116): `bifrost --mcp cli` (and any `|`-composition that names `cli`) fails with a structured error, and `--mcp` accepts no toolset that reaches it. Call it through `bifrost --tool classify_test_files` or the Rust/Python API instead.
 
 With line numbers enabled, `symbol` advertises `scan_usages_by_location`, `get_declarations_by_location`, and `get_definitions_by_location`. With `--no-line-numbers`, it instead advertises `scan_usages_by_reference` and `get_definitions_by_reference`; there is no declaration-by-reference tool.
 

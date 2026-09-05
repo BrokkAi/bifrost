@@ -1971,6 +1971,9 @@ fn cpp_bounded_type_resolution_for_node(
             if definitions.status != DefinitionLookupStatus::Resolved {
                 return None;
             }
+            if definitions.definitions.iter().all(CodeUnit::is_field) {
+                return cpp_bounded_field_type(provider, file, definitions.definitions.as_slice());
+            }
             cpp_bounded_callable_return_type(
                 provider,
                 file,
@@ -1986,6 +1989,31 @@ fn cpp_bounded_type_resolution_for_node(
         | "template_type" => cpp_bounded_type_candidates(provider, file, source, node),
         _ => None,
     }
+}
+
+fn cpp_bounded_field_type(
+    provider: &CppBoundedProvider<'_>,
+    file: &ProjectFile,
+    definitions: &[CodeUnit],
+) -> Option<CppBoundedTypeResolution> {
+    if definitions.is_empty() {
+        return None;
+    }
+    let scope = AnalyzerQueryScope::new(provider.analyzer);
+    let token = scope.token();
+    let dispatch = CppDispatch::new(provider.analyzer, token);
+    let mut roots = HashSet::default();
+    roots.insert(file.clone());
+    let visibility = CppVisibilityIndex::build(provider.cpp, token, &dispatch.source(), &roots);
+    let field_type =
+        cpp_unanimous_field_type(provider.analyzer, &visibility, file, definitions.iter())?;
+    let unit = field_type.unit?;
+    Some(CppBoundedTypeResolution {
+        fqn: unit.fq_name(),
+        candidates: vec![unit],
+        target_kind: TypeLookupTargetKind::ValueExpression,
+        ambiguous: false,
+    })
 }
 
 fn cpp_bounded_callable_return_type(
@@ -2139,6 +2167,20 @@ fn cpp_bounded_type_candidates(
     node: Node<'_>,
 ) -> Option<CppBoundedTypeResolution> {
     let node = cpp_c_autoptr_pointee_type_node(file, source, node).unwrap_or(node);
+    if is_c_source_file(file)
+        && matches!(node.kind(), "struct_specifier" | "union_specifier")
+        && node.child_by_field_name("name").is_none()
+    {
+        let scope = AnalyzerQueryScope::new(provider.analyzer);
+        let dispatch = CppDispatch::new(provider.analyzer, scope.token());
+        let unit = anonymous_aggregate_owner(&dispatch.source(), file, node)?;
+        return Some(CppBoundedTypeResolution {
+            fqn: unit.fq_name(),
+            candidates: vec![unit],
+            target_kind: TypeLookupTargetKind::ValueExpression,
+            ambiguous: false,
+        });
+    }
     let name_node = cpp_bounded_type_name_node(node, provider.session)?;
     let name = cpp_node_text(name_node, source);
     if name.is_empty() || matches!(name, "auto" | "decltype") {
@@ -6192,13 +6234,32 @@ fn resolve_cpp_field(
     let mut candidates = cpp_member_candidates(ctx, token, owners, member, arity, arg_types);
     candidates.retain(|candidate| candidate.is_field() || candidate.is_callable());
     let dispatch = CppDispatch::new(ctx.analyzer, ctx.visibility.token());
+    let visible_declarations = candidates
+        .iter()
+        .filter(|candidate| {
+            ctx.visibility.declaration_visible_at_reference(
+                &dispatch.source(),
+                ctx.file,
+                candidate,
+                name_node,
+            )
+        })
+        .cloned()
+        .collect::<Vec<_>>();
     candidates.retain(|candidate| {
-        ctx.visibility.declaration_visible_at_reference(
-            &dispatch.source(),
-            ctx.file,
-            candidate,
-            name_node,
-        )
+        visible_declarations.iter().any(|declaration| {
+            candidate == declaration
+                || (candidate.is_callable()
+                    && declaration.is_callable()
+                    && cpp_callable_definitions_share_identity_evidence_with_visibility(
+                        ctx.analyzer,
+                        token,
+                        &dispatch.source(),
+                        ctx.visibility,
+                        declaration,
+                        candidate,
+                    ))
+        })
     });
     if cpp_receiver_is_proven_lvalue(receiver, ctx.source) {
         candidates.retain(|candidate| {

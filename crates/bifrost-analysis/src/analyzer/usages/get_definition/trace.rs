@@ -612,6 +612,24 @@ pub(super) fn record_named_boundary_with_target(name: String, target: String) {
     record(row);
 }
 
+/// Record a boundary whose structured resolver proved that the activated
+/// packs publish the reference's owner but not the reference itself.
+///
+/// This is deliberately not [`record_named_boundary_with_target`]: there is no
+/// target. The owner is published, its whole inherited surface is published
+/// with no gap, and the member is not on it, so the resolver found the answer
+/// "not there" rather than a declaration. The row therefore stays rejected and
+/// names no external target, and [`finish_boundary`] leaves the status alone
+/// because it is no longer [`BoundaryStatus::ExternalUnknown`].
+pub(super) fn record_named_boundary_declared_unindexed(name: String) {
+    if !recording() {
+        return;
+    }
+    let mut row = external_route_row(name);
+    row.boundary = BoundaryStatus::ExternalDeclaredUnindexed;
+    record(row);
+}
+
 fn external_route_row(name: String) -> TraceCandidate {
     TraceCandidate::rejected(
         TraceCandidateRef::ExternalRoute { name },

@@ -20,18 +20,68 @@ use crate::analyzer::fq_name::{FqName, SegmentInterner, SegmentKind};
 ///
 /// Delimiters are `::`, `.`, `\`, `/` and `+`; a leading `\` run is dropped.
 /// C++ `operator` tokens are kept whole so `operator==` does not split.
+/// In the languages that quote identifiers with backticks
+/// ([`backtick_quotes_identifiers`]) a backtick opens a quoted run in which
+/// every delimiter is literal, so Scala's `` scalaz.`zio.ZIO` `` is two
+/// segments and not four.
 pub fn parse_symbol_path(language: Language, value: &str) -> Vec<String> {
-    let trimmed = value.trim().trim_start_matches('\\');
+    // Emptiness is decided after normalization, not before it: a Rust segment
+    // typed as nothing but the raw-identifier escape (`r#`) normalizes to
+    // nothing, and a segment is by definition a non-empty run. Emitting it
+    // would put an empty component in the string path and, via
+    // `parse_symbol_path_fq`, an empty segment text into the interner, which
+    // rejects it.
+    symbol_path_segments(language, value)
+        .into_iter()
+        .map(|segment| normalized_client_symbol_segment(language, segment))
+        .filter(|segment| !segment.is_empty())
+        .collect()
+}
+
+/// The same split as [`parse_symbol_path`], before per-language segment
+/// normalization: each segment is a trimmed, non-empty subslice of `value`.
+///
+/// A consumer that only needs to *read* one component -- the leading name of a
+/// source type text, say -- takes it from here instead of writing its own
+/// `split('.')`, which is what put four segments in a backtick-quoted Scala
+/// name (#2219).
+pub fn symbol_path_segments(language: Language, value: &str) -> Vec<&str> {
+    let text = value.trim().trim_start_matches('\\');
     let mut segments = Vec::new();
-    let mut current = String::new();
-    let mut chars = trimmed.char_indices().peekable();
+    // The byte range of the run in progress. Every segment is a contiguous
+    // subslice of `text`: nothing here rewrites a character, it only decides
+    // where a run ends.
+    let mut run: Option<(usize, usize)> = None;
+    let mut chars = text.char_indices().peekable();
+    let mut inside_backticks = false;
 
     while let Some((index, ch)) = chars.next() {
-        let rest = &trimmed[index..];
+        let rest = &text[index..];
+
+        if backtick_quotes_identifiers(language) {
+            if inside_backticks {
+                // Inside the quoted run every delimiter is part of the name.
+                // An unterminated run therefore ends at the end of the input:
+                // one forward pass, no lookahead, and the run always carries at
+                // least its opening backtick, so it can never flush an empty
+                // segment.
+                extend_run(&mut run, index, ch.len_utf8());
+                inside_backticks = ch != '`';
+                continue;
+            }
+            // A backtick quotes a whole identifier, so it only opens a run at a
+            // segment boundary; anywhere else it is an ordinary character.
+            if ch == '`' && run.is_none_or(|(start, end)| text[start..end].trim().is_empty()) {
+                extend_run(&mut run, index, ch.len_utf8());
+                inside_backticks = true;
+                continue;
+            }
+        }
+
         if language == Language::Cpp
-            && let Some(operator) = cpp_operator_token(rest, current.is_empty())
+            && let Some(operator) = cpp_operator_token(rest, run.is_none())
         {
-            current.push_str(operator);
+            extend_run(&mut run, index, operator.len());
             for _ in operator.chars().skip(1) {
                 chars.next();
             }
@@ -39,21 +89,64 @@ pub fn parse_symbol_path(language: Language, value: &str) -> Vec<String> {
         }
 
         if rest.starts_with("::") {
-            flush_segment(language, &mut current, &mut segments);
+            flush_run(text, &mut run, &mut segments);
             chars.next();
             continue;
         }
 
         if matches!(ch, '.' | '\\' | '/' | '+') {
-            flush_segment(language, &mut current, &mut segments);
+            flush_run(text, &mut run, &mut segments);
             continue;
         }
 
-        current.push(ch);
+        extend_run(&mut run, index, ch.len_utf8());
     }
-    flush_segment(language, &mut current, &mut segments);
+    flush_run(text, &mut run, &mut segments);
 
     segments
+}
+
+fn extend_run(run: &mut Option<(usize, usize)>, index: usize, len: usize) {
+    match run {
+        Some((_, end)) => *end = index + len,
+        None => *run = Some((index, index + len)),
+    }
+}
+
+fn flush_run<'a>(text: &'a str, run: &mut Option<(usize, usize)>, segments: &mut Vec<&'a str>) {
+    let Some((start, end)) = run.take() else {
+        return;
+    };
+    let segment = text[start..end].trim();
+    if !segment.is_empty() {
+        segments.push(segment);
+    }
+}
+
+/// Whether a backtick quotes an identifier in this language's grammar.
+///
+/// Scala and Kotlin both let any identifier be written `` `like this` ``, and
+/// both let the quoted text carry characters the splitter otherwise reads as
+/// delimiters: Scala allows a `.` (scalaz spells a class `` `zio.ZIO` ``),
+/// Kotlin allows a space (routine in test method names). No other supported
+/// language gives the backtick that meaning -- Go spells raw strings with it
+/// and C# spells generic arity with it (`Dictionary`2`) -- so quoting must not
+/// be applied to them.
+fn backtick_quotes_identifiers(language: Language) -> bool {
+    matches!(language, Language::Scala | Language::Kotlin)
+}
+
+/// Strip the surrounding backticks from a backtick-quoted identifier.
+///
+/// Kotlin's declaration walk indexes the quoted name *without* its backticks
+/// (`kotlin_identifier_text`), so a selector segment must drop them too or the
+/// declaration is unreachable by the only spelling source can write. Scala's
+/// walk keeps them -- an indexed `` `zio.ZIO` `` carries the backticks in its
+/// interned segment text -- so Scala must not call this.
+pub fn strip_backtick_quotes(text: &str) -> &str {
+    text.strip_prefix('`')
+        .and_then(|text| text.strip_suffix('`'))
+        .unwrap_or(text)
 }
 
 fn cpp_operator_token(value: &str, at_segment_start: bool) -> Option<&str> {
@@ -87,23 +180,6 @@ fn is_symbol_path_delimiter_at(value: &str) -> bool {
             .is_some_and(|ch| matches!(ch, '.' | '\\' | '/' | '+'))
 }
 
-fn flush_segment(language: Language, current: &mut String, segments: &mut Vec<String>) {
-    let trimmed = current.trim();
-    if !trimmed.is_empty() {
-        // Emptiness is decided after normalization, not before it: a Rust
-        // segment typed as nothing but the raw-identifier escape (`r#`)
-        // normalizes to nothing, and a segment is by definition a non-empty
-        // run. Emitting it would put an empty component in the string path and,
-        // via `parse_symbol_path_fq`, an empty segment text into the interner,
-        // which rejects it.
-        let normalized = normalized_client_symbol_segment(language, trimmed);
-        if !normalized.is_empty() {
-            segments.push(normalized);
-        }
-    }
-    current.clear();
-}
-
 fn normalized_client_symbol_segment(language: Language, segment: &str) -> String {
     // This normalizes client-provided symbol selector text, not Go source.
     // Go declaration extraction already uses tree-sitter receiver nodes and
@@ -121,6 +197,14 @@ fn normalized_client_symbol_segment(language: Language, segment: &str) -> String
     // selector segment, never a larger path or arbitrary text.
     if language == Language::Rust {
         return strip_raw_identifier_prefix(segment).to_string();
+    }
+
+    // Kotlin indexes a backtick-quoted declaration under the bare name (the
+    // backticks are quoting syntax, not part of it), so the selector segment
+    // has to shed them to name the same segment text. Scala indexes the quoted
+    // spelling verbatim, so its segment is left exactly as typed.
+    if language == Language::Kotlin {
+        return strip_backtick_quotes(segment).to_string();
     }
 
     segment.to_string()
@@ -221,5 +305,147 @@ mod tests {
         let fq = parse_symbol_path_fq(Language::Rust, "krate::r#::r#type", segment_interner());
         assert_eq!(fq.display(segment_interner()), "krate.type");
         assert!(parse_symbol_path_fq(Language::Rust, "r#", segment_interner()).is_empty());
+    }
+
+    /// Issue #2219. A Scala backtick-quoted name may contain a `.` (scalaz
+    /// spells a class `` `zio.ZIO` ``). The declaration walk interns the quoted
+    /// spelling verbatim, so the selector must produce that one segment and not
+    /// the two nonexistent segments `zio` and `ZIO`.
+    #[test]
+    fn a_scala_backtick_quoted_name_containing_a_dot_is_one_segment() {
+        assert_eq!(
+            parse_symbol_path(Language::Scala, "scalaz.`zio.ZIO`"),
+            vec!["scalaz".to_string(), "`zio.ZIO`".to_string()]
+        );
+        assert_eq!(
+            parse_symbol_path(Language::Scala, "scalaz.`zio.ZIO`.run"),
+            vec![
+                "scalaz".to_string(),
+                "`zio.ZIO`".to_string(),
+                "run".to_string()
+            ]
+        );
+
+        // A quoted name without a dot, and an unquoted name, keep splitting the
+        // way they always did.
+        assert_eq!(
+            parse_symbol_path(Language::Scala, "scalaz.`Plain`"),
+            vec!["scalaz".to_string(), "`Plain`".to_string()]
+        );
+        assert_eq!(
+            parse_symbol_path(Language::Scala, "zio.ZIO"),
+            vec!["zio".to_string(), "ZIO".to_string()]
+        );
+    }
+
+    /// The rendering direction of the same name: an `FqName` parsed from the
+    /// selector renders back to the byte-identical selector, which is the
+    /// #1189 round trip for a segment that carries a delimiter inside it.
+    #[test]
+    fn a_scala_backtick_quoted_name_round_trips_through_fq_name() {
+        let selector = "scalaz.`zio.ZIO`";
+        let fq = parse_symbol_path_fq(Language::Scala, selector, segment_interner());
+        assert_eq!(fq.len(), 2);
+        assert_eq!(fq.display(segment_interner()), selector);
+        assert_eq!(
+            fq.display_native(Language::Scala, segment_interner()),
+            selector
+        );
+        assert_eq!(
+            parse_symbol_path_fq(
+                Language::Scala,
+                &fq.display(segment_interner()),
+                segment_interner()
+            ),
+            fq
+        );
+    }
+
+    /// Kotlin quotes identifiers the same way, and allows a space inside the
+    /// quotes (routine in test method names). The quoted run is one segment --
+    /// and, because Kotlin's declaration walk indexes the bare name, the
+    /// segment normalizes to that bare name.
+    #[test]
+    fn a_kotlin_backtick_quoted_name_is_one_segment_without_its_quotes() {
+        assert_eq!(
+            parse_symbol_path(Language::Kotlin, "pkg.`my test`"),
+            vec!["pkg".to_string(), "my test".to_string()]
+        );
+        assert_eq!(
+            parse_symbol_path(Language::Kotlin, "pkg.Suite.`resolves a name`"),
+            vec![
+                "pkg".to_string(),
+                "Suite".to_string(),
+                "resolves a name".to_string()
+            ]
+        );
+        assert_eq!(
+            parse_symbol_path(Language::Kotlin, "pkg.Suite"),
+            vec!["pkg".to_string(), "Suite".to_string()]
+        );
+    }
+
+    /// An unterminated quoted run ends at the end of the input. The rule is one
+    /// forward pass with no lookahead, and the run always carries at least its
+    /// own opening backtick, so it can never flush an empty segment; falling
+    /// back to plain splitting would instead re-shred exactly the name the
+    /// quotes were protecting.
+    #[test]
+    fn an_unterminated_backtick_run_reaches_the_end_of_the_input() {
+        assert_eq!(
+            parse_symbol_path(Language::Scala, "scalaz.`zio.ZIO"),
+            vec!["scalaz".to_string(), "`zio.ZIO".to_string()]
+        );
+        assert_eq!(
+            parse_symbol_path(Language::Scala, "`"),
+            vec!["`".to_string()]
+        );
+        // Kotlin's normalization only sheds a *matched* pair, so an
+        // unterminated run keeps its opening backtick rather than emptying.
+        assert_eq!(
+            parse_symbol_path(Language::Kotlin, "pkg.`my test"),
+            vec!["pkg".to_string(), "`my test".to_string()]
+        );
+        // A quoted run that is empty normalizes away in Kotlin, and
+        // `flush_segment` drops it rather than interning an empty segment.
+        assert_eq!(
+            parse_symbol_path(Language::Kotlin, "pkg.``.Suite"),
+            vec!["pkg".to_string(), "Suite".to_string()]
+        );
+    }
+
+    /// Only Scala and Kotlin give the backtick that meaning. Every other
+    /// language splits a stray backtick exactly the way it did before #2219 --
+    /// it is an ordinary character carried inside whatever segment it lands in.
+    #[test]
+    fn other_languages_split_a_stray_backtick_as_an_ordinary_character() {
+        assert_eq!(
+            parse_symbol_path(Language::Cpp, "ns::`zio.ZIO`::run"),
+            vec![
+                "ns".to_string(),
+                "`zio".to_string(),
+                "ZIO`".to_string(),
+                "run".to_string()
+            ]
+        );
+        assert_eq!(
+            parse_symbol_path(Language::Go, "pkg/`zio.ZIO`"),
+            vec!["pkg".to_string(), "`zio".to_string(), "ZIO`".to_string()]
+        );
+        assert_eq!(
+            parse_symbol_path(Language::Python, "mod.`zio.ZIO`"),
+            vec!["mod".to_string(), "`zio".to_string(), "ZIO`".to_string()]
+        );
+        // C# spells generic arity with a backtick; quoting it would fuse the
+        // arity marker into the following segment.
+        assert_eq!(
+            parse_symbol_path(Language::CSharp, "System.Collections.Dictionary`2.Add"),
+            vec![
+                "System".to_string(),
+                "Collections".to_string(),
+                "Dictionary`2".to_string(),
+                "Add".to_string()
+            ]
+        );
     }
 }

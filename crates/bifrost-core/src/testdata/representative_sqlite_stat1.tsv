@@ -1,0 +1,108 @@
+# Representative sqlite_stat1 for the analyzer store (issue #3016).
+#
+# Columns are the tab-separated `tbl`, `idx`, `stat` projection of
+# `sqlite_stat1`. An empty `idx` is the table's own rowid statistics.
+#
+# Captured 2026-09-04 from workspace builds of the corpus clones under
+# /nfs/morannon/nvme/repo-clones, one repository per supported language,
+# each analyzed with `PRAGMA analysis_limit = 1000; ANALYZE;`. Where the
+# stores disagreed about one index, the row with the largest first count
+# (the estimated row total) was kept, so the fixture models the largest
+# table the corpus produced rather than an average.
+#
+# Source stores (slug -- see the ExecPlan table for commit, repository
+# size, store size, and ANALYZE timings):
+#   JetBrains__Exposed
+#   afadesigns__zshellcheck
+#   alibaba__fastjson2
+#   apache__shardingsphere
+#   bytedance__deer-flow
+#   code-yeongyu__oh-my-openagent
+#   esphome__esphome
+#   granit-fx__granit-dotnet
+#   iamkun__dayjs
+#   languagetool-org__languagetool
+#   laravel__framework
+#   libgit2__libgit2
+#   scala-steward-org__scala-steward
+#   tokio-rs__tokio
+#
+# Regenerate with the `dump_pinned_plans_for_store` tooling described in
+# .agents/plans/issue-3016-analyzer-store-planner-statistics.md.
+analysis_epochs	analysis_epochs	5 1
+analysis_generation_sequence		1
+blob_meta	blob_meta	9676 1
+blob_optional_fact_manifest	blob_optional_fact_manifest	2210 1 1
+blob_payload_costs	blob_payload_costs	9676 1
+blob_reference_fact_manifests	blob_reference_fact_manifests	9676 1
+blobs	idx_blobs_lang_generation	9676 342 342 1
+blobs	sqlite_autoindex_blobs_1	9676 1 1
+blobs	sqlite_autoindex_blobs_2	9676 1 1
+cache_state		1
+code_unit_fq_segments	code_unit_fq_segments	865386 46 3 1
+code_units	code_units	106575 15 1
+code_units	idx_code_units_anchored_blob_exact_tail	24057 10 10 10 10 1 1
+code_units	idx_code_units_anchored_normalized_tail	0 0 0 0 0
+code_units	idx_code_units_anchored_package_type	1527 1001 1001 1001 1001 2
+code_units	idx_code_units_anchored_parent_identifier	24057 1001 1001 1001 1001 2
+code_units	idx_code_units_lang_content_qualifier_declarations	106574 1001 1001
+code_units	idx_code_units_lang_exact_fqn_declarations	106574 1001 1001
+code_units	idx_code_units_lang_identifier_lookup	106575 1001 2
+code_units	idx_code_units_lang_normalized_fqn_declarations	106574 1001 1001
+code_units	idx_code_units_lang_package_simple_type_declarations	10080 504 4 1
+code_units	idx_code_units_lang_short_name	106575 1001 2
+code_units	idx_code_units_stable_exact_tail	86622 772 2 1 1
+code_units	idx_code_units_stable_normalized_tail	6846 1001 2
+code_units	idx_code_units_stable_package_type	10073 1001 4 1
+code_units	idx_code_units_stable_parent_identifier	86622 772 5 2
+import_lexical_prefixes	import_lexical_prefixes	2464 8 1 1
+import_lexical_scopes	import_lexical_scopes	432 6 1 1
+import_path_segments	idx_import_path_segments_by_segment	673502 554 13 1 1 1
+import_path_segments	import_path_segments	673502 36 5 1
+import_statements	import_statements	104362 10 1
+materialization_records	materialization_records	7594 6 1
+reference_fact_epochs	reference_fact_epochs	5 1
+reference_identifiers	idx_reference_identifiers_by_identifier	259108 1001 2 1
+reference_identifiers	reference_identifiers	259108 32 1
+rust_exports	idx_rust_exports_name	242 2
+rust_exports	rust_exports	242 5 1
+rust_identifier_occurrences	idx_rust_identifier_occurrences	126802 1001 8
+rust_identifier_occurrences	rust_identifier_occurrences	126802 59 1
+rust_import_targets	idx_rust_import_targets_bound	6580 13
+rust_import_targets	idx_rust_import_targets_module	6580 10
+rust_import_targets	rust_import_targets	6580 8 1
+rust_item_macros	rust_item_macros	168 4 1
+rust_module_route_gates	rust_module_route_gates	233 7 1 1
+rust_module_routes	rust_module_routes	534 5 1
+rust_module_scopes	rust_module_scopes	980 2 1
+rust_modules	rust_modules	1283 2 1
+scala_traits	scala_traits	41 2 1
+structural_fact_manifests	structural_fact_manifests	299 1
+structural_fact_nodes	structural_fact_nodes	106036 53 1
+structural_fact_occurrence_roles	structural_fact_occurrence_roles	61608 41 1 1
+structural_fact_roles	structural_fact_roles	71700 35 3 1
+unit_children	unit_children	76640 14 8 1 1
+unit_cpp_template_metadata	unit_cpp_template_metadata	789 4 1
+unit_ranges	idx_unit_ranges_lang_blob_ordinal	106761 1001 26 26
+unit_ranges	unit_ranges	106761 15 1 1
+unit_signature_metadata	unit_signature_metadata	72550 13 1 1
+unit_signatures	unit_signatures	100920 14 1 1
+unit_supertypes	unit_supertypes	5629 2 1 1
+unit_visibility_containers	unit_visibility_containers	1428 3 1 1
+workspace_file_anchor_rows	idx_workspace_file_anchor_rows_package	1749 1 1 1 1
+workspace_file_anchor_rows	workspace_file_anchor_rows	1749 1 1 1
+workspace_file_package_edge_rows	idx_workspace_file_package_edge_rows_child	84542 72 72 1
+workspace_file_package_edge_rows	idx_workspace_file_package_edge_rows_parent	84542 251 134 1
+workspace_file_package_edge_rows	workspace_file_package_edge_rows	84542 8 1 1
+workspace_file_package_rows	idx_workspace_file_package_rows_name	19343 6 1
+workspace_file_package_rows	workspace_file_package_rows	19343 2 1
+workspace_file_path_symbol_rows	idx_workspace_file_path_symbol_rows_exact	4632 2 1
+workspace_file_path_symbol_rows	idx_workspace_file_path_symbol_rows_normalized	4632 2 1
+workspace_file_path_symbol_rows	workspace_file_path_symbol_rows	4632 1 1 1
+workspace_file_versions	idx_workspace_file_versions_open_path	9687 1001 1001 1001 1
+workspace_file_versions	idx_workspace_file_versions_snapshot_blob	9687 1001 1001 1001 1 1 1 1
+workspace_file_versions	idx_workspace_file_versions_snapshot_path	9687 1001 1001 1001 1 1 1 1
+workspace_file_versions	sqlite_autoindex_workspace_file_versions_1	9687 1001 1001 1001 1 1
+workspace_file_versions	sqlite_autoindex_workspace_file_versions_2	9687 1 1
+workspace_heads	workspace_heads	5 5 1 1
+workspace_revisions	workspace_revisions	6 6 2 2 1

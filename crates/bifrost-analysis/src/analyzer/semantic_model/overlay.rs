@@ -1609,7 +1609,7 @@ impl SemanticModelOverlay {
             .iter()
             .any(|relation| relation.provenance.ambiguous);
         for relation in hierarchy {
-            let resolved = self.resolve_edge_target(&relation.to);
+            let resolved = self.resolve_edge_target(&relation.to, &symbol.language);
             conflict |= resolved.defect == Some(SemanticModelEdgeDefect::Ambiguous);
             if let Some(defect) = resolved.defect {
                 defects.push(SemanticModelUnresolvedEdge {
@@ -1628,7 +1628,7 @@ impl SemanticModelOverlay {
             && let Some(root_name) =
                 universal_root_name(symbol).filter(|root| *root != symbol.qualified_name)
         {
-            let resolved = self.resolve_edge_target(root_name);
+            let resolved = self.resolve_edge_target(root_name, &symbol.language);
             conflict |= resolved.defect == Some(SemanticModelEdgeDefect::Ambiguous);
             if let Some(defect) = resolved.defect {
                 defects.push(SemanticModelUnresolvedEdge {
@@ -1665,7 +1665,14 @@ impl SemanticModelOverlay {
     /// two indexed packages can each declare a `Base`. The records still carry
     /// the guess, because navigation wants the candidate, but the defect says a
     /// proof must not treat it as a crossed edge.
-    fn resolve_edge_target(&self, target: &str) -> ResolvedEdgeTarget<'_> {
+    ///
+    /// A producer records a re-export as an exact alias of the declaring
+    /// record, so `collections.abc.MutableSet` is an alias of
+    /// `typing.MutableSet` and names that declaration as surely as its own
+    /// qualified name does (#2958). Aliases also carry bare export spellings,
+    /// which another language's pack can hold by coincidence, so an alias match
+    /// counts only for the language that spelled the edge.
+    fn resolve_edge_target(&self, target: &str, language: &str) -> ResolvedEdgeTarget<'_> {
         let by_id = self.symbols_with_id(target);
         if !by_id.records.is_empty() {
             return ResolvedEdgeTarget {
@@ -1681,23 +1688,27 @@ impl SemanticModelOverlay {
                 defect: Some(SemanticModelEdgeDefect::Unpublished),
             };
         }
-        let qualified = by_name
+        let exact = by_name
             .records
             .iter()
             .copied()
-            .filter(|record| record.qualified_name == target)
+            .filter(|record| {
+                record.qualified_name == target
+                    || (record.language == language
+                        && record.aliases.iter().any(|alias| alias == target))
+            })
             .collect::<Vec<_>>();
-        match qualified.as_slice() {
+        match exact.as_slice() {
             [] => ResolvedEdgeTarget {
                 records: by_name.records,
                 defect: Some(SemanticModelEdgeDefect::NameResolved),
             },
             [record] if !record.provenance.ambiguous => ResolvedEdgeTarget {
-                records: qualified,
+                records: exact,
                 defect: None,
             },
             _ => ResolvedEdgeTarget {
-                records: qualified,
+                records: exact,
                 defect: Some(SemanticModelEdgeDefect::Ambiguous),
             },
         }
@@ -6321,6 +6332,54 @@ mod tests {
 
         assert!(surface.proves_absence(), "{surface:#?}");
         assert_eq!(vec!["pkg.Child", "pkg.Base"], closure_names(&surface));
+    }
+
+    #[test]
+    fn an_exact_re_export_alias_crosses_a_hierarchy_edge_and_proves_absence() {
+        let mut declaring = class("typing.MutableSet", "python");
+        declaring.aliases.push("shim.MutableSet".to_string());
+        let root = class("builtins.object", "python");
+        let uses = class("pkg.Uses", "python");
+        let overlay = overlay(
+            vec![uses.clone(), declaring.clone(), root],
+            vec![
+                extends(&uses, "shim.MutableSet"),
+                extends(&declaring, "builtins.object"),
+            ],
+        );
+
+        let surface = overlay.owner_surface(named(&overlay, "pkg.Uses"));
+        assert!(surface.proves_absence(), "{surface:#?}");
+        assert_eq!(
+            vec!["pkg.Uses", "typing.MutableSet", "builtins.object"],
+            closure_names(&surface),
+            "a wildcard re-export shim names the declaring class"
+        );
+        assert_eq!(
+            overlay
+                .member_target_on_owner(&uses.id, "strip")
+                .disposition,
+            SemanticModelMemberTargetDisposition::Absent,
+            "a resolved re-export edge closes the surface"
+        );
+    }
+
+    #[test]
+    fn an_alias_another_language_published_never_crosses_a_hierarchy_edge() {
+        let mut foreign = class("widget.Local", "typescript");
+        foreign.aliases.push("Base".to_string());
+        let child = class("pkg.Child", "python");
+        let root = class("builtins.object", "python");
+        let overlay = overlay(
+            vec![child.clone(), foreign, root],
+            vec![extends(&child, "Base")],
+        );
+
+        let surface = overlay.owner_surface(named(&overlay, "pkg.Child"));
+        assert!(
+            !surface.proves_absence(),
+            "a bare export spelling from another language is a guess: {surface:#?}"
+        );
     }
 
     #[test]

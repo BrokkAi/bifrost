@@ -1346,7 +1346,6 @@ impl<'de> de::DeserializeSeed<'de> for TypestateProjectionFactsSeed<'_> {
 pub(crate) enum StoredTypestateFindingAnchor {
     Strong {
         protocol_hash: TypestateProtocolHash,
-        binding_plan_hash: TypestateBindingPlanHash,
         subject_identity: StableSemanticIdentity,
         violation_site_identity: StableSemanticIdentity,
         scenario_set_hash: TypestateScenarioSetHash,
@@ -1366,10 +1365,41 @@ impl RetainedSize for TypestatePolicyProjectionFacts {
     }
 }
 
+/// What one typestate finding is, said only in facts the finding owns.
+///
+/// Every field is derived from the violation itself and from mount-free
+/// semantic identities, so the same violation over the same content has the
+/// same anchor in any checkout and at any revision:
+///
+/// - `protocol_hash` is the compiled automaton, which comes from the policy
+///   document alone.
+/// - `subject_identity` is the tracked object's mount-free semantic identity.
+/// - `violation_site_identity` is the mount-free identity of the site that
+///   violated.
+/// - `scenario_set_hash` is the solver root's own mount-free semantic
+///   identity, which is what the scenario id of every finding this root
+///   produces spells.
+/// - `violation_hash` folds the violated event or terminal-expectation id, its
+///   states and endpoint, together with the site identity and the scenario set.
+///
+/// Two distinct violations under one root therefore cannot share an anchor: a
+/// second violation is either at another site (a different
+/// `violation_site_identity`, which `violation_hash` folds as well), of another
+/// expectation or event (a different `violation_hash`), of the same expectation
+/// in another observed state (again a different `violation_hash`), or about
+/// another tracked object (a different `subject_identity`).
+///
+/// The compiled binding-plan hash is deliberately absent (#2968). It is a
+/// digest of every binding the policy made anywhere in the workspace, so an
+/// edit that only adds a subject in an unrelated file rotated it -- and with it
+/// every finding identity the policy reports, which made a `--diff-base` run
+/// call unchanged violations `fixed` and re-introduce them as `new`. The plan
+/// hash stays on the projection facts, where the projection authority still
+/// seals a projection to the compile that produced it; it is not part of what
+/// a finding is.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TypestateStrongAnchor {
     protocol_hash: TypestateProtocolHash,
-    binding_plan_hash: TypestateBindingPlanHash,
     subject_identity: StableSemanticIdentity,
     violation_site_identity: StableSemanticIdentity,
     scenario_set_hash: TypestateScenarioSetHash,
@@ -1379,9 +1409,6 @@ pub struct TypestateStrongAnchor {
 impl TypestateStrongAnchor {
     pub const fn protocol_hash(&self) -> TypestateProtocolHash {
         self.protocol_hash
-    }
-    pub const fn binding_plan_hash(&self) -> TypestateBindingPlanHash {
-        self.binding_plan_hash
     }
     pub const fn subject_identity(&self) -> &StableSemanticIdentity {
         &self.subject_identity
@@ -1415,10 +1442,8 @@ pub enum TypestateFindingAnchor {
 }
 
 impl TypestateFindingAnchor {
-    #[allow(clippy::too_many_arguments)]
     pub fn strong(
         protocol_hash: TypestateProtocolHash,
-        binding_plan_hash: TypestateBindingPlanHash,
         subject_identity: StableSemanticIdentity,
         violation_site_identity: StableSemanticIdentity,
         scenario_set_hash: TypestateScenarioSetHash,
@@ -1447,7 +1472,6 @@ impl TypestateFindingAnchor {
         );
         Ok(Self::Strong(Box::new(TypestateStrongAnchor {
             protocol_hash,
-            binding_plan_hash,
             subject_identity,
             violation_site_identity,
             scenario_set_hash,
@@ -1473,7 +1497,6 @@ impl TypestateFindingAnchor {
     ) -> Result<Self, FutureEvidenceError> {
         let StoredTypestateFindingAnchor::Strong {
             protocol_hash,
-            binding_plan_hash,
             subject_identity,
             violation_site_identity,
             scenario_set_hash,
@@ -1481,7 +1504,6 @@ impl TypestateFindingAnchor {
         } = stored;
         let anchor = Self::strong(
             protocol_hash,
-            binding_plan_hash,
             subject_identity,
             violation_site_identity,
             scenario_set_hash,
@@ -1528,10 +1550,9 @@ impl Serialize for TypestateFindingAnchor {
     {
         match self {
             Self::Strong(anchor) => {
-                let mut state = serializer.serialize_struct("TypestateFindingAnchor", 7)?;
+                let mut state = serializer.serialize_struct("TypestateFindingAnchor", 6)?;
                 state.serialize_field("type", "strong")?;
                 state.serialize_field("protocol_hash", &anchor.protocol_hash)?;
-                state.serialize_field("binding_plan_hash", &anchor.binding_plan_hash)?;
                 state.serialize_field("subject_identity", &anchor.subject_identity)?;
                 state
                     .serialize_field("violation_site_identity", &anchor.violation_site_identity)?;
@@ -1651,9 +1672,7 @@ impl TypestateFindingEvidence {
             });
         }
         if let Some(strong) = anchor.strong_fields() {
-            if strong.protocol_hash != protocol_hash
-                || strong.binding_plan_hash != binding_plan_hash
-            {
+            if strong.protocol_hash != protocol_hash {
                 return Err(FutureEvidenceError::AnchorCompiledHashMismatch);
             }
             if strong.scenario_set_hash != scenario_set_hash {
@@ -2172,6 +2191,11 @@ pub(crate) fn taint_vulnerability_digest(anchor: &TaintFindingAnchor) -> [u8; 32
 
 /// Canonical digest used by `PolicyFindingId::from_typestate_anchor` in the
 /// identity module, where the private `PolicyFindingId` bytes are owned.
+///
+/// It folds the policy id and every field of the anchor, and the anchor holds
+/// only facts the finding owns -- see [`TypestateStrongAnchor`] for what those
+/// are, why two violations under one root cannot collide, and why the compiled
+/// binding-plan hash is not among them.
 pub(crate) fn typestate_policy_finding_digest(
     policy_id: &PolicyId,
     anchor: &TypestateFindingAnchor,
@@ -2184,7 +2208,6 @@ pub(crate) fn typestate_policy_finding_digest(
         TypestateFindingAnchor::Strong(anchor) => {
             update_finding_value(&mut hasher, b"strong");
             update_finding_value(&mut hasher, anchor.protocol_hash.as_bytes());
-            update_finding_value(&mut hasher, anchor.binding_plan_hash.as_bytes());
             update_finding_stable_identity(&mut hasher, &anchor.subject_identity);
             update_finding_stable_identity(&mut hasher, &anchor.violation_site_identity);
             update_finding_value(&mut hasher, anchor.scenario_set_hash.as_bytes());
@@ -2206,7 +2229,6 @@ pub(crate) fn typestate_vulnerability_digest(anchor: &TypestateFindingAnchor) ->
         TypestateFindingAnchor::Strong(anchor) => {
             update_finding_value(&mut hasher, b"strong");
             update_finding_value(&mut hasher, anchor.protocol_hash.as_bytes());
-            update_finding_value(&mut hasher, anchor.binding_plan_hash.as_bytes());
             update_finding_stable_identity(&mut hasher, &anchor.subject_identity);
             update_finding_stable_identity(&mut hasher, &anchor.violation_site_identity);
             update_finding_value(&mut hasher, anchor.scenario_set_hash.as_bytes());
@@ -2970,10 +2992,20 @@ mod tests {
     }
 
     fn typestate_projection() -> TypestatePolicyProjectionFacts {
+        typestate_projection_under_plan(TypestateBindingPlanHash::from_canonical_bytes(b"bindings"))
+    }
+
+    /// The same projection facts, compiled under the binding plan given.
+    ///
+    /// Two calls differ in exactly one input: what the policy bound across the
+    /// whole workspace. Everything about the violation itself is identical.
+    fn typestate_projection_under_plan(
+        binding_plan_hash: TypestateBindingPlanHash,
+    ) -> TypestatePolicyProjectionFacts {
         TypestatePolicyProjectionFacts::try_new(
             TypestateAuthoringProjectionHash::from_bytes([4; 32]),
             TypestateProtocolHash::from_canonical_bytes(b"protocol"),
-            TypestateBindingPlanHash::from_canonical_bytes(b"bindings"),
+            binding_plan_hash,
             endpoint("subject"),
             EndpointSemanticHash::from_bytes([5; 32]),
             EndpointAnalysisProjectionHash::from_bytes([6; 32]),
@@ -3306,7 +3338,6 @@ mod tests {
         let projection = typestate_projection();
         let strong = TypestateFindingAnchor::strong(
             projection.protocol_hash,
-            projection.binding_plan_hash,
             stable_identity(StableIdentityDerivation::ProtocolSubject, "subject"),
             projection.violation_site.clone().unwrap(),
             projection.scenario_set_hash,
@@ -3317,7 +3348,6 @@ mod tests {
         assert_eq!(
             TypestateFindingAnchor::strong(
                 projection.protocol_hash,
-                projection.binding_plan_hash,
                 stable_identity(StableIdentityDerivation::CanonicalAstIdentity, "subject"),
                 projection.violation_site.clone().unwrap(),
                 projection.scenario_set_hash,
@@ -3378,7 +3408,6 @@ mod tests {
         let projection = typestate_projection();
         let typestate_anchor = TypestateFindingAnchor::strong(
             projection.protocol_hash,
-            projection.binding_plan_hash,
             stable_identity(StableIdentityDerivation::ProtocolSubject, "subject"),
             projection.violation_site.clone().unwrap(),
             projection.scenario_set_hash,
@@ -3397,6 +3426,74 @@ mod tests {
             taint_id,
             PolicyFindingId::from_taint_anchor(&policy_id, &weak)
         );
+    }
+
+    /// A typestate finding identity is the finding, not the compile (#2968).
+    ///
+    /// The first half is the bug the ticket reported. A head that acquires one
+    /// more tracked object anywhere in the workspace compiles a binding plan
+    /// the base never compiled, and the identity used to fold that plan's
+    /// hash, so every finding the policy reported rotated: a `--diff-base` run
+    /// called two unchanged violations `fixed` and reported the same two again
+    /// as `new`.
+    ///
+    /// The second half is what the identity still has to do once the plan is
+    /// out of it. Two violations of the same expectation, by the same tracked
+    /// object, under one solver root are separated by where they violated, and
+    /// the site is folded twice -- once as the anchor's own field and once
+    /// through the violation hash.
+    #[test]
+    fn typestate_identities_survive_a_plan_change_and_separate_two_sites() {
+        let policy_id = PolicyId::new("test.lifecycle").unwrap();
+        let base_plan = TypestateBindingPlanHash::from_canonical_bytes(b"bindings");
+        let head_plan = TypestateBindingPlanHash::from_canonical_bytes(b"bindings-and-one-more");
+        assert_ne!(base_plan, head_plan);
+        let base = typestate_projection_under_plan(base_plan);
+        let head = typestate_projection_under_plan(head_plan);
+        // The plan does reach the projection facts, which is where it belongs:
+        // the projection authority seals a projection to the compile that
+        // produced it. What follows is that it does not reach the identity.
+        assert_ne!(base.semantic_hash, head.semantic_hash);
+
+        let subject = stable_identity(StableIdentityDerivation::ProtocolSubject, "subject");
+        let identity_of = |facts: &TypestatePolicyProjectionFacts,
+                           site: &StableSemanticIdentity| {
+            let anchor = TypestateFindingAnchor::strong(
+                facts.protocol_hash,
+                subject.clone(),
+                site.clone(),
+                facts.scenario_set_hash,
+                &facts.violation,
+            )
+            .unwrap();
+            assert_eq!(anchor.stability(), FindingIdentityStability::Strong);
+            (
+                PolicyFindingId::from_typestate_anchor(&policy_id, &anchor),
+                typestate_vulnerability_digest(&anchor),
+            )
+        };
+
+        let site = base.violation_site.clone().unwrap();
+        let (base_id, base_vulnerability) = identity_of(&base, &site);
+        let (head_id, head_vulnerability) = identity_of(&head, &site);
+        assert_eq!(
+            base_id, head_id,
+            "the same violation of the same root keeps its identity when the policy binds \
+             another subject elsewhere"
+        );
+        assert_eq!(base_vulnerability, head_vulnerability);
+
+        let second_site = stable_identity(
+            StableIdentityDerivation::ProtocolViolationSite,
+            "crate::run/early-return",
+        );
+        assert_ne!(site, second_site);
+        let (second_id, second_vulnerability) = identity_of(&head, &second_site);
+        assert_ne!(
+            head_id, second_id,
+            "two violating sites under one root are two findings"
+        );
+        assert_ne!(head_vulnerability, second_vulnerability);
     }
 
     #[test]
@@ -3435,7 +3532,6 @@ mod tests {
         let projection = typestate_projection();
         let anchor = TypestateFindingAnchor::strong(
             projection.protocol_hash,
-            projection.binding_plan_hash,
             stable_identity(StableIdentityDerivation::ProtocolSubject, "subject"),
             projection.violation_site.clone().unwrap(),
             projection.scenario_set_hash,

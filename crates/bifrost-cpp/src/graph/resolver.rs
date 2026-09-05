@@ -27,7 +27,9 @@ use brokk_bifrost_core::analyzer::model::{
 use brokk_bifrost_core::analyzer::pool_memo::PoolSafeMemo;
 use brokk_bifrost_core::analyzer::prepared_syntax::PreparedSyntaxTree;
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
-use brokk_bifrost_core::analyzer::tree_walk::{ParentIndex, node_for_exact_range};
+use brokk_bifrost_core::analyzer::tree_walk::{
+    ParentIndex, WalkControl, node_for_exact_range, walk_named_tree_preorder,
+};
 use brokk_bifrost_core::analyzer::usages::common::same_node;
 use brokk_bifrost_core::analyzer::usages::local_inference::LocalInferenceEngine;
 use brokk_bifrost_core::analyzer::{CodeUnit, ProjectFile, Range};
@@ -857,6 +859,7 @@ type ConditionalIncludeProjectionIndex = HashMap<ProjectFile, Arc<[ConditionalIn
 type ConditionalIncludeProjectionCell = Arc<PoolSafeMemo<ConditionalIncludeProjectionIndex>>;
 type ConditionalIncludeProjectionCache = HashMap<ProjectFile, ConditionalIncludeProjectionCell>;
 type VisibleParserAliasNameSetCell = Arc<OnceLock<HashSet<String>>>;
+type ParserAliasTargetMatchCell = Arc<OnceLock<bool>>;
 type IndexedStructuralClassScopeCache = HashMap<(ProjectFile, usize, usize), Option<Vec<String>>>;
 type IndexedEnclosingOwnerScopeCache = HashMap<(ProjectFile, usize, usize), Option<Vec<String>>>;
 
@@ -897,6 +900,8 @@ pub struct VisibilityIndex<'a> {
     visible_source_files_by_root: HashMap<ProjectFile, HashSet<ProjectFile>>,
     alias_cells: Mutex<HashMap<ProjectFile, AliasCell>>,
     visible_parser_alias_name_sets: RwLock<HashMap<ProjectFile, VisibleParserAliasNameSetCell>>,
+    parser_alias_target_matches:
+        RwLock<HashMap<(ProjectFile, String, LogicalSymbolKey), ParserAliasTargetMatchCell>>,
     ordinary_type_import_cells: Mutex<HashMap<ProjectFile, OrdinaryTypeImportCell>>,
     project_using_index: OnceLock<ProjectUsingIndex>,
     callable_reference_specs:
@@ -931,6 +936,7 @@ pub struct VisibilityIndex<'a> {
     field_type_facts: Mutex<HashMap<CodeUnit, Option<DeclaredFieldTypeFact>>>,
     structured_alias_targets: Mutex<HashMap<CodeUnit, Option<StructuredAliasTarget>>>,
     callable_comparables: Mutex<HashMap<CodeUnit, Option<Arc<ExtractedComparable>>>>,
+    comparable_name_declarations: Mutex<HashMap<StructuredTypeName, Option<CodeUnit>>>,
     indexed_structural_class_scopes: Mutex<IndexedStructuralClassScopeCache>,
     indexed_enclosing_owner_scopes: Mutex<IndexedEnclosingOwnerScopeCache>,
     precise_parent_cache: Mutex<HashMap<CodeUnit, Option<CodeUnit>>>,
@@ -969,6 +975,10 @@ pub struct VisibilityIndex<'a> {
     qualified_candidate_inspections: AtomicUsize,
     #[cfg(any(test, feature = "test-support"))]
     target_preserving_type_resolution_count: AtomicUsize,
+    #[cfg(any(test, feature = "test-support"))]
+    visibility_identifier_lookup_count: usize,
+    #[cfg(any(test, feature = "test-support"))]
+    visibility_identifier_batch_count: usize,
 }
 
 impl Drop for VisibilityIndex<'_> {
@@ -1669,6 +1679,7 @@ impl<'a> VisibilityIndex<'a> {
             visible_source_files_by_root,
             alias_cells: Mutex::new(HashMap::default()),
             visible_parser_alias_name_sets: RwLock::new(HashMap::default()),
+            parser_alias_target_matches: RwLock::new(HashMap::default()),
             ordinary_type_import_cells: Mutex::new(HashMap::default()),
             project_using_index: OnceLock::new(),
             callable_reference_specs: Mutex::new(HashMap::default()),
@@ -1692,6 +1703,7 @@ impl<'a> VisibilityIndex<'a> {
             field_type_facts: Mutex::new(HashMap::default()),
             structured_alias_targets: Mutex::new(HashMap::default()),
             callable_comparables: Mutex::new(HashMap::default()),
+            comparable_name_declarations: Mutex::new(HashMap::default()),
             indexed_structural_class_scopes: Mutex::new(HashMap::default()),
             indexed_enclosing_owner_scopes: Mutex::new(HashMap::default()),
             precise_parent_cache: Mutex::new(HashMap::default()),
@@ -1713,6 +1725,8 @@ impl<'a> VisibilityIndex<'a> {
             cpp_template_families: HashMap::default(),
             qualified_candidate_inspections: AtomicUsize::new(0),
             target_preserving_type_resolution_count: AtomicUsize::new(0),
+            visibility_identifier_lookup_count: 0,
+            visibility_identifier_batch_count: 0,
         }
     }
 
@@ -1779,13 +1793,14 @@ impl<'a> VisibilityIndex<'a> {
         );
         if std::env::var_os("BIFROST_CPP_VISIBILITY_STATS").is_some() {
             eprintln!(
-                "BIFROST_CPP_VISIBILITY_STATS total_ms={} include_ms={} include_files={} rounds={} root_names={} identifier_lookups={} candidate_units={} candidate_sources={} declaration_reads={} declaration_units={} selected_units={} dependency_ast_nodes={} dependency_names={} lookup_ms={} declaration_ms={} dependency_ast_ms={}",
+                "BIFROST_CPP_VISIBILITY_STATS total_ms={} include_ms={} include_files={} rounds={} root_names={} identifier_lookups={} identifier_batches={} candidate_units={} candidate_sources={} declaration_reads={} declaration_units={} selected_units={} dependency_ast_nodes={} dependency_names={} lookup_ms={} declaration_ms={} dependency_ast_ms={}",
                 visibility_started.elapsed().as_millis(),
                 include_elapsed.as_millis(),
                 include_file_count,
                 visibility_stats.rounds,
                 visibility_stats.root_names,
                 visibility_stats.identifier_lookups,
+                visibility_stats.identifier_batches,
                 visibility_stats.candidate_units,
                 visibility_stats.candidate_sources,
                 visibility_stats.declaration_reads,
@@ -1927,6 +1942,7 @@ impl<'a> VisibilityIndex<'a> {
             visible_source_files_by_root,
             alias_cells: Mutex::new(HashMap::default()),
             visible_parser_alias_name_sets: RwLock::new(HashMap::default()),
+            parser_alias_target_matches: RwLock::new(HashMap::default()),
             ordinary_type_import_cells: Mutex::new(HashMap::default()),
             project_using_index: OnceLock::new(),
             callable_reference_specs: Mutex::new(HashMap::default()),
@@ -1960,6 +1976,7 @@ impl<'a> VisibilityIndex<'a> {
             field_type_facts: Mutex::new(HashMap::default()),
             structured_alias_targets: Mutex::new(HashMap::default()),
             callable_comparables: Mutex::new(HashMap::default()),
+            comparable_name_declarations: Mutex::new(HashMap::default()),
             indexed_structural_class_scopes: Mutex::new(HashMap::default()),
             indexed_enclosing_owner_scopes: Mutex::new(HashMap::default()),
             precise_parent_cache: Mutex::new(HashMap::default()),
@@ -1988,6 +2005,10 @@ impl<'a> VisibilityIndex<'a> {
             qualified_candidate_inspections: AtomicUsize::new(0),
             #[cfg(any(test, feature = "test-support"))]
             target_preserving_type_resolution_count: AtomicUsize::new(0),
+            #[cfg(any(test, feature = "test-support"))]
+            visibility_identifier_lookup_count: visibility_stats.identifier_lookups,
+            #[cfg(any(test, feature = "test-support"))]
+            visibility_identifier_batch_count: visibility_stats.identifier_batches,
         }
     }
 
@@ -3682,24 +3703,80 @@ impl<'a> VisibilityIndex<'a> {
         let started = std::time::Instant::now();
         self.parser_alias_fallback_calls
             .fetch_add(1, Ordering::Relaxed);
-        let mut files = 0usize;
-        let matched = match self.visible_source_files_by_root.get(file) {
+        let key = (
+            file.clone(),
+            alias_name.to_string(),
+            logical_symbol_key(target),
+        );
+        let cached = self
+            .parser_alias_target_matches
+            .read()
+            .expect("parser alias target-match cache poisoned")
+            .get(&key)
+            .cloned();
+        let cell = if let Some(cached) = cached {
+            cached
+        } else {
+            let mut cells = self
+                .parser_alias_target_matches
+                .write()
+                .expect("parser alias target-match cache poisoned");
+            Arc::clone(
+                cells
+                    .entry(key)
+                    .or_insert_with(|| Arc::new(OnceLock::new())),
+            )
+        };
+        let matched = *cell.get_or_init(|| match self.visible_source_files_by_root.get(file) {
             None => {
-                files = 1;
+                self.parser_alias_fallback_files
+                    .fetch_add(1, Ordering::Relaxed);
                 self.file_alias_matches(self.cpp, file, alias_name, target)
             }
             Some(visible_files) => visible_files.iter().any(|visible_file| {
-                files += 1;
+                self.parser_alias_fallback_files
+                    .fetch_add(1, Ordering::Relaxed);
                 self.file_alias_matches(self.cpp, visible_file, alias_name, target)
             }),
-        };
-        self.parser_alias_fallback_files
-            .fetch_add(files, Ordering::Relaxed);
+        });
         self.parser_alias_fallback_elapsed_micros.fetch_add(
             started.elapsed().as_micros().min(usize::MAX as u128) as usize,
             Ordering::Relaxed,
         );
         matched
+    }
+
+    fn file_alias_matches(
+        &self,
+        cpp: &dyn CppSource,
+        file: &ProjectFile,
+        alias_name: &str,
+        target: &CodeUnit,
+    ) -> bool {
+        let cell = {
+            let mut cells = self.alias_cells.lock().expect("alias cell map lock");
+            Arc::clone(
+                cells
+                    .entry(file.clone())
+                    .or_insert_with(|| Arc::new(OnceLock::new())),
+            )
+        };
+        cell.get_or_init(|| {
+            self.parser_alias_source_parses
+                .fetch_add(1, Ordering::Relaxed);
+            #[cfg(any(test, feature = "test-support"))]
+            {
+                *self
+                    .alias_source_parse_counts
+                    .lock()
+                    .expect("alias source parse count lock")
+                    .entry(file.clone())
+                    .or_default() += 1;
+            }
+            aliases_from_prepared_source(cpp, self.token, file).into_boxed_slice()
+        })
+        .iter()
+        .any(|alias| alias.name == alias_name && alias_target_matches_target(alias, target))
     }
 
     fn callable_arities_for_target(
@@ -4047,6 +4124,59 @@ impl<'a> VisibilityIndex<'a> {
             guards_compatible_at_reference(required, reference_guards.as_ref())
         }) {
             return false;
+        }
+        if declaration.source() == file
+            && !analyzer.reference_uses_c_semantics(file)
+            && (declaration.is_field() || declaration.is_callable())
+            && type_owner_of(analyzer, declaration).is_some_and(|owner| {
+                self.indexed_enclosing_owner_scope(analyzer, file, reference)
+                    .is_some_and(|scope| scope == canonical_cpp_scope_components(&owner))
+            })
+        {
+            // C++ complete-class context makes members visible throughout the
+            // class. The guard check above still excludes a declaration from
+            // an incompatible preprocessor branch.
+            return true;
+        }
+        if declaration.is_field() && declaration.source() == file {
+            let reference_byte = reference.start_byte();
+            let reference_function =
+                real_function_definition_ancestor(reference, prepared.source());
+            let guards = OnceCell::new();
+            let field_reference = CallableReferenceContext {
+                file,
+                position: Some(CallableReferencePosition {
+                    prepared: prepared.as_ref(),
+                    byte: reference_byte,
+                    guards: &guards,
+                }),
+            };
+            let mut has_local_declaration = false;
+            let mut local_declaration_visible = false;
+            for declaration in callable_declaration_nodes(analyzer, prepared.as_ref(), declaration)
+            {
+                let Some(declaration_function) =
+                    real_function_definition_ancestor(declaration, prepared.source())
+                else {
+                    continue;
+                };
+                has_local_declaration = true;
+                if reference_function.is_some_and(|reference_function| {
+                    reference_function.start_byte() == declaration_function.start_byte()
+                        && reference_function.end_byte() == declaration_function.end_byte()
+                }) && callable_preprocessor_context_is_visible_for_reference(
+                    declaration,
+                    prepared.source(),
+                    &field_reference,
+                ) && callable_declaration_activation_byte(declaration) < reference_byte
+                {
+                    local_declaration_visible = true;
+                    break;
+                }
+            }
+            if has_local_declaration {
+                return local_declaration_visible;
+            }
         }
         let guards = OnceCell::new();
         self.physical_declaration_visible_at(
@@ -6056,7 +6186,7 @@ impl<'a> VisibilityIndex<'a> {
                         return Ok(physically_visible[0].clone());
                     }
                 }
-                unique_type_candidate_preserving_alias(analyzer, candidates)
+                unique_type_candidate_preserving_alias(analyzer, file, candidates)
                     .ok_or(TypeCandidateFailure::Ambiguous)
             }
             TypeCandidateResolution::PreserveTarget(target) => self
@@ -7244,7 +7374,7 @@ impl<'a> VisibilityIndex<'a> {
         };
         let candidates = self.type_candidates(file, &normalized);
         if candidates.is_empty() {
-            return self.parser_alias_resolves_to_type(analyzer, file, raw_name, target);
+            return self.parser_alias_resolves_to_type(file, raw_name, target);
         }
         let Some(resolved) =
             self.unique_type_candidate_preserving_target(analyzer, file, &candidates, target)
@@ -7464,9 +7594,8 @@ impl<'a> VisibilityIndex<'a> {
     /// workspace cannot prove one.
     ///
     /// The lookup is a closure-independent lexical-scope prefix walk over the
-    /// workspace definition index rather than a visibility lookup: the index
-    /// handed to a definition query is rooted at the reference file, and a
-    /// body's `.cpp` is almost never in that file's include closure. Any name
+    /// stored C++ identifier index rather than a visibility lookup: a body's
+    /// `.cpp` is almost never in the reference file's include closure. Any name
     /// this walk resolves is one an enclosing-scope lookup could resolve, so it
     /// cannot invent a type the compiler could not see; `using`-directives are
     /// not modelled, and a name that needs one stays unresolved.
@@ -7552,33 +7681,50 @@ impl<'a> VisibilityIndex<'a> {
         analyzer: &CppGraphSource<'_>,
         name: &StructuredTypeName,
     ) -> Option<CodeUnit> {
-        let definitions = analyzer.workspace_definitions();
+        // The same parameter-name pair is commonly compared once for every
+        // physical declaration in a candidate set. Keep the index lookup under
+        // the cache lock so concurrent workers cannot all miss the same key
+        // and repeat the workspace candidate filter. `None` is a meaningful
+        // result too: unresolved and ambiguous names must remain unresolved on
+        // every later comparison.
+        let mut cache = self
+            .comparable_name_declarations
+            .lock()
+            .expect("C++ comparable name declaration cache poisoned");
+        if let Some(cached) = cache.get(name) {
+            return cached.clone();
+        }
         let interner = segment_interner();
+        let identifier = name.path().last()?;
+        let candidates_by_identifier = self.cpp.visibility_identifier_candidates(identifier);
         let first_depth = if name.is_absolute() {
             0
         } else {
             name.lexical_scope().len()
         };
+        let mut resolved = None;
         for depth in (0..=first_depth).rev() {
             let mut structured = FqName::new();
             for component in name.lexical_scope()[..depth].iter().chain(name.path()) {
                 structured.push(interner.intern(component, SegmentKind::Unknown));
             }
-            let mut candidates = definitions
-                .identifier(&structured)
-                .into_iter()
+            let mut candidates = candidates_by_identifier
+                .iter()
                 .filter(|unit| unit.fq().same_segment_texts(&structured))
                 .filter(|unit| {
                     unit.kind() == CodeUnitType::Class || declared_type_alias(analyzer, unit)
-                });
+                })
+                .cloned();
             let Some(first) = candidates.next() else {
                 continue;
             };
-            return candidates
+            resolved = candidates
                 .all(|unit| same_logical_symbol(&unit, &first))
                 .then_some(first);
+            break;
         }
-        None
+        cache.insert(name.clone(), resolved.clone());
+        resolved
     }
 
     /// The comparison inputs of one callable declaration, extracted once.
@@ -7644,7 +7790,6 @@ impl<'a> VisibilityIndex<'a> {
 
     pub fn parser_alias_resolves_to_type(
         &self,
-        analyzer: &CppGraphSource<'_>,
         file: &ProjectFile,
         raw_name: &str,
         target: &CodeUnit,
@@ -7652,49 +7797,7 @@ impl<'a> VisibilityIndex<'a> {
         let Some(alias_name) = normalize_reference_name(raw_name) else {
             return false;
         };
-        let Some(cpp) = analyzer.cpp else {
-            return false;
-        };
-        let matches_file = |source_file: &ProjectFile| {
-            self.file_alias_matches(cpp, source_file, &alias_name, target)
-        };
-        self.visible_source_files_by_root.get(file).map_or_else(
-            || matches_file(file),
-            |files| files.iter().any(matches_file),
-        )
-    }
-
-    fn file_alias_matches(
-        &self,
-        cpp: &dyn CppSource,
-        file: &ProjectFile,
-        alias_name: &str,
-        target: &CodeUnit,
-    ) -> bool {
-        let cell = {
-            let mut cells = self.alias_cells.lock().expect("alias cell map lock");
-            Arc::clone(
-                cells
-                    .entry(file.clone())
-                    .or_insert_with(|| Arc::new(OnceLock::new())),
-            )
-        };
-        cell.get_or_init(|| {
-            self.parser_alias_source_parses
-                .fetch_add(1, Ordering::Relaxed);
-            #[cfg(any(test, feature = "test-support"))]
-            {
-                *self
-                    .alias_source_parse_counts
-                    .lock()
-                    .expect("alias source parse count lock")
-                    .entry(file.clone())
-                    .or_default() += 1;
-            }
-            aliases_from_prepared_source(cpp, self.token, file).into_boxed_slice()
-        })
-        .iter()
-        .any(|alias| alias.name == alias_name && alias_target_matches_target(alias, target))
+        self.parser_alias_name_may_resolve_to_target(file, &alias_name, target)
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -7713,6 +7816,11 @@ impl<'a> VisibilityIndex<'a> {
             .get(file)
             .copied()
             .unwrap_or(0)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn parser_alias_fallback_file_count_for_test(&self) -> usize {
+        self.parser_alias_fallback_files.load(Ordering::Relaxed)
     }
 
     pub fn resolve_named(
@@ -8372,6 +8480,16 @@ impl<'a> VisibilityIndex<'a> {
     }
 
     #[cfg(any(test, feature = "test-support"))]
+    pub fn visibility_identifier_lookup_count(&self) -> usize {
+        self.visibility_identifier_lookup_count
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn visibility_identifier_batch_count(&self) -> usize {
+        self.visibility_identifier_batch_count
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
     pub fn reset_target_preserving_type_resolution_count(&self) {
         self.target_preserving_type_resolution_count
             .store(0, Ordering::Relaxed);
@@ -8457,6 +8575,7 @@ fn build_bounded_visible_declarations(
     cancellation: Option<&CancellationToken>,
     stats: &mut BoundedVisibilityStats,
 ) -> HashMap<ProjectFile, HashSet<CodeUnit>> {
+    let mut candidates_by_identifier = HashMap::default();
     roots
         .iter()
         .map(|root| {
@@ -8502,22 +8621,47 @@ fn build_bounded_visible_declarations(
                 let round_names = std::mem::take(&mut pending_names);
                 let mut requested_names_by_source: HashMap<ProjectFile, HashSet<String>> =
                     HashMap::default();
+                let mut identifiers = Vec::new();
                 for identifier in round_names {
                     if !completed_names.insert(identifier.clone())
                         || cancellation.is_some_and(CancellationToken::is_cancelled)
                     {
                         continue;
                     }
+                    identifiers.push(identifier);
+                }
+                let missing_identifiers = identifiers
+                    .iter()
+                    .filter(|identifier| !candidates_by_identifier.contains_key(*identifier))
+                    .cloned()
+                    .collect::<HashSet<_>>();
+                if !missing_identifiers.is_empty() {
                     let lookup_started = Instant::now();
-                    let candidates = cpp.visibility_identifier_candidates(&identifier);
+                    let mut candidates = cpp
+                        .visibility_identifier_candidates_batch(&missing_identifiers, cancellation);
                     stats.lookup_elapsed += lookup_started.elapsed();
-                    stats.identifier_lookups += 1;
-                    stats.candidate_units += candidates.len();
-                    for source in candidates
-                        .into_iter()
-                        .map(|unit| unit.source().clone())
-                        .collect::<HashSet<_>>()
-                    {
+                    stats.identifier_lookups += missing_identifiers.len();
+                    stats.identifier_batches += 1;
+                    if cancellation.is_some_and(CancellationToken::is_cancelled) {
+                        break;
+                    }
+                    for identifier in missing_identifiers {
+                        let units = candidates.remove(&identifier).unwrap_or_default();
+                        let candidate_count = units.len();
+                        let candidate_sources = units
+                            .into_iter()
+                            .map(|unit| unit.source().clone())
+                            .collect::<HashSet<_>>();
+                        candidates_by_identifier
+                            .insert(identifier, (candidate_sources, candidate_count));
+                    }
+                }
+                for identifier in identifiers {
+                    let (candidate_sources, candidate_count) = candidates_by_identifier
+                        .get(&identifier)
+                        .expect("every missing identifier was inserted after the batch lookup");
+                    stats.candidate_units += *candidate_count;
+                    for source in candidate_sources.iter().cloned() {
                         if source != *root
                             && visible_sources
                                 .get(root)
@@ -8601,6 +8745,7 @@ struct BoundedVisibilityStats {
     rounds: usize,
     root_names: usize,
     identifier_lookups: usize,
+    identifier_batches: usize,
     candidate_units: usize,
     candidate_sources: usize,
     declaration_reads: usize,
@@ -9410,8 +9555,7 @@ fn aliases_from_prepared_source(
 }
 
 fn collect_cpp_aliases(root: Node<'_>, source: &str, out: &mut Vec<CppAlias>) {
-    let mut stack = vec![root];
-    while let Some(node) = stack.pop() {
+    walk_named_tree_preorder(root, true, |node| {
         match node.kind() {
             "alias_declaration" if alias_has_visible_file_scope(node) => {
                 if let Some(alias) = cpp_alias_from_alias_declaration(node, source) {
@@ -9423,13 +9567,8 @@ fn collect_cpp_aliases(root: Node<'_>, source: &str, out: &mut Vec<CppAlias>) {
             }
             _ => {}
         }
-
-        for index in (0..node.named_child_count()).rev() {
-            if let Some(child) = node.named_child(index) {
-                stack.push(child);
-            }
-        }
-    }
+        WalkControl::Continue
+    });
 }
 
 fn alias_has_visible_file_scope(node: Node<'_>) -> bool {
@@ -10552,25 +10691,9 @@ fn nameable_callable_declaration_nodes<'tree>(
     prepared: &'tree PreparedSyntaxTree,
     candidate: &CodeUnit,
 ) -> Vec<Node<'tree>> {
-    let root = prepared.tree().root_node();
-    analyzer
-        .ranges(candidate)
+    callable_declaration_nodes(analyzer, prepared, candidate)
         .into_iter()
-        .filter_map(|range| {
-            let mut declaration =
-                root.descendant_for_byte_range(range.start_byte, range.end_byte)?;
-            // A declaration an attribute-like macro invocation swallowed lives
-            // inside the `ERROR` the parser left, not inside a `declaration`
-            // node, so that envelope is where the climb stops (#2552).
-            while !matches!(
-                declaration.kind(),
-                "declaration" | "field_declaration" | "function_definition"
-            ) && !crate::declarations::is_macro_wrapped_declaration_envelope(
-                declaration,
-                prepared.source(),
-            ) {
-                declaration = declaration.parent()?;
-            }
+        .filter(|declaration| {
             let mut ancestor = declaration.parent();
             while let Some(node) = ancestor {
                 if node.kind() == "function_definition"
@@ -10591,13 +10714,58 @@ fn nameable_callable_declaration_nodes<'tree>(
                     node.kind(),
                     "compound_statement" | "function_definition" | "lambda_expression"
                 ) {
-                    return None;
+                    return false;
                 }
                 ancestor = node.parent();
+            }
+            true
+        })
+        .collect()
+}
+
+fn callable_declaration_nodes<'tree>(
+    analyzer: &CppGraphSource<'_>,
+    prepared: &'tree PreparedSyntaxTree,
+    candidate: &CodeUnit,
+) -> Vec<Node<'tree>> {
+    let root = prepared.tree().root_node();
+    analyzer
+        .ranges(candidate)
+        .into_iter()
+        .filter_map(|range| {
+            let mut declaration =
+                root.descendant_for_byte_range(range.start_byte, range.end_byte)?;
+            // A declaration an attribute-like macro invocation swallowed lives
+            // inside the `ERROR` the parser left, not inside a `declaration`
+            // node, so that envelope is where the climb stops (#2552).
+            while !matches!(
+                declaration.kind(),
+                "declaration" | "field_declaration" | "function_definition"
+            ) && !crate::declarations::is_macro_wrapped_declaration_envelope(
+                declaration,
+                prepared.source(),
+            ) {
+                declaration = declaration.parent()?;
             }
             Some(declaration)
         })
         .collect()
+}
+
+fn real_function_definition_ancestor<'tree>(
+    node: Node<'tree>,
+    source: &str,
+) -> Option<Node<'tree>> {
+    let mut ancestor = node.parent();
+    while let Some(node) = ancestor {
+        if node.kind() == "function_definition"
+            && !is_recovered_declaration_scope_container(node, source)
+        {
+            return Some(node);
+        }
+        ancestor = node.parent();
+    }
+    None
 }
 
 fn callable_declaration_activation_in_file(
@@ -11565,6 +11733,7 @@ fn unique_logical_type_candidate(candidates: Vec<&CodeUnit>) -> Option<CodeUnit>
 
 fn unique_type_candidate_preserving_alias(
     analyzer: &CppGraphSource<'_>,
+    file: &ProjectFile,
     candidates: &[&CodeUnit],
 ) -> Option<CodeUnit> {
     let first = *candidates.first()?;
@@ -11579,7 +11748,10 @@ fn unique_type_candidate_preserving_alias(
             })
             .then(|| first.clone());
     }
-    if first.is_class() && indexed_c_tag_kind(analyzer, first).is_some() {
+    if analyzer.reference_uses_c_semantics(file)
+        && first.is_class()
+        && indexed_c_tag_kind(analyzer, first).is_some()
+    {
         let mut full_source = None;
         let mut tag_kind = None;
         for candidate in candidates.iter().copied() {
@@ -11658,11 +11830,11 @@ fn decode_field_declared_type_fact(
     let mut stack = vec![contextual_tree.root_node()];
     while let Some(node) = stack.pop() {
         if let Some(recovered) = recovered_pyobject_head_field(node, &contextual_declaration)
-            && node_text(recovered.declarator, &contextual_declaration) == field.identifier()
+            && node_text(recovered.name, &contextual_declaration) == field.identifier()
         {
             return Some(DeclaredFieldTypeFact {
                 type_text: node_text(recovered.type_node, &contextual_declaration).to_string(),
-                indirection: 0,
+                indirection: recovered.pointer_depth(),
                 template_arguments: None,
             });
         }
@@ -13740,6 +13912,13 @@ fn recovered_c_function_declarator_invocation(node: Node<'_>) -> bool {
                 | "preproc_else"
                 | "preproc_elif"
         ) {
+            return true;
+        }
+        if parent.kind() == "function_definition"
+            && parent.child_by_field_name("declarator") == Some(current)
+            && parent.named_child(0) == Some(current)
+            && parent.child_by_field_name("body").is_some()
+        {
             return true;
         }
         if parent.is_error()
@@ -16987,6 +17166,23 @@ int body(void *s) {
                 offsetof(CPUX86State, xmm_regs[0].ZMM_L(0)));
     execvp(strZ(value), UNCONSTIFY(char **, args));
 }
+ #define DEV_CHECK_PRESENCE(TYPE, MEMBER, DEVTYPE, PROPERTY, VALUE) \
+    if (!((TYPE)target)->MEMBER) { check(DEVTYPE, PROPERTY, VALUE); }
+int recovered_deviation(struct Deviation *d, struct Target *target, void *ctx) {
+    if (d->units) {
+        switch (target->nodetype) {
+        case 1:
+        case 2:
+            break;
+        default:
+            AMEND_WRONG_NODETYPE("deviation", "replace", "units");
+        }
+        DEV_CHECK_PRESENCE(struct Item *, units, "replacing", "units", d->units);
+        lysdict_remove(ctx, ((struct Item *)target)->units);
+        DUP_STRING_GOTO(ctx, d->units, ((struct Item *)target)->units, ret, cleanup);
+    }
+     return 0;
+ }
 STATIC EFI_STATUS Encode () { return 0; }
 "#;
         let tree = parse_cpp(source);
@@ -17016,6 +17212,14 @@ STATIC EFI_STATUS Encode () { return 0; }
             .root_node()
             .named_descendant_for_byte_range(strz_start, strz_start + 4)
             .expect("nested function call node");
+        let recovered_call_start = source.find("lysdict_remove(ctx").expect("recovered call");
+        let recovered_call = tree
+            .root_node()
+            .named_descendant_for_byte_range(
+                recovered_call_start,
+                recovered_call_start + "lysdict_remove".len(),
+            )
+            .expect("recovered call node");
         let binder_start = source.find("Encode").expect("binder");
         let binder = tree
             .root_node()
@@ -17026,6 +17230,7 @@ STATIC EFI_STATUS Encode () { return 0; }
         assert!(recovered_c_function_declarator_invocation(body_macro));
         assert!(recovered_c_function_declarator_invocation(function_call));
         assert!(recovered_c_function_declarator_invocation(strz));
+        assert!(recovered_c_function_declarator_invocation(recovered_call));
         assert!(!recovered_c_function_declarator_invocation(binder));
     }
 

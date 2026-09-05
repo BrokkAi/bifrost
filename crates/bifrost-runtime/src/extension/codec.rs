@@ -1,6 +1,7 @@
 use super::{
     ExtensionCancellation, ExtensionWorkspace, ObservationDocument, ObservationMappingResult,
     SemanticRelationRequest, SemanticRelationSnapshot, StructuralRequest, StructuralResult,
+    TypestateRequest, TypestateSnapshot,
 };
 use crate::extension::ExtensionOutcome;
 use serde::{Deserialize, Serialize};
@@ -11,6 +12,7 @@ use std::fmt;
 pub enum ExtensionRequest {
     Structural(StructuralRequest),
     SemanticRelations(SemanticRelationRequest),
+    Typestate(Box<TypestateRequest>),
     Observations(Box<ObservationDocument>),
 }
 
@@ -19,6 +21,7 @@ pub enum ExtensionRequest {
 pub enum ExtensionResponse {
     Structural(ExtensionOutcome<StructuralResult>),
     SemanticRelations(ExtensionOutcome<SemanticRelationSnapshot>),
+    Typestate(ExtensionOutcome<TypestateSnapshot>),
     Observations(ObservationMappingResult),
 }
 
@@ -65,6 +68,9 @@ impl ExtensionWorkspace {
             ExtensionRequest::SemanticRelations(request) => self
                 .semantic_relations(request, cancellation)
                 .map(ExtensionResponse::SemanticRelations),
+            ExtensionRequest::Typestate(request) => self
+                .typestate_check(*request, cancellation)
+                .map(ExtensionResponse::Typestate),
             ExtensionRequest::Observations(request) => self
                 .map_observations(&request, cancellation)
                 .map(ExtensionResponse::Observations),

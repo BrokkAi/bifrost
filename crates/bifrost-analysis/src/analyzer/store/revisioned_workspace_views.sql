@@ -57,13 +57,6 @@ FROM main.workspace_file_anchor_rows AS rows
      INDEXED BY idx_workspace_file_anchor_rows_package
 JOIN workspace_files AS files ON files.file_id = rows.file_version_id;
 
-CREATE TEMP VIEW IF NOT EXISTS path_symbol_units AS
-SELECT files.lang, files.rel_path, files.blob_oid, files.file_id,
-       rows.kind, rows.package_name, rows.short_name,
-       rows.exact_fqn, rows.normalized_fqn, files.generation
-FROM main.workspace_file_path_symbol_rows AS rows
-JOIN workspace_files AS files ON files.file_id = rows.file_version_id;
-
 CREATE TEMP VIEW IF NOT EXISTS live_workspace_files AS
 SELECT files.file_id, files.lang, files.generation, files.rel_path,
        files.blob_oid, live.blob_id
@@ -119,28 +112,42 @@ WITH RECURSIVE descendants(
 SELECT lang, generation, ancestor_package_name, descendant_package_name
 FROM descendants;
 
-CREATE TEMP VIEW IF NOT EXISTS workspace_path_symbols AS
-SELECT symbols.lang, symbols.generation, symbols.rel_path, symbols.blob_oid,
+-- The one lean view over path-derived module rows. A path-derived module unit
+-- is a declaration the analyzer invents for a file whose module name comes from
+-- its path: `pkg/service.py` is the module `pkg.service` although no line in it
+-- says so.
+--
+-- This replaces four views (`path_symbol_units`, `workspace_path_symbols`, and
+-- the two aliases `workspace_path_symbol_exact_names` /
+-- `workspace_path_symbol_normalized_names`) that stacked a workspace join on a
+-- second, four-column re-join to `live_workspace_files`. Joining
+-- `live_workspace_files` on `file_id` alone is equivalent, because
+-- `workspace_files.file_id` is unique and `live_workspace_files` is a
+-- restriction of it, and it leaves the path row's own columns free for the
+-- planner to seek: a predicate on `short_name` or `package_name` now reaches
+-- `idx_workspace_file_path_symbol_rows_short` / `_package` from migration 0046
+-- instead of walking every live file of the language.
+--
+-- The import gate reads the row's own `requires_imports` flag, written from
+-- `path_synthetic_module_requires_imports()`, instead of naming JavaScript and
+-- TypeScript in SQL.
+--
+-- `CROSS JOIN` fixes the loop order with the path rows outermost. Without it
+-- SQLite drives `live_workspace_files` first for a predicate on `exact_fqn` or
+-- `normalized_fqn` -- it reads `blobs` by language and seeks each row by its
+-- primary key -- which is the walk this view exists to remove. It is a join
+-- order hint only; the join is still an inner join on `file_id` and the result
+-- set is unchanged.
+CREATE TEMP VIEW IF NOT EXISTS live_path_symbol_names AS
+SELECT files.lang, files.generation, files.rel_path, files.blob_oid,
        files.blob_id,
-       symbols.kind, symbols.package_name, symbols.short_name,
-       symbols.exact_fqn, symbols.normalized_fqn
-FROM path_symbol_units AS symbols
-JOIN live_workspace_files AS files
-  ON files.lang = symbols.lang
- AND files.generation = symbols.generation
- AND files.rel_path = symbols.rel_path
- AND files.blob_oid = symbols.blob_oid
-WHERE symbols.lang NOT IN ('javascript', 'typescript:ts', 'typescript:tsx')
-   OR EXISTS(
-     SELECT 1 FROM main.import_statements AS imports
-     WHERE imports.blob_id = files.blob_id
-   );
-
-CREATE TEMP VIEW IF NOT EXISTS workspace_path_symbol_exact_names AS
-SELECT * FROM workspace_path_symbols;
-
-CREATE TEMP VIEW IF NOT EXISTS workspace_path_symbol_normalized_names AS
-SELECT * FROM workspace_path_symbols;
+       rows.kind, rows.package_name, rows.short_name,
+       rows.exact_fqn, rows.normalized_fqn, rows.requires_imports
+FROM main.workspace_file_path_symbol_rows AS rows
+CROSS JOIN live_workspace_files AS files ON files.file_id = rows.file_version_id
+WHERE rows.requires_imports = 0
+   OR EXISTS(SELECT 1 FROM main.import_statements AS imports
+             WHERE imports.blob_id = files.blob_id);
 
 CREATE TEMP VIEW IF NOT EXISTS live_definition_exact_names AS
 SELECT units.lang, files.generation, files.rel_path, files.blob_oid,
@@ -186,7 +193,7 @@ SELECT symbols.lang, symbols.generation, symbols.rel_path, symbols.blob_oid,
        symbols.package_name AS exact_parent_tail,
        NULL AS normalized_parent_tail, symbols.package_name AS package_tail,
        symbols.short_name AS simple_type_name, NULL AS signature
-FROM workspace_path_symbol_exact_names AS symbols;
+FROM live_path_symbol_names AS symbols;
 
 CREATE TEMP VIEW IF NOT EXISTS live_definition_normalized_names AS
 SELECT lang, generation, rel_path, blob_oid, blob_id, unit_key, kind, short_name,
@@ -210,7 +217,7 @@ SELECT symbols.lang, symbols.generation, symbols.rel_path, symbols.blob_oid,
        symbols.package_name AS exact_parent_tail,
        NULL AS normalized_parent_tail, symbols.package_name AS package_tail,
        symbols.short_name AS simple_type_name, NULL AS signature
-FROM workspace_path_symbol_normalized_names AS symbols;
+FROM live_path_symbol_names AS symbols;
 
 CREATE TEMP VIEW IF NOT EXISTS live_structural_members AS
 SELECT * FROM live_definition_exact_names WHERE exact_parent_tail IS NOT NULL;
@@ -279,7 +286,7 @@ SELECT symbols.lang, symbols.generation, symbols.rel_path, symbols.blob_oid,
        symbols.exact_fqn AS tail,
        CASE WHEN symbols.normalized_fqn <> symbols.exact_fqn
             THEN symbols.normalized_fqn END AS normalized_tail
-FROM workspace_path_symbol_exact_names AS symbols
+FROM live_path_symbol_names AS symbols
 WHERE symbols.kind = 0;
 
 CREATE TEMP VIEW IF NOT EXISTS live_callable_facts AS
@@ -479,6 +486,72 @@ CROSS JOIN main.workspace_file_anchor_rows AS anchors
 WHERE units.fq_anchor_kind IS NOT NULL
   AND units.exact_fqn_tail IS NOT NULL
   AND (units.in_declarations = 1 OR units.in_definition_lookup = 1)
+  AND files.valid_from <= selected.revision
+  AND (files.valid_until IS NULL OR selected.revision < files.valid_until);
+
+-- The two content arms of `live_package_types`, as lean views, for the same
+-- reason the parent-name and identifier shapes have them: a point query or a
+-- request relation against the wide compound makes SQLite materialize all three
+-- arms, including the path arm whose rows the caller then discards.
+--
+-- `live_stable_package_types` is the wide view's first arm unchanged. It
+-- already seeks `idx_code_units_stable_package_type` fully bound
+-- (`lang=? AND package_fqn_tail=? AND simple_type_name=?`), because
+-- `fq_anchor_kind IS NULL` is a literal condition on the arm.
+CREATE TEMP VIEW IF NOT EXISTS live_stable_package_types AS
+SELECT units.lang, files.generation, files.rel_path, files.blob_oid,
+       units.blob_id,
+       units.unit_key, units.identifier, 'content' AS source_kind,
+       '' AS prefix, units.package_fqn_tail AS package_tail,
+       units.simple_type_name, units.exact_fqn_tail AS tail,
+       units.normalized_fqn_tail AS normalized_tail
+FROM main.code_units AS units INDEXED BY idx_code_units_stable_package_type
+JOIN live_workspace_files AS files
+  ON files.blob_id = units.blob_id
+WHERE units.fq_anchor_kind IS NULL
+  AND units.exact_fqn_tail IS NOT NULL
+  AND units.in_declarations = 1 AND units.kind = 0
+  AND units.simple_type_name IS NOT NULL;
+
+-- `live_anchored_package_types` cannot be the wide view's second arm unchanged.
+-- There, `fq_anchor_kind` and `fq_anchor_pop` come from a correlated join to
+-- `workspace_file_anchors`, so SQLite can only range on them
+-- (`lang=? AND fq_anchor_kind>?`) and never reaches `package_fqn_tail` or
+-- `simple_type_name` in the same composite index. Driving from the anchor rows
+-- instead, the way `live_anchored_definition_parent_names` does, binds both
+-- anchor columns from the request's own prefix and gives the fully bound seek
+-- `lang=? AND fq_anchor_kind=? AND fq_anchor_pop=? AND package_fqn_tail=? AND
+-- simple_type_name=?`.
+--
+-- The `analysis_epochs` condition is the one `live_workspace_files` applies, so
+-- this view selects exactly the rows the wide view's anchored arm selects.
+CREATE TEMP VIEW IF NOT EXISTS live_anchored_package_types AS
+SELECT units.lang, files.generation, files.rel_path, files.blob_oid,
+       units.blob_id,
+       units.unit_key, units.identifier, 'anchored' AS source_kind,
+       anchors.package_name AS prefix,
+       units.package_fqn_tail AS package_tail, units.simple_type_name,
+       units.exact_fqn_tail AS tail, units.normalized_fqn_tail AS normalized_tail
+FROM main.workspace_file_anchor_rows AS anchors
+     INDEXED BY idx_workspace_file_anchor_rows_package
+CROSS JOIN main.workspace_file_versions AS files
+  ON files.file_version_id = anchors.file_version_id
+CROSS JOIN selected_workspace_revisions AS selected
+  ON selected.workspace_id = files.workspace_id
+ AND selected.lang = files.lang
+ AND selected.generation = files.generation
+CROSS JOIN main.live_parsed_blobs AS live
+  ON live.blob_oid = files.blob_oid AND live.lang = files.lang
+CROSS JOIN main.code_units AS units INDEXED BY idx_code_units_anchored_package_type
+  ON units.blob_id = live.blob_id
+ AND units.fq_anchor_kind = anchors.anchor_kind
+ AND units.fq_anchor_pop = anchors.anchor_pop
+LEFT JOIN main.analysis_epochs AS epochs ON epochs.lang = files.lang
+WHERE units.fq_anchor_kind IS NOT NULL
+  AND units.exact_fqn_tail IS NOT NULL
+  AND units.in_declarations = 1 AND units.kind = 0
+  AND units.simple_type_name IS NOT NULL
+  AND files.generation = COALESCE(epochs.generation, 0)
   AND files.valid_from <= selected.revision
   AND (files.valid_until IS NULL OR selected.revision < files.valid_until);
 

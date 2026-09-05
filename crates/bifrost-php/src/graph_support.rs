@@ -9,8 +9,8 @@
 //! naming the analyzer type.
 
 use super::aliases::{
-    PhpFileContext, PhpUseAliases, parse_php_use_aliases_by_kind,
-    parse_php_use_aliases_from_source, resolve_php_type,
+    PhpFileContext, PhpFileContextIndex, PhpUseAliases, parse_php_use_aliases_from_source,
+    resolve_php_type,
 };
 use brokk_bifrost_core::analyzer::capabilities::TypeHierarchyProvider;
 use brokk_bifrost_core::analyzer::{CodeUnit, CodeUnitIndex, ProjectFile};
@@ -100,23 +100,11 @@ pub fn php_use_aliases_by_kind_from_source(source: &str) -> PhpUseAliases {
     parse_php_use_aliases_from_source(source)
 }
 
-pub fn php_file_context_from_source(
-    php: &dyn PhpSource,
-    file: &ProjectFile,
-    source: &str,
-) -> PhpFileContext {
-    PhpFileContext {
-        namespace: php_namespace_of_file(php, file),
-        aliases: php_use_aliases_by_kind_from_source(source),
-    }
-}
-
-fn php_declaration_context(php: &dyn PhpSource, code_unit: &CodeUnit) -> PhpFileContext {
+fn php_declaration_context(php: &dyn PhpSource, code_unit: &CodeUnit) -> Option<PhpFileContext> {
     let namespace = code_unit.package_name().to_string();
-    let aliases = php_declaration_start(php, code_unit)
-        .and_then(|start| php_aliases_visible_before_declaration(php, code_unit.source(), start))
-        .unwrap_or_else(|| php_use_aliases_by_kind_of(php, code_unit.source()));
-    PhpFileContext { namespace, aliases }
+    let start = php_declaration_start(php, code_unit)?;
+    let aliases = php_aliases_visible_before_declaration(php, code_unit.source(), start)?;
+    Some(PhpFileContext { namespace, aliases })
 }
 
 fn php_declaration_start(php: &dyn PhpSource, code_unit: &CodeUnit) -> Option<usize> {
@@ -133,11 +121,8 @@ fn php_aliases_visible_before_declaration(
 ) -> Option<PhpUseAliases> {
     let source = php.project().read_source(file).ok()?;
     let tree = parse_php_tree_memoized(&source)?;
-    Some(php_aliases_visible_before(
-        tree.root_node(),
-        &source,
-        declaration_start,
-    ))
+    let index = PhpFileContextIndex::from_tree(tree.root_node(), &source, || true)?;
+    Some(index.context_at(declaration_start).aliases.clone())
 }
 
 pub fn php_is_interface(php: &dyn PhpSource, code_unit: &CodeUnit) -> bool {
@@ -164,7 +149,7 @@ pub fn php_resolve_declared_supertype(
     code_unit: &CodeUnit,
     raw: &str,
 ) -> Option<CodeUnit> {
-    let ctx = php_declaration_context(php, code_unit);
+    let ctx = php_declaration_context(php, code_unit)?;
     let fq_name = resolve_php_type(raw, &ctx)?;
     php.definitions(&fq_name)
         .find(|candidate| candidate.is_class())
@@ -216,54 +201,6 @@ fn php_declaration_kind_for_range(
     None
 }
 
-fn php_aliases_visible_before(
-    root: Node<'_>,
-    source: &str,
-    declaration_start: usize,
-) -> PhpUseAliases {
-    let namespace_scope = php_namespace_scope(root, declaration_start);
-    let mut aliases = PhpUseAliases::default();
-    let mut stack = vec![namespace_scope.unwrap_or(root)];
-    while let Some(node) = stack.pop() {
-        if node.start_byte() >= declaration_start {
-            continue;
-        }
-        if node.kind() == "namespace_use_declaration" {
-            aliases.extend(parse_php_use_aliases_by_kind(
-                &source[node.start_byte()..node.end_byte()],
-            ));
-            continue;
-        }
-
-        for index in (0..node.named_child_count()).rev() {
-            if let Some(child) = node.named_child(index) {
-                stack.push(child);
-            }
-        }
-    }
-    aliases
-}
-
-fn php_namespace_scope(root: Node<'_>, declaration_start: usize) -> Option<Node<'_>> {
-    let mut best = None;
-    let mut stack = vec![root];
-    while let Some(node) = stack.pop() {
-        if node.kind() == "namespace_definition"
-            && node.start_byte() <= declaration_start
-            && declaration_start <= node.end_byte()
-        {
-            best = Some(node);
-        }
-
-        for index in (0..node.named_child_count()).rev() {
-            if let Some(child) = node.named_child(index) {
-                stack.push(child);
-            }
-        }
-    }
-    best
-}
-
 /// Files declaring the target's owning type or a descendant of it, plus every PHP file
 /// whose `use` aliases name one of those types.
 ///
@@ -293,8 +230,7 @@ pub fn php_import_alias_candidates(
     for file in analyzed_php_files() {
         let aliases = php_use_aliases_by_kind_of(php, &file);
         if aliases
-            .type_aliases
-            .values()
+            .type_targets()
             .any(|fq_name| relevant_types.contains(fq_name))
         {
             candidates.insert(file);

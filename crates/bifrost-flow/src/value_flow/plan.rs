@@ -4,11 +4,12 @@ use crate::analyzer::semantic::{
     AbstractLocation, AbstractObject, AccessPathRoot, CallArgumentEndpoint, CallBinding,
     CallBindings, CallSiteHandle, CallSiteId, CallableTarget, CallableTargetResolution,
     CandidateCoverage, ControlEdgeId, ControlEdgeKind, DeclarationLocator, DeclarationSegmentKind,
-    DispatchBoundaryKind, EvidenceCompleteness, GuardFact, IcfgEdgeKind, MemoryLocationKind,
-    ObjectCardinality, ProcedureHandle, ProcedureSemantics, ProgramPointHandle, ProgramPointId,
-    ProofStatus, SemanticArtifact, SemanticArtifactKey, SemanticCapability, SemanticEffect,
-    SemanticGapHandle, SemanticGapImpact, SemanticGapKind, SemanticGapSubject, SemanticLocator,
-    SemanticValueKind, ValueFlowRelationKind, ValueFlowSnapshot, ValueTransfer,
+    DispatchBoundaryKind, EvidenceCompleteness, GuardFact, IcfgEdgeKind, LengthDelimitedDigest,
+    MemoryLocationKind, ObjectCardinality, ProcedureHandle, ProcedureSemantics, ProgramPointHandle,
+    ProgramPointId, ProofStatus, SemanticArtifact, SemanticArtifactKey, SemanticCapability,
+    SemanticEffect, SemanticGapHandle, SemanticGapImpact, SemanticGapKind, SemanticGapSubject,
+    SemanticLocator, SemanticValueKind, StableDigest, ValueFlowRelationKind, ValueFlowSnapshot,
+    ValueTransfer,
 };
 use crate::dataflow::{
     CuratedCallModel, CuratedCallModelFingerprint, ExternalSemanticSummarySet,
@@ -242,6 +243,140 @@ pub(crate) struct ValueFlowCarrierSummaryIdentity {
 }
 
 impl ValueFlowCarrierSummaryIdentity {
+    /// Checkout-independent identity of the exact carrier transfer contract.
+    ///
+    /// This deliberately projects mounted artifact keys through their public
+    /// fingerprints. All other equality-relevant structure is encoded
+    /// directly with variant tags, explicit collection lengths, and fixed-width
+    /// integers; no `Debug` or display representation enters persisted cache
+    /// identity.
+    #[cfg(test)]
+    pub(crate) fn stable_fingerprint(&self) -> StableDigest {
+        self.fingerprint_with(None)
+    }
+
+    /// Checkout-independent identity of this procedure's exact structured
+    /// carrier contract. Local locator coordinates are relative to the
+    /// procedure, and call rules name stable callee lineage rather than callee
+    /// content; dependency keys own callee-result validity.
+    pub(crate) fn procedure_local_fingerprint(
+        &self,
+        procedure: &crate::analyzer::semantic::SemanticLocator,
+    ) -> StableDigest {
+        self.fingerprint_with(Some(procedure))
+    }
+
+    fn fingerprint_with(
+        &self,
+        procedure: Option<&crate::analyzer::semantic::SemanticLocator>,
+    ) -> StableDigest {
+        let domain: &[u8] = if procedure.is_some() {
+            b"bifrost-value-flow-procedure-local-summary-identity-v1"
+        } else {
+            b"bifrost-value-flow-carrier-summary-identity-v1"
+        };
+        let mut digest = LengthDelimitedDigest::new(domain);
+        digest.push(self.unmodeled_call_behavior.label().as_bytes());
+        push_summary_len(&mut digest, self.external_summaries.len());
+        for summary in &self.external_summaries {
+            digest.push(summary.as_bytes());
+        }
+        push_summary_len(&mut digest, self.fallback_globals.len());
+        for carrier in &self.fallback_globals {
+            push_summary_carrier(&mut digest, carrier, procedure);
+        }
+        push_summary_bool(&mut digest, self.has_snapshot);
+
+        push_summary_len(&mut digest, self.local_rules.len());
+        for rule in &self.local_rules {
+            digest.push(b"local_rule");
+            digest.push(&rule.point.get().to_le_bytes());
+            digest.push(&rule.event_index.to_le_bytes());
+            push_relation_kind(&mut digest, rule.kind);
+            push_value_transfer(&mut digest, rule.transfer);
+            push_summary_carrier(&mut digest, &rule.source, procedure);
+            push_summary_carrier(&mut digest, &rule.target, procedure);
+            push_proof(&mut digest, &rule.proof);
+            push_completeness(&mut digest, &rule.completeness);
+            push_summary_bool(&mut digest, rule.strong_update);
+        }
+
+        push_summary_len(&mut digest, self.call_rules.len());
+        for rule in &self.call_rules {
+            digest.push(b"call_rule");
+            digest.push(&rule.call.get().to_le_bytes());
+            if procedure.is_some() {
+                digest.push(
+                    rule.callee_artifact
+                        .procedure_environment_fingerprint()
+                        .as_bytes(),
+                );
+                push_declaration_shape(&mut digest, &rule.callee_declaration);
+            } else {
+                digest.push(rule.callee_artifact.public_fingerprint().as_bytes());
+                push_declaration(&mut digest, &rule.callee_declaration);
+            }
+            digest.push(match rule.kind {
+                CallFlowRuleKind::Call => b"call",
+                CallFlowRuleKind::NormalReturn => b"normal_return",
+                CallFlowRuleKind::ExceptionalReturn => b"exceptional_return",
+            });
+            push_summary_carrier(&mut digest, &rule.source, procedure);
+            push_summary_carrier(&mut digest, &rule.target, procedure);
+            push_proof(&mut digest, &rule.proof);
+            push_completeness(&mut digest, &rule.completeness);
+        }
+
+        push_summary_len(&mut digest, self.curated_models.len());
+        for rule in &self.curated_models {
+            digest.push(b"curated_model");
+            digest.push(&rule.call.get().to_le_bytes());
+            digest.push(rule.model.as_bytes());
+        }
+
+        push_summary_len(&mut digest, self.fallback_rules.len());
+        for rule in &self.fallback_rules {
+            digest.push(b"fallback_rule");
+            digest.push(&rule.call.get().to_le_bytes());
+            push_summary_len(&mut digest, rule.inputs.len());
+            for input in &rule.inputs {
+                push_summary_carrier(&mut digest, input, procedure);
+            }
+            push_summary_len(&mut digest, rule.reachable_components.len());
+            for component in &rule.reachable_components {
+                digest.push(
+                    &u64::try_from(*component)
+                        .expect("value-flow component index fits in u64")
+                        .to_le_bytes(),
+                );
+            }
+            push_optional_carrier(&mut digest, rule.normal_output.as_ref(), procedure);
+            push_optional_carrier(&mut digest, rule.exceptional_output.as_ref(), procedure);
+        }
+
+        push_summary_len(&mut digest, self.location_bindings.len());
+        for binding in &self.location_bindings {
+            digest.push(b"location_binding");
+            digest.push(&binding.call.get().to_le_bytes());
+            push_summary_port(&mut digest, &binding.port);
+            push_summary_carrier(&mut digest, &binding.carrier, procedure);
+        }
+
+        push_summary_len(&mut digest, self.edge_kills.len());
+        for kill in &self.edge_kills {
+            digest.push(b"edge_kill");
+            digest.push(&kill.point.get().to_le_bytes());
+            digest.push(&kill.target.get().to_le_bytes());
+            digest.push(kill.kind.label().as_bytes());
+            push_summary_carrier(&mut digest, &kill.carrier, procedure);
+            push_summary_len(&mut digest, kill.sources.len());
+            for source in &kill.sources {
+                push_summary_event(&mut digest, source, procedure);
+            }
+        }
+        digest.finish()
+    }
+
     pub(crate) fn retained_bytes(&self) -> usize {
         let local = size_of_val(self.local_rules.as_ref()).saturating_add(
             self.local_rules.iter().fold(0usize, |total, rule| {
@@ -323,6 +458,187 @@ impl ValueFlowCarrierSummaryIdentity {
             .saturating_add(fallbacks)
             .saturating_add(location_bindings)
             .saturating_add(edge_kills)
+    }
+}
+
+fn push_summary_len(digest: &mut LengthDelimitedDigest, len: usize) {
+    digest.push(
+        &u64::try_from(len)
+            .expect("value-flow summary collection length fits in u64")
+            .to_le_bytes(),
+    );
+}
+
+fn push_summary_bool(digest: &mut LengthDelimitedDigest, value: bool) {
+    digest.push(&[u8::from(value)]);
+}
+
+fn push_optional_carrier(
+    digest: &mut LengthDelimitedDigest,
+    carrier: Option<&ValueFlowCarrierKey>,
+    procedure: Option<&crate::analyzer::semantic::SemanticLocator>,
+) {
+    match carrier {
+        Some(carrier) => {
+            digest.push(b"some");
+            push_summary_carrier(digest, carrier, procedure);
+        }
+        None => digest.push(b"none"),
+    }
+}
+
+fn push_summary_carrier(
+    digest: &mut LengthDelimitedDigest,
+    carrier: &ValueFlowCarrierKey,
+    procedure: Option<&crate::analyzer::semantic::SemanticLocator>,
+) {
+    match procedure {
+        Some(procedure) => carrier.push_procedure_local_identity(digest, procedure),
+        None => carrier.push_stable_identity(digest),
+    }
+}
+
+fn push_summary_event(
+    digest: &mut LengthDelimitedDigest,
+    event: &ValueFlowEventKey,
+    procedure: Option<&crate::analyzer::semantic::SemanticLocator>,
+) {
+    match procedure {
+        Some(procedure) => event.push_procedure_local_identity(digest, procedure),
+        None => event.push_stable_identity(digest),
+    }
+}
+
+fn push_declaration(digest: &mut LengthDelimitedDigest, declaration: &DeclarationLocator) {
+    push_summary_len(digest, declaration.segments().len());
+    for segment in declaration.segments() {
+        digest.push(segment.kind().stable_label().as_bytes());
+        match segment.name() {
+            Some(name) => {
+                digest.push(b"named");
+                digest.push(name.as_bytes());
+            }
+            None => digest.push(b"anonymous"),
+        }
+        digest.push_anchor(segment.anchor());
+        digest.push(&segment.sibling_ordinal().to_le_bytes());
+    }
+}
+
+fn push_declaration_shape(digest: &mut LengthDelimitedDigest, declaration: &DeclarationLocator) {
+    push_summary_len(digest, declaration.segments().len());
+    for segment in declaration.segments() {
+        digest.push(segment.kind().stable_label().as_bytes());
+        match segment.name() {
+            Some(name) => {
+                digest.push(b"named");
+                digest.push(name.as_bytes());
+            }
+            None => digest.push(b"anonymous"),
+        }
+        digest.push(&segment.sibling_ordinal().to_le_bytes());
+    }
+}
+
+fn push_proof(digest: &mut LengthDelimitedDigest, proof: &ProofStatus) {
+    match proof {
+        ProofStatus::Proven => digest.push(b"proven"),
+        ProofStatus::Unproven(reason) => {
+            digest.push(b"unproven");
+            digest.push(reason.as_bytes());
+        }
+    }
+}
+
+fn push_completeness(digest: &mut LengthDelimitedDigest, completeness: &EvidenceCompleteness) {
+    match completeness {
+        EvidenceCompleteness::Complete => digest.push(b"complete"),
+        EvidenceCompleteness::Partial(reason) => {
+            digest.push(b"partial");
+            digest.push(reason.as_bytes());
+        }
+    }
+}
+
+fn push_relation_kind(digest: &mut LengthDelimitedDigest, kind: ValueFlowRelationKind) {
+    digest.push(match kind {
+        ValueFlowRelationKind::Assignment => b"assignment",
+        ValueFlowRelationKind::Parameter => b"parameter",
+        ValueFlowRelationKind::Receiver => b"receiver",
+        ValueFlowRelationKind::NormalReturn => b"normal_return",
+        ValueFlowRelationKind::ExceptionalReturn => b"exceptional_return",
+        ValueFlowRelationKind::Allocation => b"allocation",
+        ValueFlowRelationKind::MemoryLoad => b"memory_load",
+        ValueFlowRelationKind::MemoryStore => b"memory_store",
+        ValueFlowRelationKind::Capture => b"capture",
+        ValueFlowRelationKind::HandlerBinding => b"handler_binding",
+        ValueFlowRelationKind::ContainerCollapse => b"container_collapse",
+        ValueFlowRelationKind::LanguageDefined => b"language_defined",
+    });
+}
+
+fn push_value_transfer(digest: &mut LengthDelimitedDigest, transfer: Option<ValueTransfer>) {
+    use crate::analyzer::semantic::{
+        MoveInvalidation, TransferKind, TransferOperation, ValuePreservation,
+    };
+
+    let Some(transfer) = transfer else {
+        digest.push(b"no_transfer");
+        return;
+    };
+    digest.push(b"transfer");
+    match transfer.kind {
+        TransferKind::Copy => digest.push(b"copy"),
+        TransferKind::AggregateCopy => digest.push(b"aggregate_copy"),
+        TransferKind::Move { invalidation } => {
+            digest.push(b"move");
+            digest.push(match invalidation {
+                MoveInvalidation::Invalidated => b"invalidated",
+                MoveInvalidation::Unknown => b"unknown",
+            });
+        }
+        TransferKind::Conversion { preservation } => {
+            digest.push(b"conversion");
+            digest.push(match preservation {
+                ValuePreservation::Identity => b"identity",
+                ValuePreservation::Preserving => b"preserving",
+                ValuePreservation::Changing => b"changing",
+            });
+        }
+        TransferKind::Boxing => digest.push(b"boxing"),
+        TransferKind::Unboxing => digest.push(b"unboxing"),
+    }
+    match transfer.operation {
+        TransferOperation::None => digest.push(b"no_operation"),
+        TransferOperation::CallSite(call) => {
+            digest.push(b"call_site_operation");
+            digest.push(&call.get().to_le_bytes());
+        }
+        TransferOperation::Unknown => digest.push(b"unknown_operation"),
+    }
+}
+
+fn push_summary_port(digest: &mut LengthDelimitedDigest, port: &SummaryPort) {
+    match port {
+        SummaryPort::Receiver => digest.push(b"receiver"),
+        SummaryPort::Parameter(ordinal) => {
+            digest.push(b"parameter");
+            digest.push(&ordinal.to_le_bytes());
+        }
+        SummaryPort::NormalReturn => digest.push(b"normal_return"),
+        SummaryPort::IndexedNormalReturn(ordinal) => {
+            digest.push(b"indexed_normal_return");
+            digest.push(&ordinal.to_le_bytes());
+        }
+        SummaryPort::ExceptionalReturn => digest.push(b"exceptional_return"),
+        SummaryPort::Capture(location) => {
+            digest.push(b"capture");
+            digest.push(location.as_bytes());
+        }
+        SummaryPort::Heap(location) => {
+            digest.push(b"heap");
+            digest.push(location.as_bytes());
+        }
     }
 }
 
@@ -1980,6 +2296,11 @@ impl ValueFlowPlan {
         self.carrier_keys.get(id.index())
     }
 
+    /// Stable keys in the same dense-ID order as [`Self::carriers`].
+    pub(crate) fn carrier_keys(&self) -> &[ValueFlowCarrierKey] {
+        &self.carrier_keys
+    }
+
     pub(crate) fn carrier_id_for_key(
         &self,
         key: &ValueFlowCarrierKey,
@@ -2895,6 +3216,16 @@ impl ValueFlowPlan {
             .any(|(candidate, _)| candidate == call)
     }
 
+    /// Every callee this plan can enter through a concrete call binding.
+    ///
+    /// An unbound or open call has no pair and therefore cannot consume a
+    /// reusable procedure summary. Callees may repeat when several call sites
+    /// bind the same procedure; consumers that only test existence can stop at
+    /// the first match without allocating a deduplication index.
+    pub(crate) fn bound_callees(&self) -> impl Iterator<Item = &ProcedureHandle> {
+        self.binding_pairs.iter().map(|(_, callee)| callee)
+    }
+
     /// Every analyzed procedure this plan binds a call of `procedure` to
     /// (#2296).
     ///
@@ -3797,6 +4128,86 @@ mod tests {
         let mut trace = HashTrace::default();
         plan.propagation_semantics_hash(&mut trace);
         trace.0
+    }
+
+    fn carrier_summary_identity(source: &str) -> ValueFlowCarrierSummaryIdentity {
+        let project = InlineTestProject::with_language(Language::Go)
+            .file("flow.go", source)
+            .build();
+        let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+        let cancellation = CancellationToken::default();
+        let mut budget = SemanticBudget::default();
+        let artifact = workspace
+            .materialize_program_semantics(
+                &project.file("flow.go"),
+                &mut SemanticRequest::new(&mut budget, &cancellation),
+            )
+            .expect("fixture semantics materialize")
+            .available_value()
+            .cloned()
+            .expect("fixture semantics remain available");
+        let root = artifact
+            .procedures()
+            .iter()
+            .find(|procedure| {
+                procedure
+                    .locator()
+                    .declaration()
+                    .segments()
+                    .last()
+                    .and_then(|segment| segment.name())
+                    == Some("run")
+            })
+            .and_then(|procedure| artifact.procedure_handle(procedure.id()))
+            .expect("fixture declares run");
+        let mut budget = SemanticBudget::default();
+        let snapshot_outcome = workspace
+            .semantic_oracle_provider()
+            .procedure_relations(
+                &root,
+                &OracleCallContext::empty(),
+                &mut SemanticRequest::new(&mut budget, &cancellation),
+            )
+            .expect("fixture value-flow snapshot materializes");
+        let status = SemanticInputStatus::from_outcome(&snapshot_outcome);
+        let snapshot = snapshot_outcome
+            .available_value()
+            .cloned()
+            .expect("fixture value-flow snapshot remains available");
+        let plan = ValueFlowPlan::try_new(
+            root.clone(),
+            vec![ValueFlowInput::new(snapshot, status)],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        )
+        .expect("fixture value-flow plan");
+        plan.carrier_summary_identities()
+            .remove(&root)
+            .expect("root has a carrier summary identity")
+    }
+
+    #[test]
+    fn carrier_summary_fingerprint_is_checkout_independent_and_semantic() {
+        const SOURCE: &str = r#"package fixture
+func run(input string) string {
+    output := input
+    return output
+}
+"#;
+
+        let first = carrier_summary_identity(SOURCE);
+        let second = carrier_summary_identity(SOURCE);
+        assert_ne!(first, second, "mounted carrier identities remain exact");
+        assert_eq!(first.stable_fingerprint(), second.stable_fingerprint());
+
+        let mut changed = first.clone();
+        let rule = changed
+            .local_rules
+            .first_mut()
+            .expect("fixture has a local transfer rule");
+        rule.strong_update = !rule.strong_update;
+        assert_ne!(first.stable_fingerprint(), changed.stable_fingerprint());
     }
 
     #[test]

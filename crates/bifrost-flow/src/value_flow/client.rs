@@ -6,7 +6,8 @@ use crate::analyzer::semantic::{
 };
 use crate::dataflow::{
     DataflowEdge, DataflowOutput, DataflowRequest, DistributiveDataflowProblem,
-    SummaryDataflowError, SummarySolveInput, WitnessRetentionLimits, solve_with_summaries,
+    ReusableSummaryProvider, SummaryDataflowError, SummarySolveInput, WitnessRetentionLimits,
+    solve_with_reusable_end_summaries, solve_with_summaries,
 };
 
 use super::plan::CallFlowRuleKind;
@@ -34,6 +35,14 @@ impl ValueFlowUncertainty {
 
     pub(crate) const fn with_complete(self, complete: bool) -> Self {
         if complete { self } else { self.with_semantic() }
+    }
+
+    pub(crate) const fn from_semantic_uncertainty(uncertain: bool) -> Self {
+        if uncertain {
+            Self::empty().with_semantic()
+        } else {
+            Self::empty()
+        }
     }
 
     pub(crate) fn with_quality(
@@ -72,6 +81,34 @@ pub struct ValueFlowFact(ValueFlowFactKind);
 
 impl ValueFlowFact {
     const ZERO: Self = Self(ValueFlowFactKind::Zero);
+
+    pub(crate) const fn zero() -> Self {
+        Self::ZERO
+    }
+
+    pub(crate) const fn carrier_fact(
+        source: ValueFlowSourceId,
+        carrier: ValueFlowCarrierId,
+        uncertainty: ValueFlowUncertainty,
+    ) -> Self {
+        Self(ValueFlowFactKind::Carrier {
+            source,
+            carrier,
+            uncertainty,
+        })
+    }
+
+    pub(crate) const fn meeting_fact(
+        source: ValueFlowSourceId,
+        sink: ValueFlowSinkId,
+        uncertainty: ValueFlowUncertainty,
+    ) -> Self {
+        Self(ValueFlowFactKind::Meeting {
+            source,
+            sink,
+            uncertainty,
+        })
+    }
 
     pub const fn source(self) -> Option<ValueFlowSourceId> {
         match self.0 {
@@ -526,6 +563,34 @@ where
         SummarySolveInput::new(root, &[]).with_witness_retention(witness_retention),
         provider,
         &problem,
+        semantic_budget,
+        request,
+    )?;
+    ValueFlowSummaryResult::from_result(plan, result)
+}
+
+pub(crate) fn solve_value_flow_with_reusable_summaries<Provider, Reusable>(
+    root: &ProcedureHandle,
+    provider: &Provider,
+    reusable: &mut Reusable,
+    plan: &ValueFlowPlan,
+    witness_retention: WitnessRetentionLimits,
+    semantic_budget: &mut SemanticBudget,
+    request: &mut DataflowRequest<'_>,
+) -> Result<ValueFlowSummaryResult, ValueFlowSolveError>
+where
+    Provider: IcfgProvider + ?Sized,
+    Reusable: ReusableSummaryProvider<ValueFlowFact> + ?Sized,
+{
+    if root != plan.root() {
+        return Err(ValueFlowSolveError::RootMismatch);
+    }
+    let problem = ValueFlowProblem::new(plan);
+    let result = solve_with_reusable_end_summaries(
+        SummarySolveInput::new(root, &[]).with_witness_retention(witness_retention),
+        provider,
+        &problem,
+        reusable,
         semantic_budget,
         request,
     )?;

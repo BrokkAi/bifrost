@@ -1892,19 +1892,6 @@ struct FlattenedEntryTransfer {
     function: TaintEdgeFunction,
 }
 
-fn conjoin_taint_evidence(
-    prefix: PathQualityFrontier,
-    suffix: PathQualityFrontier,
-) -> PathQualityFrontier {
-    let mut combined = PathQualityFrontier::default();
-    for prefix_quality in prefix.iter() {
-        for suffix_quality in suffix.iter() {
-            combined.insert(prefix_quality.conjoin(suffix_quality));
-        }
-    }
-    combined
-}
-
 fn merge_flattened_observation(
     states: &mut HashMap<FlattenedObservationKey, FlattenedObservationValue>,
     key: FlattenedObservationKey,
@@ -2097,7 +2084,7 @@ fn flatten_taint_observations(
                 &mut states,
                 next_key.clone(),
                 FlattenedObservationValue {
-                    evidence: conjoin_taint_evidence(transfer.evidence, value.evidence),
+                    evidence: transfer.evidence.conjoin(value.evidence),
                     function: transfer.function.compose(&value.function),
                 },
                 request,

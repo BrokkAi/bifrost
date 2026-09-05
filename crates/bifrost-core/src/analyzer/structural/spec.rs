@@ -16,7 +16,7 @@ use super::materialization::DeclarationMaterializationSupport;
 use super::occurrences::{
     Namespace, OccurrenceRole, OccurrenceRoleSupport, default_occurrence_namespace,
 };
-use super::resolution::{BindingActivation, LexicalEnvironmentSupport};
+use super::resolution::{BindingActivation, ImportActivation, LexicalEnvironmentSupport};
 use super::routes::{CuratedExportSurface, IdentityRouteSupport, RouteHopKind};
 use crate::analyzer::{Language, Range};
 use crate::cancellation::CancellationToken;
@@ -225,6 +225,32 @@ pub trait StructuralSpec: Send + Sync + 'static {
     /// wrong.
     fn binding_activation(&self, _binder: Node<'_>, _scope: Range) -> Option<BindingActivation> {
         None
+    }
+
+    /// The interval the local name of the import declaration spanning
+    /// `declaration` is in effect over, inside the scope whose range is
+    /// `scope` and whose normalized kind is `scope_kind` (`None` for the
+    /// synthesized whole-file scope).
+    ///
+    /// This is the import-binder counterpart of [`Self::binding_activation`]:
+    /// the derivation layer knows which scope an import is written in, and the
+    /// adapter states when the name it introduces starts being in effect. The
+    /// default is scope-wide, which every language whose imports either hoist
+    /// or are required at the top of their scope keeps by not overriding it.
+    /// Scala overrides it because a block-local `import` is in effect from the
+    /// import statement onward (#2925).
+    ///
+    /// There is no `None` here, unlike [`Self::binding_activation`]: the
+    /// import row exists either way, and the scope it is written in is always
+    /// an interval the layer can state, so an adapter that says nothing is
+    /// stating the scope-wide answer rather than failing to answer.
+    fn import_binder_activation(
+        &self,
+        _declaration: Range,
+        scope: Range,
+        _scope_kind: Option<NormalizedKind>,
+    ) -> ImportActivation {
+        ImportActivation::scope_wide(scope)
     }
 
     /// The namespace an occurrence of `role` resolves in, where `declares` is

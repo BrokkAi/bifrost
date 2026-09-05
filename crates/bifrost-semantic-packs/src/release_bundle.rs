@@ -4,8 +4,9 @@
 //! producer family that can consume one pinned exact artifact today: the JVM
 //! source archives, Java class JARs, TypeScript declaration files, .NET
 //! assemblies, rustdoc JSON documents, Python stub trees, npm packages, Go
-//! modules, Ruby gem archives, and Composer packages. A spec that names an
-//! unknown family fails parsing, it is never skipped.
+//! modules, Ruby gem archives, Composer packages, and PHP declaration stub
+//! trees. A spec that names an unknown family fails parsing, it is never
+//! skipped.
 //!
 //! Four of those families -- npm, Go, Ruby, Composer -- have no on-disk
 //! installed layout to derive their structure from when a pinned spec is
@@ -59,9 +60,9 @@ use brokk_bifrost_analysis::analyzer::{
     ComposerPinnedAutoloadRule, FileSetProject, GoModulePackProducer,
     GoPinnedPackage as AnalysisGoPinnedPackage, JavaJarPackProducer, JdkSourceArchiveLayout,
     JdkSourceArchivePackProducer, JdkVersion, JvmDependencyPackAdapter,
-    KotlinSourceJarPackProducer, Language, PythonArtifactPackProducer, RubyGemArchivePackProducer,
-    RustdocJsonPackProducer, ScalaSourceJarPackProducer, TypeScriptDeclarationPackProducer,
-    WorkspaceAnalyzer,
+    KotlinSourceJarPackProducer, Language, PhpDeclarationStubPackProducer,
+    PythonArtifactPackProducer, RubyGemArchivePackProducer, RustdocJsonPackProducer,
+    ScalaSourceJarPackProducer, TypeScriptDeclarationPackProducer, WorkspaceAnalyzer,
 };
 use semver::{Version, VersionReq};
 use serde::{Deserialize, Serialize};
@@ -165,6 +166,20 @@ pub enum PinnedPackKind {
     ComposerPackage {
         rules: Vec<PinnedComposerAutoloadRule>,
     },
+    /// One pinned tree of plain PHP declaration stubs: PHP source that states
+    /// the runtime's own classes, interfaces, constants and functions with
+    /// native signatures and empty bodies. `stubs` lists the pinned `.php`
+    /// files relative to the tree root, and the pinned artifact digest is the
+    /// canonical source-set digest over those paths and bytes, exactly as
+    /// `PythonStub` pins a typeshed slice.
+    ///
+    /// This is not `ComposerPackage` with different files. A Composer package
+    /// is code that runs and autoloads under rules the spec must name; a stub
+    /// tree describes code no file in any workspace contains, so it carries no
+    /// autoload rules and its declarations take the `php` runtime ecosystem.
+    PhpDeclarationStub {
+        stubs: Vec<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -258,6 +273,7 @@ impl PinnedPackKind {
             Self::GoModule { .. } => ExternalArtifactKind::GoSourceSet,
             Self::RubyGemArchive => ExternalArtifactKind::RubyGemArchive,
             Self::ComposerPackage { .. } => ExternalArtifactKind::ComposerPackageSourceSet,
+            Self::PhpDeclarationStub { .. } => ExternalArtifactKind::PhpDeclarationStub,
         }
     }
 }
@@ -1037,6 +1053,16 @@ fn read_pinned_artifact(
                 limits,
             )
         }
+        PinnedPackKind::PhpDeclarationStub { stubs } => {
+            let relative_paths = stubs.iter().map(PathBuf::from).collect::<Vec<_>>();
+            read_exact_source_set(
+                artifact_path,
+                &relative_paths,
+                MAX_SOURCE_SET_FILES,
+                MAX_SOURCE_SET_PATH_DEPTH,
+                limits,
+            )
+        }
         PinnedPackKind::RustdocJsonSet { crates } => {
             let relative_paths = crates
                 .iter()
@@ -1186,6 +1212,8 @@ fn produce_pinned_pack(
                 &rules,
             )
         }
+        PinnedPackKind::PhpDeclarationStub { stubs } => PhpDeclarationStubPackProducer
+            .produce_loaded_source_set(request, limits, cancellation, artifact, stubs),
     }
 }
 
@@ -1399,6 +1427,35 @@ fn validate_spec(spec: &PinnedPackSpec, spec_path: &Path) -> Result<(), BundleEr
                         spec_path.display()
                     )));
                 }
+            }
+        }
+    }
+    if let PinnedPackKind::PhpDeclarationStub { stubs } = &spec.kind {
+        if stubs.is_empty() {
+            return Err(BundleError::new(format!(
+                "spec {} must list at least one pinned PHP stub file",
+                spec_path.display()
+            )));
+        }
+        let mut paths = BTreeSet::new();
+        for stub in stubs {
+            let stub_path = Path::new(stub);
+            require_safe_relative(stub_path)?;
+            if stub_path
+                .extension()
+                .and_then(|extension| extension.to_str())
+                != Some("php")
+            {
+                return Err(BundleError::new(format!(
+                    "spec {} pins non-stub source {stub}; every pinned PHP stub must be a .php file",
+                    spec_path.display()
+                )));
+            }
+            if !paths.insert(stub.clone()) {
+                return Err(BundleError::new(format!(
+                    "spec {} lists duplicate PHP stub path {stub}",
+                    spec_path.display()
+                )));
             }
         }
     }

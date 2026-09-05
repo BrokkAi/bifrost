@@ -2284,14 +2284,25 @@ records `degraded: true`, and a `diff-base-unreliable` report diagnostic
 states why, so a broken base can never hide new findings and can never be
 mistaken for a clean diff run.
 
-Three identity limitations are accepted rather than solved. A pure file rename
+Two identity limitations are accepted rather than solved. A pure file rename
 re-keys every finding in the file (the path is part of the identity), so a
 rename reports one `fixed` plus one `new` pair. Identical source slices under
 one owner are distinguished by an ordinal, so inserting an exact duplicate
-above an existing one can shift the ordinals and misclassify one pair. A
-typestate finding's identity contains the policy's compiled binding plan, so
-an edit that changes which declarations that policy binds re-keys every
-finding it reports, and each one is listed as `fixed` plus `new`.
+above an existing one can shift the ordinals and misclassify one pair.
+
+A typestate finding's identity follows the same rule as every other family: it
+hashes only what the finding itself is. That is the policy id, the compiled
+protocol, the tracked object's semantic identity, the violating site's
+semantic identity, the solver root's semantic identity, and the violated event
+or terminal expectation together with its observed and expected states. Two
+violations under one root stay two findings because they differ in at least
+one of those: the site, the expectation or event, the observed state, or the
+tracked object. The policy's compiled binding plan -- a digest of every
+declaration the policy binds anywhere in the workspace -- is not part of the
+identity, so an edit that adds a tracked object in one file leaves every other
+finding's identity where it was. Editing the policy document's automaton does
+re-key the findings that policy reports, because a different protocol is a
+different rule.
 
 ### What a second run reuses
 

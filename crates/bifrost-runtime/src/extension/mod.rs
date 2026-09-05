@@ -34,6 +34,7 @@ mod limits;
 mod observation;
 mod outcome;
 mod relation;
+mod typestate;
 mod version;
 mod workspace;
 
@@ -55,6 +56,7 @@ pub use outcome::{
     ExtensionTierReport, ExtensionWork,
 };
 pub use relation::*;
+pub use typestate::*;
 pub use version::{
     ApiStability, CapabilitySupport, EXTENSION_API_VERSION, ExtensionApiVersion,
     ExtensionCapabilityId, ExtensionCompatibility, ExtensionCompatibilityError,

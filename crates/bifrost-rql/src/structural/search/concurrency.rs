@@ -771,9 +771,13 @@ impl ConcurrencyProvider for WorkspaceConcurrencyProvider<'_> {
                     vec![AccessSelector::Index(selector)],
                 )
             }
-            MemoryLocationKind::Static { .. }
-            | MemoryLocationKind::LexicalCell { .. }
-            | MemoryLocationKind::Capture { .. } => {
+            // The solver canonicalizes a static itself unless the producer
+            // marked the location's identity unresolved, which only happens
+            // for a value whose declaring file the producer may not read.
+            MemoryLocationKind::Static { member } => {
+                return Ok(resolved_static(self.workspace, procedure, location, member));
+            }
+            MemoryLocationKind::LexicalCell { .. } | MemoryLocationKind::Capture { .. } => {
                 unreachable!("the concurrency solver canonicalizes non-heap locations directly")
             }
         };
@@ -955,6 +959,74 @@ fn value_handle(
     procedure.value_handle(value).ok_or_else(|| {
         SemanticProviderError::internal("concurrency input names a stale semantic value")
     })
+}
+
+/// Resolve one imported package value's occurrence back to its
+/// declaration.
+///
+/// A language adapter that declares no intra-file dependencies cannot read
+/// the declaring file, so it stores the occurrence and marks the location
+/// unresolved. This provider can see the workspace, and resolving the
+/// occurrence is what lets two files naming one variable agree that they
+/// name one storage. Without it a cross-package race is not merely missed:
+/// the two accesses look disjoint and the run reports itself clean.
+///
+/// Anything short of exactly one declaration stays open. Several
+/// declarations would be a genuine ambiguity, and none means the reference
+/// left the workspace.
+fn resolved_static(
+    workspace: &WorkspaceAnalyzer,
+    procedure: &ProcedureHandle,
+    location: MemoryLocationId,
+    member: &crate::analyzer::semantic::SemanticLocator,
+) -> ConcurrencyAnswer<ResolvedConcurrencyLocation> {
+    // The declaration is the identity both sides of an import must agree on.
+    // A producer that resolved it stored the declaration's own locator, and one
+    // that could not stored a use site; resolving either lands on the same
+    // declaration, so the two meet.
+    let unresolved_by_producer = procedure.semantics().gaps().iter().any(|gap| {
+        gap.subject == crate::analyzer::semantic::SemanticGapSubject::MemoryLocation(location)
+    });
+    let fallback = || {
+        if unresolved_by_producer {
+            // The stored locator is a use site. Rendering it would claim two
+            // occurrences of one variable are different storage.
+            open_resolved_location()
+        } else {
+            ConcurrencyAnswer::Proven(ResolvedConcurrencyLocation::exact(
+                CanonicalConcurrencyLocation::new(format!("static:{member:?}"), "static"),
+            ))
+        }
+    };
+    let file = super::witness_projection::locator_file(workspace, member);
+    let Some(source) = workspace.analyzer().indexed_source(&file) else {
+        return fallback();
+    };
+    let span = member.anchor().span();
+    let requests = vec![
+        crate::analyzer::usages::get_definition::DefinitionLookupRequest {
+            file: file.clone(),
+            line: None,
+            column: None,
+            start_byte: Some(span.start_byte() as usize),
+            end_byte: Some(span.end_byte() as usize),
+        },
+    ];
+    let outcomes = crate::analyzer::usages::get_definition::resolve_definition_batch_with_source(
+        workspace.analyzer(),
+        requests,
+        file,
+        Arc::from(source),
+    );
+    let Some(outcome) = outcomes.into_iter().next() else {
+        return fallback();
+    };
+    let [definition] = outcome.definitions.as_slice() else {
+        return fallback();
+    };
+    ConcurrencyAnswer::Proven(ResolvedConcurrencyLocation::exact(
+        CanonicalConcurrencyLocation::new(format!("static:{}", definition.fq_name()), "static"),
+    ))
 }
 
 fn open_resolved_location() -> ConcurrencyAnswer<ResolvedConcurrencyLocation> {

@@ -8,6 +8,7 @@ use std::collections::VecDeque;
 use std::fmt;
 use std::sync::Arc;
 
+use crate::analyzer::read_ledger::{LookupKind, ReadKey};
 use crate::analyzer::semantic_model::{ActiveSemanticModelSnapshot, ProcedureSummaryMemberKey};
 use crate::analyzer::{DispatchHierarchyExpansion, Language, WorkspaceAnalyzer};
 use crate::hash::{HashMap, HashSet};
@@ -41,6 +42,58 @@ const WORKSPACE_ICFG_PROVIDER_BEHAVIOR_DOMAIN: &[u8] =
 /// no read half can ever equal a full identity by accident.
 const WORKSPACE_ICFG_PROVIDER_READ_BEHAVIOR_DOMAIN: &[u8] =
     b"bifrost-icfg-provider/workspace-read-behavior/v2";
+
+/// Why one dispatch lookup could not be named by a replayable read key.
+///
+/// A summary that observes this status must fail closed instead of publishing
+/// an apparently complete read set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum DispatchReadUnattributedReason {
+    /// The semantic call site has no exact retained source range.
+    SourceRangeUnavailable,
+}
+
+/// The replayable input read by one call-dispatch lookup, or the typed reason
+/// that lookup cannot be attributed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DispatchReadAttribution {
+    Attributed(ReadKey),
+    Unattributed(DispatchReadUnattributedReason),
+}
+
+/// Build the canonical read attribution for one handle-keyed dispatch answer.
+///
+/// Both the ICFG provider's request ledger and cached value-flow discovery use
+/// this function. A cache hit must record the same input as the cold oracle
+/// call that populated it, rather than disappearing from a later procedure
+/// summary's read set.
+pub fn dispatch_read_attribution(
+    call: &CallSiteHandle,
+    outcome: &SemanticOutcome<DispatchResult>,
+) -> DispatchReadAttribution {
+    dispatch_read_attribution_with_range(
+        call,
+        outcome,
+        super::workspace_oracle::exact_call_range(call),
+    )
+}
+
+fn dispatch_read_attribution_with_range(
+    call: &CallSiteHandle,
+    outcome: &SemanticOutcome<DispatchResult>,
+    range: Result<crate::analyzer::Range, SemanticProviderError>,
+) -> DispatchReadAttribution {
+    let Ok(range) = range else {
+        return DispatchReadAttribution::Unattributed(
+            DispatchReadUnattributedReason::SourceRangeUnavailable,
+        );
+    };
+    DispatchReadAttribution::Attributed(ReadKey::lookup(
+        LookupKind::Dispatch,
+        super::workspace_oracle::dispatch_question(call.procedure().artifact(), range),
+        super::workspace_oracle::one_call_dispatch_answer_digest(call, outcome),
+    ))
+}
 
 /// Whether this first authored non-return consumer has an unambiguous call
 /// identity and immediate-invocation contract for `language`.
@@ -522,15 +575,10 @@ impl<'a> WorkspaceIcfgProvider<'a> {
         if !analyzer.read_ledger_attached() {
             return;
         }
-        let Ok(range) = super::workspace_oracle::exact_call_range(call) else {
-            analyzer.record_unattributed_read();
-            return;
-        };
-        analyzer.record_read(crate::analyzer::read_ledger::ReadKey::lookup(
-            crate::analyzer::read_ledger::LookupKind::Dispatch,
-            super::workspace_oracle::dispatch_question(call.procedure().artifact(), range),
-            super::workspace_oracle::one_call_dispatch_answer_digest(call, outcome),
-        ));
+        match dispatch_read_attribution(call, outcome) {
+            DispatchReadAttribution::Attributed(key) => analyzer.record_read(key),
+            DispatchReadAttribution::Unattributed(_) => analyzer.record_unattributed_read(),
+        }
     }
 }
 
@@ -3098,6 +3146,56 @@ mod tests {
         let expected = SnapshotQuality::Unsupported(SemanticCapability::CleanupControlFlow);
         assert_eq!(merge_quality(deferred, cleanup), expected);
         assert_eq!(merge_quality(cleanup, deferred), expected);
+    }
+
+    #[test]
+    fn unnameable_dispatch_range_is_typed_unattributed() {
+        let fixture = AnalyzerFixture::new_for_language(
+            crate::analyzer::Language::TypeScript,
+            &[(
+                "dispatch-read.ts",
+                "function target() {}\nexport function caller() { target(); }\n",
+            )],
+        );
+        let file = ProjectFile::new(fixture.project_root(), "dispatch-read.ts");
+        let cancellation = CancellationToken::default();
+        let mut budget = SemanticBudget::default();
+        let artifact = fixture
+            .analyzer
+            .materialize_program_semantics(
+                &file,
+                &mut SemanticRequest::new(&mut budget, &cancellation),
+            )
+            .expect("TypeScript semantic materialization")
+            .available_value()
+            .cloned()
+            .expect("TypeScript semantic artifact");
+        let call = artifact
+            .procedures()
+            .iter()
+            .find(|procedure| !procedure.call_sites().is_empty())
+            .and_then(|procedure| artifact.procedure_handle(procedure.id()))
+            .and_then(|procedure| procedure.call_site_handle(CallSiteId::new(0)))
+            .expect("fixture call site");
+        let outcome = SemanticOutcome::<DispatchResult>::Unknown {
+            partial: None,
+            work: SemanticWork::default(),
+        };
+
+        let attribution = dispatch_read_attribution_with_range(
+            &call,
+            &outcome,
+            Err(SemanticProviderError::internal(
+                "synthetic missing source range",
+            )),
+        );
+
+        assert_eq!(
+            attribution,
+            DispatchReadAttribution::Unattributed(
+                DispatchReadUnattributedReason::SourceRangeUnavailable
+            )
+        );
     }
 
     #[test]

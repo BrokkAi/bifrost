@@ -833,7 +833,6 @@ const ARTIFACT_CURRENCY_SOURCE_BYTES: usize = usize::MAX;
 /// digest of the read set being verified. That identity is checkout-
 /// independent because every read key is, so the same unit verified against
 /// two head workspaces reports the same artifact.
-#[allow(clippy::too_many_arguments)]
 pub fn verify_read_set(
     head: &WorkspaceAnalyzer,
     changed: &ChangedFacts,
@@ -847,6 +846,28 @@ pub fn verify_read_set(
         DerivedArtifactKind::PolicyEvaluationUnit,
         crate::analyzer::read_ledger::read_set_digest(keys).digest(),
     );
+    verify_read_set_for_artifact(unit, head, changed, inputs, keys, limits, summaries, memo)
+}
+
+/// [`verify_read_set`] for a derived product that already has its own exact
+/// identity.
+///
+/// The supplied `artifact` is used only in the resulting retention or
+/// invalidation evidence; read replay is otherwise identical. Policy units use
+/// [`verify_read_set`] to preserve their historical read-set-derived identity,
+/// while procedure summaries and other persisted products can name the cache
+/// artifact their callers actually hold.
+#[allow(clippy::too_many_arguments)]
+pub fn verify_read_set_for_artifact(
+    artifact: DerivedArtifactId,
+    head: &WorkspaceAnalyzer,
+    changed: &ChangedFacts,
+    inputs: &HeadInputs,
+    keys: &[ReadKey],
+    limits: LookupReplayLimits,
+    summaries: &dyn SummaryAnswers,
+    memo: &mut LookupMemo,
+) -> ReadVerdict {
     for key in keys {
         let reason = match key {
             ReadKey::File {
@@ -855,7 +876,7 @@ pub fn verify_read_set(
                 blob,
             } => (changed.head_blob(*language, rel_path) != Some(*blob)).then(|| {
                 InvalidationReason::InputContentChanged {
-                    artifact: unit,
+                    artifact,
                     before: blob_identity(Some(*blob)),
                     after: blob_identity(changed.head_blob(*language, rel_path)),
                 }
@@ -867,7 +888,7 @@ pub fn verify_read_set(
             ReadKey::PathAbsent { language, rel_path } => changed
                 .head_blob(*language, rel_path)
                 .map(|blob| InvalidationReason::InputContentChanged {
-                    artifact: unit,
+                    artifact,
                     before: blob_identity(None),
                     after: blob_identity(Some(blob)),
                 }),
@@ -876,11 +897,11 @@ pub fn verify_read_set(
                     // A changed-key set that could not be completed is smaller
                     // than the truth, and a smaller set would let a changed
                     // name pass. The absence of evidence is not evidence.
-                    Some(InvalidationReason::ContentIdentityEvidenceMissing { artifact: unit })
+                    Some(InvalidationReason::ContentIdentityEvidenceMissing { artifact })
                 } else {
                     changed.contains(*family, key).then_some(
                         InvalidationReason::DependencyChanged {
-                            artifact: unit,
+                            artifact,
                             dependency: ReadKey::index(*family, key).canonical_digest(),
                         },
                     )
@@ -918,7 +939,7 @@ pub fn verify_read_set(
                 }
                 Some(replayed) if replayed != *digest => {
                     Some(InvalidationReason::DependencyFingerprintChanged {
-                        artifact: unit,
+                        artifact,
                         before: *digest,
                         after: replayed,
                     })
@@ -932,12 +953,10 @@ pub fn verify_read_set(
             } => match memo.answer(head, *kind, question, limits, summaries) {
                 // The head has no answer to the question that was asked, so
                 // nothing about it can be reused.
-                None => {
-                    Some(InvalidationReason::ReverseDependencyEvidenceMissing { artifact: unit })
-                }
+                None => Some(InvalidationReason::ReverseDependencyEvidenceMissing { artifact }),
                 Some(replayed) if replayed != *digest => {
                     Some(InvalidationReason::DependencyFingerprintChanged {
-                        artifact: unit,
+                        artifact,
                         before: *digest,
                         after: replayed,
                     })
@@ -945,7 +964,7 @@ pub fn verify_read_set(
                 Some(_) => None,
             },
             ReadKey::Artifact { id, rel_path } => {
-                verify_artifact(head, unit, *id, rel_path.as_deref())
+                verify_artifact(head, artifact, *id, rel_path.as_deref())
             }
             ReadKey::Scope {
                 languages,
@@ -955,10 +974,10 @@ pub fn verify_read_set(
                 .workspace_content_identities()
                 .and_then(|identities| identities.scope(|language| languages.contains(&language)))
             {
-                None => Some(InvalidationReason::ContentIdentityEvidenceMissing { artifact: unit }),
+                None => Some(InvalidationReason::ContentIdentityEvidenceMissing { artifact }),
                 Some(head_identity) if head_identity != *identity => {
                     Some(InvalidationReason::DependencyChanged {
-                        artifact: unit,
+                        artifact,
                         dependency: key.canonical_digest(),
                     })
                 }
@@ -966,7 +985,7 @@ pub fn verify_read_set(
             },
             ReadKey::Models(models) => (*models != inputs.models).then_some(
                 InvalidationReason::DependencyFingerprintChanged {
-                    artifact: unit,
+                    artifact,
                     before: *models,
                     after: inputs.models,
                 },
@@ -976,7 +995,7 @@ pub fn verify_read_set(
                 source,
             } => (*semantic_hash != inputs.policy_semantic_hash || *source != inputs.policy_source)
                 .then(|| InvalidationReason::DependencyFingerprintChanged {
-                    artifact: unit,
+                    artifact,
                     before: key.canonical_digest(),
                     after: ReadKey::Policy {
                         semantic_hash: inputs.policy_semantic_hash,
@@ -986,13 +1005,13 @@ pub fn verify_read_set(
                 }),
             ReadKey::Configuration(configuration) => (*configuration != inputs.configuration)
                 .then_some(InvalidationReason::DependencyFingerprintChanged {
-                    artifact: unit,
+                    artifact,
                     before: *configuration,
                     after: inputs.configuration,
                 }),
             ReadKey::Epoch(epoch) => {
                 (*epoch != inputs.epoch).then_some(InvalidationReason::EpochChanged {
-                    artifact: unit,
+                    artifact,
                     before: *epoch,
                     after: inputs.epoch,
                 })
@@ -1219,6 +1238,44 @@ mod tests {
             ("input_content_changed", "path_absent"),
             "unexpected verdict {changed:#?}"
         );
+    }
+
+    #[test]
+    fn explicit_artifact_identity_names_the_changed_read_verdict() {
+        let base = workspace(ORIGINAL);
+        let head = workspace(ORIGINAL);
+        let base_analyzer = base.workspace_analyzer(AnalyzerConfig::default());
+        let head_analyzer = head.workspace_analyzer(AnalyzerConfig::default());
+        let changed = ChangedFacts::between(&base_analyzer, &head_analyzer);
+        let recorded_epoch = StableDigest::sha256(b"recorded-epoch");
+        let head_epoch = StableDigest::sha256(b"head-epoch");
+        let artifact = DerivedArtifactId::procedure_summary(StableDigest::sha256(b"summary"));
+        let inputs = HeadInputs {
+            models: StableDigest::sha256(b"models"),
+            policy_semantic_hash: StableDigest::sha256(b"policy-semantic"),
+            policy_source: StableDigest::sha256(b"policy-source"),
+            configuration: StableDigest::sha256(b"configuration"),
+            epoch: head_epoch,
+        };
+
+        let verdict = verify_read_set_for_artifact(
+            artifact,
+            &head_analyzer,
+            &changed,
+            &inputs,
+            &[ReadKey::Epoch(recorded_epoch)],
+            LookupReplayLimits::default(),
+            &NoSummaryAnswers,
+            &mut LookupMemo::new(),
+        );
+
+        let changed = verdict.changed().expect("the recorded epoch moved");
+        assert_eq!(changed.reason.artifact(), artifact);
+        assert!(matches!(
+            changed.reason,
+            InvalidationReason::EpochChanged { before, after, .. }
+                if before == recorded_epoch && after == head_epoch
+        ));
     }
 
     #[test]

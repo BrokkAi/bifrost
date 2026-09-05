@@ -92,6 +92,12 @@ pub struct RustWalkCaches {
     /// Probe executions, for the memo's pin. On the analyzer's own hot path the
     /// increment happens once per miss, not once per lookup.
     module_probe_computations: AtomicU64,
+    /// Alias-aware module-route resolutions, for the memo's pin. The #2632
+    /// regression pin: the re-export closure asks for the import edges binding
+    /// one identity per importer of a name, and every ask used to re-resolve
+    /// every candidate file's `use` paths, so this grew with importers squared
+    /// rather than with import statements.
+    route_resolutions: AtomicU64,
     owner_roots: Cache<ProjectFile, Arc<Vec<ProjectFile>>>,
     module_domains: Cache<ModuleKey, Option<Arc<Vec<Domain>>>>,
     alias_routes: Cache<ModuleKey, Arc<Vec<RustModuleAliasRoute>>>,
@@ -126,6 +132,7 @@ impl RustWalkCaches {
             module_probes: build_weighted_cache(share, weight_module_probe),
             include_routes: build_weighted_cache(share, weight_include_routes),
             module_probe_computations: AtomicU64::new(0),
+            route_resolutions: AtomicU64::new(0),
         }
     }
 
@@ -142,6 +149,12 @@ impl RustWalkCaches {
     pub fn module_declaration_lookups(&self) -> u64 {
         self.module_declaration_lookups
             .load(AtomicOrdering::Relaxed)
+    }
+
+    /// How many alias-aware module-route resolutions the walks have run. The
+    /// #2632 regression pin: see [`Self::route_resolutions`]'s field comment.
+    pub fn route_resolutions(&self) -> u64 {
+        self.route_resolutions.load(AtomicOrdering::Relaxed)
     }
 }
 
@@ -908,6 +921,9 @@ impl<'a> RustUsageWalks<'a> {
         importing_module: &str,
         segments: &[String],
     ) -> Vec<RustResolvedModuleRoute> {
+        self.caches
+            .route_resolutions
+            .fetch_add(1, AtomicOrdering::Relaxed);
         // Resolve bare paths against the physical module graph first. A child
         // module with the same name as an ancestor alias owns that path in
         // Rust's module namespace, so the ancestor walk below must not reach
@@ -1368,98 +1384,6 @@ impl<'a> RustUsageWalks<'a> {
         }
     }
 
-    /// Import edges from one binding that can bind `identity`.
-    ///
-    /// A named edge can only bind the requested imported name. Glob and
-    /// namespace edges still use the full alias-aware resolver, then retain
-    /// only the requested target module. This avoids resolving every named
-    /// prefix in a candidate file merely to discard its edges afterward.
-    fn append_import_edges_binding_identity(
-        &self,
-        file: &ProjectFile,
-        binding: &RustImportBinding,
-        identity: &RustSymbolIdentity,
-        edges: &mut Vec<RustImportEdge>,
-    ) {
-        let owner = &binding.owner_module;
-        let propagate_alias = matches!(binding.extent, RustImportExtent::Module { .. });
-        let path_identity = self.queries.path_identity_of(file);
-        let Some(edge_domain) = direct_import_scope_for_module_with_identity(
-            owner,
-            binding.visibility.clone(),
-            self.cargo_routes.target_roots_for_file(file).contains(file),
-            &path_identity,
-        ) else {
-            return;
-        };
-        let template = |target: RustResolvedModuleRoute,
-                        local_name: String,
-                        kind: RustImportEdgeKind| RustImportEdge {
-            importer: file.clone(),
-            importer_module: binding.importer_module.clone(),
-            extent: binding.extent.clone(),
-            source_path: binding.path.clone(),
-            local_name,
-            target_file: target.target_file,
-            target_module: target.target_module,
-            kind,
-            propagate_alias,
-            domain: edge_domain.clone(),
-            namespace: None,
-            provenance: target.provenance,
-            cfg_condition: binding.cfg_condition.clone(),
-        };
-        let targets_identity_module = |resolved: &RustResolvedModuleRoute| {
-            resolved.target_file == identity.file && resolved.target_module == identity.module
-        };
-        if binding.is_glob {
-            for resolved in self
-                .resolve_segments(file, owner, &binding.path)
-                .into_iter()
-                .filter(targets_identity_module)
-            {
-                self.admit_import_edge(
-                    edges,
-                    template(resolved, String::new(), RustImportEdgeKind::Glob),
-                );
-            }
-            return;
-        }
-        let Some(imported_name) = binding.path.last() else {
-            return;
-        };
-        if !binding.is_extern_crate && imported_name == &identity.name {
-            for resolved in self
-                .resolve_segments(file, owner, &binding.path[..binding.path.len() - 1])
-                .into_iter()
-                .filter(targets_identity_module)
-            {
-                self.admit_import_edge(
-                    edges,
-                    template(
-                        resolved,
-                        binding.local_name.clone(),
-                        RustImportEdgeKind::Named(imported_name.clone()),
-                    ),
-                );
-            }
-        }
-        for resolved in self
-            .resolve_segments(file, owner, &binding.path)
-            .into_iter()
-            .filter(targets_identity_module)
-        {
-            self.admit_import_edge(
-                edges,
-                template(
-                    resolved,
-                    binding.local_name.clone(),
-                    RustImportEdgeKind::Namespace,
-                ),
-            );
-        }
-    }
-
     /// `add_import_edge`: an edge only exists when the two files can actually
     /// see each other.
     fn admit_import_edge(&self, edges: &mut Vec<RustImportEdge>, edge: RustImportEdge) {
@@ -1632,54 +1556,42 @@ impl<'a> RustUsageWalks<'a> {
 
     /// The import edges that bind `identity`, computed from candidate files
     /// rather than from a workspace-wide reverse map.
+    ///
+    /// A candidate's edges are the candidate's forward import edges: which
+    /// module a `use` reaches is a property of the writing file, not of the
+    /// identity being asked about. Selecting from
+    /// [`Self::forward_import_edges_of`] therefore resolves each candidate's
+    /// module routes once per generation and answers every later identity from
+    /// that memo. The re-export closure in `usage.rs` asks this question once
+    /// per importer of a widely imported name -- 328 identities named
+    /// `WorkspaceAnalyzer` over the same 291 candidates on this repository
+    /// (#2632) -- so resolving per identity made the closure quadratic in the
+    /// import count and spent 39 s of a 47 s scan re-deriving routes it had
+    /// already derived.
     pub fn edges_binding_identity(&self, identity: &RustSymbolIdentity) -> Vec<RustImportEdge> {
         let _scope = brokk_bifrost_core::profiling::scope("rust_usage_walks::binding_edges");
         if let Some(cached) = self.caches.binding_edges.get(identity) {
             return cached.as_ref().clone();
         }
         let mut edges = Vec::new();
-        // One candidate is one full forward-edge computation, and a common
-        // identifier offers thousands of them on a large workspace: this is
-        // the longest single region a usage query spends in the walk layer,
-        // so it is the one that most has to stop when the budget expires.
         let candidates = self.importer_candidates_for(identity);
-        let name_candidates: HashSet<ProjectFile> = self
-            .queries
-            .files_mentioning(&identity.name, RUST_OCCURRENCE_CODE)
-            .into_iter()
-            .collect();
         brokk_bifrost_core::profiling::note_with(|| {
             format!(
-                "rust binding identity={} candidates={} name_candidates={}",
+                "rust binding identity={} candidates={}",
                 identity.name,
                 candidates.len(),
-                name_candidates.len(),
             )
         });
         for candidate in candidates {
             if self.cancelled() {
                 break;
             }
-            let inspect_all_bindings = name_candidates.contains(&candidate);
-            for binding in self.queries.import_bindings_of(&candidate).iter() {
-                if self.cancelled() {
-                    break;
-                }
-                let relative_module_path_reaches_target =
-                    matches!(
-                        binding.path.first().map(String::as_str),
-                        Some("self" | "super")
-                    ) && self.binding_could_reach_module(&candidate, binding, &identity.module);
-                if !inspect_all_bindings
-                    && !relative_module_path_reaches_target
-                    && !binding_can_bind_identity_by_written_name(binding, identity)
-                {
-                    continue;
-                }
-                self.append_import_edges_binding_identity(
-                    &candidate, binding, identity, &mut edges,
-                );
-            }
+            edges.extend(
+                self.forward_import_edges_of(&candidate)
+                    .iter()
+                    .filter(|edge| edge_binds_identity(edge, identity))
+                    .cloned(),
+            );
         }
         if !self.cancelled() {
             self.caches
@@ -2246,18 +2158,22 @@ fn binding_names_module_component(binding: &RustImportBinding, component: &str) 
             && binding.path[binding.path.len() - 2] == component)
 }
 
-fn binding_can_bind_identity_by_written_name(
-    binding: &RustImportBinding,
-    identity: &RustSymbolIdentity,
-) -> bool {
-    binding.path.last().is_some_and(|component| {
-        component == &identity.name
-            || identity
-                .module
-                .components
-                .last()
-                .is_some_and(|module_component| component == module_component)
-    })
+/// Whether one forward import edge binds `identity`.
+///
+/// An edge binds an identity when it reaches the identity's declaring module in
+/// its declaring file. A named edge additionally carries the name it imported,
+/// and only the identity of that name is bound; a glob or namespace edge binds
+/// whatever the module exports, so the reaching test is the whole test.
+fn edge_binds_identity(edge: &RustImportEdge, identity: &RustSymbolIdentity) -> bool {
+    if edge.target_file != identity.file || edge.target_module != identity.module {
+        return false;
+    }
+    match &edge.kind {
+        RustImportEdgeKind::Named(imported_name) => imported_name == &identity.name,
+        RustImportEdgeKind::Glob
+        | RustImportEdgeKind::Namespace
+        | RustImportEdgeKind::Qualified(_) => true,
+    }
 }
 
 /// The v1 worklist visited each `(target, origin, domain)` triple once; the

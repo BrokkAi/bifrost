@@ -34,6 +34,7 @@ pub use backward_client::{
     solve_value_flow_backward_with_snapshot,
 };
 pub(crate) use client::kills_target as rule_kills_target;
+pub(crate) use client::solve_value_flow_with_reusable_summaries;
 pub use client::{
     ValueFlowFact, ValueFlowProblem, ValueFlowSolveError, ValueFlowUncertainty,
     solve_value_flow_with_summaries, solve_value_flow_with_witnesses,
@@ -62,7 +63,10 @@ pub use planned::{
     plan_value_flow_direction, plan_value_flow_direction_with_requirements,
     solve_value_flow_planned, solve_value_flow_planned_backward, solve_value_flow_planned_forward,
 };
-pub use provider::{ValueFlowCache, ValueFlowProvider, WorkspaceValueFlowProvider};
+pub(crate) use provider::{DispatchReadCollector, ProcedureDispatchRead};
+pub use provider::{
+    ValueFlowCache, ValueFlowCacheStatsSnapshot, ValueFlowProvider, WorkspaceValueFlowProvider,
+};
 pub use result::{
     ValueFlowMayStatus, ValueFlowMeeting, ValueFlowMustStatus, ValueFlowSinkOutcome,
     ValueFlowSummaryResult,

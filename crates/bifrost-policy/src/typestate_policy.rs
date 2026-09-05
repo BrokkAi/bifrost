@@ -1860,9 +1860,11 @@ fn project_finding(
             budget,
         )
         .map_err(|error| error.to_string())?;
+        // The anchor names the finding, not the compile: the projection facts
+        // above still carry the binding-plan hash the authority seals them to,
+        // and the anchor carries only what this violation is (#2968).
         let anchor = TypestateFindingAnchor::strong(
             authority.protocol_hash(),
-            authority.binding_plan_hash(),
             subject_identity.clone(),
             site_identity.clone(),
             facts.scenario_set_hash,

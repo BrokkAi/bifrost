@@ -71,7 +71,12 @@ use std::fmt;
 /// `case_clause` are block-kind facts and `package_object` is a class-kind
 /// fact, so Scala facts carry scope-forming nodes that version 18 did not
 /// (#1597).
-pub(crate) const STRUCTURAL_FACTS_VERSION: i64 = 19;
+/// Version 20 completes that scope tree: a Scala `given_definition` is a
+/// callable-kind fact and an `extension_definition` is a block-kind fact, so
+/// the parameters written in either are scoped by the definition instead of
+/// sitting in the enclosing template's scope, where the shared class-scope
+/// rule excluded them as members (#2925).
+pub(crate) const STRUCTURAL_FACTS_VERSION: i64 = 20;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StructuralFactsPersistenceError(String);
@@ -870,7 +875,7 @@ mod tests {
 
     #[test]
     fn relational_round_trip_reconstructs_identical_hot_facts() {
-        assert_eq!(STRUCTURAL_FACTS_VERSION, 19);
+        assert_eq!(STRUCTURAL_FACTS_VERSION, 20);
         let original = relational_fixture();
         let rows = original.persisted_rows().unwrap();
         assert_eq!(rows.source_bytes, original.source().len() as u32);

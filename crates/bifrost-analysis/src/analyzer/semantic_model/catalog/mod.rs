@@ -35,7 +35,10 @@ pub const CATALOG_SCHEMA_VERSION: i64 = db::CURRENT_CATALOG_VERSION;
 ///
 /// Increment this whenever producer or compiler behavior can change the bytes
 /// or meaning of a generated pack without changing its other exact inputs.
-pub const GENERATED_PRODUCTION_CACHE_VERSION: u32 = 8;
+///
+/// 9: the Python stub producer expands wildcard re-exports across a source set,
+/// publishing the names a shim module binds and dropping its `*` marker (#2958).
+pub const GENERATED_PRODUCTION_CACHE_VERSION: u32 = 9;
 pub const SEMANTIC_PACK_CACHE_ROOT_ENV: &str = "BIFROST_SEMANTIC_PACK_CACHE_ROOT";
 
 /// Resolve the generated catalog used when no explicit catalog is configured.
@@ -2039,7 +2042,7 @@ impl SemanticPackCatalog {
     /// language models, but it does not prove that the pack models a specific
     /// discovered package, module, or toolchain version. Dependency
     /// preparation must keep those two activation routes separate.
-    pub(crate) fn dependency_candidates(
+    pub fn dependency_candidates(
         &self,
         query: &SemanticPackSelectorQuery,
     ) -> Result<Vec<CatalogCandidate>, CatalogError> {

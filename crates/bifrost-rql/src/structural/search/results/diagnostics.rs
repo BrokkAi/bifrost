@@ -910,6 +910,15 @@ pub struct CodeQueryTypeFlowWork {
     pub field_slot_builds: u64,
     pub solves: u64,
     pub cache_hits: u64,
+    pub snapshot_cache_hits: u64,
+    pub snapshot_cache_misses: u64,
+    pub dispatch_cache_hits: u64,
+    pub dispatch_cache_misses: u64,
+    pub binding_cache_hits: u64,
+    pub binding_cache_misses: u64,
+    pub summary_cache_hits: u64,
+    pub summary_cache_misses: u64,
+    pub published_summaries: u64,
     pub class_set_rows: u64,
     pub finding_rows: u64,
     pub incomplete_roots: u64,
@@ -921,6 +930,15 @@ impl CodeQueryTypeFlowWork {
         self.field_slot_builds == 0
             && self.solves == 0
             && self.cache_hits == 0
+            && self.snapshot_cache_hits == 0
+            && self.snapshot_cache_misses == 0
+            && self.dispatch_cache_hits == 0
+            && self.dispatch_cache_misses == 0
+            && self.binding_cache_hits == 0
+            && self.binding_cache_misses == 0
+            && self.summary_cache_hits == 0
+            && self.summary_cache_misses == 0
+            && self.published_summaries == 0
             && self.class_set_rows == 0
             && self.finding_rows == 0
             && self.incomplete_roots == 0
@@ -934,6 +952,33 @@ impl CodeQueryTypeFlowWork {
                 .saturating_sub(earlier.field_slot_builds),
             solves: self.solves.saturating_sub(earlier.solves),
             cache_hits: self.cache_hits.saturating_sub(earlier.cache_hits),
+            snapshot_cache_hits: self
+                .snapshot_cache_hits
+                .saturating_sub(earlier.snapshot_cache_hits),
+            snapshot_cache_misses: self
+                .snapshot_cache_misses
+                .saturating_sub(earlier.snapshot_cache_misses),
+            dispatch_cache_hits: self
+                .dispatch_cache_hits
+                .saturating_sub(earlier.dispatch_cache_hits),
+            dispatch_cache_misses: self
+                .dispatch_cache_misses
+                .saturating_sub(earlier.dispatch_cache_misses),
+            binding_cache_hits: self
+                .binding_cache_hits
+                .saturating_sub(earlier.binding_cache_hits),
+            binding_cache_misses: self
+                .binding_cache_misses
+                .saturating_sub(earlier.binding_cache_misses),
+            summary_cache_hits: self
+                .summary_cache_hits
+                .saturating_sub(earlier.summary_cache_hits),
+            summary_cache_misses: self
+                .summary_cache_misses
+                .saturating_sub(earlier.summary_cache_misses),
+            published_summaries: self
+                .published_summaries
+                .saturating_sub(earlier.published_summaries),
             class_set_rows: self.class_set_rows.saturating_sub(earlier.class_set_rows),
             finding_rows: self.finding_rows.saturating_sub(earlier.finding_rows),
             incomplete_roots: self
@@ -950,6 +995,33 @@ impl CodeQueryTypeFlowWork {
                 .saturating_add(other.field_slot_builds),
             solves: self.solves.saturating_add(other.solves),
             cache_hits: self.cache_hits.saturating_add(other.cache_hits),
+            snapshot_cache_hits: self
+                .snapshot_cache_hits
+                .saturating_add(other.snapshot_cache_hits),
+            snapshot_cache_misses: self
+                .snapshot_cache_misses
+                .saturating_add(other.snapshot_cache_misses),
+            dispatch_cache_hits: self
+                .dispatch_cache_hits
+                .saturating_add(other.dispatch_cache_hits),
+            dispatch_cache_misses: self
+                .dispatch_cache_misses
+                .saturating_add(other.dispatch_cache_misses),
+            binding_cache_hits: self
+                .binding_cache_hits
+                .saturating_add(other.binding_cache_hits),
+            binding_cache_misses: self
+                .binding_cache_misses
+                .saturating_add(other.binding_cache_misses),
+            summary_cache_hits: self
+                .summary_cache_hits
+                .saturating_add(other.summary_cache_hits),
+            summary_cache_misses: self
+                .summary_cache_misses
+                .saturating_add(other.summary_cache_misses),
+            published_summaries: self
+                .published_summaries
+                .saturating_add(other.published_summaries),
             class_set_rows: self.class_set_rows.saturating_add(other.class_set_rows),
             finding_rows: self.finding_rows.saturating_add(other.finding_rows),
             incomplete_roots: self.incomplete_roots.saturating_add(other.incomplete_roots),

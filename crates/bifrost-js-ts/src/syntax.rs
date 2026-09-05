@@ -788,6 +788,20 @@ pub fn slice<'a>(node: Node<'_>, source: &'a str) -> &'a str {
     brokk_bifrost_core::analyzer::common::node_source_text(node, source)
 }
 
+/// The module specifier an `import_statement` or `export_statement` names, read
+/// from the statement's `source` field.
+///
+/// `None` when the statement has no `source` field, as in `export { x };` or
+/// `export function f() {}`, and `None` when the specifier is empty. A
+/// side-effect import (`import './side';`) does carry a source. Both the import
+/// binder and the definition route ask this question of the same field, so they
+/// ask it here.
+pub fn js_ts_statement_module_specifier(statement: Node<'_>, source: &str) -> Option<String> {
+    let source_node = statement.child_by_field_name("source")?;
+    let specifier = unquote(slice(source_node, source));
+    (!specifier.is_empty()).then_some(specifier)
+}
+
 pub fn nested_type_identifier_parts(node: Node<'_>) -> Option<(Node<'_>, Node<'_>)> {
     (node.kind() == "nested_type_identifier").then_some(())?;
     Some((
@@ -1478,13 +1492,9 @@ fn visit_commonjs_require_statement(node: Node<'_>, source: &str, binder: &mut J
 }
 
 fn visit_import_statement(node: Node<'_>, source: &str, binder: &mut JsTsImportBinder) {
-    let Some(source_node) = node.child_by_field_name("source") else {
+    let Some(module_specifier) = js_ts_statement_module_specifier(node, source) else {
         return;
     };
-    let module_specifier = unquote(slice(source_node, source));
-    if module_specifier.is_empty() {
-        return;
-    }
 
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {

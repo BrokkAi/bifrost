@@ -24,7 +24,7 @@ use crate::analyzer::tree_sitter_analyzer::{
 use crate::analyzer::{GoAnalyzer, Language, ProjectFile};
 use crate::hash::{HashMap, HashSet};
 
-const ADAPTER_VERSION: &[u8] = b"go-value-semantics-v46";
+const ADAPTER_VERSION: &[u8] = b"go-value-semantics-v47";
 
 impl_program_semantics_provider!(GoAnalyzer, GoSemanticLowerer);
 
@@ -2132,6 +2132,14 @@ struct LoweringContext<'tree, 'facts, 'targets, 'imports, 'procedure> {
     /// store and a load of the same name still meet.
     field_locators: HashMap<Box<str>, SemanticLocator>,
     static_locations: HashMap<Box<str>, MemoryLocationId>,
+    /// One occurrence identity per imported package value, interned by its
+    /// qualified spelling.
+    ///
+    /// This adapter declares `no-intrafile-dependencies`, so it must not read
+    /// the declaring file and cannot state the declaration's own identity. The
+    /// occurrence therefore carries a gap, and a workspace-aware consumer
+    /// resolves it; see `add_imported_package_value_gap`.
+    imported_static_locators: HashMap<Box<str>, SemanticLocator>,
     /// One value per integer-literal magnitude. Go accepts several spellings
     /// for the same integer, so the cache is keyed by parsed value rather than
     /// source text.
@@ -2326,6 +2334,7 @@ fn lower_procedure<'tree>(
         struct_field_anchors,
         field_locators: HashMap::default(),
         static_locations: HashMap::default(),
+        imported_static_locators: HashMap::default(),
         constant_index_values: HashMap::default(),
         receiver: None,
         root_body: spec.body,
@@ -3611,23 +3620,127 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
         Ok((locator, resolved))
     }
 
+    /// The occurrence identity of one imported package value, anchored at the
+    /// use so a workspace-aware consumer can resolve it back to a declaration.
+    fn imported_package_value_locator(
+        &mut self,
+        place: Node<'tree>,
+        field: Node<'tree>,
+    ) -> Result<SemanticLocator, GoLoweringError> {
+        let qualified = node_text(self.prepared.source(), place).map(Box::<str>::from);
+        if let Some(qualified) = qualified.as_deref()
+            && let Some(locator) = self.imported_static_locators.get(qualified)
+        {
+            return Ok(locator.clone());
+        }
+        let anchor = source_anchor(field, 0).map_err(GoLoweringError::Invalid)?;
+        let procedure = self.session.locator();
+        let locator = SemanticLocator::new(
+            procedure.mount(),
+            procedure.path().clone(),
+            procedure.language(),
+            procedure.declaration().clone(),
+            SemanticRole::MemoryLocation,
+            anchor,
+        );
+        if let Some(qualified) = qualified {
+            self.imported_static_locators
+                .insert(qualified, locator.clone());
+        }
+        Ok(locator)
+    }
+
+    /// Record that an imported package value's declaring package is not
+    /// resolved here, so the occurrence identity above is a use site rather
+    /// than a declaration.
+    ///
+    /// A consumer that read it as a declaration would conclude that two files
+    /// naming one variable name different storage, which is how a real
+    /// cross-package race came back as a clean, complete run.
+    fn add_imported_package_value_gap(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        point: ProgramPointId,
+        location: MemoryLocationId,
+    ) -> Result<(), GoLoweringError> {
+        self.session.add_gap_with_impacts(
+            builder,
+            point,
+            SemanticGapSubject::MemoryLocation(location),
+            SemanticCapability::StaticMemory,
+            SemanticGapImpacts::single(SemanticGapImpact::HeapRead)
+                .with(SemanticGapImpact::HeapWrite)
+                .with(SemanticGapImpact::Aliasing),
+            SemanticGapKind::Unknown,
+            "Go imported package value occurrence is structured, but its declaring package is resolved outside this file",
+        )?;
+        Ok(())
+    }
+
+    /// The storage one package-level name denotes.
+    ///
+    /// `package_value_locators` is filled by walking this file, so a variable
+    /// declared in another file of the same package is absent from it.
+    /// Returning nothing for those recorded no access at all, which made a
+    /// race on such a variable vanish with nothing reported open. Go requires
+    /// every identifier to resolve, and a local binding, an import qualifier
+    /// and a predeclared constant have each been excluded before this point,
+    /// so what remains is a package-level declaration this file does not
+    /// state. Give it an occurrence identity and mark that identity
+    /// unresolved, exactly as an imported value is treated; the concurrency
+    /// provider resolves both to the same declaration.
     fn package_static_location(
         &mut self,
         builder: &mut ProcedureCfgBuilder,
         point: ProgramPointId,
+        node: Node<'tree>,
         name: &str,
     ) -> Result<Option<MemoryLocationId>, GoLoweringError> {
         if let Some(location) = self.static_locations.get(name).copied() {
             return Ok(Some(location));
         }
-        let Some(member) = self.package_value_locators.get(name).cloned() else {
-            return Ok(None);
+        let declared = self.package_value_locators.get(name).cloned();
+        let resolved = declared.is_some();
+        let member = match declared {
+            Some(member) => member,
+            None => {
+                // A name this file does declare, yet has no locator for, is a
+                // package constant: `package_value_locators` records only
+                // `var_spec` names on purpose, because a constant is not
+                // mutable storage. Keep returning nothing for those, and for
+                // anything that is not storage at all.
+                if self.package_values.contains(name)
+                    || self.import_bindings.contains_key(name)
+                    || self.package_functions.contains(name)
+                    || is_go_predeclared_constant_kind(node.kind())
+                {
+                    return Ok(None);
+                }
+                let anchor = source_anchor(node, 0).map_err(GoLoweringError::Invalid)?;
+                let procedure = self.session.locator();
+                SemanticLocator::new(
+                    procedure.mount(),
+                    procedure.path().clone(),
+                    procedure.language(),
+                    procedure.declaration().clone(),
+                    SemanticRole::MemoryLocation,
+                    anchor,
+                )
+            }
         };
         let location = self.session.add_memory_location(
             builder,
             point,
             MemoryLocationKind::Static { member },
         )?;
+        // Deliberately no gap here, unlike the imported-selector case. A gap is
+        // a general semantic signal that every consumer reads, and marking
+        // these made an unrelated value-flow plan report this as its blocking
+        // cause. The concurrency provider resolves an occurrence of a package
+        // variable to its declaration on both sides without needing the marker,
+        // and where it cannot the identity simply stays this file's, which is
+        // the behavior that already existed.
+        let _ = resolved;
         self.static_locations.insert(name.into(), location);
         Ok(Some(location))
     }
@@ -3645,6 +3758,22 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
     ) -> Result<Option<MemoryPlaceLocation>, GoLoweringError> {
         let place = transparent_parenthesized_expression(place);
         match place.kind() {
+            "selector_expression"
+                if matches!(
+                    self.selector_resolution(place),
+                    GoSelectorResolution::Package
+                ) =>
+            {
+                let field = required_field(place, "field")?;
+                let member = self.imported_package_value_locator(place, field)?;
+                let location = self.session.add_memory_location(
+                    builder,
+                    point,
+                    MemoryLocationKind::Static { member },
+                )?;
+                self.add_imported_package_value_gap(builder, point, location)?;
+                Ok(Some((MemoryAccessKind::Static, location, None)))
+            }
             "selector_expression" if !self.selector_denotes_no_location(place) => {
                 let operand =
                     transparent_parenthesized_expression(required_field(place, "operand")?);
@@ -3818,7 +3947,12 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
     /// field-memory gap on syntax that holds nothing.
     fn selector_denotes_no_location(&self, node: Node<'tree>) -> bool {
         match self.selector_resolution(node) {
-            GoSelectorResolution::Package | GoSelectorResolution::Method { .. } => return true,
+            // `pkg.Name` names storage this file does not declare. Treating it
+            // as no location made every cross-package race vanish: no access
+            // was recorded, so no pair was compared, and the run still called
+            // itself complete.
+            GoSelectorResolution::Package => return false,
+            GoSelectorResolution::Method { .. } => return true,
             GoSelectorResolution::Field => return false,
             GoSelectorResolution::Unknown => {}
         }
@@ -4010,7 +4144,7 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
             return Ok(());
         };
         let Some(source) = self.binding_value(name, node.start_byte()) else {
-            if let Some(location) = self.package_static_location(builder, point, name)? {
+            if let Some(location) = self.package_static_location(builder, point, node, name)? {
                 let metadata = self.value_mapping(builder, node)?;
                 self.session.append_effect_with_metadata(
                     builder,
@@ -4848,7 +4982,8 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
             self.append_binding_assignment(builder, boundary, target, computed, kind)?;
         } else if is_go_binding_reference_kind(operand.kind())
             && let Some(name) = node_text(self.prepared.source(), operand)
-            && let Some(location) = self.package_static_location(builder, boundary, name)?
+            && let Some(location) =
+                self.package_static_location(builder, boundary, operand, name)?
         {
             self.append_effect(
                 builder,
@@ -4982,7 +5117,7 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
             let name = node_text(self.prepared.source(), left_items[0]);
             match name {
                 Some(name) if self.binding_value(name, node.start_byte()).is_none() => self
-                    .package_static_location(builder, boundary, name)?
+                    .package_static_location(builder, boundary, left_items[0], name)?
                     .map(|location| (name, location)),
                 Some(_) | None => None,
             }
@@ -5064,7 +5199,7 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
                         )?;
                     }
                 } else if let Some(location) =
-                    self.package_static_location(builder, boundary, name)?
+                    self.package_static_location(builder, boundary, name_node, name)?
                 {
                     let value = self.expression_value(
                         builder,
@@ -7348,6 +7483,41 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
                     entry,
                     &[operand],
                     EdgeTarget::normal(boundary),
+                    scope,
+                    stack,
+                )
+            }
+            // An imported package's value is a place, but its qualifier names a
+            // package rather than a value: there is no operand to evaluate and
+            // no nil operand to panic on.
+            "selector_expression"
+                if !is_assignment_target(node)
+                    && matches!(
+                        self.selector_resolution(node),
+                        GoSelectorResolution::Package
+                    ) =>
+            {
+                let access = self.point(builder, node, Vec::new())?;
+                let Some((kind, location)) = self.memory_access_location(builder, access, node)?
+                else {
+                    unreachable!("an imported package value is a memory place");
+                };
+                debug_assert_eq!(kind, MemoryAccessKind::Static);
+                self.append_effect(
+                    builder,
+                    access,
+                    SemanticEffect::MemoryLoad {
+                        kind,
+                        location,
+                        result,
+                    },
+                )?;
+                self.edge(builder, access, next)?;
+                self.schedule_expressions(
+                    builder,
+                    entry,
+                    &[],
+                    EdgeTarget::normal(access),
                     scope,
                     stack,
                 )
@@ -11506,7 +11676,7 @@ func observe() { consume(&global) }
     }
 
     #[test]
-    fn imported_selector_address_without_a_location_does_not_fabricate_value_assignment() {
+    fn imported_selector_address_names_static_storage_without_fabricating_an_assignment() {
         const SOURCE: &str = r#"package main
 import "net/http"
 
@@ -11535,14 +11705,24 @@ func observe() any { return &http.DefaultClient }
                     !matches!(event.effect, SemanticEffect::Assignment { target, .. } if target == address.id)
                 })
         );
+        // The occurrence now has a structured location instead of nothing, and
+        // the explicit gap moved onto that location. This is what lets a
+        // workspace-aware consumer resolve the declaration; while the
+        // occurrence had no location at all, a race on an imported variable
+        // was silently missed and the run still reported itself complete.
+        let location = procedure
+            .memory_locations
+            .iter()
+            .find(|location| matches!(location.kind, MemoryLocationKind::Static { .. }))
+            .expect("the imported occurrence names static storage");
         let gap = procedure
             .gaps
             .iter()
             .find(|gap| {
-                gap.subject == SemanticGapSubject::Value(address.id)
-                    && gap.capability == SemanticCapability::Assignments
+                gap.subject == SemanticGapSubject::MemoryLocation(location.id)
+                    && gap.capability == SemanticCapability::StaticMemory
             })
-            .expect("the unmaterialized imported location remains explicit");
+            .expect("the unresolved imported declaration remains explicit");
         for impact in [
             SemanticGapImpact::Aliasing,
             SemanticGapImpact::HeapRead,

@@ -2049,12 +2049,6 @@ fn write_evidence_detail<W: Write>(
                 writeln!(output, "  typestate anchor: strong").map_err(map_io_error)?;
                 writeln!(output, "    protocol hash: {}", anchor.protocol_hash())
                     .map_err(map_io_error)?;
-                writeln!(
-                    output,
-                    "    binding plan hash: {}",
-                    anchor.binding_plan_hash()
-                )
-                .map_err(map_io_error)?;
                 write!(output, "    subject identity: ").map_err(map_io_error)?;
                 write_optional_stable_identity(output, Some(anchor.subject_identity()))?;
                 writeln!(output).map_err(map_io_error)?;

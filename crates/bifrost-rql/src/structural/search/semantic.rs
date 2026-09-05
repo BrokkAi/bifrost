@@ -297,6 +297,8 @@ impl<'a> SemanticQueryContext<'a> {
             None,
             active_semantic_model_snapshot,
             None,
+            None,
+            None,
         )
     }
 
@@ -314,6 +316,8 @@ impl<'a> SemanticQueryContext<'a> {
         semantic_summaries: Option<
             Arc<brokk_bifrost_flow::dataflow::ProductionSemanticSummaryRepository>,
         >,
+        value_flow_cache: Option<brokk_bifrost_flow::value_flow::ValueFlowCache>,
+        type_flow_summaries: Option<brokk_bifrost_flow::type_flow::TypeFlowSummaryState>,
     ) -> Self {
         debug_assert!(limits.all_positive());
         let budget = SemanticBudget::new(semantic_budget_limits(limits))
@@ -329,6 +333,8 @@ impl<'a> SemanticQueryContext<'a> {
             analysis_context,
             active_semantic_model_snapshot,
             semantic_summaries,
+            value_flow_cache,
+            type_flow_summaries,
             budget,
             None,
             None,
@@ -349,6 +355,8 @@ impl<'a> SemanticQueryContext<'a> {
         semantic_summaries: Option<
             Arc<brokk_bifrost_flow::dataflow::ProductionSemanticSummaryRepository>,
         >,
+        value_flow_cache: Option<brokk_bifrost_flow::value_flow::ValueFlowCache>,
+        type_flow_summaries: Option<brokk_bifrost_flow::type_flow::TypeFlowSummaryState>,
         parent_scope: &SemanticBudgetScopeSnapshot,
         child_semantic_limits: SemanticWork,
         execution_before: SemanticExecutionBudgetSnapshot,
@@ -367,6 +375,8 @@ impl<'a> SemanticQueryContext<'a> {
             analysis_context,
             active_semantic_model_snapshot,
             semantic_summaries,
+            value_flow_cache,
+            type_flow_summaries,
             budget,
             Some((execution_before, execution_child)),
             Some(artifact_leases),
@@ -387,6 +397,8 @@ impl<'a> SemanticQueryContext<'a> {
         semantic_summaries: Option<
             Arc<brokk_bifrost_flow::dataflow::ProductionSemanticSummaryRepository>,
         >,
+        value_flow_cache: Option<brokk_bifrost_flow::value_flow::ValueFlowCache>,
+        type_flow_summaries: Option<brokk_bifrost_flow::type_flow::TypeFlowSummaryState>,
         budget: SemanticBudget,
         receipt_execution: Option<(SemanticExecutionBudgetSnapshot, SemanticExecutionBudget)>,
         artifact_leases: Option<SemanticArtifactLeaseSnapshot>,
@@ -442,7 +454,10 @@ impl<'a> SemanticQueryContext<'a> {
             typestate: TypestateQueryState::default(),
             value_flow: ValueFlowQueryState::default(),
             taint: TaintQueryState::default(),
-            type_flow: super::type_flow::TypeFlowQueryState::default(),
+            type_flow: super::type_flow::TypeFlowQueryState::new(
+                value_flow_cache.unwrap_or_default(),
+                type_flow_summaries.unwrap_or_default(),
+            ),
         }
     }
 
@@ -3483,6 +3498,8 @@ mod tests {
             0,
             None,
             workspace.analyzer().active_semantic_model_snapshot(),
+            None,
+            None,
             None,
             &parent_scope,
             parent_semantic.remaining(),

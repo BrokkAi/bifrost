@@ -8,9 +8,14 @@ use brokk_bifrost_core::analyzer::model::{
 use brokk_bifrost_core::analyzer::parsed_file::ParsedFile;
 use brokk_bifrost_core::analyzer::structural::resolution::DeclaredVisibility;
 use brokk_bifrost_core::analyzer::{CodeUnit, ProjectFile};
+use brokk_bifrost_core::hash::HashSet;
 use tree_sitter::{Node, Point, Tree};
 
-use crate::aliases::{php_file_context_from_tree_at, resolve_php_type_node};
+use crate::aliases::{
+    PhpFileContext, PhpUseAliases, module_constant_fq, php_file_context_from_tree_at,
+    php_use_aliases_from_node, resolve_php_type_node,
+};
+use crate::graph::syntax::{instanceof_type_node, object_creation_type, static_member_parts};
 
 /// Intern one qualified-name segment in the process-global interner.
 fn php_segment(text: &str, kind: SegmentKind) -> SegmentId {
@@ -52,7 +57,155 @@ pub fn parse_php_file(file: &ProjectFile, source: &str, tree: &Tree) -> ParsedFi
         parsed: &mut parsed,
     };
     visitor.visit_children(tree.root_node(), &PhpScope::new(package_name, None));
+    collect_php_imported_type_names(tree.root_node(), source, &mut parsed.type_identifiers);
     parsed
+}
+
+/// The workspace-visible FQ names one PHP file imports.
+///
+/// PHP binds an unqualified class name written inside `namespace N;` to
+/// `N\Name` by language rule, with no `use` declaration anywhere in the file.
+/// A PHP file's imports are therefore not its `use` declarations alone, and a
+/// reader that collects only those sees no import at all in the common
+/// single-namespace library layout (#1713). This records both: the target of
+/// every `use` declaration, and the type named by every type reference the
+/// file spells, each resolved through the namespace and alias context in force
+/// where it is written. A `use` alias wins over the namespace rule because
+/// [`resolve_php_type_node`] applies aliases first, which is PHP's own
+/// precedence.
+///
+/// The names stored are already absolute. Resolution happens here, while the
+/// parser tree is present, so no reader reconstructs PHP name syntax from
+/// text. That is why this family holds resolved FQ names for PHP where it
+/// holds written names for Java: a Java name needs the READER's package to
+/// resolve, a PHP name needs only the file it is written in.
+///
+/// A declaration's own name never appears: only reference positions are
+/// matched. A name that no workspace file declares (`\Exception`, a `use` of a
+/// vendor class) is stored and simply finds no definition when a reader looks
+/// it up.
+///
+/// A bare function call or constant read (`helper()`, `LIMIT`) is not recorded
+/// unless a `use function` / `use const` clause binds it. PHP gives those two
+/// a global-namespace fallback that types do not have, so an unqualified one
+/// names two candidate declarations rather than one, and this family stores a
+/// resolved name per entry. The inverted usage graph already resolves that
+/// pair at its own site through [`crate::aliases::resolve_php_function`].
+fn collect_php_imported_type_names(root: Node<'_>, source: &str, out: &mut HashSet<String>) {
+    let mut scopes = vec![(root, String::new())];
+    while let Some((scope, namespace)) = scopes.pop() {
+        let mut ctx = PhpFileContext {
+            namespace,
+            aliases: PhpUseAliases::default(),
+        };
+        let mut cursor = scope.walk();
+        for child in scope.named_children(&mut cursor) {
+            match child.kind() {
+                "namespace_definition" => {
+                    let name = child
+                        .child_by_field_name("name")
+                        .map(|name_node| php_namespace_package_name(name_node, source))
+                        .unwrap_or_default();
+                    match child.child_by_field_name("body") {
+                        // `namespace N { ... }` is its own scope, with its own
+                        // `use` declarations.
+                        Some(body) => scopes.push((body, name)),
+                        // `namespace N;` replaces the file scope's namespace
+                        // from this statement on, and starts a fresh alias set.
+                        None => {
+                            ctx.namespace = name;
+                            ctx.aliases = PhpUseAliases::default();
+                        }
+                    }
+                }
+                "namespace_use_declaration" => {
+                    let Some(aliases) = php_use_aliases_from_node(child, source, &mut || true)
+                    else {
+                        continue;
+                    };
+                    // Every `use` clause binds a name to a declaration made
+                    // elsewhere, whichever kind it names. A constant is stored
+                    // under the module-constant identity its declaration
+                    // carries, the same mapping `resolve_php_constant` applies.
+                    out.extend(aliases.type_aliases.values().cloned());
+                    out.extend(aliases.function_aliases.values().cloned());
+                    out.extend(
+                        aliases
+                            .const_aliases
+                            .values()
+                            .map(|target| module_constant_fq(target)),
+                    );
+                    ctx.aliases.extend(aliases);
+                }
+                _ => collect_php_type_reference_names(child, source, &ctx, out),
+            }
+        }
+    }
+}
+
+/// The types one statement subtree names in reference position.
+fn collect_php_type_reference_names(
+    root: Node<'_>,
+    source: &str,
+    ctx: &PhpFileContext,
+    out: &mut HashSet<String>,
+) {
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        match node.kind() {
+            // Parameter, return, property and `catch` types, and casts:
+            // `named_type` wraps the written name in every one of them.
+            "named_type" => push_php_resolved_type(node, source, ctx, out),
+            // `extends`, `implements`, a class body's `use TraitName;`, and an
+            // attribute name each hold a bare `name`/`qualified_name` child
+            // rather than a `named_type`.
+            "base_clause" | "class_interface_clause" | "use_declaration" | "attribute" => {
+                let mut cursor = node.walk();
+                for child in node.named_children(&mut cursor) {
+                    if matches!(child.kind(), "name" | "qualified_name") {
+                        push_php_resolved_type(child, source, ctx, out);
+                    }
+                }
+            }
+            "object_creation_expression" => {
+                if let Some(type_node) = object_creation_type(node) {
+                    push_php_resolved_type(type_node, source, ctx, out);
+                }
+            }
+            // `X::method()`, `X::$property` and `X::CONST` each name `X` as a
+            // type. `self`/`static`/`parent` name no absolute type and the
+            // resolver drops them.
+            "scoped_call_expression"
+            | "scoped_property_access_expression"
+            | "class_constant_access_expression" => {
+                if let Some((scope, _)) = static_member_parts(node) {
+                    push_php_resolved_type(scope, source, ctx, out);
+                }
+            }
+            "binary_expression" => {
+                if let Some(type_node) = instanceof_type_node(node) {
+                    push_php_resolved_type(type_node, source, ctx, out);
+                }
+            }
+            _ => {}
+        }
+        for index in (0..node.named_child_count()).rev() {
+            if let Some(child) = node.named_child(index) {
+                stack.push(child);
+            }
+        }
+    }
+}
+
+fn push_php_resolved_type(
+    node: Node<'_>,
+    source: &str,
+    ctx: &PhpFileContext,
+    out: &mut HashSet<String>,
+) {
+    if let Some(resolved) = resolve_php_type_node(node, source, ctx, || true) {
+        out.insert(resolved);
+    }
 }
 
 #[derive(Clone)]
@@ -948,5 +1101,96 @@ mod callable_modifier_tests {
         assert_eq!(modifiers("App.Widget.measure"), (false, false, 1));
         assert_eq!(modifiers("App.Widget.reset"), (true, false, 0));
         assert_eq!(modifiers("App.Renders.paint"), (false, false, 1));
+    }
+}
+
+#[cfg(test)]
+mod imported_type_name_tests {
+    use super::*;
+    use tree_sitter::Parser;
+
+    fn imported_names(source: &str) -> Vec<String> {
+        let file = ProjectFile::new(std::env::temp_dir(), "collector.php");
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_php::LANGUAGE_PHP.into())
+            .expect("PHP parser language");
+        let tree = parser.parse(source, None).expect("parse PHP fixture");
+        let parsed = parse_php_file(&file, source, &tree);
+        let mut names: Vec<String> = parsed.type_identifiers.into_iter().collect();
+        names.sort();
+        names
+    }
+
+    /// #1713: an unqualified name inside `namespace N;` binds to `N\Name` with
+    /// no `use` declaration, so every reference position resolves against the
+    /// file's own namespace. A `use` alias overrides that, an absolute `\Name`
+    /// escapes it, and the file's own declaration is not an import.
+    #[test]
+    fn same_namespace_references_resolve_without_a_use_declaration() {
+        let names = imported_names(
+            "<?php\nnamespace FastRoute;\n\nuse Other\\Helper as Aid;\n\nclass Collector extends Base implements Marker {\n    use Mixin;\n\n    private DataGenerator $generator;\n\n    public function build(RouteParser $parser): Result {\n        $made = new Handler();\n        Aid::make();\n        Settings::LIMIT;\n        if ($made instanceof Guard) {\n            return $made;\n        }\n        try {\n            return $parser;\n        } catch (\\RuntimeException $error) {\n            throw $error;\n        }\n    }\n}\n",
+        );
+
+        assert_eq!(
+            names,
+            vec![
+                "FastRoute.Base".to_string(),
+                "FastRoute.DataGenerator".to_string(),
+                "FastRoute.Guard".to_string(),
+                "FastRoute.Handler".to_string(),
+                "FastRoute.Marker".to_string(),
+                "FastRoute.Mixin".to_string(),
+                "FastRoute.Result".to_string(),
+                "FastRoute.RouteParser".to_string(),
+                "FastRoute.Settings".to_string(),
+                "Other.Helper".to_string(),
+                "RuntimeException".to_string(),
+            ]
+        );
+    }
+
+    /// A `use` alias wins over the namespace rule, which is PHP's own
+    /// precedence: the file names `RouteParser`, and the name it binds is the
+    /// aliased one, not the same-namespace one.
+    #[test]
+    fn a_use_alias_shadows_the_same_namespace_name() {
+        let names = imported_names(
+            "<?php\nnamespace FastRoute;\n\nuse Other\\RouteParser;\n\nclass Collector {\n    public function build(RouteParser $parser): void {}\n}\n",
+        );
+
+        assert_eq!(names, vec!["Other.RouteParser".to_string()]);
+    }
+
+    /// A `use function` / `use const` clause names a declaration made in
+    /// another file exactly as a class `use` does. A constant is stored under
+    /// the module-constant identity its declaration carries.
+    #[test]
+    fn function_and_constant_use_clauses_are_imports() {
+        let names = imported_names(
+            "<?php\nnamespace FastRoute;\n\nuse function Other\\render;\nuse const Other\\LIMIT;\n\nclass Collector {}\n",
+        );
+
+        assert_eq!(
+            names,
+            vec![
+                "Other._module_.LIMIT".to_string(),
+                "Other.render".to_string()
+            ]
+        );
+    }
+
+    /// Each `namespace N { ... }` block carries its own namespace and its own
+    /// aliases, so a bare name resolves against the block it is written in.
+    #[test]
+    fn scoped_namespace_blocks_resolve_against_their_own_namespace() {
+        let names = imported_names(
+            "<?php\nnamespace First {\n    class One {\n        public function run(Shared $value): void {}\n    }\n}\nnamespace Second {\n    class Two {\n        public function run(Shared $value): void {}\n    }\n}\n",
+        );
+
+        assert_eq!(
+            names,
+            vec!["First.Shared".to_string(), "Second.Shared".to_string()]
+        );
     }
 }

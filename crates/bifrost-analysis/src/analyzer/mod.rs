@@ -194,8 +194,8 @@ pub(crate) use model::{CallableLinkage, CppFieldLinkage, CppTemplateMetadata};
 pub use multi_analyzer::resolve_analyzer;
 pub use multi_analyzer::{AnalyzerDelegate, MultiAnalyzer};
 pub use php::{
-    ComposerPackagePackProducer, ComposerPinnedAutoloadRule, PhpDependencyPackAdapter,
-    resolve_php_semantic_pack_dependencies,
+    ComposerPackagePackProducer, ComposerPinnedAutoloadRule, PhpDeclarationStubPackProducer,
+    PhpDependencyPackAdapter, resolve_php_semantic_pack_dependencies,
 };
 pub use php::{
     PhpAnalyzer, PhpUseAliases, parse_php_use_aliases, parse_php_use_aliases_by_kind,
@@ -229,7 +229,7 @@ pub use read_ledger::{
 pub use read_verification::{
     ChangedFacts, ChangedRead, HeadInputs, LookupMemo, LookupReplayLimits, NoSummaryAnswers,
     ReadVerdict, SummaryAnswers, WorkspaceFactIndex, analysis_epoch_digest, replay_lookup,
-    verify_read_set,
+    verify_read_set, verify_read_set_for_artifact,
 };
 pub use ruby::RubyAnalyzer;
 pub use ruby::{

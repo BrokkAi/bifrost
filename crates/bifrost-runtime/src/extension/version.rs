@@ -1,7 +1,13 @@
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
-pub const EXTENSION_API_VERSION: ExtensionApiVersion = ExtensionApiVersion { major: 1, minor: 0 };
+/// The published surface version.
+///
+/// Minor 1 adds `experimental.semantic.typestate`. Minor is additive only: a
+/// client that negotiated 1.0 keeps every operation it had, and a client that
+/// requires the new operation asks for it by capability id rather than by
+/// minor, so the two checks cannot drift.
+pub const EXTENSION_API_VERSION: ExtensionApiVersion = ExtensionApiVersion { major: 1, minor: 1 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExtensionApiVersion {
@@ -92,15 +98,15 @@ pub const PUBLISHED_OPERATIONS: &[PublishedOperation] = &[
         stability: ApiStability::Experimental { since_minor: 0 },
         support: CapabilitySupport::Partial,
     },
-    // Typestate machinery exists in the engine but has no route on this
-    // surface yet. Advertising the operation as `Unsupported` rather than
-    // omitting it lets extensions distinguish "unsupported here" from "does
-    // not exist", while negotiation still refuses a client that requires it.
+    // Served by `ExtensionWorkspace::typestate_check` since minor 1. `Partial`
+    // for the same reason value dependence is: the route answers for one
+    // analysis root under caller-owned span bindings, and the per-language
+    // rows in the capability report say where even that much is unavailable.
     // Design: .agents/docs/extension-typestate-design-2026-08.md.
     PublishedOperation {
         id: "experimental.semantic.typestate",
-        stability: ApiStability::Experimental { since_minor: 0 },
-        support: CapabilitySupport::Unsupported,
+        stability: ApiStability::Experimental { since_minor: 1 },
+        support: CapabilitySupport::Partial,
     },
 ];
 

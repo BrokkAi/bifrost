@@ -92,11 +92,11 @@ pub use reusable_summary::{
     SummaryConcurrencyTargetCoverage, SummaryContextKey, SummaryDependencyFingerprint,
     SummaryDependencyKey, SummaryEffect, SummaryEffectKey, SummaryEventKey, SummaryEvidence,
     SummaryEvidenceAlternative, SummaryExit, SummaryExitKind, SummaryIncompleteReason,
-    SummaryLocationKey, SummaryOrigin, SummaryPort, SummaryPublicationError,
-    SummaryPublicationOutcome, SummaryReadObserver, SummaryReadRecorder, SummaryRecursiveEdge,
-    SummaryRecursiveGroupFingerprint, SummaryRecursiveGroupKey, SummaryRepositoryLimits,
-    SummaryReverseDependencyIndex, SummarySchemaVersion, SummarySemanticsVersion, SummaryTransfer,
-    SummaryValidationError,
+    SummaryLocationKey, SummaryOrigin, SummaryPort, SummaryProcedureSemanticsKey,
+    SummaryPublicationError, SummaryPublicationOutcome, SummaryReadObserver, SummaryReadRecorder,
+    SummaryRecursiveEdge, SummaryRecursiveGroupFingerprint, SummaryRecursiveGroupKey,
+    SummaryRepositoryLimits, SummaryReverseDependencyIndex, SummarySchemaVersion,
+    SummarySemanticsVersion, SummaryTransfer, SummaryValidationError,
 };
 pub(crate) use reusable_summary::{
     SemanticSummarySetValidationError, canonicalize_semantic_summary_items,
@@ -110,8 +110,8 @@ pub use summary::{
 };
 pub use summary_result::{
     SummaryBoundary, SummaryBoundaryKind, SummaryCoverage, SummaryDataflowError,
-    SummaryDataflowResult, SummaryEdge, SummaryEntry, SummaryIncomingCall, SummaryMetrics,
-    SummaryReachedFact, SummarySemanticStatus, TabulationEndSummary,
+    SummaryDataflowResult, SummaryEdge, SummaryEntry, SummaryEntryTransfer, SummaryIncomingCall,
+    SummaryMetrics, SummaryReachedFact, SummarySemanticStatus, TabulationEndSummary,
 };
 pub use tabulation::{solve, solve_backward, solve_backward_on_snapshot, solve_on_snapshot};
 pub use witness::{

@@ -5167,6 +5167,7 @@ where
             short_name: unit.short_name().to_string(),
             exact_fqn: unit.fq_name(),
             normalized_fqn: adapter.normalize_full_name(&unit.fq_name()),
+            requires_imports: adapter.path_synthetic_module_requires_imports(),
         })
     }
 
@@ -9976,6 +9977,94 @@ where
         matches
     }
 
+    /// Batched exact-identifier form of [`Self::lookup_declarations_by_identifier`].
+    ///
+    /// C and C++ have no decorated source identifiers, so one indexed `IN`
+    /// query per bounded chunk replaces thousands of otherwise identical
+    /// transactions during a multi-root visibility build. Dirty and
+    /// non-persisted declarations are scanned once for the whole request.
+    pub(crate) fn lookup_declarations_by_identifiers(
+        &self,
+        identifiers: &HashSet<String>,
+        cancellation: Option<&CancellationToken>,
+    ) -> HashMap<String, BTreeSet<CodeUnit>> {
+        if identifiers.is_empty() || !self.workspace_declaration_identities_authoritative() {
+            return HashMap::default();
+        }
+        debug_assert!(identifiers.iter().all(|identifier| {
+            decorated_identifier_seeks(self.adapter.language(), identifier).is_empty()
+        }));
+
+        let mut ordered = identifiers.iter().map(String::as_str).collect::<Vec<_>>();
+        ordered.sort_unstable();
+        let langs = self.storage_language_keys_for_queries();
+        let mut grouped = HashMap::default();
+        {
+            let mut add = |unit: CodeUnit| {
+                if identifiers.contains(unit.identifier()) {
+                    grouped
+                        .entry(unit.identifier().to_string())
+                        .or_insert_with(BTreeSet::new)
+                        .insert(unit.clone());
+                }
+                let source_identifier =
+                    crate::analyzer::common::source_identifier_for_target(&unit);
+                if source_identifier != unit.identifier() && identifiers.contains(source_identifier)
+                {
+                    grouped
+                        .entry(source_identifier.to_string())
+                        .or_insert_with(BTreeSet::new)
+                        .insert(unit);
+                }
+            };
+            for chunk in ordered.chunks(500) {
+                if cancellation.is_some_and(CancellationToken::is_cancelled) {
+                    break;
+                }
+                let rows = self
+                    .store_query_or_record(
+                        |sink| {
+                            for identifier in chunk {
+                                sink.push(ReadKey::index(
+                                    IndexFamily::DefinitionIdentifier,
+                                    *identifier,
+                                ));
+                            }
+                        },
+                        self.store_context
+                            .store
+                            .declaration_candidate_rows_by_identifiers_for_langs(
+                                &langs,
+                                self.store_context.generations.as_ref(),
+                                chunk,
+                            ),
+                        format!("querying declarations by identifiers {chunk:?}"),
+                    )
+                    .unwrap_or_default();
+                for unit in self.resolve_candidate_rows(rows) {
+                    add(unit);
+                }
+            }
+            if !cancellation.is_some_and(CancellationToken::is_cancelled) {
+                let requested = |unit: &CodeUnit| {
+                    identifiers.contains(unit.identifier())
+                        || identifiers
+                            .contains(crate::analyzer::common::source_identifier_for_target(unit))
+                };
+                for unit in self.dirty_units_matching(true, &requested) {
+                    add(unit);
+                }
+                for unit in self
+                    .sql_nonpersisted_workspace_declarations_vec_matching(&requested)
+                    .unwrap_or_default()
+                {
+                    add(unit);
+                }
+            }
+        }
+        grouped
+    }
+
     /// The file-scoped form of [`Self::lookup_declarations_by_identifier`].
     /// The persisted seek is narrowed by the live blob; the existing dirty and
     /// non-persisted merges retain the workspace lookup's membership rules.
@@ -14258,6 +14347,135 @@ mod tests {
             1,
             "all qualifying set-query shapes share one workspace cardinality read"
         );
+
+        // The same contract for a language whose declarations include
+        // path-derived module units. A Python file `pkg/service.py` is the
+        // module `pkg.service` although no line in it says so, and that unit
+        // exists only in `workspace_file_path_symbol_rows`, never in
+        // `code_units`. Before Part 2 of the issue #2588 plan, every set
+        // executor returned early for such a language, so these requests were
+        // always answered one at a time. Now the batch answers them, and it has
+        // to return the same units the point path returns: a batch that
+        // forgets the path half silently drops every module.
+        let python_temp = tempfile::tempdir().expect("temp dir");
+        let python_root = python_temp
+            .path()
+            .canonicalize()
+            .expect("canonical temp dir");
+        ProjectFile::new(python_root.clone(), "pkg/service.py")
+            .write("class Service:\n    def run(self):\n        pass\n")
+            .expect("write Python fixture");
+        let python_project: Arc<dyn Project> =
+            Arc::new(TestProject::new(&python_root, Language::Python));
+        let python_analyzer = TreeSitterAnalyzer::new(python_project, PythonAdapter);
+        let module = python_analyzer
+            .get_all_declarations()
+            .into_iter()
+            .find(|unit| unit.is_module() && unit.identifier() == "service")
+            .expect("fixture declares the path-derived module pkg.service");
+        let python_scope = DefinitionLanguageScope::Language(Language::Python);
+        let module_name = RelationalName::stable(module.fq().clone());
+        let package_name = RelationalName::stable(
+            brokk_bifrost_core::analyzer::symbol_path::parse_symbol_path_fq(
+                Language::Python,
+                "pkg",
+                crate::analyzer::fq_name::segment_interner(),
+            ),
+        );
+        let missing_module = |index: usize| {
+            RelationalName::stable(
+                brokk_bifrost_core::analyzer::symbol_path::parse_symbol_path_fq(
+                    Language::Python,
+                    &format!("pkg.missing{index}"),
+                    crate::analyzer::fq_name::segment_interner(),
+                ),
+            )
+        };
+        // A set executor only claims a shape once the batch holds
+        // `SET_QUERY_MIN_REQUESTS` (64) *distinct* requests of it, so each
+        // batch below asks one answerable question and 63 unanswerable ones,
+        // exactly as the Java batches above do.
+        let path_shapes: [(&str, RelationalDefinitionQuery); 3] = [
+            ("exact name", RelationalDefinitionQuery::ExactName),
+            ("normalized name", RelationalDefinitionQuery::NormalizedName),
+            (
+                "structural members",
+                RelationalDefinitionQuery::StructuralMembers {
+                    identifier: "service".to_string(),
+                },
+            ),
+        ];
+        for (case_name, shape) in path_shapes {
+            let answerable = match &shape {
+                RelationalDefinitionQuery::StructuralMembers { .. } => package_name.clone(),
+                _ => module_name.clone(),
+            };
+            let point = RelationalDefinitionRequest {
+                ordinal: 0,
+                language_scope: python_scope.clone(),
+                name: answerable.clone(),
+                query: shape.clone(),
+            };
+            let RelationalBatchOutcome::Complete(point_results) =
+                python_analyzer.batch(std::slice::from_ref(&point), &CancellationToken::new())
+            else {
+                panic!("one-request relational batch should complete")
+            };
+            let RelationalDefinitionValue::Definitions(point_definitions) = &point_results[0].value
+            else {
+                panic!("path query returned the wrong value shape")
+            };
+            assert_eq!(
+                point_definitions,
+                std::slice::from_ref(&module),
+                "the point path must answer {case_name} with the path-derived module"
+            );
+
+            let batched = (0..64usize)
+                .map(|index| RelationalDefinitionRequest {
+                    ordinal: index,
+                    language_scope: python_scope.clone(),
+                    name: match (&shape, index) {
+                        (_, 0) => answerable.clone(),
+                        (RelationalDefinitionQuery::StructuralMembers { .. }, _) => {
+                            package_name.clone()
+                        }
+                        _ => missing_module(index),
+                    },
+                    query: match (&shape, index) {
+                        (RelationalDefinitionQuery::StructuralMembers { .. }, 0) => shape.clone(),
+                        (RelationalDefinitionQuery::StructuralMembers { .. }, _) => {
+                            RelationalDefinitionQuery::StructuralMembers {
+                                identifier: format!("missing{index}"),
+                            }
+                        }
+                        _ => shape.clone(),
+                    },
+                })
+                .collect::<Vec<_>>();
+            let RelationalBatchOutcome::Complete(batched_results) =
+                python_analyzer.batch(&batched, &CancellationToken::new())
+            else {
+                panic!("set-shaped relational batch should complete")
+            };
+            assert_eq!(batched_results.len(), 64);
+            for (index, result) in batched_results.iter().enumerate() {
+                let RelationalDefinitionValue::Definitions(definitions) = &result.value else {
+                    panic!("path set query returned the wrong value shape")
+                };
+                if index == 0 {
+                    assert_eq!(
+                        definitions, point_definitions,
+                        "the batched path must answer {case_name} exactly as the point path does"
+                    );
+                } else {
+                    assert!(
+                        definitions.is_empty(),
+                        "{case_name} answered an unanswerable request at {index}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

@@ -2039,7 +2039,13 @@ fn rust_impl_owner_identity_from_path(
     })
 }
 
-fn rust_nominal_type_path(node: Node<'_>, source: &str) -> Option<Vec<String>> {
+/// Return the source-written nominal path contained in a Rust type node.
+///
+/// This helper intentionally unwraps generic arguments and type wrappers for
+/// the ordinary declaration model's synthesized impl owner. Callers that must
+/// distinguish `Foo` from a non-nominal target such as `&Foo` must validate
+/// the outer Tree-sitter shape before calling it.
+pub fn rust_nominal_type_path(node: Node<'_>, source: &str) -> Option<Vec<String>> {
     let mut pending = vec![node];
     while let Some(candidate) = pending.pop() {
         match candidate.kind() {

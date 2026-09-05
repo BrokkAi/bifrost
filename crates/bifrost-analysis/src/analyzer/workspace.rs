@@ -1485,6 +1485,25 @@ impl WorkspaceAnalyzer {
 
         store_context.workspace_snapshot = None;
 
+        // Give SQLite's query planner real cardinalities for what this build
+        // just persisted, while the build lock still holds every other
+        // worktree off this cache (issue #3016). Only the elected builder of a
+        // persisted cache reaches here with a lock, and the store skips the
+        // work when nothing was persisted or collected since the last refresh,
+        // so a repeated no-op build costs one indexed query.
+        if build_lock.is_some()
+            && brokk_bifrost_core::cache_gc::planner_statistics_enabled()
+            && let Some(evidence) = store_context.store.refresh_planner_statistics_if_stale()?
+        {
+            profiling::note_with(|| {
+                format!(
+                    "workspace.planner_statistics refreshed: {:.1} ms, {} sqlite_stat1 rows",
+                    evidence.elapsed.as_secs_f64() * 1000.0,
+                    evidence.stat1_rows
+                )
+            });
+        }
+
         let build_context = WorkspaceBuildContext::new(
             Arc::clone(&project),
             config,
@@ -1584,6 +1603,59 @@ impl WorkspaceAnalyzer {
             Self::Multi(analyzer) => analyzer.build_context(),
         };
         build_context.map(WorkspaceBuildContext::store)
+    }
+
+    /// Resolve one current disk-backed semantic artifact to the durable blob
+    /// identity used by analyzer-store derived rows.
+    ///
+    /// The source snapshot is captured once and checked against `key` before
+    /// hashing. Overlay artifacts deliberately return `None`: their ephemeral
+    /// revision must never be attached to, or later replayed from, a disk blob
+    /// row that happens to have the same workspace path.
+    pub fn semantic_artifact_store_attachment(
+        &self,
+        key: &crate::analyzer::semantic::SemanticArtifactKey,
+    ) -> Result<
+        Option<crate::analyzer::store::class_set_summaries::ClassSetSummaryAttachment>,
+        crate::analyzer::semantic::SemanticProviderError,
+    > {
+        if !matches!(
+            key.revision(),
+            crate::analyzer::semantic::SourceRevision::Disk { .. }
+        ) {
+            return Ok(None);
+        }
+        let root = self.analyzer().project().root();
+        if key.mount() != crate::analyzer::semantic::WorkspaceMountId::from_root(root) {
+            return Ok(None);
+        }
+        let file = crate::analyzer::ProjectFile::new(root.to_path_buf(), key.path().as_path());
+        let Some(provider) = self.program_semantics_provider_for_file(&file) else {
+            return Ok(None);
+        };
+        let Some(snapshot) = provider.current_artifact_source(&file, usize::MAX)? else {
+            return Ok(None);
+        };
+        if snapshot.key() != key {
+            return Ok(None);
+        }
+        let blob_oid = git2::Oid::hash_object(git2::ObjectType::Blob, snapshot.source().as_bytes())
+            .map_err(|error| {
+                crate::analyzer::semantic::SemanticProviderError::Internal(
+                    format!(
+                        "failed to derive analyzer-store blob identity for {}: {error}",
+                        key.path()
+                    )
+                    .into(),
+                )
+            })?;
+        Ok(Some(
+            crate::analyzer::store::class_set_summaries::ClassSetSummaryAttachment {
+                rel_path: key.path().as_str().to_owned(),
+                blob_oid: blob_oid.to_string(),
+                language: key.language().language(),
+            },
+        ))
     }
 
     /// Number of files in the project, i.e. an upper bound on the distinct

@@ -87,6 +87,14 @@ define_summary_digest!(
     /// Context and access-path abstraction selected for one summary family.
     SummaryContextKey
 );
+define_summary_digest!(
+    /// Exact structured semantics of one procedure for one summary family.
+    ///
+    /// This key excludes source-revision and checkout coordinates. The
+    /// summary producer must derive it from every procedure-local input that
+    /// can change the projected relation.
+    SummaryProcedureSemanticsKey
+);
 /// Exceptional, escape, external-call, and unresolved-call behavior.
 ///
 /// Two digests over the same inputs. The first is the cache identity: a
@@ -498,38 +506,84 @@ impl ProcedureSummaryIdentity {
         )
     }
 
+    /// Stable lineage of this procedure, excluding its source revision and
+    /// procedure-local semantics.
+    ///
+    /// Dependency indexes use this address to pair an old procedure summary
+    /// with the same declaration after an edit. It is not sufficient for
+    /// replay by itself; [`Self::procedure_read_fingerprint`] adds the exact
+    /// procedure-local structured semantics.
+    pub fn read_lineage_fingerprint(&self) -> StableDigest {
+        let mut bytes = Vec::new();
+        push_digest_part(&mut bytes, b"bifrost-procedure-summary-lineage-v1");
+        push_digest_part(
+            &mut bytes,
+            self.artifact.procedure_environment_fingerprint().as_bytes(),
+        );
+        self.push_declaration_lineage(&mut bytes);
+        StableDigest::sha256(bytes)
+    }
+
+    fn push_declaration_lineage(&self, bytes: &mut Vec<u8>) {
+        for segment in self.declaration.segments() {
+            push_digest_part(bytes, segment.kind().stable_label().as_bytes());
+            match segment.name() {
+                Some(name) => {
+                    push_digest_part(bytes, b"named");
+                    push_digest_part(bytes, name.as_bytes());
+                }
+                None => push_digest_part(bytes, b"anonymous"),
+            }
+            push_digest_part(bytes, &segment.sibling_ordinal().to_le_bytes());
+        }
+    }
+
+    fn push_summary_contract(&self, bytes: &mut Vec<u8>, behavior: &[u8; 32]) {
+        push_digest_part(bytes, &self.schema.get().to_le_bytes());
+        push_digest_part(bytes, self.semantics.as_bytes());
+        push_digest_part(bytes, self.context.as_bytes());
+        push_digest_part(bytes, behavior);
+        match &self.origin {
+            SummaryOrigin::Inferred => push_digest_part(bytes, b"inferred"),
+            SummaryOrigin::External(origin) => {
+                push_digest_part(bytes, b"external");
+                push_digest_part(bytes, origin.model.as_str().as_bytes());
+                push_digest_part(bytes, origin.content.as_bytes());
+                push_digest_part(bytes, &origin.contract_version.to_le_bytes());
+                push_digest_part(bytes, &[u8::from(origin.covers_overrides)]);
+            }
+        }
+    }
+
+    /// Checkout-independent replay identity for exact procedure semantics.
+    pub fn procedure_read_fingerprint(
+        &self,
+        procedure: SummaryProcedureSemanticsKey,
+    ) -> StableDigest {
+        let mut bytes = Vec::new();
+        push_digest_part(
+            &mut bytes,
+            b"bifrost-procedure-summary-local-read-identity-v1",
+        );
+        push_digest_part(&mut bytes, self.read_lineage_fingerprint().as_bytes());
+        self.push_summary_contract(&mut bytes, self.behavior.read_bytes());
+        push_digest_part(&mut bytes, procedure.as_bytes());
+        StableDigest::sha256(bytes)
+    }
+
     /// The two checkout-independent fingerprints above, which differ only in
     /// their domain and in which half of the behavior key they fold.
     fn checkout_independent_fingerprint(&self, domain: &[u8], behavior: &[u8; 32]) -> StableDigest {
         let mut bytes = Vec::new();
         push_digest_part(&mut bytes, domain);
         push_digest_part(&mut bytes, self.artifact.public_fingerprint().as_bytes());
-        for segment in self.declaration.segments() {
-            push_digest_part(&mut bytes, segment.kind().stable_label().as_bytes());
-            match segment.name() {
-                Some(name) => {
-                    push_digest_part(&mut bytes, b"named");
-                    push_digest_part(&mut bytes, name.as_bytes());
-                }
-                None => push_digest_part(&mut bytes, b"anonymous"),
-            }
-            push_digest_part(&mut bytes, &segment.sibling_ordinal().to_le_bytes());
-        }
-        push_digest_part(&mut bytes, &self.schema.get().to_le_bytes());
-        push_digest_part(&mut bytes, self.semantics.as_bytes());
-        push_digest_part(&mut bytes, self.context.as_bytes());
-        push_digest_part(&mut bytes, behavior);
-        match &self.origin {
-            SummaryOrigin::Inferred => push_digest_part(&mut bytes, b"inferred"),
-            SummaryOrigin::External(origin) => {
-                push_digest_part(&mut bytes, b"external");
-                push_digest_part(&mut bytes, origin.model.as_str().as_bytes());
-                push_digest_part(&mut bytes, origin.content.as_bytes());
-                push_digest_part(&mut bytes, &origin.contract_version.to_le_bytes());
-                push_digest_part(&mut bytes, &[u8::from(origin.covers_overrides)]);
-            }
-        }
+        self.push_checkout_independent_contract(&mut bytes, behavior);
         StableDigest::sha256(bytes)
+    }
+
+    fn push_checkout_independent_contract(&self, bytes: &mut Vec<u8>, behavior: &[u8; 32]) {
+        self.push_declaration_lineage(bytes);
+        self.push_summary_contract(bytes, behavior);
     }
 
     /// Conservative retained size of this owned identity and its heap fields.

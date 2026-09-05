@@ -16,11 +16,55 @@ use crate::analyzer::semantic_model::{
     member_declaration_id, type_declaration_id,
 };
 use brokk_bifrost_core::analyzer::semantic_diagnostics::node_text;
-use brokk_bifrost_php::aliases::{PhpFileContext, php_namespace_to_fq, resolve_php_type};
-use brokk_bifrost_php::graph_support::php_use_aliases_by_kind_from_source;
+use brokk_bifrost_php::aliases::{
+    PhpFileContext, PhpFileContextIndex, php_namespace_to_fq, resolve_php_type,
+};
+use brokk_bifrost_php::graph::syntax::declaration_doc_comment;
 
 /// The ecosystem term that binds every Composer declaration identity.
 pub(crate) const COMPOSER_ECOSYSTEM: &str = "composer";
+
+/// The ecosystem term that binds every PHP *runtime* declaration identity.
+///
+/// The runtime is not a Composer package, so a builtin `PDO` and a vendor
+/// class that happens to be named `PDO` must not collapse onto one identity.
+pub(crate) const PHP_RUNTIME_ECOSYSTEM: &str = "php";
+
+/// The logical-path scheme a Composer package's projected locators carry.
+pub(crate) const COMPOSER_LOCATOR_SCHEME: &str = "composer";
+
+/// The logical-path scheme a PHP declaration stub's projected locators carry.
+pub(crate) const PHP_STUB_LOCATOR_SCHEME: &str = "php-stub";
+
+/// The identity domain one PHP projection publishes into.
+///
+/// `ecosystem` is the term hashed into every declaration id, and `scheme` is
+/// the prefix of the logical artifact path a locator records. These are data,
+/// not a mode: both callers use them identically, and only the domain they
+/// name differs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PhpProjectionOrigin<'a> {
+    pub ecosystem: &'a str,
+    pub scheme: &'a str,
+}
+
+impl PhpProjectionOrigin<'static> {
+    /// The domain a Composer package's declarations belong to.
+    pub(crate) const fn composer() -> Self {
+        Self {
+            ecosystem: COMPOSER_ECOSYSTEM,
+            scheme: COMPOSER_LOCATOR_SCHEME,
+        }
+    }
+
+    /// The domain a pinned PHP runtime stub tree's declarations belong to.
+    pub(crate) const fn php_runtime_stub() -> Self {
+        Self {
+            ecosystem: PHP_RUNTIME_ECOSYSTEM,
+            scheme: PHP_STUB_LOCATOR_SCHEME,
+        }
+    }
+}
 
 /// The owner name for declarations in PHP's global namespace.
 ///
@@ -53,9 +97,48 @@ pub(crate) enum PhpAutoloadRule<'a> {
 pub(crate) struct PhpSourceProjection {
     pub types: Vec<TypeFact>,
     pub members: Vec<MemberFact>,
+    /// Everything this projection noticed about a declaration it published but
+    /// did not model.
+    ///
+    /// The walk records the observation rather than interpreting it: a stub
+    /// tree states version-dependent types and availability windows as PHP
+    /// attributes, and states extra members in docblocks. The producer that
+    /// reads such a tree must be able to say which records it therefore read
+    /// incompletely. A Composer projection has no such need and ignores the
+    /// field.
+    pub notes: Vec<PhpDeclarationNote>,
     pub diagnostics: Vec<ProducerDiagnostic>,
     pub suppressed_diagnostics: SuppressedDiagnostics,
     pub complete: bool,
+}
+
+/// One declaration this projection published together with one thing the walk
+/// noticed but did not model. `declaration` is the fact id, so a caller can
+/// name the exact record its marker is about.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct PhpDeclarationNote {
+    pub declaration: String,
+    pub marker: PhpDeclarationMarker,
+}
+
+/// What the walk noticed on one declaration.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum PhpDeclarationMarker {
+    /// A PHP attribute written on the declaration or on one of its
+    /// parameters, resolved through the file's `use` bindings so that an
+    /// aliased import and a plain one name the same attribute.
+    Attribute(String),
+    /// The declaration states one parameter name more than once. PHP itself
+    /// rejects that at compile time, so it arises only in a declaration-stub
+    /// dialect that spells one parameter twice for different runtime
+    /// versions. The projection keeps the first spelling, which is the one a
+    /// reader of the declaration sees, and reports the rest here.
+    DuplicateParameterName(String),
+    /// The declaration's own docblock states `@method`, `@property`,
+    /// `@property-read`, or `@property-write` members. Bifrost synthesizes no
+    /// declaration from those tags, so the published surface is not all of the
+    /// declaration's surface.
+    DocblockOnlyMembers,
 }
 
 struct Work<'tree> {
@@ -70,11 +153,13 @@ struct PhpOwner {
     name: String,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn project_php_source(
     artifact_sha256: &str,
     entry_path: &str,
     source: &str,
     rule: PhpAutoloadRule<'_>,
+    origin: PhpProjectionOrigin<'_>,
     limits: &ArtifactProducerLimits,
     cancellation: Option<&CancellationToken>,
 ) -> PhpSourceProjection {
@@ -85,27 +170,37 @@ pub(crate) fn project_php_source(
             None,
             "PHP declaration projection was cancelled",
         );
-        return finish(Vec::new(), Vec::new(), diagnostics, false);
+        return finish(Vec::new(), Vec::new(), Vec::new(), diagnostics, false);
     }
     let Some(tree) = parse_php_tree(source) else {
         diagnostics.error(
             "php.source.parse",
-            Some(logical_path(artifact_sha256, entry_path)),
+            Some(logical_path(origin, artifact_sha256, entry_path)),
             "could not parse PHP declaration source",
         );
-        return finish(Vec::new(), Vec::new(), diagnostics, false);
+        return finish(Vec::new(), Vec::new(), Vec::new(), diagnostics, false);
     };
     if tree.root_node().has_error() {
         diagnostics.warning(
             "php.source.syntax",
-            Some(logical_path(artifact_sha256, entry_path)),
+            Some(logical_path(origin, artifact_sha256, entry_path)),
             "PHP declaration source contains syntax errors",
         );
     }
 
-    let aliases = php_use_aliases_by_kind_from_source(source);
+    let Some(contexts) =
+        PhpFileContextIndex::from_tree(tree.root_node(), source, || !is_cancelled(cancellation))
+    else {
+        diagnostics.error(
+            "php.source.cancelled",
+            None,
+            "PHP declaration projection was cancelled",
+        );
+        return finish(Vec::new(), Vec::new(), Vec::new(), diagnostics, false);
+    };
     let mut types = Vec::new();
     let mut members = Vec::new();
+    let mut notes = Vec::new();
     let mut namespaces = Vec::new();
     let mut stack = Vec::new();
     expand_container(
@@ -129,7 +224,7 @@ pub(crate) fn project_php_source(
         if types.len().saturating_add(members.len()) >= limits.max_records {
             diagnostics.error(
                 "limit.records",
-                Some(logical_path(artifact_sha256, entry_path)),
+                Some(logical_path(origin, artifact_sha256, entry_path)),
                 format!(
                     "PHP declarations exceed the {} record limit",
                     limits.max_records
@@ -137,10 +232,11 @@ pub(crate) fn project_php_source(
             );
             break;
         }
-        let ctx = PhpFileContext {
-            namespace: work.namespace.clone(),
-            aliases: aliases.clone(),
-        };
+        let ctx = contexts.context_at(work.node.start_byte());
+        debug_assert_eq!(
+            ctx.namespace, work.namespace,
+            "the PHP declaration walk and context index must agree on namespace scope"
+        );
         match work.node.kind() {
             "class_declaration"
             | "interface_declaration"
@@ -148,25 +244,29 @@ pub(crate) fn project_php_source(
             | "enum_declaration" => {
                 project_type(
                     &work,
-                    &ctx,
+                    ctx,
+                    origin,
                     artifact_sha256,
                     entry_path,
                     source,
                     &mut namespaces,
                     &mut types,
+                    &mut notes,
                     &mut stack,
                 );
             }
             "function_definition" => {
                 if let Some(member) = project_callable(
                     work.node,
-                    owner_for(&work, &mut namespaces),
-                    &ctx,
+                    owner_for(&work, origin, &mut namespaces),
+                    ctx,
+                    origin,
                     artifact_sha256,
                     entry_path,
                     source,
                     MemberKind::Function,
                 ) {
+                    record_callable_notes(work.node, source, ctx, &member.id, &mut notes);
                     members.push(member);
                 }
             }
@@ -183,12 +283,14 @@ pub(crate) fn project_php_source(
                 if let Some(member) = project_callable(
                     work.node,
                     owner,
-                    &ctx,
+                    ctx,
+                    origin,
                     artifact_sha256,
                     entry_path,
                     source,
                     kind,
                 ) {
+                    record_callable_notes(work.node, source, ctx, &member.id, &mut notes);
                     members.push(member);
                 }
             }
@@ -196,25 +298,43 @@ pub(crate) fn project_php_source(
                 let Some(owner) = work.owner.clone() else {
                     continue;
                 };
+                let first_property = members.len();
                 project_properties(
                     work.node,
                     owner,
-                    &ctx,
+                    ctx,
+                    origin,
                     artifact_sha256,
                     entry_path,
                     source,
                     &mut members,
                 );
+                record_declaration_notes(
+                    work.node,
+                    source,
+                    ctx,
+                    &members[first_property..],
+                    &mut notes,
+                );
             }
             "const_declaration" => {
-                let owner = owner_for(&work, &mut namespaces);
+                let owner = owner_for(&work, origin, &mut namespaces);
+                let first_constant = members.len();
                 project_constants(
                     work.node,
                     owner,
+                    origin,
                     artifact_sha256,
                     entry_path,
                     source,
                     &mut members,
+                );
+                record_declaration_notes(
+                    work.node,
+                    source,
+                    ctx,
+                    &members[first_constant..],
+                    &mut notes,
                 );
             }
             "enum_case" => {
@@ -226,6 +346,7 @@ pub(crate) fn project_php_source(
                         owner,
                         name,
                         Visibility::Public,
+                        origin,
                         artifact_sha256,
                         entry_path,
                     ));
@@ -239,6 +360,7 @@ pub(crate) fn project_php_source(
         check_psr4_agreement(
             namespace_prefix,
             entry_path,
+            origin,
             artifact_sha256,
             &types,
             &mut diagnostics,
@@ -248,14 +370,21 @@ pub(crate) fn project_php_source(
         record_namespace(namespace_prefix, &mut namespaces);
     }
     for namespace in namespaces {
-        types.push(namespace_fact(&namespace, artifact_sha256, entry_path));
+        types.push(namespace_fact(
+            &namespace,
+            origin,
+            artifact_sha256,
+            entry_path,
+        ));
     }
     types.sort_by(|left, right| left.id.cmp(&right.id));
     types.dedup_by(|left, right| left.id == right.id);
     members.sort_by(|left, right| left.id.cmp(&right.id));
     members.dedup_by(|left, right| left.id == right.id);
+    notes.sort();
+    notes.dedup();
     let complete = diagnostics.is_empty();
-    finish(types, members, diagnostics, complete)
+    finish(types, members, notes, diagnostics, complete)
 }
 
 /// Expand a container's declarations in source order.
@@ -336,11 +465,13 @@ fn namespace_body(node: Node<'_>) -> Option<Node<'_>> {
 fn project_type<'tree>(
     work: &Work<'tree>,
     ctx: &PhpFileContext,
+    origin: PhpProjectionOrigin<'_>,
     artifact_sha256: &str,
     entry_path: &str,
     source: &str,
     namespaces: &mut Vec<String>,
     types: &mut Vec<TypeFact>,
+    notes: &mut Vec<PhpDeclarationNote>,
     stack: &mut Vec<Work<'tree>>,
 ) {
     let Some(name) = declaration_name(work.node, source) else {
@@ -348,7 +479,7 @@ fn project_type<'tree>(
     };
     let qualified = qualify(&work.namespace, &name);
     let id = type_declaration_id(TypeIdentity {
-        ecosystem: COMPOSER_ECOSYSTEM,
+        ecosystem: origin.ecosystem,
         name: &qualified,
     });
     let type_kind = match work.node.kind() {
@@ -375,8 +506,22 @@ fn project_type<'tree>(
         aliases: Vec::new(),
         extension_surfaces: Vec::new(),
         guard: None,
-        locator: artifact_locator(artifact_sha256, entry_path, &qualified),
+        locator: artifact_locator(origin, artifact_sha256, entry_path, &qualified),
     });
+    for attribute in declaration_attribute_names(work.node, source, ctx) {
+        notes.push(PhpDeclarationNote {
+            declaration: id.clone(),
+            marker: PhpDeclarationMarker::Attribute(attribute),
+        });
+    }
+    if declaration_doc_comment(work.node, source)
+        .is_some_and(brokk_bifrost_php::phpdoc::declares_docblock_only_members)
+    {
+        notes.push(PhpDeclarationNote {
+            declaration: id.clone(),
+            marker: PhpDeclarationMarker::DocblockOnlyMembers,
+        });
+    }
     if let Some(body) = type_body(work.node) {
         expand_container(
             body,
@@ -463,6 +608,7 @@ fn project_callable(
     node: Node<'_>,
     owner: PhpOwner,
     ctx: &PhpFileContext,
+    origin: PhpProjectionOrigin<'_>,
     artifact_sha256: &str,
     entry_path: &str,
     source: &str,
@@ -510,6 +656,7 @@ fn project_callable(
         aliases: Vec::new(),
         guard: None,
         locator: artifact_locator(
+            origin,
             artifact_sha256,
             entry_path,
             &format!("{}.{name}", owner.name),
@@ -528,10 +675,23 @@ fn callable_signature(node: Node<'_>, source: &str, ctx: &PhpFileContext) -> Sig
             ) {
                 continue;
             }
+            let name = child
+                .child_by_field_name("name")
+                .map(|name| node_text(name, source).trim_start_matches('$').to_owned());
+            // PHP rejects a repeated parameter name at compile time, so a
+            // repeat can only come from a declaration-stub dialect spelling
+            // one parameter twice for two runtime versions. The first
+            // spelling is the one a reader of the declaration sees; the walk
+            // keeps it and `record_callable_notes` reports the rest.
+            if name.as_ref().is_some_and(|name| {
+                parameters
+                    .iter()
+                    .any(|existing: &Parameter| existing.name.as_ref() == Some(name))
+            }) {
+                continue;
+            }
             parameters.push(Parameter {
-                name: child
-                    .child_by_field_name("name")
-                    .map(|name| node_text(name, source).trim_start_matches('$').to_owned()),
+                name,
                 r#type: child
                     .child_by_field_name("type")
                     .and_then(|type_node| php_type_ref(type_node, source, ctx))
@@ -556,6 +716,7 @@ fn project_properties(
     node: Node<'_>,
     owner: PhpOwner,
     ctx: &PhpFileContext,
+    origin: PhpProjectionOrigin<'_>,
     artifact_sha256: &str,
     entry_path: &str,
     source: &str,
@@ -615,6 +776,7 @@ fn project_properties(
             aliases: Vec::new(),
             guard: None,
             locator: artifact_locator(
+                origin,
                 artifact_sha256,
                 entry_path,
                 &format!("{}.{name}", owner.name),
@@ -626,6 +788,7 @@ fn project_properties(
 fn project_constants(
     node: Node<'_>,
     owner: PhpOwner,
+    origin: PhpProjectionOrigin<'_>,
     artifact_sha256: &str,
     entry_path: &str,
     source: &str,
@@ -651,6 +814,7 @@ fn project_constants(
             owner.clone(),
             name.to_owned(),
             visibility,
+            origin,
             artifact_sha256,
             entry_path,
         ));
@@ -661,6 +825,7 @@ fn constant_member(
     owner: PhpOwner,
     name: String,
     visibility: Visibility,
+    origin: PhpProjectionOrigin<'_>,
     artifact_sha256: &str,
     entry_path: &str,
 ) -> MemberFact {
@@ -693,6 +858,7 @@ fn constant_member(
         aliases: Vec::new(),
         guard: None,
         locator: artifact_locator(
+            origin,
             artifact_sha256,
             entry_path,
             &format!("{}.{name}", owner.name),
@@ -703,10 +869,15 @@ fn constant_member(
 /// A namespace scaffold type. Free functions and constants need an owner, and
 /// the collector reads these facts to learn which namespaces an indexed pack
 /// actually covers.
-fn namespace_fact(namespace: &str, artifact_sha256: &str, entry_path: &str) -> TypeFact {
+fn namespace_fact(
+    namespace: &str,
+    origin: PhpProjectionOrigin<'_>,
+    artifact_sha256: &str,
+    entry_path: &str,
+) -> TypeFact {
     TypeFact {
         id: type_declaration_id(TypeIdentity {
-            ecosystem: COMPOSER_ECOSYSTEM,
+            ecosystem: origin.ecosystem,
             name: namespace,
         }),
         name: namespace.to_owned(),
@@ -724,7 +895,7 @@ fn namespace_fact(namespace: &str, artifact_sha256: &str, entry_path: &str) -> T
         aliases: Vec::new(),
         extension_surfaces: Vec::new(),
         guard: None,
-        locator: artifact_locator(artifact_sha256, entry_path, namespace),
+        locator: artifact_locator(origin, artifact_sha256, entry_path, namespace),
     }
 }
 
@@ -734,6 +905,7 @@ fn namespace_fact(namespace: &str, artifact_sha256: &str, entry_path: &str) -> T
 fn check_psr4_agreement(
     namespace_prefix: &str,
     entry_path: &str,
+    origin: PhpProjectionOrigin<'_>,
     artifact_sha256: &str,
     types: &[TypeFact],
     diagnostics: &mut BoundedProducerDiagnostics,
@@ -751,7 +923,7 @@ fn check_psr4_agreement(
         if !matches_prefix {
             diagnostics.warning(
                 "php.autoload.psr4_namespace",
-                Some(logical_path(artifact_sha256, entry_path)),
+                Some(logical_path(origin, artifact_sha256, entry_path)),
                 format!(
                     "PHP type {} is not below its PSR-4 prefix {namespace_prefix}",
                     fact.name
@@ -768,7 +940,7 @@ fn check_psr4_agreement(
         if !entry_path.ends_with(&expected) {
             diagnostics.warning(
                 "php.autoload.psr4_path",
-                Some(logical_path(artifact_sha256, entry_path)),
+                Some(logical_path(origin, artifact_sha256, entry_path)),
                 format!(
                     "PHP type {} does not autoload from {entry_path} under PSR-4 prefix {namespace_prefix}",
                     fact.name
@@ -778,7 +950,11 @@ fn check_psr4_agreement(
     }
 }
 
-fn owner_for(work: &Work<'_>, namespaces: &mut Vec<String>) -> PhpOwner {
+fn owner_for(
+    work: &Work<'_>,
+    origin: PhpProjectionOrigin<'_>,
+    namespaces: &mut Vec<String>,
+) -> PhpOwner {
     if let Some(owner) = &work.owner {
         return owner.clone();
     }
@@ -786,7 +962,7 @@ fn owner_for(work: &Work<'_>, namespaces: &mut Vec<String>) -> PhpOwner {
     let name = scaffold_name(&work.namespace);
     PhpOwner {
         id: type_declaration_id(TypeIdentity {
-            ecosystem: COMPOSER_ECOSYSTEM,
+            ecosystem: origin.ecosystem,
             name,
         }),
         name: name.to_owned(),
@@ -883,15 +1059,24 @@ fn qualify(namespace: &str, name: &str) -> String {
     }
 }
 
-fn artifact_locator(artifact_sha256: &str, entry_path: &str, symbol: &str) -> Locator {
+fn artifact_locator(
+    origin: PhpProjectionOrigin<'_>,
+    artifact_sha256: &str,
+    entry_path: &str,
+    symbol: &str,
+) -> Locator {
     Locator::Artifact {
-        path: logical_path(artifact_sha256, entry_path),
+        path: logical_path(origin, artifact_sha256, entry_path),
         symbol: symbol.to_owned(),
     }
 }
 
-fn logical_path(artifact_sha256: &str, entry_path: &str) -> String {
-    format!("composer+sha256:{artifact_sha256}!/{entry_path}")
+fn logical_path(
+    origin: PhpProjectionOrigin<'_>,
+    artifact_sha256: &str,
+    entry_path: &str,
+) -> String {
+    format!("{}+sha256:{artifact_sha256}!/{entry_path}", origin.scheme)
 }
 
 fn parse_php_tree(source: &str) -> Option<Tree> {
@@ -916,6 +1101,7 @@ pub(crate) fn is_php_entry(path: &str) -> bool {
 fn finish(
     types: Vec<TypeFact>,
     members: Vec<MemberFact>,
+    notes: Vec<PhpDeclarationNote>,
     diagnostics: BoundedProducerDiagnostics,
     complete: bool,
 ) -> PhpSourceProjection {
@@ -923,8 +1109,121 @@ fn finish(
     PhpSourceProjection {
         types,
         members,
+        notes,
         diagnostics,
         suppressed_diagnostics,
         complete,
+    }
+}
+
+/// Every PHP attribute name written directly on `node`, resolved to its
+/// qualified identity.
+///
+/// The grammar stores an attribute block on the declaration's `attributes`
+/// field as an `attribute_list` of `attribute_group`s of `attribute`s, and an
+/// attribute's own name is its `name` or `qualified_name` child. The read is
+/// entirely by node kind and field, never by scanning source text.
+///
+/// The written name is then resolved through the file's own `use` bindings,
+/// exactly as a base-class name is. A declaration-stub tree imports the same
+/// attribute plainly in one file and under an alias in another, and a
+/// consumer that matched the written spelling would see one of those two and
+/// miss the other.
+fn declaration_attribute_names(node: Node<'_>, source: &str, ctx: &PhpFileContext) -> Vec<String> {
+    let Some(list) = node.child_by_field_name("attributes") else {
+        return Vec::new();
+    };
+    let mut names = Vec::new();
+    let mut group_cursor = list.walk();
+    for group in list.named_children(&mut group_cursor) {
+        if group.kind() != "attribute_group" {
+            continue;
+        }
+        let mut attribute_cursor = group.walk();
+        for attribute in group.named_children(&mut attribute_cursor) {
+            if attribute.kind() != "attribute" {
+                continue;
+            }
+            let Some(name) = attribute
+                .named_child(0)
+                .filter(|child| matches!(child.kind(), "name" | "qualified_name"))
+            else {
+                continue;
+            };
+            let text = node_text(name, source).trim();
+            if !text.is_empty() {
+                names
+                    .push(resolve_php_type(text, ctx).unwrap_or_else(|| php_namespace_to_fq(text)));
+            }
+        }
+    }
+    names
+}
+
+/// Record the attributes one declaration node carries against every member it
+/// published. A `property_declaration` or `const_declaration` can declare more
+/// than one element, and the block's attributes apply to all of them.
+fn record_declaration_notes(
+    node: Node<'_>,
+    source: &str,
+    ctx: &PhpFileContext,
+    published: &[MemberFact],
+    notes: &mut Vec<PhpDeclarationNote>,
+) {
+    if published.is_empty() {
+        return;
+    }
+    for attribute in declaration_attribute_names(node, source, ctx) {
+        for member in published {
+            notes.push(PhpDeclarationNote {
+                declaration: member.id.clone(),
+                marker: PhpDeclarationMarker::Attribute(attribute.clone()),
+            });
+        }
+    }
+}
+
+/// Record what one callable states that the projected signature does not
+/// model: the attributes it and its parameters carry, and any parameter name
+/// it spells more than once.
+///
+/// A stub tree states a parameter's availability window with a parameter
+/// attribute, and spells a version-varying parameter twice, so a callable
+/// whose parameter list is version dependent must be reported as read
+/// incompletely too.
+fn record_callable_notes(
+    node: Node<'_>,
+    source: &str,
+    ctx: &PhpFileContext,
+    declaration: &str,
+    notes: &mut Vec<PhpDeclarationNote>,
+) {
+    let mut names = declaration_attribute_names(node, source, ctx);
+    let mut seen: Vec<String> = Vec::new();
+    if let Some(list) = node.child_by_field_name("parameters") {
+        let mut cursor = list.walk();
+        for parameter in list.named_children(&mut cursor) {
+            names.extend(declaration_attribute_names(parameter, source, ctx));
+            let Some(name) = parameter
+                .child_by_field_name("name")
+                .map(|name| node_text(name, source).trim_start_matches('$').to_owned())
+            else {
+                continue;
+            };
+            if seen.contains(&name) {
+                notes.push(PhpDeclarationNote {
+                    declaration: declaration.to_owned(),
+                    marker: PhpDeclarationMarker::DuplicateParameterName(name),
+                });
+            } else {
+                seen.push(name);
+            }
+        }
+    }
+    for attribute in names {
+        notes.push(PhpDeclarationNote {
+            declaration: declaration.to_owned(),
+            marker: PhpDeclarationMarker::Attribute(attribute),
+        });
     }
 }

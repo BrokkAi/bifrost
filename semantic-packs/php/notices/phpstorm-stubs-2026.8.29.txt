@@ -1,0 +1,12 @@
+JetBrains phpstorm-stubs PHP runtime declaration stubs
+
+Copyright the phpstorm-stubs project contributors.
+
+The generated declaration data is derived from a bounded subset of the
+extension stub trees of the JetBrains phpstorm-stubs project and is
+distributed under the Apache License, Version 2.0.
+
+Project: https://github.com/JetBrains/phpstorm-stubs
+License: https://www.apache.org/licenses/LICENSE-2.0
+Pinned revision: 748ab87d16253a5b5d648b5fe4dae1ff4152bb03
+Pinned artifact: https://github.com/JetBrains/phpstorm-stubs/archive/748ab87d16253a5b5d648b5fe4dae1ff4152bb03.tar.gz

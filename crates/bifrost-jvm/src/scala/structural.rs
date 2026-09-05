@@ -19,7 +19,8 @@ use brokk_bifrost_core::analyzer::structural::occurrences::{
     OccurrenceRole, OccurrenceRoleSupport,
 };
 use brokk_bifrost_core::analyzer::structural::resolution::{
-    BindingActivation, BindingKind, EnvironmentAxis, HoistingClass, LexicalEnvironmentSupport,
+    BindingActivation, BindingKind, EnvironmentAxis, HoistingClass, ImportActivation,
+    LexicalEnvironmentSupport,
 };
 use brokk_bifrost_core::analyzer::structural::routes::{
     IdentityRouteSupport, NO_IDENTITY_ROUTE_SUPPORT,
@@ -81,6 +82,13 @@ pub const SCALA_KIND_TABLE: &[(&str, NormalizedKind)] = &[
     ("field_expression", NormalizedKind::FieldAccess),
     ("function_definition", NormalizedKind::Function),
     ("function_declaration", NormalizedKind::Function),
+    // A `given` is a definition with its own parameter clauses and its own
+    // body, so it scopes the parameters written in it exactly as a `def`
+    // does. Without it the given's parameters sat directly in the enclosing
+    // template's scope and the shared class-scope rule excluded them as
+    // members (#2925). `refine_kind` turns a given written in a template into
+    // a method, which is what a given member is.
+    ("given_definition", NormalizedKind::Function),
     ("lambda_expression", NormalizedKind::Lambda),
     ("class_definition", NormalizedKind::Class),
     ("object_definition", NormalizedKind::Class),
@@ -105,6 +113,12 @@ pub const SCALA_KIND_TABLE: &[(&str, NormalizedKind)] = &[
     ("block", NormalizedKind::Block),
     ("indented_block", NormalizedKind::Block),
     ("case_clause", NormalizedKind::Block),
+    // An `extension` group has no name of its own: it is a definition list
+    // that scopes the extension parameter over every method written in it,
+    // which is the block kind's own description. As with a `case_clause`,
+    // without the fact the extension parameter sat in the enclosing template's
+    // scope and read as a member (#2925).
+    ("extension_definition", NormalizedKind::Block),
     ("val_definition", NormalizedKind::Assignment),
     ("var_definition", NormalizedKind::Assignment),
     ("assignment_expression", NormalizedKind::Assignment),
@@ -735,6 +749,50 @@ fn scala_binding_activation(binder: Node<'_>, scope: Range) -> Option<BindingAct
     }
 }
 
+/// Whether a definition is written in a class-like template body, which is
+/// what makes a `def` a method rather than a free function.
+///
+/// The nearest enclosing fact answers this for a definition written directly
+/// in a template, which is what `refine_kind` reads first. An `extension`
+/// group is a lexical scope of its own (#2925), so it is the nearest fact
+/// around its methods while those methods are still members of the template
+/// the group is written in; the group is transparent here for exactly that
+/// reason. Anything else ends the walk: a `def` inside a block is a local
+/// function whatever encloses the block.
+fn is_template_member(node: Node<'_>) -> bool {
+    let mut current = node.parent();
+    while let Some(ancestor) = current {
+        match ancestor.kind() {
+            "extension_definition" => current = ancestor.parent(),
+            "template_body" | "with_template_body" | "enum_body" => return true,
+            _ => return false,
+        }
+    }
+    false
+}
+
+/// The interval a Scala `import` puts its local name in effect over.
+///
+/// Scala's `import` is a statement, not a header: the names it introduces are
+/// in effect from the import clause to the end of the statement sequence it is
+/// written in. That sequence is a `block` or an `indented_block`, which is
+/// exactly the block-kind scope the derivation layer hands over here, so a
+/// block-local import is `SourceOrder` from the end of its own declaration.
+/// Every other scope an import can be written in -- the file, a package
+/// clause, a template body -- holds definitions whose order does not decide
+/// visibility, so the import stays scope-wide there (#2925).
+fn scala_import_binder_activation(
+    declaration: Range,
+    scope: Range,
+    scope_kind: Option<NormalizedKind>,
+) -> ImportActivation {
+    if scope_kind == Some(NormalizedKind::Block) {
+        ImportActivation::from_declaration(declaration, scope)
+    } else {
+        ImportActivation::scope_wide(scope)
+    }
+}
+
 /// Whether a node holds members rather than statements: the body of a class,
 /// object, trait, enum, given or package object, a braced package's body, or
 /// the top level of a Scala 3 file. A definition written directly in one of
@@ -781,13 +839,15 @@ impl StructuralSpec for ScalaStructuralSpec {
 
     fn refine_kind(
         &self,
-        _node: Node<'_>,
+        node: Node<'_>,
         kind: NormalizedKind,
         enclosing: Option<NormalizedKind>,
         _source: &str,
         _context: &CallSiteContext,
     ) -> NormalizedKind {
-        if kind == NormalizedKind::Function && enclosing == Some(NormalizedKind::Class) {
+        if kind == NormalizedKind::Function
+            && (enclosing == Some(NormalizedKind::Class) || is_template_member(node))
+        {
             NormalizedKind::Method
         } else {
             kind
@@ -880,6 +940,15 @@ impl StructuralSpec for ScalaStructuralSpec {
 
     fn binding_activation(&self, binder: Node<'_>, scope: Range) -> Option<BindingActivation> {
         scala_binding_activation(binder, scope)
+    }
+
+    fn import_binder_activation(
+        &self,
+        declaration: Range,
+        scope: Range,
+        scope_kind: Option<NormalizedKind>,
+    ) -> ImportActivation {
+        scala_import_binder_activation(declaration, scope, scope_kind)
     }
 
     fn extract(&self, node: Node<'_>, kind: NormalizedKind, sink: &mut RoleSink<'_>) {
@@ -1008,7 +1077,9 @@ impl StructuralSpec for ScalaStructuralSpec {
 #[cfg(test)]
 mod tests {
     use super::{SCALA_STRUCTURAL_SPEC, scala_occurrence_role};
+    use brokk_bifrost_core::analyzer::Range;
     use brokk_bifrost_core::analyzer::structural::adapter_helpers::{nearest_ancestor, node_range};
+    use brokk_bifrost_core::analyzer::structural::kinds::NormalizedKind;
     use brokk_bifrost_core::analyzer::structural::occurrences::OccurrenceRole;
     use brokk_bifrost_core::analyzer::structural::resolution::{BindingKind, HoistingClass};
     use brokk_bifrost_core::analyzer::structural::spec::StructuralSpec;
@@ -1050,12 +1121,16 @@ mod tests {
                     kind,
                     "function_definition"
                         | "lambda_expression"
+                        | "given_definition"
+                        | "extension_definition"
                         | "class_definition"
                         | "object_definition"
                         | "trait_definition"
                 )
             })
-            .expect("every fixture binder sits in a callable, lambda or template");
+            .expect(
+                "every fixture binder sits in a callable, lambda, given, extension or template",
+            );
             let binding = SCALA_STRUCTURAL_SPEC
                 .binding_activation(node, node_range(scope))
                 .expect("every classified binder states an interval");
@@ -1145,6 +1220,95 @@ mod tests {
         assert_eq!(activation("entry"), " => entry");
         // A lambda parameter is scope-wide over the lambda itself.
         assert_eq!(activation("item"), "item => item.length");
+    }
+
+    /// A `given` and an `extension` scope the parameters written in them, so
+    /// each parameter is in effect over the definition that declares it and
+    /// not over the template the definition is written in (#2925).
+    #[test]
+    fn given_and_extension_parameters_are_scope_wide_over_their_own_definition() {
+        let source = concat!(
+            "object Host {\n",
+            "  given ordering(using base: Int): Ord[Int] = build(base)\n",
+            "\n",
+            "  extension (value: String) {\n",
+            "    def twice(sep: String): String = value + sep + value\n",
+            "  }\n",
+            "}\n",
+        );
+        let found = binding_activations(source);
+        assert_eq!(
+            found
+                .iter()
+                .map(|(token, kind, hoisting, _)| (*token, *kind, *hoisting))
+                .collect::<Vec<_>>(),
+            vec![
+                ("base", BindingKind::Parameter, HoistingClass::ScopeWide),
+                ("value", BindingKind::Parameter, HoistingClass::ScopeWide),
+                ("sep", BindingKind::Parameter, HoistingClass::ScopeWide),
+            ],
+            "{found:#?}"
+        );
+
+        let activation = |name: &str| {
+            found
+                .iter()
+                .find(|(token, _, _, _)| *token == name)
+                .unwrap_or_else(|| panic!("no binder named {name} in {found:#?}"))
+                .3
+        };
+        assert_eq!(
+            activation("base"),
+            "given ordering(using base: Int): Ord[Int] = build(base)"
+        );
+        assert!(
+            activation("value").starts_with("extension (value: String)"),
+            "{:?}",
+            activation("value")
+        );
+        assert_eq!(
+            activation("sep"),
+            "def twice(sep: String): String = value + sep + value"
+        );
+    }
+
+    /// A Scala `import` inside a statement list is in effect from the import
+    /// clause onward; an import written anywhere else -- the file, a package
+    /// clause, a template body -- is in effect over its whole scope (#2925).
+    #[test]
+    fn a_block_scoped_import_activates_at_its_own_declaration() {
+        let declaration = Range {
+            start_byte: 20,
+            end_byte: 41,
+            start_line: 3,
+            end_line: 3,
+        };
+        let scope = Range {
+            start_byte: 10,
+            end_byte: 80,
+            start_line: 2,
+            end_line: 6,
+        };
+
+        let in_block =
+            super::scala_import_binder_activation(declaration, scope, Some(NormalizedKind::Block));
+        assert_eq!(in_block.hoisting, HoistingClass::SourceOrder);
+        assert_eq!(in_block.activation.start_byte, declaration.end_byte);
+        assert_eq!(in_block.activation.end_byte, scope.end_byte);
+
+        for scope_kind in [
+            None,
+            Some(NormalizedKind::Class),
+            Some(NormalizedKind::Method),
+        ] {
+            let elsewhere = super::scala_import_binder_activation(declaration, scope, scope_kind);
+            assert_eq!(
+                elsewhere.hoisting,
+                HoistingClass::ScopeWide,
+                "an import in {scope_kind:?} is in effect over its whole scope"
+            );
+            assert_eq!(elsewhere.activation, scope);
+        }
     }
 
     /// Scala 3's braceless `catch` inlines its case pattern into the

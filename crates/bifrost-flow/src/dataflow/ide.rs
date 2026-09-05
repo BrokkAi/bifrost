@@ -1745,10 +1745,9 @@ where
                 request,
                 metrics,
             )?;
-            let path_qualities = conjoin_quality_frontiers(
-                fact_result.reached()[relation.caller].path_qualities(),
-                PathQualityFrontier::singleton(relation.edge_quality),
-            );
+            let path_qualities = fact_result.reached()[relation.caller]
+                .path_qualities()
+                .conjoin(PathQualityFrontier::singleton(relation.edge_quality));
             entry_transfers.push(IdeEntryTransfer::new(
                 fact_result.reached()[source_entry_row].entry().clone(),
                 fact_result.reached()[relation.target_entry].entry().clone(),
@@ -2354,19 +2353,6 @@ struct PendingPointValue {
     qualities: PathQualityFrontier,
 }
 
-fn conjoin_quality_frontiers(
-    prefix: PathQualityFrontier,
-    suffix: PathQualityFrontier,
-) -> PathQualityFrontier {
-    let mut combined = PathQualityFrontier::default();
-    for prefix_quality in prefix.iter() {
-        for suffix_quality in suffix.iter() {
-            combined.insert(prefix_quality.conjoin(suffix_quality));
-        }
-    }
-    combined
-}
-
 #[allow(clippy::too_many_arguments)]
 fn materialize_values<Problem>(
     root: &ProcedureHandle,
@@ -2482,14 +2468,10 @@ where
                 None => candidate,
             };
 
-            let prefix_qualities = conjoin_quality_frontiers(
-                entry_qualities[entry],
-                result.reached()[relation.caller].path_qualities(),
-            );
-            let candidate_qualities = conjoin_quality_frontiers(
-                prefix_qualities,
-                PathQualityFrontier::singleton(relation.edge_quality),
-            );
+            let prefix_qualities =
+                entry_qualities[entry].conjoin(result.reached()[relation.caller].path_qualities());
+            let candidate_qualities =
+                prefix_qualities.conjoin(PathQualityFrontier::singleton(relation.edge_quality));
             let mut next_qualities = entry_qualities[relation.target_entry];
             let mut quality_changed = false;
             for quality in candidate_qualities.iter() {
@@ -2535,10 +2517,7 @@ where
             point: reached.point().clone(),
             fact: reached.fact(),
             value,
-            qualities: conjoin_quality_frontiers(
-                entry_qualities[graph.row_entries[index]],
-                reached.path_qualities(),
-            ),
+            qualities: entry_qualities[graph.row_entries[index]].conjoin(reached.path_qualities()),
         });
     }
 

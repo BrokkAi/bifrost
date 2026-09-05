@@ -330,7 +330,6 @@ fn raw_typestate_projection(
     .unwrap();
     let anchor = TypestateFindingAnchor::strong(
         protocol_hash,
-        binding_plan_hash,
         subject_identity,
         site,
         facts.scenario_set_hash,

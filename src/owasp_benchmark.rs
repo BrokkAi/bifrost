@@ -100,6 +100,20 @@ impl InjectionCategory {
         }
     }
 
+    /// The taint label minted by this category's source endpoints and accepted
+    /// by its sink endpoints. These labels are the sanitizer pack's
+    /// sink-context vocabulary, rather than the Benchmark category tokens.
+    pub const fn hazard_label(self) -> &'static str {
+        match self {
+            InjectionCategory::Sqli => "sql",
+            InjectionCategory::Cmdi => "shell",
+            InjectionCategory::Ldapi => "ldap",
+            InjectionCategory::Pathtraver => "path",
+            InjectionCategory::Xpathi => "xpath",
+            InjectionCategory::Xss => "html",
+        }
+    }
+
     pub fn from_label(label: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|c| c.label() == label)
     }
@@ -645,6 +659,7 @@ pub fn policy_id(category: InjectionCategory) -> String {
 /// shares the source set and differs only in its sink set, so a finding
 /// attributes unambiguously to the category whose policy produced it.
 pub fn build_policy(category: InjectionCategory) -> String {
+    let hazard_label = category.hazard_label();
     let mut sources = String::new();
     for (index, callee) in SOURCE_CALLEES.iter().enumerate() {
         sources.push_str(&format!(
@@ -652,7 +667,7 @@ pub fn build_policy(category: InjectionCategory) -> String {
              \x20           :categories [input.user-controlled io.external]\n\
              \x20           :selector (rql :schema-version 1\n\
              \x20             (language java (call :callee (name {callee:?}))))\n\
-             \x20           :bind return-value :labels [attacker-controlled])\n"
+             \x20           :bind return-value :labels [{hazard_label}])\n"
         ));
     }
     let mut sinks = String::new();
@@ -676,7 +691,7 @@ pub fn build_policy(category: InjectionCategory) -> String {
                      \x20           :categories [data.sensitive]\n\
                      \x20           :selector (rql :schema-version 1\n\
                      \x20             (language java (call :callee (name {callee:?}) (arity :min {min_arity}))))\n\
-                     \x20           :dangerous-operand (argument :index {argument}) :accepts [attacker-controlled])\n"
+                     \x20           :dangerous-operand (argument :index {argument}) :accepts [{hazard_label}])\n"
                 ));
             }
             SinkSelector::ExactCallBinding {
@@ -701,7 +716,7 @@ pub fn build_policy(category: InjectionCategory) -> String {
                      \x20                   (call-bindings (call-shape (call :callee (name {callee:?})))))))\n\
                      \x20             (call :over calls :resolves-to {model_id} :proof declared)\n\
                      \x20             (call-argument :over calls :formal-name {formal_name:?}))\n\
-                     \x20           :dangerous-operand (argument :name {formal_name:?}) :accepts [attacker-controlled])\n",
+                     \x20           :dangerous-operand (argument :name {formal_name:?}) :accepts [{hazard_label}])\n",
                 ));
             }
         }
@@ -713,7 +728,7 @@ pub fn build_policy(category: InjectionCategory) -> String {
         \x20 :schema-version 1\n\
         \x20 :id {id:?}\n\
         \x20 :name \"OWASP Benchmark {label} (require-model)\"\n\
-        \x20 :message \"attacker-controlled data reached a {label} sink\"\n\
+        \x20 :message \"data carrying {hazard_label} reached a {label} sink\"\n\
         \x20 :severity warning\n\
         \x20 :analysis (analysis\n\
         \x20   :type taint\n\
@@ -724,6 +739,7 @@ pub fn build_policy(category: InjectionCategory) -> String {
         \x20 :classification (classification\n\
         \x20   :fallback (classification-id :taxonomy \"OWASP\" :id {taxonomy_id:?})))\n",
         label = category.label(),
+        hazard_label = hazard_label,
     )
 }
 
@@ -1858,6 +1874,41 @@ mod tests {
             case_name_from_path("src/main/java/org/owasp/Helper.java"),
             None
         );
+    }
+
+    #[test]
+    fn benchmark_categories_use_exact_sink_context_hazard_labels() {
+        let expected = [
+            (InjectionCategory::Sqli, "sql"),
+            (InjectionCategory::Cmdi, "shell"),
+            (InjectionCategory::Ldapi, "ldap"),
+            (InjectionCategory::Pathtraver, "path"),
+            (InjectionCategory::Xpathi, "xpath"),
+            (InjectionCategory::Xss, "html"),
+        ];
+
+        for (category, hazard_label) in expected {
+            assert_eq!(category.hazard_label(), hazard_label);
+            let policy = build_policy(category);
+
+            assert!(!policy.contains("attacker-controlled"));
+            assert_eq!(
+                policy.matches(&format!(":labels [{hazard_label}]")).count(),
+                SOURCE_CALLEES.len(),
+                "every source must mint the category's hazard label"
+            );
+            assert_eq!(
+                policy
+                    .matches(&format!(":accepts [{hazard_label}]"))
+                    .count(),
+                category_sinks(category).len(),
+                "every sink must accept only the category's hazard label"
+            );
+            assert!(policy.contains(&format!(
+                ":message \"data carrying {hazard_label} reached a {} sink\"",
+                category.label()
+            )));
+        }
     }
 
     #[test]

@@ -43,6 +43,132 @@ pub(crate) fn collect_php_semantic_diagnostics(
     crate::analyzer::semantic_model::degrade_pack_gap_absences(analyzer, report)
 }
 
+/// What the activated packs say about one member of one PHP owner, asked by
+/// qualified owner name rather than by an already-resolved overlay identity.
+///
+/// This is the question the definition path asks. The boundary trace's PHP arm
+/// cannot ask it: PHP spells qualified names with `\`, which the
+/// reference-site scanner does not span, so the trace holds one written
+/// segment (`prepare`) and would answer it with any activated PHP symbol of
+/// that name. The definition site knows the receiver's owner, so it can ask
+/// the owner-scoped question and name the exact target.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PhpOverlayMember {
+    /// Exactly one activated declaration answers the member; the string is its
+    /// overlay identity.
+    Indexed(String),
+    /// The owner is published, its whole inherited surface is published with
+    /// no gap, and the member is not on it.
+    DeclaredAbsent,
+    /// Nothing activated publishes the owner, more than one pack does, or the
+    /// owner's surface has a gap. Nothing is proven either way.
+    Unknown,
+}
+
+/// The synthetic owner every PHP global-namespace function and constant hangs
+/// off. Kept in step with `super::source_artifact::PHP_GLOBAL_NAMESPACE`,
+/// which is the producer side of the same identity.
+pub(crate) const PHP_GLOBAL_NAMESPACE_OWNER: &str = super::source_artifact::PHP_GLOBAL_NAMESPACE;
+
+/// PHP declarations in the overlay whose qualified name is exactly `fqn`.
+///
+/// Matching on the qualified name keeps a terminal-name posting for an
+/// unrelated symbol from answering a fully qualified question, and filtering
+/// to PHP keeps another ecosystem's posting from answering at all.
+fn php_overlay_symbols_named<'a>(
+    overlay: &'a SemanticModelOverlay,
+    fqn: &str,
+) -> Vec<&'a SemanticModelSymbol> {
+    overlay
+        .symbols_named(fqn)
+        .records
+        .into_iter()
+        .filter(|symbol| symbol.language == "php" && symbol.qualified_name == fqn)
+        .collect()
+}
+
+/// What the activated packs say about one PHP type name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PhpOverlayType {
+    /// Exactly one activated declaration answers the name; the string is its
+    /// overlay identity.
+    Indexed(String),
+    /// Nothing activated publishes the name, or more than one pack does.
+    Unknown,
+}
+
+/// Resolve one PHP type name against the activated packs.
+///
+/// A namespace scaffold is filtered out: it exists so free functions have an
+/// owner, and no reference can name it as a type.
+pub(crate) fn php_overlay_type(
+    overlay: Option<&SemanticModelOverlay>,
+    fqn: &str,
+) -> PhpOverlayType {
+    let Some(overlay) = overlay else {
+        return PhpOverlayType::Unknown;
+    };
+    let records = php_overlay_symbols_named(overlay, fqn)
+        .into_iter()
+        .filter(|symbol| symbol.kind != SemanticModelSymbolKind::Module)
+        .collect::<Vec<_>>();
+    match records.as_slice() {
+        [symbol] if !symbol.provenance.ambiguous => PhpOverlayType::Indexed(symbol.id.clone()),
+        _ => PhpOverlayType::Unknown,
+    }
+}
+
+/// Resolve one member of one PHP owner against the activated packs.
+///
+/// The walk is the same one `AnalyzerPhpExternalSurface::lookup_member` takes
+/// -- the owner's whole inherited closure, gated on that closure having no gap
+/// -- so the definition path and the semantic-diagnostics collector agree
+/// about what "the activated packs declare this member" means.
+pub(crate) fn php_overlay_member(
+    overlay: Option<&SemanticModelOverlay>,
+    owner: &str,
+    member: &str,
+) -> PhpOverlayMember {
+    let Some(overlay) = overlay else {
+        return PhpOverlayMember::Unknown;
+    };
+    let owners = php_overlay_symbols_named(overlay, owner);
+    let [owner_symbol] = owners.as_slice() else {
+        // Nothing publishes the owner, or two packs disagree about it.
+        return PhpOverlayMember::Unknown;
+    };
+    if owner_symbol.provenance.ambiguous {
+        return PhpOverlayMember::Unknown;
+    }
+    let surface = overlay.owner_surface(owner_symbol);
+    // `owner_surface` puts the owner first and its ancestors after, so the
+    // first hit is the most derived declaration, which is the one PHP
+    // dispatches to.
+    let found = surface
+        .closure
+        .iter()
+        .flat_map(|ancestor| overlay.members_of(&ancestor.id).records)
+        .filter(|symbol| symbol.name == member)
+        .collect::<Vec<_>>();
+    if let Some(symbol) = found.iter().find(|symbol| !symbol.provenance.ambiguous) {
+        return PhpOverlayMember::Indexed(symbol.id.clone());
+    }
+    if !found.is_empty() {
+        // Every declaration that answers the name was flagged ambiguous by the
+        // pack that published it, so no single target can be named.
+        return PhpOverlayMember::Unknown;
+    }
+    // The global namespace is the one owner whose presence is never a claim of
+    // coverage: PHP's builtin global surface is far larger than any one pack,
+    // so a name missing from the scaffold proves nothing. Every other owner is
+    // absent only when its whole published surface has no gap.
+    if owner == PHP_GLOBAL_NAMESPACE_OWNER || !surface.gaps.is_empty() {
+        PhpOverlayMember::Unknown
+    } else {
+        PhpOverlayMember::DeclaredAbsent
+    }
+}
+
 /// The overlay and discovery evidence an analyzer already holds, presented as
 /// the narrow window PHP's collector reads.
 struct AnalyzerPhpExternalSurface {
@@ -51,22 +177,6 @@ struct AnalyzerPhpExternalSurface {
 }
 
 impl AnalyzerPhpExternalSurface {
-    /// PHP declarations in the overlay whose qualified name is exactly `fqn`.
-    ///
-    /// Matching on the qualified name keeps a terminal-name posting for an
-    /// unrelated symbol from answering a fully qualified question.
-    fn php_symbols_named<'a>(
-        overlay: &'a SemanticModelOverlay,
-        fqn: &str,
-    ) -> Vec<&'a SemanticModelSymbol> {
-        overlay
-            .symbols_named(fqn)
-            .records
-            .into_iter()
-            .filter(|symbol| symbol.language == "php" && symbol.qualified_name == fqn)
-            .collect()
-    }
-
     fn classify(records: &[&SemanticModelSymbol]) -> PhpExternalSymbol {
         match records {
             [] => PhpExternalSymbol::Absent,
@@ -83,7 +193,7 @@ impl PhpExternalSurface for AnalyzerPhpExternalSurface {
         let Some(overlay) = &self.overlay else {
             return PhpExternalSymbol::Absent;
         };
-        let records = Self::php_symbols_named(overlay, fqn);
+        let records = php_overlay_symbols_named(overlay, fqn);
         // A namespace scaffold is not a type a reference can name.
         let records = records
             .into_iter()
@@ -148,7 +258,7 @@ impl PhpExternalSurface for AnalyzerPhpExternalSurface {
         // namespace below it, so walk back toward the root.
         let mut candidate = namespace_fq;
         loop {
-            let covered = Self::php_symbols_named(overlay, candidate)
+            let covered = php_overlay_symbols_named(overlay, candidate)
                 .into_iter()
                 .any(|symbol| {
                     symbol.kind == SemanticModelSymbolKind::Module

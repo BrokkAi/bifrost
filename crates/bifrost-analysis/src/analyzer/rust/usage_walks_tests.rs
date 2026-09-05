@@ -340,6 +340,88 @@ mod tests {
         assert_eq!(*fresh, *first, "the answer itself is unchanged");
     }
 
+    /// The re-export closure asks for the import edges binding one identity per
+    /// importer of a name. Which module a candidate's `use` reaches is a fact
+    /// about the candidate, not about the identity asked for, so the routes a
+    /// candidate resolves must be resolved once per generation and reused by
+    /// every later identity.
+    ///
+    /// Issue #2632: `scan_usages_by_location` on this repository asked
+    /// `edges_binding_identity` for 328 identities named `WorkspaceAnalyzer`
+    /// over the same 291 candidate files, and each ask re-resolved every
+    /// candidate's `use` paths. That made the closure quadratic in the import
+    /// count and spent 39 s of a 47 s scan re-deriving routes it already had.
+    /// The counter here is the resolver work: flat across identities with the
+    /// per-file memo, and one candidate scan per identity without it.
+    #[test]
+    fn binding_edges_resolve_each_candidate_route_once_per_generation() {
+        const IMPORTERS: usize = 12;
+        let mut lib = String::from("pub mod service;\n");
+        for index in 0..IMPORTERS {
+            lib.push_str(&format!("pub mod m{index};\n"));
+        }
+        let mut sources: Vec<(String, String)> = vec![
+            ("src/lib.rs".to_string(), lib),
+            (
+                "src/service.rs".to_string(),
+                "pub struct Widget;\n".to_string(),
+            ),
+        ];
+        for index in 0..IMPORTERS {
+            sources.push((
+                format!("src/m{index}.rs"),
+                format!(
+                    "pub use crate::service::Widget;\n\
+                     pub fn take{index}(_: Widget) {{}}\n"
+                ),
+            ));
+        }
+        let borrowed: Vec<(&str, &str)> = sources
+            .iter()
+            .map(|(rel, body)| (rel.as_str(), body.as_str()))
+            .collect();
+        let (_temp, analyzer) = project(&borrowed);
+        let analyzer_scope = AnalyzerQueryScope::new(&analyzer);
+        let walks = RustUsageWalks::new(&analyzer, analyzer_scope.token());
+        let service = file(&analyzer, "service.rs");
+        let root = identity_named(&walks, &service, "Widget");
+
+        let before = walks.caches.route_resolutions();
+        let root_edges = walks.edges_binding_identity(&root);
+        let after_root = walks.caches.route_resolutions();
+        assert!(
+            after_root > before,
+            "the first ask must resolve the candidates' module routes"
+        );
+
+        // The identities the closure in `usage.rs` derives from those edges:
+        // one per module-scope importer, all naming the same item.
+        let aliases: Vec<RustSymbolIdentity> = root_edges
+            .iter()
+            .filter(|edge| edge.propagate_alias)
+            .map(|edge| RustSymbolIdentity {
+                file: edge.importer.clone(),
+                module: edge.importer_module.clone(),
+                name: root.name.clone(),
+                namespace: root.namespace,
+            })
+            .collect();
+        assert_eq!(
+            aliases.len(),
+            IMPORTERS,
+            "every importer re-exports the name, so every importer binds an alias: {root_edges:?}"
+        );
+
+        for alias in &aliases {
+            walks.edges_binding_identity(alias);
+        }
+        assert_eq!(
+            walks.caches.route_resolutions(),
+            after_root,
+            "no identity after the first may resolve a candidate's routes again"
+        );
+    }
+
     /// The workspace declaration lookup behind `files_in_module_package` is
     /// keyed on the module's short name, so it runs once per short name even
     /// when many module packages end in it.

@@ -7,7 +7,7 @@
 //! that produces them, and the analyzer-bound fixture suite that exercises them.
 
 use crate::aliases::{
-    PhpFileContext, resolve_php_constant, resolve_php_function, resolve_php_type,
+    PhpFileContextIndex, resolve_php_constant, resolve_php_function, resolve_php_type,
     resolve_php_type_arms,
 };
 use crate::external_surface::{PhpExternalMember, PhpExternalSurface, PhpExternalSymbol};
@@ -17,9 +17,7 @@ use crate::graph::syntax::{
     static_property_identifier,
 };
 use crate::graph::{PhpCallableFacts, PhpGraphSource};
-use crate::graph_support::{
-    PhpSource, php_direct_declared_class_parent, php_file_context_from_source,
-};
+use crate::graph_support::{PhpSource, php_direct_declared_class_parent};
 use brokk_bifrost_core::analyzer::model::{Range, SemanticDiagnostic};
 use brokk_bifrost_core::analyzer::semantic_diagnostics::{node_range, node_text};
 use brokk_bifrost_core::analyzer::structural::resolution::BoundaryStatus;
@@ -119,7 +117,15 @@ pub fn collect_php_semantic_diagnostics(
     }
 
     let line_starts = compute_line_starts(source);
-    let ctx = php_file_context_from_source(php, file, source);
+    let Some(contexts) = PhpFileContextIndex::from_tree(tree.root_node(), source, || true) else {
+        report.push_incomplete(
+            None,
+            vec![SemanticDiagnosticIncompleteReason::UnsupportedSemantics {
+                detail: "PHP namespace/import indexing failed".to_owned(),
+            }],
+        );
+        return report;
+    };
     let mut collector = PhpDiagnosticCollector {
         php,
         index,
@@ -128,7 +134,7 @@ pub fn collect_php_semantic_diagnostics(
         file,
         source,
         line_starts: &line_starts,
-        ctx,
+        contexts,
         report,
         published: 0,
         truncated: false,
@@ -153,7 +159,7 @@ struct PhpDiagnosticCollector<'a> {
     file: &'a ProjectFile,
     source: &'a str,
     line_starts: &'a [usize],
-    ctx: PhpFileContext,
+    contexts: PhpFileContextIndex,
     report: SemanticDiagnosticReport,
     /// Published errors, which is what the cap bounds. Resolved and incomplete
     /// outcomes are cheap and are not limited.
@@ -221,7 +227,7 @@ impl PhpDiagnosticCollector<'_> {
             let mut bindings = LocalInferenceEngine::default();
             if is_local_scope(scope) {
                 seed_parameter_types(scope, self.source, &mut bindings, |_name, raw| {
-                    resolve_php_type_arms(raw, &self.ctx)
+                    resolve_php_type_arms(raw, self.contexts.context_at(scope.start_byte()))
                 });
             }
             self.scan_scope(scope, &mut bindings, &mut scopes);
@@ -283,7 +289,7 @@ impl PhpDiagnosticCollector<'_> {
             },
             node,
             self.source,
-            &self.ctx,
+            self.contexts.context_at(node.start_byte()),
             bindings,
             |start, end| self.enclosing_owner_fqn_at(start, end),
         )
@@ -374,11 +380,15 @@ impl PhpDiagnosticCollector<'_> {
             && is_unqualified_php_name(&raw);
         let indexed = |candidate: &str| !self.support.fqn(candidate).is_empty();
         let fqn = match kind {
-            SymbolKind::Type => resolve_php_type(&raw, &self.ctx),
-            SymbolKind::Function => resolve_php_function(&raw, &self.ctx)
-                .map(|candidates| candidates.first_indexed(indexed).to_string()),
-            SymbolKind::Constant => resolve_php_constant(&raw, &self.ctx)
-                .map(|candidates| candidates.first_indexed(indexed).to_string()),
+            SymbolKind::Type => resolve_php_type(&raw, self.contexts.context_at(node.start_byte())),
+            SymbolKind::Function => {
+                resolve_php_function(&raw, self.contexts.context_at(node.start_byte()))
+                    .map(|candidates| candidates.first_indexed(indexed).to_string())
+            }
+            SymbolKind::Constant => {
+                resolve_php_constant(&raw, self.contexts.context_at(node.start_byte()))
+                    .map(|candidates| candidates.first_indexed(indexed).to_string())
+            }
         };
         let Some(fqn) = fqn else {
             return;
@@ -672,7 +682,7 @@ impl PhpDiagnosticCollector<'_> {
                 let child = self.support.fqn(&owner).into_iter().next()?;
                 php_direct_declared_class_parent(self.php, &child).map(|parent| parent.fq_name())
             }
-            _ => resolve_php_type(text, &self.ctx),
+            _ => resolve_php_type(text, self.contexts.context_at(scope.start_byte())),
         }
     }
 

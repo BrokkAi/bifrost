@@ -198,11 +198,13 @@ pub fn kotlin_import_path(import: &ImportInfo) -> Option<String> {
 /// Whether a declaration is one a star import over its package would bind.
 ///
 /// Kotlin packages export top-level types, functions, and properties alike, so
-/// this is not restricted to classes the way a type-only import would be. A
-/// dotted short name means the declaration is nested inside another one, which
-/// a package-level star import does not reach.
+/// this is not restricted to classes the way a type-only import would be. More
+/// than one segment past the package prefix means the declaration is nested
+/// inside another one, which a package-level star import does not reach. The
+/// question is asked of the recorded segments rather than of the rendered
+/// spelling, which is the same rule the Scala side uses (#2219).
 pub fn is_kotlin_importable_top_level(unit: &CodeUnit) -> bool {
-    !unit.is_synthetic() && !unit.short_name().contains('.')
+    !unit.is_synthetic() && unit.declaration_segment_count() == 1
 }
 
 // ---------------------------------------------------------------------------

@@ -4,6 +4,7 @@ use super::inverted::{
 use crate::scala::graph::syntax::{ScalaCallableRole, parenthesized_arity};
 use crate::scala::graph_support::ScalaSource;
 use crate::scala::wildcard_imports::scala_import_path;
+use brokk_bifrost_core::analyzer::model::Language;
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_core::analyzer::{CodeUnit, ProjectFile, default_parent_fq_name};
 use brokk_bifrost_core::hash::{HashMap, HashSet};
@@ -616,14 +617,31 @@ fn scala_type_base(type_text: &str) -> Option<&str> {
         .filter(|name| !name.is_empty())
 }
 
+/// The terminal simple name of a (possibly generic/qualified) type text.
+///
+/// The qualifier boundary is read with the shared symbol-path segmentation
+/// rather than a local `rsplit('.')`, because a Scala identifier may be
+/// backtick-quoted and carry a literal `.` inside the quotes: the simple name
+/// of `` `zio.ZIO` `` is the whole quoted identifier, not `` ZIO` `` (#2219).
+///
+/// The shared splitter also treats `::` as a separator, which is right for a
+/// client-typed selector but not for Scala source, where `::` is an ordinary
+/// symbolic identifier (`x: ::[Int]`). A base made only of separator
+/// characters has no segment to report, and its own text is then the name.
 fn scala_simple_type_name(type_text: &str) -> Option<&str> {
-    type_text
+    let base = type_text
         .trim()
         .split(['[', '(', '{', ' ', '<'])
-        .next()
-        .and_then(|base| base.rsplit('.').next())
-        .map(str::trim)
-        .filter(|name| !name.is_empty())
+        .next()?
+        .trim();
+    if base.is_empty() {
+        return None;
+    }
+    Some(
+        brokk_bifrost_core::analyzer::symbol_path::symbol_path_segments(Language::Scala, base)
+            .pop()
+            .unwrap_or(base),
+    )
 }
 
 pub fn method_arity_matches(

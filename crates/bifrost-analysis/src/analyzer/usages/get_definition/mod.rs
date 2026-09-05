@@ -1298,7 +1298,7 @@ pub fn resolve_call_target_batch_with_source(
     }
     if matches!(
         language_for_file(&file),
-        Language::JavaScript | Language::TypeScript | Language::Python
+        Language::JavaScript | Language::TypeScript | Language::Php | Language::Python
     ) {
         let scope = AnalyzerQueryScope::new(analyzer);
         let mut context = DefinitionBatchContext::new(analyzer, scope.token(), requests.len() > 1);
@@ -2135,14 +2135,18 @@ fn resolve_one_with_evidence<'a>(
             tree.as_ref(),
             &site,
         ),
-        Language::Php => php::resolve_php(
-            analyzer,
-            context.bounded_support(),
-            &request.file,
-            &source,
-            tree.as_ref(),
-            &site,
-        ),
+        Language::Php => {
+            let resolution = php::resolve_php(
+                analyzer,
+                context.bounded_support(),
+                &request.file,
+                &source,
+                tree.as_ref(),
+                &site,
+            );
+            external_callee_identity = resolution.external_callee_identity;
+            resolution.outcome
+        }
         Language::Python => {
             let mut outcome = python::resolve_python(
                 analyzer,

@@ -1296,7 +1296,6 @@ fn validate_typestate_projection(
     let facts = validate_typestate_facts(authority, projection.facts, budget)?;
     if let Some(anchor) = projection.anchor.strong_fields()
         && (anchor.protocol_hash() != facts.protocol_hash
-            || anchor.binding_plan_hash() != facts.binding_plan_hash
             || anchor.scenario_set_hash() != facts.scenario_set_hash
             || facts.violation_site.as_ref() != Some(anchor.violation_site_identity())
             || anchor.violation_hash()
@@ -2953,7 +2952,6 @@ mod tests {
         .unwrap();
         let anchor = TypestateFindingAnchor::strong(
             authority.protocol_hash(),
-            authority.binding_plan_hash(),
             subject_identity,
             site,
             facts.scenario_set_hash,
@@ -3081,7 +3079,6 @@ mod tests {
         .unwrap();
         wrong_hash.anchor = TypestateFindingAnchor::strong(
             strong.protocol_hash(),
-            strong.binding_plan_hash(),
             strong.subject_identity().clone(),
             strong.violation_site_identity().clone(),
             strong.scenario_set_hash(),

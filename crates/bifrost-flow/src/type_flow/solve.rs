@@ -22,8 +22,9 @@ use brokk_bifrost_core::profiling;
 use crate::analyzer::WorkspaceAnalyzer;
 use crate::analyzer::semantic::{
     ClassAtom, ClassIdentity, DispatchHint, DispatchHintCallSiteKey, DispatchHintSet,
-    DispatchHints, MemberAccessKind, MemberDeclaration, MemberLookup, ProcedureHandle,
-    SemanticBudget, SourceSite, TypeFlowAdapter, UnknownReason, WorkspaceIcfgProvider,
+    DispatchHints, IcfgProvider, MemberAccessKind, MemberDeclaration, MemberLookup,
+    ProcedureHandle, SemanticBudget, SourceSite, TypeFlowAdapter, UnknownReason,
+    WorkspaceIcfgProvider,
 };
 use crate::analyzer::semantic_model::ActiveSemanticModelSnapshot;
 use crate::dataflow::{
@@ -33,11 +34,12 @@ use crate::dataflow::{
 use crate::value_flow::{
     ClosureLimits, ValueFlowCache, ValueFlowCarrier, ValueFlowMeeting, ValueFlowSinkId,
     ValueFlowSinkOutcome, ValueFlowSolveError, ValueFlowSummaryResult, WorkspaceValueFlowProvider,
-    solve_value_flow_with_witnesses,
+    solve_value_flow_with_reusable_summaries, solve_value_flow_with_witnesses,
 };
 
 use super::FieldSlotIndex;
 use super::plan::{MemberAccessSite, TypeFlowPlan, TypeFlowPlanError, uncovered_reason};
+use super::summary::{PreparedClassSetSummaries, TypeFlowSummaryState};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClassSetStatus {
@@ -83,7 +85,7 @@ impl ClassSetStatus {
 
 /// The classes and Unknown reasons that reached one member access under one
 /// root, plus the status a consumer may act on.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReceiverClassSet {
     pub site: MemberAccessSite,
     pub classes: Vec<(ClassIdentity, SourceSite)>,
@@ -97,7 +99,7 @@ pub struct ReceiverClassSet {
 
 /// A member access whose receiver provably holds a class that does not
 /// declare the member.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AbsentMemberFinding {
     pub root: ProcedureHandle,
     pub site: MemberAccessSite,
@@ -128,6 +130,13 @@ pub struct TypeFlowRootResult {
     /// boundaries. Executors surface this as their
     /// `semantic_budget_exhausted` diagnostic.
     pub semantic_budget_exhausted: bool,
+    /// Cross-root procedure-summary lookups served by a reusable class-set
+    /// relation while computing this result.
+    pub reusable_summary_hits: usize,
+    /// Cross-root procedure-summary entry facts that had no reusable relation.
+    pub reusable_summary_misses: usize,
+    /// Complete leaf entry relations newly published for later roots.
+    pub published_summaries: usize,
 }
 
 /// Why one root's class-set solve could not run.
@@ -205,10 +214,11 @@ pub fn solve_type_flow_for_root(
     active_semantic_model_snapshot: Option<Arc<ActiveSemanticModelSnapshot>>,
     limits: ClosureLimits,
     feedback_limits: FeedbackLimits,
+    value_flow_cache: ValueFlowCache,
+    summary_state: TypeFlowSummaryState,
     semantic_budget: &mut SemanticBudget,
     request: &mut DataflowRequest<'_>,
 ) -> Result<TypeFlowRootResult, TypeFlowError> {
-    let value_flow_cache = ValueFlowCache::default();
     let mut dispatch_hints = DispatchHints::empty();
     let mut previous = None;
     for iteration in 0..feedback_limits.max_iterations() {
@@ -224,6 +234,7 @@ pub fn solve_type_flow_for_root(
         );
         let discovery_provider = WorkspaceValueFlowProvider::with_oracle(
             provider.oracle().clone(),
+            provider.behavior_identity(),
             value_flow_cache.clone(),
         );
         let plan = TypeFlowPlan::build(
@@ -236,19 +247,83 @@ pub fn solve_type_flow_for_root(
             &mut iteration_budget,
             request.cancellation,
         )?;
-        let result = {
-            let _scope = profiling::scope("type_flow.solve");
-            solve_value_flow_with_witnesses(
-                root,
-                &provider,
-                plan.value_flow(),
-                WitnessRetentionLimits::new(1)
-                    .expect("one alternative is a valid witness retention limit"),
-                &mut iteration_budget,
-                request,
-            )?
-        };
-        let interpreted = interpret(workspace, adapter, root, &plan, &result);
+        let mut summaries = PreparedClassSetSummaries::new(
+            summary_state.clone(),
+            workspace,
+            &plan,
+            field_slots,
+            provider.behavior_identity(),
+        );
+        let mut interpreted;
+        if summaries.has_reusable_rows() {
+            // Reusable rows currently retain reachability and path quality,
+            // not witness fragments. Run the cheap symbolic trial without a
+            // witness sidecar. If it produces a finding, discard its staged
+            // budgets and run the exact witness-producing path; otherwise no
+            // consumer can observe the missing sidecar, so commit the trial.
+            let mut trial_solver_budget = request.budget.clone();
+            let mut trial_request =
+                DataflowRequest::new(&mut trial_solver_budget, request.cancellation)
+                    .with_query_plan_config(request.query_plan_config());
+            let mut trial_semantic_budget = iteration_budget.clone();
+            let trial_result = {
+                let _scope = profiling::scope("type_flow.solve");
+                solve_value_flow_with_reusable_summaries(
+                    root,
+                    &provider,
+                    &mut summaries,
+                    plan.value_flow(),
+                    WitnessRetentionLimits::disabled(),
+                    &mut trial_semantic_budget,
+                    &mut trial_request,
+                )?
+            };
+            let metrics = trial_result.result().metrics();
+            let trial_interpreted = interpret(workspace, adapter, root, &plan, &trial_result);
+            if metrics.reusable_summary_hits > 0 && trial_interpreted.findings.is_empty() {
+                *request.budget = trial_solver_budget;
+                iteration_budget = trial_semantic_budget;
+                interpreted = trial_interpreted;
+                interpreted.reusable_summary_hits = metrics.reusable_summary_hits;
+                interpreted.reusable_summary_misses = metrics.reusable_summary_misses;
+                interpreted.published_summaries =
+                    summaries.publish_complete(&trial_result, request.cancellation);
+            } else {
+                let result = {
+                    let _scope = profiling::scope("type_flow.solve");
+                    solve_value_flow_with_witnesses(
+                        root,
+                        &provider,
+                        plan.value_flow(),
+                        WitnessRetentionLimits::new(1)
+                            .expect("one alternative is a valid witness retention limit"),
+                        &mut iteration_budget,
+                        request,
+                    )?
+                };
+                interpreted = interpret(workspace, adapter, root, &plan, &result);
+                interpreted.reusable_summary_hits = metrics.reusable_summary_hits;
+                interpreted.reusable_summary_misses = metrics.reusable_summary_misses;
+                interpreted.published_summaries =
+                    summaries.publish_complete(&result, request.cancellation);
+            }
+        } else {
+            let result = {
+                let _scope = profiling::scope("type_flow.solve");
+                solve_value_flow_with_witnesses(
+                    root,
+                    &provider,
+                    plan.value_flow(),
+                    WitnessRetentionLimits::new(1)
+                        .expect("one alternative is a valid witness retention limit"),
+                    &mut iteration_budget,
+                    request,
+                )?
+            };
+            interpreted = interpret(workspace, adapter, root, &plan, &result);
+            interpreted.published_summaries =
+                summaries.publish_complete(&result, request.cancellation);
+        }
         if interpreted.semantic_budget_exhausted || !interpreted.complete {
             if let Some(previous) = previous {
                 return Ok(previous);
@@ -390,6 +465,9 @@ fn interpret(
         findings: distinct_findings,
         complete,
         semantic_budget_exhausted,
+        reusable_summary_hits: 0,
+        reusable_summary_misses: 0,
+        published_summaries: 0,
     }
 }
 

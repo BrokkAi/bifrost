@@ -721,6 +721,9 @@ fn visit_ts_value(
             continue;
         }
         let name = trim_statement(node_text(name_node, source));
+        if name.is_empty() {
+            continue;
+        }
         let value = child.child_by_field_name("value");
         let is_function = value
             .map(|value| matches!(value.kind(), "arrow_function" | "function_expression"))
@@ -1425,6 +1428,24 @@ fn collect_ts_export_identifier(node: Node<'_>, source: &str, roots: &mut HashSe
     }
 }
 
+/// The declared name of a class-body or interface member: its `name` child,
+/// trimmed of statement noise and string quotes.
+///
+/// Returns `None` when the node has no `name` child or when tree-sitter error
+/// recovery inserted a zero-width (missing) one whose text is empty. In
+/// `abstract!: void;` the grammar consumes `abstract` as the field's modifier
+/// and recovers the absent name as a missing `property_identifier`; `(): void;`
+/// recovers the same way in a `method_signature`. Such a member declares no
+/// name a read could resolve to, so the member visitors skip it instead of
+/// minting a unit whose segment text is empty (#3020).
+fn ts_member_name(node: Node<'_>, source: &str) -> Option<String> {
+    let name_node = node.child_by_field_name("name")?;
+    let name = trim_statement(node_text(name_node, source))
+        .trim_matches('"')
+        .to_string();
+    (!name.is_empty()).then_some(name)
+}
+
 fn visit_ts_method(
     file: &ProjectFile,
     source: &str,
@@ -1433,12 +1454,9 @@ fn visit_ts_method(
     top_level: &CodeUnit,
     parsed: &mut brokk_bifrost_core::analyzer::parsed_file::ParsedFile,
 ) {
-    let Some(name_node) = node.child_by_field_name("name") else {
+    let Some(name) = ts_member_name(node, source) else {
         return;
     };
-    let name = trim_statement(node_text(name_node, source))
-        .trim_matches('"')
-        .to_string();
     let member_name = if is_static_ts_member(node) {
         format!("{name}$static")
     } else {
@@ -1564,10 +1582,9 @@ fn visit_ts_field(
     top_level: &CodeUnit,
     parsed: &mut brokk_bifrost_core::analyzer::parsed_file::ParsedFile,
 ) {
-    let name_node = node.child_by_field_name("name").unwrap_or(node);
-    let name = trim_statement(node_text(name_node, source))
-        .trim_matches('"')
-        .to_string();
+    let Some(name) = ts_member_name(node, source) else {
+        return;
+    };
     let member_name = if is_static_ts_member(node) {
         format!("{name}$static")
     } else {
@@ -1948,5 +1965,115 @@ mod callable_modifier_tests {
         assert_eq!(modifiers("render"), (false, false));
         assert_eq!(modifiers("measure"), (false, false));
         assert_eq!(modifiers("constructor"), (false, true));
+    }
+}
+
+#[cfg(test)]
+mod recovered_member_name_tests {
+    use super::*;
+    use tree_sitter::Parser;
+
+    /// Issue #3020: tree-sitter error recovery gives a member whose modifier
+    /// is followed by definite-assignment `!` and no name (`abstract!: void;`)
+    /// a zero-width (missing) `name` child. The member visitors must skip such
+    /// a member instead of interning its empty text and panicking the whole
+    /// workspace index in `SegmentInterner::intern`.
+    fn parse(source: &str) -> brokk_bifrost_core::analyzer::parsed_file::ParsedFile {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let file = ProjectFile::new(
+            temp.path().canonicalize().expect("canonical root"),
+            "fixture.ts",
+        );
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into())
+            .expect("TypeScript parser language");
+        let tree = parser
+            .parse(source, None)
+            .expect("parse TypeScript fixture");
+        parse_typescript_file(&file, source, &tree)
+    }
+
+    /// `(identifier, is_field)` for every unit the parse minted, sorted so the
+    /// assertions compare sets exactly.
+    fn minted(
+        parsed: &brokk_bifrost_core::analyzer::parsed_file::ParsedFile,
+    ) -> Vec<(String, bool)> {
+        let mut units: Vec<(String, bool)> = parsed
+            .ranges
+            .keys()
+            .map(|unit| (unit.identifier().to_owned(), unit.is_field()))
+            .collect();
+        units.sort();
+        units
+    }
+
+    #[test]
+    fn abstract_definite_assignment_without_a_name_mints_only_the_class() {
+        let parsed = parse("class C {\n    abstract!: void;\n}\n");
+        assert_eq!(
+            minted(&parsed),
+            vec![("C".to_string(), false)],
+            "a nameless recovered field is unaddressable and is skipped: {parsed:?}"
+        );
+    }
+
+    #[test]
+    fn accessor_definite_assignment_without_a_name_mints_only_the_class() {
+        let parsed = parse("class C {\n    accessor!: void;\n}\n");
+        assert_eq!(
+            minted(&parsed),
+            vec![("C".to_string(), false)],
+            "a nameless recovered field is unaddressable and is skipped: {parsed:?}"
+        );
+    }
+
+    #[test]
+    fn nameless_recovered_members_in_interfaces_and_method_shapes_are_skipped() {
+        let parsed = parse("interface I {\n    : void;\n}\nclass C {\n    (): void;\n}\n");
+        assert_eq!(
+            minted(&parsed),
+            vec![("C".to_string(), false), ("I".to_string(), false)],
+            "neither the recovered property_signature nor the method_signature has a name: {parsed:?}"
+        );
+    }
+
+    #[test]
+    fn modifier_named_members_keep_their_names() {
+        let parsed = parse(
+            "class C {\n    readonly!: void;\n    abstract foo!: void;\n    public(): void;\n}\n",
+        );
+        assert_eq!(
+            minted(&parsed),
+            vec![
+                ("C".to_string(), false),
+                ("foo".to_string(), true),
+                ("public".to_string(), false),
+                ("readonly".to_string(), true),
+            ],
+            "`readonly` is this field's name and `public` this method's, not modifiers: {parsed:?}"
+        );
+    }
+
+    /// The babel-parser `members-with-modifier-names` fixture shape from
+    /// #3020: keyword-named members beside one genuinely nameless recovered
+    /// field. The whole class must index, and the nameless member must leave
+    /// no empty segment behind.
+    #[test]
+    fn members_with_modifier_names_fixture_indexes_without_a_nameless_member() {
+        let parsed = parse(
+            "class C {\n    public(): void;\n    public static(): void;\n    readonly = 0;\n    async<T>(): void;\n    abstract!:void;\n}\n",
+        );
+        assert_eq!(
+            minted(&parsed),
+            vec![
+                ("C".to_string(), false),
+                ("async".to_string(), false),
+                ("public".to_string(), false),
+                ("readonly".to_string(), true),
+                ("static".to_string(), false),
+            ],
+            "`abstract!:void` recovers without a name and is skipped: {parsed:?}"
+        );
     }
 }

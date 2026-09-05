@@ -23,6 +23,16 @@ projection and its commit history does not contain every source commit.
 
 ### Added
 
+- The stable extension surface now serves typestate. A new experimental
+  operation, `experimental.semantic.typestate`, answers one bounded protocol
+  question about one procedure: the caller supplies its own automaton and binds
+  each observation to a source span, and the result reports every violation with
+  its site, certainty, evidence, and witness, under the same completion envelope
+  the existing semantic operations use. The surface version is now 1.1, the
+  capability report carries a per-language typestate row, and the report's
+  per-language semantic rows are derived from the workspace's own execution
+  semantics instead of being asserted.
+
 - Semantic call binding now carries exact keyword-argument names across every
   named-call language, so modeled call targets resolve through keyword or
   named arguments instead of positional ambiguity.
@@ -398,6 +408,48 @@ projection and its commit history does not contain every source commit.
 
 ### Changed
 
+- The `cli` toolset is no longer part of any `--mcp` composition. `classify_test_files`
+  made zero calls across a 40-run BrokkBench sweep against dozens of calls to the symbol
+  tools, so it is no longer advertised to MCP agents (`core`, `searchtools`, or any manual
+  `|`-composition); `--mcp cli` and a composition such as `symbol|cli` now fail with a
+  structured error. `classify_test_files` remains available through
+  `bifrost --tool classify_test_files` and the Rust/Python API, unchanged.
+- Go concurrency policy packs now model timer callbacks (`time.AfterFunc`)
+  and map/slice backing-store flow, so data-race rules can follow accesses a
+  timer task performs on shared containers.
+- Reusing a verified generated semantic pack now validates catalog metadata
+  without re-reading and decoding every shard; shard bytes remain checked when
+  loaded and any corrupt artifact is quarantined.
+- C++ include-graph indexing and preprocessor macro environments now reuse
+  bounded shared state, substantially reducing repeated navigation and usage
+  analysis work in large include graphs.
+- The MCP `run_policy` report now includes per-policy evaluation timing when
+  timing output is requested, making expensive policy checks attributable
+  without changing the default report.
+- A policy run no longer forwards the CodeQuery `broad_query` advisory as a
+  policy diagnostic. The advisory measures the execution that raised it, and
+  the report's `work` section already carries those counters, so forwarding it
+  made a report's bytes and its retention boundary depend on how the run was
+  executed rather than on what the workspace contains. Every other query
+  diagnostic is forwarded unchanged.
+- JavaScript and TypeScript now treat Node's `node:` module scheme as spelling
+  rather than identity. `import fs from 'node:fs'` and `import fs from 'fs'`
+  name one module, so they mint one external owner, one package identity, and
+  one discovery evidence entry across import binding, receiver analysis,
+  external-callee owners, and semantic diagnostics. A semantic pack authored
+  for the bare builtin now binds both spellings, so the shipped JavaScript and
+  TypeScript golden summary packs (0.4.0) and the Node child-process
+  declaration packs (0.2.0) no longer duplicate every module entry per
+  spelling.
+- The MCP `query_code` structural search path now reads analyzed source blobs
+  without hydrating full file state when the query only needs source text,
+  substantially reducing warm whole-workspace query latency.
+- The built-in OWASP XSS policy now limits servlet response sinks to exact
+  `PrintWriter` calls, avoiding broader same-surface matches.
+- Upgraded `bifrost.code-smells` to 2.7.0 for the exact Go failure-path error
+  policy. Its initial scope is limited to arguments of calls whose result is
+  returned; direct returns and statement-only calls remain available through
+  RQL but are not yet built-in findings.
 - Upgraded `bifrost.code-smells` to 2.5.0. The Go result-contract rule now
   includes exact `net.Listen` acquisitions and reports required operations on
   the returned listener when its paired error has not established success.
@@ -442,6 +494,101 @@ projection and its commit history does not contain every source commit.
 
 ### Fixed
 
+- A typestate finding's identity no longer contains the policy's compiled
+  binding plan. The plan is a digest of every declaration the policy binds
+  anywhere in the workspace, so an edit that added one tracked object re-keyed
+  every finding the policy reported and a `--diff-base` run listed unchanged
+  violations as `fixed` and reported the same violations again as `new`. The
+  identity now hashes only what the finding is: the policy id, the compiled
+  protocol, the tracked object's and the violating site's mount-free semantic
+  identities, the solver root's semantic identity, and the violated event or
+  terminal expectation with its states. Policy evaluation units and recorded
+  base evaluations from earlier builds are not reused, because they carry the
+  identities and the product shape the previous engine minted.
+- C/C++ definition navigation now resolves guarded typedef uses through the
+  same conditional-include environment as the reference site.
+- The workspace usage catalog no longer drops Scala and Kotlin methods
+  declared inside anonymous classes, restoring the missing graph edges.
+- C++ definition navigation now types qualified and subscript receivers, follows
+  transitive include closures from declarations to bodies, and retains
+  ambiguous overload candidates instead of preferring an unrelated body.
+- Java anonymous-class receiver dispatch and Kotlin resolution across Java and
+  Scala JVM-realm peers now preserve exact receiver and inherited-type
+  identities.
+- Taint policies with disconnected source and sink regions now return typed
+  incomplete evidence rather than failing evaluation, retaining conservative
+  negative results.
+- PHP and Ruby callable metadata now records receiver/static modifiers, allowing
+  exact procedure-summary keys to bind supported declarations.
+- Analyzer queries now report structural-fact persistence failures instead of
+  silently dropping cache-write errors.
+- Extension capability negotiation now derives from the same published
+  capability table as the extension workspace report, so clients can require
+  every capability the report marks as served.
+- C/C++ definition lookup now preserves structured preprocessor-guard context
+  across unrelated macro definitions, resolving guarded same-file typedef
+  parameters without a spurious include-boundary diagnostic.
+- CodeQuery/RQL now enforces every list role. The `elements`, `attributes`,
+  and `children` patterns were decoded and documented but never checked, so
+  `(collection_literal :elements [(numeric_literal)])` matched a literal of
+  strings and a JSX attribute or child list narrowed nothing. All five list
+  roles now read the same way, the rule `args` always used: each listed
+  pattern must match a distinct edge of that role in source order. That also
+  tightens `decorators`, which previously let two patterns match one
+  annotation and accepted any order.
+
+- `query_code` full-detail rows now carry their own source columns even when
+  an earlier row in the same answer resolved into their file. Rendering
+  hydrates a bounded set of sources, and a file that was consulted for a
+  nested reference target before its own rows were rendered was recorded as
+  having no source at all, so every row of that file reported column 1 for
+  both ends of its range while its lines stayed correct. Which rows were
+  affected depended on the order the answer happened to render, so the same
+  row could report different columns in a workspace-wide query and in a
+  path-scoped one.
+- When a `--diff-base` run repairs more than 256 base findings, the diff
+  review's `fixed` list now deterministically retains the 256 smallest
+  `(policy_id, finding_id)` identities in sorted order. Previously the
+  retained subset was taken in hash-map iteration order before sorting, so two
+  runs of the same build over the same inputs could report different entries
+  while agreeing on `fixed_count`.
+- The base revision of a `--diff-base` run is now analyzed with the same
+  analyzer configuration as the head, including a configuration a host such as
+  the MCP server or the LSP session supplied. The base previously built with
+  the analyzer defaults, so dependency discovery, dispatch expansion, and
+  per-language behavior could differ from the head whose findings it was joined
+  with.
+- The exported base revision of a `--diff-base` run now honors the
+  `.bifrostignore` file that revision commits, so a file the head excludes from
+  analysis no longer contributes base findings that the diff reports as fixed.
+  Ignored paths stay in the file view on both sides, as they always have.
+- The base revision of a `--diff-base` run now activates the same semantic
+  models as the head. The base always activated the shipped models, so a head
+  supplied by a host that activated none of them was compared against a base
+  that modeled calls the head never modeled, and every finding that depended on
+  one was reported as fixed plus new.
+- Typestate findings no longer depend on where the checkout lives. A typestate
+  finding's identity contains the policy's compiled binding plan, and that plan
+  folded a hash of the absolute workspace root, so the base of a `--diff-base`
+  run -- which is analyzed at a temporary export root -- could never mint the
+  head's identities and every typestate finding was reported as both new and
+  fixed. The plan now names each bound procedure by its workspace-relative
+  path, language, declaration segments, role, and anchor, which identify it
+  exactly within one workspace.
+- Go data-race findings no longer depend on where the checkout lives. A
+  concurrent-access conflict named its procedures by a durable key whose first
+  component folds a hash of the absolute workspace root, so under `--diff-base`
+  every data-race finding was reported as new and no base finding was ever
+  matched as fixed. The conflict id, the site strings folded into it, and the
+  procedure ids the query publishes now use the mount-free procedure wire id
+  that every other rendered semantic row already carries.
+- Watched workspaces now keep overlays and linked-worktree updates coherent
+  across file deletion and other incremental changes, with background reads
+  anchored to the selected analyzer generation.
+- LSP position conversion and word lookup now handle CRLF and multibyte text
+  without offset errors, dropped blank snippet rows, or panics.
+- Semantic-pack activation retries transient catalog locks and reports rejected
+  source entries instead of silently treating them as usable pack input.
 - Go result-contract analysis now follows direct modeled results through
   assignments, conversions, conditional switches, deferred cleanup, and early
   exits while retaining explicit boundaries for unsupported paths.

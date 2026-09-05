@@ -1,11 +1,12 @@
 use std::{error::Error, fmt, mem::size_of_val, sync::Arc};
 
+use crate::analyzer::semantic::LengthDelimitedDigest;
 use crate::analyzer::semantic::{
     AbstractLocation, AccessPath, AccessPathRoot, AccessPathTail, AccessSelector, CallSiteHandle,
     DurableIdentityError, DurableObjectIdentity, DurablePortIdentity, DurableValueIdentity,
     EvidenceCompleteness, IndexSelector, OracleCallContext, ProcedureHandle, ProcedurePortHandle,
     ProgramPointHandle, ProofStatus, ScopedSemanticLocator, SemanticArtifact, SemanticLocator,
-    ValueFlowEndpoint, ValueHandle,
+    StableDigest, ValueFlowEndpoint, ValueHandle,
 };
 use brokk_bifrost_core::analyzer::dense_id::define_dense_id;
 
@@ -257,6 +258,147 @@ pub enum ValueFlowCarrierKey {
 }
 
 impl ValueFlowCarrierKey {
+    /// Add this carrier's checkout-independent structured identity to `digest`.
+    ///
+    /// The caller owns the outer domain separation. Every carrier and selector
+    /// variant is tagged, collection lengths are explicit, and locators use the
+    /// semantic layer's sanctioned stable encoding. The explicit work stack is
+    /// intentional: access paths can be deeply nested and identity production
+    /// must not consume the Rust call stack.
+    pub fn push_stable_identity(&self, digest: &mut LengthDelimitedDigest) {
+        self.push_stable_identity_with(digest, None);
+    }
+
+    /// Add this carrier's structured identity relative to its owning
+    /// procedure. Procedure-local source movement is normalized while
+    /// locators outside the owner remain exact external inputs.
+    pub(crate) fn push_procedure_local_identity(
+        &self,
+        digest: &mut LengthDelimitedDigest,
+        procedure: &SemanticLocator,
+    ) {
+        self.push_stable_identity_with(digest, Some(procedure));
+    }
+
+    fn push_stable_identity_with(
+        &self,
+        digest: &mut LengthDelimitedDigest,
+        procedure: Option<&SemanticLocator>,
+    ) {
+        enum Part<'key> {
+            Carrier(&'key ValueFlowCarrierKey),
+            Selector(&'key ValueFlowSelectorKey),
+        }
+
+        let mut pending = vec![Part::Carrier(self)];
+        while let Some(part) = pending.pop() {
+            match part {
+                Part::Carrier(Self::Value {
+                    locator,
+                    role,
+                    ordinal,
+                }) => {
+                    digest.push(b"value");
+                    push_carrier_locator(digest, locator, procedure);
+                    digest.push(role.as_bytes());
+                    match ordinal {
+                        Some(ordinal) => {
+                            digest.push(b"ordinal");
+                            digest.push(&ordinal.to_le_bytes());
+                        }
+                        None => digest.push(b"no_ordinal"),
+                    }
+                }
+                Part::Carrier(Self::Port {
+                    procedure: port_procedure,
+                    kind,
+                }) => {
+                    digest.push(b"port");
+                    push_carrier_locator(digest, port_procedure, procedure);
+                    match kind {
+                        ValueFlowPortKey::Receiver => digest.push(b"receiver"),
+                        ValueFlowPortKey::Parameter { ordinal } => {
+                            digest.push(b"parameter");
+                            digest.push(&ordinal.to_le_bytes());
+                        }
+                        ValueFlowPortKey::NormalReturn => digest.push(b"normal_return"),
+                        ValueFlowPortKey::IndexedNormalReturn { ordinal } => {
+                            digest.push(b"indexed_normal_return");
+                            digest.push(&ordinal.to_le_bytes());
+                        }
+                        ValueFlowPortKey::ExceptionalReturn => digest.push(b"exceptional_return"),
+                        ValueFlowPortKey::Capture { slot } => {
+                            digest.push(b"capture");
+                            digest.push(&slot.to_le_bytes());
+                        }
+                    }
+                }
+                Part::Carrier(Self::Allocation { locator }) => {
+                    digest.push(b"allocation");
+                    push_carrier_locator(digest, locator, procedure);
+                }
+                Part::Carrier(Self::CallResult {
+                    call,
+                    result,
+                    callee,
+                }) => {
+                    digest.push(b"call_result");
+                    push_carrier_locator(digest, call, procedure);
+                    push_carrier_locator(digest, callee, procedure);
+                    pending.push(Part::Carrier(result));
+                }
+                Part::Carrier(Self::ScopedRoot { kind, locator }) => {
+                    digest.push(b"scoped_root");
+                    digest.push(match kind {
+                        ValueFlowScopedRootKind::Static => b"static",
+                        ValueFlowScopedRootKind::LexicalCell => b"lexical_cell",
+                        ValueFlowScopedRootKind::TypeSummary => b"type_summary",
+                        ValueFlowScopedRootKind::ModuleObject => b"module_object",
+                        ValueFlowScopedRootKind::External => b"external",
+                    });
+                    push_carrier_locator(digest, locator, procedure);
+                }
+                Part::Carrier(Self::Location {
+                    root,
+                    selectors,
+                    exact,
+                }) => {
+                    digest.push(b"location");
+                    digest.push(if *exact { b"exact" } else { b"prefix" });
+                    digest.push(
+                        &u64::try_from(selectors.len())
+                            .expect("value-flow selector count fits in u64")
+                            .to_le_bytes(),
+                    );
+                    for selector in selectors.iter().rev() {
+                        pending.push(Part::Selector(selector));
+                    }
+                    pending.push(Part::Carrier(root));
+                }
+                Part::Selector(ValueFlowSelectorKey::Field(locator)) => {
+                    digest.push(b"field");
+                    push_carrier_locator(digest, locator, procedure);
+                }
+                Part::Selector(ValueFlowSelectorKey::ExactIndex(index)) => {
+                    digest.push(b"exact_index");
+                    pending.push(Part::Carrier(index));
+                }
+                Part::Selector(ValueFlowSelectorKey::ConstantIndex(index)) => {
+                    digest.push(b"constant_index");
+                    digest.push(&index.to_le_bytes());
+                }
+                Part::Selector(ValueFlowSelectorKey::AnyIndex) => digest.push(b"any_index"),
+            }
+        }
+    }
+
+    /// Checkout-independent fingerprint for one stable value-flow carrier.
+    pub fn stable_fingerprint(&self) -> StableDigest {
+        let mut digest = LengthDelimitedDigest::new(b"bifrost-value-flow-carrier-key-v1");
+        self.push_stable_identity(&mut digest);
+        digest.finish()
+    }
+
     /// Conservative retained size, including boxed nested access paths.
     pub fn retained_bytes(&self) -> usize {
         let mut total = std::mem::size_of::<Self>();
@@ -309,6 +451,17 @@ impl ValueFlowCarrierKey {
             }
         }
         total
+    }
+}
+
+fn push_carrier_locator(
+    digest: &mut LengthDelimitedDigest,
+    locator: &SemanticLocator,
+    procedure: Option<&SemanticLocator>,
+) {
+    match procedure {
+        Some(procedure) => locator.push_procedure_local_identity(digest, procedure),
+        None => locator.push_stable_identity(digest),
     }
 }
 
@@ -384,6 +537,42 @@ impl ValueFlowEventKey {
 
     pub const fn kind(&self) -> ValueFlowEventKind {
         self.kind
+    }
+
+    /// Add this event's checkout-independent structured identity to `digest`.
+    pub fn push_stable_identity(&self, digest: &mut LengthDelimitedDigest) {
+        self.push_stable_identity_with(digest, None);
+    }
+
+    pub(crate) fn push_procedure_local_identity(
+        &self,
+        digest: &mut LengthDelimitedDigest,
+        procedure: &SemanticLocator,
+    ) {
+        self.push_stable_identity_with(digest, Some(procedure));
+    }
+
+    fn push_stable_identity_with(
+        &self,
+        digest: &mut LengthDelimitedDigest,
+        procedure: Option<&SemanticLocator>,
+    ) {
+        digest.push(b"value_flow_event");
+        push_carrier_locator(digest, &self.site, procedure);
+        digest.push(&self.ordinal.to_le_bytes());
+        digest.push(match self.kind {
+            ValueFlowEventKind::Source => b"source",
+            ValueFlowEventKind::Sink => b"sink",
+            ValueFlowEventKind::Sanitizer => b"sanitizer",
+            ValueFlowEventKind::Transform => b"transform",
+        });
+    }
+
+    /// Checkout-independent fingerprint for one resolved semantic event.
+    pub fn stable_fingerprint(&self) -> StableDigest {
+        let mut digest = LengthDelimitedDigest::new(b"bifrost-value-flow-event-key-v1");
+        self.push_stable_identity(&mut digest);
+        digest.finish()
     }
 
     pub fn retained_bytes(&self) -> usize {
@@ -659,5 +848,129 @@ fn selector_key(selector: &AccessSelector) -> Result<ValueFlowSelectorKey, Value
             Ok(ValueFlowSelectorKey::ConstantIndex(*index))
         }
         AccessSelector::Index(IndexSelector::Any) => Ok(ValueFlowSelectorKey::AnyIndex),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::analyzer::Language;
+    use crate::analyzer::semantic::{
+        DeclarationLocator, DeclarationSegment, DeclarationSegmentKind, SemanticLanguage,
+        SemanticRole, SourceAnchor, SourcePosition, SourceSpan, WorkspaceMountId,
+        WorkspaceRelativePath,
+    };
+
+    use super::*;
+
+    fn locator(mount: &str, role: SemanticRole, name: &str) -> SemanticLocator {
+        let span =
+            SourceSpan::new(SourcePosition::new(4, 1, 0), SourcePosition::new(8, 1, 4)).unwrap();
+        let anchor = SourceAnchor::new(span, 0);
+        SemanticLocator::new(
+            WorkspaceMountId::hash_bytes(mount),
+            WorkspaceRelativePath::new("src/fixture.py").unwrap(),
+            SemanticLanguage::Standard(Language::Python),
+            DeclarationLocator::new(vec![
+                DeclarationSegment::named(DeclarationSegmentKind::Function, name, anchor, 0)
+                    .unwrap(),
+            ])
+            .unwrap(),
+            role,
+            anchor,
+        )
+    }
+
+    fn nested_carrier(mount: &str) -> ValueFlowCarrierKey {
+        let procedure = locator(mount, SemanticRole::Procedure, "run");
+        let value = locator(mount, SemanticRole::Value, "run");
+        let call = locator(mount, SemanticRole::CallSite, "run");
+        let field = locator(mount, SemanticRole::MemoryLocation, "run");
+        ValueFlowCarrierKey::Location {
+            root: Box::new(ValueFlowCarrierKey::CallResult {
+                call,
+                result: Box::new(ValueFlowCarrierKey::Value {
+                    locator: value.clone(),
+                    role: "result".into(),
+                    ordinal: Some(u32::MAX),
+                }),
+                callee: procedure,
+            }),
+            selectors: vec![
+                ValueFlowSelectorKey::Field(field),
+                ValueFlowSelectorKey::ExactIndex(Box::new(ValueFlowCarrierKey::Value {
+                    locator: value,
+                    role: "index".into(),
+                    ordinal: None,
+                })),
+                ValueFlowSelectorKey::ConstantIndex(u128::MAX),
+                ValueFlowSelectorKey::AnyIndex,
+            ]
+            .into_boxed_slice(),
+            exact: true,
+        }
+    }
+
+    #[test]
+    fn carrier_fingerprint_is_structured_and_checkout_independent() {
+        let first = nested_carrier("first checkout");
+        let second = nested_carrier("second checkout");
+        assert_ne!(first, second, "mounted locators retain exact equality");
+        assert_eq!(first.stable_fingerprint(), second.stable_fingerprint());
+
+        let mut prefix = first.clone();
+        let ValueFlowCarrierKey::Location { exact, .. } = &mut prefix else {
+            unreachable!("fixture is a location")
+        };
+        *exact = false;
+        assert_ne!(first.stable_fingerprint(), prefix.stable_fingerprint());
+    }
+
+    #[test]
+    fn carrier_fingerprint_handles_deep_access_paths_iteratively() {
+        let locator = locator("mount", SemanticRole::Value, "run");
+        let mut carrier = ValueFlowCarrierKey::Value {
+            locator,
+            role: "seed".into(),
+            ordinal: None,
+        };
+        for index in 0..4_096_u128 {
+            carrier = ValueFlowCarrierKey::Location {
+                root: Box::new(carrier),
+                selectors: vec![ValueFlowSelectorKey::ConstantIndex(index)].into_boxed_slice(),
+                exact: true,
+            };
+        }
+        assert_ne!(carrier.stable_fingerprint().as_bytes(), &[0; 32]);
+    }
+
+    #[test]
+    fn event_fingerprint_partitions_kind_and_ordinal_but_not_mount() {
+        let event = ValueFlowEventKey {
+            site: locator("first checkout", SemanticRole::ProgramPoint, "run"),
+            ordinal: 7,
+            kind: ValueFlowEventKind::Source,
+        };
+        let remounted = ValueFlowEventKey {
+            site: locator("second checkout", SemanticRole::ProgramPoint, "run"),
+            ..event.clone()
+        };
+        assert_eq!(event.stable_fingerprint(), remounted.stable_fingerprint());
+
+        let changed_ordinal = ValueFlowEventKey {
+            ordinal: 8,
+            ..event.clone()
+        };
+        let changed_kind = ValueFlowEventKey {
+            kind: ValueFlowEventKind::Sink,
+            ..event.clone()
+        };
+        assert_ne!(
+            event.stable_fingerprint(),
+            changed_ordinal.stable_fingerprint()
+        );
+        assert_ne!(
+            event.stable_fingerprint(),
+            changed_kind.stable_fingerprint()
+        );
     }
 }

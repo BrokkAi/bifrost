@@ -1631,10 +1631,12 @@ pub fn concurrent_access_conflicts(
             } else {
                 None
             };
+            let mut spawned_any_task = false;
             for (targets, group, bind_invocation) in
                 direct_targets.into_iter().chain(modeled_spawns)
             {
                 for target in targets {
+                    spawned_any_task = true;
                     let child = TaskId(u32::try_from(tasks.len()).map_err(|_| {
                         SemanticProviderError::internal("concurrency task count exceeds u32")
                     })?);
@@ -1673,6 +1675,16 @@ pub fn concurrent_access_conflicts(
                         procedure: target,
                     });
                 }
+            }
+            // A spawn always runs a body. Reaching none means the body was not
+            // found, not that there is nothing to analyze, and the difference
+            // matters: an unreported empty spawn leaves the parent's accesses
+            // with nothing to compare against, so a real race reads as a clean
+            // and complete run. An ordinary call may legitimately reach no body
+            // -- a reviewed external is described by its effects -- which is
+            // why only the detached case claims this.
+            if detached && !spawned_any_task {
+                report.reasons.push(ConcurrencyOpenReason::UnresolvedTarget);
             }
 
             if !detached {
@@ -2278,14 +2290,46 @@ fn canonicalize_access(
         .expect("validated access location exists");
     match &row.kind {
         MemoryLocationKind::Static { member } => {
-            let canonical =
-                CanonicalConcurrencyLocation::new(format!("static:{member:?}"), "static");
-            Ok(CanonicalizedAccess {
-                canonical: Some(canonical.clone()),
-                resolved_location: ResolvedConcurrencyLocation::exact(canonical),
-                reasons: Vec::new(),
-                index_alias_domain: None,
-                field_alias_domain: None,
+            // A producer that resolved the declaration stored that
+            // declaration's own locator, so rendering it is an identity every
+            // file agrees on. A producer that could not -- Go's `pkg.Name`
+            // through an import, whose declaring file an intra-file adapter
+            // must not read -- says so with a gap on the location, and stored a
+            // use site instead. Rendering that would claim two occurrences of
+            // one variable name different storage. Ask the provider, which can
+            // see the workspace, to resolve it.
+            // Every static goes to the provider, not only the ones a producer
+            // marked unresolved. A file that declares the variable stores the
+            // declaration's locator and a file that imports it stores a use
+            // site, so canonicalizing the two differently would mean the
+            // declaring and importing sides of one variable never meet, which
+            // is the whole defect. One resolver answers for both.
+            let _ = member;
+            let answer =
+                provider.canonical_location(&context.procedure, point, location, request)?;
+            let (canonical, reasons) = match answer {
+                ConcurrencyAnswer::Proven(canonical) => (canonical, Vec::new()),
+                ConcurrencyAnswer::Open { partial, reasons } => (partial, reasons),
+            };
+            Ok(match canonical {
+                Some(canonical) => CanonicalizedAccess {
+                    canonical: Some(canonical.clone()),
+                    resolved_location: ResolvedConcurrencyLocation::exact(canonical),
+                    reasons,
+                    index_alias_domain: None,
+                    field_alias_domain: None,
+                },
+                None => CanonicalizedAccess {
+                    canonical: None,
+                    resolved_location: ResolvedConcurrencyLocation::unknown(),
+                    reasons: if reasons.is_empty() {
+                        vec![ConcurrencyOpenReason::UnknownLocation]
+                    } else {
+                        reasons
+                    },
+                    index_alias_domain: None,
+                    field_alias_domain: None,
+                },
             })
         }
         MemoryLocationKind::LexicalCell { .. } | MemoryLocationKind::Capture { .. } => {

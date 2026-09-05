@@ -4722,6 +4722,46 @@ impl<'a> CppVisitor<'a> {
         }
     }
 
+    /// Index only anonymous aggregate declarations from an ordinary C
+    /// function body. Function bodies are otherwise outside the declaration
+    /// walk, but their anonymous aggregate owners must exist so structured
+    /// local binding inference can name their fields (#2994).
+    fn visit_c_anonymous_local_aggregates_in_function<'tree>(
+        &mut self,
+        function: Node<'tree>,
+        scope: &ScopeInfo,
+        stack: &mut Vec<CppWork<'tree>>,
+        ancestry: &ParentIndex<'tree>,
+    ) {
+        if !self.c_tag_semantics || scope.class_unit.is_some() {
+            return;
+        }
+        let Some(body) = cpp_body_node(function) else {
+            return;
+        };
+        let mut pending = vec![body];
+        while let Some(node) = pending.pop() {
+            if matches!(node.kind(), "function_definition" | "lambda_expression") {
+                continue;
+            }
+            if node.kind() == "declaration"
+                && self.visit_c_anonymous_local_aggregate_declaration(node, scope, stack, ancestry)
+            {
+                continue;
+            }
+            if matches!(
+                node.kind(),
+                "class_specifier" | "struct_specifier" | "union_specifier"
+            ) {
+                continue;
+            }
+            let mut cursor = node.walk();
+            let mut children = node.named_children(&mut cursor).collect::<Vec<_>>();
+            children.reverse();
+            pending.extend(children);
+        }
+    }
+
     fn visit_error_swallowed_function_declaration<'tree>(
         &mut self,
         node: Node<'tree>,
@@ -5676,6 +5716,7 @@ impl<'a> CppVisitor<'a> {
         } else if let Some(module) = &scope.module {
             self.parsed.add_child(module.clone(), code_unit);
         }
+        self.visit_c_anonymous_local_aggregates_in_function(node, scope, stack, ancestry);
     }
 
     /// Recover the namespace lost when tree-sitter promotes an export-macro
@@ -9083,8 +9124,8 @@ fn render_cpp_field_signature(node: Node<'_>, declarator: Node<'_>, source: &str
         && recovered.declarator == declarator
     {
         let type_text = normalize_cpp_whitespace(node_text(recovered.type_node, source));
-        let name = normalize_cpp_whitespace(node_text(recovered.declarator, source));
-        return format!("{type_text} {name};");
+        let declarator = normalize_cpp_whitespace(node_text(recovered.declarator, source));
+        return format!("{type_text} {declarator};");
     }
     if let Some(recovered) = recovered_function_like_field_declarator(node, source)
         && recovered.name == declarator
@@ -13833,13 +13874,30 @@ fn cpp_is_stray_semicolon(node: Node<'_>, source: &str) -> bool {
 ///
 /// For `PyObject_HEAD Imaging image;`, the CST has `PyObject_HEAD` as the
 /// field type, `Imaging` as the field declarator, and a trailing ERROR whose
-/// sole child is the real field identifier. The shape is intentionally exact:
-/// a pointer declarator and similarly malformed fields do not provide the
-/// same evidence that this is the CPython macro boundary.
+/// sole child is the real field declarator. The tail may wrap that identifier
+/// in pointer declarators, as in `PyObject_HEAD ImagingObject *image;`; other
+/// malformed wrappers do not provide the same evidence that this is the
+/// CPython macro boundary.
 #[derive(Clone, Copy)]
 pub(crate) struct RecoveredPyObjectHeadField<'tree> {
     pub(crate) type_node: Node<'tree>,
+    pub(crate) name: Node<'tree>,
     pub(crate) declarator: Node<'tree>,
+}
+
+impl RecoveredPyObjectHeadField<'_> {
+    pub(crate) fn pointer_depth(self) -> i32 {
+        let mut depth = 0;
+        let mut current = self.declarator;
+        while current != self.name {
+            debug_assert_eq!(current.kind(), "pointer_declarator");
+            depth += 1;
+            current = current
+                .child_by_field_name("declarator")
+                .expect("recovered PyObject field pointer has an inner declarator");
+        }
+        depth
+    }
 }
 
 pub(crate) fn recovered_pyobject_head_field<'tree>(
@@ -13856,9 +13914,6 @@ pub(crate) fn recovered_pyobject_head_field<'tree>(
         return None;
     }
     let pseudo_declarator = node.child_by_field_name("declarator")?;
-    if pseudo_declarator.kind() != "field_identifier" {
-        return None;
-    }
     let mut cursor = node.walk();
     let errors = node
         .named_children(&mut cursor)
@@ -13867,13 +13922,34 @@ pub(crate) fn recovered_pyobject_head_field<'tree>(
     let [error] = errors.as_slice() else {
         return None;
     };
-    if error.start_byte() < pseudo_declarator.end_byte() || error.named_child_count() != 1 {
+    if error.named_child_count() != 1 {
         return None;
     }
-    let declarator = error.named_child(0)?;
-    (declarator.kind() == "identifier").then_some(RecoveredPyObjectHeadField {
-        type_node: pseudo_declarator,
-        declarator,
+    let error_child = error.named_child(0)?;
+    if pseudo_declarator.kind() == "field_identifier"
+        && error.start_byte() >= pseudo_declarator.end_byte()
+        && error_child.kind() == "identifier"
+    {
+        return Some(RecoveredPyObjectHeadField {
+            type_node: pseudo_declarator,
+            name: error_child,
+            declarator: error_child,
+        });
+    }
+    if pseudo_declarator.kind() != "pointer_declarator"
+        || error.end_byte() > pseudo_declarator.start_byte()
+        || error_child.kind() != "identifier"
+    {
+        return None;
+    }
+    let mut name = pseudo_declarator;
+    while name.kind() == "pointer_declarator" {
+        name = name.child_by_field_name("declarator")?;
+    }
+    (name.kind() == "field_identifier").then_some(RecoveredPyObjectHeadField {
+        type_node: error_child,
+        name,
+        declarator: pseudo_declarator,
     })
 }
 
@@ -20692,6 +20768,38 @@ public:
         assert_eq!(
             render_cpp_field_signature(declaration, name, source),
             "struct handshake * handshake;"
+        );
+    }
+
+    #[test]
+    fn pyobject_head_pointer_field_keeps_its_structured_name_and_type() {
+        let source = "struct Holder { PyObject_HEAD ImagingObject *image; };";
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_cpp::LANGUAGE.into())
+            .expect("C++ grammar");
+        let tree = parser.parse(source, None).expect("fixture tree");
+        let mut stack = vec![tree.root_node()];
+        let mut recovered = None;
+        while let Some(node) = stack.pop() {
+            if let Some(field) = recovered_pyobject_head_field(node, source) {
+                recovered = Some((node, field));
+                break;
+            }
+            let mut cursor = node.walk();
+            stack.extend(node.named_children(&mut cursor));
+        }
+        let (declaration, recovered) = recovered.unwrap_or_else(|| {
+            panic!(
+                "pointer field after PyObject_HEAD was not recovered: {}",
+                tree.root_node().to_sexp()
+            )
+        });
+        assert_eq!(node_text(recovered.name, source), "image");
+        assert_eq!(recovered.pointer_depth(), 1);
+        assert_eq!(
+            render_cpp_field_signature(declaration, recovered.declarator, source),
+            "ImagingObject *image;"
         );
     }
 }

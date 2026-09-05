@@ -567,7 +567,6 @@ fn bifrost_searchtools_server_speaks_mcp_stdio() {
             "report_long_method_and_god_object_smells",
             "report_dead_code_and_unused_abstraction_smells",
             "report_secret_like_code",
-            "classify_test_files",
         ];
         expected
     });
@@ -1891,111 +1890,44 @@ fn bifrost_mcp_lists_and_runs_built_in_policies() {
     assert!(status.success(), "bifrost exited unsuccessfully: {status}");
 }
 
+/// `cli` is no longer an agent-facing toolset (issue #1116): a 40-run
+/// BrokkBench sweep made zero agent calls to `classify_test_files` against
+/// dozens of calls to the symbol tools. `--mcp cli`, and a composition that
+/// names it such as `symbol|cli`, must fail before the server ever answers a
+/// request, with a structured error naming the tool and the `--tool` path --
+/// not a server that silently starts without it.
+///
+/// `classify_test_files` itself stays reachable through `bifrost --tool
+/// classify_test_files`; see
+/// `tests/suite_mcp_cli/bifrost_tool_cli.rs::tool_classify_test_files_runs_without_an_mcp_toolset`
+/// for that coverage.
 #[test]
-fn bifrost_cli_toolset_exposes_classify_test_files() {
+fn bifrost_mcp_cli_mode_is_rejected() {
     let fixture_root = TempDir::new().expect("temp dir");
-    fs::create_dir_all(fixture_root.path().join("src/test/java")).expect("test dir");
-    fs::create_dir_all(fixture_root.path().join("src/main/java")).expect("main dir");
-    fs::write(
-        fixture_root.path().join("SampleTest.java"),
-        r#"
-        import org.junit.jupiter.api.Test;
 
-        public class SampleTest {
-            @Test
-            void works() {}
-        }
-        "#,
-    )
-    .expect("write test file");
-    fs::write(
-        fixture_root.path().join("src/test/java/Helper.java"),
-        r#"
-        public class Helper {
-            String value() { return "ok"; }
-        }
-        "#,
-    )
-    .expect("write helper file");
-    fs::write(
-        fixture_root.path().join("src/main/java/Production.java"),
-        r#"
-        public class Production {
-            void works() {}
-        }
-        "#,
-    )
-    .expect("write production file");
-
-    let mut child = spawn_server(fixture_root.path(), "cli", &[]);
-    let mut stdin = child.stdin.take().expect("stdin");
-    let stdout = child.stdout.take().expect("stdout");
-    let mut stderr = child.stderr.take().expect("stderr");
-    let mut reader = BufReader::new(stdout);
-
-    initialize_session(&mut stdin, &mut reader, &mut stderr);
-
-    let list_tools = round_trip(
-        &mut stdin,
-        &mut reader,
-        &mut stderr,
-        json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }),
-    );
-    let tools = list_tools["result"]["tools"]
-        .as_array()
-        .expect("tools array");
-    assert!(
-        tool_names(tools).contains(&"classify_test_files"),
-        "cli toolset should advertise classify_test_files: {list_tools}"
-    );
-
-    let response = round_trip(
-        &mut stdin,
-        &mut reader,
-        &mut stderr,
-        json!({
-            "jsonrpc": "2.0",
-            "id": 2,
-            "method": "tools/call",
-            "params": {
-                "name": "classify_test_files",
-                "arguments": {
-                    "file_paths": [
-                        "SampleTest.java",
-                        "src/test/java/Helper.java",
-                        "src/main/java/Production.java",
-                        "Missing.java"
-                    ]
-                }
-            }
-        }),
-    );
-    assert_eq!(response["result"]["isError"], false, "{response}");
-    assert_eq!(
-        response["result"]["structuredContent"],
-        json!({
-            "classifications": {
-                "SampleTest.java": {
-                    "kind": "test",
-                    "contains_test_code": true
-                },
-                "src/main/java/Production.java": {
-                    "kind": "production",
-                    "contains_test_code": false
-                },
-                "src/test/java/Helper.java": {
-                    "kind": "test_support",
-                    "contains_test_code": false
-                }
-            },
-            "unresolved": ["Missing.java"]
-        }),
-        "{response}"
-    );
-
-    drop(stdin);
-    let status = child.wait().expect("wait bifrost");
-    assert!(status.success(), "bifrost exited unsuccessfully: {status}");
+    for mode in ["cli", "symbol|cli"] {
+        let mut child = spawn_server(fixture_root.path(), mode, &[]);
+        let status = child.wait().expect("wait bifrost");
+        assert!(
+            !status.success(),
+            "bifrost --mcp {mode} should fail to start: {status}"
+        );
+        let mut stderr_text = String::new();
+        child
+            .stderr
+            .take()
+            .expect("stderr")
+            .read_to_string(&mut stderr_text)
+            .expect("read stderr");
+        assert!(
+            stderr_text.contains("classify_test_files"),
+            "stderr should name classify_test_files for mode {mode}: {stderr_text}"
+        );
+        assert!(
+            stderr_text.contains("--tool classify_test_files"),
+            "stderr should point at the --tool path for mode {mode}: {stderr_text}"
+        );
+    }
 }
 
 #[test]

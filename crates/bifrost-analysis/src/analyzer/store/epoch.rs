@@ -853,12 +853,24 @@ pub(super) fn rust_epoch_before_anchored_fq_encoding() -> String {
 // modifiers", so `receiver_contract_of` reports no contract and every PHP
 // procedure summary stays inert on a warm workspace with no error raised
 // anywhere.
+// Salt bumped again (#1713): the PHP declaration walk now records the file's
+// imported type names in `type_identifiers`, resolved to absolute FQ names
+// through the namespace and `use` context they are written in. PHP wrote no
+// row of that family at all before, so a warm workspace answers
+// `imported_code_units_of` with the empty set for every file and loses the
+// whole PHP import graph.
 lang_epoch!(
     Php,
     "php",
     "treesitter/php/",
-    "synthetic-file-scope-code-units-2026-07;ast-test-detection-2026-07;fq-interned-segments-2026-07;conditional-free-function-declarations-2026-07;php-query-assets-in-brokk-bifrost-php-2026-08;structured-declared-return-identities-2026-08;php-callable-modifier-metadata-2026-09"
+    "synthetic-file-scope-code-units-2026-07;ast-test-detection-2026-07;fq-interned-segments-2026-07;conditional-free-function-declarations-2026-07;php-query-assets-in-brokk-bifrost-php-2026-08;structured-declared-return-identities-2026-08;php-callable-modifier-metadata-2026-09;php-imported-type-names-2026-09"
 );
+
+#[cfg(test)]
+pub(super) fn php_epoch_before_imported_type_names() -> String {
+    let prior = salt_before_bump(Php::SALT, "php-imported-type-names-2026-09");
+    compute_epoch::<Php>(&tree_sitter_php::LANGUAGE_PHP.into(), prior)
+}
 
 /// The PHP epoch as it stood before the #1420 conditional-free-function bump.
 ///

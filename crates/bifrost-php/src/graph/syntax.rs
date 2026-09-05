@@ -1,12 +1,12 @@
 use super::resolver::node_text;
 use crate::adapter::php_signature_return_type_text;
 use crate::aliases::{
-    PhpDeclaredType, PhpFileContext, php_dynamic_type_keyword, resolve_php_function_node,
-    resolve_php_type, resolve_php_type_arms,
+    PhpDeclaredType, PhpFileContext, PhpFileContextIndex, php_dynamic_type_keyword,
+    resolve_php_function_node, resolve_php_type, resolve_php_type_arms,
 };
 use crate::graph::PhpGraphSource;
 use crate::graph_support::PhpSource;
-use crate::graph_support::{php_direct_declared_class_parent, php_file_context_from_source};
+use crate::graph_support::php_direct_declared_class_parent;
 use crate::phpdoc::{
     parameter_element_type as phpdoc_parameter_element_type,
     return_element_type as phpdoc_return_element_type,
@@ -228,6 +228,22 @@ pub fn object_creation_type(node: Node<'_>) -> Option<Node<'_>> {
     let mut cursor = node.walk();
     node.named_children(&mut cursor)
         .find(|child| matches!(child.kind(), "name" | "qualified_name" | "relative_scope"))
+}
+
+/// The type name a `binary_expression` spells on the right of `instanceof`.
+///
+/// `$x instanceof Foo` is a type reference like any other, but the grammar
+/// spells it as a plain `name`/`qualified_name` under the operator rather than
+/// as a `named_type`, so the shape has to be recognized from the operator.
+pub fn instanceof_type_node(node: Node<'_>) -> Option<Node<'_>> {
+    if node.kind() != "binary_expression" {
+        return None;
+    }
+    let operator = node.child_by_field_name("operator")?;
+    if operator.kind() != "instanceof" {
+        return None;
+    }
+    node.child_by_field_name("right")
 }
 
 pub fn static_member_parts(node: Node<'_>) -> Option<(Node<'_>, Node<'_>)> {
@@ -835,8 +851,9 @@ fn declared_relative_field_type_fq_name(
     )?;
     let type_node = declaration.child_by_field_name("type")?;
     let keyword = relative_declared_type_keyword(type_node, &source, || true)?;
-    let ctx = php_file_context_from_source(php, field.source(), &source);
-    static_scope_type_fq_name(php, analyzer, keyword, &ctx, Some(owner.fq_name().as_str()))
+    let contexts = PhpFileContextIndex::from_tree(tree.root_node(), &source, || true)?;
+    let ctx = contexts.context_at(declaration.start_byte());
+    static_scope_type_fq_name(php, analyzer, keyword, ctx, Some(owner.fq_name().as_str()))
 }
 
 /// Return the single relative class keyword proved by a declared type node.
@@ -916,7 +933,8 @@ pub fn declared_field_element_type_fq_name(
         php.ranges(field).as_slice(),
         || true,
     )?;
-    let ctx = php_file_context_from_source(php, field.source(), &source);
+    let contexts = PhpFileContextIndex::from_tree(tree.root_node(), &source, || true)?;
+    let ctx = contexts.context_at(declaration.start_byte());
     infer_indexed_field_element_type(
         declaration,
         &source,
@@ -930,12 +948,12 @@ pub fn declared_field_element_type_fq_name(
                     php,
                     analyzer,
                     node_text(type_node, &source),
-                    &ctx,
+                    ctx,
                     Some(owner.fq_name().as_str()),
                 );
             }
             let type_node = parameter_type_node(right, &source, || true)?;
-            let mut arms = resolve_php_type_arms(node_text(type_node, &source), &ctx);
+            let mut arms = resolve_php_type_arms(node_text(type_node, &source), ctx);
             (arms.len() == 1).then(|| arms.remove(0))
         },
     )
@@ -948,7 +966,7 @@ pub fn declared_field_element_type_fq_name(
             || true,
         )?;
         let raw = phpdoc_var_element_type(declaration_doc_comment(field_declaration, &source)?)?;
-        resolve_php_type(&raw, &ctx)
+        resolve_php_type(&raw, ctx)
     })
     .or_else(|| {
         let field_declaration = declaration_node_for_unit(
@@ -959,7 +977,7 @@ pub fn declared_field_element_type_fq_name(
             || true,
         )?;
         let raw = promoted_property_doc_element_type(field_declaration, &source, || true)?;
-        resolve_php_type(&raw, &ctx)
+        resolve_php_type(&raw, ctx)
     })
     .or_else(|| {
         infer_constructor_assigned_field_type(
@@ -969,7 +987,7 @@ pub fn declared_field_element_type_fq_name(
             || true,
             |right| {
                 let raw = parameter_doc_element_type(right, &source, || true)?;
-                resolve_php_type(&raw, &ctx)
+                resolve_php_type(&raw, ctx)
             },
         )
     })
@@ -1005,7 +1023,8 @@ fn inferred_constructor_field_type_fq_name(
         php.ranges(field).as_slice(),
         || true,
     )?;
-    let ctx = php_file_context_from_source(php, field.source(), &source);
+    let contexts = PhpFileContextIndex::from_tree(tree.root_node(), &source, || true)?;
+    let ctx = contexts.context_at(declaration.start_byte());
     infer_constructor_assigned_field_type(
         declaration,
         &source,
@@ -1019,12 +1038,12 @@ fn inferred_constructor_field_type_fq_name(
                     php,
                     analyzer,
                     node_text(type_node, &source),
-                    &ctx,
+                    ctx,
                     Some(owner.fq_name().as_str()),
                 );
             }
             let type_node = constructor_parameter_type_node(right, &source, || true)?;
-            let mut arms = resolve_php_type_arms(node_text(type_node, &source), &ctx);
+            let mut arms = resolve_php_type_arms(node_text(type_node, &source), ctx);
             (arms.len() == 1).then(|| arms.remove(0))
         },
     )
@@ -1043,7 +1062,7 @@ fn inferred_constructor_field_type_fq_name(
                     php,
                     analyzer,
                     node_text(type_node, &source),
-                    &ctx,
+                    ctx,
                     Some(owner.fq_name().as_str()),
                 )
             },
@@ -1531,8 +1550,9 @@ where
         || true,
     )?;
     let raw = fact(declaration_doc_comment(declaration, &source)?)?;
-    let ctx = php_file_context_from_source(php, unit.source(), &source);
-    resolve_php_type(&raw, &ctx)
+    let contexts = PhpFileContextIndex::from_tree(tree.root_node(), &source, || true)?;
+    let ctx = contexts.context_at(declaration.start_byte());
+    resolve_php_type(&raw, ctx)
 }
 
 pub fn collection_element_type_fq_name(
@@ -2201,8 +2221,30 @@ fn signature_declared_type(
     let Ok(source) = unit.source().read_to_string() else {
         return PhpDeclaredType::Unknown;
     };
-    let ctx = php_file_context_from_source(php, unit.source(), &source);
-    PhpDeclaredType::nominal(resolve_php_type_arms(raw, &ctx))
+    let mut parser = Parser::new();
+    if parser
+        .set_language(&tree_sitter_php::LANGUAGE_PHP.into())
+        .is_err()
+    {
+        return PhpDeclaredType::Unknown;
+    }
+    let Some(tree) = parser.parse(source.as_str(), None) else {
+        return PhpDeclaredType::Unknown;
+    };
+    let Some(contexts) = PhpFileContextIndex::from_tree(tree.root_node(), &source, || true) else {
+        return PhpDeclaredType::Unknown;
+    };
+    let Some(declaration) = declaration_node_for_unit(
+        tree.root_node(),
+        &source,
+        unit,
+        php.ranges(unit).as_slice(),
+        || true,
+    ) else {
+        return PhpDeclaredType::Unknown;
+    };
+    let ctx = contexts.context_at(declaration.start_byte());
+    PhpDeclaredType::nominal(resolve_php_type_arms(raw, ctx))
 }
 
 /// The member surface a PHP reference addresses.

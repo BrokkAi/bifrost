@@ -18,13 +18,13 @@ use crate::analyzer::semantic_model::ActiveSemanticModelSnapshot;
 use crate::analyzer::{Language, ProjectFile, WorkspaceAnalyzer};
 use crate::dataflow::{DataflowRequest, SolverBudget};
 use crate::hash::HashMap;
-use crate::value_flow::ClosureLimits;
+use crate::value_flow::{ClosureLimits, ValueFlowCache};
 
-use super::FieldSlotIndex;
 use super::solve::{
     AbsentMemberFinding, ClassSetStatus, FeedbackLimits, ReceiverClassSet, TypeFlowError,
     TypeFlowRootResult, solve_type_flow_for_root,
 };
+use super::{FieldSlotIndex, TypeFlowSummaryState};
 
 /// Durable identity of one member access: the file, the receiver span, and
 /// the member name survive re-materialization; handles do not.
@@ -184,6 +184,8 @@ pub fn solve_type_flow_workspace(
     cancellation: &CancellationToken,
 ) -> Result<TypeFlowReport, TypeFlowError> {
     let active_semantic_model_snapshot = workspace.analyzer().active_semantic_model_snapshot();
+    let value_flow_cache = ValueFlowCache::default();
+    let summary_state = TypeFlowSummaryState::default();
     let mut report = TypeFlowReport::default();
     for language in Language::ANALYZABLE {
         let Some(adapter) = type_flow_adapter(language) else {
@@ -196,12 +198,15 @@ pub fn solve_type_flow_workspace(
             &budget,
             cancellation,
             active_semantic_model_snapshot.clone(),
+            value_flow_cache.clone(),
+            summary_state.clone(),
             &mut report,
         )?;
     }
     Ok(report)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn solve_language(
     workspace: &WorkspaceAnalyzer,
     adapter: &dyn TypeFlowAdapter,
@@ -209,6 +214,8 @@ fn solve_language(
     budget: &SolverBudget,
     cancellation: &CancellationToken,
     active_semantic_model_snapshot: Option<Arc<ActiveSemanticModelSnapshot>>,
+    value_flow_cache: ValueFlowCache,
+    summary_state: TypeFlowSummaryState,
     report: &mut TypeFlowReport,
 ) -> Result<(), TypeFlowError> {
     let mut field_slot_budget = SemanticBudget::default();
@@ -251,6 +258,8 @@ fn solve_language(
                 active_semantic_model_snapshot.clone(),
                 limits,
                 FeedbackLimits::default(),
+                value_flow_cache.clone(),
+                summary_state.clone(),
                 &mut semantic_budget,
                 &mut request,
             ) {

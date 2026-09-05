@@ -14,13 +14,14 @@ use std::path::Path;
 
 use brokk_bifrost_core::profiling;
 
+use crate::analyzer::read_ledger::ReadKey;
 use crate::analyzer::semantic::{
-    CallSiteId, CancellationToken, ClassAtom, ClassIdentity, ClassSeed, EvidenceCompleteness,
-    GuardArmSide, GuardPredicate, MemberAccessKind, MemberAccessQuery, MemoryLocationKind,
-    NarrowingVerdict, ProcedureHandle, ProcedurePortHandle, ProgramPointHandle, ProgramPointId,
-    ProofStatus, SemanticBudget, SemanticCallSite, SemanticEffect, SemanticLocator,
-    SemanticProviderError, SemanticValueKind, SourceSite, SourceSiteKind, SourceSpan,
-    TypeFlowAdapter, UnknownReason,
+    CallSiteId, CancellationToken, ClassAtom, ClassIdentity, ClassSeed, DispatchReadAttribution,
+    DispatchReadUnattributedReason, EvidenceCompleteness, GuardArmSide, GuardPredicate,
+    MemberAccessKind, MemberAccessQuery, MemoryLocationKind, NarrowingVerdict, ProcedureHandle,
+    ProcedurePortHandle, ProgramPointHandle, ProgramPointId, ProofStatus, SemanticBudget,
+    SemanticCallSite, SemanticEffect, SemanticLocator, SemanticProviderError, SemanticValueKind,
+    SourceSite, SourceSiteKind, SourceSpan, TypeFlowAdapter, UnknownReason,
 };
 use crate::analyzer::{ProjectFile, WorkspaceAnalyzer};
 use crate::dataflow::SemanticInputStatus;
@@ -30,11 +31,11 @@ use crate::dataflow::{
 };
 use crate::hash::HashMap;
 use crate::value_flow::{
-    BindingCoverage, CallSiteCoverage, ClosureLimits, DiscoveredClosure, DispatchStatus,
-    DurableProcedureKey, ValueFlowCarrier, ValueFlowEdgeKillSpec, ValueFlowEventKey,
-    ValueFlowEventKind, ValueFlowObservationPhase, ValueFlowPlan, ValueFlowPlanError,
-    ValueFlowSinkId, ValueFlowSinkSpec, ValueFlowSourceId, ValueFlowSourceSpec,
-    WorkspaceValueFlowProvider, discover_closure_with,
+    BindingCoverage, CallSiteCoverage, ClosureLimits, DiscoveredClosure, DispatchReadCollector,
+    DispatchStatus, DurableProcedureKey, ProcedureDispatchRead, ValueFlowCarrier,
+    ValueFlowEdgeKillSpec, ValueFlowEventKey, ValueFlowEventKind, ValueFlowObservationPhase,
+    ValueFlowPlan, ValueFlowPlanError, ValueFlowSinkId, ValueFlowSinkSpec, ValueFlowSourceId,
+    ValueFlowSourceSpec, WorkspaceValueFlowProvider, discover_closure_with,
 };
 use crate::{ProcedureSummaryBindingError, bind_active_unmaterialized_procedure_summaries};
 
@@ -42,7 +43,7 @@ use super::field_slots::{FieldSlotIndex, receiver_values};
 use crate::scalar_state::BindingOriginIndex;
 
 /// One member access whose receiver's class set the solve computes.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MemberAccessSite {
     pub procedure: ProcedureHandle,
     pub point: ProgramPointHandle,
@@ -53,6 +54,19 @@ pub struct MemberAccessSite {
     pub span: SourceSpan,
     pub member: Box<str>,
     pub kind: MemberAccessKind,
+}
+
+/// The exact dispatch inputs read while discovering one procedure.
+///
+/// `Complete` is authoritative even when its slice is empty: the procedure
+/// was in the discovered closure and crossed no dispatch funnel. One or more
+/// `Unattributed` reasons instead make the contract unusable for summary
+/// publication; attributed reads observed alongside them are deliberately not
+/// exposed as if they were complete.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProcedureDispatchReadContract {
+    Complete(Box<[ReadKey]>),
+    Unattributed(Box<[DispatchReadUnattributedReason]>),
 }
 
 /// A root's value-flow plan plus the class-set tables keyed by its ids.
@@ -69,7 +83,60 @@ pub struct TypeFlowPlan {
     source_sites: Vec<SourceSite>,
     sinks: Vec<MemberAccessSite>,
     coverage: HashMap<(DurableProcedureKey, CallSiteId), CallSiteCoverage>,
+    dispatch_reads: HashMap<DurableProcedureKey, ProcedureDispatchReadContract>,
     field_slot_semantic_budget_exhausted: bool,
+}
+
+fn canonical_dispatch_read_contract(
+    attributions: impl IntoIterator<Item = DispatchReadAttribution>,
+) -> ProcedureDispatchReadContract {
+    let mut reads = Vec::new();
+    let mut unattributed = Vec::new();
+    for attribution in attributions {
+        match attribution {
+            DispatchReadAttribution::Attributed(read) => reads.push(read),
+            DispatchReadAttribution::Unattributed(reason) => unattributed.push(reason),
+        }
+    }
+    reads.sort_unstable();
+    reads.dedup();
+    unattributed.sort_unstable();
+    unattributed.dedup();
+    if unattributed.is_empty() {
+        ProcedureDispatchReadContract::Complete(reads.into_boxed_slice())
+    } else {
+        ProcedureDispatchReadContract::Unattributed(unattributed.into_boxed_slice())
+    }
+}
+
+fn canonical_dispatch_read_contracts(
+    procedures: &[ProcedureHandle],
+    observations: Vec<ProcedureDispatchRead>,
+) -> HashMap<DurableProcedureKey, ProcedureDispatchReadContract> {
+    let mut pending = HashMap::default();
+    for procedure in procedures {
+        let previous = pending.insert(
+            procedure.durable_key(),
+            Vec::<DispatchReadAttribution>::new(),
+        );
+        assert!(
+            previous.is_none(),
+            "the discovered closure contains each procedure exactly once"
+        );
+    }
+    for observation in observations {
+        let (caller, attribution) = observation.into_parts();
+        let contract = pending
+            .get_mut(&caller.durable_key())
+            .expect("every dispatch observation belongs to a discovered procedure");
+        contract.push(attribution);
+    }
+    pending
+        .into_iter()
+        .map(|(procedure, attributions)| {
+            (procedure, canonical_dispatch_read_contract(attributions))
+        })
+        .collect()
 }
 
 /// Why one root's class-set plan could not be built.
@@ -333,15 +400,25 @@ impl TypeFlowPlan {
         semantic_budget: &mut SemanticBudget,
         cancellation: &CancellationToken,
     ) -> Result<Self, TypeFlowPlanError> {
+        let dispatch_reads = DispatchReadCollector::default();
         let closure = {
             let _scope = profiling::scope("type_flow.discovery");
-            discover_closure_with(provider, root, limits, semantic_budget, cancellation)
-                .map_err(TypeFlowPlanError::Discovery)?
+            let observed_provider = provider.observing_dispatch_reads(dispatch_reads.clone());
+            discover_closure_with(
+                &observed_provider,
+                root,
+                limits,
+                semantic_budget,
+                cancellation,
+            )
+            .map_err(TypeFlowPlanError::Discovery)?
         };
         let _scope = profiling::scope("type_flow.plan_build");
         if closure.root_snapshot.is_none() {
             return Err(TypeFlowPlanError::RootRelationsUnavailable);
         }
+        let dispatch_reads =
+            canonical_dispatch_read_contracts(&closure.procedures, dispatch_reads.observations());
         let root_key = root.durable_key();
         let mut unmaterialized_external_targets = closure
             .boundaries
@@ -457,6 +534,7 @@ impl TypeFlowPlan {
             source_sites,
             sinks: member_sites,
             coverage: closure.coverage,
+            dispatch_reads,
             field_slot_semantic_budget_exhausted: field_slots.semantic_budget_exhausted(),
         })
     }
@@ -475,6 +553,15 @@ impl TypeFlowPlan {
 
     pub fn sink(&self, sink: ValueFlowSinkId) -> &MemberAccessSite {
         &self.sinks[sink.index()]
+    }
+
+    /// The canonical dispatch-read contract for one procedure in this plan's
+    /// discovered closure. A procedure outside the closure has no contract.
+    pub fn dispatch_read_contract(
+        &self,
+        procedure: &DurableProcedureKey,
+    ) -> Option<&ProcedureDispatchReadContract> {
+        self.dispatch_reads.get(procedure)
     }
 
     /// The call site in `procedure` whose result is `value`, when one exists.
@@ -1111,7 +1198,55 @@ fn source_site(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::analyzer::semantic::SemanticWork;
+    use crate::analyzer::semantic::{SemanticWork, StableDigest};
+
+    fn test_read(label: &[u8]) -> ReadKey {
+        ReadKey::Models(StableDigest::sha256(label))
+    }
+
+    #[test]
+    fn dispatch_read_contract_sorts_and_deduplicates_two_calls() {
+        let first = test_read(b"first-call");
+        let second = test_read(b"second-call");
+        let left = canonical_dispatch_read_contract([
+            DispatchReadAttribution::Attributed(second.clone()),
+            DispatchReadAttribution::Attributed(first.clone()),
+            DispatchReadAttribution::Attributed(first.clone()),
+        ]);
+        let right = canonical_dispatch_read_contract([
+            DispatchReadAttribution::Attributed(first.clone()),
+            DispatchReadAttribution::Attributed(second.clone()),
+        ]);
+        let mut expected = vec![first, second];
+        expected.sort_unstable();
+
+        assert_eq!(left, right, "discovery order is not contract identity");
+        assert_eq!(
+            left,
+            ProcedureDispatchReadContract::Complete(expected.into_boxed_slice())
+        );
+        assert_eq!(
+            canonical_dispatch_read_contract([]),
+            ProcedureDispatchReadContract::Complete(Box::new([])),
+            "a discovered procedure with no calls has an explicit empty contract"
+        );
+    }
+
+    #[test]
+    fn unattributed_dispatch_read_fails_closed() {
+        let reason = DispatchReadUnattributedReason::SourceRangeUnavailable;
+        let contract = canonical_dispatch_read_contract([
+            DispatchReadAttribution::Attributed(test_read(b"attributed-call")),
+            DispatchReadAttribution::Unattributed(reason),
+            DispatchReadAttribution::Unattributed(reason),
+        ]);
+
+        assert_eq!(
+            contract,
+            ProcedureDispatchReadContract::Unattributed(Box::new([reason])),
+            "partial exact reads must not masquerade as a complete contract"
+        );
+    }
 
     fn budget_status() -> SemanticInputStatus {
         let mut limits = SemanticBudget::default().limits();

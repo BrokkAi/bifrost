@@ -78,7 +78,7 @@ use crate::scala::{
     scala_simple_type_name,
 };
 use brokk_bifrost_core::analyzer::model::{
-    CallableArity, CallableFacts, ImportInfo, ScalaExportInfo, ScalaExportSelector,
+    CallableArity, CallableFacts, ImportInfo, Language, ScalaExportInfo, ScalaExportSelector,
     SignatureMetadata,
 };
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
@@ -7424,8 +7424,16 @@ impl PhysicalCallableTargets {
     }
 }
 
+/// Whether `unit` is declared directly in its package rather than nested
+/// inside another declaration.
+///
+/// The question is about segment count, not about the rendered spelling: a
+/// Scala backtick-quoted name may itself contain a `.` (scalaz spells a class
+/// `` `zio.ZIO` ``), and reading the string made such a class look nested, so
+/// the same-package name table never bound it and no reference to it resolved
+/// (#2219).
 pub fn is_package_level_type(unit: &CodeUnit) -> bool {
-    !unit.short_name().contains('.')
+    unit.declaration_segment_count() == 1
 }
 
 fn method_arities_compatible(method: Option<usize>, ancestor: Option<usize>) -> bool {
@@ -7492,12 +7500,28 @@ fn method_key(fqn: &str, arity: Option<usize>) -> String {
 }
 
 /// The leading simple name of a (possibly generic/qualified) type text.
+///
+/// The qualifier boundary is read with the shared symbol-path segmentation
+/// rather than a local `split('.')`, because a Scala identifier may be
+/// backtick-quoted and carry a literal `.` inside the quotes: scalaz spells a
+/// class `` `zio.ZIO` ``, whose leading name is the whole quoted identifier,
+/// not `` `zio `` (#2219).
+///
+/// The shared splitter also treats `::` as a separator, which is right for a
+/// client-typed selector but not for Scala source, where `::` is an ordinary
+/// symbolic identifier (`x: ::[Int]`). A base made only of separator
+/// characters has no segment to report, and its own text is then the name.
 fn simple_type_name(type_text: &str) -> Option<&str> {
-    type_text
-        .split(['[', '(', '{', '.', ' '])
-        .next()
-        .map(str::trim)
-        .filter(|name| !name.is_empty())
+    let base = type_text.split(['[', '(', '{', ' ']).next()?.trim();
+    if base.is_empty() {
+        return None;
+    }
+    Some(
+        brokk_bifrost_core::analyzer::symbol_path::symbol_path_segments(Language::Scala, base)
+            .into_iter()
+            .next()
+            .unwrap_or(base),
+    )
 }
 
 /// Build the whole Scala `caller -> callee` edge set in a single inverted pass

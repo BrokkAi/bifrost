@@ -50,6 +50,15 @@ pub fn resolve_php_semantic_pack_dependencies(
     let mut evidence_bytes_read = 0_u64;
     let mut cancelled = false;
 
+    // The runtime dependency is *declared*, not installed, so it is resolved
+    // whether or not a host configured Composer evidence. A workspace that
+    // declares no PHP version resolves nothing here and stays complete.
+    match resolve_declared_php_runtime_dependency(project.root(), &mut metadata_inputs_considered) {
+        Ok(Some(runtime)) => dependencies.push(runtime),
+        Ok(None) => {}
+        Err(error) => diagnostics.push(error),
+    }
+
     for configured in &config.dependency_api_evidence {
         if is_cancelled(cancellation) {
             cancelled = true;
@@ -778,6 +787,310 @@ struct InstalledPackage {
     install_path: Option<PathBuf>,
 }
 
+/// The workspace file that pins an exact PHP interpreter line, by the
+/// phpenv/asdf convention.
+const PHP_VERSION_FILE_NAME: &str = ".php-version";
+
+/// Composer's own manifest, which states the platform the project targets in
+/// `config.platform.php` and the versions it supports in `require.php`.
+const COMPOSER_MANIFEST_FILE_NAME: &str = "composer.json";
+
+/// The toolchain name a PHP runtime pack's activation selector matches.
+const PHP_TOOLCHAIN_NAME: &str = "php";
+
+/// The ecosystem term a PHP *runtime* dependency publishes. The runtime is not
+/// a Composer package, so it never carries the `composer` ecosystem.
+const PHP_RUNTIME_ECOSYSTEM: &str = "php";
+
+const MAX_PHP_TOOLCHAIN_DECLARATION_BYTES: u64 = 256 * 1024;
+
+/// Resolve the PHP runtime dependency a workspace *declares* rather than
+/// installs: an exact interpreter pin read from `.php-version`, from
+/// `composer.json`'s `config.platform.php`, or from the provable inclusive
+/// lower bound of `composer.json`'s `require.php` constraint.
+///
+/// The dependency carries no artifacts on purpose. Preparation serves an
+/// artifact-less dependency from a compatible installed pack, which is what
+/// selects a released PHP builtin declaration pack, exactly as a declared
+/// `.python-version` selects the released typeshed pack. No interpreter is
+/// discovered, executed, or consulted; the declaration files are ordinary
+/// workspace files that Composer dependency invalidation already watches.
+///
+/// A declaration this cannot read exactly is an attributable refusal rather
+/// than a guessed pin: guessing would let a pack prove a name absent for an
+/// interpreter the workspace actually supports.
+fn resolve_declared_php_runtime_dependency(
+    project_root: &Path,
+    inputs_considered: &mut usize,
+) -> Result<Option<ResolvedDependency>, DependencyPackDiagnostic> {
+    let version_file = project_root.join(PHP_VERSION_FILE_NAME);
+    if let Some(source) = read_bounded_declaration_file(&version_file).map_err(|message| {
+        declaration_diagnostic("php.toolchain.version_file", &version_file, message)
+    })? {
+        *inputs_considered += 1;
+        let declared = source
+            .lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty() && !line.starts_with('#'))
+            .ok_or_else(|| {
+                declaration_diagnostic(
+                    "php.toolchain.version_file",
+                    &version_file,
+                    "`.php-version` declares no version line".to_owned(),
+                )
+            })?;
+        let version = parse_exact_php_version(declared).ok_or_else(|| {
+            declaration_diagnostic(
+                "php.toolchain.version_file",
+                &version_file,
+                format!(
+                    "`.php-version` declaration {declared:?} is not an exact PHP version \
+                     (expected MAJOR.MINOR or MAJOR.MINOR.PATCH)"
+                ),
+            )
+        })?;
+        return Ok(Some(declared_php_runtime_dependency(
+            version,
+            PHP_VERSION_FILE_NAME,
+            declared,
+        )));
+    }
+
+    let manifest_path = project_root.join(COMPOSER_MANIFEST_FILE_NAME);
+    let Some(source) = read_bounded_declaration_file(&manifest_path).map_err(|message| {
+        declaration_diagnostic("php.toolchain.composer_manifest", &manifest_path, message)
+    })?
+    else {
+        return Ok(None);
+    };
+    *inputs_considered += 1;
+    let manifest: ComposerManifest = serde_json::from_str(&source).map_err(|error| {
+        declaration_diagnostic(
+            "php.toolchain.composer_manifest",
+            &manifest_path,
+            format!("could not decode composer.json: {error}"),
+        )
+    })?;
+    // `config.platform.php` is Composer's own exact statement of the platform
+    // it resolved against, so it outranks the range the project merely
+    // supports.
+    if let Some(platform) = manifest
+        .config
+        .as_ref()
+        .and_then(|config| config.platform.as_ref())
+        .and_then(|platform| platform.php.as_ref())
+    {
+        let version = parse_exact_php_version(platform).ok_or_else(|| {
+            declaration_diagnostic(
+                "php.toolchain.platform",
+                &manifest_path,
+                format!(
+                    "composer.json config.platform.php {platform:?} is not an exact PHP version"
+                ),
+            )
+        })?;
+        return Ok(Some(declared_php_runtime_dependency(
+            version,
+            "composer.json config.platform.php",
+            platform,
+        )));
+    }
+    let Some(requirement) = manifest
+        .require
+        .as_ref()
+        .and_then(|require| require.get(PHP_TOOLCHAIN_NAME))
+    else {
+        return Ok(None);
+    };
+    let version = php_constraint_lower_bound(requirement).map_err(|message| {
+        declaration_diagnostic("php.toolchain.require", &manifest_path, message)
+    })?;
+    Ok(Some(declared_php_runtime_dependency(
+        version,
+        "composer.json require.php",
+        requirement,
+    )))
+}
+
+#[derive(Debug, Deserialize)]
+struct ComposerManifest {
+    #[serde(default)]
+    require: Option<HashMap<String, String>>,
+    #[serde(default)]
+    config: Option<ComposerManifestConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ComposerManifestConfig {
+    #[serde(default)]
+    platform: Option<ComposerManifestPlatform>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ComposerManifestPlatform {
+    #[serde(default)]
+    php: Option<String>,
+}
+
+/// Read one workspace declaration file. Absent means "the workspace declares
+/// nothing here" and is not a diagnostic.
+fn read_bounded_declaration_file(path: &Path) -> Result<Option<String>, String> {
+    let metadata = match std::fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("could not inspect declaration file: {error}")),
+    };
+    if !metadata.is_file() || metadata.len() > MAX_PHP_TOOLCHAIN_DECLARATION_BYTES {
+        return Err(format!(
+            "declaration file is not a regular file within \
+             {MAX_PHP_TOOLCHAIN_DECLARATION_BYTES} bytes"
+        ));
+    }
+    std::fs::read_to_string(path)
+        .map(Some)
+        .map_err(|error| format!("could not read declaration file: {error}"))
+}
+
+/// Parse a plain dotted numeric PHP version with one to three components. A
+/// missing component means `.0`: declaring `8.2` pins the line's floor, which
+/// is the only version the declaration proves.
+fn parse_exact_php_version(text: &str) -> Option<Version> {
+    let text = text.trim();
+    let mut components = text.split('.').map(|component| {
+        (!component.is_empty() && component.bytes().all(|byte| byte.is_ascii_digit()))
+            .then(|| component.parse::<u64>().ok())
+            .flatten()
+    });
+    let major = components.next().flatten()?;
+    let minor = components.next().unwrap_or(Some(0))?;
+    let patch = components.next().unwrap_or(Some(0))?;
+    components
+        .next()
+        .is_none()
+        .then(|| Version::new(major, minor, patch))
+}
+
+/// Pin the provable inclusive lower bound of one Composer version constraint.
+///
+/// Composer separates alternatives with `||` and conjuncts with a comma or a
+/// space. Within one alternative, the greatest inclusive lower bound decides;
+/// across alternatives, the least does, because the workspace supports all of
+/// them. `^`, `~`, `>=`, `=` and a bare or wildcard version state a bound
+/// directly; `<`, `<=` and `!=` never lower one and pass through
+/// uninterpreted. Any clause this cannot read exactly refuses the whole
+/// declaration.
+fn php_constraint_lower_bound(requirement: &str) -> Result<Version, String> {
+    let mut overall: Option<Version> = None;
+    for alternative in requirement.split("||") {
+        let mut lower: Option<Version> = None;
+        let mut clauses = 0_usize;
+        for clause in alternative.split([',', ' ']) {
+            let clause = clause.trim();
+            if clause.is_empty() {
+                continue;
+            }
+            clauses += 1;
+            let bound = if let Some(rest) = clause
+                .strip_prefix("^")
+                .or_else(|| clause.strip_prefix("~"))
+                .or_else(|| clause.strip_prefix(">="))
+                .or_else(|| clause.strip_prefix("=="))
+                .or_else(|| clause.strip_prefix('='))
+            {
+                Some(parse_php_constraint_version(rest).ok_or_else(|| {
+                    format!("php constraint clause {clause:?} does not state an exact lower bound")
+                })?)
+            } else if clause.starts_with("<=")
+                || clause.starts_with('<')
+                || clause.starts_with("!=")
+            {
+                None
+            } else {
+                Some(parse_php_constraint_version(clause).ok_or_else(|| {
+                    format!("php constraint clause {clause:?} is not an interpretable version")
+                })?)
+            };
+            if let Some(bound) = bound
+                && lower.as_ref().is_none_or(|current| bound > *current)
+            {
+                lower = Some(bound);
+            }
+        }
+        if clauses == 0 {
+            continue;
+        }
+        let Some(lower) = lower else {
+            return Err(format!(
+                "php constraint {requirement:?} declares no provable inclusive lower bound"
+            ));
+        };
+        if overall.as_ref().is_none_or(|current| lower < *current) {
+            overall = Some(lower);
+        }
+    }
+    overall.ok_or_else(|| {
+        format!("php constraint {requirement:?} declares no provable inclusive lower bound")
+    })
+}
+
+/// One constraint version, which may end in a `*` wildcard component. `8.2.*`
+/// and `8.*` both floor at the version their fixed components name.
+fn parse_php_constraint_version(text: &str) -> Option<Version> {
+    let text = text.trim();
+    let text = text
+        .strip_suffix(".*")
+        .or_else(|| text.strip_suffix(".x"))
+        .unwrap_or(text);
+    parse_exact_php_version(text)
+}
+
+fn declared_php_runtime_dependency(
+    version: Version,
+    source_file: &str,
+    declared: &str,
+) -> ResolvedDependency {
+    ResolvedDependency {
+        id: format!("php:runtime:declared:php:{version}"),
+        evidence: SemanticModelActivationEvidence {
+            language: "php".to_owned(),
+            ecosystem: PHP_RUNTIME_ECOSYSTEM.to_owned(),
+            package: None,
+            module: None,
+            toolchain: Some(CatalogCoordinate {
+                name: PHP_TOOLCHAIN_NAME.to_owned(),
+                version: Some(version.clone()),
+            }),
+            // The workspace declares a version, not a platform or a build
+            // configuration, so both stay unpinned.
+            target: None,
+            configuration: None,
+            artifact_sha256: None,
+        },
+        provenance: vec![
+            provenance_entry("php.toolchain_declaration", source_file),
+            provenance_entry("php.declared_requirement", declared),
+            provenance_entry("php.pinned_version", &version),
+        ],
+        artifacts: Vec::new(),
+        scope: DependencyScope::Unknown,
+        declared_by: None,
+    }
+}
+
+fn declaration_diagnostic(
+    code: &str,
+    location: &Path,
+    message: String,
+) -> DependencyPackDiagnostic {
+    DependencyPackDiagnostic {
+        severity: DependencyPackDiagnosticSeverity::Warning,
+        code: code.to_owned(),
+        dependency_id: None,
+        location: Some(location.display().to_string()),
+        message,
+    }
+}
+
 fn provenance_entry(key: &str, value: impl ToString) -> DependencyProvenance {
     DependencyProvenance {
         key: key.to_owned(),
@@ -832,5 +1145,163 @@ fn diagnostic(
         dependency_id: None,
         location: path.map(|value| value.to_string_lossy().into_owned()),
         message: message.into(),
+    }
+}
+
+/// Milestone 2 of issue #2374: the PHP runtime dependency a workspace declares.
+///
+/// Every case here is a file the workspace already contains. Nothing in this
+/// module runs Composer or a PHP interpreter, so these tests only write files
+/// and read the resolved evidence back.
+#[cfg(test)]
+mod declared_runtime_tests {
+    use super::*;
+    use crate::analyzer::{Language, TestProject};
+
+    struct Workspace {
+        _temp: tempfile::TempDir,
+        project: TestProject,
+    }
+
+    fn workspace(files: &[(&str, &str)]) -> Workspace {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("project");
+        std::fs::create_dir_all(&root).unwrap();
+        for (path, source) in files {
+            let absolute = root.join(path);
+            std::fs::create_dir_all(absolute.parent().unwrap()).unwrap();
+            std::fs::write(absolute, source).unwrap();
+        }
+        let project = TestProject::new(root, Language::Php);
+        Workspace {
+            _temp: temp,
+            project,
+        }
+    }
+
+    fn discover(files: &[(&str, &str)]) -> DependencyDiscoveryOutcome {
+        let workspace = workspace(files);
+        resolve_php_semantic_pack_dependencies(
+            &PhpAnalyzerConfig::default(),
+            &workspace.project,
+            &DependencyPackLimits::default(),
+            None,
+        )
+    }
+
+    fn pinned_version(files: &[(&str, &str)]) -> String {
+        let outcome = discover(files);
+        assert!(outcome.complete, "{:#?}", outcome.diagnostics);
+        assert_eq!(outcome.dependencies.len(), 1, "{:#?}", outcome.dependencies);
+        let dependency = &outcome.dependencies[0];
+        assert_eq!(dependency.evidence.language, "php");
+        assert_eq!(dependency.evidence.ecosystem, "php");
+        assert!(
+            dependency.artifacts.is_empty(),
+            "a declared runtime dependency names no artifact: {:#?}",
+            dependency.artifacts
+        );
+        let toolchain = dependency
+            .evidence
+            .toolchain
+            .as_ref()
+            .expect("a declared runtime dependency pins a toolchain");
+        assert_eq!(toolchain.name, "php");
+        toolchain.version.as_ref().unwrap().to_string()
+    }
+
+    /// An exact interpreter pin outranks the range the project merely
+    /// supports, and an exact platform pin outranks that range too.
+    #[test]
+    fn an_exact_declaration_outranks_the_supported_range() {
+        assert_eq!(
+            pinned_version(&[
+                (".php-version", "8.3.7\n"),
+                (
+                    "composer.json",
+                    r#"{"require":{"php":"^8.1"},"config":{"platform":{"php":"8.2.0"}}}"#
+                ),
+            ]),
+            "8.3.7"
+        );
+        assert_eq!(
+            pinned_version(&[(
+                "composer.json",
+                r#"{"require":{"php":"^8.1"},"config":{"platform":{"php":"8.2.0"}}}"#
+            )]),
+            "8.2.0"
+        );
+    }
+
+    /// Every Composer constraint spelling this reads states one inclusive
+    /// lower bound, and a missing component floors at zero.
+    #[test]
+    fn composer_constraints_pin_their_provable_inclusive_lower_bound() {
+        for (constraint, expected) in [
+            ("^8.2", "8.2.0"),
+            ("~8.1.3", "8.1.3"),
+            (">=8.1.3", "8.1.3"),
+            ("8.2.*", "8.2.0"),
+            ("8.3.1", "8.3.1"),
+            (">=8.1 <9.0", "8.1.0"),
+            // Two supported alternatives are both supported, so the lower one
+            // is the only version the declaration proves.
+            ("^7.4 || ^8.0", "7.4.0"),
+        ] {
+            let manifest = format!(r#"{{"require":{{"php":"{constraint}"}}}}"#);
+            assert_eq!(
+                pinned_version(&[("composer.json", manifest.as_str())]),
+                expected,
+                "constraint {constraint}"
+            );
+        }
+    }
+
+    /// A constraint with no readable inclusive lower bound refuses the whole
+    /// declaration and says which file it refused, rather than guessing a pin
+    /// a pack could later use to prove a name absent.
+    #[test]
+    fn an_unreadable_declaration_is_an_attributable_refusal() {
+        let outcome = discover(&[("composer.json", r#"{"require":{"php":"<9.0"}}"#)]);
+
+        assert!(!outcome.complete);
+        assert!(outcome.dependencies.is_empty(), "{:#?}", outcome);
+        assert_eq!(
+            outcome
+                .diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.code.as_str())
+                .collect::<Vec<_>>(),
+            vec!["php.toolchain.require"],
+            "{:#?}",
+            outcome.diagnostics
+        );
+
+        let version_file = discover(&[(".php-version", "nightly\n")]);
+        assert_eq!(
+            version_file
+                .diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.code.as_str())
+                .collect::<Vec<_>>(),
+            vec!["php.toolchain.version_file"],
+            "{:#?}",
+            version_file.diagnostics
+        );
+    }
+
+    /// A workspace that declares nothing declares nothing: no dependency, no
+    /// diagnostic, and discovery stays complete.
+    #[test]
+    fn a_workspace_that_declares_no_php_version_resolves_nothing() {
+        let outcome = discover(&[("src/App.php", "<?php\nclass App {}\n")]);
+
+        assert!(outcome.complete, "{:#?}", outcome.diagnostics);
+        assert!(outcome.dependencies.is_empty(), "{:#?}", outcome);
+        assert!(outcome.diagnostics.is_empty(), "{:#?}", outcome.diagnostics);
+
+        let no_php_key = discover(&[("composer.json", r#"{"require":{"ext-json":"*"}}"#)]);
+        assert!(no_php_key.complete, "{:#?}", no_php_key.diagnostics);
+        assert!(no_php_key.dependencies.is_empty(), "{:#?}", no_php_key);
     }
 }

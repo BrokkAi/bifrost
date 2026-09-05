@@ -22,8 +22,8 @@ use super::{
     DataflowEdge, DataflowRequest, DistributiveDataflowProblem, FactId, PathQuality,
     PathQualityFrontier, SolverTermination, SolverWork, SummaryBoundary, SummaryBoundaryKind,
     SummaryCoverage, SummaryDataflowError, SummaryDataflowResult, SummaryEdge, SummaryEntry,
-    SummaryIncomingCall, SummaryMetrics, SummaryReachedFact, SummarySemanticStatus,
-    TabulationEndSummary, WitnessRetentionLimits,
+    SummaryEntryTransfer, SummaryIncomingCall, SummaryMetrics, SummaryReachedFact,
+    SummarySemanticStatus, TabulationEndSummary, WitnessRetentionLimits,
 };
 
 const ZERO_FACT_ID: FactId = FactId::new(0);
@@ -3101,19 +3101,10 @@ where
                 )
             })
             .collect();
-        // An incoming call row exists to carry its retained call witness back to
-        // a client, so a solve that retained no witnesses publishes none: the
-        // rows would cost memory proportional to the call graph and answer
-        // nothing (#2546).
-        let mut incoming_rows = if witness_owner.is_some() {
-            std::mem::take(&mut self.incoming)
-        } else {
-            self.incoming.clear();
-            Vec::new()
-        };
+        let mut incoming_rows = std::mem::take(&mut self.incoming);
         incoming_rows.sort_unstable_by_key(|row| row.key);
-        let incoming_calls = incoming_rows
-            .into_iter()
+        let entry_transfers = incoming_rows
+            .iter()
             .map(|row| {
                 let callee_procedure = self.procedures[row.key.callee.procedure].clone();
                 let callee_entry_point = callee_procedure
@@ -3126,26 +3117,66 @@ where
                 let call_point = caller_procedure
                     .point_handle(row.key.call_point)
                     .expect("published call point remains valid");
-                SummaryIncomingCall::new(
-                    SummaryEntry::new(
-                        callee_procedure,
-                        callee_entry_point,
-                        row.key.callee.entry_fact,
-                    ),
+                SummaryEntryTransfer::new(
                     SummaryEntry::new(
                         caller_procedure,
                         caller_entry_point,
                         row.key.caller.entry_fact,
                     ),
+                    SummaryEntry::new(
+                        callee_procedure,
+                        callee_entry_point,
+                        row.key.callee.entry_fact,
+                    ),
                     call_point,
                     row.key.call_fact,
-                    row.origin,
+                    row.origin.clone(),
                     row.qualities,
-                    row.witnesses,
-                    witness_owner.clone(),
                 )
             })
             .collect();
+        // An incoming call row exists to carry its retained call witness back to
+        // a client, so a solve that retained no witnesses publishes none. The
+        // witness-independent topology remains available through entry
+        // transfers without retaining witness alternatives (#2546).
+        let incoming_calls = if witness_owner.is_some() {
+            incoming_rows
+                .into_iter()
+                .map(|row| {
+                    let callee_procedure = self.procedures[row.key.callee.procedure].clone();
+                    let callee_entry_point = callee_procedure
+                        .point_handle(row.key.callee.entry_point)
+                        .expect("published callee entry point remains valid");
+                    let caller_procedure = self.procedures[row.key.caller.procedure].clone();
+                    let caller_entry_point = caller_procedure
+                        .point_handle(row.key.caller.entry_point)
+                        .expect("published caller entry point remains valid");
+                    let call_point = caller_procedure
+                        .point_handle(row.key.call_point)
+                        .expect("published call point remains valid");
+                    SummaryIncomingCall::new(
+                        SummaryEntry::new(
+                            callee_procedure,
+                            callee_entry_point,
+                            row.key.callee.entry_fact,
+                        ),
+                        SummaryEntry::new(
+                            caller_procedure,
+                            caller_entry_point,
+                            row.key.caller.entry_fact,
+                        ),
+                        call_point,
+                        row.key.call_fact,
+                        row.origin,
+                        row.qualities,
+                        row.witnesses,
+                        witness_owner.clone(),
+                    )
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         self.matched_return_cache.clear();
         let coverage = SummaryCoverage::from_parts(
             self.unproven_edges
@@ -3162,6 +3193,7 @@ where
             self.facts,
             reached,
             end_summaries,
+            entry_transfers,
             incoming_calls,
             coverage,
             termination,

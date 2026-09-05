@@ -1,4 +1,4 @@
-//! Demand materialization of value-flow snapshots and call bindings.
+//! Demand materialization of value-flow snapshots, dispatch, and call bindings.
 //!
 //! [`ValueFlowProvider`] mirrors [`IcfgProvider`](crate::analyzer::semantic::IcfgProvider):
 //! it materializes one procedure's value-flow snapshot on demand and one call's
@@ -64,6 +64,16 @@
 //! dimension, so a later touch with more budget still runs the oracle and can
 //! still reach a better answer.
 //!
+//! ### The dispatch key (#2943)
+//!
+//! A dispatch key is `(caller artifact fingerprint, caller ProcedureId,
+//! CallSiteId, IcfgProviderBehaviorIdentity, OracleLimits)`. The provider
+//! behavior's full half covers the workspace content, hierarchy expansion,
+//! active semantic models, external dispatch surface, and receiver-class hint
+//! digest. Dispatch is where all of those inputs matter. Budget and
+//! cancellation outcomes are excluded from publication by the same rule as
+//! snapshots and bindings.
+//!
 //! ### The binding key (#2289)
 //!
 //! A bindings key is
@@ -104,16 +114,17 @@
 
 use std::fmt;
 use std::mem::size_of;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use crate::analyzer::WorkspaceAnalyzer;
 use crate::analyzer::semantic::{
-    CallBinding, CallBindings, CallSiteHandle, CallSiteId, DispatchCandidate, DispatchOracle,
-    DispatchResult, EvidenceCompleteness, OracleCallContext, OracleLimits, ProcedureHandle,
-    ProcedureId, ProofStatus, SemanticOutcome, SemanticProviderError, SemanticRequest,
-    SemanticWork, StableDigest, ValueFlowOracle, ValueFlowRelation, ValueFlowSnapshot,
-    WorkspaceSemanticOracle,
+    CallBinding, CallBindings, CallSiteHandle, CallSiteId, DispatchBoundary, DispatchCandidate,
+    DispatchOracle, DispatchReadAttribution, DispatchResult, EvidenceCompleteness, IcfgProvider,
+    IcfgProviderBehaviorIdentity, OracleCallContext, OracleLimits, ProcedureHandle, ProcedureId,
+    ProofStatus, SemanticOutcome, SemanticProviderError, SemanticRequest, SemanticWork,
+    StableDigest, ValueFlowOracle, ValueFlowRelation, ValueFlowSnapshot, WorkspaceIcfgProvider,
+    WorkspaceSemanticOracle, dispatch_read_attribution,
 };
 use brokk_bifrost_core::complete_value_cache::{CompleteValueAcquisition, CompleteValueCache};
 
@@ -172,6 +183,54 @@ pub trait ValueFlowProvider {
     ) -> Result<SemanticOutcome<CallBindings>, Self::Error>;
 }
 
+/// One dispatch input observed while discovering `caller`'s outgoing calls.
+///
+/// The attribution is retained even when no replayable [`ReadKey`](crate::analyzer::read_ledger::ReadKey)
+/// can be built. Consumers must treat that typed unattributed status as a
+/// fail-closed publication barrier.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProcedureDispatchRead {
+    caller: ProcedureHandle,
+    attribution: DispatchReadAttribution,
+}
+
+impl ProcedureDispatchRead {
+    pub(crate) fn into_parts(self) -> (ProcedureHandle, DispatchReadAttribution) {
+        (self.caller, self.attribution)
+    }
+}
+
+/// Query-local observer for the exact dispatch inputs discovered by a value
+/// flow provider.
+///
+/// Clones share one synchronized collection so a provider can own one clone
+/// while the plan builder retains another. The provider's value cache remains
+/// independently shared and unchanged.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct DispatchReadCollector {
+    observations: Arc<Mutex<Vec<ProcedureDispatchRead>>>,
+}
+
+impl DispatchReadCollector {
+    fn record(&self, call: &CallSiteHandle, attribution: DispatchReadAttribution) {
+        self.observations
+            .lock()
+            .expect("dispatch read collector lock is not poisoned")
+            .push(ProcedureDispatchRead {
+                caller: call.procedure().clone(),
+                attribution,
+            });
+    }
+
+    /// Snapshot the observations in provider-call order.
+    pub(crate) fn observations(&self) -> Vec<ProcedureDispatchRead> {
+        self.observations
+            .lock()
+            .expect("dispatch read collector lock is not poisoned")
+            .clone()
+    }
+}
+
 /// Content-addressed identity of one procedure-local value-flow snapshot
 /// verdict.
 ///
@@ -214,6 +273,41 @@ type MemoizedSnapshot = SemanticOutcome<ValueFlowSnapshot>;
 /// The binding verdict this cache retains, on the same terms as
 /// [`MemoizedSnapshot`] (#2289).
 type MemoizedBindings = SemanticOutcome<CallBindings>;
+
+/// The dispatch verdict this cache retains, on the same terms as
+/// [`MemoizedSnapshot`].
+type MemoizedDispatch = SemanticOutcome<DispatchResult>;
+
+/// Content-addressed identity of one call-dispatch verdict.
+///
+/// The provider behavior folds the workspace content, hierarchy mode, active
+/// semantic-model set, external dispatch surface, and receiver-class hints.
+/// The remaining fields select the exact call and retain `OracleLimits` as an
+/// explicit verdict input.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct DispatchKey {
+    caller_artifact: StableDigest,
+    caller_procedure: ProcedureId,
+    call_site: CallSiteId,
+    provider_behavior: IcfgProviderBehaviorIdentity,
+    limits: OracleLimits,
+}
+
+impl DispatchKey {
+    fn for_query(
+        call: &CallSiteHandle,
+        provider_behavior: IcfgProviderBehaviorIdentity,
+        limits: OracleLimits,
+    ) -> Self {
+        Self {
+            caller_artifact: call.procedure().artifact().key().fingerprint(),
+            caller_procedure: call.procedure().id(),
+            call_site: call.id(),
+            provider_behavior,
+            limits,
+        }
+    }
+}
 
 /// Which published outcomes are safe to retain, and in what form.
 ///
@@ -352,21 +446,70 @@ fn weigh_bindings(_key: &BindingsKey, outcome: &Arc<MemoizedBindings>) -> u32 {
         .min(u32::MAX as usize) as u32
 }
 
+/// Conservative structural byte weight of one retained dispatch verdict.
+fn weigh_dispatch(_key: &DispatchKey, outcome: &Arc<MemoizedDispatch>) -> u32 {
+    let rows = outcome.available_value().map_or(0, |dispatch| {
+        dispatch
+            .candidates()
+            .len()
+            .saturating_mul(size_of::<DispatchCandidate>())
+            .saturating_add(
+                dispatch
+                    .boundaries()
+                    .len()
+                    .saturating_mul(size_of::<DispatchBoundary>()),
+            )
+    });
+    size_of::<MemoizedDispatch>()
+        .saturating_add(rows)
+        .min(u32::MAX as usize) as u32
+}
+
 #[derive(Debug, Default)]
 struct ValueFlowCacheStats {
     snapshot_hits: AtomicU64,
     snapshot_misses: AtomicU64,
+    dispatch_hits: AtomicU64,
+    dispatch_misses: AtomicU64,
     binding_hits: AtomicU64,
     binding_misses: AtomicU64,
 }
 
-/// Generation-independent, bounded, content-keyed cache of value-flow snapshot
-/// verdicts and complete call bindings. Cloning shares the underlying entries
-/// and counters, so the same cache can back one provider per analyzer
-/// generation and reuse unchanged procedures across generations and queries.
+/// One atomic snapshot of the acquisition counters shared by a
+/// [`ValueFlowCache`] and all of its clones.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ValueFlowCacheStatsSnapshot {
+    pub snapshot_hits: u64,
+    pub snapshot_misses: u64,
+    pub dispatch_hits: u64,
+    pub dispatch_misses: u64,
+    pub binding_hits: u64,
+    pub binding_misses: u64,
+}
+
+impl ValueFlowCacheStatsSnapshot {
+    pub const fn saturating_sub(self, earlier: Self) -> Self {
+        Self {
+            snapshot_hits: self.snapshot_hits.saturating_sub(earlier.snapshot_hits),
+            snapshot_misses: self.snapshot_misses.saturating_sub(earlier.snapshot_misses),
+            dispatch_hits: self.dispatch_hits.saturating_sub(earlier.dispatch_hits),
+            dispatch_misses: self.dispatch_misses.saturating_sub(earlier.dispatch_misses),
+            binding_hits: self.binding_hits.saturating_sub(earlier.binding_hits),
+            binding_misses: self.binding_misses.saturating_sub(earlier.binding_misses),
+        }
+    }
+}
+
+/// Generation-independent, bounded, content-keyed cache of value-flow
+/// snapshot, dispatch, and call-binding verdicts. Cloning shares the
+/// underlying entries and counters, so the same cache can back one provider
+/// per analyzer generation and reuse unchanged procedures across generations
+/// and queries. [`Self::with_fresh_stats`] keeps the shared entries while
+/// giving one query an independent attribution scope.
 #[derive(Clone)]
 pub struct ValueFlowCache {
     snapshots: CompleteValueCache<SnapshotKey, MemoizedSnapshot>,
+    dispatch: CompleteValueCache<DispatchKey, MemoizedDispatch>,
     bindings: CompleteValueCache<BindingsKey, MemoizedBindings>,
     stats: Arc<ValueFlowCacheStats>,
 }
@@ -378,12 +521,28 @@ impl Default for ValueFlowCache {
 }
 
 impl ValueFlowCache {
-    /// Build a cache that bounds each of the snapshot and binding sub-caches to
-    /// `max_retained_bytes`.
+    /// Build a cache that bounds each sub-cache to `max_retained_bytes`.
     pub fn new(max_retained_bytes: u64) -> Self {
         Self {
             snapshots: CompleteValueCache::new(max_retained_bytes, weigh_snapshot),
+            dispatch: CompleteValueCache::new(max_retained_bytes, weigh_dispatch),
             bindings: CompleteValueCache::new(max_retained_bytes, weigh_bindings),
+            stats: Arc::new(ValueFlowCacheStats::default()),
+        }
+    }
+
+    /// Share retained entries while starting an independent counter scope.
+    ///
+    /// A workspace cache can serve concurrent queries. Before/after snapshots
+    /// of counters shared by those queries would attribute intervening work
+    /// from every query to each one. Query entry points use this fork so cache
+    /// reuse remains workspace-wide while hit and miss counters remain exact
+    /// for the query that reports them.
+    pub fn with_fresh_stats(&self) -> Self {
+        Self {
+            snapshots: self.snapshots.clone(),
+            dispatch: self.dispatch.clone(),
+            bindings: self.bindings.clone(),
             stats: Arc::new(ValueFlowCacheStats::default()),
         }
     }
@@ -398,6 +557,16 @@ impl ValueFlowCache {
         self.stats.snapshot_misses.load(Ordering::Relaxed)
     }
 
+    /// Count of dispatch lookups served from a ready cache entry.
+    pub fn dispatch_hits(&self) -> u64 {
+        self.stats.dispatch_hits.load(Ordering::Relaxed)
+    }
+
+    /// Count of dispatch lookups that had to materialize through the oracle.
+    pub fn dispatch_misses(&self) -> u64 {
+        self.stats.dispatch_misses.load(Ordering::Relaxed)
+    }
+
     /// Count of binding lookups served from a ready cache entry.
     pub fn binding_hits(&self) -> u64 {
         self.stats.binding_hits.load(Ordering::Relaxed)
@@ -407,6 +576,18 @@ impl ValueFlowCache {
     pub fn binding_misses(&self) -> u64 {
         self.stats.binding_misses.load(Ordering::Relaxed)
     }
+
+    /// Capture all counters for query-local before/after attribution.
+    pub fn stats(&self) -> ValueFlowCacheStatsSnapshot {
+        ValueFlowCacheStatsSnapshot {
+            snapshot_hits: self.snapshot_hits(),
+            snapshot_misses: self.snapshot_misses(),
+            dispatch_hits: self.dispatch_hits(),
+            dispatch_misses: self.dispatch_misses(),
+            binding_hits: self.binding_hits(),
+            binding_misses: self.binding_misses(),
+        }
+    }
 }
 
 impl fmt::Debug for ValueFlowCache {
@@ -415,6 +596,8 @@ impl fmt::Debug for ValueFlowCache {
             .debug_struct("ValueFlowCache")
             .field("snapshot_hits", &self.snapshot_hits())
             .field("snapshot_misses", &self.snapshot_misses())
+            .field("dispatch_hits", &self.dispatch_hits())
+            .field("dispatch_misses", &self.dispatch_misses())
             .field("binding_hits", &self.binding_hits())
             .field("binding_misses", &self.binding_misses())
             .finish_non_exhaustive()
@@ -425,15 +608,20 @@ impl fmt::Debug for ValueFlowCache {
 /// shared [`ValueFlowCache`].
 pub struct WorkspaceValueFlowProvider<'a> {
     oracle: WorkspaceSemanticOracle<'a>,
+    provider_behavior: IcfgProviderBehaviorIdentity,
     cache: ValueFlowCache,
+    dispatch_reads: Option<DispatchReadCollector>,
 }
 
 impl<'a> WorkspaceValueFlowProvider<'a> {
     /// Bind the provider to one analyzer generation and one shared cache.
     pub fn new(workspace: &'a WorkspaceAnalyzer, cache: ValueFlowCache) -> Self {
+        let provider = WorkspaceIcfgProvider::new(workspace);
         Self {
-            oracle: workspace.semantic_oracle_provider(),
+            oracle: provider.oracle().clone(),
+            provider_behavior: provider.behavior_identity(),
             cache,
+            dispatch_reads: None,
         }
     }
 
@@ -443,8 +631,28 @@ impl<'a> WorkspaceValueFlowProvider<'a> {
     /// executor's snapshot-bound oracle today, a hinted oracle under #2945)
     /// hands it in here; building a second oracle from the current overlay
     /// would give one walk two oracle identities.
-    pub const fn with_oracle(oracle: WorkspaceSemanticOracle<'a>, cache: ValueFlowCache) -> Self {
-        Self { oracle, cache }
+    pub const fn with_oracle(
+        oracle: WorkspaceSemanticOracle<'a>,
+        provider_behavior: IcfgProviderBehaviorIdentity,
+        cache: ValueFlowCache,
+    ) -> Self {
+        Self {
+            oracle,
+            provider_behavior,
+            cache,
+            dispatch_reads: None,
+        }
+    }
+
+    /// Derive a provider that reports every dispatch input to `collector`
+    /// while sharing this provider's immutable oracle and value cache.
+    pub(crate) fn observing_dispatch_reads(&self, collector: DispatchReadCollector) -> Self {
+        Self {
+            oracle: self.oracle.clone(),
+            provider_behavior: self.provider_behavior,
+            cache: self.cache.clone(),
+            dispatch_reads: Some(collector),
+        }
     }
 
     /// The shared cache behind this provider.
@@ -455,6 +663,16 @@ impl<'a> WorkspaceValueFlowProvider<'a> {
     /// The workspace semantic oracle this provider delegates to.
     pub const fn oracle(&self) -> &WorkspaceSemanticOracle<'a> {
         &self.oracle
+    }
+
+    fn record_dispatch_read(
+        &self,
+        call: &CallSiteHandle,
+        outcome: &SemanticOutcome<DispatchResult>,
+    ) {
+        if let Some(collector) = &self.dispatch_reads {
+            collector.record(call, dispatch_read_attribution(call, outcome));
+        }
     }
 }
 
@@ -521,9 +739,39 @@ impl ValueFlowProvider for WorkspaceValueFlowProvider<'_> {
         call: &CallSiteHandle,
         request: &mut SemanticRequest<'_>,
     ) -> Result<SemanticOutcome<DispatchResult>, SemanticProviderError> {
-        // Dispatch answers are not memoized here: a call site resolves once
-        // per walk (the walk dedups bindings), so a cache would never hit.
-        self.oracle.resolve_call(call, request)
+        let key = DispatchKey::for_query(call, self.provider_behavior, *self.oracle.limits());
+        let (acquisition, _wait) = self.cache.dispatch.acquire(&key, request.cancellation);
+        let outcome = match acquisition {
+            CompleteValueAcquisition::Cached { value } => {
+                self.cache
+                    .stats
+                    .dispatch_hits
+                    .fetch_add(1, Ordering::Relaxed);
+                (*value).clone()
+            }
+            CompleteValueAcquisition::Leader { permit } => {
+                self.cache
+                    .stats
+                    .dispatch_misses
+                    .fetch_add(1, Ordering::Relaxed);
+                let outcome = self.oracle.resolve_call(call, request)?;
+                if let Some(memoized) = memoizable_outcome(&outcome) {
+                    permit.publish_complete(Arc::new(memoized));
+                }
+                outcome
+            }
+            CompleteValueAcquisition::Rejected => {
+                unreachable!("value-flow dispatch cache never publishes rejected flights")
+            }
+            CompleteValueAcquisition::Cancelled => {
+                return Ok(SemanticOutcome::Cancelled {
+                    partial: None,
+                    work: SemanticWork::default(),
+                });
+            }
+        };
+        self.record_dispatch_read(call, &outcome);
+        Ok(outcome)
     }
 
     fn call_bindings(
@@ -569,5 +817,87 @@ impl ValueFlowProvider for WorkspaceValueFlowProvider<'_> {
                 work: SemanticWork::default(),
             }),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::analyzer::semantic::{CancellationToken, SemanticBudget};
+    use crate::analyzer::{AnalyzerConfig, Language};
+    use crate::inline_project::InlineTestProject;
+
+    #[test]
+    fn cold_and_cached_dispatch_observe_the_same_read() {
+        let project = InlineTestProject::with_language(Language::TypeScript)
+            .file(
+                "flow.ts",
+                concat!(
+                    "function leaf(value: number): number { return value; }\n",
+                    "export function caller(): number { return leaf(1); }\n",
+                ),
+            )
+            .build();
+        let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+        let cancellation = CancellationToken::default();
+        let mut materialization_budget = SemanticBudget::default();
+        let artifact = workspace
+            .materialize_program_semantics(
+                &project.file("flow.ts"),
+                &mut SemanticRequest::new(&mut materialization_budget, &cancellation),
+            )
+            .expect("fixture semantic materialization")
+            .available_value()
+            .cloned()
+            .expect("fixture artifact");
+        let caller = artifact
+            .procedures()
+            .iter()
+            .find(|procedure| {
+                procedure
+                    .locator()
+                    .declaration()
+                    .segments()
+                    .last()
+                    .and_then(|segment| segment.name())
+                    == Some("caller")
+            })
+            .and_then(|procedure| artifact.procedure_handle(procedure.id()))
+            .expect("fixture caller");
+        let call = caller
+            .semantics()
+            .call_sites()
+            .first()
+            .and_then(|call| caller.call_site_handle(call.id))
+            .expect("fixture call");
+        let cache = ValueFlowCache::default();
+        let provider = WorkspaceValueFlowProvider::new(&workspace, cache.clone());
+
+        let cold_reads = DispatchReadCollector::default();
+        let cold_provider = provider.observing_dispatch_reads(cold_reads.clone());
+        let mut cold_budget = SemanticBudget::default();
+        let cold = cold_provider
+            .resolve_call(
+                &call,
+                &mut SemanticRequest::new(&mut cold_budget, &cancellation),
+            )
+            .expect("cold dispatch");
+        assert!(cold.available_value().is_some());
+
+        let cached_reads = DispatchReadCollector::default();
+        let cached_provider = provider.observing_dispatch_reads(cached_reads.clone());
+        let mut cached_budget = SemanticBudget::default();
+        let cached = cached_provider
+            .resolve_call(
+                &call,
+                &mut SemanticRequest::new(&mut cached_budget, &cancellation),
+            )
+            .expect("cached dispatch");
+
+        assert_eq!(cold.available_value(), cached.available_value());
+        assert_eq!(cache.dispatch_misses(), 1);
+        assert_eq!(cache.dispatch_hits(), 1);
+        assert_eq!(cold_reads.observations(), cached_reads.observations());
+        assert_eq!(cold_reads.observations().len(), 1);
     }
 }

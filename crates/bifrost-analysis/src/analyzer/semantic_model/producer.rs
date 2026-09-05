@@ -32,6 +32,11 @@ pub enum ExternalArtifactKind {
     /// than a compiled artifact, so the ecosystem names the input instead of
     /// the language, exactly as `NpmPackageManifest` does.
     ComposerPackageSourceSet,
+    /// One tree of plain PHP declaration stubs: PHP source that states the
+    /// runtime's classes, interfaces, constants and functions with native
+    /// signatures and empty bodies. Distinct from `ComposerPackageSourceSet`,
+    /// which is an installed package's real, executable sources.
+    PhpDeclarationStub,
     /// One explicit C++ include root containing exact header sources.
     CppHeaderSourceSet,
 }

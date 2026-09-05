@@ -3140,6 +3140,20 @@ impl CodeUnit {
         self.0.fq.prefix(self.0.package_segment_count)
     }
 
+    /// How many structured segments this declaration's own name has beyond its
+    /// package prefix: `1` for a top-level declaration, more for a member or a
+    /// nested type.
+    ///
+    /// This is the structured form of the "does `short_name` contain a `.`"
+    /// question. That question cannot be answered from the rendered spelling,
+    /// because a single segment may itself contain a `.` -- a Scala
+    /// backtick-quoted name such as `` `zio.ZIO` `` (#2219), a JS/TS
+    /// object-literal key, a Go import-path head. Asking the string made every
+    /// such top-level declaration look like a member.
+    pub fn declaration_segment_count(&self) -> usize {
+        self.0.fq.len() - self.0.package_segment_count
+    }
+
     /// The final parser-derived package segment, without recovering a
     /// component boundary from the rendered package spelling.
     pub fn package_terminal_name(&self) -> Option<&str> {

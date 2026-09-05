@@ -1067,9 +1067,15 @@ pub fn read_relation_snapshot_jsonl(
 }
 
 fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, RelationCodecError> {
+    decode_json(bytes)
+}
+/// Strict JSON decode shared by every extension wire contract.
+pub(crate) fn decode_json<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, RelationCodecError> {
     serde_json::from_slice(bytes).map_err(|e| RelationCodecError::new(e.to_string()))
 }
-fn canonical_bytes(value: &impl Serialize) -> Result<Vec<u8>, RelationCodecError> {
+/// Canonical (key-sorted, newline-terminated) JSON bytes, shared by every
+/// extension wire contract so their digests are derived the same way.
+pub(crate) fn canonical_bytes(value: &impl Serialize) -> Result<Vec<u8>, RelationCodecError> {
     let value = serde_json::to_value(value).map_err(|e| RelationCodecError::new(e.to_string()))?;
     let mut bytes = serde_json::to_vec(&canonical(value))
         .map_err(|e| RelationCodecError::new(e.to_string()))?;

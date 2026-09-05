@@ -3,8 +3,9 @@
 //! A policy evaluation unit is one policy evaluated over one partition of a
 //! workspace, together with the read set that licenses reusing it
 //! (`.agents/plans/impact-sliced-diff-base.md`, Milestone 3). This module is
-//! the store side of that: the row shapes, the SQL that writes and reads them,
-//! and the encoding that turns one [`ReadKey`] into columns and back.
+//! the store side of that: the row shapes and the SQL that writes and reads
+//! them. The shared store read-key codec turns each [`ReadKey`] into columns
+//! and back.
 //!
 //! The row shapes are deliberately store-neutral. The policy crate owns the
 //! typed key ([`PolicyUnitKey`]) and the typed product; the store owns rows.
@@ -26,13 +27,10 @@ use rusqlite::{OptionalExtension, TransactionBehavior, params, params_from_iter}
 
 use super::{PARSED_BLOB_COMPLETE_CONDITION, Result, StoreError};
 use crate::analyzer::Language;
-use crate::analyzer::content_identity::WorkspaceContentIdentity;
-use crate::analyzer::invalidation::{DerivedArtifactId, DerivedArtifactKind};
-use crate::analyzer::read_ledger::{
-    CallSiteLocator, IndexFamily, LookupKind, LookupQuestion, ReadKey,
-};
-use crate::analyzer::semantic::ids::StableDigest;
+use crate::analyzer::read_ledger::ReadKey;
 use crate::analyzer::store::AnalyzerStore;
+
+use super::read_keys::{ReadKeyColumns, decode_read_key};
 
 /// How many base evaluations one store retains.
 ///
@@ -834,343 +832,19 @@ fn load_unit_reads(conn: &rusqlite::Connection, unit_id: i64) -> Result<Vec<Read
     Ok(reads)
 }
 
-/// One read key as columns.
-///
-/// The columns are derived from the key by an exhaustive match, so a new key
-/// variant is a compile error here rather than a row that silently drops half
-/// its identity.
-struct ReadKeyColumns {
-    key_digest: [u8; 32],
-    kind: &'static str,
-    family: Option<&'static str>,
-    languages: Option<String>,
-    rel_path: Option<String>,
-    name: Option<String>,
-    index_key: Option<Vec<u8>>,
-    blob_oid: Option<String>,
-    subject: Option<Vec<u8>>,
-    start_byte: Option<i64>,
-    end_byte: Option<i64>,
-    digest: Option<Vec<u8>>,
-}
-
-impl ReadKeyColumns {
-    fn of(key: &ReadKey) -> Self {
-        let mut columns = Self {
-            key_digest: *key.canonical_digest().as_bytes(),
-            kind: key.stable_label(),
-            family: None,
-            languages: None,
-            rel_path: None,
-            name: None,
-            index_key: None,
-            blob_oid: None,
-            subject: None,
-            start_byte: None,
-            end_byte: None,
-            digest: None,
-        };
-        match key {
-            ReadKey::File {
-                language,
-                rel_path,
-                blob,
-            } => {
-                columns.languages = Some(language.config_label().to_string());
-                columns.rel_path = Some(rel_path.to_string());
-                columns.blob_oid = Some(blob.to_string());
-            }
-            ReadKey::PathAbsent { language, rel_path } => {
-                columns.languages = Some(language.config_label().to_string());
-                columns.rel_path = Some(rel_path.to_string());
-            }
-            ReadKey::Index { family, key } => {
-                columns.family = Some(family.stable_label());
-                columns.index_key = Some(key.to_vec());
-            }
-            ReadKey::Lookup {
-                kind,
-                question,
-                digest,
-            } => {
-                columns.family = Some(kind.stable_label());
-                columns.digest = Some(digest.as_bytes().to_vec());
-                match question {
-                    LookupQuestion::Declaration { rel_path, fq_name } => {
-                        columns.rel_path = Some(rel_path.to_string());
-                        columns.name = Some(fq_name.to_string());
-                    }
-                    LookupQuestion::File { rel_path } => {
-                        columns.rel_path = Some(rel_path.to_string());
-                    }
-                    LookupQuestion::CallSite {
-                        rel_path,
-                        artifact,
-                        site,
-                    } => {
-                        columns.rel_path = Some(rel_path.to_string());
-                        columns.subject = Some(artifact.as_bytes().to_vec());
-                        columns.start_byte = Some(site.start_byte as i64);
-                        columns.end_byte = Some(site.end_byte as i64);
-                    }
-                    LookupQuestion::Summary { identity } => {
-                        columns.subject = Some(identity.as_bytes().to_vec());
-                    }
-                }
-            }
-            ReadKey::Artifact { id, rel_path } => {
-                columns.family = Some(id.kind().stable_label());
-                columns.subject = Some(id.fingerprint().as_bytes().to_vec());
-                columns.rel_path = rel_path.as_ref().map(ToString::to_string);
-            }
-            ReadKey::Scope {
-                languages,
-                identity,
-            } => {
-                columns.languages = Some(language_list(languages));
-                columns.digest = Some(identity.digest().as_bytes().to_vec());
-            }
-            ReadKey::Models(digest) | ReadKey::Configuration(digest) | ReadKey::Epoch(digest) => {
-                columns.digest = Some(digest.as_bytes().to_vec());
-            }
-            ReadKey::Policy {
-                semantic_hash,
-                source,
-            } => {
-                columns.subject = Some(semantic_hash.as_bytes().to_vec());
-                columns.digest = Some(source.as_bytes().to_vec());
-            }
-        }
-        columns
-    }
-}
-
-/// The sorted language labels of one scope, as the one text column a scope key
-/// is found and rebuilt by.
-fn language_list(languages: &[Language]) -> String {
-    languages
-        .iter()
-        .map(|language| language.config_label())
-        .collect::<Vec<_>>()
-        .join(",")
-}
-
-/// Rebuild one read key from its columns, and prove the rebuild is faithful.
-///
-/// The stored `key_digest` is the canonical digest of the key that was
-/// written. Comparing it with the digest of the key just decoded is what makes
-/// "these columns are that key" a checked fact instead of a convention two
-/// functions happen to share.
-fn decode_read_key(row: &rusqlite::Row<'_>) -> Result<ReadKey> {
-    let key_digest = row.get::<_, Vec<u8>>(0)?;
-    let kind = row.get::<_, String>(1)?;
-    let family = row.get::<_, Option<String>>(2)?;
-    let languages = row.get::<_, Option<String>>(3)?;
-    let rel_path = row.get::<_, Option<String>>(4)?;
-    let name = row.get::<_, Option<String>>(5)?;
-    let index_key = row.get::<_, Option<Vec<u8>>>(6)?;
-    let blob_oid = row.get::<_, Option<String>>(7)?;
-    let subject = row.get::<_, Option<Vec<u8>>>(8)?;
-    let start_byte = row.get::<_, Option<i64>>(9)?;
-    let end_byte = row.get::<_, Option<i64>>(10)?;
-    let digest = row.get::<_, Option<Vec<u8>>>(11)?;
-
-    let missing = |column: &str| StoreError::new(format!("read key `{kind}` has no {column}"));
-    let key = match kind.as_str() {
-        "file" => ReadKey::File {
-            language: decode_language(languages.as_deref().ok_or_else(|| missing("language"))?)?,
-            rel_path: Box::from(rel_path.ok_or_else(|| missing("path"))?.as_str()),
-            blob: decode_oid(&blob_oid.ok_or_else(|| missing("blob"))?)?,
-        },
-        "path_absent" => ReadKey::PathAbsent {
-            language: decode_language(languages.as_deref().ok_or_else(|| missing("language"))?)?,
-            rel_path: Box::from(rel_path.ok_or_else(|| missing("path"))?.as_str()),
-        },
-        "index" => ReadKey::Index {
-            family: index_family_of(family.as_deref().ok_or_else(|| missing("family"))?)?,
-            key: Box::from(index_key.ok_or_else(|| missing("key"))?.as_slice()),
-        },
-        "lookup" => {
-            let lookup_kind = lookup_kind_of(family.as_deref().ok_or_else(|| missing("kind"))?)?;
-            let question = match (rel_path, name, subject, start_byte, end_byte) {
-                (Some(rel_path), Some(fq_name), None, None, None) => LookupQuestion::Declaration {
-                    rel_path: Box::from(rel_path.as_str()),
-                    fq_name: Box::from(fq_name.as_str()),
-                },
-                (Some(rel_path), None, None, None, None) => LookupQuestion::File {
-                    rel_path: Box::from(rel_path.as_str()),
-                },
-                (Some(rel_path), None, Some(artifact), Some(start), Some(end)) => {
-                    LookupQuestion::CallSite {
-                        rel_path: Box::from(rel_path.as_str()),
-                        artifact: decode_digest(&artifact, "call site artifact")?,
-                        site: CallSiteLocator {
-                            start_byte: start as usize,
-                            end_byte: end as usize,
-                        },
-                    }
-                }
-                (None, None, Some(identity), None, None) => LookupQuestion::Summary {
-                    identity: decode_digest(&identity, "summary identity")?,
-                },
-                columns => {
-                    return Err(StoreError::new(format!(
-                        "read key `lookup` has no question in its columns: {columns:?}"
-                    )));
-                }
-            };
-            ReadKey::Lookup {
-                kind: lookup_kind,
-                question,
-                digest: decode_digest(&digest.ok_or_else(|| missing("answer"))?, "lookup answer")?,
-            }
-        }
-        "artifact" => ReadKey::Artifact {
-            id: DerivedArtifactId::new(
-                artifact_kind_of(family.as_deref().ok_or_else(|| missing("kind"))?)?,
-                decode_digest(
-                    &subject.ok_or_else(|| missing("fingerprint"))?,
-                    "artifact fingerprint",
-                )?,
-            ),
-            rel_path: rel_path.map(|path| Box::from(path.as_str())),
-        },
-        "scope" => {
-            let languages = languages.ok_or_else(|| missing("languages"))?;
-            let mut scope = Vec::new();
-            for label in languages.split(',') {
-                scope.push(decode_language(label)?);
-            }
-            ReadKey::Scope {
-                languages: scope.into_boxed_slice(),
-                identity: WorkspaceContentIdentity::from_digest(decode_digest(
-                    &digest.ok_or_else(|| missing("identity"))?,
-                    "scope identity",
-                )?),
-            }
-        }
-        "models" => ReadKey::Models(decode_digest(
-            &digest.ok_or_else(|| missing("digest"))?,
-            "model set",
-        )?),
-        "policy" => ReadKey::Policy {
-            semantic_hash: decode_digest(
-                &subject.ok_or_else(|| missing("semantic hash"))?,
-                "policy semantic hash",
-            )?,
-            source: decode_digest(
-                &digest.ok_or_else(|| missing("source digest"))?,
-                "policy source",
-            )?,
-        },
-        "configuration" => ReadKey::Configuration(decode_digest(
-            &digest.ok_or_else(|| missing("digest"))?,
-            "configuration",
-        )?),
-        "epoch" => ReadKey::Epoch(decode_digest(
-            &digest.ok_or_else(|| missing("digest"))?,
-            "epoch",
-        )?),
-        other => {
-            return Err(StoreError::new(format!("unknown read key kind `{other}`")));
-        }
-    };
-    let rebuilt = key.canonical_digest();
-    if rebuilt.as_bytes().as_slice() != key_digest.as_slice() {
-        return Err(StoreError::new(format!(
-            "read key `{kind}` did not rebuild to its stored identity {}",
-            hex_of(&key_digest)
-        )));
-    }
-    Ok(key)
-}
-
-fn hex_of(bytes: &[u8]) -> String {
-    bytes
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>()
-}
-
-fn decode_digest(bytes: &[u8], what: &str) -> Result<StableDigest> {
-    let array = <[u8; 32]>::try_from(bytes)
-        .map_err(|_| StoreError::new(format!("{what} digest has {} bytes, not 32", bytes.len())))?;
-    Ok(StableDigest::from_array(array))
-}
-
-fn decode_oid(text: &str) -> Result<Oid> {
-    Oid::from_str(text)
-        .map_err(|error| StoreError::new(format!("unreadable blob `{text}`: {error}")))
-}
-
-fn decode_language(label: &str) -> Result<Language> {
-    Language::from_config_label(label)
-        .filter(|language| language.config_label() == label)
-        .ok_or_else(|| StoreError::new(format!("unknown language label `{label}`")))
-}
-
-/// Every index family, so a label decodes to the variant that spells it.
-const ALL_INDEX_FAMILIES: [IndexFamily; 9] = [
-    IndexFamily::DefinitionExact,
-    IndexFamily::DefinitionNormalizedTail,
-    IndexFamily::DefinitionIdentifier,
-    IndexFamily::ReferenceIdentifier,
-    IndexFamily::ImportPathSegment,
-    IndexFamily::PackageMembership,
-    IndexFamily::Supertype,
-    IndexFamily::SupertypeLookupPath,
-    IndexFamily::PathSymbol,
-];
-
-/// Every derived-value lookup kind.
-const ALL_LOOKUP_KINDS: [LookupKind; 8] = [
-    LookupKind::Callers,
-    LookupKind::Callees,
-    LookupKind::Usages,
-    LookupKind::Importers,
-    LookupKind::ReferenceCandidates,
-    LookupKind::Descendants,
-    LookupKind::Dispatch,
-    LookupKind::ProcedureSummary,
-];
-
-/// Every derived-artifact kind.
-const ALL_ARTIFACT_KINDS: [DerivedArtifactKind; 8] = [
-    DerivedArtifactKind::SemanticArtifact,
-    DerivedArtifactKind::ProcedureSummary,
-    DerivedArtifactKind::FlowSnapshot,
-    DerivedArtifactKind::PolicyReport,
-    DerivedArtifactKind::DerivedQueryLayer,
-    DerivedArtifactKind::WorkspaceUsageGraph,
-    DerivedArtifactKind::StructuralIndex,
-    DerivedArtifactKind::PolicyEvaluationUnit,
-];
-
-fn index_family_of(label: &str) -> Result<IndexFamily> {
-    ALL_INDEX_FAMILIES
-        .into_iter()
-        .find(|family| family.stable_label() == label)
-        .ok_or_else(|| StoreError::new(format!("unknown index family `{label}`")))
-}
-
-fn lookup_kind_of(label: &str) -> Result<LookupKind> {
-    ALL_LOOKUP_KINDS
-        .into_iter()
-        .find(|kind| kind.stable_label() == label)
-        .ok_or_else(|| StoreError::new(format!("unknown lookup kind `{label}`")))
-}
-
-fn artifact_kind_of(label: &str) -> Result<DerivedArtifactKind> {
-    ALL_ARTIFACT_KINDS
-        .into_iter()
-        .find(|kind| kind.stable_label() == label)
-        .ok_or_else(|| StoreError::new(format!("unknown derived artifact kind `{label}`")))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::analyzer::read_ledger::{CallSiteLocator, read_set_digest};
+    use crate::analyzer::content_identity::WorkspaceContentIdentity;
+    use crate::analyzer::invalidation::{DerivedArtifactId, DerivedArtifactKind};
+    use crate::analyzer::read_ledger::{
+        CallSiteLocator, IndexFamily, LookupKind, LookupQuestion, read_set_digest,
+    };
+    use crate::analyzer::semantic::ids::StableDigest;
+    // Every EXPLAIN QUERY PLAN pin below runs its assertions once against a
+    // store with no planner statistics and once with the statistics captured
+    // from real corpus stores, because production carries the latter (#3016).
+    use brokk_bifrost_core::cache_gc::PlannerStatisticsState;
 
     const POLICY_HASH: &str = "aa11bb22cc33dd44ee55ff66007788990011223344556677889900aabbccddee";
     const CONFIGURATION: &str = "bb11bb22cc33dd44ee55ff66007788990011223344556677889900aabbccddee";
@@ -1576,8 +1250,15 @@ mod tests {
     /// policy, which is the cost the whole mechanism exists to avoid.
     #[test]
     fn the_batched_unit_lookup_seeks_the_unit_key_index() {
+        for state in PlannerStatisticsState::BOTH {
+            the_batched_unit_lookup_seeks_the_unit_key_index_in(state);
+        }
+    }
+
+    fn the_batched_unit_lookup_seeks_the_unit_key_index_in(state: PlannerStatisticsState) {
         let store = AnalyzerStore::open_ephemeral().unwrap();
         let conn = store.conn.lock().expect("store mutex");
+        state.install(&conn);
         let sql = format!(
             "EXPLAIN QUERY PLAN {}",
             policy_unit_batch_sql("(?,?,?,?),(?,?,?,?)")
@@ -1610,19 +1291,26 @@ mod tests {
             plan.iter()
                 .any(|detail| detail.contains("SEARCH units USING")
                     && detail.contains("policy_units_key")),
-            "{plan:#?}"
+            "{state}: {plan:#?}"
         );
         assert!(
             plan.iter().all(|detail| !detail.contains("SCAN units")),
-            "{plan:#?}"
+            "{state}: {plan:#?}"
         );
     }
 
     /// The evaluation lookup is a point read on its own key.
     #[test]
     fn the_evaluation_lookup_seeks_the_evaluation_key_index() {
+        for state in PlannerStatisticsState::BOTH {
+            the_evaluation_lookup_seeks_the_evaluation_key_index_in(state);
+        }
+    }
+
+    fn the_evaluation_lookup_seeks_the_evaluation_key_index_in(state: PlannerStatisticsState) {
         let store = AnalyzerStore::open_ephemeral().unwrap();
         let conn = store.conn.lock().expect("store mutex");
+        state.install(&conn);
         let mut statement = conn
             .prepare(&format!(
                 "EXPLAIN QUERY PLAN {POLICY_EVALUATION_LOOKUP_SQL}"
@@ -1647,12 +1335,12 @@ mod tests {
             plan.iter()
                 .any(|detail| detail.contains("SEARCH policy_evaluations USING")
                     && detail.contains("policy_evaluations_key")),
-            "{plan:#?}"
+            "{state}: {plan:#?}"
         );
         assert!(
             plan.iter()
                 .all(|detail| !detail.contains("SCAN policy_evaluations")),
-            "{plan:#?}"
+            "{state}: {plan:#?}"
         );
     }
 
@@ -1661,8 +1349,15 @@ mod tests {
     /// every evaluation this store retains.
     #[test]
     fn the_identity_read_seeks_the_evaluation_primary_key() {
+        for state in PlannerStatisticsState::BOTH {
+            the_identity_read_seeks_the_evaluation_primary_key_in(state);
+        }
+    }
+
+    fn the_identity_read_seeks_the_evaluation_primary_key_in(state: PlannerStatisticsState) {
         let store = AnalyzerStore::open_ephemeral().unwrap();
         let conn = store.conn.lock().expect("store mutex");
+        state.install(&conn);
         let mut statement = conn
             .prepare(&format!(
                 "EXPLAIN QUERY PLAN {POLICY_EVALUATION_IDENTITY_SQL}"
@@ -1677,12 +1372,12 @@ mod tests {
             plan.iter()
                 .any(|detail| detail
                     .contains("SEARCH policy_evaluation_identities USING PRIMARY KEY")),
-            "{plan:#?}"
+            "{state}: {plan:#?}"
         );
         assert!(
             plan.iter()
                 .all(|detail| !detail.contains("SCAN policy_evaluation_identities")),
-            "{plan:#?}"
+            "{state}: {plan:#?}"
         );
     }
 
@@ -1690,8 +1385,15 @@ mod tests {
     /// set of one unit.
     #[test]
     fn the_membership_reads_seek_their_primary_keys() {
+        for state in PlannerStatisticsState::BOTH {
+            the_membership_reads_seek_their_primary_keys_in(state);
+        }
+    }
+
+    fn the_membership_reads_seek_their_primary_keys_in(state: PlannerStatisticsState) {
         let store = AnalyzerStore::open_ephemeral().unwrap();
         let conn = store.conn.lock().expect("store mutex");
+        state.install(&conn);
         let mut statement = conn
             .prepare(
                 "EXPLAIN QUERY PLAN
@@ -1708,12 +1410,12 @@ mod tests {
         assert!(
             plan.iter()
                 .any(|detail| detail.contains("SEARCH membership USING PRIMARY KEY")),
-            "{plan:#?}"
+            "{state}: {plan:#?}"
         );
         assert!(
             plan.iter()
                 .all(|detail| !detail.contains("SCAN membership")),
-            "{plan:#?}"
+            "{state}: {plan:#?}"
         );
     }
 }

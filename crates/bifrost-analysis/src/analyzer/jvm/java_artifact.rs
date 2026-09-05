@@ -213,6 +213,7 @@ impl JavaJarPackProducer {
                 | ExternalArtifactKind::PythonSource
                 | ExternalArtifactKind::RubyGemArchive
                 | ExternalArtifactKind::ComposerPackageSourceSet
+                | ExternalArtifactKind::PhpDeclarationStub
                 | ExternalArtifactKind::CppHeaderSourceSet
                 | ExternalArtifactKind::JdkJmodSet
                 | ExternalArtifactKind::RustdocJsonSet
@@ -237,6 +238,7 @@ impl JavaJarPackProducer {
                 | ExternalArtifactKind::PythonSource
                 | ExternalArtifactKind::RubyGemArchive
                 | ExternalArtifactKind::ComposerPackageSourceSet
+                | ExternalArtifactKind::PhpDeclarationStub
                 | ExternalArtifactKind::CppHeaderSourceSet
                 | ExternalArtifactKind::JdkJmodSet
                 | ExternalArtifactKind::RustdocJsonSet
@@ -307,6 +309,7 @@ impl JavaJarPackProducer {
                 | ExternalArtifactKind::PythonSource
                 | ExternalArtifactKind::RubyGemArchive
                 | ExternalArtifactKind::ComposerPackageSourceSet
+                | ExternalArtifactKind::PhpDeclarationStub
                 | ExternalArtifactKind::CppHeaderSourceSet
                 | ExternalArtifactKind::JdkJmodSet
                 | ExternalArtifactKind::RustdocJsonSet

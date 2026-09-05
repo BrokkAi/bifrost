@@ -1,6 +1,6 @@
 use crate::aliases::{
-    PhpCallableCandidates, PhpFileContext, resolve_php_constant, resolve_php_function,
-    resolve_php_type, resolve_php_type_arms,
+    PhpCallableCandidates, PhpFileContext, PhpFileContextIndex, php_use_aliases_from_node,
+    resolve_php_constant, resolve_php_function, resolve_php_type, resolve_php_type_arms,
 };
 use crate::graph::PhpGraphSource;
 use crate::graph::hits::{push_hit, push_hit_range, push_import_hit, push_self_receiver_hit_range};
@@ -18,10 +18,8 @@ use crate::graph::syntax::{
     static_scope_type_fq_name,
 };
 use crate::graph_support::PhpSource;
-use crate::graph_support::php_file_context_from_source;
 use brokk_bifrost_core::analyzer::ProjectFile;
 use brokk_bifrost_core::analyzer::tree_walk::subtree_contains;
-use brokk_bifrost_core::analyzer::usages::common::same_node;
 use brokk_bifrost_core::analyzer::usages::local_inference::LocalInferenceEngine;
 use brokk_bifrost_core::analyzer::usages::model::UsageHit;
 use brokk_bifrost_core::text_utils::compute_line_starts;
@@ -60,7 +58,9 @@ pub fn scan_file(
         return;
     }
 
-    let ctx = php_file_context_from_source(php, file, &source);
+    let Some(contexts) = PhpFileContextIndex::from_tree(tree.root_node(), &source, || true) else {
+        return;
+    };
 
     let line_starts = compute_line_starts(&source);
     if matches!(
@@ -74,7 +74,7 @@ pub fn scan_file(
             file,
             &source,
             &line_starts,
-            &ctx,
+            &contexts,
             hierarchy,
             spec,
             hits,
@@ -88,7 +88,7 @@ pub fn scan_file(
             file,
             &source,
             &line_starts,
-            &ctx,
+            &contexts,
             spec,
             hits,
         );
@@ -103,12 +103,12 @@ fn scan_node(
     file: &ProjectFile,
     source: &str,
     line_starts: &[usize],
-    ctx: &PhpFileContext,
+    contexts: &PhpFileContextIndex,
     spec: &TargetSpec,
     hits: &mut BTreeSet<UsageHit>,
 ) {
     if node.kind() == "namespace_use_declaration" {
-        record_namespace_use_import_hit(node, analyzer, file, source, line_starts, ctx, spec, hits);
+        record_namespace_use_import_hit(node, analyzer, file, source, line_starts, spec, hits);
         return;
     }
     if node.kind() == "comment" {
@@ -126,7 +126,7 @@ fn scan_node(
             file,
             source,
             line_starts,
-            ctx,
+            contexts,
             spec,
             hits,
         );
@@ -141,7 +141,7 @@ fn scan_node(
             file,
             source,
             line_starts,
-            ctx,
+            contexts,
             spec,
             hits,
         );
@@ -156,7 +156,7 @@ fn scan_node(
             file,
             source,
             line_starts,
-            ctx,
+            contexts,
             spec,
             hits,
         );
@@ -170,34 +170,30 @@ fn record_namespace_use_import_hit(
     file: &ProjectFile,
     source: &str,
     line_starts: &[usize],
-    ctx: &PhpFileContext,
     spec: &TargetSpec,
     hits: &mut BTreeSet<UsageHit>,
 ) {
     if !matches!(spec.kind, TargetKind::Type) {
         return;
     }
+    let Some(aliases) = php_use_aliases_from_node(node, source, &mut || true) else {
+        return;
+    };
     let mut stack = vec![node];
     while let Some(current) = stack.pop() {
-        if matches!(current.kind(), "namespace_name" | "qualified_name" | "name")
-            && resolve_php_type(&qualified_candidate_text(current, source), ctx)
-                .is_some_and(|fq| fq == spec.target_fq_name)
-        {
-            push_import_hit(current, analyzer, file, source, line_starts, spec, hits);
-            continue;
-        }
-        if matches!(current.kind(), "name" | "identifier") {
-            let text = node_text(current, source);
-            if is_local_namespace_use_binding_node(current)
-                && ctx
-                    .aliases
-                    .type_aliases
-                    .get(text)
-                    .is_some_and(|fq| fq == &spec.target_fq_name)
-            {
-                push_import_hit(current, analyzer, file, source, line_starts, spec, hits);
+        if current.kind() == "namespace_use_clause" {
+            let Some(binding) = namespace_use_binding_node(current) else {
                 continue;
+            };
+            let local = node_text(binding, source);
+            if aliases
+                .type_aliases
+                .get(local)
+                .is_some_and(|fq| fq == &spec.target_fq_name)
+            {
+                push_import_hit(binding, analyzer, file, source, line_starts, spec, hits);
             }
+            continue;
         }
         for index in (0..current.named_child_count()).rev() {
             if let Some(child) = current.named_child(index) {
@@ -207,21 +203,24 @@ fn record_namespace_use_import_hit(
     }
 }
 
-fn is_local_namespace_use_binding_node(node: Node<'_>) -> bool {
-    let mut current = node.parent();
-    while let Some(parent) = current {
-        if parent.kind() == "namespace_use_declaration" {
-            return true;
-        }
-        if parent.kind() == "namespace_use_clause" {
-            return match parent.child_by_field_name("alias") {
-                Some(alias) => same_node(alias, node),
-                None => true,
-            };
-        }
-        current = parent.parent();
+fn namespace_use_binding_node(clause: Node<'_>) -> Option<Node<'_>> {
+    if let Some(alias) = clause.child_by_field_name("alias") {
+        return Some(alias);
     }
-    true
+    let mut stack = vec![clause];
+    let mut last_name = None;
+    while let Some(current) = stack.pop() {
+        if current.kind() == "name" {
+            last_name = Some(current);
+            continue;
+        }
+        for index in (0..current.named_child_count()).rev() {
+            if let Some(child) = current.named_child(index) {
+                stack.push(child);
+            }
+        }
+    }
+    last_name
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -232,10 +231,11 @@ fn handle_candidate(
     file: &ProjectFile,
     source: &str,
     line_starts: &[usize],
-    ctx: &PhpFileContext,
+    contexts: &PhpFileContextIndex,
     spec: &TargetSpec,
     hits: &mut BTreeSet<UsageHit>,
 ) {
+    let ctx = contexts.context_at(node.start_byte());
     match spec.kind {
         TargetKind::Type => {
             if candidate_resolves_to_type(
@@ -245,14 +245,14 @@ fn handle_candidate(
                 node,
                 source,
                 line_starts,
-                ctx,
+                contexts,
                 &spec.target_fq_name,
             ) {
                 push_hit(node, analyzer, file, source, line_starts, spec, hits);
             }
         }
         TargetKind::Constructor => {
-            if is_constructor_reference(node, source, ctx, spec) {
+            if is_constructor_reference(node, source, contexts, spec) {
                 push_hit(node, analyzer, file, source, line_starts, spec, hits);
             }
         }
@@ -282,9 +282,10 @@ fn candidate_resolves_to_type(
     node: Node<'_>,
     source: &str,
     line_starts: &[usize],
-    ctx: &PhpFileContext,
+    contexts: &PhpFileContextIndex,
     target_fq_name: &str,
 ) -> bool {
+    let ctx = contexts.context_at(node.start_byte());
     if !is_reference_context(node) {
         return false;
     }
@@ -307,9 +308,10 @@ fn candidate_resolves_to_type(
 fn is_constructor_reference(
     node: Node<'_>,
     source: &str,
-    ctx: &PhpFileContext,
+    contexts: &PhpFileContextIndex,
     spec: &TargetSpec,
 ) -> bool {
+    let ctx = contexts.context_at(node.start_byte());
     let Some(owner) = spec.owner_fq_name.as_deref() else {
         return false;
     };
@@ -404,7 +406,7 @@ fn scan_member_patterns(
     file: &ProjectFile,
     source: &str,
     line_starts: &[usize],
-    ctx: &PhpFileContext,
+    contexts: &PhpFileContextIndex,
     hierarchy: &PhpHierarchyIndex,
     spec: &TargetSpec,
     hits: &mut BTreeSet<UsageHit>,
@@ -424,7 +426,7 @@ fn scan_member_patterns(
         file,
         source,
         line_starts,
-        ctx,
+        contexts,
         hierarchy,
         owner,
         spec,
@@ -440,7 +442,7 @@ fn scan_member_tree<'tree>(
     file: &ProjectFile,
     source: &str,
     line_starts: &[usize],
-    ctx: &PhpFileContext,
+    contexts: &PhpFileContextIndex,
     hierarchy: &PhpHierarchyIndex,
     owner: &str,
     spec: &TargetSpec,
@@ -455,7 +457,7 @@ fn scan_member_tree<'tree>(
             file,
             source,
             line_starts,
-            ctx,
+            contexts,
             hierarchy,
             owner,
             spec,
@@ -474,7 +476,7 @@ fn scan_member_scope<'tree>(
     file: &ProjectFile,
     source: &str,
     line_starts: &[usize],
-    ctx: &PhpFileContext,
+    contexts: &PhpFileContextIndex,
     hierarchy: &PhpHierarchyIndex,
     owner: &str,
     spec: &TargetSpec,
@@ -500,7 +502,7 @@ fn scan_member_scope<'tree>(
                     file,
                     source,
                     line_starts,
-                    ctx,
+                    contexts,
                     engine,
                 );
                 continue;
@@ -515,7 +517,7 @@ fn scan_member_scope<'tree>(
                 file,
                 source,
                 line_starts,
-                ctx,
+                contexts,
                 &mut scoped,
             );
             scopes.push((node, scoped));
@@ -527,7 +529,7 @@ fn scan_member_scope<'tree>(
             file,
             source,
             line_starts,
-            ctx,
+            contexts,
             hierarchy,
             owner,
             spec,
@@ -573,9 +575,10 @@ fn seed_parameter_receivers(
     file: &ProjectFile,
     source: &str,
     line_starts: &[usize],
-    ctx: &PhpFileContext,
+    contexts: &PhpFileContextIndex,
     engine: &mut LocalInferenceEngine<String>,
 ) {
+    let ctx = contexts.context_at(node.start_byte());
     seed_parameter_types(node, source, engine, |_name, raw| {
         if ["self", "static", "parent"]
             .iter()
@@ -605,10 +608,11 @@ fn apply_receiver_assignment(
     file: &ProjectFile,
     source: &str,
     line_starts: &[usize],
-    ctx: &PhpFileContext,
+    contexts: &PhpFileContextIndex,
     engine: &mut LocalInferenceEngine<String>,
 ) {
     seed_assignment_binding(node, source, engine, |right, bindings| {
+        let ctx = contexts.context_at(right.start_byte());
         assignment_value_type_fq_name(php, analyzer, right, source, ctx, bindings, |start, end| {
             enclosing_owner_fq_name_at(analyzer, file, start, end, line_starts)
         })
@@ -622,7 +626,7 @@ fn record_member_hit(
     file: &ProjectFile,
     source: &str,
     line_starts: &[usize],
-    ctx: &PhpFileContext,
+    contexts: &PhpFileContextIndex,
     hierarchy: &PhpHierarchyIndex,
     owner: &str,
     spec: &TargetSpec,
@@ -630,6 +634,7 @@ fn record_member_hit(
     engine: &LocalInferenceEngine<String>,
     hits: &mut BTreeSet<UsageHit>,
 ) {
+    let ctx = contexts.context_at(node.start_byte());
     match node.kind() {
         "member_access_expression"
         | "nullsafe_member_access_expression"
@@ -651,7 +656,7 @@ fn record_member_hit(
                 file,
                 source,
                 line_starts,
-                ctx,
+                contexts,
                 engine,
             )
             .is_some_and(|fq| receiver_type_matches(php, &fq, owner, hierarchy))
@@ -743,9 +748,10 @@ fn receiver_expression_type(
     file: &ProjectFile,
     source: &str,
     line_starts: &[usize],
-    ctx: &PhpFileContext,
+    contexts: &PhpFileContextIndex,
     engine: &LocalInferenceEngine<String>,
 ) -> Option<String> {
+    let ctx = contexts.context_at(node.start_byte());
     instance_receiver_type_fq_name(php, analyzer, node, source, ctx, engine, |start, end| {
         enclosing_owner_fq_name_at(analyzer, file, start, end, line_starts)
     })
