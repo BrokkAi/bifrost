@@ -28,10 +28,17 @@ use crate::analyzer::semantic_model::{
 use crate::analyzer::tree_sitter_analyzer::{
     PreparedSyntaxTree, WalkControl, try_walk_named_tree_preorder,
 };
-use crate::analyzer::{CppAnalyzer, IAnalyzer, Language, ProjectFile};
+use crate::analyzer::usages::get_definition::{
+    BoundedResolution, DefinitionLookupStatus, resolve_cpp_bounded,
+};
+use crate::analyzer::usages::receiver_analysis::ReceiverAnalysisBudget;
+use crate::analyzer::usages::reference_site::ResolvedReferenceSite;
+use crate::analyzer::{CodeUnit, CodeUnitIndex, CppAnalyzer, IAnalyzer, Language, ProjectFile};
 use crate::hash::{HashMap, HashSet};
+use crate::text_utils::find_line_index_for_offset;
+use std::sync::Arc;
 
-const ADAPTER_VERSION: &[u8] = b"cpp-cfg-values-v11";
+const ADAPTER_VERSION: &[u8] = b"cpp-cfg-values-v12";
 
 impl_program_semantics_provider!(CppAnalyzer, |analyzer| CppSemanticLowerer::new(analyzer));
 
@@ -103,6 +110,7 @@ impl ProgramSemanticsLowerer for CppSemanticLowerer<'_> {
                 }
             };
 
+        let function_procedures = Arc::new(FunctionProcedureIndex::new(&inventory.specs));
         let ProcedureInventory {
             specs,
             member_declarations,
@@ -121,6 +129,7 @@ impl ProgramSemanticsLowerer for CppSemanticLowerer<'_> {
                     spec,
                     &member_declarations,
                     &trivial_types,
+                    Arc::clone(&function_procedures),
                     staged_budget,
                     cancellation,
                 )
@@ -414,6 +423,70 @@ struct ProcedureInventory<'tree> {
     specs: Vec<ProcedureSpec<'tree>>,
     member_declarations: MemberDeclarations,
     trivial_types: TrivialTypeIndex,
+}
+
+/// Function definitions mounted from this artifact, keyed by their exact
+/// source ranges in the prepared syntax tree.
+#[derive(Default)]
+struct FunctionProcedureIndex {
+    procedures: Vec<FunctionProcedure>,
+}
+
+#[derive(Clone, Copy)]
+struct FunctionProcedure {
+    start_byte: usize,
+    end_byte: usize,
+    procedure: ProcedureId,
+}
+
+impl FunctionProcedureIndex {
+    fn new(specs: &[ProcedureSpec<'_>]) -> Self {
+        let procedures = specs
+            .iter()
+            .filter(|spec| {
+                matches!(
+                    spec.kind,
+                    ProcedureKind::Function | ProcedureKind::LocalFunction
+                )
+            })
+            .map(|spec| FunctionProcedure {
+                start_byte: spec.callable.start_byte(),
+                end_byte: spec.callable.end_byte(),
+                procedure: spec.id,
+            })
+            .collect();
+        Self { procedures }
+    }
+
+    /// Join one resolver-selected definition to the exact procedure mounted
+    /// from that definition. Resolution has already proven the declaration;
+    /// this final join requires its persisted declaration range to equal one
+    /// function-definition node in this immutable syntax tree.
+    fn exact_procedure(
+        &self,
+        analyzer: &CppAnalyzer,
+        file: &ProjectFile,
+        definition: &CodeUnit,
+    ) -> Option<ProcedureId> {
+        if definition.source() != file || !definition.is_function() {
+            return None;
+        }
+        let definition_ranges = analyzer.ranges(definition);
+        let matches = self
+            .procedures
+            .iter()
+            .filter(|procedure| {
+                definition_ranges.iter().any(|range| {
+                    range.start_byte == procedure.start_byte && range.end_byte == procedure.end_byte
+                })
+            })
+            .map(|procedure| procedure.procedure)
+            .collect::<Vec<_>>();
+        match matches.as_slice() {
+            [procedure] => Some(*procedure),
+            _ => None,
+        }
+    }
 }
 
 type ProcedureEnumeration<'tree> = ProcedureInventoryOutcome<ProcedureInventory<'tree>>;
@@ -1234,6 +1307,13 @@ struct LoweringContext<'tree, 'targets> {
     /// Exact active semantic-model owner ids proved by C++ resolution for the
     /// corresponding declared type occurrence.
     binding_model_type_ids: HashMap<ValueId, Box<str>>,
+    /// Function definitions mounted from this exact artifact, available for
+    /// joining a resolver-proven address-of-function target to its procedure.
+    function_procedures: Arc<FunctionProcedureIndex>,
+    /// Local bindings proved stable and initialized from one exact function.
+    function_pointer_targets: HashMap<ValueId, ProcedureId>,
+    /// The immutable syntax backing every node and source location in context.
+    prepared_tree: &'tree PreparedSyntaxTree,
     /// Parameters eligible for C++'s implicit-move return rule. This set is
     /// limited to non-const by-value parameters; named locals remain declined
     /// because NRVO makes their selected transfer conditional.
@@ -1345,6 +1425,7 @@ fn lower_procedure<'tree, 'targets>(
     spec: &ProcedureSpec<'tree>,
     member_declarations: &'targets MemberDeclarations,
     trivial_types: &'targets TrivialTypeIndex,
+    function_procedures: Arc<FunctionProcedureIndex>,
     budget: &'targets SemanticBudget,
     cancellation: &'targets CancellationToken,
 ) -> Result<(ProcedureSemanticsParts, SemanticWork), CppLoweringError> {
@@ -1393,6 +1474,9 @@ fn lower_procedure<'tree, 'targets>(
         binding_type_names: HashMap::default(),
         binding_type_identities: HashMap::default(),
         binding_model_type_ids: HashMap::default(),
+        function_procedures,
+        function_pointer_targets: HashMap::default(),
+        prepared_tree: prepared,
         implicit_move_return_parameters: HashSet::default(),
         return_model_type_id: None,
         constant_index_values: HashMap::default(),
@@ -1427,6 +1511,7 @@ fn lower_procedure<'tree, 'targets>(
     )?;
     if !spec.properties.is_synthetic {
         context.emit_local_bindings(&mut builder, spec.body)?;
+        context.derive_stable_function_pointer_targets(spec.body)?;
     }
     context.register_labels(&mut builder, spec.body)?;
 
@@ -1842,6 +1927,33 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 }
                 return Ok(WalkControl::Continue);
             }
+            if let Some(function_pointer) = cpp_function_pointer_assignment_declaration(node) {
+                let Some((scope_start, scope_end)) = cpp_local_scope(node, body) else {
+                    return Ok(WalkControl::Continue);
+                };
+                let Some(name) = nonempty_node_text(self.source, function_pointer.name) else {
+                    return Ok(WalkControl::Continue);
+                };
+                let metadata = self.value_mapping(builder, function_pointer.name)?;
+                let value = self.session.add_value_with_metadata(
+                    builder,
+                    metadata,
+                    SemanticValueKind::Local,
+                )?;
+                self.identity_bindings.insert(value);
+                self.pointer_bindings.insert(value);
+                self.locals
+                    .entry(name.into())
+                    .or_default()
+                    .push(LocalBinding {
+                        declaration_start: function_pointer.name.start_byte(),
+                        visible_from: function_pointer.name.end_byte(),
+                        scope_start,
+                        scope_end,
+                        value,
+                    });
+                return Ok(WalkControl::SkipChildren);
+            }
             if node.kind() != "declaration"
                 || has_storage_class(self.source, node, "extern")
                 || cpp_declaration_is_function(node)
@@ -1995,6 +2107,228 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         } else {
             ValueFlowKind::Parameter
         }
+    }
+
+    /// Prove a local function-pointer binding denotes one exact function.
+    ///
+    /// The resolver proves the initializer's callable identity, and the
+    /// declaration-path index joins that identity to one mounted procedure.
+    /// The binding must have exactly one initializer and no same-procedure
+    /// occurrence other than its declaration and invocation. Copies,
+    /// address-taking, parameter passage, field storage, and reassignment all
+    /// leave a typed unresolved target instead of entering this proof.
+    fn derive_stable_function_pointer_targets(
+        &mut self,
+        body: Node<'tree>,
+    ) -> Result<(), CppLoweringError> {
+        let mut candidates = Vec::new();
+        let mut pending = vec![body];
+        while let Some(node) = pending.pop() {
+            if self.session.cancellation().is_cancelled() {
+                return Err(CppLoweringError::Cancelled(Box::default()));
+            }
+            if node.id() != body.id() && cpp_nested_execution_boundary(node) {
+                continue;
+            }
+            if node.kind() == "declaration" {
+                for declarator in cpp_local_declarators(node) {
+                    let Some(initializer) = cpp_declarator_initializer(node, declarator) else {
+                        continue;
+                    };
+                    let Some(target) = cpp_address_of_function_initializer(initializer) else {
+                        continue;
+                    };
+                    if !cpp_declarator_contains_kind(declarator, "pointer_declarator")
+                        || !cpp_declarator_contains_kind(declarator, "function_declarator")
+                    {
+                        continue;
+                    }
+                    let Some(name_node) = declarator_name_node(declarator) else {
+                        continue;
+                    };
+                    let Some(name) = nonempty_node_text(self.source, name_node) else {
+                        continue;
+                    };
+                    let Some(value) = self.local_declaration_value(name, name_node.start_byte())
+                    else {
+                        continue;
+                    };
+                    candidates.push((value, target));
+                }
+            } else if let Some(function_pointer) = cpp_function_pointer_assignment_declaration(node)
+            {
+                let Some(name) = nonempty_node_text(self.source, function_pointer.name) else {
+                    pending.extend(named_children(node));
+                    continue;
+                };
+                if let Some(value) =
+                    self.local_declaration_value(name, function_pointer.name.start_byte())
+                {
+                    candidates.push((value, function_pointer.target));
+                }
+            }
+            pending.extend(named_children(node));
+        }
+
+        for (value, target) in candidates {
+            if !self.function_pointer_binding_is_stable(body, value) {
+                continue;
+            }
+            let Some(target) = self.exact_function_target(target) else {
+                continue;
+            };
+            self.function_pointer_targets.insert(value, target);
+        }
+        Ok(())
+    }
+
+    fn function_pointer_binding_is_stable(&self, body: Node<'tree>, value: ValueId) -> bool {
+        let mut pending = vec![body];
+        while let Some(node) = pending.pop() {
+            if node.id() != body.id() && cpp_nested_execution_boundary(node) {
+                if self.subtree_contains_binding(node, value) {
+                    return false;
+                }
+                continue;
+            }
+            if node.kind() == "identifier"
+                && self.binding_value_at(node, value)
+                && !self.identifier_declares_binding(node, value)
+                && !self.identifier_invokes_binding(node, value)
+            {
+                return false;
+            }
+            pending.extend(named_children(node));
+        }
+        true
+    }
+
+    fn subtree_contains_binding(&self, root: Node<'tree>, expected: ValueId) -> bool {
+        let mut pending = vec![root];
+        while let Some(node) = pending.pop() {
+            if node.kind() == "identifier" && self.binding_value_at(node, expected) {
+                return true;
+            }
+            pending.extend(named_children(node));
+        }
+        false
+    }
+
+    fn binding_value_at(&self, node: Node<'tree>, expected: ValueId) -> bool {
+        nonempty_node_text(self.source, node)
+            .and_then(|name| self.binding_value(name, node.start_byte()))
+            == Some(expected)
+    }
+
+    fn identifier_declares_binding(&self, node: Node<'tree>, value: ValueId) -> bool {
+        let Some(name) = nonempty_node_text(self.source, node) else {
+            return false;
+        };
+        let mut current = node.parent();
+        while let Some(parent) = current {
+            if let Some(function_pointer) = cpp_function_pointer_assignment_declaration(parent) {
+                return function_pointer.name.id() == node.id()
+                    && self.local_declaration_value(name, node.start_byte()) == Some(value);
+            }
+            if matches!(parent.kind(), "declaration" | "field_declaration") {
+                return cpp_local_declarators(parent).into_iter().any(|declarator| {
+                    declarator_name_node(declarator).is_some_and(|declaration_name| {
+                        declaration_name.id() == node.id()
+                            && self.local_declaration_value(name, declaration_name.start_byte())
+                                == Some(value)
+                    })
+                });
+            }
+            current = parent.parent();
+        }
+        false
+    }
+
+    fn identifier_invokes_binding(&self, identifier: Node<'tree>, _value: ValueId) -> bool {
+        let mut current = identifier;
+        while let Some(parent) = current.parent() {
+            if parent.kind() == "call_expression"
+                && parent.child_by_field_name("function") == Some(current)
+            {
+                return true;
+            }
+            let can_wrap_call = match parent.kind() {
+                "parenthesized_expression" => {
+                    first_named_child(parent).is_some_and(|child| child.id() == current.id())
+                }
+                "pointer_expression" => {
+                    has_direct_token(parent, "*")
+                        && parent
+                            .child_by_field_name("argument")
+                            .is_some_and(|child| child.id() == current.id())
+                }
+                _ => false,
+            };
+            if !can_wrap_call {
+                return false;
+            }
+            current = parent;
+        }
+        false
+    }
+
+    fn stable_local_function_target(&self, mut function: Node<'tree>) -> Option<ProcedureId> {
+        loop {
+            match function.kind() {
+                "identifier" => {
+                    let value = nonempty_node_text(self.source, function)
+                        .and_then(|name| self.binding_value(name, function.start_byte()))?;
+                    return self.function_pointer_targets.get(&value).copied();
+                }
+                "parenthesized_expression" => {
+                    function = first_named_child(function)?;
+                }
+                "pointer_expression" if has_direct_token(function, "*") => {
+                    function = function.child_by_field_name("argument")?;
+                }
+                _ => return None,
+            }
+        }
+    }
+
+    /// Resolve one initializer callable through the language's bounded
+    /// structured resolver, then require it to be one exact mounted function.
+    fn exact_function_target(&self, target: Node<'tree>) -> Option<ProcedureId> {
+        let text = nonempty_node_text(self.source, target)?.to_string();
+        let start = target.start_byte();
+        let end = target.end_byte();
+        let line_starts = self.prepared_tree.line_starts();
+        let site = ResolvedReferenceSite {
+            path: crate::path_utils::rel_path_string(self.file),
+            text,
+            range: crate::analyzer::Range {
+                start_byte: start,
+                end_byte: end,
+                start_line: find_line_index_for_offset(line_starts, start) + 1,
+                end_line: find_line_index_for_offset(line_starts, end.saturating_sub(1)) + 1,
+            },
+            focus_start_byte: start,
+            focus_end_byte: end,
+        };
+        let outcome = match resolve_cpp_bounded(
+            self.analyzer,
+            self.file,
+            self.source,
+            Some(self.prepared_tree.tree()),
+            &site,
+            ReceiverAnalysisBudget::default(),
+            Some(self.session.cancellation()),
+        ) {
+            BoundedResolution::Complete { value, .. } => value,
+            BoundedResolution::Exceeded { .. } | BoundedResolution::Cancelled { .. } => {
+                return None;
+            }
+        };
+        if outcome.status != DefinitionLookupStatus::Resolved || outcome.definitions.len() != 1 {
+            return None;
+        }
+        self.function_procedures
+            .exact_procedure(self.analyzer, self.file, &outcome.definitions[0])
     }
 
     /// Select an exact modeled value transfer from an identifier operand.
@@ -3450,6 +3784,43 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             }
             "expression_statement" => {
                 if let Some(expression) = first_named_child(node) {
+                    if let Some(function_pointer) =
+                        cpp_function_pointer_assignment_declaration(expression)
+                    {
+                        let name = nonempty_node_text(self.source, function_pointer.name)
+                            .ok_or_else(|| missing_field(expression, "declarator name"))?;
+                        let target = self
+                            .local_declaration_value(name, function_pointer.name.start_byte())
+                            .ok_or_else(|| missing_field(expression, "local binding"))?;
+                        let terminal = self.point(builder, expression, Vec::new())?;
+                        let value = self.expression_value(
+                            builder,
+                            function_pointer.initializer,
+                            cpp_expression_value_kind(function_pointer.initializer),
+                        )?;
+                        self.append_effect(
+                            builder,
+                            terminal,
+                            SemanticEffect::Assignment { target, value },
+                        )?;
+                        self.append_effect(
+                            builder,
+                            terminal,
+                            SemanticEffect::ValueFlow {
+                                kind: ValueFlowKind::Local,
+                                source: value,
+                                target,
+                            },
+                        )?;
+                        self.edge(builder, terminal, next)?;
+                        stack.push(Work::Expression {
+                            node: function_pointer.initializer,
+                            entry,
+                            next: EdgeTarget::normal(terminal),
+                            scope,
+                        });
+                        return Ok(());
+                    }
                     stack.push(Work::Expression {
                         node: expression,
                         entry,
@@ -5412,9 +5783,15 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             CallableReferenceKind::Function
         };
         let resolution = if indirect {
-            CallableTargetResolution::Unsupported
+            match self.stable_local_function_target(function) {
+                Some(target) => CallableTargetResolution::Proven(CallableTarget::Local(target)),
+                None => CallableTargetResolution::Unsupported,
+            }
         } else {
-            CallableTargetResolution::Unknown
+            match self.stable_local_function_target(function) {
+                Some(target) => CallableTargetResolution::Proven(CallableTarget::Local(target)),
+                None => CallableTargetResolution::Unknown,
+            }
         };
         let metadata = self.metadata(invoke)?;
         self.append_effect(
@@ -5474,7 +5851,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         self.abrupt(builder, exceptional, scope, CompletionKind::Throw, None)?;
         self.resolution_gaps(builder, invoke, callee, call_site, &resolution)?;
 
-        if indirect {
+        if indirect && !matches!(resolution, CallableTargetResolution::Proven(_)) {
             self.add_gap(
                 builder,
                 invoke,
@@ -6683,6 +7060,97 @@ fn cpp_declarator_initializer<'tree>(
         .flatten()
 }
 
+#[derive(Clone, Copy)]
+struct CppFunctionPointerAssignmentDeclaration<'tree> {
+    name: Node<'tree>,
+    initializer: Node<'tree>,
+    target: Node<'tree>,
+}
+
+/// Recover the declaration identity from the exact tree-sitter shape used for
+/// `void (*callback)() = &target;` inside a compound statement.
+///
+/// The C++ grammar currently represents this legal declaration as an
+/// assignment expression whose left side retains every declarator component:
+/// a type node, a `*` pointer node containing the name, and an empty function
+/// parameter list. Matching those fields is a structured grammar adaptation,
+/// not a source-text parser. Ordinary assignments and indirect initializers do
+/// not satisfy this shape.
+fn cpp_function_pointer_assignment_declaration<'tree>(
+    node: Node<'tree>,
+) -> Option<CppFunctionPointerAssignmentDeclaration<'tree>> {
+    if node.kind() != "assignment_expression"
+        || node
+            .parent()
+            .is_none_or(|parent| parent.kind() != "expression_statement")
+        || assignment_operator(node) != Some("=")
+    {
+        return None;
+    }
+    let outer = node.child_by_field_name("left")?;
+    if outer.kind() != "call_expression" {
+        return None;
+    }
+    let parameters = outer.child_by_field_name("arguments")?;
+    if parameters.kind() != "argument_list" || parameters.named_child_count() != 0 {
+        return None;
+    }
+    let declarator = outer.child_by_field_name("function")?;
+    if declarator.kind() != "call_expression" {
+        return None;
+    }
+    let type_node = declarator.child_by_field_name("function")?;
+    if !is_type_syntax(type_node.kind()) {
+        return None;
+    }
+    let pointer_list = declarator.child_by_field_name("arguments")?;
+    if pointer_list.kind() != "argument_list" || pointer_list.named_child_count() != 1 {
+        return None;
+    }
+    let pointer = pointer_list.named_child(0)?;
+    if pointer.kind() != "pointer_expression" || !has_direct_token(pointer, "*") {
+        return None;
+    }
+    let name = pointer.child_by_field_name("argument")?;
+    if name.kind() != "identifier" {
+        return None;
+    }
+    let initializer = node.child_by_field_name("right")?;
+    let target = cpp_address_of_function_initializer(initializer)?;
+    Some(CppFunctionPointerAssignmentDeclaration {
+        name,
+        initializer,
+        target,
+    })
+}
+
+/// Return the callable operand of a direct address-of initializer.
+///
+/// This recognizes only the grammar's structured `&` expression and a named
+/// callable operand. The resolver and the declaration-range join perform the
+/// target identity checks; member pointers, casts, dereferences, and other
+/// expression shapes remain outside this proof.
+fn cpp_address_of_function_initializer<'tree>(mut initializer: Node<'tree>) -> Option<Node<'tree>> {
+    while initializer.kind() == "parenthesized_expression" {
+        initializer = initializer
+            .child_by_field_name("argument")
+            .or_else(|| first_named_child(initializer))?;
+    }
+    if initializer.kind() != "pointer_expression"
+        || initializer
+            .child_by_field_name("operator")
+            .is_none_or(|operator| operator.kind() != "&")
+    {
+        return None;
+    }
+    let argument = initializer.child_by_field_name("argument")?;
+    matches!(
+        argument.kind(),
+        "identifier" | "qualified_identifier" | "scoped_identifier" | "template_function"
+    )
+    .then_some(argument)
+}
+
 fn cpp_local_allocation_kind(
     declaration: Node<'_>,
     declarator: Node<'_>,
@@ -7454,6 +7922,33 @@ mod tests {
             .flat_map(|point| point.events.iter())
             .map(|event| &event.effect)
             .collect()
+    }
+
+    #[test]
+    fn function_pointer_initializer_has_the_required_structural_shape() {
+        const SOURCE: &str =
+            "void target() {}\nvoid caller() { void (*callback)() = &target; callback(); }\n";
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_cpp::LANGUAGE.into())
+            .expect("C++ grammar is valid");
+        let tree = parser.parse(SOURCE, None).expect("fixture parses");
+        let assignment = crate::analyzer::tree_walk::descendants_of_kind(
+            tree.root_node(),
+            "assignment_expression",
+        )
+        .into_iter()
+        .find(|node| cpp_function_pointer_assignment_declaration(*node).is_some())
+        .unwrap_or_else(|| {
+            panic!(
+                "fixture has structured function-pointer declaration: {}",
+                tree.root_node().to_sexp()
+            )
+        });
+        let declaration = cpp_function_pointer_assignment_declaration(assignment)
+            .expect("the same assignment remains a declaration");
+        assert_eq!(node_text(SOURCE, declaration.name), Some("callback"));
+        assert_eq!(node_text(SOURCE, declaration.target), Some("target"));
     }
 
     /// A by-value scalar relay is a value transfer, not a decline (#2666, #2665).

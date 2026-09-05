@@ -641,6 +641,7 @@ type MacroReplacementCache = HashMap<(ProjectFile, usize), Arc<ParsedMacroReplac
 type MacroLocalBindingTemplateCache =
     HashMap<(ProjectFile, usize), Option<Arc<MacroLocalBindingTemplate>>>;
 type MacroReplacementBodyCache = HashMap<(ProjectFile, usize), Option<Arc<ParsedReplacementBody>>>;
+type MacroTypeParameterCache = HashMap<(ProjectFile, usize), Option<Arc<[usize]>>>;
 
 #[derive(Clone, Default)]
 pub struct MacroEnvironment {
@@ -943,6 +944,7 @@ pub struct VisibilityIndex<'a> {
     c_tag_kind_cache: Mutex<HashMap<CodeUnit, Option<CppCTagKind>>>,
     c_tag_complete_definition_cache: Mutex<HashMap<CodeUnit, Option<CodeUnit>>>,
     macro_event_cells: Mutex<HashMap<ProjectFile, MacroEventCell>>,
+    macro_event_name_sets: Mutex<HashMap<ProjectFile, Arc<HashSet<String>>>>,
     pub macro_include_protection_cells: Mutex<HashMap<ProjectFile, MacroIncludeProtectionCell>>,
     // The environment at selected event prefixes of each file, built once and read by every
     // worker. The authoritative differential shares this index across target workers whose
@@ -954,6 +956,7 @@ pub struct VisibilityIndex<'a> {
     macro_replacements: Mutex<MacroReplacementCache>,
     macro_local_binding_templates: Mutex<MacroLocalBindingTemplateCache>,
     macro_replacement_bodies: Mutex<MacroReplacementBodyCache>,
+    macro_type_parameters: Mutex<MacroTypeParameterCache>,
     callable_parameter_macro_arities: Mutex<HashMap<(ProjectFile, String), Option<CallableArity>>>,
     #[cfg(any(test, feature = "test-support"))]
     pub macro_replacement_parse_count: AtomicUsize,
@@ -1187,6 +1190,10 @@ pub enum MacroDefinition {
         parameters: Vec<String>,
         replacement: String,
     },
+    VariadicFunction {
+        parameters: Vec<String>,
+        replacement: String,
+    },
     Unsupported,
 }
 
@@ -1324,11 +1331,11 @@ pub struct MacroLocalBinding<'tree> {
     pub proven_unit: Option<CodeUnit>,
 }
 
-fn macro_replacement_type_parameter(
+fn macro_replacement_type_parameters(
     body: &ParsedReplacementBody,
     parameters: &[String],
-) -> Option<usize> {
-    let mut found = None;
+) -> Option<Vec<usize>> {
+    let mut found = Vec::new();
     let mut stack = vec![body.tree.root_node()];
     while let Some(node) = stack.pop() {
         let type_position = node.kind() == "type_identifier"
@@ -1360,11 +1367,9 @@ fn macro_replacement_type_parameter(
             && let Some(index) = parameters
                 .iter()
                 .position(|parameter| parameter == node_text(node, &body.source))
+            && !found.contains(&index)
         {
-            if found.is_some_and(|existing| existing != index) {
-                return None;
-            }
-            found = Some(index);
+            found.push(index);
         }
         for index in (0..node.named_child_count()).rev() {
             if let Some(child) = node.named_child(index) {
@@ -1372,7 +1377,15 @@ fn macro_replacement_type_parameter(
             }
         }
     }
-    found
+    (!found.is_empty()).then_some(found)
+}
+
+fn macro_replacement_type_parameter(
+    body: &ParsedReplacementBody,
+    parameters: &[String],
+) -> Option<usize> {
+    let mut parameters = macro_replacement_type_parameters(body, parameters)?;
+    (parameters.len() == 1).then(|| parameters.pop().unwrap())
 }
 
 fn macro_type_argument_node<'tree>(node: Node<'tree>, source: &str) -> Option<Node<'tree>> {
@@ -1407,6 +1420,35 @@ fn macro_type_argument_node<'tree>(node: Node<'tree>, source: &str) -> Option<No
             .filter(|name| matches!(name.kind(), "identifier" | "type_identifier")),
         _ => cpp_name_component_nodes(node).is_some().then_some(node),
     }
+}
+
+fn c_function_macro_argument<'tree>(
+    node: Node<'tree>,
+) -> Option<(Node<'tree>, usize, Node<'tree>)> {
+    let mut current = node;
+    while let Some(parent) = current.parent() {
+        if parent.kind() == "argument_list" {
+            let call = parent.parent().filter(|call| {
+                call.kind() == "call_expression"
+                    && call.child_by_field_name("arguments") == Some(parent)
+                    && call
+                        .child_by_field_name("function")
+                        .is_some_and(|function| {
+                            function.kind() == "identifier"
+                                && !node_range_contains(function, current)
+                        })
+            })?;
+            let mut actuals = argument_children(parent).enumerate();
+            let (index, argument) = actuals.find(|(_, argument)| {
+                node_range_contains(*argument, node)
+                    && (argument.start_byte() == current.start_byte()
+                        || argument.end_byte() == current.end_byte())
+            })?;
+            return Some((call, index, argument));
+        }
+        current = parent;
+    }
+    None
 }
 
 /// Recover GLib's `g_autoptr(T) name = value` declaration from the CST shape
@@ -1710,11 +1752,13 @@ impl<'a> VisibilityIndex<'a> {
             c_tag_kind_cache: Mutex::new(HashMap::default()),
             c_tag_complete_definition_cache: Mutex::new(HashMap::default()),
             macro_event_cells: Mutex::new(HashMap::default()),
+            macro_event_name_sets: Mutex::new(HashMap::default()),
             macro_include_protection_cells: Mutex::new(HashMap::default()),
             macro_environment_checkpoints: Mutex::new(HashMap::default()),
             macro_replacements: Mutex::new(HashMap::default()),
             macro_local_binding_templates: Mutex::new(HashMap::default()),
             macro_replacement_bodies: Mutex::new(HashMap::default()),
+            macro_type_parameters: Mutex::new(HashMap::default()),
             callable_parameter_macro_arities: Mutex::new(HashMap::default()),
             macro_replacement_parse_count: AtomicUsize::new(0),
             macro_event_application_count: AtomicUsize::new(0),
@@ -1983,11 +2027,13 @@ impl<'a> VisibilityIndex<'a> {
             c_tag_kind_cache: Mutex::new(HashMap::default()),
             c_tag_complete_definition_cache: Mutex::new(HashMap::default()),
             macro_event_cells: Mutex::new(HashMap::default()),
+            macro_event_name_sets: Mutex::new(HashMap::default()),
             macro_include_protection_cells: Mutex::new(HashMap::default()),
             macro_environment_checkpoints: Mutex::new(HashMap::default()),
             macro_replacements: Mutex::new(HashMap::default()),
             macro_local_binding_templates: Mutex::new(HashMap::default()),
             macro_replacement_bodies: Mutex::new(HashMap::default()),
+            macro_type_parameters: Mutex::new(HashMap::default()),
             callable_parameter_macro_arities: Mutex::new(HashMap::default()),
             #[cfg(any(test, feature = "test-support"))]
             macro_replacement_parse_count: AtomicUsize::new(0),
@@ -2438,6 +2484,76 @@ impl<'a> VisibilityIndex<'a> {
         })
     }
 
+    /// Return the type argument at a C function-like macro invocation.
+    ///
+    /// Exact local macro definitions identify type formals from their parsed
+    /// replacement. An unavailable definition is deliberately not inferred:
+    /// C has no AST distinction between an external macro call and an
+    /// ordinary call to an unindexed function.
+    pub fn function_macro_type_argument<'tree>(
+        &self,
+        file: &ProjectFile,
+        node: Node<'tree>,
+        source: &str,
+    ) -> Option<Node<'tree>> {
+        if !is_c_source_file(file) {
+            return None;
+        }
+        let (call, argument_index, argument) = c_function_macro_argument(node)?;
+        let function = call.child_by_field_name("function")?;
+        let function_name = node_text(function, source);
+        if function_name.is_empty() {
+            return None;
+        }
+        if !self.file_defines_macro_name(file, function_name)
+            && !self
+                .visible_identifier_candidates(file, function_name)
+                .any(|candidate| candidate.is_macro())
+        {
+            return None;
+        }
+        let environment = self.macro_environment(file, call.start_byte());
+        let binding = environment.binding(function_name)?;
+        if !binding.is_exact() {
+            return None;
+        }
+        let (parameters, replacement, variadic) = match &binding.definition {
+            MacroDefinition::Function {
+                parameters,
+                replacement,
+            } => (parameters, replacement, false),
+            MacroDefinition::VariadicFunction {
+                parameters,
+                replacement,
+            } => (parameters, replacement, true),
+            MacroDefinition::Object { .. } | MacroDefinition::Unsupported => return None,
+        };
+        let actuals = call
+            .child_by_field_name("arguments")
+            .map(argument_children)
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        let arity_matches = if variadic {
+            actuals.len() >= parameters.len()
+        } else {
+            actuals.len() == parameters.len()
+        };
+        let type_parameters = self.macro_type_parameter_indices(
+            &(binding.source.clone(), binding.declaration_byte),
+            parameters,
+            replacement,
+        )?;
+        if !arity_matches || !type_parameters.contains(&argument_index) {
+            return None;
+        }
+        let type_node = macro_type_argument_node(argument, source)?;
+        if self.names_a_macro_at(file, node_text(type_node, source), type_node.start_byte()) {
+            return None;
+        }
+        Some(type_node)
+    }
+
     fn macro_local_binding_template(
         &self,
         binding: &MacroBinding,
@@ -2578,6 +2694,55 @@ impl<'a> VisibilityIndex<'a> {
         body
     }
 
+    /// Identify fixed macro formals that retain an unambiguous type role even
+    /// when an unrelated part of the replacement needs parser recovery.
+    ///
+    /// Variadic production macros commonly contain token pasting elsewhere in
+    /// the body. The strict shared replacement parser must keep rejecting that
+    /// body for expansion modeling, but a type declaration such as `TY col`
+    /// remains usable when the node itself retains a structured type role.
+    fn macro_type_parameter_indices(
+        &self,
+        key: &(ProjectFile, usize),
+        parameters: &[String],
+        replacement: &str,
+    ) -> Option<Arc<[usize]>> {
+        if let Some(indices) = self
+            .macro_type_parameters
+            .lock()
+            .expect("C++ macro type-parameter cache poisoned")
+            .get(key)
+        {
+            return indices.clone();
+        }
+        #[cfg(any(test, feature = "test-support"))]
+        self.macro_replacement_parse_count
+            .fetch_add(1, Ordering::Relaxed);
+        let indices = (|| {
+            if replacement.trim().is_empty() {
+                return None;
+            }
+            let source = format!("{MACRO_BODY_SENTINEL_PREFIX}{replacement}; }}");
+            let mut parser = Parser::new();
+            parser
+                .set_language(&tree_sitter_cpp::LANGUAGE.into())
+                .ok()?;
+            let tree = parser.parse(&source, None)?;
+            let body = ParsedReplacementBody {
+                source,
+                tree,
+                body_offset: MACRO_BODY_SENTINEL_PREFIX.len(),
+                parameters: parameters.to_vec(),
+            };
+            macro_replacement_type_parameters(&body, parameters).map(Arc::from)
+        })();
+        self.macro_type_parameters
+            .lock()
+            .expect("C++ macro type-parameter cache poisoned")
+            .insert(key.clone(), indices.clone());
+        indices
+    }
+
     fn decode_macro_definition(node: Node<'_>, source: &str) -> MacroDefinition {
         let replacement = node
             .child_by_field_name("value")
@@ -2589,20 +2754,25 @@ impl<'a> VisibilityIndex<'a> {
         let Some(parameters) = node.child_by_field_name("parameters") else {
             return MacroDefinition::Unsupported;
         };
-        if (0..parameters.child_count()).any(|index| {
+        let variadic = (0..parameters.child_count()).any(|index| {
             parameters
                 .child(index)
                 .is_some_and(|child| child.kind() == "...")
-        }) {
-            return MacroDefinition::Unsupported;
-        }
+        });
         let parameters = (0..parameters.named_child_count())
             .filter_map(|index| parameters.named_child(index))
             .map(|parameter| node_text(parameter, source).to_string())
-            .collect();
-        MacroDefinition::Function {
-            parameters,
-            replacement,
+            .collect::<Vec<_>>();
+        if variadic {
+            MacroDefinition::VariadicFunction {
+                parameters,
+                replacement,
+            }
+        } else {
+            MacroDefinition::Function {
+                parameters,
+                replacement,
+            }
         }
     }
 
@@ -2613,6 +2783,36 @@ impl<'a> VisibilityIndex<'a> {
             .entry(file.clone())
             .or_default()
             .clone()
+    }
+
+    fn file_defines_macro_name(&self, file: &ProjectFile, name: &str) -> bool {
+        if let Some(names) = self
+            .macro_event_name_sets
+            .lock()
+            .expect("C++ macro event-name cache poisoned")
+            .get(file)
+            .cloned()
+        {
+            return names.contains(name);
+        }
+        let cell = self.macro_event_cell(file);
+        let events = cell.get_or_init(|| self.collect_macro_events(file).into_boxed_slice());
+        let names = Arc::new(
+            events
+                .iter()
+                .filter_map(|event| match event {
+                    MacroEvent::Define { name, .. } => Some(name.clone()),
+                    MacroEvent::Undef { .. }
+                    | MacroEvent::Include { .. }
+                    | MacroEvent::Invalidate { .. } => None,
+                })
+                .collect(),
+        );
+        self.macro_event_name_sets
+            .lock()
+            .expect("C++ macro event-name cache poisoned")
+            .insert(file.clone(), Arc::clone(&names));
+        names.contains(name)
     }
 
     fn macro_environment_checkpoint_cell(
@@ -2978,7 +3178,9 @@ impl<'a> VisibilityIndex<'a> {
         }
         match &binding.definition {
             MacroDefinition::Object { replacement } => Some(replacement.clone()),
-            MacroDefinition::Function { .. } | MacroDefinition::Unsupported => None,
+            MacroDefinition::Function { .. }
+            | MacroDefinition::VariadicFunction { .. }
+            | MacroDefinition::Unsupported => None,
         }
     }
 
@@ -11817,7 +12019,9 @@ fn decode_field_declared_type_fact(
     analyzer: &CppGraphSource<'_>,
     field: &CodeUnit,
 ) -> Option<DeclaredFieldTypeFact> {
-    let declaration = analyzer.get_source(field, false)?;
+    let Some(declaration) = analyzer.get_source(field, false) else {
+        return decode_indexed_field_declared_type_fact(analyzer, field);
+    };
     let mut parser = Parser::new();
     parser
         .set_language(&tree_sitter_cpp::LANGUAGE.into())
@@ -11871,6 +12075,34 @@ fn decode_field_declared_type_fact(
         }
         let mut cursor = node.walk();
         stack.extend(node.named_children(&mut cursor));
+    }
+    None
+}
+
+/// Decode a field whose generated owner prevents the ordinary source lookup
+/// from selecting a standalone declaration. The indexed ranges still point
+/// into the physical syntax tree, so recover the enclosing declaration from
+/// that structure and apply the same declarator decoder to it.
+fn decode_indexed_field_declared_type_fact(
+    analyzer: &CppGraphSource<'_>,
+    field: &CodeUnit,
+) -> Option<DeclaredFieldTypeFact> {
+    let cpp = analyzer.cpp?;
+    let prepared = cpp.prepared_syntax(analyzer.token, field.source())?;
+    let source = prepared.source();
+    let root = prepared.tree().root_node();
+    for range in analyzer.ranges(field) {
+        let end = range.start_byte.saturating_add(1).min(source.len());
+        let mut current = root.descendant_for_byte_range(range.start_byte, end);
+        while let Some(node) = current {
+            if matches!(node.kind(), "declaration" | "field_declaration")
+                && let Some(fact) =
+                    decode_declared_field_type_node(node, field.identifier(), source)
+            {
+                return Some(fact);
+            }
+            current = node.parent();
+        }
     }
     None
 }
@@ -13309,17 +13541,22 @@ pub enum DesignatedInitializerOwner {
     Unresolved,
 }
 
+enum InitializerOwnerStep {
+    Field(String),
+    AggregateWrapper,
+}
+
 /// Recognize a designated-initializer field and, when possible, resolve its
 /// aggregate owner.
 ///
 /// Covers both the grammar's ordinary `field_designator` shape and the exact
 /// recovery used for `.field = value` after a preprocessor-split array
-/// initializer. Nested aggregate levels are deliberately left unresolved unless
-/// the single outer level is the containing array initializer: resolving those
-/// would require following the enclosing field's declared type. `None` means the
-/// node is not a designator at all; an unresolved designator remains classified so
-/// callers cannot fall through to unrelated global/member heuristics.
+/// initializer. Ordered multi-component designators follow each preceding
+/// field's declared aggregate type. `None` means the node is not a designator
+/// at all; an unresolved designator remains classified so callers cannot fall
+/// through to unrelated global/member heuristics.
 pub fn designated_initializer_owner(
+    analyzer: &CppGraphSource<'_>,
     visibility: &VisibilityIndex<'_>,
     file: &ProjectFile,
     source: &str,
@@ -13330,21 +13567,30 @@ pub fn designated_initializer_owner(
         .filter(|parent| parent.kind() == "field_designator")
     {
         let pair = designator.parent()?;
-        if pair.kind() != "initializer_pair"
-            || pair.child_by_field_name("designator") != Some(designator)
-        {
+        if pair.kind() != "initializer_pair" {
             return None;
         }
+        let mut cursor = pair.walk();
+        let designators = pair
+            .children_by_field_name("designator", &mut cursor)
+            .collect::<Vec<_>>();
+        let position = designators
+            .iter()
+            .position(|candidate| same_node(*candidate, designator))?;
         let initializer = pair.parent()?;
         if initializer.kind() != "initializer_list" {
             return None;
         }
-        return Some(classified_designated_owner(initializer_list_owner(
-            visibility,
-            file,
-            source,
-            initializer,
-        )));
+        let mut owner = initializer_list_owner(analyzer, visibility, file, source, initializer);
+        for prior in &designators[..position] {
+            let field = prior
+                .child_by_field_name("field")
+                .or_else(|| first_named_child_of_kind(*prior, "field_identifier"))?;
+            owner = owner.and_then(|owner| {
+                initializer_field_owner(analyzer, visibility, file, owner, node_text(field, source))
+            });
+        }
+        return Some(classified_designated_owner(owner));
     }
 
     let init_declarator = node.parent()?;
@@ -13354,6 +13600,7 @@ pub fn designated_initializer_owner(
         return None;
     }
     Some(classified_designated_owner(declaration_owner(
+        analyzer,
         visibility,
         file,
         source,
@@ -13369,41 +13616,42 @@ fn classified_designated_owner(owner: Option<CodeUnit>) -> DesignatedInitializer
 }
 
 fn initializer_list_owner(
+    analyzer: &CppGraphSource<'_>,
     visibility: &VisibilityIndex<'_>,
     file: &ProjectFile,
     source: &str,
     initializer: Node<'_>,
 ) -> Option<CodeUnit> {
     let mut current = initializer;
-    let mut outer_initializer_lists = 0usize;
+    let mut steps = Vec::new();
     loop {
         let parent = current.parent()?;
         match parent.kind() {
-            "initializer_pair" => return None,
+            "initializer_pair" if parent.child_by_field_name("value") == Some(current) => {
+                let designator = parent.child_by_field_name("designator")?;
+                let step = designator
+                    .child_by_field_name("field")
+                    .or_else(|| first_named_child_of_kind(designator, "field_identifier"))
+                    .map(|field| InitializerOwnerStep::Field(node_text(field, source).to_string()))
+                    .unwrap_or(InitializerOwnerStep::AggregateWrapper);
+                steps.push(step);
+                current = parent.parent()?;
+            }
             "initializer_list" => {
-                outer_initializer_lists += 1;
-                if outer_initializer_lists > 1 {
-                    return None;
-                }
                 current = parent;
             }
             "init_declarator" if parent.child_by_field_name("value") == Some(current) => {
                 let declaration = parent.parent()?;
-                if outer_initializer_lists == 1
-                    && !parent
-                        .child_by_field_name("declarator")
-                        .is_some_and(contains_array_declarator)
-                {
-                    return None;
-                }
-                return declaration_owner(visibility, file, source, declaration);
+                let owner = declaration_owner(analyzer, visibility, file, source, declaration)?;
+                return apply_initializer_owner_steps(analyzer, visibility, file, owner, steps);
             }
             "compound_literal_expression"
-                if parent.child_by_field_name("value") == Some(current)
-                    && outer_initializer_lists == 0 =>
+                if parent.child_by_field_name("value") == Some(current) =>
             {
                 let type_node = parent.child_by_field_name("type")?;
-                return resolve_designated_owner_type(visibility, file, source, type_node);
+                let owner =
+                    resolve_designated_owner_type(analyzer, visibility, file, source, type_node)?;
+                return apply_initializer_owner_steps(analyzer, visibility, file, owner, steps);
             }
             "ERROR" => current = parent,
             _ => return None,
@@ -13411,7 +13659,42 @@ fn initializer_list_owner(
     }
 }
 
+fn apply_initializer_owner_steps(
+    analyzer: &CppGraphSource<'_>,
+    visibility: &VisibilityIndex<'_>,
+    file: &ProjectFile,
+    mut owner: CodeUnit,
+    steps: Vec<InitializerOwnerStep>,
+) -> Option<CodeUnit> {
+    for step in steps.into_iter().rev() {
+        if let InitializerOwnerStep::Field(field_name) = step {
+            owner = initializer_field_owner(analyzer, visibility, file, owner, &field_name)?;
+        }
+    }
+    Some(owner)
+}
+
+fn initializer_field_owner(
+    analyzer: &CppGraphSource<'_>,
+    visibility: &VisibilityIndex<'_>,
+    file: &ProjectFile,
+    owner: CodeUnit,
+    field_name: &str,
+) -> Option<CodeUnit> {
+    let fields = visibility
+        .visible_members_for_owner_name(file, &owner, field_name)
+        .into_iter()
+        .filter(|field| field.is_field())
+        .collect::<Vec<_>>();
+    let field = match fields.as_slice() {
+        [field] => *field,
+        _ => return None,
+    };
+    field_declared_binding(analyzer, visibility, file, field)?.unit
+}
+
 fn declaration_owner(
+    analyzer: &CppGraphSource<'_>,
     visibility: &VisibilityIndex<'_>,
     file: &ProjectFile,
     source: &str,
@@ -13423,34 +13706,23 @@ fn declaration_owner(
     let type_node = declaration
         .child_by_field_name("type")
         .or_else(|| first_type_child(declaration))?;
-    resolve_designated_owner_type(visibility, file, source, type_node)
+    resolve_designated_owner_type(analyzer, visibility, file, source, type_node)
 }
 
 fn resolve_designated_owner_type(
+    analyzer: &CppGraphSource<'_>,
     visibility: &VisibilityIndex<'_>,
     file: &ProjectFile,
     source: &str,
     type_node: Node<'_>,
 ) -> Option<CodeUnit> {
+    if let Some(owner) = anonymous_aggregate_owner(analyzer, file, type_node) {
+        return Some(owner);
+    }
     let type_name = normalize_type_text(node_text(type_node, source));
     visibility
         .resolve_type(file, &type_name)
         .filter(CodeUnit::is_class)
-}
-
-fn contains_array_declarator(declarator: Node<'_>) -> bool {
-    let mut stack = vec![declarator];
-    while let Some(node) = stack.pop() {
-        if node.kind() == "array_declarator" {
-            return true;
-        }
-        if matches!(node.kind(), "initializer_list" | "compound_statement") {
-            continue;
-        }
-        let mut cursor = node.walk();
-        stack.extend(node.named_children(&mut cursor));
-    }
-    false
 }
 
 pub fn first_type_child(node: Node<'_>) -> Option<Node<'_>> {

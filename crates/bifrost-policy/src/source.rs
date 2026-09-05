@@ -5655,9 +5655,11 @@ fn decode_call_argument(expr: &Expr) -> Result<RowFilter, PolicySourceError> {
 /// until the loaded-policy boundary can resolve it against typed workspace or
 /// active-model identities. `exact` consumes the analyzer's typed
 /// selector proof, which may be derived or backed by one exact authored
-/// summary. `declared` proves one complete semantic-model declaration,
-/// signature, and actual-to-formal mapping while leaving runtime dispatch as
-/// an independent axis for the taint solver and summaries.
+/// summary. `declared` proves one exact semantic-model declaration, a complete
+/// callable-family surface, and an exact actual-to-formal mapping while
+/// leaving runtime dispatch as an independent axis for the taint solver and
+/// summaries. The pack may remain globally partial when the selected callable
+/// family carries its narrower completeness proof.
 fn decode_call(expr: &Expr) -> Result<RowFilter, PolicySourceError> {
     let fields = RecordCursor::parse(
         expr,
@@ -5784,7 +5786,6 @@ fn decode_call(expr: &Expr) -> Result<RowFilter, PolicySourceError> {
             not_null("pack_id"),
             not_null("model_record_id"),
             not_null("model_proof"),
-            constrained("model_completeness", "complete"),
             RowPredicate {
                 field: field("model_ambiguous"),
                 op: RowPredicateOp::Eq,
@@ -8015,7 +8016,7 @@ mod tests {
     }
 
     #[test]
-    fn declared_call_requires_complete_model_signature_and_binding_evidence() {
+    fn declared_call_requires_exact_model_signature_and_binding_evidence() {
         let parsed = parse(&exact_call_policy(
             r#"(call :over calls :resolves-to member.widget.create :proof declared)"#,
         ))
@@ -8037,7 +8038,7 @@ mod tests {
             panic!("call must lower to a filter")
         };
         assert_eq!(filter.evidence, Some(RowFilterEvidence::DeclaredCall));
-        assert_eq!(filter.predicates.len(), 14);
+        assert_eq!(filter.predicates.len(), 13);
         assert_eq!(
             filter
                 .predicates
@@ -8053,7 +8054,6 @@ mod tests {
                 "pack_id",
                 "model_record_id",
                 "model_proof",
-                "model_completeness",
                 "model_ambiguous",
                 "mapping",
                 "coverage",

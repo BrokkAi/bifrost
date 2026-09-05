@@ -1,6 +1,7 @@
 use crate::analyzer::cpp::cpp_is_range_for_binding_name;
 use crate::analyzer::{Language, Range};
 use brokk_bifrost_cpp::graph::resolver::is_cpp_template_argument_type_leaf;
+use brokk_bifrost_cpp::graph::syntax::is_cpp_recovered_callable_declaration_reference;
 use brokk_bifrost_csharp::graph::extractor::{
     is_declaration_name as csharp_declaration_name, is_statement_label as csharp_is_statement_label,
 };
@@ -342,7 +343,10 @@ fn collect_candidate_ranges(
             && (!inside_error
                 || !matches!(frontier, CandidateFrontier::CensusMembership)
                 || match language {
-                    Language::Cpp => is_cpp_template_argument_type_leaf(node),
+                    Language::Cpp => {
+                        is_cpp_template_argument_type_leaf(node)
+                            || is_cpp_recovered_callable_declaration_reference(node)
+                    }
                     Language::Java => !java_is_declaration_name(node) && !java_is_label_name(node),
                     Language::Php => php_is_recovered_membership_reference(node),
                     Language::Scala => scala_is_recovered_membership_reference(node),
@@ -986,6 +990,46 @@ mod tests {
         assert!(
             !membership.contains(&recovery_call),
             "an arbitrary call token in recovery is not a membership reference: {membership:?}"
+        );
+    }
+
+    #[test]
+    fn cpp_census_membership_backs_recovered_p_macro_prototype_reference() {
+        let source = concat!(
+            "#define __P(x) x\n",
+            "static char * __progname __P((char *));\n",
+            "static char *\n",
+            "__progname(nargv0)\n",
+            "    char * nargv0;\n",
+            "{\n",
+            "    return nargv0;\n",
+            "}\n",
+            "int trigger(char *arg) {\n",
+            "    return __progname(arg) != 0;\n",
+            "}\n",
+        );
+        let census = census_offsets(Language::Cpp, "getopt_long.c", source);
+        let membership = census_membership_offsets(Language::Cpp, "getopt_long.c", source);
+        let prototype =
+            source.find("static char * __progname").expect("prototype") + "static char * ".len();
+
+        assert!(
+            !census.contains(&prototype),
+            "the ordinary census must keep excluding the ERROR subtree: {census:?}"
+        );
+        assert!(
+            membership.contains(&prototype),
+            "the valid prototype Reference must back inverse precision: {membership:?}"
+        );
+        let added = membership
+            .iter()
+            .copied()
+            .filter(|offset| !census.contains(offset))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            added,
+            vec![prototype],
+            "only the recovered prototype Reference may extend membership: {membership:?}"
         );
     }
 

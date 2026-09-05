@@ -231,6 +231,31 @@ fn record_reference(
     if node.kind() == "preproc_arg" {
         record_object_macro_replacement_type_references(node, ctx);
     }
+    if let Some(type_node) = ctx
+        .visibility
+        .function_macro_type_argument(ctx.file, node, ctx.source)
+    {
+        let name = node_text(type_node, ctx.source);
+        if bindings.is_shadowed(name) {
+            return;
+        }
+        match resolve_type_node_lexically(
+            type_node,
+            &ctx.analyzer,
+            ctx.visibility,
+            &ctx.ordinary_type_imports,
+            ctx.file,
+            ctx.source,
+        ) {
+            LexicalTypeResolution::Resolved { unit, .. } => {
+                ctx.record(unit.fq_name(), type_node);
+            }
+            LexicalTypeResolution::Ambiguous | LexicalTypeResolution::Missing => {
+                ctx.record_unproven(name, type_node);
+            }
+        }
+        return;
+    }
     if node
         .parent()
         .is_some_and(|parent| parent.kind() == "destructor_name")
@@ -351,7 +376,7 @@ fn record_reference(
     }
     if matches!(node.kind(), "identifier" | "field_identifier")
         && let Some(designator_owner) =
-            designated_initializer_owner(ctx.visibility, ctx.file, ctx.source, node)
+            designated_initializer_owner(&ctx.analyzer, ctx.visibility, ctx.file, ctx.source, node)
     {
         let name = node_text(node, ctx.source);
         match designator_owner {

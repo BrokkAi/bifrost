@@ -908,14 +908,15 @@ impl WorkspaceAnalyzer {
     /// analyzer-generation transaction. Diagnostic requests only read the
     /// published result and never call this host-owned method.
     ///
-    /// Failure is per ecosystem (#2442). An ecosystem whose preparation is
-    /// incomplete contributes no evidence and leaves the whole outcome
-    /// incomplete, but its siblings still activate: a workspace with an
-    /// unreadable `Cargo.lock` used to lose its npm packs too, which is the
-    /// same false-green shape as reporting a clean run from evidence that was
-    /// never read. Only cancellation stops the transaction, because a
-    /// cancelled token says the caller is gone rather than that one ecosystem
-    /// is unreadable.
+    /// Failure is per ecosystem (#2442). An incomplete preparation contributes
+    /// the exact evidence of every pack it did prepare while the whole outcome
+    /// remains incomplete. This lets a globally partial generated pack answer
+    /// a scoped claim it proves (for example, one complete callable family)
+    /// without turning an unprepared dependency or an omitted declaration into
+    /// an absence proof. An incomplete preparation with no evidence still
+    /// contributes nothing, and siblings continue to activate. Only
+    /// cancellation stops the transaction, because a cancelled token says the
+    /// caller is gone rather than that one ecosystem is unreadable.
     ///
     /// Discovery completeness is a fact about the dependency set, not a gate
     /// on preparing it (#2887). An incomplete discovery still prepares and
@@ -995,21 +996,15 @@ impl WorkspaceAnalyzer {
                 });
                 break;
             }
-            if !preparation.complete {
-                outcomes.push(DependencyPackEcosystemOutcome {
-                    ecosystem,
-                    discovery,
-                    preparation: Some(preparation),
-                });
-                continue;
+            if preparation.complete || !preparation.evidence.is_empty() {
+                activation
+                    .evidence
+                    .extend(preparation.evidence.iter().cloned());
+                publication_evidence.push((
+                    ecosystem.languages().to_vec().into_boxed_slice(),
+                    DependencyDiscoveryEvidence::from_outcome(&discovery),
+                ));
             }
-            activation
-                .evidence
-                .extend(preparation.evidence.iter().cloned());
-            publication_evidence.push((
-                ecosystem.languages().to_vec().into_boxed_slice(),
-                DependencyDiscoveryEvidence::from_outcome(&discovery),
-            ));
             outcomes.push(DependencyPackEcosystemOutcome {
                 ecosystem,
                 discovery,
@@ -1976,15 +1971,18 @@ impl WorkspaceAnalyzer {
 mod tests {
     use super::*;
     use crate::analyzer::semantic_model::{
-        CompilerOptions, SemanticModelActivationEvidence, SemanticModelRuntimeLimits,
-        SessionPackSource, SessionPackSourceKind, SourceFormat, compile_source,
+        CompilerOptions, Completeness, DependencyPackDiagnosticSeverity,
+        SemanticModelActivationEvidence, SemanticModelRuntimeLimits, SessionPackSource,
+        SessionPackSourceKind, SourceFormat, compile_source,
     };
     use crate::analyzer::store::liveness::Liveness;
     use crate::analyzer::{
-        FilesystemProject, MultiRootProject, OverlayProject, Project, ProjectFile, TestProject,
+        FilesystemProject, MultiRootProject, OverlayProject, Project, ProjectFile,
+        PythonEnvironmentConfig, PythonEnvironmentLimits, TestProject,
     };
     use crate::gitblob::test_repo::{commit_all, init_repo};
     use rusqlite::Connection;
+    use std::path::PathBuf;
     use std::sync::atomic::Ordering;
 
     use crate::inline_project::InlineTestProject;
@@ -2588,5 +2586,158 @@ mod tests {
             committed_fact_manifests, 1,
             "overlay analysis must not replace the committed source facts"
         );
+    }
+
+    /// Activate the Python ecosystem against a fabricated environment whose
+    /// standard-library root contains exactly `files`, with no intrinsic
+    /// activation evidence, so the outcome is decided by dependency
+    /// preparation alone.
+    fn activate_python_stdlib_environment(
+        files: &[(&str, &[u8])],
+    ) -> DependencyPackActivationOutcome {
+        let project = InlineTestProject::with_language(Language::Python)
+            .file("main.py", "value = 1\n")
+            .build();
+        let stdlib_root = project.root().join(".env/stdlib");
+        std::fs::create_dir_all(&stdlib_root).expect("create stdlib root");
+        for (name, contents) in files {
+            std::fs::write(stdlib_root.join(name), contents)
+                .unwrap_or_else(|error| panic!("write stdlib artifact {name}: {error}"));
+        }
+        let mut config = AnalyzerConfig::default();
+        config.python.environment = Some(PythonEnvironmentConfig {
+            implementation: "cpython".to_owned(),
+            version: "3.12.0".to_owned(),
+            platform: "linux".to_owned(),
+            standard_library_root: PathBuf::from(".env/stdlib"),
+            bundled_stub_roots: Vec::new(),
+            distribution_roots: Vec::new(),
+            limits: PythonEnvironmentLimits::default(),
+        });
+        let workspace = project.workspace_analyzer(config.clone());
+        let catalog = SemanticPackCatalog::open_ephemeral(Default::default()).unwrap();
+        let request = SemanticModelActivationRequest {
+            bifrost_version: semver::Version::parse(env!("CARGO_PKG_VERSION")).unwrap(),
+            evidence: Vec::new(),
+            controls: Vec::new(),
+            limits: SemanticModelRuntimeLimits::default(),
+        };
+        workspace.activate_dependency_packs(
+            &config,
+            &[DependencyPackEcosystem::Python],
+            DependencyPackWorkspaceContext {
+                catalog: &catalog,
+                persistence: None,
+                activation: &request,
+                limits: DependencyPackLimits::default(),
+                cancellation: &crate::CancellationToken::default(),
+            },
+        )
+    }
+
+    #[test]
+    fn partial_generated_pack_activates_while_preparation_stays_incomplete() {
+        let outcome = activate_python_stdlib_environment(&[
+            (
+                "good.py",
+                b"class Greeter:\n    def hello(self) -> int:\n        return 1\n".as_slice(),
+            ),
+            // Not valid UTF-8, so the producer fails this one artifact while
+            // the class above still yields a usable partial declaration pack.
+            ("broken.py", &[0xff, 0xfe, 0x00]),
+        ]);
+        let preparation = outcome.ecosystems[0]
+            .preparation
+            .as_ref()
+            .expect("python environment preparation must run");
+        assert!(!preparation.complete, "{preparation:#?}");
+        assert!(
+            preparation.diagnostics.iter().any(|diagnostic| {
+                diagnostic.severity == DependencyPackDiagnosticSeverity::Error
+                    && diagnostic.code == "python.source.encoding"
+            }),
+            "{preparation:#?}"
+        );
+        assert!(
+            !preparation.evidence.is_empty(),
+            "the produced partial pack must carry typed activation evidence: {preparation:#?}"
+        );
+        assert!(!outcome.complete(), "{outcome:#?}");
+        assert!(outcome.diagnostic_refresh_required, "{outcome:#?}");
+        let SemanticModelRuntimeOutcome::Ready { active, .. } = outcome
+            .runtime
+            .expect("partial pack evidence must still activate the runtime")
+        else {
+            panic!("partial pack activation should be ready")
+        };
+        assert_eq!(active.shards().len(), 1, "{active:#?}");
+        assert_eq!(
+            active.shards()[0].manifest.pack_id,
+            "bifrost.external.python"
+        );
+        assert_eq!(
+            active.shards()[0].manifest.completeness,
+            Completeness::Partial
+        );
+    }
+
+    #[test]
+    fn failed_preparation_without_evidence_publishes_nothing() {
+        let outcome = activate_python_stdlib_environment(&[("broken.py", &[0xff, 0xfe, 0x00])]);
+        let preparation = outcome.ecosystems[0]
+            .preparation
+            .as_ref()
+            .expect("python environment preparation must run");
+        assert!(!preparation.complete, "{preparation:#?}");
+        assert!(
+            preparation.evidence.is_empty(),
+            "a failed production must not leave activation evidence: {preparation:#?}"
+        );
+        assert!(
+            outcome.ecosystems[0].discovery.complete,
+            "discovery, not preparation, must own this outcome's incompleteness shape"
+        );
+        assert!(outcome.runtime.is_none(), "{outcome:#?}");
+        assert!(!outcome.diagnostic_refresh_required, "{outcome:#?}");
+        assert!(!outcome.complete(), "{outcome:#?}");
+    }
+
+    #[test]
+    fn cancelled_dependency_discovery_stops_the_whole_activation_transaction() {
+        let project = InlineTestProject::with_language(Language::Go)
+            .file("main.go", "package main\n")
+            .build();
+        let mut config = AnalyzerConfig::default();
+        config.go.dependency_discovery.mode = GoDependencyDiscoveryMode::CuratedPackEvidence;
+        config.go.dependency_discovery.go_executable = Some(project.root().join("missing-go"));
+        let workspace = project.workspace_analyzer(config.clone());
+        let catalog = SemanticPackCatalog::open_ephemeral(Default::default()).unwrap();
+        let request = SemanticModelActivationRequest {
+            bifrost_version: semver::Version::parse(env!("CARGO_PKG_VERSION")).unwrap(),
+            evidence: Vec::new(),
+            controls: Vec::new(),
+            limits: SemanticModelRuntimeLimits::default(),
+        };
+        // The first cancellation check is the top of Go discovery itself, so
+        // discovery is cancelled before it resolves anything and before the
+        // second ecosystem can start.
+        let cancellation = crate::CancellationToken::cancel_after_checks_for_test(1);
+        let outcome = workspace.activate_dependency_packs(
+            &config,
+            &[DependencyPackEcosystem::Go, DependencyPackEcosystem::Python],
+            DependencyPackWorkspaceContext {
+                catalog: &catalog,
+                persistence: None,
+                activation: &request,
+                limits: DependencyPackLimits::default(),
+                cancellation: &cancellation,
+            },
+        );
+        assert_eq!(outcome.ecosystems.len(), 1, "{outcome:#?}");
+        assert!(outcome.ecosystems[0].discovery.cancelled, "{outcome:#?}");
+        assert!(outcome.ecosystems[0].preparation.is_none(), "{outcome:#?}");
+        assert!(outcome.runtime.is_none(), "{outcome:#?}");
+        assert!(!outcome.diagnostic_refresh_required, "{outcome:#?}");
+        assert!(!outcome.complete(), "{outcome:#?}");
     }
 }

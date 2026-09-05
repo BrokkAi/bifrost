@@ -13,6 +13,38 @@ pub struct MacroReplacementTypeReference {
     pub global: bool,
 }
 
+/// Whether an identifier is a callable declaration name retained beneath C++
+/// error recovery.
+///
+/// A C prototype using the traditional `__P((...))` wrapper can be parsed as a
+/// pointer declarator whose first child is `ERROR(identifier)` and whose
+/// declarator is a function declarator for the macro invocation. The identifier
+/// is still a real declaration reference to the callable's later definition,
+/// even though the ordinary census intentionally excludes the whole ERROR
+/// subtree. Keep this predicate limited to that declaration-shaped CST so
+/// arbitrary recovery leaves do not enter inverse membership.
+pub fn is_cpp_recovered_callable_declaration_reference(node: Node<'_>) -> bool {
+    if !matches!(node.kind(), "identifier" | "field_identifier") {
+        return false;
+    }
+    let Some(error) = node.parent().filter(|parent| parent.is_error()) else {
+        return false;
+    };
+    let Some(pointer) = error.parent().filter(|parent| {
+        parent.kind() == "pointer_declarator"
+            && parent.named_child(0) == Some(error)
+            && parent
+                .child_by_field_name("declarator")
+                .is_some_and(|declarator| declarator.kind() == "function_declarator")
+    }) else {
+        return false;
+    };
+    pointer.parent().is_some_and(|declaration| {
+        declaration.kind() == "declaration"
+            && declaration.child_by_field_name("declarator") == Some(pointer)
+    })
+}
+
 /// One direct field declaration recovered from an object-like macro
 /// replacement. The replacement is parsed as the body of a synthetic struct,
 /// so the name and declaration text come from C/C++ grammar nodes rather than

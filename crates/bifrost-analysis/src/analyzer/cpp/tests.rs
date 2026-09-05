@@ -12,6 +12,151 @@ use crate::analyzer::{
 };
 use std::collections::BTreeSet;
 
+fn macro_composed_fields_fixture() -> (
+    crate::inline_project::BuiltInlineTestProject,
+    ProjectFile,
+    CppAnalyzer,
+) {
+    let fixture = crate::inline_project::InlineTestProject::with_language(Language::Cpp)
+        .file("fields.h", "#define OWNER_FIELDS int value;\n")
+        .file(
+            "owner.c",
+            "#include \"fields.h\"\nstruct Owner { OWNER_FIELDS };\n",
+        )
+        .file(
+            "unrelated.c",
+            "#include \"unrelated_fields.h\"\nstruct Unrelated { UNRELATED_FIELDS };\n",
+        )
+        .file(
+            "unrelated_fields.h",
+            "#define UNRELATED_FIELDS int value;\n",
+        )
+        .build();
+    let owner = fixture.file("owner.c");
+    let analyzer = CppAnalyzer::from_project(fixture.project().clone());
+    (fixture, owner, analyzer)
+}
+
+#[test]
+fn generated_field_ranges_only_build_their_source_overlay() {
+    let (_fixture, owner, analyzer) = macro_composed_fields_fixture();
+    let field = analyzer
+        .declarations(&owner)
+        .into_iter()
+        .find(|unit| unit.is_field() && unit.fq_name() == "Owner.value")
+        .expect("owner macro field");
+
+    analyzer.reset_macro_composed_fields_build_count_for_test();
+    assert!(!analyzer.ranges(&field).is_empty());
+    assert_eq!(
+        analyzer.macro_composed_fields_build_count_for_test(),
+        0,
+        "ranges for a generated field must reuse the field's source overlay"
+    );
+}
+
+#[test]
+fn file_scoped_identifier_queries_only_build_the_requested_source_overlay() {
+    let (_fixture, owner, analyzer) = macro_composed_fields_fixture();
+    let field = analyzer
+        .declarations(&owner)
+        .into_iter()
+        .find(|unit| unit.is_field() && unit.fq_name() == "Owner.value")
+        .expect("owner macro field");
+    let name = brokk_bifrost_core::analyzer::RelationalName::stable(
+        brokk_bifrost_core::analyzer::symbol_path::parse_symbol_path_fq(
+            Language::Cpp,
+            "value",
+            crate::analyzer::fq_name::segment_interner(),
+        ),
+    );
+    let request = RelationalDefinitionRequest {
+        ordinal: 0,
+        language_scope: DefinitionLanguageScope::Language(Language::Cpp),
+        name,
+        query: RelationalDefinitionQuery::Identifier {
+            file: Some(owner.clone()),
+        },
+    };
+
+    analyzer.reset_macro_composed_fields_build_count_for_test();
+    let RelationalBatchOutcome::Complete(mut results) =
+        analyzer.relational_definition_batch(&[request], &crate::CancellationToken::new())
+    else {
+        panic!("file-scoped identifier query must complete");
+    };
+    let RelationalDefinitionValue::Definitions(units) = results.remove(0).value else {
+        panic!("identifier query returned the wrong result shape");
+    };
+    assert!(units.contains(&field), "generated field missing: {units:?}");
+    assert_eq!(
+        analyzer.macro_composed_fields_build_count_for_test(),
+        0,
+        "a file-scoped identifier query must reuse the requested source overlay"
+    );
+}
+
+#[test]
+fn workspace_identifier_queries_retain_generated_fields_from_all_overlays() {
+    let (_fixture, _owner, analyzer) = macro_composed_fields_fixture();
+    let name = brokk_bifrost_core::analyzer::RelationalName::stable(
+        brokk_bifrost_core::analyzer::symbol_path::parse_symbol_path_fq(
+            Language::Cpp,
+            "value",
+            crate::analyzer::fq_name::segment_interner(),
+        ),
+    );
+    let request = RelationalDefinitionRequest {
+        ordinal: 0,
+        language_scope: DefinitionLanguageScope::Language(Language::Cpp),
+        name,
+        query: RelationalDefinitionQuery::Identifier { file: None },
+    };
+
+    let RelationalBatchOutcome::Complete(mut results) =
+        analyzer.relational_definition_batch(&[request], &crate::CancellationToken::new())
+    else {
+        panic!("workspace identifier query must complete");
+    };
+    let RelationalDefinitionValue::Definitions(units) = results.remove(0).value else {
+        panic!("identifier query returned the wrong result shape");
+    };
+    assert!(
+        units.iter().any(|unit| unit.fq_name() == "Owner.value"),
+        "owner generated field missing: {units:?}"
+    );
+    assert!(
+        units.iter().any(|unit| unit.fq_name() == "Unrelated.value"),
+        "workspace-wide query must retain the unrelated generated field: {units:?}"
+    );
+    assert!(
+        analyzer.macro_composed_fields_build_count_for_test() >= 2,
+        "workspace-wide query should inspect both source overlays"
+    );
+}
+
+#[test]
+fn generated_field_ranges_with_limit_only_use_their_source_overlay() {
+    let (_fixture, owner, analyzer) = macro_composed_fields_fixture();
+    let field = analyzer
+        .declarations(&owner)
+        .into_iter()
+        .find(|unit| unit.is_field() && unit.fq_name() == "Owner.value")
+        .expect("owner macro field");
+
+    analyzer.reset_macro_composed_fields_build_count_for_test();
+    let (ranges, total, complete) =
+        analyzer.ranges_with_limit(&field, 1, &crate::CancellationToken::new());
+    assert_eq!(ranges.len(), 1, "generated field range: {ranges:?}");
+    assert_eq!(total, 1, "generated field range total: {ranges:?}");
+    assert!(complete, "generated field range query: {ranges:?}");
+    assert_eq!(
+        analyzer.macro_composed_fields_build_count_for_test(),
+        0,
+        "limited ranges for a generated field must reuse its source overlay"
+    );
+}
+
 #[test]
 fn reconciliation_does_not_reenter_for_inline_constructor_without_metadata() {
     let temp = tempfile::tempdir().expect("temp dir");

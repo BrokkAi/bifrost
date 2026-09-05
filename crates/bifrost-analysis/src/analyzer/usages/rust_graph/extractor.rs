@@ -1938,12 +1938,10 @@ pub(super) fn scan_files_for_member_target(
                 return;
             }
             let owner_names_scope = candidate_phase_scope("rust_graph::member_scan.owner_names");
-            let mut owner_local_names: HashSet<String> = if file == target.source() {
-                [owner.identifier().to_string()].into_iter().collect()
-            } else {
-                usage_binding_local_names(rust, token, file, &owner_seeds)
-            };
-            owner_local_names.extend(refs.bare_names_resolving_to(&owner.fq_name()));
+            let mut owner_local_names = usage_binding_local_names(rust, token, file, &owner_seeds);
+            if file == target.source() {
+                owner_local_names.insert(owner.identifier().to_string());
+            }
             let trait_owner = is_trait_owner(rust, &owner);
             let receiver_type_names = if trait_owner {
                 trait_implementer_names(rust, token, &owner, file)

@@ -5,7 +5,9 @@
 //! block invocation).  This adapter lowers only tree-sitter-structured control
 //! and calls, and records the remaining decisions as exact semantic gaps.
 
-use brokk_bifrost_ruby::local_bindings::{LocalBindingBudget, LocalBindingTimeline};
+use brokk_bifrost_ruby::local_bindings::{
+    LocalBindingBudget, LocalBindingTimeline, callable_parameters,
+};
 use tree_sitter::Node;
 
 use super::{is_runtime_node, ruby_semantic_identifier_range, ruby_symbol_name};
@@ -22,7 +24,7 @@ use crate::analyzer::tree_walk::named_children;
 use crate::analyzer::{Language, ProjectFile, RubyAnalyzer};
 use crate::hash::HashMap;
 
-const ADAPTER_VERSION: &[u8] = b"ruby-value-semantics-v5";
+const ADAPTER_VERSION: &[u8] = b"ruby-value-semantics-v6";
 
 impl_program_semantics_provider!(RubyAnalyzer, RubySemanticLowerer);
 
@@ -643,6 +645,44 @@ impl ProgramSemanticsLowerer for RubySemanticLowerer {
             });
         }
 
+        let prepass_observed = sum_lowering_work(inventory_work, binding_work);
+        let mut prepass_budget = budget.clone();
+        if let Err(exceeded) = prepass_budget.charge(prepass_observed) {
+            return Ok(SemanticOutcome::ExceededBudget {
+                partial: None,
+                exceeded,
+                work: prepass_observed,
+            });
+        }
+        let (function_value_targets, prepass_work) = match collect_ruby_function_value_targets(
+            &specs,
+            &bindings_by_procedure,
+            prepared.source(),
+            &prepass_budget,
+            cancellation,
+        ) {
+            Ok(result) => result,
+            Err(RubyLoweringError::Cancelled(work)) => {
+                return Ok(SemanticOutcome::Cancelled {
+                    partial: None,
+                    work: sum_lowering_work(prepass_observed, *work),
+                });
+            }
+            Err(RubyLoweringError::Budget(exceeded, work)) => {
+                let work = sum_lowering_work(prepass_observed, *work);
+                let exceeded = budget.check(work).err().unwrap_or(exceeded);
+                return Ok(SemanticOutcome::ExceededBudget {
+                    partial: None,
+                    exceeded,
+                    work,
+                });
+            }
+            Err(RubyLoweringError::Invalid(detail)) => {
+                return Err(SemanticProviderError::internal(detail));
+            }
+        };
+        binding_work = sum_lowering_work(binding_work, prepass_work);
+
         lower_procedure_batch(
             specs.iter().zip(&bindings_by_procedure),
             sum_lowering_work(initial_work, binding_work),
@@ -652,8 +692,11 @@ impl ProgramSemanticsLowerer for RubySemanticLowerer {
                 lower_procedure(
                     prepared,
                     spec,
-                    &property_inventory,
-                    &local_bindings.timeline,
+                    RubyProcedureIndexes {
+                        properties: &property_inventory,
+                        local_bindings: &local_bindings.timeline,
+                        function_value_targets: &function_value_targets,
+                    },
                     local_bindings.has_parameter_defaults,
                     staged_budget,
                     cancellation,
@@ -1112,6 +1155,7 @@ enum RubyLocalStorage {
 struct LoweringContext<'tree, 'targets> {
     source: &'tree str,
     session: ProcedureLoweringSession<'targets>,
+    procedure_id: ProcedureId,
     procedure_kind: ProcedureKind,
     procedure_body_node_id: usize,
     procedure_runtime_body_node_id: usize,
@@ -1128,13 +1172,19 @@ struct LoweringContext<'tree, 'targets> {
     cleanups: Vec<CleanupRegion<'tree>>,
     controls: HashMap<ScopeFrameId, Box<[RubyControlFrame]>>,
     local_bindings: &'targets LocalBindingTimeline,
+    function_value_targets: &'targets RubyFunctionValueTargets,
+}
+
+struct RubyProcedureIndexes<'targets> {
+    properties: &'targets RubyPropertyInventory,
+    local_bindings: &'targets LocalBindingTimeline,
+    function_value_targets: &'targets RubyFunctionValueTargets,
 }
 
 fn lower_procedure<'tree, 'request>(
     prepared: &'tree PreparedSyntaxTree,
     spec: &ProcedureSpec<'tree>,
-    properties: &'request RubyPropertyInventory,
-    local_bindings: &'request LocalBindingTimeline,
+    indexes: RubyProcedureIndexes<'request>,
     has_parameter_defaults: bool,
     budget: &SemanticBudget,
     cancellation: &'request CancellationToken,
@@ -1164,11 +1214,12 @@ fn lower_procedure<'tree, 'request>(
     let mut context = LoweringContext {
         source: prepared.source(),
         session,
+        procedure_id: spec.id,
         procedure_kind: spec.kind,
         procedure_body_node_id: spec.body.id(),
         procedure_runtime_body_node_id: runtime_body.id(),
         expression_values: HashMap::default(),
-        properties,
+        properties: indexes.properties,
         parameters: HashMap::default(),
         locals: HashMap::default(),
         local_storage: HashMap::default(),
@@ -1182,7 +1233,8 @@ fn lower_procedure<'tree, 'request>(
         next_control_label: 0,
         cleanups: Vec::new(),
         controls: HashMap::default(),
-        local_bindings,
+        local_bindings: indexes.local_bindings,
+        function_value_targets: indexes.function_value_targets,
     };
     context.controls.insert(function_scope, Box::new([]));
     context.emit_procedure_inputs(&mut builder, spec.callable)?;
@@ -3199,6 +3251,12 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         };
         let resolution = if matches!(method, Some("send" | "public_send")) {
             CallableTargetResolution::Unsupported
+        } else if let Some(&target) = self
+            .function_value_targets
+            .invocations
+            .get(&(self.procedure_id, node.id()))
+        {
+            CallableTargetResolution::Proven(CallableTarget::Local(target))
         } else {
             CallableTargetResolution::Unknown
         };
@@ -4751,10 +4809,325 @@ fn ruby_constructor_call(node: Node<'_>, source: &str) -> bool {
         .is_some_and(|receiver| matches!(receiver.kind(), "constant" | "scope_resolution"))
 }
 
+/// A mounted callable target tied to the exact assignment node that produced
+/// it. The assignment node and the invocation node are both from the same
+/// prepared syntax tree; the procedure id is never recovered from a name.
+#[derive(Debug, Clone, Copy)]
+struct RubyCallableBinding<'tree> {
+    scope: ProcedureId,
+    declaration: Node<'tree>,
+    target: ProcedureId,
+}
+
+/// Mounted callable literals and invocation nodes whose receiver/callee was
+/// proved to read one stable local binding. Both keys are exact identities,
+/// never binding spellings.
+#[derive(Debug, Default)]
+struct RubyFunctionValueTargets {
+    procedures: HashMap<usize, ProcedureId>,
+    invocations: HashMap<(ProcedureId, usize), ProcedureId>,
+}
+
+fn collect_ruby_function_value_targets<'tree>(
+    specs: &[ProcedureSpec<'tree>],
+    bindings: &[ProcedureBindings],
+    source: &str,
+    budget: &SemanticBudget,
+    cancellation: &CancellationToken,
+) -> Result<(RubyFunctionValueTargets, SemanticWork), RubyLoweringError> {
+    let mut targets = RubyFunctionValueTargets::default();
+    let mut traversal = SemanticTraversalBudget {
+        work: SemanticWork::default(),
+        budget,
+        cancellation,
+    };
+
+    for spec in specs
+        .iter()
+        .filter(|spec| matches!(spec.kind, ProcedureKind::Lambda | ProcedureKind::Closure))
+    {
+        targets.procedures.insert(spec.callable.id(), spec.id);
+    }
+
+    for (procedure_index, spec) in specs.iter().enumerate() {
+        if matches!(spec.kind, ProcedureKind::Lambda | ProcedureKind::Closure) {
+            continue;
+        }
+
+        let parameter_root = callable_parameters(spec.callable, spec.body).map(|node| node.id());
+        let mut parameter_names = Vec::<Box<str>>::new();
+        let mut writes = Vec::new();
+        let mut reads = Vec::new();
+        let mut calls = Vec::new();
+        let mut stack = vec![(spec.callable, false)];
+        while let Some((node, in_parameters)) = stack.pop() {
+            traversal.enter_node()?;
+            let in_parameters = in_parameters || Some(node.id()) == parameter_root;
+            if node.id() != spec.callable.id() && ruby_nested_callable(node) {
+                continue;
+            }
+            if in_parameters
+                && node.kind() == "identifier"
+                && let Some(name) = node_text(source, node)
+            {
+                parameter_names.push(name.into());
+            }
+            if node.kind() == "identifier" {
+                reads.push(node);
+            }
+            if node.kind() == "call" {
+                calls.push(node);
+            }
+            writes.extend(ruby_binding_write_nodes(node));
+            for child in named_children(node).into_iter().rev() {
+                stack.push((child, in_parameters));
+            }
+        }
+
+        let invocation_references = calls
+            .iter()
+            .filter_map(|call| {
+                ruby_function_value_reference_node(*call, source)
+                    .map(|reference| (*call, reference))
+            })
+            .collect::<Vec<_>>();
+
+        for declaration in writes.iter().copied() {
+            let Some(name) = node_text(source, declaration) else {
+                continue;
+            };
+            if writes
+                .iter()
+                .filter(|other| node_text(source, **other) == Some(name))
+                .nth(1)
+                .is_some()
+                || parameter_names
+                    .iter()
+                    .any(|parameter| parameter.as_ref() == name)
+            {
+                continue;
+            }
+            let Some(assignment) = declaration.parent().filter(|parent| {
+                parent.kind() == "assignment"
+                    && parent.child_by_field_name("left") == Some(declaration)
+            }) else {
+                continue;
+            };
+            let Some(right) = assignment.child_by_field_name("right") else {
+                continue;
+            };
+            let Some(initializer) = ruby_callable_initializer(right) else {
+                continue;
+            };
+            let Some(&target) = targets.procedures.get(&initializer.id()) else {
+                continue;
+            };
+            let binding = RubyCallableBinding {
+                scope: spec.id,
+                declaration,
+                target,
+            };
+            if ruby_binding_is_captured(
+                spec,
+                specs,
+                bindings,
+                source,
+                name,
+                declaration.start_byte(),
+            ) {
+                continue;
+            }
+
+            let mut escaped = false;
+            let mut invocation_ids = Vec::new();
+            for read in reads.iter().copied().filter(|read| {
+                read.id() != binding.declaration.id()
+                    && read.start_byte() >= binding.declaration.start_byte()
+                    && node_text(source, *read) == Some(name)
+                    && bindings[procedure_index]
+                        .timeline
+                        .is_active_at(name, read.start_byte())
+            }) {
+                let Some((call, _)) = invocation_references
+                    .iter()
+                    .find(|(_, reference)| reference.id() == read.id())
+                else {
+                    escaped = true;
+                    break;
+                };
+                debug_assert_eq!(binding.scope, spec.id);
+                debug_assert_eq!(binding.declaration.id(), declaration.id());
+                invocation_ids.push(call.id());
+            }
+            if !escaped {
+                for invocation_id in invocation_ids {
+                    targets
+                        .invocations
+                        .insert((binding.scope, invocation_id), binding.target);
+                }
+            }
+        }
+    }
+
+    Ok((targets, traversal.work))
+}
+
+fn ruby_nested_callable(node: Node<'_>) -> bool {
+    matches!(
+        node.kind(),
+        "method"
+            | "singleton_method"
+            | "lambda"
+            | "block"
+            | "do_block"
+            | "class"
+            | "module"
+            | "singleton_class"
+    )
+}
+
+fn ruby_binding_write_nodes(node: Node<'_>) -> Vec<Node<'_>> {
+    let target = match node.kind() {
+        "assignment" | "operator_assignment" => node.child_by_field_name("left"),
+        "for" => node.child_by_field_name("pattern"),
+        "rescue" => node.child_by_field_name("variable"),
+        "match_pattern" | "test_pattern" | "in_clause" => node.child_by_field_name("pattern"),
+        _ => None,
+    };
+    let Some(target) = target else {
+        return Vec::new();
+    };
+    let mut writes = Vec::new();
+    let mut stack = vec![target];
+    while let Some(node) = stack.pop() {
+        match node.kind() {
+            "identifier" => writes.push(node),
+            "left_assignment_list"
+            | "destructured_left_assignment"
+            | "rest_assignment"
+            | "array_pattern"
+            | "find_pattern"
+            | "hash_pattern"
+            | "alternative_pattern"
+            | "parenthesized_pattern" => {
+                stack.extend(named_children(node).into_iter().rev());
+            }
+            "as_pattern" | "splat_parameter" | "hash_splat_parameter" => {
+                if let Some(name) = node.child_by_field_name("name") {
+                    stack.push(name);
+                }
+                if let Some(value) = node.child_by_field_name("value") {
+                    stack.push(value);
+                }
+            }
+            _ => {}
+        }
+    }
+    writes
+}
+
+fn ruby_callable_initializer(mut node: Node<'_>) -> Option<Node<'_>> {
+    while node.kind() == "parenthesized_statements" {
+        let children = named_children(node);
+        if children.len() != 1 {
+            return None;
+        }
+        node = children[0];
+    }
+    matches!(node.kind(), "lambda" | "block" | "do_block").then_some(node)
+}
+
+fn ruby_binding_is_captured<'tree>(
+    spec: &ProcedureSpec<'tree>,
+    specs: &[ProcedureSpec<'tree>],
+    bindings: &[ProcedureBindings],
+    source: &str,
+    name: &str,
+    declaration_start: usize,
+) -> bool {
+    specs.iter().zip(bindings).any(|(child, child_bindings)| {
+        child.lexical_parent == Some(spec.id)
+            && child.callable.start_byte() >= declaration_start
+            && child_bindings
+                .timeline
+                .is_active_at(name, child.callable.start_byte().saturating_sub(1))
+            && !ruby_parameter_names(child.callable, child.body, source)
+                .iter()
+                .any(|parameter| parameter.as_ref() == name)
+            && ruby_callable_mentions_identifier(child.callable, child.body, source, name)
+    })
+}
+
+fn ruby_callable_mentions_identifier(
+    callable: Node<'_>,
+    body: Node<'_>,
+    source: &str,
+    expected: &str,
+) -> bool {
+    let parameter_root = callable_parameters(callable, body).map(|node| node.id());
+    let mut stack = vec![(body, false)];
+    while let Some((node, in_parameters)) = stack.pop() {
+        let in_parameters = in_parameters || Some(node.id()) == parameter_root;
+        if in_parameters {
+            continue;
+        }
+        if node.kind() == "identifier" && node_text(source, node) == Some(expected) {
+            return true;
+        }
+        for child in named_children(node).into_iter().rev() {
+            if child.id() != body.id() && ruby_nested_callable(child) {
+                continue;
+            }
+            stack.push((child, in_parameters));
+        }
+    }
+    false
+}
+
+fn ruby_function_value_reference_node<'tree>(
+    node: Node<'tree>,
+    source: &str,
+) -> Option<Node<'tree>> {
+    let receiver = node.child_by_field_name("receiver");
+    let method = node.child_by_field_name("method");
+    if let Some(receiver) = receiver {
+        let callable_call = node
+            .child_by_field_name("operator")
+            .and_then(|operator| node_text(source, operator).filter(|operator| *operator == "."))
+            == Some(".")
+            && method.is_none()
+            && node.child_by_field_name("arguments").is_some();
+        return callable_call.then_some(receiver);
+    }
+    None
+}
+
+fn ruby_parameter_names(callable: Node<'_>, body: Node<'_>, source: &str) -> Vec<Box<str>> {
+    let Some(parameters) = callable_parameters(callable, body) else {
+        return Vec::new();
+    };
+    let mut names = Vec::new();
+    let mut stack = vec![parameters];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "identifier"
+            && let Some(name) = node_text(source, node)
+        {
+            names.push(name.into());
+        }
+        stack.extend(named_children(node));
+    }
+    names
+}
+
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
+    use crate::analyzer::LanguageDialect;
+    use crate::analyzer::tree_sitter_analyzer::{PreparedSourceOrigin, PreparedSyntaxSource};
     use crate::analyzer::tree_walk::descendants_of_kind;
+    use crate::text_utils::compute_line_starts;
 
     fn parsed_method(source: &str) -> (tree_sitter::Tree, usize) {
         let mut parser = tree_sitter::Parser::new();
@@ -4778,6 +5151,140 @@ mod tests {
         }
         matches.extend(descendants_of_kind(node, kind));
         matches
+    }
+
+    fn function_value_targets(
+        source: &str,
+    ) -> (
+        PreparedSyntaxTree,
+        ProcedureId,
+        Option<ProcedureId>,
+        RubyFunctionValueTargets,
+    ) {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_ruby::LANGUAGE.into())
+            .expect("Ruby grammar is valid");
+        let tree = parser.parse(source, None).expect("source parses");
+        let prepared = PreparedSyntaxTree::new(
+            PreparedSyntaxSource::Exact(Arc::<str>::from(source)),
+            tree,
+            compute_line_starts(source),
+            LanguageDialect::Standard(Language::Ruby),
+            PreparedSourceOrigin::Disk,
+            None,
+        );
+        let file = ProjectFile::new(std::env::temp_dir(), "fixture.rb");
+        let Ok(ProcedureInventoryOutcome::Complete { value: specs, .. }) = enumerate_procedures(
+            &file,
+            &prepared,
+            &SemanticBudget::default(),
+            &CancellationToken::default(),
+        ) else {
+            panic!("fixture procedure inventory must complete");
+        };
+
+        let mut bindings = Vec::with_capacity(specs.len());
+        for spec in &specs {
+            let inherited = spec.lexical_parent.and_then(|parent| {
+                bindings
+                    .get(parent.index())
+                    .map(|parent_bindings: &ProcedureBindings| {
+                        (&parent_bindings.timeline, spec.callable.start_byte())
+                    })
+            });
+            let collection = collect_local_bindings(
+                prepared.source(),
+                spec.callable,
+                spec.body,
+                inherited,
+                &SemanticBudget::default(),
+                &CancellationToken::default(),
+            )
+            .expect("fixture local binding collection must complete");
+            bindings.push(ProcedureBindings {
+                timeline: collection.timeline,
+                has_parameter_defaults: collection.has_parameter_defaults,
+            });
+        }
+        let caller_id = specs
+            .iter()
+            .find(|spec| spec.kind == ProcedureKind::Method)
+            .map(|spec| spec.id)
+            .expect("fixture has caller method");
+        let lambda_id = specs
+            .iter()
+            .find(|spec| spec.kind == ProcedureKind::Lambda)
+            .map(|spec| spec.id);
+        let (targets, _) = collect_ruby_function_value_targets(
+            &specs,
+            &bindings,
+            prepared.source(),
+            &SemanticBudget::default(),
+            &CancellationToken::default(),
+        )
+        .expect("fixture function-value collection must complete");
+        (prepared, caller_id, lambda_id, targets)
+    }
+
+    #[test]
+    fn stable_local_lambda_invocation_names_exact_mounted_target() {
+        let source = "def caller\n  local = ->(value) { target(value) }\n  local.(1)\nend\n\ndef target(value)\nend\n";
+        let (prepared, caller_id, Some(lambda_id), targets) = function_value_targets(source) else {
+            panic!("fixture has caller method and lambda");
+        };
+        let caller = prepared
+            .tree()
+            .root_node()
+            .named_child(0)
+            .expect("fixture has caller method");
+        let caller_body = caller.child_by_field_name("body").unwrap_or(caller);
+        let invocation = descendants_by_kind(caller_body, "call")
+            .into_iter()
+            .find(|call| {
+                ruby_function_value_reference_node(*call, prepared.source())
+                    .and_then(|reference| node_text(prepared.source(), reference))
+                    == Some("local")
+            })
+            .expect("fixture has local callable invocation");
+
+        assert_eq!(
+            targets.invocations.get(&(caller_id, invocation.id())),
+            Some(&lambda_id)
+        );
+    }
+
+    #[test]
+    fn function_value_near_misses_remain_unresolved() {
+        for source in [
+            "def caller(callable)\n  callable.(1)\nend\n",
+            "def caller\n  local = -> {}\n  local = -> {}\n  local.(1)\nend\n",
+            "def caller\n  local = -> {}\n  holder.local = local\n  local.(1)\nend\n",
+            "def caller\n  local = -> {}\n  callback = -> { local.(1) }\nend\n",
+            "def caller\n  local = -> {}\n  local.call(1)\nend\n",
+            "def caller\n  local = -> {}\n  local()\nend\n",
+        ] {
+            let (prepared, caller_id, _, targets) = function_value_targets(source);
+            let caller = prepared
+                .tree()
+                .root_node()
+                .named_child(0)
+                .expect("fixture has caller method");
+            let caller_body = caller.child_by_field_name("body").unwrap_or(caller);
+            let local_invocations = descendants_by_kind(caller_body, "call")
+                .into_iter()
+                .filter(|call| {
+                    ruby_function_value_reference_node(*call, prepared.source())
+                        .and_then(|reference| node_text(prepared.source(), reference))
+                        == Some("local")
+                })
+                .collect::<Vec<_>>();
+            assert!(
+                local_invocations
+                    .iter()
+                    .all(|call| { !targets.invocations.contains_key(&(caller_id, call.id())) })
+            );
+        }
     }
 
     #[test]

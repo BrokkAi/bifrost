@@ -38,7 +38,11 @@ pub const CATALOG_SCHEMA_VERSION: i64 = db::CURRENT_CATALOG_VERSION;
 ///
 /// 9: the Python stub producer expands wildcard re-exports across a source set,
 /// publishing the names a shim module binds and dropping its `*` marker (#2958).
-pub const GENERATED_PRODUCTION_CACHE_VERSION: u32 = 9;
+/// 10: exact Java binary tables certify scoped callable-family completeness,
+/// and source/JMOD production retains both formal names and that proof (#3006).
+/// 11: Python source-set rejects retain their exact source-entry identity for
+/// release extraction accounting (#3027).
+pub const GENERATED_PRODUCTION_CACHE_VERSION: u32 = 11;
 pub const SEMANTIC_PACK_CACHE_ROOT_ENV: &str = "BIFROST_SEMANTIC_PACK_CACHE_ROOT";
 
 /// Resolve the generated catalog used when no explicit catalog is configured.

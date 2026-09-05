@@ -75,6 +75,20 @@
       "source_model": "crates/bifrost-semantic-packs/models/go-concurrency-declarations.json"
     },
     {
+      "asset_role": "compiled_shard",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "compiled_semantic_model",
+      "path": "crates/bifrost-semantic-packs/embedded/go-concurrency-declarations/shards/go.concurrency.time.declarations.json",
+      "profiles": [],
+      "reason": "No supported standard CSMI Go profile adapter provides exact declaration identity and applicability evidence.",
+      "source_model": "crates/bifrost-semantic-packs/models/go-concurrency-declarations.json"
+    },
+    {
       "asset_role": "compiled_manifest",
       "audit_status": "pending",
       "blockers": [
@@ -112,6 +126,20 @@
       "generation_strategy": "retain_until_profile_support",
       "native_source_kind": "compiled_semantic_model",
       "path": "crates/bifrost-semantic-packs/embedded/go-concurrency/shards/go.concurrency.sync.deflate",
+      "profiles": [],
+      "reason": "No supported standard CSMI Go profile adapter provides exact declaration identity and applicability evidence.",
+      "source_model": "crates/bifrost-semantic-packs/models/go-concurrency.json"
+    },
+    {
+      "asset_role": "compiled_shard",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "compiled_semantic_model",
+      "path": "crates/bifrost-semantic-packs/embedded/go-concurrency/shards/go.concurrency.time.json",
       "profiles": [],
       "reason": "No supported standard CSMI Go profile adapter provides exact declaration identity and applicability evidence.",
       "source_model": "crates/bifrost-semantic-packs/models/go-concurrency.json"
@@ -931,7 +959,8 @@
       "embedded_paths": [
         "crates/bifrost-semantic-packs/embedded/go-concurrency-declarations/manifest.json",
         "crates/bifrost-semantic-packs/embedded/go-concurrency-declarations/shards/go.concurrency.errgroup.declarations.deflate",
-        "crates/bifrost-semantic-packs/embedded/go-concurrency-declarations/shards/go.concurrency.sync.declarations.deflate"
+        "crates/bifrost-semantic-packs/embedded/go-concurrency-declarations/shards/go.concurrency.sync.declarations.deflate",
+        "crates/bifrost-semantic-packs/embedded/go-concurrency-declarations/shards/go.concurrency.time.declarations.json"
       ],
       "generation_strategy": "retain_until_profile_support",
       "native_source_kind": "generated_semantic_model",
@@ -949,7 +978,8 @@
       "embedded_paths": [
         "crates/bifrost-semantic-packs/embedded/go-concurrency/manifest.json",
         "crates/bifrost-semantic-packs/embedded/go-concurrency/shards/go.concurrency.errgroup.deflate",
-        "crates/bifrost-semantic-packs/embedded/go-concurrency/shards/go.concurrency.sync.deflate"
+        "crates/bifrost-semantic-packs/embedded/go-concurrency/shards/go.concurrency.sync.deflate",
+        "crates/bifrost-semantic-packs/embedded/go-concurrency/shards/go.concurrency.time.json"
       ],
       "generation_strategy": "retain_until_profile_support",
       "native_source_kind": "generated_semantic_model",

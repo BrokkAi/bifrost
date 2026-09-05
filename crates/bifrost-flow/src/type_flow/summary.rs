@@ -38,7 +38,7 @@ use crate::dataflow::{
 use crate::hash::{HashMap, HashSet};
 use crate::value_flow::{
     BindingCoverage, ValueFlowCarrierKey, ValueFlowCarrierSummaryIdentity, ValueFlowEventKey,
-    ValueFlowFact, ValueFlowPlan, ValueFlowUncertainty,
+    ValueFlowFact, ValueFlowPlan, ValueFlowSourceId, ValueFlowUncertainty,
 };
 
 use super::plan::{ProcedureDispatchReadContract, uncovered_reason};
@@ -48,7 +48,7 @@ const CLASS_SET_SUMMARY_SEMANTICS: &[u8] = b"bifrost-class-set-summary-semantics
 const CLASS_SET_SUMMARY_CONTEXT: &[u8] = b"bifrost-class-set-summary-context-v1";
 const CLASS_SET_SUMMARY_BEHAVIOR: &[u8] = b"bifrost-class-set-summary-behavior-v1";
 const CLASS_SET_SUMMARY_ATOM: &[u8] = b"bifrost-class-set-summary-atom-v1";
-const CLASS_SET_SUMMARY_ENTRY: &[u8] = b"bifrost-class-set-summary-entry-v1";
+const CLASS_SET_SUMMARY_ENTRY: &[u8] = b"bifrost-class-set-summary-entry-v2";
 const CLASS_SET_SUMMARY_LOOKUP: &[u8] = b"bifrost-class-set-summary-lookup-v1";
 const CLASS_SET_SUMMARY_CALL_CONTRACT: &[u8] = b"bifrost-class-set-summary-call-contract-v1";
 const MAX_CLASS_SET_SUMMARIES: usize = 16_384;
@@ -98,6 +98,9 @@ struct ClassSetProcedureContract {
 enum StableEntryFact {
     Zero,
     Carrier {
+        // Guard edge kills are class-selective, so the symbolic relation is
+        // reusable only for entries carrying the same class atom.
+        atom: StableDigest,
         carrier: Box<ValueFlowCarrierKey>,
         uncertain: bool,
     },
@@ -627,6 +630,7 @@ pub(crate) struct PreparedClassSetSummaries<'plan> {
     workspace: &'plan WorkspaceAnalyzer,
     store: Option<Arc<AnalyzerStore>>,
     plan: &'plan ValueFlowPlan,
+    source_atoms: HashMap<ValueFlowSourceId, StableDigest>,
     procedures: HashMap<ProcedureHandle, PreparedProcedureSummary>,
     procedures_by_lineage: HashMap<StableDigest, Option<ProcedureHandle>>,
     used: HashMap<ClassSetRuntimeLookupKey, Arc<ClassSetProcedureSummary>>,
@@ -641,6 +645,10 @@ impl<'plan> PreparedClassSetSummaries<'plan> {
         provider_behavior: IcfgProviderBehaviorIdentity,
     ) -> Self {
         let value_flow = plan.value_flow();
+        let source_atoms = value_flow
+            .sources()
+            .map(|(source, _)| (source, class_atom_fingerprint(plan.atom(source))))
+            .collect();
         let behavior = class_set_behavior(provider_behavior, field_slots.digest());
         let mut carrier_contracts = value_flow
             .carrier_summary_identities()
@@ -823,6 +831,7 @@ impl<'plan> PreparedClassSetSummaries<'plan> {
             workspace,
             store: workspace.store().cloned(),
             plan: value_flow,
+            source_atoms,
             procedures,
             procedures_by_lineage,
             used: HashMap::default(),
@@ -1055,7 +1064,8 @@ impl<'plan> PreparedClassSetSummaries<'plan> {
             let Some(entry_fact) = result.result().fact(entry.entry_fact()).copied() else {
                 continue;
             };
-            let Some(stable_entry) = stable_entry_fact(self.plan, entry_fact) else {
+            let Some(stable_entry) = stable_entry_fact(self.plan, &self.source_atoms, entry_fact)
+            else {
                 continue;
             };
             let entry_source = entry_fact.source();
@@ -1385,8 +1395,13 @@ fn stable_entry_fingerprint(
     let mut digest = LengthDelimitedDigest::new(CLASS_SET_SUMMARY_ENTRY);
     match entry {
         StableEntryFact::Zero => digest.push(b"zero"),
-        StableEntryFact::Carrier { carrier, uncertain } => {
+        StableEntryFact::Carrier {
+            atom,
+            carrier,
+            uncertain,
+        } => {
             digest.push(b"carrier");
+            digest.push(atom.as_bytes());
             digest.push(procedure_local_carrier_fingerprint(carrier, procedure).as_bytes());
             digest.push(&[u8::from(*uncertain)]);
         }
@@ -1434,7 +1449,9 @@ fn normalized_class_set_relation_rows(
     let procedure_locator = &key.procedure_locator;
     let entry_fact = match &key.entry {
         StableEntryFact::Zero => StableValueFlowFact::Zero,
-        StableEntryFact::Carrier { carrier, uncertain } => StableValueFlowFact::Carrier {
+        StableEntryFact::Carrier {
+            carrier, uncertain, ..
+        } => StableValueFlowFact::Carrier {
             source: StableSource::Entry,
             carrier: carrier.as_ref().clone(),
             uncertain: *uncertain,
@@ -1725,6 +1742,14 @@ fn restore_persisted_summary(
             carrier,
             uncertain,
         } => StableEntryFact::Carrier {
+            atom: match &expected.entry {
+                StableEntryFact::Carrier { atom, .. } => *atom,
+                StableEntryFact::Zero => {
+                    return Err(StoreError::new(
+                        "persisted carrier entry does not match the expected zero entry",
+                    ));
+                }
+            },
             carrier: Box::new(carrier.clone()),
             uncertain: *uncertain,
         },
@@ -1930,7 +1955,7 @@ impl ReusableSummaryProvider<ValueFlowFact> for PreparedClassSetSummaries<'_> {
         let Some(prepared) = self.procedures.get(procedure) else {
             return Ok(None);
         };
-        let Some(entry) = stable_entry_fact(self.plan, entry_fact) else {
+        let Some(entry) = stable_entry_fact(self.plan, &self.source_atoms, entry_fact) else {
             return Ok(None);
         };
         let key = self
@@ -2028,10 +2053,15 @@ impl ReusableSummaryProvider<ValueFlowFact> for PreparedClassSetSummaries<'_> {
     }
 }
 
-fn stable_entry_fact(plan: &ValueFlowPlan, fact: ValueFlowFact) -> Option<StableEntryFact> {
+fn stable_entry_fact(
+    plan: &ValueFlowPlan,
+    source_atoms: &HashMap<ValueFlowSourceId, StableDigest>,
+    fact: ValueFlowFact,
+) -> Option<StableEntryFact> {
     match (fact.source(), fact.carrier(), fact.sink()) {
         (None, None, None) => Some(StableEntryFact::Zero),
-        (Some(_), Some(carrier), None) => Some(StableEntryFact::Carrier {
+        (Some(source), Some(carrier), None) => Some(StableEntryFact::Carrier {
+            atom: *source_atoms.get(&source)?,
             carrier: Box::new(plan.carrier_key(carrier)?.clone()),
             uncertain: !fact.uncertainty().is_empty(),
         }),

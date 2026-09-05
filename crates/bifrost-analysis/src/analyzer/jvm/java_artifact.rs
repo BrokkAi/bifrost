@@ -50,6 +50,10 @@ struct JavaApiMember {
     is_static: bool,
     is_abstract: bool,
     is_virtual: bool,
+    /// Whether exact binary metadata accounted for this member's complete
+    /// owner/name callable family. Source declarations cannot make this claim
+    /// independently of the binary artifact they describe.
+    callable_family_complete: bool,
     signature: Option<Signature>,
     locator: Locator,
 }
@@ -642,7 +646,17 @@ pub(super) fn java_api_facts(
                 is_abstract: member.is_abstract,
                 is_virtual: member.is_virtual,
                 implicit_operation: None,
-                callable_family_complete: false,
+                callable_family_complete: member.callable_family_complete
+                    && matches!(
+                        member.member_kind,
+                        MemberKind::Constructor | MemberKind::Method
+                    )
+                    && member.signature.as_ref().is_some_and(|signature| {
+                        signature
+                            .parameters
+                            .iter()
+                            .all(|parameter| !parameter.variadic)
+                    }),
                 signature: member.signature,
                 receiver: None,
                 extension_receiver: None,
@@ -924,6 +938,7 @@ fn source_members(
                     is_virtual: !constructor
                         && !modifiers.contains(&"static")
                         && !modifiers.contains(&"final"),
+                    callable_family_complete: false,
                     signature: Some(Signature {
                         type_parameters,
                         parameters,
@@ -991,6 +1006,7 @@ fn source_members(
                         is_static: interface_owner || modifiers.contains(&"static"),
                         is_abstract: false,
                         is_virtual: false,
+                        callable_family_complete: false,
                         signature: Some(Signature {
                             type_parameters: Vec::new(),
                             parameters: Vec::new(),
@@ -1145,6 +1161,7 @@ fn source_members(
                 is_static: false,
                 is_abstract: false,
                 is_virtual: false,
+                callable_family_complete: false,
                 signature: Some(Signature {
                     type_parameters: Vec::new(),
                     parameters: Vec::new(),
@@ -1178,6 +1195,7 @@ fn generated_java_member(
         is_static,
         is_abstract: false,
         is_virtual: !is_static && member_kind == MemberKind::Method,
+        callable_family_complete: false,
         signature: Some(Signature {
             type_parameters: Vec::new(),
             parameters,
@@ -1858,6 +1876,7 @@ pub(crate) struct JavaClassSurfaceMember {
     pub(super) member_kind: MemberKind,
     pub(super) is_abstract: bool,
     pub(super) is_virtual: bool,
+    pub(super) callable_family_complete: bool,
     pub(super) signature: Option<Signature>,
     pub(super) locator: Locator,
 }
@@ -1920,6 +1939,7 @@ pub(crate) fn class_surface(
                             .and_then(|signature| signature.returns.clone()),
                         is_abstract: member.is_abstract,
                         is_virtual: member.is_virtual,
+                        callable_family_complete: member.callable_family_complete,
                         signature: member.signature,
                         locator: member.locator,
                     })
@@ -1961,6 +1981,7 @@ pub(crate) fn class_surface_facts(
                 is_static: member.is_static,
                 is_abstract: member.is_abstract,
                 is_virtual: member.is_virtual,
+                callable_family_complete: member.callable_family_complete,
                 signature: member.signature,
                 locator: member.locator,
             })
@@ -2030,9 +2051,11 @@ fn class_api_type(
     for relation in &mut hierarchy {
         normalize_binary_type_ref(&mut relation.target, &class_file);
     }
+    let mut all_callable_families_complete = true;
     if signature_attribute(class_file.attributes(), &class_file).is_some()
         && !class_signature_decoded
     {
+        all_callable_families_complete = false;
         diagnostics.warning_for_declaration(
             "java.class.unsupported_signature",
             Some(class_entry.to_owned()),
@@ -2041,6 +2064,7 @@ fn class_api_type(
         );
     }
     let mut members = Vec::new();
+    let mut incomplete_callable_names = HashSet::default();
     for field in class_file.fields() {
         if let Some(member) = class_field_member(
             jar_name,
@@ -2068,6 +2092,8 @@ fn class_api_type(
             &class_file,
             method,
             max_depth,
+            &mut all_callable_families_complete,
+            &mut incomplete_callable_names,
             diagnostics,
         ) {
             if !take_record(remaining_records, record_limit_hit) {
@@ -2075,6 +2101,11 @@ fn class_api_type(
             }
             members.push(member);
         }
+    }
+    all_callable_families_complete &= !*record_limit_hit;
+    for member in &mut members {
+        member.callable_family_complete =
+            all_callable_families_complete && !incomplete_callable_names.contains(&member.name);
     }
     let type_kind = if class_file
         .attributes()
@@ -2169,6 +2200,7 @@ fn class_field_member(
         is_static: flags.contains(FieldFlags::ACC_STATIC),
         is_abstract: false,
         is_virtual: false,
+        callable_family_complete: false,
         signature: Some(Signature {
             type_parameters: Vec::new(),
             parameters: Vec::new(),
@@ -2189,6 +2221,8 @@ fn class_method_member(
     class_file: &ClassFile,
     method: &MethodInfo,
     max_depth: usize,
+    all_callable_families_complete: &mut bool,
+    incomplete_callable_names: &mut HashSet<String>,
     diagnostics: &mut BoundedProducerDiagnostics,
 ) -> Option<JavaApiMember> {
     let flags = method.access_flags();
@@ -2198,11 +2232,29 @@ fn class_method_member(
     {
         return None;
     }
-    let binary_name = utf8_at(class_file, method.name_index())?;
+    let Some(binary_name) = utf8_at(class_file, method.name_index()) else {
+        *all_callable_families_complete = false;
+        diagnostics.warning_for_declaration(
+            "java.class.unsupported_method_name",
+            Some(class_entry.to_owned()),
+            owner_name,
+            format!("could not decode a method name declared by {owner_name}"),
+        );
+        return None;
+    };
     if binary_name == "<clinit>" {
         return None;
     }
-    let descriptor = utf8_at(class_file, method.descriptor_index())?;
+    let Some(descriptor) = utf8_at(class_file, method.descriptor_index()) else {
+        incomplete_callable_names.insert(binary_name.to_owned());
+        diagnostics.warning_for_declaration(
+            "java.class.unsupported_method_signature",
+            Some(class_entry.to_owned()),
+            format!("{owner_name}.{binary_name}"),
+            format!("could not read method signature for {owner_name}.{binary_name}"),
+        );
+        return None;
+    };
     let generic = signature_attribute(method.attributes(), class_file).and_then(|signature| {
         let mut cursor = SignatureCursor::new(signature.as_bytes(), max_depth);
         cursor.parse_method_signature().filter(|_| cursor.at_end())
@@ -2214,6 +2266,7 @@ fn class_method_member(
             let Some((parameters, returns)) =
                 cursor.parse_method_descriptor().filter(|_| cursor.at_end())
             else {
+                incomplete_callable_names.insert(binary_name.to_owned());
                 diagnostics.warning_for_declaration(
                     "java.class.unsupported_method_signature",
                     Some(class_entry.to_owned()),
@@ -2274,6 +2327,7 @@ fn class_method_member(
         is_virtual: !constructor
             && !flags.contains(MethodFlags::ACC_STATIC)
             && !flags.contains(MethodFlags::ACC_FINAL),
+        callable_family_complete: false,
         signature: Some(Signature {
             type_parameters,
             parameters,
@@ -2675,6 +2729,7 @@ impl<'a> SignatureCursor<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::analyzer::jvm::external::{TestClassFile, TestClassMethod, write_test_class_jar};
     use crate::analyzer::semantic_model::{
         ActivationSelector, Compatibility, CompilerOptions, NameSelector, Provenance, Safety,
         compile_pack,
@@ -2985,6 +3040,34 @@ mod tests {
         assert!(matches!(class_surface.locator, Locator::Artifact { .. }));
         assert!(!source_types.iter().any(|fact| fact.name.contains("Hidden")));
         assert!(!class_types.iter().any(|fact| fact.name.contains("Hidden")));
+        assert!(
+            source_members
+                .iter()
+                .all(|member| !member.callable_family_complete),
+            "a source archive cannot certify that its callable families are exhaustive"
+        );
+
+        let class_member = |name: &str| {
+            class_members
+                .iter()
+                .find(|fact| fact.owner == class_surface.id && fact.name == name)
+                .unwrap_or_else(|| panic!("missing class member {name}"))
+        };
+        assert!(class_member("copy").callable_family_complete);
+        assert!(!class_member("value").callable_family_complete);
+        assert!(
+            class_members
+                .iter()
+                .filter(|member| member.owner == class_surface.id && member.name == "spread")
+                .any(|member| {
+                    member
+                        .signature
+                        .as_ref()
+                        .is_some_and(|signature| signature.parameters.iter().any(|p| p.variadic))
+                        && !member.callable_family_complete
+                }),
+            "variadic declarations must not claim fixed-family completeness"
+        );
 
         for member_name in ["<init>", "value", "copy", "convert"] {
             let source_member = source_members
@@ -3034,6 +3117,111 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn a_truncated_class_table_clears_retained_callable_family_claims() {
+        let temp = tempfile::tempdir().unwrap();
+        let class_jar = temp.path().join("truncated.jar");
+        write_test_class_jar(
+            &class_jar,
+            &[TestClassFile {
+                internal_name: "fixture/api/Truncated",
+                super_internal_name: "java/lang/Object",
+                methods: &[
+                    TestClassMethod {
+                        name: "first",
+                        descriptor: "()V",
+                        is_static: false,
+                    },
+                    TestClassMethod {
+                        name: "second",
+                        descriptor: "()V",
+                        is_static: false,
+                    },
+                ],
+                private_nested: false,
+            }],
+        );
+        let production = JavaJarPackProducer.produce_exact_artifact(
+            &request(class_jar, ExternalArtifactKind::JavaClassJar),
+            &ArtifactProducerLimits {
+                max_records: 2,
+                ..ArtifactProducerLimits::default()
+            },
+        );
+        assert_eq!(production.completeness, Completeness::Partial);
+        assert!(
+            production
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "limit.records")
+        );
+        let pack = production
+            .pack
+            .expect("the retained prefix remains inspectable");
+        let (_, members) = declarations(&pack);
+        assert_eq!(members.len(), 1, "{members:#?}");
+        assert!(
+            members
+                .iter()
+                .all(|member| !member.callable_family_complete),
+            "a truncated class table cannot certify even a retained family"
+        );
+    }
+
+    #[test]
+    fn an_unreadable_overload_clears_only_its_callable_family_claims() {
+        let temp = tempfile::tempdir().unwrap();
+        let class_jar = temp.path().join("unsupported-signature.jar");
+        write_test_class_jar(
+            &class_jar,
+            &[TestClassFile {
+                internal_name: "fixture/api/PartiallyDecoded",
+                super_internal_name: "java/lang/Object",
+                methods: &[
+                    TestClassMethod {
+                        name: "target",
+                        descriptor: "()V",
+                        is_static: false,
+                    },
+                    TestClassMethod {
+                        name: "target",
+                        descriptor: "(?)V",
+                        is_static: false,
+                    },
+                    TestClassMethod {
+                        name: "unrelated",
+                        descriptor: "()V",
+                        is_static: false,
+                    },
+                ],
+                private_nested: false,
+            }],
+        );
+        let production = JavaJarPackProducer.produce_exact_artifact(
+            &request(class_jar, ExternalArtifactKind::JavaClassJar),
+            &ArtifactProducerLimits::default(),
+        );
+        assert_eq!(production.completeness, Completeness::Partial);
+        assert!(production.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "java.class.unsupported_method_signature"
+                && diagnostic.declaration.as_deref() == Some("fixture.api.PartiallyDecoded.target")
+        }));
+        let pack = production
+            .pack
+            .expect("the readable class members remain inspectable");
+        let (_, members) = declarations(&pack);
+        let target = members
+            .iter()
+            .find(|member| member.name == "target")
+            .expect("the readable overload remains retained");
+        assert!(!target.callable_family_complete);
+        let unrelated = members
+            .iter()
+            .find(|member| member.name == "unrelated")
+            .expect("the unrelated family remains retained");
+        assert!(unrelated.callable_family_complete);
     }
 
     #[test]

@@ -964,6 +964,12 @@ mod tests {
         };
         assert!(types.iter().any(|fact| fact.name == "java.sql.Driver"));
         assert!(members.iter().any(|fact| fact.name == "connect"));
+        assert!(
+            members
+                .iter()
+                .find(|fact| fact.name == "connect")
+                .is_some_and(|fact| fact.callable_family_complete)
+        );
     }
 
     #[test]
@@ -979,7 +985,11 @@ mod tests {
                 test_class_file_bytes(&TestClassFile {
                     internal_name: "java/lang/Object",
                     super_internal_name: "java/lang/Object",
-                    methods: &[],
+                    methods: &[TestClassMethod {
+                        name: "hashCode",
+                        descriptor: "()I",
+                        is_static: false,
+                    }],
                     private_nested: false,
                 }),
             )],
@@ -1002,7 +1012,19 @@ mod tests {
             &artifact,
         );
         assert_eq!(production.completeness, Completeness::Partial);
-        assert!(production.pack.is_some());
+        let pack = production
+            .pack
+            .expect("the valid module remains inspectable");
+        let valid_member = pack
+            .shards
+            .iter()
+            .flat_map(|shard| match &shard.payload {
+                AuthoredPayload::DeclarationFacts { members, .. } => members.as_slice(),
+                _ => &[],
+            })
+            .find(|member| member.name == "hashCode")
+            .expect("the valid module declaration remains inspectable");
+        assert!(valid_member.callable_family_complete);
         assert!(
             production
                 .diagnostics

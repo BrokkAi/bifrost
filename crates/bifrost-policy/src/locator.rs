@@ -524,7 +524,6 @@ fn resolve_qualified_locator(
         {
             let mut provenance = records[0].provenance.clone();
             provenance.record_id = identity.clone();
-            provenance.completeness = SemanticModelCompleteness::Complete;
             return Ok(ResolvedLocatorIdentity::ActiveSemanticModel {
                 identity,
                 provenance: Box::new(provenance),
@@ -557,14 +556,6 @@ fn resolve_qualified_locator(
             ));
         }
         if let Some(record) = records.first() {
-            if record.provenance.completeness != SemanticModelCompleteness::Complete {
-                return Err(locator_error(
-                    locator,
-                    role,
-                    LocatorFailure::Partial,
-                    format!("active semantic-model identity: {}", record.id),
-                ));
-            }
             if !source_identities.is_empty() {
                 return Err(locator_error(
                     locator,
@@ -593,11 +584,18 @@ fn resolve_qualified_locator(
                 };
                 let mut provenance = record.provenance.clone();
                 provenance.record_id = identity.clone();
-                provenance.completeness = SemanticModelCompleteness::Complete;
                 return Ok(ResolvedLocatorIdentity::ActiveSemanticModel {
                     identity,
                     provenance: Box::new(provenance),
                 });
+            }
+            if record.provenance.completeness != SemanticModelCompleteness::Complete {
+                return Err(locator_error(
+                    locator,
+                    role,
+                    LocatorFailure::Partial,
+                    format!("active semantic-model identity: {}", record.id),
+                ));
             }
             return Ok(ResolvedLocatorIdentity::ActiveSemanticModel {
                 identity: record.id.clone(),

@@ -269,10 +269,6 @@ pub fn validate_row_selector_plan(
                 has_not_null_predicate(&predicates, "model_proof"),
             ),
             (
-                "model_completeness eq complete",
-                constrained("model_completeness", "complete"),
-            ),
-            (
                 "model_ambiguous eq false",
                 boolean("model_ambiguous", false),
             ),

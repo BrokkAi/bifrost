@@ -199,6 +199,8 @@ pub struct CppAnalyzer {
     #[cfg(any(test, feature = "test-support"))]
     using_guard_context_inspection_count: Arc<std::sync::atomic::AtomicUsize>,
     #[cfg(any(test, feature = "test-support"))]
+    macro_composed_fields_build_count: Arc<std::sync::atomic::AtomicUsize>,
+    #[cfg(any(test, feature = "test-support"))]
     cpp_class_strength_parse_count: Arc<std::sync::atomic::AtomicUsize>,
     /// Identifier-index scans issued for reconciliation. One per member
     /// identifier after #1908; one per queried fq name before it.
@@ -297,6 +299,9 @@ impl CppAnalyzer {
     }
 
     fn build_macro_composed_fields(&self, owner_file: &ProjectFile) -> Vec<MacroComposedField> {
+        #[cfg(any(test, feature = "test-support"))]
+        self.macro_composed_fields_build_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let scope = AnalyzerQueryScope::new(self);
         let token = scope.token();
         let include_target_index = self.include_target_index();
@@ -533,6 +538,8 @@ impl CppAnalyzer {
             #[cfg(any(test, feature = "test-support"))]
             using_guard_context_inspection_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(any(test, feature = "test-support"))]
+            macro_composed_fields_build_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            #[cfg(any(test, feature = "test-support"))]
             reconcile_candidate_scan_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(any(test, feature = "test-support"))]
             reconcile_candidate_evaluation_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -734,6 +741,8 @@ impl CppAnalyzer {
             source_using_index_build_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(any(test, feature = "test-support"))]
             using_guard_context_inspection_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            #[cfg(any(test, feature = "test-support"))]
+            macro_composed_fields_build_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(any(test, feature = "test-support"))]
             reconcile_candidate_scan_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(any(test, feature = "test-support"))]
@@ -999,6 +1008,20 @@ impl CppAnalyzer {
     #[doc(hidden)]
     pub fn reset_prepared_syntax_parse_counts_for_test(&self) {
         self.inner.reset_prepared_syntax_parse_counts_for_test();
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn reset_macro_composed_fields_build_count_for_test(&self) {
+        self.macro_composed_fields_build_count
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn macro_composed_fields_build_count_for_test(&self) -> usize {
+        self.macro_composed_fields_build_count
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -1620,7 +1643,7 @@ impl CodeUnitIndex for CppAnalyzer {
             return ranges;
         }
         if let Some(generated) = self
-            .all_macro_composed_fields()
+            .macro_composed_fields(code_unit.source())
             .iter()
             .find(|candidate| candidate.unit == *code_unit)
         {
@@ -1647,7 +1670,7 @@ impl CodeUnitIndex for CppAnalyzer {
         cancellation: &crate::CancellationToken,
     ) -> (Vec<crate::analyzer::Range>, usize, bool) {
         if let Some(field) = self
-            .all_macro_composed_fields()
+            .macro_composed_fields(code_unit.source())
             .iter()
             .find(|candidate| candidate.unit == *code_unit)
         {
@@ -1906,10 +1929,25 @@ impl IAnalyzer for CppAnalyzer {
                         units.dedup();
                         continue;
                     }
-                    let Some(macro_composed_fields) =
-                        self.all_macro_composed_fields_while(cancellation)
-                    else {
-                        return crate::analyzer::RelationalBatchOutcome::Cancelled;
+                    let macro_composed_fields = match &request.query {
+                        crate::analyzer::RelationalDefinitionQuery::Identifier {
+                            file: Some(file),
+                        }
+                        | crate::analyzer::RelationalDefinitionQuery::IdentifierPrefix {
+                            file: Some(file),
+                        } => {
+                            if cancellation.is_cancelled() {
+                                return crate::analyzer::RelationalBatchOutcome::Cancelled;
+                            }
+                            self.macro_composed_fields(file).as_ref().clone()
+                        }
+                        _ => {
+                            let Some(fields) = self.all_macro_composed_fields_while(cancellation)
+                            else {
+                                return crate::analyzer::RelationalBatchOutcome::Cancelled;
+                            };
+                            fields
+                        }
                     };
                     units.extend(
                         macro_composed_fields

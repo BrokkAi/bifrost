@@ -392,24 +392,27 @@ impl PythonArtifactPackProducer {
             }
             let relative = Path::new(entry.relative_path());
             let Some(module) = python_module_name_from_relative(relative) else {
-                diagnostics.warning(
+                diagnostics.warning_for_source_entry(
                     "python.artifact_module",
+                    Some(entry.relative_path().to_owned()),
                     Some(entry.relative_path().to_owned()),
                     "Python stub entry has no import-module identity",
                 );
                 continue;
             };
             let Ok(source) = std::str::from_utf8(entry.bytes()) else {
-                diagnostics.warning(
+                diagnostics.warning_for_source_entry(
                     "python.source.encoding",
+                    Some(entry.relative_path().to_owned()),
                     Some(entry.relative_path().to_owned()),
                     "Python stub entry is not UTF-8",
                 );
                 continue;
             };
             let Some(tree) = brokk_bifrost_python::declarations::parse_python_tree(source) else {
-                diagnostics.warning(
+                diagnostics.warning_for_source_entry(
                     "python.source.parse",
+                    Some(entry.relative_path().to_owned()),
                     Some(entry.relative_path().to_owned()),
                     "Python parser did not produce a syntax tree",
                 );
@@ -3438,7 +3441,7 @@ fn bounded_message(mut message: String, limit: usize) -> String {
 mod tests {
     use super::*;
     use crate::analyzer::semantic_model::{CompilerOptions, compile_pack, read_exact_source_set};
-    use tempfile::tempdir;
+    use tempfile::{TempDir, tempdir};
 
     #[test]
     fn version_file_declarations_pin_exact_cpython_versions() {
@@ -3644,6 +3647,180 @@ mod tests {
             TypeRef::Named { ref name, .. } if name == "absent.Missing"
         ));
         compile_pack(&pack, &CompilerOptions::default()).unwrap();
+    }
+
+    fn source_set_rejection_fixture() -> (TempDir, ExactArtifact) {
+        let fixture = tempdir().unwrap();
+        std::fs::create_dir_all(fixture.path().join("pkg")).unwrap();
+        std::fs::write(fixture.path().join("__init__.pyi"), "class RootOnly: ...\n").unwrap();
+        std::fs::write(
+            fixture.path().join("pkg/__init__.pyi"),
+            "class Widget: ...\n",
+        )
+        .unwrap();
+        std::fs::write(fixture.path().join("pkg/bad.pyi"), [0xff, 0xfe, 0x00, 0x01]).unwrap();
+        let artifact = read_exact_source_set(
+            fixture.path(),
+            &[
+                "__init__.pyi".into(),
+                "pkg/__init__.pyi".into(),
+                "pkg/bad.pyi".into(),
+            ],
+            32,
+            16,
+            &ArtifactProducerLimits::default(),
+        )
+        .unwrap();
+        (fixture, artifact)
+    }
+
+    fn source_set_request(root: &Path) -> ArtifactProductionRequest {
+        ArtifactProductionRequest {
+            path: root.to_owned(),
+            artifact_kind: ExternalArtifactKind::PythonStub,
+            pack_id: "python-source-set-rejection-fixture".to_owned(),
+            pack_version: "1.0.0".to_owned(),
+            ecosystem: "python".to_owned(),
+            compatibility: Compatibility {
+                bifrost: format!("={}", env!("CARGO_PKG_VERSION")),
+                toolchains: Vec::new(),
+            },
+            activation: vec![ActivationSelector {
+                package: None,
+                module: None,
+                toolchain: None,
+                targets: Vec::new(),
+                configurations: Vec::new(),
+                artifact_sha256: None,
+            }],
+            provenance: Provenance {
+                source: "fixture".to_owned(),
+                revision: Some("fixture-v1".to_owned()),
+            },
+            license: "Apache-2.0".to_owned(),
+            safety: Safety {
+                generated_code_only: false,
+                review_required: false,
+            },
+        }
+    }
+
+    #[test]
+    fn source_set_rejects_keep_exact_source_entries_and_artifact_digest() {
+        let (fixture, artifact) = source_set_rejection_fixture();
+        let expected_digest = artifact.sha256().to_owned();
+        let production = PythonArtifactPackProducer.produce_loaded_source_set(
+            &source_set_request(fixture.path()),
+            &ArtifactProducerLimits::default(),
+            None,
+            &artifact,
+        );
+
+        assert_eq!(
+            production.artifact_sha256.as_deref(),
+            Some(expected_digest.as_str()),
+            "source-set production retains the exact input digest"
+        );
+        assert_eq!(production.completeness, Completeness::Partial);
+        assert_eq!(
+            production.suppressed_diagnostics,
+            SuppressedDiagnostics::default()
+        );
+        assert_eq!(production.diagnostics.len(), 2);
+        let rejects = [
+            ("python.artifact_module", "__init__.pyi"),
+            ("python.source.encoding", "pkg/bad.pyi"),
+        ];
+        for (code, source_entry) in rejects {
+            let diagnostic = production
+                .diagnostics
+                .iter()
+                .find(|diagnostic| diagnostic.code == code)
+                .unwrap_or_else(|| panic!("missing diagnostic {code}"));
+            assert_eq!(diagnostic.severity, ProducerDiagnosticSeverity::Warning);
+            assert_eq!(diagnostic.location.as_deref(), Some(source_entry));
+            assert_eq!(diagnostic.source_entry.as_deref(), Some(source_entry));
+            assert_eq!(diagnostic.declaration, None);
+        }
+        assert_eq!(
+            production
+                .diagnostics
+                .iter()
+                .filter_map(|diagnostic| diagnostic.source_entry.as_deref())
+                .count(),
+            production.diagnostics.len(),
+            "every retained warning has one exact source-entry accounting subject"
+        );
+        assert!(
+            production.pack.as_ref().is_some_and(|pack| {
+                pack.shards.iter().any(|shard| match &shard.payload {
+                    AuthoredPayload::DeclarationFacts { types, .. } => {
+                        types.iter().any(|fact| fact.name == "pkg.Widget")
+                    }
+                    _ => false,
+                })
+            }),
+            "a warning-only partial source set still retains valid declarations"
+        );
+    }
+
+    #[test]
+    fn source_set_suppressed_and_cancelled_rejects_remain_unaccounted() {
+        let (fixture, artifact) = source_set_rejection_fixture();
+        let limits = ArtifactProducerLimits {
+            max_diagnostics: 1,
+            ..ArtifactProducerLimits::default()
+        };
+        let production = PythonArtifactPackProducer.produce_loaded_source_set(
+            &source_set_request(fixture.path()),
+            &limits,
+            None,
+            &artifact,
+        );
+        assert_eq!(production.completeness, Completeness::Partial);
+        assert_eq!(
+            production.suppressed_diagnostics,
+            SuppressedDiagnostics {
+                warnings: 1,
+                errors: 0,
+            }
+        );
+        assert_eq!(production.diagnostics.len(), 1);
+        assert_eq!(
+            production.diagnostics[0].source_entry.as_deref(),
+            Some("__init__.pyi")
+        );
+        assert_eq!(
+            production
+                .diagnostics
+                .iter()
+                .filter_map(|diagnostic| diagnostic.source_entry.as_deref())
+                .count(),
+            1,
+            "the suppressed reject has no retained identity to account for"
+        );
+
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        let cancelled = PythonArtifactPackProducer.produce_loaded_source_set(
+            &source_set_request(fixture.path()),
+            &ArtifactProducerLimits::default(),
+            Some(&cancellation),
+            &artifact,
+        );
+        assert_eq!(cancelled.completeness, Completeness::Partial);
+        assert!(cancelled.pack.is_none());
+        assert!(cancelled.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "artifact.cancelled"
+                && diagnostic.severity == ProducerDiagnosticSeverity::Error
+        }));
+        assert!(
+            cancelled
+                .diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.source_entry.is_none()),
+            "cancellation is a whole-source-set failure, not an entry accounting subject"
+        );
     }
 
     /// Produce one pack from an inline stub source set, the way the pinned

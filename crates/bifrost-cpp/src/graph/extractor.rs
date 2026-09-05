@@ -979,6 +979,35 @@ fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         maybe_record_object_macro_replacement_type_hits(node, ctx);
         return;
     }
+    if let Some(type_node) = ctx
+        .visibility
+        .function_macro_type_argument(ctx.file, node, ctx.source)
+    {
+        if ctx
+            .local_shadows
+            .is_shadowed(node_text(type_node, ctx.source))
+        {
+            return;
+        }
+        if let LexicalTypeResolution::Resolved {
+            unit, candidates, ..
+        } = resolve_type_node_lexically_for_target(
+            type_node,
+            &ctx.analyzer,
+            ctx.visibility,
+            &ctx.ordinary_type_imports,
+            ctx.file,
+            ctx.source,
+            &ctx.spec.target,
+            Some(&ctx.lexical_scope_cache),
+            ctx.recovered_sentinel_scope(type_node).as_deref(),
+        ) && type_resolution_matches_target(type_node, &unit, &candidates, ctx)
+        {
+            *ctx.raw_match_count += 1;
+            push_type_hit(type_node, ctx);
+        }
+        return;
+    }
     let recovered_exported_class_base =
         is_recovered_exported_class_base_type_node(node, ctx.source);
     if let Some(return_type) = recovered_macro_return_type_node(node, ctx.source) {
@@ -7495,7 +7524,8 @@ fn maybe_record_global_field_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         return;
     }
     if matches!(node.kind(), "identifier" | "field_identifier")
-        && designated_initializer_owner(ctx.visibility, ctx.file, ctx.source, node).is_some()
+        && designated_initializer_owner(&ctx.analyzer, ctx.visibility, ctx.file, ctx.source, node)
+            .is_some()
     {
         return;
     }
@@ -7722,7 +7752,7 @@ fn maybe_record_member_field_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     if matches!(node.kind(), "identifier" | "field_identifier")
         && name_matches_terminal(node_text(node, ctx.source), &ctx.spec.member_name)
         && let Some(designator_owner) =
-            designated_initializer_owner(ctx.visibility, ctx.file, ctx.source, node)
+            designated_initializer_owner(&ctx.analyzer, ctx.visibility, ctx.file, ctx.source, node)
     {
         *ctx.raw_match_count += 1;
         match designator_owner {
@@ -8718,7 +8748,7 @@ fn receiver_matches_target(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
         "call_expression" => node
             .child_by_field_name("function")
             .is_some_and(|function| receiver_matches_target(function, ctx)),
-        "pointer_expression" | "parenthesized_expression" => node
+        "pointer_expression" | "parenthesized_expression" | "subscript_expression" => node
             .child_by_field_name("argument")
             .or_else(|| node.named_child(0))
             .is_some_and(|child| receiver_matches_target(child, ctx)),
@@ -9063,7 +9093,7 @@ fn receiver_has_known_non_target(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
         "call_expression" => node
             .child_by_field_name("function")
             .is_some_and(|function| receiver_has_known_non_target(function, ctx)),
-        "pointer_expression" | "parenthesized_expression" => node
+        "pointer_expression" | "parenthesized_expression" | "subscript_expression" => node
             .child_by_field_name("argument")
             .or_else(|| node.named_child(0))
             .is_some_and(|child| receiver_has_known_non_target(child, ctx)),

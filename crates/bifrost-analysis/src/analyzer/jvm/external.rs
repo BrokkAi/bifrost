@@ -12,16 +12,16 @@ use crate::analyzer::jvm::scala_artifact::ScalaSourceJarPackProducer;
 use crate::analyzer::semantic::{LengthDelimitedDigest, StableDigest};
 use crate::analyzer::semantic_model::{
     ActivationSelector, ArtifactProducerLimits, ArtifactProduction, ArtifactProductionRequest,
-    AuthoredPayload, AuthoredSemanticModelPack, BoundedDependencyDiagnostics, CatalogCoordinate,
-    Compatibility, Completeness, DependencyArtifactRole, DependencyDiscoveryOutcome,
-    DependencyDiscoveryProfile, DependencyPackAdapter, DependencyPackDiagnostic,
-    DependencyPackDiagnosticSeverity, DependencyPackLimits, DependencyPackProduction,
-    DependencyProvenance, ExactDependencyArtifact, ExternalArtifactKind,
+    AuthoredPayload, AuthoredSemanticModelPack, AuthoredShard, BoundedDependencyDiagnostics,
+    CatalogCoordinate, Compatibility, Completeness, DependencyArtifactRole,
+    DependencyDiscoveryOutcome, DependencyDiscoveryProfile, DependencyPackAdapter,
+    DependencyPackDiagnostic, DependencyPackDiagnosticSeverity, DependencyPackLimits,
+    DependencyPackProduction, DependencyProvenance, ExactDependencyArtifact, ExternalArtifactKind,
     ExternalArtifactPackProducer, HierarchyFact, Locator, MemberFact, MemberKind, NameSelector,
     Producer, ProducerDiagnostic, ProducerDiagnosticSeverity, Provenance, ResolvedDependency,
-    ResolvedDependencyArtifact, Safety, SemanticModelActivationEvidence, SuppressedDiagnostics,
-    TypeFact, TypeKind, TypeRef, Visibility, normalize_artifact_locator_paths,
-    read_exact_artifact_while,
+    ResolvedDependencyArtifact, Safety, SemanticModelActivationEvidence, Signature,
+    SuppressedDiagnostics, TypeFact, TypeKind, TypeRef, Visibility,
+    normalize_artifact_locator_paths, read_exact_artifact_while,
 };
 use crate::analyzer::{
     JvmAnalyzerConfig, JvmDependencyDiscoveryMode, JvmExternalArtifact, JvmExternalArtifactOrigin,
@@ -571,7 +571,32 @@ fn discover_jdk_semantic_pack_dependencies(
             .into_iter()
             .find(|path| path.is_file());
         let dependency = if let Some(source) = source {
-            resolved_jdk_dependency(version.clone(), Some(source))
+            let mut dependency = resolved_jdk_dependency(version.clone(), Some(source));
+            match discover_jdk_jmods(&home) {
+                Ok(Some(relative_paths)) => {
+                    dependency
+                        .artifacts
+                        .push(ResolvedDependencyArtifact::source_set(
+                            DependencyArtifactRole::Binary,
+                            ExternalArtifactKind::JdkJmodSet,
+                            home.clone(),
+                            relative_paths,
+                        ));
+                }
+                Ok(None) => {}
+                Err(message) => discovery.diagnostics.push(DependencyPackDiagnostic {
+                    severity: if configured {
+                        DependencyPackDiagnosticSeverity::Error
+                    } else {
+                        DependencyPackDiagnosticSeverity::Warning
+                    },
+                    code: "jdk.jmods.invalid".to_owned(),
+                    dependency_id: Some(format!("jdk:{version}")),
+                    location: Some(home.to_string_lossy().into_owned()),
+                    message,
+                }),
+            }
+            dependency
         } else if configured {
             match discover_jdk_jmods(&home) {
                 Ok(Some(relative_paths)) => {
@@ -594,10 +619,10 @@ fn discover_jdk_semantic_pack_dependencies(
                 }
             }
         } else {
-            // Automatic JAVA_HOME discovery supplies exact toolchain evidence
-            // for a released source-derived pack. Parsing a full binary JDK is
-            // an explicit local-production opt-in through `jdk_homes`; doing
-            // it implicitly would block ordinary Java workspace readiness.
+            // Automatic JAVA_HOME discovery without sources supplies exact
+            // toolchain evidence for a compatible released pack. Local JMOD
+            // production remains unavailable here because it could not retain
+            // source formal names needed for exact actual-to-formal binding.
             resolved_jdk_dependency(version.clone(), None)
         };
         match dependency_by_version.entry(version) {
@@ -1268,60 +1293,129 @@ fn merge_java_dependency_packs(
     let Some(secondary) = secondary else {
         return Some(pack);
     };
-    let Some(primary_shard) = pack.shards.first_mut() else {
-        return Some(pack);
-    };
-    let AuthoredPayload::DeclarationFacts {
-        types,
-        members,
-        relations,
-    } = &mut primary_shard.payload
-    else {
-        return Some(pack);
-    };
-    let mut type_indexes: HashMap<String, usize> = types
-        .iter()
-        .enumerate()
-        .map(|(index, fact)| (fact.id.clone(), index))
-        .collect();
-    let mut member_indexes: HashMap<String, usize> = members
-        .iter()
-        .enumerate()
-        .map(|(index, fact)| (fact.id.clone(), index))
-        .collect();
-    let mut relation_ids: crate::hash::HashSet<String> =
-        relations.iter().map(|fact| fact.id.clone()).collect();
-    for shard in secondary.shards {
+    let mut type_indexes = HashMap::<String, (usize, usize)>::default();
+    let mut member_indexes = HashMap::<String, (usize, usize)>::default();
+    let mut relation_ids = crate::hash::HashSet::<String>::default();
+    for (shard_index, shard) in pack.shards.iter().enumerate() {
         let AuthoredPayload::DeclarationFacts {
-            types: secondary_types,
-            members: secondary_members,
-            relations: secondary_relations,
-        } = shard.payload
+            types,
+            members,
+            relations,
+        } = &shard.payload
         else {
             continue;
         };
+        type_indexes.extend(
+            types
+                .iter()
+                .enumerate()
+                .map(|(fact_index, fact)| (fact.id.clone(), (shard_index, fact_index))),
+        );
+        member_indexes.extend(
+            members
+                .iter()
+                .enumerate()
+                .map(|(fact_index, fact)| (fact.id.clone(), (shard_index, fact_index))),
+        );
+        relation_ids.extend(relations.iter().map(|fact| fact.id.clone()));
+    }
+    for shard in secondary.shards {
+        let AuthoredShard {
+            id,
+            activation,
+            payload,
+        } = shard;
+        let (secondary_types, secondary_members, secondary_relations) = match payload {
+            AuthoredPayload::DeclarationFacts {
+                types,
+                members,
+                relations,
+            } => (types, members, relations),
+            payload => {
+                if !pack.shards.iter().any(|shard| shard.id == id) {
+                    pack.shards.push(AuthoredShard {
+                        id,
+                        activation,
+                        payload,
+                    });
+                }
+                continue;
+            }
+        };
+        let target_shard_index = pack
+            .shards
+            .iter()
+            .position(|shard| shard.id == id)
+            .unwrap_or_else(|| {
+                let index = pack.shards.len();
+                pack.shards.push(AuthoredShard {
+                    id,
+                    activation,
+                    payload: AuthoredPayload::DeclarationFacts {
+                        types: Vec::new(),
+                        members: Vec::new(),
+                        relations: Vec::new(),
+                    },
+                });
+                index
+            });
         for fact in secondary_types {
-            if let Some(index) = type_indexes.get(&fact.id).copied() {
-                if !equivalent_java_type_fact(&types[index], &fact) {
+            if let Some((shard_index, fact_index)) = type_indexes.get(&fact.id).copied() {
+                let AuthoredPayload::DeclarationFacts { types, .. } =
+                    &pack.shards[shard_index].payload
+                else {
+                    unreachable!("Java fact indexes name declaration-fact shards")
+                };
+                if !equivalent_java_type_fact(&types[fact_index], &fact) {
                     push_java_merge_conflict(diagnostics, suppressed_diagnostics, limits, &fact.id);
                 }
             } else {
-                type_indexes.insert(fact.id.clone(), types.len());
+                let AuthoredPayload::DeclarationFacts { types, .. } =
+                    &mut pack.shards[target_shard_index].payload
+                else {
+                    unreachable!("Java merge targets a declaration-fact shard")
+                };
+                type_indexes.insert(fact.id.clone(), (target_shard_index, types.len()));
                 types.push(fact);
             }
         }
         for fact in secondary_members {
-            if let Some(index) = member_indexes.get(&fact.id).copied() {
-                if !equivalent_java_member_fact(&members[index], &fact) {
+            if let Some((shard_index, fact_index)) = member_indexes.get(&fact.id).copied() {
+                let equivalent = {
+                    let AuthoredPayload::DeclarationFacts { members, .. } =
+                        &pack.shards[shard_index].payload
+                    else {
+                        unreachable!("Java fact indexes name declaration-fact shards")
+                    };
+                    equivalent_java_member_fact(&members[fact_index], &fact)
+                };
+                if !equivalent {
                     push_java_merge_conflict(diagnostics, suppressed_diagnostics, limits, &fact.id);
+                } else {
+                    let AuthoredPayload::DeclarationFacts { members, .. } =
+                        &mut pack.shards[shard_index].payload
+                    else {
+                        unreachable!("Java fact indexes name declaration-fact shards")
+                    };
+                    members[fact_index].callable_family_complete |= fact.callable_family_complete;
                 }
             } else {
-                member_indexes.insert(fact.id.clone(), members.len());
+                let AuthoredPayload::DeclarationFacts { members, .. } =
+                    &mut pack.shards[target_shard_index].payload
+                else {
+                    unreachable!("Java merge targets a declaration-fact shard")
+                };
+                member_indexes.insert(fact.id.clone(), (target_shard_index, members.len()));
                 members.push(fact);
             }
         }
         for fact in secondary_relations {
             if relation_ids.insert(fact.id.clone()) {
+                let AuthoredPayload::DeclarationFacts { relations, .. } =
+                    &mut pack.shards[target_shard_index].payload
+                else {
+                    unreachable!("Java merge targets a declaration-fact shard")
+                };
                 relations.push(fact);
             }
         }
@@ -1351,8 +1445,27 @@ fn equivalent_java_member_fact(left: &MemberFact, right: &MemberFact) -> bool {
         && left.is_static == right.is_static
         && left.is_abstract == right.is_abstract
         && left.is_virtual == right.is_virtual
-        && left.signature == right.signature
+        && equivalent_java_signature(left.signature.as_ref(), right.signature.as_ref())
         && left.aliases == right.aliases
+}
+
+fn equivalent_java_signature(left: Option<&Signature>, right: Option<&Signature>) -> bool {
+    match (left, right) {
+        (None, None) => true,
+        (Some(left), Some(right)) => {
+            left.type_parameters.len() == right.type_parameters.len()
+                && left.returns == right.returns
+                && left.parameters.len() == right.parameters.len()
+                && left
+                    .parameters
+                    .iter()
+                    .zip(&right.parameters)
+                    .all(|(left, right)| {
+                        left.r#type == right.r#type && left.variadic == right.variadic
+                    })
+        }
+        _ => false,
+    }
 }
 
 fn push_java_merge_conflict(
@@ -4127,8 +4240,8 @@ mod tests {
             DependencyPackPreparationStatus::Generated
         );
 
-        // Adding a source archive must preserve the existing source-first
-        // preference even when JMODs are present in the same approved home.
+        // Adding a source archive retains it for formal names and also retains
+        // the exact JMOD set that certifies callable-family completeness.
         fs::create_dir_all(home.join("lib")).unwrap();
         write_zip_entries(
             &home.join("lib/src.zip"),
@@ -4144,6 +4257,7 @@ mod tests {
             ],
         );
         let source_discovered = discover_jdk_semantic_pack_dependencies(&config, root.path(), None);
+        assert_eq!(source_discovered.dependencies[0].artifacts.len(), 2);
         assert_eq!(
             source_discovered.dependencies[0].artifacts[0].kind,
             ExternalArtifactKind::JdkSourceZip
@@ -4151,6 +4265,14 @@ mod tests {
         assert_eq!(
             source_discovered.dependencies[0].artifacts[0].path(),
             fs::canonicalize(home.join("lib/src.zip")).unwrap()
+        );
+        assert_eq!(
+            source_discovered.dependencies[0].artifacts[1].kind,
+            ExternalArtifactKind::JdkJmodSet
+        );
+        assert_eq!(
+            source_discovered.dependencies[0].artifacts[1].path(),
+            fs::canonicalize(&home).unwrap()
         );
     }
 
@@ -4461,8 +4583,8 @@ mod tests {
     fn java_dependency_pack_retains_coordinate_and_reuses_merged_artifacts() {
         use crate::analyzer::semantic_model::{
             CatalogOptions, DependencyArtifactRole, DependencyPackLimits,
-            DependencyPackPreparationStatus, SemanticPackCatalog,
-            prepare_dependency_semantic_packs,
+            DependencyPackPreparationStatus, ExactDependencyArtifact, SemanticPackCatalog,
+            prepare_dependency_semantic_packs, read_exact_artifact,
         };
 
         let Some(fixture) = ExternalJarFixture::new(true) else {
@@ -4513,6 +4635,116 @@ mod tests {
                 DependencyArtifactRole::Binary,
                 DependencyArtifactRole::Sources
             ]
+        );
+
+        let producer_limits = ArtifactProducerLimits::default();
+        let exact_artifacts = [
+            ExactDependencyArtifact::from_exact(
+                DependencyArtifactRole::Binary,
+                ExternalArtifactKind::JavaClassJar,
+                None,
+                read_exact_artifact(&fixture.binary_jar_path(), &producer_limits).unwrap(),
+            ),
+            ExactDependencyArtifact::from_exact(
+                DependencyArtifactRole::Sources,
+                ExternalArtifactKind::JavaSourceJar,
+                None,
+                read_exact_artifact(&fixture.source_jar_path(), &producer_limits).unwrap(),
+            ),
+        ];
+        let merged = JvmDependencyPackAdapter.produce(
+            &dependencies[0],
+            &exact_artifacts,
+            &producer_limits,
+            None,
+        );
+        assert!(merged.diagnostics.is_empty(), "{:#?}", merged.diagnostics);
+        let merged_pack = merged.pack.expect("source and binary packs merge");
+        let AuthoredPayload::DeclarationFacts { types, members, .. } =
+            &merged_pack.shards[0].payload
+        else {
+            panic!("Java dependency producer must emit declaration facts")
+        };
+        let owner = types
+            .iter()
+            .find(|fact| fact.name == "com.example.dep.ExternalService")
+            .expect("merged service declaration");
+        let echo = members
+            .iter()
+            .find(|fact| fact.owner == owner.id && fact.name == "echo")
+            .expect("merged echo declaration");
+        assert_eq!(
+            echo.signature
+                .as_ref()
+                .and_then(|signature| signature.parameters[0].name.as_deref()),
+            Some("name"),
+            "source formal names remain authoritative"
+        );
+        assert!(
+            echo.callable_family_complete,
+            "an equivalent exact binary table contributes scoped completeness"
+        );
+
+        let produce_java_pack = |path: &Path, kind: ExternalArtifactKind| {
+            let mut request = jvm_dependency_production_request(&dependencies[0]);
+            request.path = path.to_path_buf();
+            request.artifact_kind = kind;
+            let artifact = read_exact_artifact(path, &producer_limits).unwrap();
+            JavaJarPackProducer
+                .produce_loaded_artifact(&request, &producer_limits, None, &artifact)
+                .pack
+                .expect("standalone Java declaration pack")
+        };
+        let mut source_pack = produce_java_pack(
+            &fixture.source_jar_path(),
+            ExternalArtifactKind::JavaSourceJar,
+        );
+        let mut binary_pack = produce_java_pack(
+            &fixture.binary_jar_path(),
+            ExternalArtifactKind::JavaClassJar,
+        );
+        for pack in [&mut source_pack, &mut binary_pack] {
+            let activation = pack.shards[0].activation.clone();
+            pack.shards[0].id = "declarations.second".to_owned();
+            pack.shards.insert(
+                0,
+                AuthoredShard {
+                    id: "declarations.first".to_owned(),
+                    activation,
+                    payload: AuthoredPayload::DeclarationFacts {
+                        types: Vec::new(),
+                        members: Vec::new(),
+                        relations: Vec::new(),
+                    },
+                },
+            );
+        }
+        let mut multi_shard_diagnostics = Vec::new();
+        let mut multi_shard_suppressed = SuppressedDiagnostics::default();
+        let multi_shard = merge_java_dependency_packs(
+            Some(source_pack),
+            Some(binary_pack),
+            &mut multi_shard_diagnostics,
+            &mut multi_shard_suppressed,
+            &producer_limits,
+        )
+        .expect("multi-shard Java packs merge");
+        assert!(multi_shard_diagnostics.is_empty());
+        assert_eq!(multi_shard_suppressed.total(), 0);
+        let AuthoredPayload::DeclarationFacts { types, members, .. } =
+            &multi_shard.shards[1].payload
+        else {
+            panic!("the corresponding declaration shard remains typed")
+        };
+        let owner = types
+            .iter()
+            .find(|fact| fact.name == "com.example.dep.ExternalService")
+            .expect("multi-shard service declaration");
+        assert!(
+            members.iter().any(|fact| {
+                fact.owner == owner.id && fact.name == "echo" && fact.callable_family_complete
+            }),
+            "binary proof must merge into the matching source shard"
         );
 
         let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
@@ -5753,6 +5985,7 @@ mod tests {
                 package_dir.join("ExternalService.java"),
                 "package com.example.dep;\n\
                  public class ExternalService {\n\
+                   public String echo(String name) { return name; }\n\
                    public static class Nested {}\n\
                    protected static class ProtectedNested {}\n\
                    static class PackageNested {}\n\

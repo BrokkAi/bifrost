@@ -5,6 +5,34 @@ analysis behavior, integrations, and release artifacts. It is curated from the
 complete private release range because the public open-core repository is a
 projection and its commit history does not contain every source commit.
 
+## [Unreleased]
+
+### Added
+
+- The built-in `bifrost.security` pack now ships an exact
+  Servlet-parameter-to-JDBC rule backed by behavioral models for the shipped
+  Java endpoints.
+
+### Changed
+
+- JVM dependency discovery now certifies exact callable families from JMOD
+  artifacts and activates scoped evidence from partial generated packs
+  without promoting their completeness.
+
+### Fixed
+
+- C definition navigation now resolves ordered, nested, and anonymous
+  designated-initializer fields and fields accessed through indexed array
+  elements, and macro-field relational lookups stay local to their source
+  overlay.
+- Rust member scans now derive owner names from structured usage bindings --
+  imports, aliases, re-exports, and `Self` -- instead of repository-wide
+  bare-name reverse resolution, removing a multi-second scan span and
+  same-name false bindings.
+- Type-flow reusable summaries now include the concrete class atom in guarded
+  entry keys (with a one-time persisted-key rotation), so guard narrowing can
+  no longer share one summary across classes with different edge kills.
+
 ## [0.11.0] - 2026-09-04
 
 ### Breaking

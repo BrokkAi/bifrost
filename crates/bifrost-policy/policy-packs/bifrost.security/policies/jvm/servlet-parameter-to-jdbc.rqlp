@@ -34,7 +34,30 @@
                   (call
                     :over calls
                     :resolves-to member.servletrequest.getparameter
-                    :proof exact)
+                    :proof declared)
+                  (call-argument :over calls :formal-name "name"))
+              :bind return-value
+              :labels [attacker-controlled])
+            (source
+              :id jakarta-servlet-request-parameter
+              :display-name "Jakarta ServletRequest.getParameter(String)"
+              :categories [input.user-controlled io.external]
+              :selector
+                (row-selector
+                  :output calls
+                  (bind
+                    :name calls
+                    :query
+                      (rql
+                        :schema-version 1
+                        (language java
+                          (call-bindings
+                            (call-shape
+                              (call :callee (name "getParameter") (arity 1)))))))
+                  (call
+                    :over calls
+                    :resolves-to member.37411473c8205b46f537d2dd45f5068265365b0c2ed02640496ffd7e025f18cc
+                    :proof declared)
                   (call-argument :over calls :formal-name "name"))
               :bind return-value
               :labels [attacker-controlled])])
@@ -60,10 +83,136 @@
                   (call
                     :over calls
                     :resolves-to member.statement.execute
-                    :proof exact)
+                    :proof declared)
                   (call-argument :over calls :formal-name "sql"))
               :dangerous-operand (argument :name "sql")
-              :accepts [attacker-controlled])]))
+              :accepts [attacker-controlled])
+            (sink
+              :id generated-jdbc-statement-execute-sql
+              :display-name "Generated Statement.execute(String) SQL"
+              :categories [sql.structure]
+              :selector
+                (row-selector
+                  :output calls
+                  (bind
+                    :name calls
+                    :query
+                      (rql
+                        :schema-version 1
+                        (language java
+                          (call-bindings
+                            (call-shape
+                              (call :callee (name "execute") (arity 1)))))))
+                  (call
+                    :over calls
+                    :resolves-to member.3032e0ed03b524a17379a2e259a980dc81d1f8e4f881a88921b0434637d1f982
+                    :proof declared)
+                  (call-argument :over calls :formal-name "sql"))
+              :dangerous-operand (argument :name "sql")
+              :accepts [attacker-controlled])])
+      :external-models
+        (endpoint-set
+          :entries [
+            (external-model
+              :id servlet-request-parameter-call
+              :selector
+                (row-selector
+                  :output calls
+                  (bind
+                    :name calls
+                    :query
+                      (rql
+                        :schema-version 1
+                        (language java
+                          (call-bindings
+                            (call-shape
+                              (call :callee (name "getParameter") (arity 1)))))))
+                  (call
+                    :over calls
+                    :resolves-to member.servletrequest.getparameter
+                    :proof declared)
+                  (call-argument :over calls :formal-name "name"))
+              :transfers [
+                (transfer
+                  :from receiver
+                  :to return-value
+                  :labels [attacker-controlled]
+                  :effect propagate)])
+            (external-model
+              :id jakarta-servlet-request-parameter-call
+              :selector
+                (row-selector
+                  :output calls
+                  (bind
+                    :name calls
+                    :query
+                      (rql
+                        :schema-version 1
+                        (language java
+                          (call-bindings
+                            (call-shape
+                              (call :callee (name "getParameter") (arity 1)))))))
+                  (call
+                    :over calls
+                    :resolves-to member.37411473c8205b46f537d2dd45f5068265365b0c2ed02640496ffd7e025f18cc
+                    :proof declared)
+                  (call-argument :over calls :formal-name "name"))
+              :transfers [
+                (transfer
+                  :from receiver
+                  :to return-value
+                  :labels [attacker-controlled]
+                  :effect propagate)])
+            (external-model
+              :id jdbc-statement-execute-sql-call
+              :selector
+                (row-selector
+                  :output calls
+                  (bind
+                    :name calls
+                    :query
+                      (rql
+                        :schema-version 1
+                        (language java
+                          (call-bindings
+                            (call-shape
+                              (call :callee (name "execute") (arity 1)))))))
+                  (call
+                    :over calls
+                    :resolves-to member.statement.execute
+                    :proof declared)
+                  (call-argument :over calls :formal-name "sql"))
+              :transfers [
+                (transfer
+                  :from receiver
+                  :to receiver
+                  :labels [attacker-controlled]
+                  :effect propagate)])
+            (external-model
+              :id generated-jdbc-statement-execute-sql-call
+              :selector
+                (row-selector
+                  :output calls
+                  (bind
+                    :name calls
+                    :query
+                      (rql
+                        :schema-version 1
+                        (language java
+                          (call-bindings
+                            (call-shape
+                              (call :callee (name "execute") (arity 1)))))))
+                  (call
+                    :over calls
+                    :resolves-to member.3032e0ed03b524a17379a2e259a980dc81d1f8e4f881a88921b0434637d1f982
+                    :proof declared)
+                  (call-argument :over calls :formal-name "sql"))
+              :transfers [
+                (transfer
+                  :from receiver
+                  :to receiver
+                  :labels [attacker-controlled]
+                  :effect propagate)])]))
   :classification
     (classification
       :fallback (classification-id :taxonomy "CWE" :id "89")))

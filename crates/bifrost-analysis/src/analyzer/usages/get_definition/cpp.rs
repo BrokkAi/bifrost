@@ -659,6 +659,39 @@ pub(super) fn resolve_cpp<'a>(
         }
         OrdinaryMacroReferenceResolution::Missing => {}
     }
+    if let Some(type_node) = visibility.function_macro_type_argument(file, node, source) {
+        let support = context.bounded_support();
+        let ctx = CppLookupCtx {
+            analyzer,
+            support,
+            file,
+            visibility: visibility.as_ref(),
+            source,
+            root,
+            class_ranges: Some(class_ranges.as_ref()),
+        };
+        let type_name = cpp_node_text(type_node, source);
+        if cpp_local_bindings_before(ctx, token, type_node, node.start_byte())
+            .is_shadowed(type_name)
+        {
+            return no_definition(
+                "local_variable_reference",
+                format!("`{type_name}` is a local C value"),
+            );
+        }
+        return resolve_cpp_type(
+            analyzer,
+            token,
+            context,
+            file,
+            visibility.as_ref(),
+            source,
+            type_node,
+            Some(class_ranges.as_ref()),
+            exact_token_focus,
+            operation,
+        );
+    }
     let recovered_c_value = recovered_c_new_expression_argument_at(
         node,
         site.focus_start_byte,
@@ -897,9 +930,15 @@ pub(super) fn resolve_cpp<'a>(
                     "the C offsetof expression has no complete structured owner and member",
                 );
             }
-            if let Some(designator_owner) =
-                cpp_designated_initializer_owner(ctx.visibility, ctx.file, ctx.source, identifier)
-            {
+            let dispatch = CppDispatch::new(ctx.analyzer, ctx.visibility.token());
+            let graph = dispatch.source();
+            if let Some(designator_owner) = cpp_designated_initializer_owner(
+                &graph,
+                ctx.visibility,
+                ctx.file,
+                ctx.source,
+                identifier,
+            ) {
                 let member = cpp_node_text(identifier, ctx.source);
                 let CppDesignatedInitializerOwner::Resolved(owner) = designator_owner else {
                     return no_definition(

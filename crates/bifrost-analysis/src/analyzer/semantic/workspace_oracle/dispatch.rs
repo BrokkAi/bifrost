@@ -282,12 +282,7 @@ impl PreparedWorkspaceDispatchSession<'_> {
         call: &CallSiteHandle,
         request: &mut SemanticRequest<'_>,
     ) -> Result<Option<SemanticOutcome<DispatchResult>>, SemanticProviderError> {
-        if !matches!(
-            self.artifact.key().language(),
-            LanguageDialect::Standard(
-                Language::JavaScript | Language::TypeScript | Language::Kotlin
-            )
-        ) {
+        if !matches!(self.artifact.key().language(), LanguageDialect::Standard(_)) {
             return Ok(None);
         }
         let semantic_call = call
@@ -4297,6 +4292,223 @@ mod tests {
         assert!(session.retained_bytes() >= source.len());
     }
 
+    #[test]
+    fn go_adapter_proven_local_callback_bypasses_source_rediscovery() {
+        let source = "package sample\nfunc caller() { callback := func() {}; callback() }\n";
+        let (fixture, call) =
+            semantic_call_fixture_for_language(Language::Go, "callback.go", source);
+        let declared_target = match &call
+            .procedure()
+            .semantics()
+            .call_site(call.id())
+            .expect("call belongs to its procedure")
+            .declared_targets
+        {
+            CallableTargetResolution::Proven(CallableTarget::Local(target)) => *target,
+            other => panic!("expected one adapter-proven Go local callback, got {other:?}"),
+        };
+        let artifact = Arc::clone(call.procedure().artifact());
+        let mut session = fixture
+            .analyzer
+            .semantic_oracle_provider()
+            .prepare_call_dispatch_session(artifact);
+        let cancellation = CancellationToken::default();
+        let mut budget = SemanticBudget::default();
+        let outcome = session
+            .resolve_call(&call, &mut SemanticRequest::new(&mut budget, &cancellation))
+            .expect("adapter-proven Go callback dispatch");
+        let SemanticOutcome::Complete { value, .. } = outcome else {
+            panic!("adapter-proven Go local dispatch must be complete: {outcome:?}");
+        };
+
+        assert_eq!(value.coverage(), CandidateCoverage::Exhaustive);
+        assert_eq!(value.candidates().len(), 1);
+        assert_eq!(value.candidates()[0].target().id(), declared_target);
+        assert_eq!(value.candidates()[0].proof(), &ProofStatus::Proven);
+        assert_eq!(
+            value.candidates()[0].completeness(),
+            &EvidenceCompleteness::Complete
+        );
+        assert!(!value.candidates()[0].provenance().is_empty());
+        assert_eq!(budget.used().source_bytes, source.len());
+        assert!(session.retained_bytes() >= source.len());
+    }
+
+    #[test]
+    fn cpp_adapter_proven_local_function_pointer_bypasses_source_rediscovery() {
+        let source =
+            "void target() {}\nvoid caller() { void (*callback)() = &target; callback(); }\n";
+        let fixture = AnalyzerFixture::new_for_language(Language::Cpp, &[("callback.cpp", source)]);
+        let file = ProjectFile::new(fixture.project_root(), "callback.cpp");
+        let cancellation = CancellationToken::default();
+        let mut materialization_budget = SemanticBudget::default();
+        let artifact = fixture
+            .analyzer
+            .materialize_program_semantics(
+                &file,
+                &mut SemanticRequest::new(&mut materialization_budget, &cancellation),
+            )
+            .expect("C++ semantic materialization")
+            .available_value()
+            .cloned()
+            .expect("C++ semantic artifact");
+        let proven_calls = calls_in_source_order(&artifact)
+            .into_iter()
+            .filter(|call| {
+                matches!(
+                    call.procedure()
+                        .semantics()
+                        .call_site(call.id())
+                        .expect("call belongs to its procedure")
+                        .declared_targets,
+                    CallableTargetResolution::Proven(CallableTarget::Local(_))
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            proven_calls.len(),
+            1,
+            "the stable pointer invocation is the sole exact local call: {:#?}",
+            calls_in_source_order(&artifact)
+                .iter()
+                .map(|call| call
+                    .procedure()
+                    .semantics()
+                    .call_site(call.id())
+                    .expect("call belongs to its procedure"))
+                .collect::<Vec<_>>()
+        );
+
+        let call = &proven_calls[0];
+        let declared_target = match call
+            .procedure()
+            .semantics()
+            .call_site(call.id())
+            .expect("call belongs to its procedure")
+            .declared_targets
+        {
+            CallableTargetResolution::Proven(CallableTarget::Local(target)) => target,
+            ref other => panic!("expected one C++ local target, got {other:?}"),
+        };
+        let mut session = fixture
+            .analyzer
+            .semantic_oracle_provider()
+            .prepare_call_dispatch_session(Arc::clone(call.procedure().artifact()));
+        let mut dispatch_budget = SemanticBudget::default();
+        let outcome = session
+            .resolve_call(
+                call,
+                &mut SemanticRequest::new(&mut dispatch_budget, &cancellation),
+            )
+            .expect("adapter-proven C++ pointer dispatch");
+        let SemanticOutcome::Complete { value, .. } = outcome else {
+            panic!("adapter-proven C++ local dispatch must be complete: {outcome:?}");
+        };
+
+        assert_eq!(value.coverage(), CandidateCoverage::Exhaustive);
+        assert_eq!(value.candidates().len(), 1);
+        assert_eq!(value.candidates()[0].target().id(), declared_target);
+        assert_eq!(value.candidates()[0].proof(), &ProofStatus::Proven);
+        assert_eq!(
+            value.candidates()[0].completeness(),
+            &EvidenceCompleteness::Complete
+        );
+    }
+
+    #[test]
+    fn unsafe_cpp_function_pointer_bindings_retain_no_initializer_target() {
+        for (name, source) in [
+            (
+                "reassigned.cpp",
+                "void first() {}\nvoid second() {}\nvoid caller() { void (*callback)() = &first; callback = &second; callback(); }\n",
+            ),
+            (
+                "copied.cpp",
+                "void target() {}\nvoid caller() { void (*callback)() = &target; auto escaped = callback; callback(); }\n",
+            ),
+            (
+                "address_escaped.cpp",
+                "void target() {}\nvoid caller() { void (*callback)() = &target; auto escaped = &callback; callback(); }\n",
+            ),
+            (
+                "passed.cpp",
+                "void target() {}\nvoid consume(void (*)()) {}\nvoid caller() { void (*callback)() = &target; consume(callback); callback(); }\n",
+            ),
+            (
+                "nonempty_signature.cpp",
+                "void target(int) {}\nvoid caller() { void (*callback)(int) = &target; callback(1); }\n",
+            ),
+        ] {
+            let fixture = AnalyzerFixture::new_for_language(Language::Cpp, &[(name, source)]);
+            let file = ProjectFile::new(fixture.project_root(), name);
+            let cancellation = CancellationToken::default();
+            let mut budget = SemanticBudget::default();
+            let artifact = fixture
+                .analyzer
+                .materialize_program_semantics(
+                    &file,
+                    &mut SemanticRequest::new(&mut budget, &cancellation),
+                )
+                .expect("C++ semantic materialization")
+                .available_value()
+                .cloned()
+                .expect("C++ semantic artifact");
+
+            assert!(
+                calls_in_source_order(&artifact).into_iter().all(|call| {
+                    !matches!(
+                        call.procedure()
+                            .semantics()
+                            .call_site(call.id())
+                            .expect("call belongs to its procedure")
+                            .declared_targets,
+                        CallableTargetResolution::Proven(CallableTarget::Local(_))
+                    )
+                }),
+                "{name} must not retain an initializer target"
+            );
+        }
+    }
+
+    #[test]
+    fn ruby_adapter_proven_local_lambda_bypasses_source_rediscovery() {
+        let source = "def caller\n  local = ->(value) { value }\n  local.(1)\nend\n";
+        let (fixture, call) =
+            semantic_call_fixture_for_language(Language::Ruby, "callback.rb", source);
+        let declared_target = match call
+            .procedure()
+            .semantics()
+            .call_site(call.id())
+            .expect("call belongs to its procedure")
+            .declared_targets
+        {
+            CallableTargetResolution::Proven(CallableTarget::Local(target)) => target,
+            ref other => panic!("expected one adapter-proven Ruby lambda, got {other:?}"),
+        };
+        let artifact = Arc::clone(call.procedure().artifact());
+        let mut session = fixture
+            .analyzer
+            .semantic_oracle_provider()
+            .prepare_call_dispatch_session(artifact);
+        let cancellation = CancellationToken::default();
+        let mut budget = SemanticBudget::default();
+        let outcome = session
+            .resolve_call(&call, &mut SemanticRequest::new(&mut budget, &cancellation))
+            .expect("adapter-proven Ruby lambda dispatch");
+        let SemanticOutcome::Complete { value, .. } = outcome else {
+            panic!("adapter-proven Ruby local dispatch must be complete: {outcome:?}");
+        };
+
+        assert_eq!(value.coverage(), CandidateCoverage::Exhaustive);
+        assert_eq!(value.candidates().len(), 1);
+        assert_eq!(value.candidates()[0].target().id(), declared_target);
+        assert_eq!(value.candidates()[0].proof(), &ProofStatus::Proven);
+        assert_eq!(
+            value.candidates()[0].completeness(),
+            &EvidenceCompleteness::Complete
+        );
+    }
+
     fn assert_declared_binding_shortcut_is_skipped(language: Language, name: &str, source: &str) {
         let (fixture, call) = semantic_call_fixture_for_language(language, name, source);
         assert!(matches!(
@@ -4327,7 +4539,7 @@ mod tests {
     }
 
     #[test]
-    fn go_local_target_stays_on_source_resolver_route() {
+    fn direct_go_callable_syntax_stays_on_source_resolver_route() {
         assert_declared_binding_shortcut_is_skipped(
             Language::Go,
             "call.go",
