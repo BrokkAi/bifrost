@@ -7931,14 +7931,31 @@ fn bifrost_lsp_server_absent_document_uses_present_language_defaults() {
     }));
     let published = server.read_notification("textDocument/publishDiagnostics");
     assert_eq!(published["params"]["uri"], app_uri);
+    // As in the default-activation test above, startup may finish before this
+    // save is handled or the save may supersede it. Observe the current
+    // generation's refresh before shutdown, without treating that scheduling
+    // race as part of the absent-document default contract.
+    let activation_refresh = server.read_notification("textDocument/publishDiagnostics");
+    assert_eq!(
+        activation_refresh["params"]["uri"], app_uri,
+        "the completed present-language activation must refresh the published document: {activation_refresh}"
+    );
 
     let stderr = server.shutdown_with_stderr();
-    assert_eq!(
-        activation_count(&stderr),
-        1,
-        "an absent document must activate present-language defaults: {stderr}"
+    let activation_logs = stderr
+        .lines()
+        .filter(|line| line.contains(ACTIVATION_LOG_PREFIX))
+        .collect::<Vec<_>>();
+    assert!(
+        matches!(activation_logs.len(), 1 | 2),
+        "expected one current activation plus at most one superseded startup activation: {stderr}"
     );
-    assert!(stderr.contains("ecosystems=[Python]"), "{stderr}");
+    assert!(
+        activation_logs
+            .iter()
+            .all(|line| line.contains("ecosystems=[Python]")),
+        "every activation must use only the present Python language, not the Go dependency input: {stderr}"
+    );
 }
 
 #[test]

@@ -183,7 +183,7 @@
     },
     {
       "policy_id": "bifrost.performance.loop-invariant-sort",
-      "finding_id": "20749a5886d80d04e0974e86549a61285d00dcc059bd7a3394ffda134fc1ae0d",
+      "finding_id": "0e1006668070a67855533fc3e8fe5e2eaf220228d040699e8ed8df3661cbc67c",
       "path": "crates/bifrost-analysis/src/analyzer/reference_candidates.rs",
       "identity_stability": "strong",
       "status": "accepted",
@@ -195,7 +195,7 @@
     },
     {
       "policy_id": "bifrost.performance.loop-invariant-sort",
-      "finding_id": "ce0060428da70d65d5cc633137573837cd9a9c9eb86c5368c95cdf724bafad4b",
+      "finding_id": "e1b3283fcb632197731ec71f609cd1cde12f5af51211d4dfea9af35e3a947df3",
       "path": "crates/bifrost-analysis/src/analyzer/reference_candidates.rs",
       "identity_stability": "strong",
       "status": "accepted",
