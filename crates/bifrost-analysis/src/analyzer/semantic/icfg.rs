@@ -1324,6 +1324,7 @@ impl IcfgProvider for WorkspaceIcfgProvider<'_> {
                         origin: origin.clone(),
                         dispatch: DispatchBoundary {
                             kind: boundary_kind,
+                            external_callee_identity: None,
                             exact_external_target: None,
                             unmaterialized_external_target: None,
                             proof: candidate.proof,
@@ -1371,6 +1372,7 @@ impl IcfgProvider for WorkspaceIcfgProvider<'_> {
                         origin: origin.clone(),
                         dispatch: DispatchBoundary {
                             kind: boundary_kind,
+                            external_callee_identity: None,
                             exact_external_target: None,
                             unmaterialized_external_target: None,
                             proof: candidate.proof,
@@ -4741,6 +4743,7 @@ void raii_caller() {
             origin: other_call,
             dispatch: DispatchBoundary {
                 kind: DispatchBoundaryKind::Unresolved,
+                external_callee_identity: None,
                 exact_external_target: None,
                 unmaterialized_external_target: None,
                 proof: ProofStatus::Unproven("fabricated foreign-origin boundary".into()),

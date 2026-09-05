@@ -50,6 +50,7 @@ use std::collections::{BTreeSet, VecDeque};
 use std::sync::{Arc, OnceLock};
 
 pub(crate) use adapter::CppAdapter;
+use brokk_bifrost_cpp::adapter::parse_cpp_file_with_object_macro_fields;
 use brokk_bifrost_cpp::clones::cpp_clone_parser;
 use brokk_bifrost_cpp::compile_context::{CppCompileContext, CppCompileContexts};
 pub(crate) use brokk_bifrost_cpp::declarations::CppRecoveredExportClassIndex;
@@ -58,12 +59,15 @@ use brokk_bifrost_cpp::graph::extractor::build_source_using_index;
 use brokk_bifrost_cpp::graph::resolver::{
     CppClassDeclarationStrength, OrphanedNamespaceScopeIndex, SourceUsingIndex,
 };
+use brokk_bifrost_cpp::graph::syntax::MacroReplacementField;
 use brokk_bifrost_cpp::graph_support::CppSource;
 use brokk_bifrost_cpp::identity::{
     CppReconcileCandidates, CppReconcileGroupKey, CppReconciledDefinitionIndex,
     cpp_reconcile_candidates_from_units, cpp_reconcile_group, cpp_reconcile_group_key,
 };
-use brokk_bifrost_cpp::imports::IncludeTargetIndex;
+use brokk_bifrost_cpp::imports::{
+    IncludeTargetIndex, include_paths, resolve_include_targets_with_index,
+};
 use brokk_bifrost_cpp::test_detection::detect_cpp_test_assertion_smells;
 use cache::{
     weight_code_unit_set_by_file, weight_code_unit_vec_by_file, weight_include_reachability,
@@ -73,7 +77,8 @@ use cache::{
 use clones::build_clone_candidate_data;
 
 pub(crate) use brokk_bifrost_cpp::declarations::{
-    cpp_sentinel_recovered_classes, is_direct_recovered_exported_class_field_declaration, node_text,
+    ObjectMacroFieldEvent, collect_cpp_object_macro_field_events, cpp_sentinel_recovered_classes,
+    is_direct_recovered_exported_class_field_declaration, node_text,
 };
 use brokk_bifrost_cpp::identity::cpp_callable_unit_role;
 pub(crate) use brokk_bifrost_cpp::identity::{
@@ -81,6 +86,13 @@ pub(crate) use brokk_bifrost_cpp::identity::{
     cpp_is_range_for_binding_name, cpp_occurrence_role_for_range,
     cpp_range_is_pure_virtual_declaration,
 };
+
+#[derive(Clone)]
+struct MacroComposedField {
+    unit: CodeUnit,
+    owner: CodeUnit,
+    ranges: Vec<Range>,
+}
 pub use brokk_bifrost_cpp::identity::{
     cpp_is_constructor_or_destructor_declarator_name, cpp_is_conversion_operator_target_type,
     cpp_is_recovered_macro_character_token_type,
@@ -97,6 +109,10 @@ pub struct CppAnalyzer {
     inner: TreeSitterAnalyzer<CppAdapter>,
     memo_budget: u64,
     imported_code_units: Cache<ProjectFile, Arc<HashSet<CodeUnit>>>,
+    /// Owner-specific fields materialized from object-like macros in the
+    /// owner's include closure. This remains an analyzer overlay because the
+    /// donor macro and consuming aggregate live in different parsed blobs.
+    macro_composed_fields_by_file: Cache<ProjectFile, Arc<Vec<MacroComposedField>>>,
     referencing_files: Cache<ProjectFile, Arc<HashSet<ProjectFile>>>,
     direct_ancestors: Cache<CodeUnit, Arc<Vec<CodeUnit>>>,
     visible_type_units_by_file: Cache<ProjectFile, Arc<Vec<CodeUnit>>>,
@@ -248,6 +264,167 @@ impl ForwardQueryProvider for CppAnalyzer {
 }
 
 impl CppAnalyzer {
+    fn macro_composed_fields(&self, file: &ProjectFile) -> Arc<Vec<MacroComposedField>> {
+        self.macro_composed_fields_by_file
+            .get_with_by_ref(file, || Arc::new(self.build_macro_composed_fields(file)))
+    }
+
+    fn all_macro_composed_fields(&self) -> Vec<MacroComposedField> {
+        self.inner
+            .get_analyzed_files()
+            .into_iter()
+            .flat_map(|file| {
+                self.macro_composed_fields(&file)
+                    .as_ref()
+                    .clone()
+                    .into_iter()
+            })
+            .collect()
+    }
+
+    fn all_macro_composed_fields_while(
+        &self,
+        cancellation: &crate::CancellationToken,
+    ) -> Option<Vec<MacroComposedField>> {
+        let mut fields = Vec::new();
+        for file in self.inner.get_analyzed_files() {
+            if cancellation.is_cancelled() {
+                return None;
+            }
+            fields.extend(self.macro_composed_fields(&file).iter().cloned());
+        }
+        Some(fields)
+    }
+
+    fn build_macro_composed_fields(&self, owner_file: &ProjectFile) -> Vec<MacroComposedField> {
+        let scope = AnalyzerQueryScope::new(self);
+        let token = scope.token();
+        let include_target_index = self.include_target_index();
+        let mut visited = HashSet::default();
+        let mut queue = VecDeque::from([owner_file.clone()]);
+        let mut macro_fields = HashMap::<String, Vec<MacroReplacementField>>::default();
+        let mut blocked = HashSet::default();
+        while let Some(file) = queue.pop_front() {
+            if self
+                .inner
+                .active_query_cancellation()
+                .is_some_and(|cancellation| cancellation.is_cancelled())
+            {
+                return Vec::new();
+            }
+            if !visited.insert(file.clone()) {
+                continue;
+            }
+            let imports = self.import_statements_from_projection(token, &file);
+            for include in include_paths(&imports) {
+                for target in
+                    resolve_include_targets_with_index(&file, &include, include_target_index)
+                {
+                    if target != *owner_file {
+                        queue.push_back(target);
+                    }
+                }
+            }
+            if file == *owner_file {
+                continue;
+            }
+            let Some(prepared) = self.prepared_syntax(token, &file) else {
+                continue;
+            };
+            for event in collect_cpp_object_macro_field_events(
+                prepared.tree().root_node(),
+                prepared.source(),
+            ) {
+                if self
+                    .inner
+                    .active_query_cancellation()
+                    .is_some_and(|cancellation| cancellation.is_cancelled())
+                {
+                    return Vec::new();
+                }
+                match event {
+                    ObjectMacroFieldEvent::Define { name, fields, .. } => {
+                        if fields.is_empty() {
+                            macro_fields.remove(&name);
+                            blocked.insert(name);
+                            continue;
+                        }
+                        if blocked.contains(&name) {
+                            continue;
+                        }
+                        if let Some(previous) = macro_fields.get(&name) {
+                            if previous != &fields {
+                                macro_fields.remove(&name);
+                                blocked.insert(name);
+                            }
+                        } else {
+                            macro_fields.insert(name, fields);
+                        }
+                    }
+                    ObjectMacroFieldEvent::Undef { name, .. } => {
+                        // Include traversal order can differ from preprocessor
+                        // execution order. Permanently blocking an undefined
+                        // name is conservative and prevents a stale donor
+                        // definition from crossing an undef.
+                        macro_fields.remove(&name);
+                        blocked.insert(name);
+                    }
+                }
+            }
+        }
+        if macro_fields.is_empty() {
+            return Vec::new();
+        }
+        let Some(prepared) = self.prepared_syntax(token, owner_file) else {
+            return Vec::new();
+        };
+        let parsed = parse_cpp_file_with_object_macro_fields(
+            owner_file,
+            prepared.source(),
+            prepared.tree(),
+            macro_fields,
+        );
+        let owners = self
+            .inner
+            .declarations(owner_file)
+            .into_iter()
+            .filter(|unit| unit.is_class())
+            .collect::<Vec<_>>();
+        parsed
+            .declarations()
+            .iter()
+            .filter(|unit| unit.is_field() && unit.is_synthetic())
+            .filter_map(|unit| {
+                let owner_fq = unit.fq().parent()?;
+                let owner = owners.iter().find(|owner| owner.fq() == &owner_fq)?.clone();
+                let ranges = parsed.declaration_ranges(unit).to_vec();
+                Some(MacroComposedField {
+                    unit: unit.clone(),
+                    owner,
+                    ranges,
+                })
+            })
+            .collect()
+    }
+
+    fn macro_composed_fields_for_owner(&self, owner: &CodeUnit) -> Vec<CodeUnit> {
+        self.macro_composed_fields(owner.source())
+            .iter()
+            .filter(|field| field.owner == *owner)
+            .map(|field| field.unit.clone())
+            .collect()
+    }
+
+    fn generated_field_owner(&self, field: &CodeUnit) -> Option<CodeUnit> {
+        if !field.is_field() || !field.is_synthetic() {
+            return None;
+        }
+        self.all_macro_composed_fields()
+            .iter()
+            .find(|candidate| candidate.unit == *field)
+            .map(|candidate| candidate.owner.clone())
+    }
+
     pub(crate) fn reconciled_provisional(&self, unit: &CodeUnit) -> Option<CodeUnit> {
         self.reconciled_definitions(&unit.fq_name())
             .provisional_of
@@ -293,6 +470,10 @@ impl CppAnalyzer {
             imported_code_units: build_weighted_cache(
                 memo_budget / 4,
                 weight_code_unit_set_by_file,
+            ),
+            macro_composed_fields_by_file: build_weighted_cache(
+                memo_budget / 8,
+                cache::weight_macro_composed_field_vec_by_file,
             ),
             referencing_files: build_weighted_cache(memo_budget / 8, weight_project_file_set),
             direct_ancestors: build_weighted_cache(memo_budget / 8, weight_code_unit_vec_by_unit),
@@ -488,6 +669,10 @@ impl CppAnalyzer {
             imported_code_units: build_weighted_cache(
                 self.memo_budget / 4,
                 weight_code_unit_set_by_file,
+            ),
+            macro_composed_fields_by_file: build_weighted_cache(
+                self.memo_budget / 8,
+                cache::weight_macro_composed_field_vec_by_file,
             ),
             referencing_files: build_weighted_cache(self.memo_budget / 8, weight_project_file_set),
             direct_ancestors: build_weighted_cache(
@@ -796,6 +981,7 @@ impl CppAnalyzer {
             // #1970: a unit only the C reading of a header mints has no `cpp`
             // rows, so its owner edge lives in that reading.
             .or_else(|| self.c_reading_parent(token, code_unit))
+            .or_else(|| self.generated_field_owner(code_unit))
     }
 
     pub(crate) fn template_metadata(
@@ -1014,7 +1200,14 @@ impl CppSource for CppAnalyzer {
     }
 
     fn visibility_identifier_candidates(&self, identifier: &str) -> BTreeSet<CodeUnit> {
-        self.inner.lookup_candidates_by_identifier(identifier)
+        let mut candidates = self.inner.lookup_candidates_by_identifier(identifier);
+        candidates.extend(
+            self.all_macro_composed_fields()
+                .iter()
+                .filter(|field| field.unit.identifier() == identifier)
+                .map(|field| field.unit.clone()),
+        );
+        candidates
     }
 
     fn stored_callable_unit_role(&self, callable: &CodeUnit) -> CppCallableUnitRole {
@@ -1318,15 +1511,38 @@ impl CodeUnitIndex for CppAnalyzer {
     /// reading under `cpp:c`, so the generic declaration scan returns both
     /// identities of one declaration site without a Rust-side workspace map.
     fn all_declarations(&self) -> Box<dyn Iterator<Item = CodeUnit> + '_> {
-        self.inner.all_declarations()
+        let mut declarations = self.inner.all_declarations().collect::<Vec<_>>();
+        declarations.extend(
+            self.all_macro_composed_fields()
+                .iter()
+                .map(|field| field.unit.clone()),
+        );
+        declarations.sort();
+        declarations.dedup();
+        Box::new(declarations.into_iter())
     }
 
     fn declarations_sharing_name(&self, unit: &CodeUnit) -> Vec<CodeUnit> {
-        self.inner.declarations_sharing_name(unit)
+        let mut declarations = self.inner.declarations_sharing_name(unit);
+        declarations.extend(
+            self.all_macro_composed_fields()
+                .iter()
+                .filter(|field| field.unit.identifier() == unit.identifier())
+                .map(|field| field.unit.clone()),
+        );
+        declarations.sort();
+        declarations.dedup();
+        declarations
     }
 
     fn declarations(&self, file: &ProjectFile) -> BTreeSet<CodeUnit> {
-        self.inner.declarations(file)
+        let mut declarations = self.inner.declarations(file);
+        declarations.extend(
+            self.macro_composed_fields(file)
+                .iter()
+                .map(|field| field.unit.clone()),
+        );
+        declarations
     }
 
     fn materialization_records(
@@ -1338,10 +1554,16 @@ impl CodeUnitIndex for CppAnalyzer {
 
     fn definitions(&self, fq_name: &str) -> Box<dyn Iterator<Item = CodeUnit> + '_> {
         let _scope = crate::profiling::scope(format!("cpp.definitions[{fq_name}]"));
-        Box::new(
-            self.relational_definitions_for_rendered_name(fq_name)
-                .into_iter(),
-        )
+        let mut definitions = self.relational_definitions_for_rendered_name(fq_name);
+        definitions.extend(
+            self.all_macro_composed_fields()
+                .iter()
+                .filter(|field| field.unit.fq_name() == fq_name)
+                .map(|field| field.unit.clone()),
+        );
+        definitions.sort();
+        definitions.dedup();
+        Box::new(definitions.into_iter())
     }
 
     fn definitions_by_structured_name(
@@ -1350,16 +1572,29 @@ impl CodeUnitIndex for CppAnalyzer {
         language: Language,
     ) -> Vec<CodeUnit> {
         debug_assert_eq!(language, Language::Cpp);
-        self.relational_definition_values(
+        let mut definitions = self.relational_definition_values(
             brokk_bifrost_core::analyzer::RelationalName::stable(fq_name.clone()),
             crate::analyzer::RelationalDefinitionQuery::ExactName,
-        )
+        );
+        definitions.extend(
+            self.all_macro_composed_fields()
+                .iter()
+                .filter(|field| field.unit.fq() == fq_name)
+                .map(|field| field.unit.clone()),
+        );
+        definitions.sort();
+        definitions.dedup();
+        definitions
     }
 
     fn direct_children(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
         let scope = AnalyzerQueryScope::new(self);
         let token = scope.token();
         let children = self.inner.direct_children(code_unit);
+        let mut children = children;
+        children.extend(self.macro_composed_fields_for_owner(code_unit));
+        children.sort();
+        children.dedup();
         if !children.is_empty() {
             return children;
         }
@@ -1375,6 +1610,13 @@ impl CodeUnitIndex for CppAnalyzer {
         let ranges = self.inner.ranges(code_unit);
         if !ranges.is_empty() {
             return ranges;
+        }
+        if let Some(generated) = self
+            .all_macro_composed_fields()
+            .iter()
+            .find(|candidate| candidate.unit == *code_unit)
+        {
+            return generated.ranges.clone();
         }
         // #1134: a re-keyed reconciled definition (canonical identity, real
         // `.cpp` source) is not itself in the store; its ranges live under the
@@ -1396,12 +1638,33 @@ impl CodeUnitIndex for CppAnalyzer {
         max_ranges: usize,
         cancellation: &crate::CancellationToken,
     ) -> (Vec<crate::analyzer::Range>, usize, bool) {
+        if let Some(field) = self
+            .all_macro_composed_fields()
+            .iter()
+            .find(|candidate| candidate.unit == *code_unit)
+        {
+            let total = field.ranges.len();
+            let returned = field.ranges.iter().take(max_ranges).cloned().collect();
+            return (
+                returned,
+                total,
+                total <= max_ranges && !cancellation.is_cancelled(),
+            );
+        }
         self.inner
             .ranges_with_limit(code_unit, max_ranges, cancellation)
     }
 
     fn signatures(&self, code_unit: &CodeUnit) -> Vec<String> {
-        self.inner.signatures(code_unit)
+        let signatures = self.inner.signatures(code_unit);
+        if !signatures.is_empty() {
+            return signatures;
+        }
+        code_unit
+            .signature()
+            .map(str::to_string)
+            .into_iter()
+            .collect()
     }
 
     fn signature_metadata(&self, code_unit: &CodeUnit) -> Vec<SignatureMetadata> {
@@ -1441,11 +1704,11 @@ impl CodeUnitIndex for CppAnalyzer {
     /// See [`CodeUnitIndex::all_declarations`] above: both identities of a
     /// C-attributed header's declaration site are listed (#1970).
     fn get_all_declarations(&self) -> Vec<CodeUnit> {
-        self.inner.get_all_declarations()
+        self.all_declarations().collect()
     }
 
     fn get_definitions(&self, fq_name: &str) -> Vec<CodeUnit> {
-        self.relational_definitions_for_rendered_name(fq_name)
+        self.definitions(fq_name).collect()
     }
 
     fn get_skeleton(&self, code_unit: &CodeUnit) -> Option<String> {
@@ -1457,15 +1720,36 @@ impl CodeUnitIndex for CppAnalyzer {
     }
 
     fn get_source(&self, code_unit: &CodeUnit, include_comments: bool) -> Option<String> {
+        if let Some(field) = self
+            .all_macro_composed_fields()
+            .iter()
+            .find(|candidate| candidate.unit == *code_unit)
+        {
+            let source = self.inner.file_source(code_unit.source())?;
+            let range = field.ranges.first()?;
+            return source
+                .get(range.start_byte..range.end_byte)
+                .map(str::to_string);
+        }
         self.inner.get_source(code_unit, include_comments)
     }
 
     fn get_sources(&self, code_unit: &CodeUnit, include_comments: bool) -> BTreeSet<String> {
+        if let Some(source) = self.get_source(code_unit, include_comments) {
+            return std::iter::once(source).collect();
+        }
         self.inner.get_sources(code_unit, include_comments)
     }
 
     fn search_definitions(&self, pattern: &str, auto_quote: bool) -> BTreeSet<CodeUnit> {
-        self.inner.search_definitions(pattern, auto_quote)
+        let mut definitions = self.inner.search_definitions(pattern, auto_quote);
+        definitions.extend(
+            self.all_macro_composed_fields()
+                .iter()
+                .filter(|field| field.unit.fq_name() == pattern)
+                .map(|field| field.unit.clone()),
+        );
+        definitions
     }
 
     fn search_definitions_by_suffix_pattern(
@@ -1474,12 +1758,34 @@ impl CodeUnitIndex for CppAnalyzer {
         terminal_identifiers: &[String],
         language: Language,
     ) -> BTreeSet<CodeUnit> {
-        self.inner
-            .search_definitions_by_suffix_pattern(pattern, terminal_identifiers, language)
+        let mut definitions = self.inner.search_definitions_by_suffix_pattern(
+            pattern,
+            terminal_identifiers,
+            language,
+        );
+        definitions.extend(
+            self.all_macro_composed_fields()
+                .iter()
+                .filter(|field| {
+                    terminal_identifiers
+                        .iter()
+                        .any(|identifier| field.unit.identifier() == identifier)
+                        && field.unit.fq_name().ends_with(pattern)
+                })
+                .map(|field| field.unit.clone()),
+        );
+        definitions
     }
 
     fn lookup_candidates_by_short_name(&self, symbol: &str) -> BTreeSet<CodeUnit> {
-        self.inner.lookup_candidates_by_short_name(symbol)
+        let mut candidates = self.inner.lookup_candidates_by_short_name(symbol);
+        candidates.extend(
+            self.all_macro_composed_fields()
+                .iter()
+                .filter(|field| field.unit.short_name() == symbol || field.unit.fq_name() == symbol)
+                .map(|field| field.unit.clone()),
+        );
+        candidates
     }
 
     fn has_complete_symbol_lookup_index(&self) -> bool {
@@ -1557,6 +1863,60 @@ impl IAnalyzer for CppAnalyzer {
                         .filter(|unit| self.inner.unit_matches_relational_request(unit, request))
                         .collect::<Vec<_>>();
                     units.extend(additions);
+                    let requested_name = request
+                        .name
+                        .full_name()
+                        .display(crate::analyzer::fq_name::segment_interner());
+                    let requested_identifier = request
+                        .name
+                        .full_name()
+                        .last()
+                        .map(|segment| {
+                            crate::analyzer::fq_name::segment_interner()
+                                .resolve(segment)
+                                .0
+                        })
+                        .unwrap_or_default();
+                    let Some(macro_composed_fields) =
+                        self.all_macro_composed_fields_while(cancellation)
+                    else {
+                        return crate::analyzer::RelationalBatchOutcome::Cancelled;
+                    };
+                    units.extend(
+                        macro_composed_fields
+                            .iter()
+                            .filter(|field| match &request.query {
+                                crate::analyzer::RelationalDefinitionQuery::ExactName
+                                | crate::analyzer::RelationalDefinitionQuery::NormalizedName => {
+                                    field.unit.fq_name() == requested_name
+                                }
+                                crate::analyzer::RelationalDefinitionQuery::StructuralChildren => {
+                                    field.owner.fq_name() == requested_name
+                                }
+                                crate::analyzer::RelationalDefinitionQuery::StructuralMembers {
+                                    identifier,
+                                }
+                                | crate::analyzer::RelationalDefinitionQuery::VisibleMembers {
+                                    identifier,
+                                } => {
+                                    field.owner.fq_name() == requested_name
+                                        && field.unit.identifier() == identifier
+                                }
+                                crate::analyzer::RelationalDefinitionQuery::Identifier { file }
+                                | crate::analyzer::RelationalDefinitionQuery::IdentifierPrefix {
+                                    file,
+                                } => {
+                                    field.unit.identifier() == requested_identifier
+                                        && file
+                                            .as_ref()
+                                            .is_none_or(|file| field.unit.source() == file)
+                                }
+                                _ => false,
+                            })
+                            .map(|field| field.unit.clone()),
+                    );
+                    units.sort();
+                    units.dedup();
                 }
                 crate::analyzer::RelationalDefinitionValue::CallableFacts(facts) => {
                     let mut declaration_names = facts

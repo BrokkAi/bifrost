@@ -1,3 +1,4 @@
+use crate::declarations::node_text;
 use crate::graph::resolver::{
     cpp_name_component_nodes, cpp_type_name_components, is_globally_qualified_cpp_name,
     is_nested_type_node, qualified_owner_components,
@@ -10,6 +11,139 @@ pub struct MacroReplacementTypeReference {
     pub components: Vec<String>,
     pub component_ranges: Vec<Range<usize>>,
     pub global: bool,
+}
+
+/// One direct field declaration recovered from an object-like macro
+/// replacement. The replacement is parsed as the body of a synthetic struct,
+/// so the name and declaration text come from C/C++ grammar nodes rather than
+/// from a textual macro expansion.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MacroReplacementField {
+    pub name: String,
+    pub declaration: String,
+}
+
+/// Recover direct fields hidden in an object-like macro replacement.
+///
+/// A field-list macro is valid in more than one owner, so this helper returns
+/// only the declaration-shaped children of the synthetic field list. Nested
+/// aggregate promotion remains the owner's normal structured aggregate logic;
+/// treating nested members as direct fields here would leak them across owners.
+pub fn object_macro_replacement_fields(replacement: &str) -> Vec<MacroReplacementField> {
+    if replacement.trim().is_empty() {
+        return Vec::new();
+    }
+    let normalized_replacement = normalize_macro_continuations(replacement);
+    const PREFIX: &str = "struct __bifrost_macro_fields { ";
+    let synthetic = format!("{PREFIX}{normalized_replacement} }};");
+    let mut parser = Parser::new();
+    if parser
+        .set_language(&tree_sitter_cpp::LANGUAGE.into())
+        .is_err()
+    {
+        return Vec::new();
+    }
+    let Some(tree) = parser.parse(&synthetic, None) else {
+        return Vec::new();
+    };
+    if tree.root_node().has_error() {
+        return Vec::new();
+    }
+    let mut stack = vec![tree.root_node()];
+    let body = loop {
+        let Some(current) = stack.pop() else {
+            return Vec::new();
+        };
+        if current.kind() == "struct_specifier"
+            && let Some(body) = current.child_by_field_name("body")
+        {
+            break body;
+        }
+        let mut cursor = current.walk();
+        for child in current.named_children(&mut cursor) {
+            stack.push(child);
+        }
+    };
+    let mut fields = Vec::new();
+    let mut cursor = body.walk();
+    for declaration in body.named_children(&mut cursor) {
+        if !matches!(declaration.kind(), "declaration" | "field_declaration") {
+            continue;
+        }
+        let Some(declarator) = declaration
+            .child_by_field_name("declarator")
+            .or_else(|| declaration.named_child(1))
+        else {
+            continue;
+        };
+        let Some(name) = macro_replacement_declarator_name(declarator, &synthetic) else {
+            continue;
+        };
+        let Some(declaration_text) =
+            declaration_text_without_synthetic_prefix(declaration, replacement, PREFIX.len())
+        else {
+            continue;
+        };
+        fields.push(MacroReplacementField {
+            name,
+            declaration: declaration_text,
+        });
+    }
+    fields
+}
+
+/// Keep preprocessor line continuations as byte-preserving whitespace before
+/// reparsing an opaque replacement. The parser's replacement node includes
+/// the backslash/newline pair, while C's preprocessing phase treats it as one
+/// logical line. Replacing both bytes (and CRLF's three bytes) keeps every
+/// tree-sitter byte range mapped directly to the original replacement.
+fn normalize_macro_continuations(replacement: &str) -> String {
+    let source = replacement.as_bytes();
+    let mut normalized = source.to_vec();
+    let mut index = 0;
+    while index + 1 < source.len() {
+        if source[index] == b'\\' && source[index + 1] == b'\n' {
+            normalized[index] = b' ';
+            normalized[index + 1] = b' ';
+            index += 2;
+        } else if index + 2 < source.len()
+            && source[index] == b'\\'
+            && source[index + 1] == b'\r'
+            && source[index + 2] == b'\n'
+        {
+            normalized[index] = b' ';
+            normalized[index + 1] = b' ';
+            normalized[index + 2] = b' ';
+            index += 3;
+        } else {
+            index += 1;
+        }
+    }
+    String::from_utf8(normalized).expect("source text must remain valid UTF-8")
+}
+
+fn macro_replacement_declarator_name(node: Node<'_>, source: &str) -> Option<String> {
+    match node.kind() {
+        "identifier" | "field_identifier" | "type_identifier" | "qualified_identifier" => {
+            let name = node_text(node, source).trim();
+            (!name.is_empty()).then(|| name.to_string())
+        }
+        "function_declarator" => None,
+        _ => node
+            .child_by_field_name("declarator")
+            .or_else(|| node.child_by_field_name("name"))
+            .and_then(|child| macro_replacement_declarator_name(child, source)),
+    }
+}
+
+fn declaration_text_without_synthetic_prefix(
+    node: Node<'_>,
+    source: &str,
+    prefix_len: usize,
+) -> Option<String> {
+    let start = node.start_byte().checked_sub(prefix_len)?;
+    let end = node.end_byte().checked_sub(prefix_len)?;
+    (end <= source.len()).then(|| source[start..end].to_string())
 }
 
 /// Recover type-bearing syntax hidden inside an object-like macro replacement.
@@ -244,6 +378,29 @@ mod tests {
             .map(|range| &source[range.clone()])
             .collect::<Vec<_>>();
         assert_eq!(rendered, ["api", "SettingsImpl"]);
+    }
+
+    #[test]
+    fn object_macro_replacement_fields_are_structured_and_direct_only() {
+        let fields = object_macro_replacement_fields(
+            r#"int public_value; \
+             union { int nested_value; }; \
+             unsigned private_value;"#,
+        );
+        assert_eq!(
+            fields,
+            vec![
+                MacroReplacementField {
+                    name: "public_value".to_string(),
+                    declaration: "int public_value;".to_string(),
+                },
+                MacroReplacementField {
+                    name: "private_value".to_string(),
+                    declaration: "unsigned private_value;".to_string(),
+                },
+            ]
+        );
+        assert!(object_macro_replacement_fields("not a declaration").is_empty());
     }
 
     #[test]

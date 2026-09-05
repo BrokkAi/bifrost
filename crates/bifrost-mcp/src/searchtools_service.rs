@@ -6236,6 +6236,57 @@ mod watcher_startup_tests {
         assert_eq!(observed.len(), 1);
     }
 
+    /// #2923: naming a pack and one policy id must evaluate that one policy.
+    /// The selectors intersect, so the report carries a single run instead of
+    /// the whole pack's runs filtered afterwards.
+    #[test]
+    fn issue_2923_a_pack_and_an_id_evaluate_only_that_policy() {
+        let (_temp, root) = workspace("Observed.js", "eval(userInput);\n");
+        let service = SearchToolsService::new_manual_ephemeral(root).expect("manual service");
+
+        let ToolOutput::Structured { structured, .. } = service
+            .call_tool_output(
+                "run_policy",
+                json!({
+                    "policy_packs": ["bifrost.code-smells"],
+                    "policy_ids": ["bifrost.correctness.dynamic-evaluation"],
+                    "evaluation_date": "2026-09-03",
+                    "fail_on": "never"
+                }),
+                RenderOptions::default(),
+            )
+            .expect("run_policy should evaluate the narrowed selection")
+        else {
+            panic!("run_policy must return structured output");
+        };
+        let evaluated = structured["report"]["runs"]
+            .as_array()
+            .expect("policy runs")
+            .iter()
+            .map(|run| run["policy_id"].as_str().expect("policy id"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            evaluated,
+            vec!["bifrost.correctness.dynamic-evaluation"],
+            "{structured:#}"
+        );
+
+        let error = service
+            .call_tool_output(
+                "run_policy",
+                json!({
+                    "policy_packs": ["bifrost.security"],
+                    "policy_ids": ["bifrost.correctness.dynamic-evaluation"],
+                    "evaluation_date": "2026-09-03",
+                    "fail_on": "never"
+                }),
+                RenderOptions::default(),
+            )
+            .expect_err("an id outside the named pack selects nothing to run");
+        assert_eq!(error.code, SearchToolsServiceErrorCode::InvalidParams);
+        assert!(error.message.contains("matches no policy"), "{error:?}");
+    }
+
     #[test]
     fn issue_1296_run_policy_snapshot_deadline_returns_canonical_report() {
         let (_temp, root) = workspace("DeferredPolicy.java", "class DeferredPolicy {}\n");
@@ -6667,10 +6718,17 @@ mod watcher_startup_tests {
                 first_started_tx
                     .send(())
                     .expect("test should observe the first build");
+                // Unbounded on purpose: the release only arrives after the test
+                // body binds the second workspace, runs `ensure_ready()` (a
+                // Java fixture build), and issues a `list_symbols` query, none
+                // of which is wall-clock-bounded. A fixed timeout here raced
+                // that work under load. If an assertion panics first,
+                // `release_first_tx` is dropped, `recv()` returns `Err`, and
+                // this `expect` fails the closure instead of hanging forever.
                 release_first_rx
                     .lock()
                     .expect("release lock")
-                    .recv_timeout(Duration::from_secs(5))
+                    .recv()
                     .expect("test should release the first build");
                 let watcher = ProjectChangeWatcher::start_polling_with_claimed_files_for_tests(
                     project,

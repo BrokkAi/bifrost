@@ -9,7 +9,8 @@ use crate::declarations::{
     cpp_callable_identity_suffix, cpp_comparable_parameter_shapes, cpp_declarator_adds_indirection,
     cpp_displaced_preprocessor_boundary, cpp_export_macro_token, cpp_field_declaration_linkage,
     cpp_function_declarator_at, cpp_template_term, node_text, normalize_cpp_whitespace,
-    recovered_class_body_at,
+    recovered_class_body_at, recovered_function_like_field_declarator,
+    recovered_pyobject_head_field,
 };
 use crate::graph::CppGraphSource;
 use crate::graph::extractor::ScanCtx;
@@ -673,10 +674,11 @@ struct MacroEnvironmentCheckpoint {
 /// The replay checkpoints for one file's macro events, ascending by frontier
 /// and always starting at frontier zero (the compile-proven defines alone).
 ///
-/// A checkpoint lands every [`MACRO_ENVIRONMENT_CHECKPOINT_STRIDE`] events and
-/// directly after every `#include` event, because applying an include event
-/// replays the included file's complete event list: keeping one there is what
-/// holds that unbounded cost out of every later replay window.
+/// Checkpoints use an adaptive stride no greater than
+/// [`MACRO_ENVIRONMENT_CHECKPOINT_STRIDE`], and one lands directly after every
+/// `#include` event. Applying an include event replays the included file's
+/// complete event list, so keeping one there holds that unbounded cost out of
+/// every later replay window.
 struct MacroEnvironmentCheckpoints {
     checkpoints: Vec<MacroEnvironmentCheckpoint>,
 }
@@ -932,6 +934,8 @@ pub struct VisibilityIndex<'a> {
     indexed_structural_class_scopes: Mutex<IndexedStructuralClassScopeCache>,
     indexed_enclosing_owner_scopes: Mutex<IndexedEnclosingOwnerScopeCache>,
     precise_parent_cache: Mutex<HashMap<CodeUnit, Option<CodeUnit>>>,
+    c_tag_kind_cache: Mutex<HashMap<CodeUnit, Option<CppCTagKind>>>,
+    c_tag_complete_definition_cache: Mutex<HashMap<CodeUnit, Option<CodeUnit>>>,
     macro_event_cells: Mutex<HashMap<ProjectFile, MacroEventCell>>,
     pub macro_include_protection_cells: Mutex<HashMap<ProjectFile, MacroIncludeProtectionCell>>,
     // The environment at selected event prefixes of each file, built once and read by every
@@ -1300,11 +1304,99 @@ struct MacroLocalBindingTemplate {
 /// `type_node` points into the invocation syntax when the replacement's type
 /// is one of the macro parameters. Consumers can therefore use their normal
 /// lexical type resolver without parsing replacement text themselves.
+/// `proven_unit` carries a structured C-tag resolution when the grammar splits
+/// an explicit `struct` or `union` argument across recovery nodes.
 pub struct MacroLocalBinding<'tree> {
     pub name: String,
     pub type_name: String,
     pub type_node: Option<Node<'tree>>,
     pub pointer_depth: i32,
+    pub proven_unit: Option<CodeUnit>,
+}
+
+fn macro_replacement_type_parameter(
+    body: &ParsedReplacementBody,
+    parameters: &[String],
+) -> Option<usize> {
+    let mut found = None;
+    let mut stack = vec![body.tree.root_node()];
+    while let Some(node) = stack.pop() {
+        let type_position = node.kind() == "type_identifier"
+            || (node.kind() == "identifier"
+                && node.parent().is_some_and(|parent| {
+                    parent.kind() == "type_descriptor"
+                        && parent.child_by_field_name("type") == Some(node)
+                }));
+        let offsetof_type_position = node.kind() == "identifier"
+            && node
+                .parent()
+                .filter(|parent| parent.kind() == "argument_list")
+                .and_then(|arguments| arguments.parent())
+                .is_some_and(|call| {
+                    call.kind() == "call_expression"
+                        && call
+                            .child_by_field_name("function")
+                            .is_some_and(|function| {
+                                function.kind() == "identifier"
+                                    && node_text(function, &body.source) == "offsetof"
+                            })
+                        && call
+                            .child_by_field_name("arguments")
+                            .is_some_and(|arguments| {
+                                argument_children(arguments).next() == Some(node)
+                            })
+                });
+        if (type_position || offsetof_type_position)
+            && let Some(index) = parameters
+                .iter()
+                .position(|parameter| parameter == node_text(node, &body.source))
+        {
+            if found.is_some_and(|existing| existing != index) {
+                return None;
+            }
+            found = Some(index);
+        }
+        for index in (0..node.named_child_count()).rev() {
+            if let Some(child) = node.named_child(index) {
+                stack.push(child);
+            }
+        }
+    }
+    found
+}
+
+fn macro_type_argument_node<'tree>(node: Node<'tree>, source: &str) -> Option<Node<'tree>> {
+    match node.kind() {
+        "type_descriptor" => {
+            let type_child = node
+                .child_by_field_name("type")
+                .or_else(|| first_type_child(node))?;
+            for index in (0..node.named_child_count()).rev() {
+                let child = node.named_child(index)?;
+                if child != type_child
+                    && matches!(
+                        child.kind(),
+                        "identifier"
+                            | "type_identifier"
+                            | "qualified_identifier"
+                            | "scoped_type_identifier"
+                    )
+                {
+                    return Some(child);
+                }
+            }
+            macro_type_argument_node(type_child, source)
+        }
+        "class_specifier" | "struct_specifier" | "union_specifier" | "enum_specifier" => {
+            node.child_by_field_name("name")
+        }
+        "identifier" if matches!(node_text(node, source), "struct" | "union") => node
+            .next_named_sibling()
+            .filter(|sibling| sibling.is_error() && sibling.named_child_count() == 1)
+            .and_then(|error| error.named_child(0))
+            .filter(|name| matches!(name.kind(), "identifier" | "type_identifier")),
+        _ => cpp_name_component_nodes(node).is_some().then_some(node),
+    }
 }
 
 /// Recover GLib's `g_autoptr(T) name = value` declaration from the CST shape
@@ -1365,6 +1457,7 @@ fn recognized_c_macro_declarator_binding<'tree>(
         type_name: type_name.to_string(),
         type_node: Some(type_node),
         pointer_depth: 1,
+        proven_unit: None,
     })
 }
 
@@ -1602,6 +1695,8 @@ impl<'a> VisibilityIndex<'a> {
             indexed_structural_class_scopes: Mutex::new(HashMap::default()),
             indexed_enclosing_owner_scopes: Mutex::new(HashMap::default()),
             precise_parent_cache: Mutex::new(HashMap::default()),
+            c_tag_kind_cache: Mutex::new(HashMap::default()),
+            c_tag_complete_definition_cache: Mutex::new(HashMap::default()),
             macro_event_cells: Mutex::new(HashMap::default()),
             macro_include_protection_cells: Mutex::new(HashMap::default()),
             macro_environment_checkpoints: Mutex::new(HashMap::default()),
@@ -1868,6 +1963,8 @@ impl<'a> VisibilityIndex<'a> {
             indexed_structural_class_scopes: Mutex::new(HashMap::default()),
             indexed_enclosing_owner_scopes: Mutex::new(HashMap::default()),
             precise_parent_cache: Mutex::new(HashMap::default()),
+            c_tag_kind_cache: Mutex::new(HashMap::default()),
+            c_tag_complete_definition_cache: Mutex::new(HashMap::default()),
             macro_event_cells: Mutex::new(HashMap::default()),
             macro_include_protection_cells: Mutex::new(HashMap::default()),
             macro_environment_checkpoints: Mutex::new(HashMap::default()),
@@ -1950,7 +2047,14 @@ impl<'a> VisibilityIndex<'a> {
         };
         let recovered_c_keyword_arguments =
             recovered_c_keyword_argument_count(file, call, arguments, source);
-        let arguments = argument_children(arguments).collect::<Vec<_>>();
+        let c_semantics = reference_uses_c_semantics(self.cpp, file);
+        let arguments = argument_children(arguments)
+            .flat_map(|argument| {
+                recovered_c_new_expression_arguments(argument, c_semantics)
+                    .map(Vec::from)
+                    .unwrap_or_else(|| vec![argument])
+            })
+            .collect::<Vec<_>>();
         if arguments
             .iter()
             .all(|argument| !argument_shape_may_change_arity(*argument))
@@ -2217,6 +2321,99 @@ impl<'a> VisibilityIndex<'a> {
             type_name,
             type_node,
             pointer_depth: template.pointer_depth,
+            proven_unit: None,
+        })
+    }
+
+    /// Recover the typed receiver established by a C container macro
+    /// assignment, such as `value = container_of(ptr, struct item, link)`.
+    ///
+    /// The macro definition's parsed replacement identifies the one formal
+    /// parameter used in type position.  The invocation supplies the actual
+    /// type node, which is then resolved through the ordinary visibility
+    /// index.  Calls with no unique type-position parameter, an unresolved
+    /// type, or an uncertain macro environment remain unproven.
+    pub fn function_macro_container_binding<'tree>(
+        &self,
+        analyzer: &CppGraphSource<'_>,
+        file: &ProjectFile,
+        assignment: Node<'tree>,
+        source: &str,
+    ) -> Option<MacroLocalBinding<'tree>> {
+        if !is_c_source_file(file) || assignment.kind() != "assignment_expression" {
+            return None;
+        }
+        let name_node = assignment.child_by_field_name("left")?;
+        if name_node.kind() != "identifier" {
+            return None;
+        }
+        let call = assignment.child_by_field_name("right")?;
+        if call.kind() != "call_expression" {
+            return None;
+        }
+        let function = call.child_by_field_name("function")?;
+        if function.kind() != "identifier" {
+            return None;
+        }
+        let arguments = call.child_by_field_name("arguments")?;
+        let actuals = argument_children(arguments).collect::<Vec<_>>();
+        let function_name = node_text(function, source);
+        let environment = self.macro_environment(file, call.start_byte());
+        let binding = environment.binding(function_name)?;
+        if !binding.is_exact() {
+            return None;
+        }
+        let MacroDefinition::Function {
+            parameters,
+            replacement,
+        } = &binding.definition
+        else {
+            return None;
+        };
+        if actuals.len() != parameters.len() {
+            return None;
+        }
+        let body = self.parsed_macro_replacement_body(
+            &(binding.source.clone(), binding.declaration_byte),
+            parameters,
+            replacement,
+        )?;
+        let type_parameter = macro_replacement_type_parameter(&body, parameters)?;
+        let type_argument = *actuals.get(type_parameter)?;
+        let type_node = macro_type_argument_node(type_argument, source)?;
+        let type_name = node_text(type_node, source).trim().to_string();
+        if type_name.is_empty() {
+            return None;
+        }
+        let explicit_tag = match node_text(type_argument, source) {
+            "struct" => Some(CppCTagKind::Struct),
+            "union" => Some(CppCTagKind::Union),
+            _ => None,
+        };
+        let resolved_type = if let Some(tag) = explicit_tag {
+            let candidates = self
+                .visible_identifier_candidates(file, &type_name)
+                .filter(|candidate| self.cached_c_tag_kind(analyzer, candidate) == Some(tag))
+                .collect::<Vec<_>>();
+            self.resolve_type_candidates(
+                analyzer,
+                file,
+                &candidates,
+                TypeCandidateResolution::Canonical,
+            )
+            .ok()
+        } else {
+            self.resolve_type_node_result(file, type_node, source)
+                .ok()
+                .flatten()
+        };
+        let proven_unit = resolved_type?;
+        Some(MacroLocalBinding {
+            name: node_text(name_node, source).to_string(),
+            type_name,
+            type_node: Some(type_node),
+            pointer_depth: 1,
+            proven_unit: Some(proven_unit),
         })
     }
 
@@ -2468,13 +2665,21 @@ impl<'a> VisibilityIndex<'a> {
             frontier: 0,
             environment: Arc::new(environment.clone()),
         }];
+        // Keep roughly one fixed stride's worth of checkpoints, while taking
+        // a checkpoint at every event for event sets no larger than the fixed
+        // stride. Generated C tables commonly have thousands of uses between
+        // one #define and a trailing #undef; with a fixed stride those
+        // identical frontier requests would all copy and replay the same
+        // prefix.
+        let checkpoint_stride = events
+            .len()
+            .div_ceil(MACRO_ENVIRONMENT_CHECKPOINT_STRIDE)
+            .clamp(1, MACRO_ENVIRONMENT_CHECKPOINT_STRIDE);
         let mut include_stack = HashSet::from_iter([file.clone()]);
         for (index, event) in events.iter().enumerate() {
             self.apply_macro_event(file, event, &mut environment, &mut include_stack);
             let frontier = index + 1;
-            if frontier % MACRO_ENVIRONMENT_CHECKPOINT_STRIDE == 0
-                || matches!(event, MacroEvent::Include { .. })
-            {
+            if frontier % checkpoint_stride == 0 || matches!(event, MacroEvent::Include { .. }) {
                 checkpoints.push(MacroEnvironmentCheckpoint {
                     frontier,
                     environment: Arc::new(environment.clone()),
@@ -2518,6 +2723,49 @@ impl<'a> VisibilityIndex<'a> {
         before_byte: usize,
         target: &CodeUnit,
     ) -> bool {
+        let ranges = analyzer.ranges(target);
+        let declaration_bytes = self.macro_declaration_bytes(target, &ranges);
+        self.macro_binding_matches_target_declaration_at(
+            file,
+            name,
+            before_byte,
+            target.source(),
+            &declaration_bytes,
+        )
+    }
+
+    /// Resolve declaration ranges once for inverse scans that test many call
+    /// sites against one macro target. Walking a large generated syntax tree
+    /// back to the same `#define` for every call site is otherwise quadratic
+    /// in the number of top-level declarations.
+    pub(crate) fn macro_declaration_bytes(
+        &self,
+        target: &CodeUnit,
+        ranges: &[Range],
+    ) -> Vec<usize> {
+        let Some(prepared) = self.cpp.prepared_syntax(self.token, target.source()) else {
+            return Vec::new();
+        };
+        ranges
+            .iter()
+            .filter_map(|range| {
+                let mut node = node_for_exact_range(prepared.tree().root_node(), range)?;
+                while !matches!(node.kind(), "preproc_def" | "preproc_function_def") {
+                    node = node.parent()?;
+                }
+                Some(node.start_byte())
+            })
+            .collect()
+    }
+
+    pub(crate) fn macro_binding_matches_target_declaration_at(
+        &self,
+        file: &ProjectFile,
+        name: &str,
+        before_byte: usize,
+        target_source: &ProjectFile,
+        target_declaration_bytes: &[usize],
+    ) -> bool {
         let environment = self.macro_environment(file, before_byte);
         let Some(binding) = environment.binding(name) else {
             return false;
@@ -2528,24 +2776,10 @@ impl<'a> VisibilityIndex<'a> {
         // A normal header guard makes the replacement text conditional, but
         // it does not erase the definition site's source and byte identity.
         // Keep that identity even when expansion details are not exact.
-        if binding.source != *target.source() {
+        if binding.source != *target_source {
             return false;
         }
-        let Some(prepared) = self.cpp.prepared_syntax(self.token, target.source()) else {
-            return false;
-        };
-        analyzer.ranges(target).iter().any(|range| {
-            let Some(mut node) = node_for_exact_range(prepared.tree().root_node(), range) else {
-                return false;
-            };
-            while !matches!(node.kind(), "preproc_def" | "preproc_function_def") {
-                let Some(parent) = node.parent() else {
-                    return false;
-                };
-                node = parent;
-            }
-            node.start_byte() == binding.declaration_byte
-        })
+        target_declaration_bytes.contains(&binding.declaration_byte)
     }
 
     /// Resolve an ordinary expression-position macro token at its exact byte.
@@ -2622,19 +2856,71 @@ impl<'a> VisibilityIndex<'a> {
         let mut stack = vec![(root, root.is_error())];
         while let Some((node, inside_error)) = stack.pop() {
             let inside_error = inside_error || node.is_error();
+            if node.kind() == "preproc_arg" {
+                // Tree-sitter keeps an object-like replacement opaque. The
+                // inverse extractor uses the same parsed replacement helper;
+                // retain its exact macro/type leaves for precision membership
+                // even when the preprocessor node is outside ERROR recovery.
+                let macro_value_kind = node.parent().and_then(|parent| {
+                    (parent.child_by_field_name("value") == Some(node)).then_some(parent.kind())
+                });
+                if matches!(
+                    macro_value_kind,
+                    Some("preproc_def" | "preproc_function_def")
+                ) {
+                    let name = node_text(node, source);
+                    if !name.is_empty()
+                        && self.macro_name_may_be_bound_at(file, name, node.start_byte())
+                        && !push_recovered_c_range(
+                            &mut ranges,
+                            &mut seen,
+                            node.start_byte(),
+                            node.end_byte(),
+                            node,
+                            limit,
+                        )
+                    {
+                        return RecoveredCReferenceRanges::LimitExceeded;
+                    }
+                }
+                if macro_value_kind == Some("preproc_def") {
+                    for reference in object_macro_replacement_type_references(node, source) {
+                        for range in reference.component_ranges {
+                            let visible = self
+                                .visible_identifier_candidates(file, &source[range.clone()])
+                                .any(|candidate| {
+                                    candidate.is_class()
+                                        || candidate.is_module()
+                                        || is_type_alias(candidate)
+                                });
+                            if visible
+                                && !push_recovered_c_range(
+                                    &mut ranges,
+                                    &mut seen,
+                                    range.start,
+                                    range.end,
+                                    node,
+                                    limit,
+                                )
+                            {
+                                return RecoveredCReferenceRanges::LimitExceeded;
+                            }
+                        }
+                    }
+                }
+            }
             if inside_error
                 && recovered_c_reference_node(self, file, node, source)
-                && seen.insert((node.start_byte(), node.end_byte()))
+                && !push_recovered_c_range(
+                    &mut ranges,
+                    &mut seen,
+                    node.start_byte(),
+                    node.end_byte(),
+                    node,
+                    limit,
+                )
             {
-                if ranges.len() == limit {
-                    return RecoveredCReferenceRanges::LimitExceeded;
-                }
-                ranges.push(Range {
-                    start_byte: node.start_byte(),
-                    end_byte: node.end_byte(),
-                    start_line: node.start_position().row,
-                    end_line: node.end_position().row,
-                });
+                return RecoveredCReferenceRanges::LimitExceeded;
             }
             let mut cursor = node.walk();
             for child in node.named_children(&mut cursor) {
@@ -3739,6 +4025,39 @@ impl<'a> VisibilityIndex<'a> {
             })
     }
 
+    /// Whether a physical declaration is visible at an exact structured
+    /// reference node. Inverse C field references need the reference's own
+    /// preprocessor environment before using the callable activation path:
+    /// callable activation can establish that a field declaration is
+    /// nameable, but it must not admit the opposite branch of that field's
+    /// conditional family.
+    pub fn declaration_visible_at_reference(
+        &self,
+        analyzer: &CppGraphSource<'_>,
+        file: &ProjectFile,
+        declaration: &CodeUnit,
+        reference: Node<'_>,
+    ) -> bool {
+        let Some(prepared) = self.cpp.prepared_syntax(self.token, file) else {
+            return false;
+        };
+        let reference_guards = preprocessor_guard_environment(reference, prepared.source());
+        let declaration_guards = declaration_guard_requirements(analyzer, self.cpp, declaration);
+        if !declaration_guards.iter().any(|(_, required)| {
+            guards_compatible_at_reference(required, reference_guards.as_ref())
+        }) {
+            return false;
+        }
+        let guards = OnceCell::new();
+        self.physical_declaration_visible_at(
+            analyzer,
+            file,
+            declaration,
+            reference.start_byte(),
+            &guards,
+        )
+    }
+
     /// C forward navigation may bind a call to a later same-file definition.
     /// There is no earlier source declaration to activate in that legacy C
     /// shape, but the call's preprocessor environment must still imply the
@@ -4085,6 +4404,12 @@ impl<'a> VisibilityIndex<'a> {
             }
             other => other,
         };
+        if std::env::var_os("BIFROST_CPP_VISIBILITY_STATS").is_some() {
+            eprintln!(
+                "BIFROST_CPP_TYPE_VISIBILITY_STATS phase=foreign_guard_compatibility declaration_source={} declaration_guards={declaration_guards:?} reference_guards={reference_guards:?}",
+                declaration_source.rel_path().display(),
+            );
+        }
         if !guards_compatible_at_reference(declaration_guards, reference_guards) {
             return false;
         }
@@ -5105,6 +5430,12 @@ impl<'a> VisibilityIndex<'a> {
             }
             saw_shape_candidate = true;
             if same_visible_symbol(candidate, target)
+                || self.c_tag_declaration_family_matches_target(
+                    analyzer,
+                    file,
+                    std::slice::from_ref(&candidate),
+                    target,
+                )
                 || self.compatible_primary_template_redeclarations(candidate, target)
                 || (declared_type_alias(analyzer, candidate)
                     && self.alias_candidate_may_preserve_target(analyzer, file, candidate, target))
@@ -5114,6 +5445,177 @@ impl<'a> VisibilityIndex<'a> {
         }
 
         !saw_shape_candidate
+    }
+
+    /// A C tag's forward declaration and complete definition are one logical
+    /// type even when their indexed signatures and source files differ. Keep
+    /// this identity narrow: the complete declaration must be a top-level C
+    /// tag, every visible candidate must be its physical forward declaration,
+    /// and the parsed tag kind must agree. Different FQNs, competing complete
+    /// definitions, aliases, and struct/union mismatches remain ambiguous.
+    fn cached_c_tag_kind(
+        &self,
+        analyzer: &CppGraphSource<'_>,
+        candidate: &CodeUnit,
+    ) -> Option<CppCTagKind> {
+        if let Some(kind) = self
+            .c_tag_kind_cache
+            .lock()
+            .expect("C tag kind cache poisoned")
+            .get(candidate)
+        {
+            return *kind;
+        }
+        let kind = indexed_c_tag_kind(analyzer, candidate);
+        self.c_tag_kind_cache
+            .lock()
+            .expect("C tag kind cache poisoned")
+            .insert(candidate.clone(), kind);
+        kind
+    }
+
+    fn cached_unique_c_tag_complete_definition(
+        &self,
+        analyzer: &CppGraphSource<'_>,
+        target: &CodeUnit,
+        target_tag: CppCTagKind,
+    ) -> Option<CodeUnit> {
+        if let Some(definition) = self
+            .c_tag_complete_definition_cache
+            .lock()
+            .expect("C tag complete-definition cache poisoned")
+            .get(target)
+        {
+            return definition.clone();
+        }
+        let complete_definitions = analyzer
+            .definitions(&target.fq_name())
+            .filter(|candidate| {
+                candidate.is_class()
+                    && !declared_type_alias(analyzer, candidate)
+                    && is_c_source_file(candidate.source())
+                    && analyzer.parent_of(candidate).is_none()
+                    && cpp_class_declaration_strength(analyzer, candidate)
+                        == CppClassDeclarationStrength::Full
+                    && self.cached_c_tag_kind(analyzer, candidate) == Some(target_tag)
+            })
+            .collect::<HashSet<_>>();
+        let definition = (complete_definitions.len() == 1)
+            .then(|| complete_definitions.into_iter().next())
+            .flatten()
+            .filter(|candidate| same_visible_symbol(candidate, target));
+        self.c_tag_complete_definition_cache
+            .lock()
+            .expect("C tag complete-definition cache poisoned")
+            .insert(target.clone(), definition.clone());
+        definition
+    }
+
+    pub fn c_tag_declaration_family_matches_target(
+        &self,
+        analyzer: &CppGraphSource<'_>,
+        visible_from: &ProjectFile,
+        candidates: &[&CodeUnit],
+        target: &CodeUnit,
+    ) -> bool {
+        if std::env::var_os("BIFROST_CPP_VISIBILITY_STATS").is_some() {
+            let candidate_evidence = candidates
+                .iter()
+                .map(|candidate| {
+                    (
+                        candidate.fq_name(),
+                        candidate.source().rel_path().to_path_buf(),
+                        cpp_class_declaration_strength(analyzer, candidate),
+                        indexed_c_tag_kind(analyzer, candidate),
+                        self.is_physically_visible(visible_from, candidate),
+                    )
+                })
+                .collect::<Vec<_>>();
+            eprintln!(
+                "BIFROST_CPP_C_TAG_FAMILY_STATS visible_from={} target=({}, {}, {:?}, {:?}) candidates={candidate_evidence:?}",
+                visible_from.rel_path().display(),
+                target.fq_name(),
+                target.source().rel_path().display(),
+                cpp_class_declaration_strength(analyzer, target),
+                indexed_c_tag_kind(analyzer, target),
+            );
+        }
+        if candidates.is_empty()
+            || !target.is_class()
+            || declared_type_alias(analyzer, target)
+            || !is_c_source_file(target.source())
+            || analyzer.parent_of(target).is_some()
+            || cpp_class_declaration_strength(analyzer, target) != CppClassDeclarationStrength::Full
+        {
+            return false;
+        }
+        let Some(target_tag) = self.cached_c_tag_kind(analyzer, target) else {
+            return false;
+        };
+        if self
+            .cached_unique_c_tag_complete_definition(analyzer, target, target_tag)
+            .is_none()
+        {
+            return false;
+        }
+        let mut saw_visible_forward = false;
+        for candidate in candidates.iter().copied() {
+            if candidate == target {
+                continue;
+            }
+            if !candidate.is_class()
+                || declared_type_alias(analyzer, candidate)
+                || candidate.fq_name() != target.fq_name()
+                || analyzer.parent_of(candidate).is_some()
+                || cpp_class_declaration_strength(analyzer, candidate)
+                    != CppClassDeclarationStrength::Forward
+                || self.cached_c_tag_kind(analyzer, candidate) != Some(target_tag)
+                || !self.is_physically_visible(visible_from, candidate)
+            {
+                return false;
+            }
+            saw_visible_forward = true;
+        }
+        saw_visible_forward
+    }
+
+    /// Collapse one visible complete C tag and its visible forward declarations
+    /// before ordinary lexical resolution sees their different signatures as
+    /// competing types. A second complete definition, a different FQN/tag
+    /// kind, or an unknown declaration shape remains ambiguous.
+    fn unique_c_tag_declaration_family(
+        &self,
+        analyzer: &CppGraphSource<'_>,
+        visible_from: &ProjectFile,
+        candidates: &[&CodeUnit],
+    ) -> Option<CodeUnit> {
+        let first = candidates.first()?;
+        let target_fq_name = first.fq_name();
+        let target_tag = self.cached_c_tag_kind(analyzer, first)?;
+        let mut full = None;
+        let mut saw_forward = false;
+        for candidate in candidates.iter().copied() {
+            if !candidate.is_class()
+                || declared_type_alias(analyzer, candidate)
+                || candidate.fq_name() != target_fq_name
+                || analyzer.parent_of(candidate).is_some()
+                || self.cached_c_tag_kind(analyzer, candidate) != Some(target_tag)
+            {
+                return None;
+            }
+            match cpp_class_declaration_strength(analyzer, candidate) {
+                CppClassDeclarationStrength::Full
+                    if is_c_source_file(candidate.source())
+                        && full.replace(candidate.clone()).is_none() => {}
+                CppClassDeclarationStrength::Forward
+                    if self.is_physically_visible(visible_from, candidate) =>
+                {
+                    saw_forward = true
+                }
+                _ => return None,
+            }
+        }
+        if saw_forward { full } else { None }
     }
 
     pub fn target_preserving_reference_namespace(
@@ -5247,6 +5749,8 @@ impl<'a> VisibilityIndex<'a> {
                 }
                 continue;
             }
+            let candidates =
+                self.candidates_for_type_resolution(analyzer, file, &candidates, resolution);
             let unit = match self.resolve_type_candidates(analyzer, file, &candidates, resolution) {
                 Ok(unit) => unit,
                 Err(failure) => return failure.lexical_resolution(),
@@ -5319,6 +5823,7 @@ impl<'a> VisibilityIndex<'a> {
             return None;
         }
         let owner_components = lexical_scope[..owner_len].to_vec();
+        let matches = self.candidates_for_type_resolution(analyzer, file, &matches, resolution);
         let resolution = match self.resolve_type_candidates(analyzer, file, &matches, resolution) {
             Ok(unit) => LexicalTypeResolution::Resolved {
                 unit,
@@ -5400,6 +5905,8 @@ impl<'a> VisibilityIndex<'a> {
                     }
                     continue;
                 }
+                let candidates =
+                    self.candidates_for_type_resolution(analyzer, file, &candidates, resolution);
                 let unit =
                     match self.resolve_type_candidates(analyzer, file, &candidates, resolution) {
                         Ok(unit) => unit,
@@ -5499,6 +6006,11 @@ impl<'a> VisibilityIndex<'a> {
         candidates: &[&CodeUnit],
         resolution: TypeCandidateResolution<'_>,
     ) -> Result<CodeUnit, TypeCandidateFailure> {
+        if !matches!(resolution, TypeCandidateResolution::PreserveTarget(_))
+            && let Some(unit) = self.unique_c_tag_declaration_family(analyzer, file, candidates)
+        {
+            return Ok(unit);
+        }
         match resolution {
             TypeCandidateResolution::Canonical => {
                 self.canonical_type_candidate_resolution(analyzer, file, candidates)
@@ -5551,6 +6063,68 @@ impl<'a> VisibilityIndex<'a> {
                 .unique_type_candidate_preserving_target(analyzer, file, candidates, target)
                 .ok_or(TypeCandidateFailure::Ambiguous),
         }
+    }
+
+    fn candidates_for_type_resolution<'b>(
+        &self,
+        analyzer: &CppGraphSource<'_>,
+        file: &ProjectFile,
+        candidates: &[&'b CodeUnit],
+        resolution: TypeCandidateResolution<'_>,
+    ) -> Vec<&'b CodeUnit> {
+        if matches!(resolution, TypeCandidateResolution::PreserveAlias) && candidates.len() > 1 {
+            let compile_proven = self.compile_proven_type_candidates(analyzer, file, candidates);
+            if compile_proven.len() == 1 {
+                return compile_proven;
+            }
+        }
+        candidates.to_vec()
+    }
+
+    /// Narrow a same-name forward lookup to the declaration selected by the
+    /// translation unit's compile command. The lexical resolver intentionally
+    /// does not receive a reference node, so this is the only compile-context
+    /// evidence available at that stage. A single selected candidate is safe:
+    /// the caller still checks include activation and the reference's own
+    /// guards before reporting the result as visible.
+    fn compile_proven_type_candidates<'b>(
+        &self,
+        analyzer: &CppGraphSource<'_>,
+        file: &ProjectFile,
+        candidates: &[&'b CodeUnit],
+    ) -> Vec<&'b CodeUnit> {
+        let proven = self.compile_proven_guards(file);
+        if proven.is_empty() {
+            return Vec::new();
+        }
+        let Some(prepared) = self.cpp.prepared_syntax(self.token, file) else {
+            return Vec::new();
+        };
+        candidates
+            .iter()
+            .copied()
+            .filter(|candidate| {
+                let declaration_guards =
+                    declaration_guard_requirements(analyzer, self.cpp, candidate);
+                if declaration_guards.is_empty() {
+                    return false;
+                }
+                if candidate.source() == file {
+                    return declaration_guards.iter().any(|(_, required)| {
+                        guard_requirements_hold_at_reference(required, Some(proven.as_ref()))
+                    });
+                }
+                declaration_guards.iter().any(|(_, required)| {
+                    self.foreign_declaration_reachable_from_compile_proven_guards(
+                        file,
+                        prepared.as_ref(),
+                        candidate.source(),
+                        required,
+                        usize::MAX,
+                    )
+                })
+            })
+            .collect()
     }
 
     pub fn resolve_callable_value_components_lexically(
@@ -6175,7 +6749,9 @@ impl<'a> VisibilityIndex<'a> {
         // itself is one of the physical candidates. Do not merge same-named
         // declarations from different files or namespaces; those remain
         // ambiguous and fail closed below.
-        if self.alternate_same_fqn_type_declarations(analyzer, candidates, target) {
+        if self.c_tag_declaration_family_matches_target(analyzer, visible_from, candidates, target)
+            || self.alternate_same_fqn_type_declarations(analyzer, candidates, target)
+        {
             return Some(target.clone());
         }
         let mut resolved_candidates = Vec::new();
@@ -8228,6 +8804,13 @@ pub fn resolve_declaring_member_owner(
                 return EnclosingMemberOwnerResolution::Ambiguous;
             };
             for member in visibility.visible_members_for_owner_name(file, &owner, member_name) {
+                // A type nested in an owner shares the owner's member-name
+                // index, but it cannot be the value receiver of `owner.name`.
+                // Keep value members here so an anonymous aggregate field
+                // does not become ambiguous with its promoted receiver type.
+                if !member.is_field() && !member.is_function() {
+                    continue;
+                }
                 let Some(member_owner) = type_owner_of(analyzer, member) else {
                     return EnclosingMemberOwnerResolution::Ambiguous;
                 };
@@ -9519,7 +10102,7 @@ fn context_fact_names(contexts: &[CppCompileContext]) -> Option<HashSet<String>>
     )
 }
 
-fn guard_requirements_hold_at_reference(
+pub fn guard_requirements_hold_at_reference(
     required: &HashSet<PreprocessorGuard>,
     reference: Option<&HashSet<PreprocessorGuard>>,
 ) -> bool {
@@ -9775,7 +10358,17 @@ pub fn merge_preprocessor_guards(
 ) -> Option<HashSet<PreprocessorGuard>> {
     let mut merged = left.clone();
     for guard in right {
-        if merged.contains(&guard.negated()) {
+        let boolean_negation = guard
+            .as_boolean_expression()
+            .map(|expression| expression.negated());
+        if merged.contains(&guard.negated())
+            || boolean_negation.is_some_and(|negated| {
+                merged
+                    .iter()
+                    .filter_map(PreprocessorGuard::as_boolean_expression)
+                    .any(|existing| existing == negated)
+            })
+        {
             return None;
         }
         merged.insert(guard.clone());
@@ -10554,6 +11147,62 @@ pub fn argument_children<'tree>(node: Node<'tree>) -> impl Iterator<Item = Node<
         .flatten()
 }
 
+/// Recover the two ordinary C values that the C++ grammar folds into one
+/// `new_expression` for `callee(new, trailing)`.
+///
+/// The malformed node has an exact grammar-owned shape: the anonymous `new`
+/// token, an extra `ERROR` containing only the comma token, and the trailing
+/// value in the `type` field.  The caller supplies the compilation-dialect
+/// proof from [`reference_uses_c_semantics`]; a C++ source therefore never
+/// reinterprets a real new-expression through this path.
+pub fn recovered_c_new_expression_arguments(
+    node: Node<'_>,
+    uses_c_semantics: bool,
+) -> Option<[Node<'_>; 2]> {
+    if !uses_c_semantics || node.kind() != "new_expression" {
+        return None;
+    }
+    let parent = node.parent()?;
+    if parent.kind() != "argument_list" {
+        return None;
+    }
+    let keyword = node.child(0)?;
+    let error = node.child(1)?;
+    let trailing = node.child(2)?;
+    if node.child(3).is_some()
+        || keyword.kind() != "new"
+        || keyword.is_named()
+        || keyword.child_count() != 0
+        || error.kind() != "ERROR"
+        || !error.is_extra()
+        || error.child_count() != 1
+        || error.child(0).is_none_or(|comma| comma.kind() != ",")
+        || node.child_by_field_name("type") != Some(trailing)
+        || trailing.kind() != "type_identifier"
+    {
+        return None;
+    }
+    Some([keyword, trailing])
+}
+
+/// The recovered C value covering one focused source range, starting from any
+/// node within the malformed new-expression.
+pub fn recovered_c_new_expression_argument_at(
+    mut node: Node<'_>,
+    start_byte: usize,
+    end_byte: usize,
+    uses_c_semantics: bool,
+) -> Option<Node<'_>> {
+    loop {
+        if let Some(arguments) = recovered_c_new_expression_arguments(node, uses_c_semantics) {
+            return arguments.into_iter().find(|argument| {
+                argument.start_byte() <= start_byte && end_byte <= argument.end_byte()
+            });
+        }
+        node = node.parent()?;
+    }
+}
+
 fn recovered_c_keyword_argument_count(
     file: &ProjectFile,
     call: Node<'_>,
@@ -10682,6 +11331,23 @@ pub fn constructor_type_node(node: Node<'_>) -> Option<Node<'_>> {
     }
 }
 
+/// The structured type named by a C-style cast expression.
+///
+/// Tree-sitter wraps the actual type syntax in a `type_descriptor`.  Return its
+/// structured `type` field so resolution retains qualified and nested syntax
+/// without reparsing source text.
+pub fn cast_expression_type_node(node: Node<'_>) -> Option<Node<'_>> {
+    if node.kind() != "cast_expression" {
+        return None;
+    }
+    let descriptor = node.child_by_field_name("type")?;
+    if descriptor.kind() == "type_descriptor" {
+        descriptor.child_by_field_name("type")
+    } else {
+        Some(descriptor)
+    }
+}
+
 pub fn field_initializer_constructs_target(
     node: Node<'_>,
     ctx: &ScanCtx<'_>,
@@ -10786,12 +11452,96 @@ pub fn field_declared_binding(
             .ok(),
         (resolved, None) => resolved,
         (None, Some(_)) => None,
-    };
+    }
+    .or_else(|| anonymous_aggregate_field_owner(analyzer, visibility, visible_from, field));
     Some(CppScanBinding::from_type_name(
         normalized,
         resolved,
         fact.indirection,
     ))
+}
+
+/// Resolve the receiver type minted for a named declarator on an anonymous C
+/// aggregate, such as `struct { int r; } c`. The declaration index preserves
+/// the aggregate as the nested class `Owner$c`, but the field's type fact has
+/// no spelling that can name that class. Confirm the anonymous aggregate from
+/// its parsed declaration, then use the owner's structured child relationship
+/// to recover the one corresponding receiver type.
+fn anonymous_aggregate_field_owner(
+    analyzer: &CppGraphSource<'_>,
+    visibility: &VisibilityIndex<'_>,
+    visible_from: &ProjectFile,
+    field: &CodeUnit,
+) -> Option<CodeUnit> {
+    let owner = type_owner_of(analyzer, field)?;
+    if !owner.is_class() {
+        return None;
+    }
+    let declaration = analyzer.get_source(field, false)?;
+    let mut parser = Parser::new();
+    parser
+        .set_language(&tree_sitter_cpp::LANGUAGE.into())
+        .ok()?;
+    let tree = parser.parse(&declaration, None)?;
+    let mut stack = vec![tree.root_node()];
+    while let Some(node) = stack.pop() {
+        if matches!(node.kind(), "declaration" | "field_declaration")
+            && let Some(type_node) = node
+                .child_by_field_name("type")
+                .or_else(|| first_type_child(node))
+            && matches!(type_node.kind(), "struct_specifier" | "union_specifier")
+            && type_node.child_by_field_name("name").is_none()
+            && declared_name_indirection(node, type_node, field.identifier(), &declaration)
+                .is_some()
+        {
+            let matches = visibility
+                .visible_members_for_owner_name(visible_from, &owner, field.identifier())
+                .into_iter()
+                .filter(|child| child.is_class() && child.identifier() == field.identifier())
+                .collect::<Vec<_>>();
+            return match matches.as_slice() {
+                [child] => Some((*child).clone()),
+                _ => None,
+            };
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.named_children(&mut cursor));
+    }
+    None
+}
+
+/// Resolve an anonymous C aggregate's generated owner from its declaration
+/// range. Anonymous local structs and unions have no type name to enter into
+/// the visibility index; declaration extraction gives them a structured class
+/// identity keyed by the aggregate node's exact CST range instead. Matching
+/// that range keeps nested aggregates and unrelated generated owners out of
+/// the result without inspecting source text.
+pub fn anonymous_aggregate_owner(
+    analyzer: &CppGraphSource<'_>,
+    file: &ProjectFile,
+    node: Node<'_>,
+) -> Option<CodeUnit> {
+    if !matches!(node.kind(), "struct_specifier" | "union_specifier")
+        || node.child_by_field_name("name").is_some()
+    {
+        return None;
+    }
+    let mut candidates = analyzer
+        .declarations(file)
+        .into_iter()
+        .filter(|candidate| {
+            candidate.is_class()
+                && analyzer.ranges(candidate).into_iter().any(|range| {
+                    range.start_byte == node.start_byte() && range.end_byte == node.end_byte()
+                })
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by_key(|candidate| candidate.fq_name());
+    candidates.dedup();
+    match candidates.as_slice() {
+        [candidate] => Some(candidate.clone()),
+        _ => None,
+    }
 }
 
 /// The one logical type the candidates name, or why they do not name one.
@@ -10828,6 +11578,27 @@ fn unique_type_candidate_preserving_alias(
                     && candidate.source() == first.source()
             })
             .then(|| first.clone());
+    }
+    if first.is_class() && indexed_c_tag_kind(analyzer, first).is_some() {
+        let mut full_source = None;
+        let mut tag_kind = None;
+        for candidate in candidates.iter().copied() {
+            let candidate_tag_kind = indexed_c_tag_kind(analyzer, candidate)?;
+            if tag_kind
+                .replace(candidate_tag_kind)
+                .is_some_and(|existing| existing != candidate_tag_kind)
+            {
+                return None;
+            }
+            if cpp_class_declaration_strength(analyzer, candidate)
+                == CppClassDeclarationStrength::Full
+                && full_source
+                    .replace(candidate.source())
+                    .is_some_and(|existing| existing != candidate.source())
+            {
+                return None;
+            }
+        }
     }
     candidates
         .iter()
@@ -10879,40 +11650,88 @@ fn decode_field_declared_type_fact(
     parser
         .set_language(&tree_sitter_cpp::LANGUAGE.into())
         .ok()?;
+    // A field's indexed source is stored without its surrounding class body.
+    // Give tree-sitter that grammatical context before checking recovery-only
+    // field shapes such as `PyObject_HEAD Imaging image;`.
+    let contextual_declaration = format!("struct __bifrost_field_context {{ {declaration} }};");
+    let contextual_tree = parser.parse(&contextual_declaration, None)?;
+    let mut stack = vec![contextual_tree.root_node()];
+    while let Some(node) = stack.pop() {
+        if let Some(recovered) = recovered_pyobject_head_field(node, &contextual_declaration)
+            && node_text(recovered.declarator, &contextual_declaration) == field.identifier()
+        {
+            return Some(DeclaredFieldTypeFact {
+                type_text: node_text(recovered.type_node, &contextual_declaration).to_string(),
+                indirection: 0,
+                template_arguments: None,
+            });
+        }
+        if let Some(recovered) =
+            recovered_function_like_field_declarator(node, &contextual_declaration)
+            && node_text(recovered.name, &contextual_declaration) == field.identifier()
+        {
+            let type_node = node
+                .child_by_field_name("type")
+                .or_else(|| first_type_child(node))?;
+            return Some(DeclaredFieldTypeFact {
+                type_text: node_text(type_node, &contextual_declaration).to_string(),
+                indirection: recovered.pointer_depth(),
+                template_arguments: cpp_template_reference_arguments(
+                    type_node,
+                    &contextual_declaration,
+                ),
+            });
+        }
+        if let Some(fact) =
+            decode_declared_field_type_node(node, field.identifier(), &contextual_declaration)
+        {
+            return Some(fact);
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.named_children(&mut cursor));
+    }
     let tree = parser.parse(&declaration, None)?;
     let mut stack = vec![tree.root_node()];
     while let Some(node) = stack.pop() {
-        if matches!(node.kind(), "declaration" | "field_declaration")
-            && let Some(type_node) = node
-                .child_by_field_name("type")
-                .or_else(|| first_type_child(node))
-            && let Some(indirection) =
-                declared_name_indirection(node, type_node, field.identifier(), &declaration)
+        if let Some(fact) = decode_declared_field_type_node(node, field.identifier(), &declaration)
         {
-            let declared_type = if matches!(
-                type_node.kind(),
-                "class_specifier" | "struct_specifier" | "union_specifier"
-            ) {
-                type_node.child_by_field_name("name")
-            } else {
-                Some(type_node)
-            };
-            let type_text = declared_type.map_or_else(
-                || field.identifier().to_string(),
-                |declared_type| node_text(declared_type, &declaration).to_string(),
-            );
-            return Some(DeclaredFieldTypeFact {
-                type_text,
-                indirection,
-                template_arguments: declared_type.and_then(|declared_type| {
-                    cpp_template_reference_arguments(declared_type, &declaration)
-                }),
-            });
+            return Some(fact);
         }
         let mut cursor = node.walk();
         stack.extend(node.named_children(&mut cursor));
     }
     None
+}
+
+fn decode_declared_field_type_node(
+    node: Node<'_>,
+    field_name: &str,
+    source: &str,
+) -> Option<DeclaredFieldTypeFact> {
+    if !matches!(node.kind(), "declaration" | "field_declaration") {
+        return None;
+    }
+    let type_node = node
+        .child_by_field_name("type")
+        .or_else(|| first_type_child(node))?;
+    let indirection = declared_name_indirection(node, type_node, field_name, source)?;
+    let declared_type = if matches!(
+        type_node.kind(),
+        "class_specifier" | "struct_specifier" | "union_specifier"
+    ) {
+        type_node.child_by_field_name("name")
+    } else {
+        Some(type_node)
+    };
+    Some(DeclaredFieldTypeFact {
+        type_text: declared_type.map_or_else(
+            || field_name.to_string(),
+            |declared_type| node_text(declared_type, source).to_string(),
+        ),
+        indirection,
+        template_arguments: declared_type
+            .and_then(|declared_type| cpp_template_reference_arguments(declared_type, source)),
+    })
 }
 
 /// Text of the type that a C or C++ alias declaration names, read from the
@@ -11802,6 +12621,60 @@ pub fn is_c_sizeof_expression_type_candidate(file: &ProjectFile, node: Node<'_>)
     })
 }
 
+/// Return the type and member leaves of a C `offsetof` member designator.
+///
+/// `offsetof_expression` is a dedicated tree-sitter node, so its two operands
+/// must be interpreted through their named fields.  In particular, do not
+/// infer the aggregate from the enclosing lexical scope: an `offsetof` can
+/// name a member of an unrelated aggregate, including a field promoted from
+/// an anonymous union.  A missing or unsupported operand is deliberately
+/// rejected so callers can keep the reference unresolved.
+pub fn c_offsetof_member_parts(node: Node<'_>) -> Option<(Node<'_>, Node<'_>)> {
+    if node.kind() != "field_identifier" {
+        return None;
+    }
+    let expression = node.parent().filter(|parent| {
+        parent.kind() == "offsetof_expression" && parent.child_by_field_name("member") == Some(node)
+    })?;
+    if expression.has_error() {
+        return None;
+    }
+    let closing = expression.child(expression.child_count().saturating_sub(1))?;
+    if closing.kind() != ")" || closing.is_missing() {
+        return None;
+    }
+    let type_descriptor = expression.child_by_field_name("type")?;
+    if type_descriptor.kind() != "type_descriptor"
+        || type_descriptor.is_missing()
+        || type_descriptor.has_error()
+    {
+        return None;
+    }
+    let type_specifier = type_descriptor.child_by_field_name("type")?;
+    if type_specifier.is_missing() || type_specifier.has_error() {
+        return None;
+    }
+    let type_reference = match type_specifier.kind() {
+        "class_specifier" | "struct_specifier" | "union_specifier" => {
+            type_specifier.child_by_field_name("name")?
+        }
+        _ => type_specifier,
+    };
+    (!type_reference.is_missing() && !type_reference.has_error()).then_some((type_reference, node))
+}
+
+/// Whether `node` is the member leaf of an `offsetof_expression`, including a
+/// malformed type operand.  Callers use this guard to prevent the ordinary
+/// field-name heuristics from guessing an owner after structured resolution
+/// has failed.
+pub fn is_c_offsetof_member_node(node: Node<'_>) -> bool {
+    node.kind() == "field_identifier"
+        && node.parent().is_some_and(|parent| {
+            parent.kind() == "offsetof_expression"
+                && parent.child_by_field_name("member") == Some(node)
+        })
+}
+
 /// Whether `node` is a template argument name that tree-sitter spelled with
 /// type syntax.
 ///
@@ -12599,7 +13472,7 @@ pub fn is_recovered_qualified_friend_class_type_reference(node: Node<'_>, source
 }
 
 pub fn is_ordinary_macro_reference_node(node: Node<'_>) -> bool {
-    if !matches!(node.kind(), "identifier" | "field_identifier") || is_declaration_name(node) {
+    if !matches!(node.kind(), "identifier" | "field_identifier") {
         return false;
     }
     if let Some(parent) = node.parent() {
@@ -12613,6 +13486,9 @@ pub fn is_ordinary_macro_reference_node(node: Node<'_>) -> bool {
         {
             return false;
         }
+    }
+    if is_declaration_name(node) {
+        return false;
     }
     let mut current = node.parent();
     while let Some(ancestor) = current {
@@ -12670,21 +13546,253 @@ fn recovered_c_reference_node(
     {
         return false;
     }
-
+    // A declaration name can be an identifier child of a recovered ERROR
+    // (for example `EFI_STATUS Encode()` in C files parsed as C++). Do not
+    // let a same-named macro turn that binder into a reference. An
+    // assignment whose C callee follows the recovered `explicit` token is
+    // the one expression-shaped exception: the generic declarator walk sees
+    // its function_declarator as a declaration path, but the ERROR sibling
+    // proves it is a call.
     let name = node_text(node, source);
+    let recovered_function_call =
+        recovered_c_function_declarator_call(visibility, file, node, name);
+    let recovered_macro_call = recovered_c_function_declarator_invocation(node)
+        && visibility.macro_name_may_be_bound_at(file, name, node.start_byte());
+    let recovered_parenthesized_reference = recovered_c_parenthesized_declarator_reference(node);
+    if is_declaration_name(node)
+        && !recovered_c_explicit_assignment_callee(visibility, file, node, name)
+        && !recovered_function_call
+        && !recovered_macro_call
+        && !recovered_parenthesized_reference
+    {
+        return false;
+    }
+
     if !name.is_empty() && visibility.macro_name_may_be_bound_at(file, name, node.start_byte()) {
         return true;
     }
     if recovered_c_explicit_assignment_callee(visibility, file, node, name) {
         return true;
     }
-    if is_declaration_name(node) {
-        return false;
-    }
-    if matches!(node.kind(), "type_identifier" | "namespace_identifier") {
+    if recovered_parenthesized_reference {
         return true;
     }
-    recovered_c_reference_anchor(node)
+    if matches!(node.kind(), "type_identifier" | "namespace_identifier") {
+        if recovered_function_call {
+            return true;
+        }
+        return visibility
+            .visible_identifier_candidates(file, name)
+            .any(|candidate| {
+                candidate.is_class() || candidate.is_module() || is_type_alias(candidate)
+            });
+    }
+    let visible = visibility
+        .visible_identifier_candidates(file, name)
+        .next()
+        .is_some();
+    visible
+        && (recovered_c_reference_anchor(node)
+            || recovered_c_error_expression_leaf(node)
+            || recovered_function_call)
+}
+
+fn push_recovered_c_range(
+    ranges: &mut Vec<Range>,
+    seen: &mut HashSet<(usize, usize)>,
+    start_byte: usize,
+    end_byte: usize,
+    node: Node<'_>,
+    limit: usize,
+) -> bool {
+    if start_byte >= end_byte || !seen.insert((start_byte, end_byte)) {
+        return true;
+    }
+    if ranges.len() >= limit {
+        return false;
+    }
+    ranges.push(Range {
+        start_byte,
+        end_byte,
+        start_line: node.start_position().row,
+        end_line: node.end_position().row,
+    });
+    true
+}
+
+/// A reference leaf can sit directly beneath an ERROR while its ERROR parent
+/// is still attached to a real expression (most often a recovered macro call
+/// argument). The expression parent is the structured proof; an unindexed
+/// identifier beneath a bare recovery envelope has no such proof.
+fn recovered_c_error_expression_leaf(node: Node<'_>) -> bool {
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        if parent.is_error() {
+            let Some(anchor) = parent.parent() else {
+                return false;
+            };
+            return anchor.kind().ends_with("_expression")
+                || matches!(
+                    anchor.kind(),
+                    "argument_list"
+                        | "return_statement"
+                        | "expression_statement"
+                        | "case_statement"
+                        | "initializer_list"
+                        | "field_designator"
+                        | "enumerator"
+                );
+        }
+        if matches!(
+            parent.kind(),
+            "translation_unit" | "function_definition" | "compound_statement"
+        ) {
+            return false;
+        }
+        current = parent.parent();
+    }
+    false
+}
+
+/// C recovery may represent a call as `identifier > function_declarator >
+/// ERROR > compound_statement`. This shape is only a call when the malformed
+/// declarator is attached to a real function body and the name is an indexed
+/// visible callable. A declaration's `ERROR > function_declarator >
+/// declaration` shape deliberately fails this test.
+fn recovered_c_function_declarator_call(
+    visibility: &VisibilityIndex<'_>,
+    file: &ProjectFile,
+    node: Node<'_>,
+    name: &str,
+) -> bool {
+    if !matches!(
+        node.kind(),
+        "identifier" | "field_identifier" | "type_identifier"
+    ) {
+        return false;
+    }
+    recovered_c_function_declarator_invocation(node)
+        && visibility
+            .visible_identifier_candidates(file, name)
+            .any(CodeUnit::is_function)
+}
+
+/// Return whether a C identifier belongs to a call-shaped declarator that the
+/// C++ grammar put under an `ERROR` node.
+///
+/// The malformed call can be direct (`f(arg)`) or nested in a parameter
+/// declaration when one of its arguments looks like a type (`f(TYPE, value)`).
+/// In both cases the CST retains the function-declarator and its enclosing
+/// recovery envelope. We walk only those declarator/parameter nodes and stop
+/// at a real expression-bearing boundary; declarations therefore cannot pass
+/// this predicate merely because they have a parameter list.
+fn recovered_c_function_declarator_invocation(node: Node<'_>) -> bool {
+    let function_declarator = if node.parent().is_some_and(|parent| {
+        parent.kind() == "function_declarator"
+            && parent.child_by_field_name("declarator") == Some(node)
+    }) {
+        node.parent().expect("checked function declarator parent")
+    } else {
+        let Some(parameter) = node.parent().filter(|parent| {
+            parent.kind() == "parameter_declaration"
+                && parent.child_by_field_name("type") == Some(node)
+        }) else {
+            return false;
+        };
+        if !parameter
+            .child_by_field_name("declarator")
+            .is_some_and(|declarator| declarator.kind() == "abstract_function_declarator")
+        {
+            return false;
+        }
+        let Some(parameters) = parameter
+            .parent()
+            .filter(|parent| parent.kind() == "parameter_list")
+        else {
+            return false;
+        };
+        let Some(function_declarator) = parameters
+            .parent()
+            .filter(|parent| parent.kind() == "function_declarator")
+        else {
+            return false;
+        };
+        function_declarator
+    };
+
+    let Some(mut current) = function_declarator
+        .parent()
+        .filter(|parent| parent.is_error())
+    else {
+        return false;
+    };
+    loop {
+        let Some(parent) = current.parent() else {
+            return false;
+        };
+        if matches!(
+            parent.kind(),
+            "translation_unit"
+                | "compound_statement"
+                | "preproc_if"
+                | "preproc_ifdef"
+                | "preproc_ifndef"
+                | "preproc_else"
+                | "preproc_elif"
+        ) {
+            return true;
+        }
+        if parent.is_error()
+            || matches!(
+                parent.kind(),
+                "parameter_declaration"
+                    | "parameter_list"
+                    | "function_declarator"
+                    | "abstract_function_declarator"
+                    | "parenthesized_declarator"
+            )
+        {
+            current = parent;
+            continue;
+        }
+        return false;
+    }
+}
+
+/// C permits an identifier named `typename`. The C++ grammar can recover an
+/// assignment using that identifier as a declaration whose declarator is a
+/// parenthesized argument list, for example `typename = f(ctx, value)`. Only
+/// the argument retained beneath the nested `ERROR` is a reference; sibling
+/// declarator identifiers remain binders/grammar artifacts.
+fn recovered_c_parenthesized_declarator_reference(node: Node<'_>) -> bool {
+    let Some(error) = node.parent().filter(|parent| parent.is_error()) else {
+        return false;
+    };
+    if error.named_child_count() != 1 || error.named_child(0) != Some(node) {
+        return false;
+    }
+    let Some(declarator) = error
+        .parent()
+        .filter(|parent| parent.kind() == "parenthesized_declarator")
+    else {
+        return false;
+    };
+    let Some(declaration) = declarator
+        .parent()
+        .filter(|parent| parent.kind() == "declaration")
+    else {
+        return false;
+    };
+    if declaration.child_by_field_name("declarator") != Some(declarator) {
+        return false;
+    }
+    let Some(type_node) = declaration.child_by_field_name("type") else {
+        return false;
+    };
+    type_node.kind() == "dependent_type"
+        && type_node
+            .child(0)
+            .is_some_and(|keyword| keyword.kind() == "typename")
 }
 
 fn recovered_c_explicit_assignment_callee(
@@ -12712,11 +13820,8 @@ fn recovered_c_explicit_assignment_callee(
         return false;
     }
     visibility
-        .cpp
-        .declarations(file)
-        .iter()
-        .chain(visibility.visible_by_file.get(file).into_iter().flatten())
-        .any(|candidate| candidate.identifier() == name && candidate.is_function())
+        .visible_identifier_candidates(file, name)
+        .any(CodeUnit::is_function)
 }
 
 fn recovered_c_macro_binding_role(mut node: Node<'_>) -> bool {
@@ -12751,6 +13856,17 @@ fn recovered_c_reference_anchor(mut node: Node<'_>) -> bool {
     while let Some(parent) = node.parent() {
         if parent.is_error() {
             return false;
+        }
+        // A C macro call recovered as a function declarator can parse an
+        // assignment-shaped argument as an optional parameter. Its
+        // `default_value` field remains an expression role even though the
+        // surrounding call shape is beneath ERROR.
+        if parent.kind() == "optional_parameter_declaration"
+            && parent
+                .child_by_field_name("default_value")
+                .is_some_and(|value| node_range_contains(value, node))
+        {
+            return true;
         }
         if parent.kind().ends_with("_expression")
             || matches!(
@@ -14803,7 +15919,7 @@ enum FullOwnerResolution {
     Ambiguous,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CppClassDeclarationStrength {
     Full,
     Forward,
@@ -15054,6 +16170,42 @@ fn cpp_class_node_has_body(node: Node<'_>) -> bool {
             )
         })
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CppCTagKind {
+    Struct,
+    Union,
+}
+
+fn indexed_c_tag_kind(analyzer: &CppGraphSource<'_>, code_unit: &CodeUnit) -> Option<CppCTagKind> {
+    let declaration = analyzer.get_source(code_unit, false)?;
+    let mut parser = Parser::new();
+    parser
+        .set_language(&tree_sitter_cpp::LANGUAGE.into())
+        .ok()?;
+    let tree = parser.parse(&declaration, None)?;
+    let mut stack = vec![tree.root_node()];
+    while let Some(node) = stack.pop() {
+        let kind = match node.kind() {
+            "struct_specifier" => CppCTagKind::Struct,
+            "union_specifier" => CppCTagKind::Union,
+            _ => {
+                let mut cursor = node.walk();
+                stack.extend(node.named_children(&mut cursor));
+                continue;
+            }
+        };
+        if node
+            .child_by_field_name("name")
+            .is_some_and(|name| node_text(name, &declaration) == code_unit.identifier())
+        {
+            return Some(kind);
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.named_children(&mut cursor));
+    }
+    None
 }
 
 pub fn visible_owner_from_member_name(ctx: &ScanCtx<'_>, code_unit: &CodeUnit) -> Option<CodeUnit> {
@@ -15597,6 +16749,34 @@ struct AfterAll {};
     }
 
     #[test]
+    fn expression_defined_and_ifndef_guards_are_incompatible() {
+        let source = "#if defined(WIN_MODE)\nint selected;\n#endif\n#ifndef WIN_MODE\nint rejected;\n#endif\n";
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_cpp::LANGUAGE.into())
+            .expect("C++ grammar");
+        let tree = parser.parse(source, None).expect("fixture tree");
+        let root = tree.root_node();
+        let selected_start = source.find("selected").expect("selected declaration");
+        let rejected_start = source.find("rejected").expect("rejected declaration");
+        let selected = root
+            .descendant_for_byte_range(selected_start, selected_start + "selected".len())
+            .expect("selected node");
+        let rejected = root
+            .descendant_for_byte_range(rejected_start, rejected_start + "rejected".len())
+            .expect("rejected node");
+        let selected_guards =
+            preprocessor_guard_environment(selected, source).expect("selected guards");
+        let rejected_guards =
+            preprocessor_guard_environment(rejected, source).expect("rejected guards");
+
+        assert!(
+            merge_preprocessor_guards(&selected_guards, &rejected_guards).is_none(),
+            "opposite spellings of one macro guard must contradict"
+        );
+    }
+
+    #[test]
     fn split_language_linkage_wrapper_does_not_contradict_later_c_branch() {
         let source = r#"#ifdef _WIN32
 #if defined(__cplusplus)
@@ -15791,6 +16971,97 @@ static int use_entropy(void) { return entropy_target(); }
             recovered_c_keyword_argument_count(&c_file, unbound_call, unbound_arguments, source),
             0
         );
+    }
+
+    #[test]
+    fn c_function_declarator_recovery_accepts_invocations_not_binders() {
+        let source = r#"#define MAKE(type) type *value
+MAKE(int *);
+typedef struct Item Item;
+struct CPUX86State { struct { int ZMM_L(int); } xmm_regs[8]; };
+void gen_op_movl(void *s, int first, int second) { }
+const char *strZ(const char *value) { return value; }
+int body(void *s) {
+    MAKE(int *);
+    gen_op_movl(s, offsetof(CPUX86State, xmm_regs[0].ZMM_L(0)),
+                offsetof(CPUX86State, xmm_regs[0].ZMM_L(0)));
+    execvp(strZ(value), UNCONSTIFY(char **, args));
+}
+STATIC EFI_STATUS Encode () { return 0; }
+"#;
+        let tree = parse_cpp(source);
+        let top_macro_start = source.find("MAKE(int *);").expect("top macro");
+        let top_macro = tree
+            .root_node()
+            .named_descendant_for_byte_range(top_macro_start, top_macro_start + 4)
+            .expect("top macro node");
+        let body_macro_start = source
+            .match_indices("MAKE(int *);")
+            .nth(1)
+            .expect("body macro")
+            .0;
+        let body_macro = tree
+            .root_node()
+            .named_descendant_for_byte_range(body_macro_start, body_macro_start + 4)
+            .expect("body macro node");
+        let function_call_start = source
+            .find("gen_op_movl(s, offsetof(CPUX86State")
+            .expect("function call");
+        let function_call = tree
+            .root_node()
+            .named_descendant_for_byte_range(function_call_start, function_call_start + 11)
+            .expect("function call node");
+        let strz_start = source.find("strZ(value)").expect("nested function call");
+        let strz = tree
+            .root_node()
+            .named_descendant_for_byte_range(strz_start, strz_start + 4)
+            .expect("nested function call node");
+        let binder_start = source.find("Encode").expect("binder");
+        let binder = tree
+            .root_node()
+            .named_descendant_for_byte_range(binder_start, binder_start + 6)
+            .expect("binder node");
+
+        assert!(recovered_c_function_declarator_invocation(top_macro));
+        assert!(recovered_c_function_declarator_invocation(body_macro));
+        assert!(recovered_c_function_declarator_invocation(function_call));
+        assert!(recovered_c_function_declarator_invocation(strz));
+        assert!(!recovered_c_function_declarator_invocation(binder));
+    }
+
+    #[test]
+    fn c_parenthesized_declarator_recovery_keeps_keyword_argument_and_rejects_siblings() {
+        let source = r#"typedef int krb5_context;
+int helper(int first, int second) { return first + second; }
+static krb5_context ctx;
+int main(int argc, char **argv) {
+    int ccinitial;
+    const char *collection_name, *typename;
+    typename = helper(ctx, ccinitial);
+    return 0;
+}
+"#;
+        let tree = parse_cpp(source);
+        let ctx = tree
+            .root_node()
+            .descendant_for_byte_range(
+                source.find("ctx, ccinitial").expect("ctx argument"),
+                source.find("ctx, ccinitial").expect("ctx argument") + 3,
+            )
+            .expect("ctx node");
+        let ccinitial_start = source.find("ctx, ccinitial").expect("ctx argument") + 5;
+        let ccinitial = tree
+            .root_node()
+            .descendant_for_byte_range(ccinitial_start, ccinitial_start + "ccinitial".len())
+            .expect("sibling node");
+        let typename = named_node_at(&tree, source, "typename = helper");
+        let helper = named_node_at(&tree, source, "helper(ctx, ccinitial)");
+
+        assert_eq!(ctx.kind(), "identifier");
+        assert!(recovered_c_parenthesized_declarator_reference(ctx));
+        assert!(!recovered_c_parenthesized_declarator_reference(ccinitial));
+        assert!(!recovered_c_parenthesized_declarator_reference(typename));
+        assert!(!recovered_c_parenthesized_declarator_reference(helper));
     }
 
     fn first_enum_flattened_namespace(source: &str) -> Option<Vec<String>> {

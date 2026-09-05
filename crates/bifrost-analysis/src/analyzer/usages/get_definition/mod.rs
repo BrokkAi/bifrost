@@ -2,6 +2,7 @@ use crate::analyzer::common::{IdentifierSeek, decorated_identifier_seeks, langua
 use crate::analyzer::languages::language_support;
 use crate::analyzer::lexical_definitions::{
     LexicalBindingResolution, LexicalDefinition, resolve_lexical_binding,
+    resolve_lexical_binding_from_focus,
 };
 use crate::analyzer::read_ledger::{IndexFamily, ReadKey};
 use crate::analyzer::structural::resolution::{BoundaryStatus, PrecedenceTier, RejectionReason};
@@ -13,7 +14,8 @@ use crate::analyzer::usages::cpp_graph::{
     cpp_constructor_type_node, cpp_designated_initializer_owner,
     cpp_enclosing_lexical_scope_components, cpp_field_declared_type_binding, cpp_first_type_child,
     cpp_function_return_type_text, cpp_initialized_effective_using_imports,
-    cpp_is_declaration_name, cpp_is_declarator_node, cpp_name_for, cpp_reference_fqn_candidates,
+    cpp_is_declaration_name, cpp_is_declarator_node, cpp_name_for,
+    cpp_recovered_c_new_expression_argument_at, cpp_reference_fqn_candidates,
     cpp_resolve_bare_call_target, cpp_resolve_block_using_call_target,
     cpp_resolve_type_components_lexically_at_preserving_alias, cpp_signature_arity,
     cpp_split_top_level_commas, cpp_template_reference_arguments, cpp_type_name_components,
@@ -71,6 +73,7 @@ use brokk_bifrost_js_ts::syntax::JsTsImportBinder;
 // crate. The direction is one-way, exactly as it is for rust and python:
 // `brokk_bifrost_ruby::graph` names `ResolutionSession`, `get_definition`,
 // `get_type` and `DefinitionBatchContext` zero times.
+use crate::analyzer::semantic::ResolverOwnedExternalCalleeIdentity;
 use crate::analyzer::usages::scala_graph::{
     import_candidate_fq_names, import_candidate_owner_fq_names,
     package_name_of as scala_package_name_of, scala_builtin_type_name,
@@ -79,11 +82,11 @@ use crate::analyzer::usages::scala_graph::{
 };
 use crate::analyzer::{
     AliasResolver, AnalyzerDefinitionLookup, AnalyzerQueryScope, BoundedDefinitionLookup,
-    CSharpAnalyzer, CodeUnit, CppAnalyzer, DeclarationKind, DispatchExtensibility, GoAnalyzer,
-    IAnalyzer, ImportAnalysisProvider, ImportInfo, JavaAnalyzer, Language, ModuleBindingEventKind,
-    ModuleBindingTimeline, PhpAnalyzer, ProjectFile, PythonAnalyzer, Range, RubyAnalyzer,
-    RustAnalyzer, ScalaAnalyzer, cpp_include_paths, cpp_node_text, csharp_callable_arity,
-    resolve_analyzer, resolve_include_targets,
+    CSharpAnalyzer, CodeUnit, CodeUnitIndex, CppAnalyzer, DeclarationKind, DispatchExtensibility,
+    GoAnalyzer, IAnalyzer, ImportAnalysisProvider, ImportInfo, JavaAnalyzer, Language,
+    ModuleBindingEventKind, ModuleBindingTimeline, PhpAnalyzer, ProjectFile, PythonAnalyzer, Range,
+    RubyAnalyzer, RustAnalyzer, ScalaAnalyzer, cpp_include_paths, cpp_node_text,
+    csharp_callable_arity, resolve_analyzer, resolve_include_targets,
 };
 use crate::cancellation::CancellationToken;
 use crate::hash::{HashMap, HashSet};
@@ -456,6 +459,10 @@ pub struct CallTargetLookupOutcome {
     /// modeled callable rather than merely a spelling that crossed the
     /// workspace boundary.
     pub(crate) exact_external_call: Option<ExactExternalCallProof>,
+    /// Resolver-owned external owner/member identity. Unlike
+    /// `exact_external_call`, this carries no arity or receiver evidence and
+    /// must never mint an exact semantic procedure target on its own.
+    pub(crate) external_callee_identity: Option<ResolverOwnedExternalCalleeIdentity>,
     pub structure_unavailable: bool,
     pub unproven_link_unit: bool,
     pub truncated: bool,
@@ -581,6 +588,7 @@ struct DefinitionResolution {
     call_application: CallApplicationKind,
     dispatch_extensibility: Option<DispatchExtensibility>,
     exact_external_call: Option<ExactExternalCallProof>,
+    external_callee_identity: Option<ResolverOwnedExternalCalleeIdentity>,
 }
 
 impl From<DefinitionLookupOutcome> for DefinitionResolution {
@@ -590,6 +598,7 @@ impl From<DefinitionLookupOutcome> for DefinitionResolution {
             call_application: CallApplicationKind::Unknown,
             dispatch_extensibility: None,
             exact_external_call: None,
+            external_callee_identity: None,
         }
     }
 }
@@ -1213,6 +1222,7 @@ pub fn resolve_call_target_batch_with_source(
                             call_application: CallApplicationKind::Unknown,
                             dispatch_extensibility: None,
                             exact_external_call: None,
+                            external_callee_identity: None,
                             structure_unavailable: false,
                             unproven_link_unit: false,
                             truncated: true,
@@ -1230,6 +1240,7 @@ pub fn resolve_call_target_batch_with_source(
                             call_application: CallApplicationKind::Unknown,
                             dispatch_extensibility: None,
                             exact_external_call: None,
+                            external_callee_identity: None,
                             structure_unavailable: false,
                             unproven_link_unit: false,
                             truncated: false,
@@ -1277,6 +1288,7 @@ pub fn resolve_call_target_batch_with_source(
                     call_application: resolution.call_application,
                     dispatch_extensibility: resolution.dispatch_extensibility,
                     exact_external_call: resolution.exact_external_call,
+                    external_callee_identity: resolution.external_callee_identity,
                     structure_unavailable: false,
                     unproven_link_unit: false,
                     truncated,
@@ -1315,6 +1327,7 @@ pub fn resolve_call_target_batch_with_source(
                     call_application: resolution.call_application,
                     dispatch_extensibility: resolution.dispatch_extensibility,
                     exact_external_call: resolution.exact_external_call,
+                    external_callee_identity: resolution.external_callee_identity,
                     structure_unavailable: false,
                     unproven_link_unit: false,
                     truncated: false,
@@ -1340,6 +1353,7 @@ pub fn resolve_call_target_batch_with_source(
                 call_application: CallApplicationKind::Unknown,
                 dispatch_extensibility: None,
                 exact_external_call: None,
+                external_callee_identity: None,
                 structure_unavailable: false,
                 unproven_link_unit: false,
                 truncated: false,
@@ -1364,6 +1378,7 @@ pub fn resolve_call_target_batch_with_source(
         call_application: CallApplicationKind::Unknown,
         dispatch_extensibility: None,
         exact_external_call: None,
+        external_callee_identity: None,
         structure_unavailable: outcome.structure_unavailable,
         unproven_link_unit: outcome.unproven_link_unit,
         truncated: outcome.truncated,
@@ -1458,6 +1473,7 @@ struct DefinitionBatchContext<'a> {
     trees: HashMap<(ProjectFile, Language), Option<Tree>>,
     line_starts: HashMap<ProjectFile, Arc<Vec<usize>>>,
     cpp_visibility: HashMap<ProjectFile, Arc<CppVisibilityIndex<'a>>>,
+    cpp_live_sources_seeded: bool,
     // Candidate declaration ranges belong to the analyzer generation, so these
     // caches must use indexed source rather than the request's live disk source.
     cpp_indexed_sources: HashMap<ProjectFile, Option<Arc<String>>>,
@@ -1494,6 +1510,7 @@ impl<'a> DefinitionBatchContext<'a> {
             trees: HashMap::default(),
             line_starts: HashMap::default(),
             cpp_visibility: HashMap::default(),
+            cpp_live_sources_seeded: false,
             cpp_indexed_sources: HashMap::default(),
             cpp_indexed_trees: HashMap::default(),
             cpp_navigation_indexes: HashMap::default(),
@@ -1641,6 +1658,20 @@ impl<'a> DefinitionBatchContext<'a> {
     ) -> Arc<CppVisibilityIndex<'a>> {
         let token = self.token;
         let dispatch = CppDispatch::new(analyzer, token);
+        if !self.cpp_live_sources_seeded {
+            // Visibility construction walks include edges before it builds the
+            // per-root declaration set. Those edges can read a candidate's
+            // live source directly, while the declaration walk seeds the
+            // complete live-source snapshot. Seed it first so a candidate
+            // file is validated once per request, independent of whether a
+            // warmed import cache changes which visibility phase reaches it
+            // first.
+            let _ = cpp.analyzed_files();
+            self.cpp_live_sources_seeded = true;
+        }
+        if let Some(index) = self.cpp_visibility.get(file) {
+            return Arc::clone(index);
+        }
         self.cpp_visibility
             .entry(file.clone())
             .or_insert_with(|| {
@@ -1911,14 +1942,43 @@ fn resolve_one_with_evidence<'a>(
             && rust::focused_site_is_macro_argument(tree.root_node(), &site))
         && let Some(identifier) = source.get(site.focus_start_byte..site.focus_end_byte)
     {
-        match resolve_lexical_binding(
+        let lexical_binding = resolve_lexical_binding(
             language,
             tree.root_node(),
             &source,
             site.focus_start_byte,
             site.focus_end_byte,
             identifier,
-        ) {
+        )
+        .or_else(|| {
+            if language != Language::Cpp {
+                return None;
+            }
+            let focus = smallest_named_node_covering(
+                tree.root_node(),
+                site.focus_start_byte,
+                site.focus_end_byte,
+            )?;
+            let dispatch = CppDispatch::new(analyzer, token);
+            let graph = dispatch.source();
+            let value = cpp_recovered_c_new_expression_argument_at(
+                focus,
+                site.focus_start_byte,
+                site.focus_end_byte,
+                graph.reference_uses_c_semantics(&request.file),
+            )?;
+            let recovered_expression = value
+                .parent()
+                .filter(|parent| parent.kind() == "new_expression")?;
+            resolve_lexical_binding_from_focus(
+                language,
+                recovered_expression,
+                &source,
+                site.focus_start_byte,
+                identifier,
+            )
+        });
+        match lexical_binding {
             Some(
                 LexicalBindingResolution::Parameter(definition)
                 | LexicalBindingResolution::OtherLocal(definition),
@@ -1933,6 +1993,7 @@ fn resolve_one_with_evidence<'a>(
     let mut call_application = CallApplicationKind::Unknown;
     let mut dispatch_extensibility = None;
     let mut exact_external_call = None;
+    let mut external_callee_identity = None;
     let resolved = match language {
         Language::Rust => {
             if let Some(cancellation) = cancellation {
@@ -2060,6 +2121,7 @@ fn resolve_one_with_evidence<'a>(
                 call_application = resolution.call_application;
                 dispatch_extensibility = resolution.dispatch_extensibility;
                 exact_external_call = resolution.exact_external_call;
+                external_callee_identity = resolution.external_callee_identity;
                 resolution.outcome
             } else {
                 no_definition("go_analyzer_unavailable", "Go analyzer is unavailable")
@@ -2177,6 +2239,7 @@ fn resolve_one_with_evidence<'a>(
         call_application,
         dispatch_extensibility,
         exact_external_call,
+        external_callee_identity,
     }
 }
 

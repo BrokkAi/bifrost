@@ -271,7 +271,14 @@ fn attach_argument_roles(sink: &mut RoleSink<'_>, arguments: Node<'_>) {
     }
 }
 
-fn named_argument_parts(argument: Node<'_>) -> Option<(Node<'_>, Node<'_>)> {
+/// The keyword name node and the value node of a Scala named argument.
+///
+/// Scala spells `f(name = value)` as an `assignment_expression` whose `left`
+/// names a parameter of the callee, so every consumer that must separate the
+/// label from the passed value reads the same two fields here. The caller
+/// establishes that the assignment really sits in an invocation's argument
+/// list; see `is_scala_named_argument_assignment`.
+pub fn named_argument_parts(argument: Node<'_>) -> Option<(Node<'_>, Node<'_>)> {
     if argument.kind() != "assignment_expression" {
         return None;
     }

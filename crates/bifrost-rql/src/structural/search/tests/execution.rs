@@ -5111,6 +5111,82 @@ func reassignedSpawn(flag bool) int {
     );
 }
 
+/// A method reached through a receiver bound by multi-result destructuring
+/// must be expanded, exactly as one bound from a single-result call is.
+///
+/// `SignatureMetadata` carried a single return identity, so the Go adapter
+/// dropped the result type of any callable declaring more than one. A receiver
+/// bound from such a call had no type, dispatch could not resolve the method,
+/// and the concurrency solver never compared what the method body does. bbolt
+/// binds its transaction exactly this way, in
+/// `tx, err := readOnlyDB.Begin(false)`.
+///
+/// The method writes package state rather than a receiver field so this test
+/// fails only for dispatch. Carrying a receiver field's identity across the
+/// call is a separate open gap, and pinning it here would make this test fail
+/// for two reasons at once.
+#[test]
+fn go_methods_dispatch_on_a_multi_result_bound_receiver() {
+    let project = InlineTestProject::with_language(Language::Go)
+        .file(
+            "main.go",
+            r#"package main
+
+type box struct{ n int }
+
+var shared int
+
+func newBox() (*box, error) { return &box{}, nil }
+
+func newBoxOnly() *box { return &box{} }
+
+func (b *box) bump() { shared = 1 }
+
+func singleResultReceiver() int {
+    b := newBoxOnly()
+    go func() { b.bump() }()
+    return shared
+}
+
+func multiResultReceiver() int {
+    b, _ := newBox()
+    go func() { b.bump() }()
+    return shared
+}
+"#,
+        )
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    for name in ["singleResultReceiver", "multiResultReceiver"] {
+        let query = CodeQuery::from_json(&json!({
+            "languages": ["go"],
+            "match": { "kind": "function", "name": name },
+            "steps": [
+                { "op": "procedure_of" },
+                { "op": "concurrent_access_conflicts" }
+            ],
+            "result_detail": "full"
+        }))
+        .expect("multi-result receiver concurrent access query");
+        let result = execute_workspace(
+            &workspace,
+            &brokk_bifrost_flow::FlowWorkspaceState::new(),
+            &query,
+        );
+        assert_eq!(
+            result.completion(),
+            CodeQueryCompletion::Complete,
+            "{name}: {result:#?}"
+        );
+        let value = find_concurrent_relation(&result, |value| value.verdict == "conflict");
+        assert_eq!(
+            (value.ordering, value.proof, value.coverage),
+            ("unordered", "proven", "exhaustive"),
+            "{name}: {result:#?}"
+        );
+    }
+}
+
 #[test]
 fn go_concurrent_access_conflicts_close_summarized_recursive_slices() {
     let project = InlineTestProject::with_language(Language::Go)

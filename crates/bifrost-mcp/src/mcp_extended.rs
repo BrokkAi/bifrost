@@ -1077,7 +1077,7 @@ pub(crate) fn extended_tool_descriptors() -> Vec<Value> {
                         "minItems": 1,
                         "maxItems": max_policy_files,
                         "uniqueItems": true,
-                        "description": "Optional built-in pack ids."
+                        "description": "Optional built-in pack ids. Selectors intersect: with policy_ids or policy_categories, only policies in this pack that also satisfy those run."
                     },
                     "policy_categories": {
                         "type": "array",
@@ -1089,7 +1089,7 @@ pub(crate) fn extended_tool_descriptors() -> Vec<Value> {
                         "minItems": 1,
                         "maxItems": max_policy_files,
                         "uniqueItems": true,
-                        "description": "Optional built-in policy categories."
+                        "description": "Optional built-in policy categories. Selectors intersect: with policy_packs or policy_ids, only policies in this category that also satisfy those run."
                     },
                     "policy_ids": {
                         "type": "array",
@@ -1101,7 +1101,7 @@ pub(crate) fn extended_tool_descriptors() -> Vec<Value> {
                         "minItems": 1,
                         "maxItems": max_policy_files,
                         "uniqueItems": true,
-                        "description": "Optional stable built-in policy ids."
+                        "description": "Optional stable built-in policy ids. Selectors intersect: with policy_packs or policy_categories, an id outside them selects nothing and is an error."
                     },
                     "suppression_file": {
                         "type": "string",

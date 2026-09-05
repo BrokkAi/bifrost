@@ -500,12 +500,14 @@ pub(super) struct GoDefinitionResolution {
     pub(super) call_application: CallApplicationKind,
     pub(super) dispatch_extensibility: Option<DispatchExtensibility>,
     pub(super) exact_external_call: Option<ExactExternalCallProof>,
+    pub(super) external_callee_identity: Option<ResolverOwnedExternalCalleeIdentity>,
 }
 
 struct GoCallEvidence {
     application: CallApplicationKind,
     dispatch_extensibility: Option<DispatchExtensibility>,
     exact_external_call: Option<ExactExternalCallProof>,
+    external_callee_identity: Option<ResolverOwnedExternalCalleeIdentity>,
 }
 
 impl GoCallEvidence {
@@ -513,6 +515,21 @@ impl GoCallEvidence {
         self.application = proof.call_application();
         self.dispatch_extensibility = proof.dispatch_extensibility();
         self.exact_external_call = Some(proof);
+    }
+
+    fn record_external_identity(&mut self, owner_fqn: &str, member: &str) {
+        let identity = ResolverOwnedExternalCalleeIdentity::new(
+            Language::Go,
+            owner_fqn.to_owned(),
+            member.to_owned(),
+        );
+        debug_assert!(
+            self.external_callee_identity
+                .as_ref()
+                .is_none_or(|existing| existing == &identity),
+            "one Go call cannot resolve to conflicting external identities"
+        );
+        self.external_callee_identity = Some(identity);
     }
 }
 
@@ -551,6 +568,7 @@ pub(super) fn resolve_go(
         application,
         dispatch_extensibility: None,
         exact_external_call: None,
+        external_callee_identity: None,
     };
     let outcome = resolve_go_outcome(
         analyzer,
@@ -568,6 +586,7 @@ pub(super) fn resolve_go(
         call_application: call_evidence.application,
         dispatch_extensibility: call_evidence.dispatch_extensibility,
         exact_external_call: call_evidence.exact_external_call,
+        external_callee_identity: call_evidence.external_callee_identity,
     }
 }
 
@@ -737,8 +756,8 @@ fn resolve_go_outcome(
                 reference,
                 workspace_status,
                 format!("`{package}` is outside this partial Go workspace analysis"),
-                "no_indexed_definition",
                 format!("`{reference}` is not indexed in Go package `{package}`"),
+                call_evidence,
             );
         }
         if selector.is_some() && !resolution.resolved_import_packages.is_empty() {
@@ -830,8 +849,8 @@ fn resolve_go_outcome(
                 reference,
                 GoWorkspacePackageStatus::Absent,
                 format!("`{package}` is outside this partial Go workspace analysis"),
-                "no_indexed_definition",
                 format!("`{reference}` is not indexed in dot-imported Go package `{package}`"),
+                call_evidence,
             );
         }
         if !external_packages.is_empty() {
@@ -913,8 +932,8 @@ fn resolve_go_outcome(
                 name,
                 workspace_status,
                 format!("`{import_path}` is outside this partial Go workspace analysis"),
-                "no_indexed_definition",
                 format!("`{name}` is not indexed in Go package `{import_path}`"),
+                call_evidence,
             );
         }
         if let Some(outcome) = tree.and_then(|tree| {
@@ -1024,8 +1043,8 @@ fn resolve_go_outcome(
             reference,
             GoWorkspacePackageStatus::Absent,
             format!("`{import_path}` is outside this partial Go workspace analysis"),
-            "no_indexed_definition",
             format!("`{reference}` is not indexed in dot-imported Go package `{import_path}`"),
+            call_evidence,
         );
     }
     if !external_dot_imports.is_empty() {
@@ -1063,17 +1082,18 @@ fn go_imported_member_boundary(
     member: &str,
     workspace_status: GoWorkspacePackageStatus,
     boundary_message: String,
-    no_definition_kind: impl Into<String>,
     no_definition_message: impl Into<String>,
+    call_evidence: &mut GoCallEvidence,
 ) -> DefinitionLookupOutcome {
     let mut outcome = go_workspace_package_boundary(
         import_path,
         workspace_status,
         boundary_message,
-        no_definition_kind,
+        "no_indexed_definition",
         no_definition_message,
     );
     if outcome.status == DefinitionLookupStatus::UnresolvableImportBoundary {
+        call_evidence.record_external_identity(import_path, member);
         let mut reference = site.clone();
         reference.text = format!("{import_path}.{member}");
         outcome.reference = Some(reference);
@@ -3750,9 +3770,6 @@ fn go_callable_return_inferred_type(
     candidates: Vec<CodeUnit>,
     result_ordinal: usize,
 ) -> Option<GoInferredType> {
-    if result_ordinal != 0 {
-        return None;
-    }
     let mut inferred = Vec::new();
     for candidate in candidates {
         if !support.scope_step() {
@@ -3762,7 +3779,10 @@ fn go_callable_return_inferred_type(
             if !support.scope_step() {
                 return None;
             }
-            let Some(identity) = metadata.into_return_type_identity() else {
+            // A multi-result callable answers by position; a single-result one
+            // has no positional list and answers ordinal zero from its one
+            // return identity.
+            let Some(identity) = metadata.result_type_identity(result_ordinal).cloned() else {
                 continue;
             };
             let candidate_type = GoInferredType {

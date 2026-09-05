@@ -361,35 +361,44 @@ impl BuiltInPolicyCatalog {
         self.document.packs.iter().find(|pack| pack.id == pack_id)
     }
 
+    /// Resolve a selection against the shipped catalog.
+    ///
+    /// Every non-empty dimension is a constraint, not an addition: a policy is
+    /// selected when its pack, its category, and its id each satisfy the
+    /// dimension the caller provided, and an empty dimension constrains
+    /// nothing. So `packs = [p]` with `policy_ids = [i]` runs the single
+    /// policy `i` inside `p`, never the whole pack (issue 2923). Output keeps
+    /// catalog order, which reports and digests depend on.
     pub fn select(
         &'static self,
         selection: &BuiltInPolicySelection,
     ) -> Result<Vec<SelectedBuiltInPolicy>, BuiltInPolicyError> {
-        let mut selected_ids = HashSet::new();
+        // A caller that names no built-in selector asks for no built-in
+        // policy; the whole catalog is requested by naming its packs.
+        if selection.is_empty() {
+            return Ok(Vec::new());
+        }
+
         for pack in &selection.packs {
             if self.pack_manifest(pack).is_none() {
                 return Err(BuiltInPolicyError::new(format!(
                     "unknown built-in policy pack `{pack}`"
                 )));
             }
-            let manifest = self.pack_manifest(pack).expect("validated pack");
-            selected_ids.extend(manifest.policies.iter().map(|entry| entry.id.as_str()));
         }
 
         for category in &selection.categories {
-            let matching = self
+            let known = self
                 .document
                 .packs
                 .iter()
                 .flat_map(|pack| pack.policies.iter())
-                .filter(|entry| &entry.category == category)
-                .collect::<Vec<_>>();
-            if matching.is_empty() {
+                .any(|entry| &entry.category == category);
+            if !known {
                 return Err(BuiltInPolicyError::new(format!(
                     "unknown built-in policy category `{category}`"
                 )));
             }
-            selected_ids.extend(matching.into_iter().map(|entry| entry.id.as_str()));
         }
 
         for policy_id in &selection.policy_ids {
@@ -398,21 +407,37 @@ impl BuiltInPolicyCatalog {
                     "unknown built-in policy id `{policy_id}`"
                 )));
             }
-            selected_ids.insert(policy_id.as_str());
         }
 
-        Ok(self
+        let selected = self
             .document
             .packs
             .iter()
             .flat_map(|pack| pack.policies.iter().map(move |entry| (pack, entry)))
-            .filter(|(_, entry)| selected_ids.contains(entry.id.as_str()))
+            .filter(|(pack, entry)| {
+                [
+                    (&selection.packs, &pack.id),
+                    (&selection.categories, &entry.category),
+                    (&selection.policy_ids, &entry.id),
+                ]
+                .into_iter()
+                .all(|(dimension, value)| dimension.is_empty() || dimension.contains(value))
+            })
             .map(|(pack, entry)| SelectedBuiltInPolicy {
                 manifest: entry,
                 source: self.source_by_policy_id[entry.id.as_str()],
                 pack_id: pack.id.as_str(),
             })
-            .collect())
+            .collect::<Vec<_>>();
+        if selected.is_empty() {
+            return Err(BuiltInPolicyError::new(format!(
+                "built-in policy selection matches no policy: every named selector exists, \
+                 but no policy satisfies all of them together (packs {:?}, categories {:?}, \
+                 policy ids {:?})",
+                selection.packs, selection.categories, selection.policy_ids
+            )));
+        }
+        Ok(selected)
     }
 }
 
@@ -592,6 +617,166 @@ mod tests {
         assert_eq!(
             security[0].source_identity().as_str(),
             "builtin:bifrost.security/policies/jvm/servlet-parameter-to-jdbc.rqlp"
+        );
+    }
+
+    fn selected_ids(selection: &BuiltInPolicySelection) -> Result<Vec<String>, String> {
+        built_in_policy_catalog()
+            .expect("valid built-in catalog")
+            .select(selection)
+            .map(|selected| {
+                selected
+                    .into_iter()
+                    .map(|policy| policy.manifest().id.clone())
+                    .collect()
+            })
+            .map_err(|error| error.to_string())
+    }
+
+    #[test]
+    fn a_pack_and_an_id_select_only_that_id() {
+        assert_eq!(
+            selected_ids(&BuiltInPolicySelection {
+                packs: vec![CODE_SMELLS_PACK_ID.to_owned()],
+                policy_ids: vec!["bifrost.performance.loop-invariant-sort".to_owned()],
+                ..BuiltInPolicySelection::default()
+            }),
+            Ok(vec!["bifrost.performance.loop-invariant-sort".to_owned()])
+        );
+    }
+
+    #[test]
+    fn a_category_narrows_within_the_named_pack() {
+        let selected = selected_ids(&BuiltInPolicySelection {
+            packs: vec![CODE_SMELLS_PACK_ID.to_owned()],
+            categories: vec!["correctness".to_owned()],
+            ..BuiltInPolicySelection::default()
+        })
+        .expect("code-smells correctness policies");
+        assert!(
+            selected
+                .iter()
+                .all(|id| id.starts_with("bifrost.correctness.")),
+            "{selected:?}"
+        );
+        assert_eq!(selected.len(), 6, "{selected:?}");
+        // The security pack's only policy is in category `security`, so the
+        // category dimension alone never reaches it from this request.
+        assert!(
+            !selected.contains(&"bifrost.security.java.servlet-parameter-to-jdbc".to_owned()),
+            "{selected:?}"
+        );
+    }
+
+    #[test]
+    fn a_category_alone_spans_every_pack_that_declares_it() {
+        assert_eq!(
+            selected_ids(&BuiltInPolicySelection {
+                categories: vec!["security".to_owned()],
+                ..BuiltInPolicySelection::default()
+            }),
+            Ok(vec![
+                "bifrost.security.java.servlet-parameter-to-jdbc".to_owned()
+            ])
+        );
+    }
+
+    #[test]
+    fn an_id_alone_still_selects_that_policy() {
+        assert_eq!(
+            selected_ids(&BuiltInPolicySelection {
+                policy_ids: vec!["bifrost.correctness.go-data-race".to_owned()],
+                ..BuiltInPolicySelection::default()
+            }),
+            Ok(vec!["bifrost.correctness.go-data-race".to_owned()])
+        );
+    }
+
+    #[test]
+    fn several_ids_keep_catalog_order() {
+        assert_eq!(
+            selected_ids(&BuiltInPolicySelection {
+                policy_ids: vec![
+                    "bifrost.performance.sleep-in-loop".to_owned(),
+                    "bifrost.correctness.dynamic-evaluation".to_owned(),
+                ],
+                ..BuiltInPolicySelection::default()
+            }),
+            Ok(vec![
+                "bifrost.correctness.dynamic-evaluation".to_owned(),
+                "bifrost.performance.sleep-in-loop".to_owned(),
+            ])
+        );
+    }
+
+    #[test]
+    fn an_empty_selection_selects_no_built_in_policy() {
+        assert_eq!(
+            selected_ids(&BuiltInPolicySelection::default()),
+            Ok(Vec::new())
+        );
+    }
+
+    #[test]
+    fn an_id_outside_the_named_pack_is_an_error() {
+        let error = selected_ids(&BuiltInPolicySelection {
+            packs: vec![SECURITY_PACK_ID.to_owned()],
+            policy_ids: vec!["bifrost.performance.loop-invariant-sort".to_owned()],
+            ..BuiltInPolicySelection::default()
+        })
+        .expect_err("an id outside the named pack matches nothing");
+        assert!(error.contains("matches no policy"), "{error}");
+        assert!(error.contains("bifrost.security"), "{error}");
+        assert!(
+            error.contains("bifrost.performance.loop-invariant-sort"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_category_outside_the_named_pack_is_an_error() {
+        let error = selected_ids(&BuiltInPolicySelection {
+            packs: vec![SECURITY_PACK_ID.to_owned()],
+            categories: vec!["performance".to_owned()],
+            ..BuiltInPolicySelection::default()
+        })
+        .expect_err("no security-pack policy is in category performance");
+        assert!(error.contains("matches no policy"), "{error}");
+        assert!(error.contains("performance"), "{error}");
+    }
+
+    #[test]
+    fn unknown_selector_names_are_still_errors() {
+        assert_eq!(
+            selected_ids(&BuiltInPolicySelection {
+                packs: vec!["bifrost.nonexistent".to_owned()],
+                ..BuiltInPolicySelection::default()
+            }),
+            Err("unknown built-in policy pack `bifrost.nonexistent`".to_owned())
+        );
+        assert_eq!(
+            selected_ids(&BuiltInPolicySelection {
+                categories: vec!["nonexistent".to_owned()],
+                ..BuiltInPolicySelection::default()
+            }),
+            Err("unknown built-in policy category `nonexistent`".to_owned())
+        );
+        assert_eq!(
+            selected_ids(&BuiltInPolicySelection {
+                policy_ids: vec!["bifrost.nonexistent.policy".to_owned()],
+                ..BuiltInPolicySelection::default()
+            }),
+            Err("unknown built-in policy id `bifrost.nonexistent.policy`".to_owned())
+        );
+        // An unknown name is reported even when another dimension already
+        // narrows the request to nothing.
+        assert_eq!(
+            selected_ids(&BuiltInPolicySelection {
+                packs: vec![SECURITY_PACK_ID.to_owned()],
+                policy_ids: vec!["bifrost.nonexistent.policy".to_owned()],
+                ..BuiltInPolicySelection::default()
+            }),
+            Err("unknown built-in policy id `bifrost.nonexistent.policy`".to_owned())
         );
     }
 

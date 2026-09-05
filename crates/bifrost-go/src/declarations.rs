@@ -319,6 +319,7 @@ pub fn go_signature_metadata(
             .with_return_type_identity(
                 return_type.and_then(|result| go_structured_type_identity(result, source)),
             )
+            .with_result_type_identities(go_declared_result_type_identities(node, source))
             .with_extension_receiver_type_identity(
                 receiver_type.and_then(|receiver| go_structured_type_identity(receiver, source)),
             )
@@ -358,6 +359,52 @@ pub fn go_signature_metadata(
         })
         .collect();
     enrich(SignatureMetadata::new(signature, parameters))
+}
+
+/// One structured identity per declared result of a multi-result callable.
+///
+/// `func f() T` states its result as a bare type node and is already described
+/// by the single `return_type_identity`. `func f() (T, error)` states a
+/// `parameter_list` instead, which that single field cannot represent, so a
+/// caller asking what `b` is bound to in `b, _ := f()` previously got nothing
+/// at all. Go also spells a named or parenthesized single result this way.
+///
+/// A declaration that names several results of one type, `(a, b T)`, declares
+/// one identity per name, so the ordinals stay aligned with the call's
+/// results. A result whose type does not resolve to a structured identity
+/// stops the list rather than shifting every later ordinal onto the wrong
+/// type.
+fn go_declared_result_type_identities(node: Node<'_>, source: &str) -> Vec<StructuredTypeIdentity> {
+    let Some(result) = node
+        .child_by_field_name("result")
+        .filter(|result| result.kind() == "parameter_list")
+    else {
+        return Vec::new();
+    };
+    let mut cursor = result.walk();
+    let mut identities = Vec::new();
+    for declaration in result.named_children(&mut cursor) {
+        if !matches!(
+            declaration.kind(),
+            "parameter_declaration" | "variadic_parameter_declaration"
+        ) {
+            continue;
+        }
+        let Some(identity) = declaration
+            .child_by_field_name("type")
+            .and_then(|kind| go_structured_type_identity(kind, source))
+        else {
+            return Vec::new();
+        };
+        let mut names = declaration.walk();
+        let named = declaration
+            .named_children(&mut names)
+            .filter(|child| child.kind() == "identifier")
+            .count()
+            .max(1);
+        identities.extend(std::iter::repeat_n(identity, named));
+    }
+    identities
 }
 
 pub fn go_method_receiver_type_node(node: Node<'_>) -> Option<Node<'_>> {

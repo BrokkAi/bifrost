@@ -1,5 +1,7 @@
 //! Scala lowering into the language-neutral executable-semantics IR.
 
+use brokk_bifrost_jvm::scala::graph::syntax::is_scala_named_argument_assignment;
+use brokk_bifrost_jvm::scala::structural::named_argument_parts;
 use tree_sitter::Node;
 
 use crate::analyzer::lexical_definitions::formal_parameter_slots_for_owner;
@@ -17,7 +19,7 @@ use crate::analyzer::{DispatchExtensibility, Language, ProjectFile, ScalaAnalyze
 use crate::hash::HashMap;
 use std::sync::Arc;
 
-const ADAPTER_VERSION: &[u8] = b"scala-value-semantics-v7";
+const ADAPTER_VERSION: &[u8] = b"scala-value-semantics-v8";
 
 /// Bound on the expression nodes examined while proving that a result
 /// expression already carries the callable's declared result type. The
@@ -3361,9 +3363,18 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         )?;
         let arguments = argument_nodes
             .iter()
-            .map(|argument| {
-                self.expression_value(builder, *argument, expression_value_kind(*argument))
-            })
+            .map(
+                |argument| -> Result<SemanticCallArgument, ScalaLoweringError> {
+                    let written = self.call_argument(builder, *argument)?;
+                    // A contextual (`using`) list inserts arguments this syntax
+                    // never wrote, so the written rows carry no proven domain.
+                    Ok(if has_implicit_arguments {
+                        SemanticCallArgument::unclassified(written.value)
+                    } else {
+                        written
+                    })
+                },
+            )
             .collect::<Result<Vec<_>, _>>()?;
         let call_site = self.session.add_call_site(
             builder,
@@ -3371,16 +3382,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 point: invoke,
                 callee,
                 receiver,
-                arguments: arguments
-                    .into_iter()
-                    .map(|value| {
-                        if has_implicit_arguments {
-                            SemanticCallArgument::unclassified(value)
-                        } else {
-                            SemanticCallArgument::direct(value, ArgumentDomain::Positional)
-                        }
-                    })
-                    .collect(),
+                arguments: arguments.into(),
                 normal_results: Box::new([]),
                 result: Some(result),
                 thrown: Some(thrown),
@@ -3502,7 +3504,14 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         }
         for arguments in &argument_lists {
             if !has_structured_by_name_argument(*arguments) {
-                evaluations.extend(runtime_expression_children(*arguments));
+                // A named argument evaluates its right-hand side. Scheduling
+                // the `assignment_expression` itself lowered the label as a
+                // store to a same-named binding in the caller's scope.
+                evaluations.extend(
+                    runtime_expression_children(*arguments)
+                        .into_iter()
+                        .map(call_argument_value_node),
+                );
             }
         }
         self.schedule_expressions(
@@ -3729,6 +3738,38 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         )
     }
 
+    /// Lower one written call argument into its call-site row.
+    ///
+    /// Scala spells a named argument as an `assignment_expression` inside the
+    /// invocation's argument list. The label names a formal at the callee and
+    /// the passed value is the right-hand side, so the row binds that value
+    /// and carries the label; binding the assignment node instead published a
+    /// value identity no formal ever receives (#2959). Every other argument,
+    /// including an assignment whose left side is not a plain name and is
+    /// therefore a unit-typed assignment expression, stays positional and
+    /// binds the argument node itself.
+    fn call_argument(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        argument: Node<'tree>,
+    ) -> Result<SemanticCallArgument, ScalaLoweringError> {
+        let Some((keyword, passed)) = named_call_argument_parts(argument) else {
+            let value =
+                self.expression_value(builder, argument, expression_value_kind(argument))?;
+            return Ok(SemanticCallArgument::direct(
+                value,
+                ArgumentDomain::Positional,
+            ));
+        };
+        let value = self.expression_value(builder, passed, expression_value_kind(passed))?;
+        let name = node_text(self.prepared.source(), keyword).ok_or_else(|| {
+            ScalaLoweringError::Invalid(
+                "Scala named argument label does not lie on a source boundary".into(),
+            )
+        })?;
+        Ok(SemanticCallArgument::keyword(value, name))
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn call_like_expression(
         &mut self,
@@ -3775,9 +3816,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         )?;
         let arguments = argument_nodes
             .iter()
-            .map(|argument| {
-                self.expression_value(builder, *argument, expression_value_kind(*argument))
-            })
+            .map(|argument| self.call_argument(builder, *argument))
             .collect::<Result<Vec<_>, _>>()?;
         let call_site = self.session.add_call_site(
             builder,
@@ -3785,10 +3824,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 point: invoke,
                 callee,
                 receiver,
-                arguments: arguments
-                    .into_iter()
-                    .map(|value| SemanticCallArgument::direct(value, ArgumentDomain::Positional))
-                    .collect(),
+                arguments: arguments.into(),
                 normal_results: Box::new([]),
                 result: Some(result),
                 thrown: Some(thrown),
@@ -3837,10 +3873,15 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 "argument evaluation strictness depends on the resolved Scala parameter signature",
             )?;
         }
+        let evaluations = evaluations
+            .iter()
+            .copied()
+            .map(call_argument_value_node)
+            .collect::<Vec<_>>();
         self.schedule_expressions(
             builder,
             entry,
-            evaluations,
+            &evaluations,
             EdgeTarget::normal(invoke),
             scope,
             stack,
@@ -4555,6 +4596,24 @@ fn normalized_callable_expression(mut node: Node<'_>) -> Result<Node<'_>, ScalaL
         node = required_field(node, "function")?;
     }
     Ok(node)
+}
+
+/// The label and passed value of a Scala named call argument.
+///
+/// The shape test is structural and belongs to the shared Scala layer: the
+/// assignment must sit directly in an invocation's argument list
+/// (`is_scala_named_argument_assignment`) and its left side must be a plain
+/// name (`named_argument_parts`). `x.y = 1` written as an argument satisfies
+/// neither and stays the unit-typed assignment expression it is.
+fn named_call_argument_parts<'tree>(argument: Node<'tree>) -> Option<(Node<'tree>, Node<'tree>)> {
+    is_scala_named_argument_assignment(argument)
+        .then(|| named_argument_parts(argument))
+        .flatten()
+}
+
+/// The expression a written call argument evaluates.
+fn call_argument_value_node(argument: Node<'_>) -> Node<'_> {
+    named_call_argument_parts(argument).map_or(argument, |(_, passed)| passed)
 }
 
 fn semantic_argument_nodes(arguments: Node<'_>) -> Vec<Node<'_>> {

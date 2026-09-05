@@ -8,12 +8,13 @@ use crate::declarations::{
     CppVisitor, collect_cpp_identifiers, collect_cpp_includes, recover_quoted_includes,
 };
 use crate::graph::resolver::OrphanedNamespaceScopeIndex;
+use crate::graph::syntax::MacroReplacementField;
 use brokk_bifrost_core::analyzer::ProjectFile;
 use brokk_bifrost_core::analyzer::cognitive_complexity;
 use brokk_bifrost_core::analyzer::model::{Language, LanguageDialect};
 use brokk_bifrost_core::analyzer::parsed_file::ParsedFile;
 use brokk_bifrost_core::analyzer::tree_walk::ParentIndex;
-use brokk_bifrost_core::hash::HashMap;
+use brokk_bifrost_core::hash::{HashMap, HashSet};
 use std::sync::LazyLock;
 use tree_sitter::{Node, Tree};
 
@@ -51,6 +52,28 @@ pub fn parse_cpp_file(file: &ProjectFile, source: &str, tree: &Tree) -> ParsedFi
         source,
         tree,
         LanguageDialect::for_path(Language::Cpp, file.rel_path()),
+    )
+}
+
+/// Extract a source after seeding its object-like field-list environment from
+/// include-visible declarations. The seed is consumed structurally by the
+/// ordinary declaration walk; local definitions and undef directives retain
+/// their source-order semantics.
+pub fn parse_cpp_file_with_object_macro_fields(
+    file: &ProjectFile,
+    source: &str,
+    tree: &Tree,
+    object_macro_fields: HashMap<String, Vec<MacroReplacementField>>,
+) -> ParsedFile {
+    let root = tree.root_node();
+    let ancestry = ParentIndex::new(root);
+    parse_cpp_reading_with_object_macro_fields(
+        file,
+        source,
+        root,
+        LanguageDialect::for_path(Language::Cpp, file.rel_path()),
+        &ancestry,
+        object_macro_fields,
     )
 }
 
@@ -128,6 +151,7 @@ pub fn parse_cpp_c_reading<'tree>(
         LanguageDialect::CppC,
         ancestry,
         &mut parsed,
+        HashMap::default(),
     );
     parsed.finalize_deferred_replacements();
 
@@ -160,12 +184,38 @@ fn parse_cpp_reading<'tree>(
     dialect: LanguageDialect,
     ancestry: &ParentIndex<'tree>,
 ) -> ParsedFile {
+    parse_cpp_reading_with_object_macro_fields(
+        file,
+        source,
+        root,
+        dialect,
+        ancestry,
+        HashMap::default(),
+    )
+}
+
+fn parse_cpp_reading_with_object_macro_fields<'tree>(
+    file: &ProjectFile,
+    source: &str,
+    root: Node<'tree>,
+    dialect: LanguageDialect,
+    ancestry: &ParentIndex<'tree>,
+    object_macro_fields: HashMap<String, Vec<MacroReplacementField>>,
+) -> ParsedFile {
     let mut parsed = ParsedFile::new(String::new());
 
     collect_cpp_includes(root, source, &mut parsed);
     collect_cpp_identifiers(root, source, &mut parsed.type_identifiers);
 
-    walk_cpp_declarations(file, source, root, dialect, ancestry, &mut parsed);
+    walk_cpp_declarations(
+        file,
+        source,
+        root,
+        dialect,
+        ancestry,
+        &mut parsed,
+        object_macro_fields,
+    );
     // A line scan over the source rather than a tree walk: it recovers the
     // quoted directives a parse error hid from the tree, skipping any snippet
     // the sweep above already recorded.
@@ -184,6 +234,7 @@ fn walk_cpp_declarations<'tree>(
     dialect: LanguageDialect,
     ancestry: &ParentIndex<'tree>,
     parsed: &mut ParsedFile,
+    object_macro_fields: HashMap<String, Vec<MacroReplacementField>>,
 ) {
     let mut visitor = CppVisitor {
         file,
@@ -196,6 +247,8 @@ fn walk_cpp_declarations<'tree>(
         namespace_forward_scans: HashMap::default(),
         field_owners: None,
         recovery_captures: Vec::new(),
+        object_macro_fields,
+        ambiguous_object_macro_fields: HashSet::default(),
     };
     visitor.visit_container(root, ancestry, "", None, None, None, Vec::new());
 }

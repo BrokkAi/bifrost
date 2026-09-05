@@ -31,7 +31,7 @@ const BASELINE_MIGRATION_VERSION: i64 = 18;
 // Version 25 belonged to a rejected local relational-key experiment. Skipping
 // it prevents an old experimental v25 store from being mistaken for this
 // schema; the version sequence is intentionally monotonic, not contiguous.
-const CURRENT_MIGRATION_VERSION: i64 = 42;
+const CURRENT_MIGRATION_VERSION: i64 = 43;
 pub const OPTIONAL_FACT_KIND_CPP_TEMPLATE_METADATA: i64 = 1;
 pub const OPTIONAL_FACT_KIND_RUBY_METHOD_DISPATCH_MODE: i64 = 2;
 pub const OPTIONAL_FACT_KIND_SCALA_TRAIT: i64 = 3;
@@ -81,6 +81,8 @@ const STRUCTURAL_FACT_LABELS_FROM_REGISTRY_SQL: &str =
 const POLICY_ROOT_UNITS_SQL: &str = include_str!("../migrations/cache/0041-policy-root-units.sql");
 const POLICY_SELECTOR_UNITS_SQL: &str =
     include_str!("../migrations/cache/0042-policy-selector-units.sql");
+const SIGNATURE_RESULT_TYPE_IDENTITIES_SQL: &str =
+    include_str!("../migrations/cache/0043-signature-result-type-identities.sql");
 
 // Migration 0023 spells the signature-metadata byte cap as the literal 8388608,
 // because a checked-in SQL file cannot interpolate a Rust constant. The two must
@@ -101,7 +103,7 @@ struct CacheMigration {
     sql: &'static str,
 }
 
-const CACHE_MIGRATIONS: [CacheMigration; 24] = [
+const CACHE_MIGRATIONS: [CacheMigration; 25] = [
     CacheMigration {
         version: 18,
         sql: CURRENT_BASELINE_SQL,
@@ -197,6 +199,10 @@ const CACHE_MIGRATIONS: [CacheMigration; 24] = [
     CacheMigration {
         version: 42,
         sql: POLICY_SELECTOR_UNITS_SQL,
+    },
+    CacheMigration {
+        version: 43,
+        sql: SIGNATURE_RESULT_TYPE_IDENTITIES_SQL,
     },
 ];
 

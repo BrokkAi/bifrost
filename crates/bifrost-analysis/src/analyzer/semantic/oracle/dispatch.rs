@@ -29,6 +29,64 @@ pub struct DispatchCandidate {
     sealed: bool,
 }
 
+/// Structured identity supplied by a language resolver for an external
+/// callee whose body is outside the indexed workspace.
+///
+/// This is deliberately not a semantic procedure target: it carries only the
+/// language, owner, and member that the resolver proved. Call-shape facts
+/// such as effective arity and receiver binding remain in the resolver's exact
+/// external-call proof and are required before an unmaterialized semantic
+/// locator can be minted.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ResolverOwnedExternalCalleeIdentity {
+    language: Language,
+    owner_fqn: Box<str>,
+    member: Box<str>,
+}
+
+impl ResolverOwnedExternalCalleeIdentity {
+    /// Construct a validated resolver-owned identity. An identity with an
+    /// empty owner/member or an unsupported `None` language is not evidence
+    /// that can cross the resolver boundary.
+    pub(crate) fn new(
+        language: Language,
+        owner_fqn: impl Into<Box<str>>,
+        member: impl Into<Box<str>>,
+    ) -> Self {
+        let owner_fqn = owner_fqn.into();
+        let member = member.into();
+        assert!(language != Language::None);
+        assert!(!owner_fqn.is_empty());
+        assert!(!member.is_empty());
+        Self {
+            language,
+            owner_fqn,
+            member,
+        }
+    }
+
+    pub const fn language(&self) -> Language {
+        self.language
+    }
+
+    pub fn owner_fqn(&self) -> &str {
+        &self.owner_fqn
+    }
+
+    pub fn member(&self) -> &str {
+        &self.member
+    }
+
+    pub(crate) fn matches_unmaterialized_external_target(
+        &self,
+        target: &UnmaterializedExternalTarget,
+    ) -> bool {
+        self.language == target.language().language()
+            && self.owner_fqn.as_ref() == target.owner_fqn()
+            && self.member.as_ref() == target.member()
+    }
+}
+
 impl DispatchCandidate {
     /// Create a draft that becomes a candidate-specific query token only
     /// after validation by [`DispatchResult::new`].
@@ -125,6 +183,11 @@ impl DispatchCandidate {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct DispatchBoundary {
     pub kind: DispatchBoundaryKind,
+    /// Resolver-owned owner/member identity for an external callee. This is
+    /// intentionally independent of [`ExactExternalCallProof`]: it can name
+    /// an external demand even when call-shape evidence is insufficient to
+    /// mint a semantic procedure target.
+    pub external_callee_identity: Option<ResolverOwnedExternalCalleeIdentity>,
     /// Exact resolver-owned metadata for a named procedure whose body is not
     /// materialized in the workspace. This remains absent when dispatch lacks
     /// any one of the exact artifact, declaration, symbol, receiver, or formal
@@ -156,6 +219,12 @@ impl DispatchBoundary {
     /// (#1978).
     pub fn unmaterialized_external_target(&self) -> Option<&UnmaterializedExternalTarget> {
         self.unmaterialized_external_target.as_ref()
+    }
+
+    /// Resolver-owned external owner/member identity, when the external
+    /// boundary has one. This never implies an exact semantic procedure.
+    pub fn external_callee_identity(&self) -> Option<&ResolverOwnedExternalCalleeIdentity> {
+        self.external_callee_identity.as_ref()
     }
 
     /// Return the receiver shape proved independently of an external body.
@@ -198,6 +267,22 @@ impl DispatchBoundary {
         &self,
         call: &CallSiteHandle,
     ) -> Result<(), OracleContractError> {
+        let external_identity_is_valid = match (
+            &self.external_callee_identity,
+            &self.kind,
+            &self.exact_external_target,
+            &self.unmaterialized_external_target,
+        ) {
+            (None, _, _, _) => true,
+            (Some(_), DispatchBoundaryKind::External(_), None, None) => true,
+            (Some(identity), DispatchBoundaryKind::External(_), None, Some(target)) => {
+                identity.matches_unmaterialized_external_target(target)
+            }
+            _ => false,
+        };
+        if !external_identity_is_valid {
+            return Err(OracleContractError::InvalidRelationIdentity);
+        }
         let exact_target_is_valid = match (
             &self.kind,
             &self.exact_external_target,

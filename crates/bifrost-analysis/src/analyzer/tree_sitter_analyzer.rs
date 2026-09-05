@@ -1420,13 +1420,30 @@ pub(crate) struct ImportFileFacts {
     pub(crate) contains_tests: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DirtyFileStateStatus {
+    Retryable,
+    TerminalStale,
+    TerminalResourceBound,
+}
+
+fn dirty_file_state_status(error: &StoreError) -> DirtyFileStateStatus {
+    if error.is_stale_generation() {
+        DirtyFileStateStatus::TerminalStale
+    } else if error.is_resource_bound() {
+        DirtyFileStateStatus::TerminalResourceBound
+    } else {
+        DirtyFileStateStatus::Retryable
+    }
+}
+
 #[derive(Debug, Clone)]
 struct DirtyFileState {
     state: Arc<FileState>,
     generation: GenerationId,
     attempts: usize,
     next_retry_at: Instant,
-    terminal_stale: bool,
+    status: DirtyFileStateStatus,
     _last_error: String,
 }
 
@@ -5665,7 +5682,7 @@ where
                                 let key = Self::transient_cache_key(oid, &file);
                                 match error {
                                     Some(error) => {
-                                        let terminal_stale = error.is_stale_generation();
+                                        let status = dirty_file_state_status(&error);
                                         dirty_file_states.insert(
                                             key.clone(),
                                             Self::dirty_file_state(
@@ -5673,7 +5690,7 @@ where
                                                 store_context.generations[storage_key],
                                                 STORE_WRITE_IMMEDIATE_RETRIES + 1,
                                                 error.to_string(),
-                                                terminal_stale,
+                                                status,
                                             ),
                                         );
                                     }
@@ -5921,14 +5938,14 @@ where
         generation: GenerationId,
         attempts: usize,
         last_error: String,
-        terminal_stale: bool,
+        status: DirtyFileStateStatus,
     ) -> DirtyFileState {
         DirtyFileState {
             state,
             generation,
             attempts,
             next_retry_at: Instant::now() + Self::dirty_retry_delay(attempts),
-            terminal_stale,
+            status,
             _last_error: last_error,
         }
     }
@@ -5953,8 +5970,9 @@ where
                 Ok(()) => return Ok(attempt),
                 Err(err) => {
                     let stale = err.is_stale_generation();
+                    let resource_bound = err.is_resource_bound();
                     last_error = Some(err);
-                    if stale {
+                    if stale || resource_bound {
                         break;
                     }
                     if attempt <= STORE_WRITE_IMMEDIATE_RETRIES {
@@ -5990,7 +6008,7 @@ where
                 dirty_file_states.remove(&key);
             }
             Err(err) => {
-                let terminal_stale = err.is_stale_generation();
+                let status = dirty_file_state_status(&err);
                 dirty_file_states.insert(
                     key,
                     Self::dirty_file_state(
@@ -5998,7 +6016,7 @@ where
                         generation,
                         STORE_WRITE_IMMEDIATE_RETRIES + 1,
                         err.to_string(),
-                        terminal_stale,
+                        status,
                     ),
                 );
             }
@@ -6025,7 +6043,9 @@ where
                 .lock()
                 .expect("dirty file-state mutex poisoned");
             let dirty = dirty_file_states.get(key)?;
-            if dirty.terminal_stale || Instant::now() < dirty.next_retry_at {
+            if dirty.status != DirtyFileStateStatus::Retryable
+                || Instant::now() < dirty.next_retry_at
+            {
                 return Some(Arc::clone(&dirty.state));
             }
             (Arc::clone(&dirty.state), dirty.generation)
@@ -6061,9 +6081,11 @@ where
                 Some(state)
             }
             Err(err) => {
-                self.record_store_error(
-                    err.clone().context("retrying a deferred parsed-blob write"),
-                );
+                if !err.is_resource_bound() {
+                    self.record_store_error(
+                        err.clone().context("retrying a deferred parsed-blob write"),
+                    );
+                }
                 let mut dirty_file_states = self
                     .state
                     .dirty_file_states
@@ -6071,7 +6093,9 @@ where
                     .expect("dirty file-state mutex poisoned");
                 if let Some(dirty) = dirty_file_states.get_mut(key) {
                     if err.is_stale_generation() {
-                        dirty.terminal_stale = true;
+                        dirty.status = DirtyFileStateStatus::TerminalStale;
+                    } else if err.is_resource_bound() {
+                        dirty.status = DirtyFileStateStatus::TerminalResourceBound;
                     }
                     dirty.attempts = dirty.attempts.saturating_add(1);
                     dirty.next_retry_at = Instant::now() + Self::dirty_retry_delay(dirty.attempts);
@@ -7588,7 +7612,7 @@ where
                     .remove(&key);
             }
             Err(err) => {
-                let terminal_stale = err.is_stale_generation();
+                let status = dirty_file_state_status(&err);
                 self.state
                     .dirty_file_states
                     .lock()
@@ -7600,7 +7624,7 @@ where
                             generation,
                             STORE_WRITE_IMMEDIATE_RETRIES + 1,
                             err.to_string(),
-                            terminal_stale,
+                            status,
                         ),
                     );
             }
@@ -15756,7 +15780,7 @@ mod tests {
     }
 
     #[test]
-    fn bounded_regression_dirty_file_state_is_authoritative_for_symbol_reads() {
+    fn oversized_persistence_produces_queryable_resource_bound_dirty_state() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
         std::fs::create_dir_all(root.join("pkg")).unwrap();
@@ -15770,25 +15794,21 @@ mod tests {
         let mut parser = TreeSitterAnalyzer::<PythonAdapter>::build_parser(
             adapter.parser_language_for_file(&file),
         );
-        let parsed = TreeSitterAnalyzer::<PythonAdapter>::analyze_source(
+        let mut parsed = TreeSitterAnalyzer::<PythonAdapter>::analyze_source(
             &mut parser,
             &*adapter,
             &file,
             source,
         )
         .expect("python file parses");
+        // Keep this fixture small in source form while still exercising the
+        // production writer's actual row-cap admission check. These are
+        // structured reference identifiers, so preparation and persistence
+        // account for them exactly like identifiers produced by the parser.
+        for index in 0..=PersistBatchLimits::PRODUCTION.max_rows {
+            parsed.type_identifiers.insert(format!("synthetic_{index}"));
+        }
         let key = TreeSitterAnalyzer::<PythonAdapter>::transient_cache_key(oid, &file);
-        let mut dirty = HashMap::default();
-        dirty.insert(
-            key,
-            TreeSitterAnalyzer::<PythonAdapter>::dirty_file_state(
-                Arc::new(parsed),
-                GenerationId::BOOTSTRAP,
-                32,
-                "forced test persistence failure".to_string(),
-                false,
-            ),
-        );
 
         let live_paths = Arc::new(LivePathMap::default());
         live_paths.refresh([LivePathEntry::overlay(file.clone(), oid)]);
@@ -15809,6 +15829,31 @@ mod tests {
             build_abort: Arc::new(BuildAbort::default()),
             build_tier_access: Arc::new(AnalyzerBuildTierAccess::default()),
         };
+        let prepared = AnalyzerStore::prepare_parsed_blob(
+            oid,
+            "python",
+            GenerationId::BOOTSTRAP,
+            &*adapter,
+            Arc::new(parsed.clone()),
+        )
+        .expect("oversized fixture must prepare");
+        assert!(prepared.logical_rows() > PersistBatchLimits::PRODUCTION.max_rows);
+        let mut dirty = HashMap::default();
+        TreeSitterAnalyzer::<PythonAdapter>::persist_or_mark_dirty(
+            &mut dirty,
+            &store_context,
+            &*adapter,
+            &file,
+            oid,
+            "python",
+            GenerationId::BOOTSTRAP,
+            &parsed,
+        );
+        let dirty_state = dirty.get(&key).expect("resource-bound state is retained");
+        assert_eq!(
+            dirty_state.status,
+            DirtyFileStateStatus::TerminalResourceBound
+        );
         let config = AnalyzerConfig::default();
         let analyzer = TreeSitterAnalyzer::from_state(
             project,
@@ -15837,7 +15882,16 @@ mod tests {
                 .iter()
                 .any(|unit| unit.fq_name() == "pkg.dirty.Dirty")
         );
+        let context = Arc::new(crate::analyzer::AnalyzerQueryContext::default());
+        analyzer.begin_query(&context);
+        let starts = store.parsed_blob_transaction_starts_for_test();
         assert_eq!(analyzer.get_definitions("pkg.dirty.Dirty").len(), 1);
+        assert!(
+            context.store_error().is_none(),
+            "a resource-bound dirty state must not become request-fatal"
+        );
+        assert_eq!(store.parsed_blob_transaction_starts_for_test(), starts);
+        analyzer.end_query(&context);
         assert!(
             analyzer
                 .lookup_declarations_by_identifier("Dirty")
@@ -16454,7 +16508,7 @@ mod tests {
                 generation,
                 STORE_WRITE_IMMEDIATE_RETRIES + 1,
                 "stale generation".to_string(),
-                true,
+                DirtyFileStateStatus::TerminalStale,
             ),
         );
         let starts = analyzer
@@ -16486,7 +16540,8 @@ mod tests {
                 .unwrap()
                 .get(&key)
                 .unwrap()
-                .terminal_stale
+                .status
+                == DirtyFileStateStatus::TerminalStale
         );
     }
 
@@ -16591,7 +16646,7 @@ mod tests {
                 GenerationId::BOOTSTRAP,
                 32,
                 "forced test persistence failure".to_string(),
-                false,
+                DirtyFileStateStatus::Retryable,
             ),
         );
 
@@ -17891,7 +17946,7 @@ mod tests {
                 GenerationId::BOOTSTRAP,
                 32,
                 "forced test persistence failure".to_string(),
-                false,
+                DirtyFileStateStatus::Retryable,
             ),
         );
 

@@ -13,9 +13,10 @@ use crate::graph::callable_definitions_share_identity_evidence as cpp_callable_d
 use crate::graph::callable_definitions_share_identity_evidence_with_visibility as cpp_callable_definitions_share_identity_evidence_with_visibility;
 use crate::graph::hits::{
     enclosing_context, is_member_field_own_declarator, push_declaration_reference_hit,
-    push_definition_hit, push_hit, push_recursive_reference_hit, push_reference_hit_range,
-    push_self_receiver_hit, push_type_hit, push_type_hit_range, push_unproven_definition_hit,
-    push_unproven_hit, push_unproven_reference_hit_range,
+    push_declared_reference_hit, push_definition_hit, push_hit, push_recovered_definition_hit,
+    push_recursive_reference_hit, push_reference_hit_range, push_self_receiver_hit, push_type_hit,
+    push_type_hit_range, push_unproven_definition_hit, push_unproven_hit,
+    push_unproven_reference_hit_range,
 };
 use crate::graph::resolver::*;
 use crate::graph::syntax::{object_macro_replacement_type_references, qualified_callable_value};
@@ -23,13 +24,13 @@ use crate::graph_support::CppSource;
 use brokk_bifrost_core::analyzer::fq_name::segment_interner;
 use brokk_bifrost_core::analyzer::prepared_syntax::PreparedSyntaxTree;
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
-use brokk_bifrost_core::analyzer::tree_walk::ParentIndex;
+use brokk_bifrost_core::analyzer::tree_walk::{ParentIndex, WalkControl, walk_named_tree_preorder};
 use brokk_bifrost_core::analyzer::usages::common::same_node;
 use brokk_bifrost_core::analyzer::usages::inverted_edges::ClassRangeIndex;
 use brokk_bifrost_core::analyzer::usages::local_inference::{
     LocalInferenceConfig, LocalInferenceEngine, SymbolResolution,
 };
-use brokk_bifrost_core::analyzer::usages::model::UsageHit;
+use brokk_bifrost_core::analyzer::usages::model::{UsageHit, UsageHitSurface};
 use brokk_bifrost_core::analyzer::{CodeUnit, ProjectFile, Range};
 use brokk_bifrost_core::hash::{HashMap, HashSet};
 #[cfg(any(test, feature = "test-support"))]
@@ -64,9 +65,10 @@ pub struct ScanCtx<'a> {
     pub line_starts: &'a [usize],
     pub spec: &'a TargetSpec,
     pub target_group: &'a HashSet<CodeUnit>,
-    pub has_physically_visible_type_target: bool,
+    pub has_proven_visible_type_target: bool,
     type_reference_component_names: HashSet<String>,
     pub target_declaration_ranges: Vec<Range>,
+    target_macro_declaration_bytes: Vec<usize>,
     pub bindings: LocalInferenceEngine<CppScanBinding>,
     local_shadows: LocalInferenceEngine<()>,
     using_enum_owners: ScopedUsingEnumOwners,
@@ -76,6 +78,7 @@ pub struct ScanCtx<'a> {
     pub unproven_hits: &'a mut BTreeSet<UsageHit>,
     pub raw_match_count: &'a mut usize,
     pub max_usages: usize,
+    pub external_hit_count: usize,
     pub limit_exceeded: &'a mut bool,
     pub enclosing_cache: RefCell<HashMap<(usize, usize), EnclosingContext>>,
     pub enclosing_owner_cache: RefCell<HashMap<CodeUnit, Option<CodeUnit>>>,
@@ -122,13 +125,23 @@ pub fn scan_prepared_file(
         return;
     }
     let needs_using_enum_member_resolution = spec.enum_owner_kind == EnumOwnerKind::Scoped;
-    let has_physically_visible_type_target = spec.kind == TargetKind::Type
-        && target_group.iter().any(|target| {
+    let has_proven_visible_type_target = spec.kind == TargetKind::Type
+        && (target_group.iter().any(|target| {
             same_logical_symbol(target, &spec.target)
                 && visibility.is_physically_visible(file, target)
+        }) || {
+            let candidates = visibility
+                .visible_identifier_candidates(file, spec.target.identifier())
+                .collect::<Vec<_>>();
+            visibility.c_tag_declaration_family_matches_target(
+                analyzer,
+                file,
+                &candidates,
+                &spec.target,
+            )
         });
     if spec.kind == TargetKind::Type
-        && !has_physically_visible_type_target
+        && !has_proven_visible_type_target
         && visibility
             .visible_identifier_candidates(file, spec.target.identifier())
             .any(|candidate| {
@@ -136,6 +149,12 @@ pub fn scan_prepared_file(
                     && !target_group.contains(candidate)
                     && same_logical_symbol(candidate, &spec.target)
                     && visibility.is_physically_visible(file, candidate)
+                    && !visibility.c_tag_declaration_family_matches_target(
+                        analyzer,
+                        file,
+                        std::slice::from_ref(&candidate),
+                        &spec.target,
+                    )
             })
     {
         return;
@@ -146,8 +165,13 @@ pub fn scan_prepared_file(
             .filter(|target| target.source() == file && same_logical_symbol(target, &spec.target))
             .flat_map(|target| analyzer.ranges(target))
             .collect()
-    } else if spec.target.source() == file {
+    } else if spec.kind == TargetKind::Macro || spec.target.source() == file {
         analyzer.ranges(&spec.target)
+    } else {
+        Vec::new()
+    };
+    let target_macro_declaration_bytes = if spec.kind == TargetKind::Macro {
+        visibility.macro_declaration_bytes(&spec.target, &target_declaration_ranges)
     } else {
         Vec::new()
     };
@@ -163,6 +187,11 @@ pub fn scan_prepared_file(
     } else {
         HashSet::default()
     };
+    let external_hit_count = state
+        .hits
+        .iter()
+        .filter(|hit| hit.kind.included_in(UsageHitSurface::ExternalUsages))
+        .count();
     let mut ctx = ScanCtx {
         analyzer: *analyzer,
         visibility,
@@ -174,9 +203,10 @@ pub fn scan_prepared_file(
         line_starts: prepared.line_starts(),
         spec,
         target_group,
-        has_physically_visible_type_target,
+        has_proven_visible_type_target,
         type_reference_component_names,
         target_declaration_ranges,
+        target_macro_declaration_bytes,
         bindings: LocalInferenceEngine::new(LocalInferenceConfig::default()),
         local_shadows: LocalInferenceEngine::new(LocalInferenceConfig::default()),
         using_enum_owners: ScopedUsingEnumOwners::new(),
@@ -186,6 +216,7 @@ pub fn scan_prepared_file(
         unproven_hits: state.unproven_hits,
         raw_match_count: state.raw_match_count,
         max_usages: state.max_usages,
+        external_hit_count,
         limit_exceeded: state.limit_exceeded,
         enclosing_cache: RefCell::new(HashMap::default()),
         enclosing_owner_cache: RefCell::new(HashMap::default()),
@@ -198,7 +229,25 @@ pub fn scan_prepared_file(
     if needs_using_enum_member_resolution {
         collect_semantic_using_enums(prepared.tree().root_node(), &mut ctx);
     }
+    if spec.kind == TargetKind::Macro {
+        scan_macro_nodes(prepared.tree().root_node(), &mut ctx);
+        return;
+    }
     scan_node(prepared.tree().root_node(), &mut ctx);
+}
+
+/// Scan a macro target without maintaining the declaration and lexical state
+/// required by ordinary C and C++ symbols. Macro activation comes entirely
+/// from [`VisibilityIndex`], so rebuilding unrelated binding state at every
+/// node makes generated tables needlessly expensive.
+fn scan_macro_nodes(root: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    walk_named_tree_preorder(root, true, |node| {
+        if *ctx.limit_exceeded {
+            return WalkControl::Break;
+        }
+        maybe_record_macro_hit(node, ctx);
+        WalkControl::Continue
+    });
 }
 
 enum UsingEnumDeclarationScope {
@@ -455,6 +504,7 @@ fn seed_declarations(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         "declaration" | "field_declaration" => seed_variable_declaration(node, ctx),
         "for_range_loop" => seed_range_binding(node, ctx),
         "expression_statement" => seed_function_macro_local_binding(node, ctx),
+        "assignment_expression" => seed_function_macro_container_binding(node, ctx),
         "using_declaration" => seed_using_enum(node, ctx),
         _ => {}
     }
@@ -493,6 +543,33 @@ fn seed_function_macro_local_binding(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
             binding.pointer_depth + cpp_type_text_pointer_depth(&binding.type_name),
         ),
     );
+}
+
+fn seed_function_macro_container_binding(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    let Some(binding) =
+        ctx.visibility
+            .function_macro_container_binding(&ctx.analyzer, ctx.file, node, ctx.source)
+    else {
+        return;
+    };
+    let normalized = normalize_cpp_type_name(&binding.type_name);
+    let unit = binding.proven_unit.clone().or_else(|| {
+        binding
+            .type_node
+            .and_then(|type_node| {
+                ctx.visibility
+                    .resolve_type_node_result(ctx.file, type_node, ctx.source)
+                    .ok()
+                    .flatten()
+            })
+            .or_else(|| ctx.visibility.resolve_type(ctx.file, &normalized))
+    });
+    if let Some(unit) = unit {
+        ctx.bindings.seed_symbol(
+            binding.name,
+            CppScanBinding::from_type_name(normalized, Some(unit), binding.pointer_depth),
+        );
+    }
 }
 
 fn indexed_recovered_class_field_declaration(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
@@ -669,6 +746,13 @@ fn seed_binding_from_type_or_value(
         .map(|node| {
             let text = node_text(node, ctx.source);
             let name = normalize_cpp_type_name(text);
+            if let Some(unit) = anonymous_aggregate_owner(&ctx.analyzer, ctx.file, node) {
+                return CppScanBinding::from_type_name(
+                    name,
+                    Some(unit),
+                    cpp_type_text_pointer_depth(text),
+                );
+            }
             // Bare type names need lexical ownership before the coarse visible-name
             // fallback (two namespaces can each declare `CopyResult`). Template
             // references keep the specialization-aware resolver first because a
@@ -806,6 +890,17 @@ fn maybe_record_macro_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         return;
     }
     if is_ordinary_macro_reference_node(node) {
+        if ctx.visibility.macro_binding_matches_target_declaration_at(
+            ctx.file,
+            &ctx.spec.member_name,
+            node.start_byte(),
+            ctx.spec.target.source(),
+            &ctx.target_macro_declaration_bytes,
+        ) {
+            *ctx.raw_match_count += 1;
+            push_hit(node, ctx);
+            return;
+        }
         match ctx.visibility.resolve_ordinary_macro_reference(
             &ctx.analyzer,
             ctx.file,
@@ -847,12 +942,12 @@ fn maybe_record_macro_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     }) {
         return;
     }
-    if ctx.visibility.macro_binding_matches_target_at(
-        &ctx.analyzer,
+    if ctx.visibility.macro_binding_matches_target_declaration_at(
         ctx.file,
         &ctx.spec.member_name,
         node.start_byte(),
-        &ctx.spec.target,
+        ctx.spec.target.source(),
+        &ctx.target_macro_declaration_bytes,
     ) {
         *ctx.raw_match_count += 1;
         push_hit(node, ctx);
@@ -870,6 +965,16 @@ fn maybe_record_macro_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
 }
 
 fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    if recovered_c_new_expression_argument_at(
+        node,
+        node.start_byte(),
+        node.end_byte(),
+        ctx.analyzer.reference_uses_c_semantics(ctx.file),
+    )
+    .is_some()
+    {
+        return;
+    }
     if node.kind() == "preproc_arg" {
         maybe_record_object_macro_replacement_type_hits(node, ctx);
         return;
@@ -4099,8 +4204,16 @@ fn type_resolution_identifies_unit_target(
                 target,
             );
     }
-    ctx.visibility
-        .same_template_member_identity(&ctx.analyzer, unit, target)
+    unit == target
+        || ctx
+            .visibility
+            .same_template_member_identity(&ctx.analyzer, unit, target)
+        || ctx.visibility.c_tag_declaration_family_matches_target(
+            &ctx.analyzer,
+            ctx.file,
+            &candidates.iter().collect::<Vec<_>>(),
+            target,
+        )
         || ctx.visibility.structured_class_alias_resolves_to_target(
             &ctx.analyzer,
             ctx.file,
@@ -5893,7 +6006,7 @@ fn maybe_record_free_function_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
             BareCallTargetResolution::FreeFunctions(units)
                 if units
                     .iter()
-                    .any(|unit| same_visible_symbol(unit, &ctx.spec.target)) =>
+                    .any(|unit| free_function_target_matches(unit, ctx)) =>
             {
                 if free_function_call_may_target(node, text, ctx) {
                     let recursive = enclosing_context(terminal, ctx)
@@ -5910,7 +6023,7 @@ fn maybe_record_free_function_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
             BareCallTargetResolution::UnprovenFreeFunctions(units)
                 if units
                     .iter()
-                    .any(|unit| same_visible_symbol(unit, &ctx.spec.target)) =>
+                    .any(|unit| free_function_target_matches(unit, ctx)) =>
             {
                 push_unproven_hit(terminal, ctx);
             }
@@ -5945,6 +6058,19 @@ fn maybe_record_free_function_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     } else {
         push_unproven_hit(function_terminal_node(function), ctx);
     }
+}
+
+fn free_function_target_matches(unit: &CodeUnit, ctx: &ScanCtx<'_>) -> bool {
+    same_visible_symbol(unit, &ctx.spec.target)
+        || ctx
+            .visibility
+            .same_logical_callable(&ctx.analyzer, unit, &ctx.spec.target)
+            && cpp_callable_definitions_share_identity_evidence_with_visibility(
+                &ctx.analyzer,
+                ctx.visibility,
+                unit,
+                &ctx.spec.target,
+            )
 }
 
 /// Recover a bare call whose adjacent object-like macro arguments made
@@ -6227,6 +6353,16 @@ fn maybe_record_free_function_value_reference(node: Node<'_>, ctx: &mut ScanCtx<
     if !name_matches_callable(text, &ctx.spec.member_name) {
         return;
     }
+    if let Some(kind) = recovered_callable_declaration_kind(node, ctx) {
+        *ctx.raw_match_count += 1;
+        match kind {
+            RecoveredCallableDeclarationKind::Declaration => push_declared_reference_hit(node, ctx),
+            RecoveredCallableDeclarationKind::Definition => {
+                push_recovered_definition_hit(node, ctx)
+            }
+        }
+        return;
+    }
     if is_declaration_name(node) {
         maybe_record_free_function_declaration_reference(node, ctx);
         return;
@@ -6252,6 +6388,88 @@ fn maybe_record_free_function_value_reference(node: Node<'_>, ctx: &mut ScanCtx<
     } else {
         push_unproven_hit(node, ctx);
     }
+}
+
+#[derive(Clone, Copy)]
+enum RecoveredCallableDeclarationKind {
+    Declaration,
+    Definition,
+}
+
+/// Recover the role of a callable name whose declaration was split by an
+/// ERROR node. An indexed declaration range proves identity when available;
+/// for a top-level C callable that recovery failed to range-index, same-file
+/// name identity is sufficient because C has no function overloading. The CST
+/// shape distinguishes a prototype from a definition. C++ parsing of
+/// an unknown C return type can put the name under an ERROR child of the
+/// function declarator, while call-shaped recovery puts that declarator under
+/// an ERROR whose parent is a compound statement; only the former is admitted.
+fn recovered_callable_declaration_kind(
+    node: Node<'_>,
+    ctx: &ScanCtx<'_>,
+) -> Option<RecoveredCallableDeclarationKind> {
+    if !matches!(node.kind(), "identifier" | "field_identifier") {
+        return None;
+    }
+    let target_identity_proven =
+        ctx.target_declaration_ranges.iter().any(|range| {
+            range.start_byte <= node.start_byte() && node.end_byte() <= range.end_byte
+        }) || (ctx.analyzer.reference_uses_c_semantics(ctx.file)
+            && ctx.spec.target.is_function()
+            && ctx.spec.target.source() == ctx.file);
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        if parent.is_error() {
+            // C files with an unknown return type can retain the real
+            // callable name as `function_declarator > ERROR`, with the ERROR
+            // as a named child rather than the declarator field itself.
+            let error = parent;
+            let Some(function) = error.parent().filter(|function| {
+                function.kind() == "function_declarator"
+                    && function
+                        .child_by_field_name("parameters")
+                        .is_some_and(|parameters| error.end_byte() <= parameters.start_byte())
+            }) else {
+                current = parent.parent();
+                continue;
+            };
+            let container = function.parent()?;
+            let kind = match container.kind() {
+                "declaration" => RecoveredCallableDeclarationKind::Declaration,
+                "function_definition" => RecoveredCallableDeclarationKind::Definition,
+                _ => return None,
+            };
+            return target_identity_proven.then_some(kind);
+        }
+        if parent.kind() == "function_declarator" {
+            let error = parent.parent().filter(|parent| parent.is_error())?;
+            let declarator = parent.child_by_field_name("declarator")?;
+            if declarator.start_byte() > node.start_byte()
+                || node.end_byte() > declarator.end_byte()
+            {
+                return None;
+            }
+            let container = error.parent()?;
+            let kind = match container.kind() {
+                "declaration" => RecoveredCallableDeclarationKind::Declaration,
+                "function_definition" => RecoveredCallableDeclarationKind::Definition,
+                _ => return None,
+            };
+            return target_identity_proven.then_some(kind);
+        }
+        if parent.is_error() {
+            current = parent.parent();
+            continue;
+        }
+        if matches!(
+            parent.kind(),
+            "translation_unit" | "function_definition" | "compound_statement"
+        ) {
+            return None;
+        }
+        current = parent.parent();
+    }
+    None
 }
 
 fn maybe_record_free_function_declaration_reference(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
@@ -7275,6 +7493,9 @@ fn scan_leaf_is_value_position(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
 }
 
 fn maybe_record_global_field_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    if is_c_offsetof_member_node(node) {
+        return;
+    }
     if matches!(node.kind(), "identifier" | "field_identifier")
         && designated_initializer_owner(ctx.visibility, ctx.file, ctx.source, node).is_some()
     {
@@ -7422,7 +7643,7 @@ fn bare_global_field_uniquely_resolves_to_target(text: &str, ctx: &ScanCtx<'_>) 
     matched_target
 }
 
-fn has_persisted_global_field_identity(unit: &CodeUnit) -> bool {
+pub(crate) fn has_persisted_global_field_identity(unit: &CodeUnit) -> bool {
     // C++ type members persist their owner in `short_name` (`Owner.member`), while namespace
     // identity lives in `package_name`; global and namespace-scoped fields therefore have a
     // terminal-only short name. Keep this hot lookup projection-only instead of asking the
@@ -7464,6 +7685,10 @@ fn global_field_is_known_non_target(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
 }
 
 fn maybe_record_member_field_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    if is_c_offsetof_member_node(node) {
+        maybe_record_c_offsetof_field_hit(node, ctx);
+        return;
+    }
     if node.kind() == "field_expression" {
         let Some(field) = node.child_by_field_name("field") else {
             return;
@@ -7476,7 +7701,17 @@ fn maybe_record_member_field_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
             .child_by_field_name("argument")
             .or_else(|| node.child_by_field_name("object"));
         match receiver.map(|receiver| explicit_receiver_target_resolution(receiver, None, ctx)) {
-            Some(MethodReceiverTargetResolution::Target) => push_hit(field, ctx),
+            Some(MethodReceiverTargetResolution::Target)
+                if ctx.visibility.declaration_visible_at_reference(
+                    &ctx.analyzer,
+                    ctx.file,
+                    &ctx.spec.target,
+                    field,
+                ) =>
+            {
+                push_hit(field, ctx)
+            }
+            Some(MethodReceiverTargetResolution::Target) => {}
             Some(MethodReceiverTargetResolution::Missing) | None => push_unproven_hit(field, ctx),
             Some(
                 MethodReceiverTargetResolution::NonTarget
@@ -7620,6 +7855,44 @@ fn maybe_record_member_field_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         }
     } else if !matches!(owner_context, StructuredOwnerContextResolution::NonTarget) {
         push_unproven_hit(node, ctx);
+    }
+}
+
+fn maybe_record_c_offsetof_field_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    if node_text(node, ctx.source) != ctx.spec.member_name {
+        return;
+    }
+    *ctx.raw_match_count += 1;
+    let Some((type_reference, member)) = c_offsetof_member_parts(node) else {
+        push_unproven_hit(node, ctx);
+        return;
+    };
+    let owner = match resolve_type_node_lexically(
+        type_reference,
+        &ctx.analyzer,
+        ctx.visibility,
+        &ctx.ordinary_type_imports,
+        ctx.file,
+        ctx.source,
+    ) {
+        LexicalTypeResolution::Resolved { unit, .. } if unit.is_class() => unit,
+        LexicalTypeResolution::Resolved { .. }
+        | LexicalTypeResolution::Ambiguous
+        | LexicalTypeResolution::Missing => {
+            push_unproven_hit(member, ctx);
+            return;
+        }
+    };
+    let candidates = ctx
+        .visibility
+        .visible_members_for_owner_name(ctx.file, &owner, ctx.spec.member_name.as_str())
+        .into_iter()
+        .filter(|candidate| candidate.is_field())
+        .collect::<Vec<_>>();
+    if candidates.len() == 1 && ctx.target_group.contains(candidates[0]) {
+        push_hit(member, ctx);
+    } else if candidates.len() > 1 {
+        push_unproven_hit(member, ctx);
     }
 }
 
@@ -7870,10 +8143,14 @@ fn receiver_type_units_with_budget(
                         .collect();
                 }
                 if let Some(first) = global_fields.first()
-                    && global_fields
-                        .iter()
-                        .skip(1)
-                        .any(|field| !same_visible_symbol(first, field))
+                    && global_fields.iter().skip(1).any(|field| {
+                        !same_visible_global_field_symbol(
+                            &ctx.analyzer,
+                            &mut ctx.global_field_internal_linkage_cache.borrow_mut(),
+                            first,
+                            field,
+                        )
+                    })
                 {
                     return Vec::new();
                 }
@@ -7884,6 +8161,18 @@ fn receiver_type_units_with_budget(
                     .and_then(|binding| binding.unit)
                     .into_iter()
                     .collect();
+            }
+            // `((T*)p)->member` is typed by what the cast spells, not by the
+            // operand it converts (#2981). Pointer depth does not change which
+            // type declares the member, so only the descriptor's type matters.
+            "cast_expression" => {
+                let Some(descriptor) = current.child_by_field_name("type") else {
+                    return Vec::new();
+                };
+                let Ok(unit) = resolve_receiver_type_node(descriptor, ctx) else {
+                    return Vec::new();
+                };
+                break unit.into_iter().collect();
             }
             "this" if ctx.analyzer.reference_uses_c_semantics(ctx.file) => {
                 let name = node_text(current, source);
@@ -8134,17 +8423,10 @@ fn receiver_type_name_unit(node: Node<'_>, type_name: &str, ctx: &ScanCtx<'_>) -
     // trying file-visible type lookup; this keeps the alias's lexical shadow
     // boundary intact.
     if let Some(alias_type) = local_receiver_alias_type_node(node, &normalized, ctx) {
-        let alias_type = receiver_type_node_base(alias_type);
-        match ctx
-            .visibility
-            .resolve_type_node_result(ctx.file, alias_type, ctx.source)
-        {
+        match resolve_receiver_type_node(alias_type, ctx) {
             Ok(Some(unit)) => return Some(unit),
             Err(_) => return None,
             Ok(None) => {}
-        }
-        if let Some(unit) = resolve_receiver_type_node_lexically(alias_type, ctx) {
-            return Some(unit);
         }
     }
 
@@ -8160,6 +8442,27 @@ fn receiver_type_name_unit(node: Node<'_>, type_name: &str, ctx: &ScanCtx<'_>) -
         .filter_map(|candidate| canonical_receiver_unit(candidate, ctx))
         .collect();
     unanimous_receiver_units(candidates).into_iter().next()
+}
+
+/// The receiver type a type node names: the visible indexed type it resolves
+/// to, else the type its components name in the enclosing lexical scope.
+///
+/// A `type_descriptor` (a cast's type, an alias declaration's right-hand side)
+/// is unwrapped to its type specifier first, so every caller that has a spelled
+/// type reads it the same way. `Err` reports a template whose arguments could
+/// not be resolved; that is a structured failure, not an absent type.
+fn resolve_receiver_type_node(
+    type_node: Node<'_>,
+    ctx: &ScanCtx<'_>,
+) -> std::result::Result<Option<CodeUnit>, CppTemplateResolutionError> {
+    let type_node = receiver_type_node_base(type_node);
+    if let Some(unit) = ctx
+        .visibility
+        .resolve_type_node_result(ctx.file, type_node, ctx.source)?
+    {
+        return Ok(Some(unit));
+    }
+    Ok(resolve_receiver_type_node_lexically(type_node, ctx))
 }
 
 fn resolve_receiver_type_node_lexically(
@@ -11774,7 +12077,18 @@ fn resolve_type_components_in_authoritative_scope(
     let normal = match normal {
         LexicalTypeResolution::Resolved { ref unit, .. }
             if !visibility
-                .external_type_candidate_visible_in_context(analyzer, file, unit, node) =>
+                .external_type_candidate_visible_in_context(analyzer, file, unit, node)
+                && !direct_target.is_some_and(|target| {
+                    let candidate_refs = visibility
+                        .visible_identifier_candidates(file, target.identifier())
+                        .collect::<Vec<_>>();
+                    visibility.c_tag_declaration_family_matches_target(
+                        analyzer,
+                        file,
+                        &candidate_refs,
+                        target,
+                    )
+                }) =>
         {
             LexicalTypeResolution::Missing
         }

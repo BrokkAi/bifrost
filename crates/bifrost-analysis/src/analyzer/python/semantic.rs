@@ -22,7 +22,7 @@ use brokk_bifrost_python::bindings::{
     python_direct_scope_bindings_bounded,
 };
 
-const ADAPTER_VERSION: &[u8] = b"python-value-semantics-v11";
+const ADAPTER_VERSION: &[u8] = b"python-value-semantics-v12";
 
 impl_program_semantics_provider!(PythonAnalyzer, PythonSemanticLowerer);
 
@@ -999,10 +999,10 @@ fn heap_binding_proofs<'tree>(
     // complete allocation root. This is intentionally conservative: a unique
     // constructor/list assignment alone is not a type or alias proof.
     //
-    // A plain whole-value call argument is the exception, and it is not a
-    // weakening: it names no attribute and no element, so it cannot retract
-    // the identity of an access that already ran, and it records an escape
-    // byte that bounds the accesses that follow it instead.
+    // A whole-value call argument, positional or keyword, is the exception,
+    // and it is not a weakening: it names no attribute and no element, so it
+    // cannot retract the identity of an access that already ran, and it
+    // records an escape byte that bounds the accesses that follow it instead.
     let candidate_names: HashSet<Box<str>> = candidates.keys().cloned().collect();
     let candidate_classes: HashMap<Box<str>, Option<Box<str>>> = candidates
         .iter()
@@ -1023,7 +1023,7 @@ fn heap_binding_proofs<'tree>(
     let mut occurrences = vec![body];
     while let Some(node) = occurrences.pop() {
         if node != body && is_nested_execution_boundary(node) {
-            occurrences.extend(named_children(node));
+            occurrences.extend(heap_occurrence_children(node));
             continue;
         }
         if node.kind() == "identifier"
@@ -1043,7 +1043,7 @@ fn heap_binding_proofs<'tree>(
                 }
             }
         }
-        occurrences.extend(named_children(node));
+        occurrences.extend(heap_occurrence_children(node));
     }
 
     // Scan nested execution boundaries separately. The ordinary traversal
@@ -1060,11 +1060,11 @@ fn heap_binding_proofs<'tree>(
                 {
                     invalid_roots.insert(candidate.root.clone());
                 }
-                nested_nodes.extend(named_children(nested_node));
+                nested_nodes.extend(heap_occurrence_children(nested_node));
             }
             continue;
         }
-        nested.extend(named_children(node));
+        nested.extend(heap_occurrence_children(node));
     }
 
     let mut known_lists = HashSet::default();
@@ -1230,6 +1230,19 @@ fn is_dominated_heap_use(node: Node<'_>, body: Node<'_>) -> bool {
     false
 }
 
+/// The children of `node` that an allocation root can occur in. A
+/// `keyword_argument`'s `name` is the formal the actual binds to, not a read
+/// of a local that happens to share its spelling, so `f(holder=holder)` holds
+/// exactly one occurrence of `holder`. The lowering already reads only the
+/// `value` field of a keyword argument, and the allocation-proof scan must
+/// agree with it.
+fn heap_occurrence_children(node: Node<'_>) -> Vec<Node<'_>> {
+    if node.kind() == "keyword_argument" {
+        return children_by_field_name(node, "value");
+    }
+    named_children(node)
+}
+
 fn is_nested_execution_boundary(node: Node<'_>) -> bool {
     matches!(
         node.kind(),
@@ -1366,20 +1379,44 @@ fn classify_heap_occurrence<'tree, 'source>(
                 .is_some_and(|index| is_structural_constant_index(source, index).is_some()),
         );
     }
-    // A plain positional argument only. A keyword argument, a `*args` or
-    // `**kwargs` splat, and a comprehension or generator argument all parent
-    // the identifier under another node, so they never reach here and keep
-    // invalidating the root.
-    if parent.kind() == "argument_list"
-        && named_children(parent)
-            .into_iter()
-            .any(|argument| argument.id() == node.id())
-        && parent.parent().is_some_and(|call| call.kind() == "call")
-        && is_top_level_heap_use(node, body)
-    {
+    // The whole actual of a call, positional or keyword. `f(holder)` and
+    // `f(holder=holder)` hand the same object to the same callee, so both
+    // escape. A `*args` or `**kwargs` splat parents the identifier under
+    // `list_splat` or `dictionary_splat`, where the container and not the
+    // allocation is the actual, and a comprehension or generator argument
+    // parents it under its own execution boundary; neither reaches here, and
+    // both keep invalidating the root.
+    if is_whole_call_actual(node, parent) && is_top_level_heap_use(node, body) {
         return HeapOccurrence::Escapes;
     }
     HeapOccurrence::Unproven
+}
+
+/// Whether `node` is the entire value of one actual argument of a call: a
+/// direct named child of the `argument_list`, or the `value` of a
+/// `keyword_argument` that is itself a direct named child of that list.
+fn is_whole_call_actual(node: Node<'_>, parent: Node<'_>) -> bool {
+    let (actual, argument_list) = if parent.kind() == "keyword_argument" {
+        if !parent
+            .child_by_field_name("value")
+            .is_some_and(|value| value.id() == node.id())
+        {
+            return false;
+        }
+        let Some(argument_list) = parent.parent() else {
+            return false;
+        };
+        (parent, argument_list)
+    } else {
+        (node, parent)
+    };
+    argument_list.kind() == "argument_list"
+        && argument_list
+            .parent()
+            .is_some_and(|call| call.kind() == "call")
+        && named_children(argument_list)
+            .into_iter()
+            .any(|argument| argument.id() == actual.id())
 }
 
 fn structured_when(structured: bool) -> HeapOccurrence {

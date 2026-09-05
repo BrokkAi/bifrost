@@ -1966,6 +1966,9 @@ OPTIONS:
     --policy-pack ID       Evaluate every built-in policy in a pack. Repeatable.
     --policy-category NAME Evaluate built-in policies in a category. Repeatable.
     --policy-id ID         Evaluate one built-in policy by stable id. Repeatable.
+                           Repeating one selector widens it; combining different
+                           selectors narrows: --policy-pack P --policy-id I runs I
+                           only, and errors when I is not in P.
     --list-policies        Print the deterministic built-in policy catalog as JSON
     --list-row-schemas     Print the deterministic bifrost_relation_schema/v1 catalog as JSON:
                            every row domain a relational policy may bind, each field's scalar

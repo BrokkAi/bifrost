@@ -30,29 +30,33 @@ use crate::declarations::{
 use crate::graph::CppGraphSource;
 use crate::graph::extractor::{
     BareCallTargetResolution, LexicalScopeResolution, enclosing_lexical_scope_components,
-    initialized_ordinary_type_imports, ordinary_using_declaration_type_node,
-    resolve_bare_call_target, resolve_ordinary_using_declaration_owner,
-    resolve_type_components_lexically_at, resolve_type_node_lexically,
-    resolve_using_enum_declaration_owner, using_enum_declaration_type_node,
+    has_persisted_global_field_identity, initialized_ordinary_type_imports,
+    ordinary_using_declaration_type_node, resolve_bare_call_target,
+    resolve_ordinary_using_declaration_owner, resolve_type_components_lexically_at,
+    resolve_type_node_lexically, resolve_using_enum_declaration_owner,
+    using_enum_declaration_type_node,
 };
+use crate::graph::resolver::field_declared_binding;
 use crate::graph::resolver::{
     CppTemplateResolutionError, DesignatedInitializerOwner, EnclosingMemberOwnerResolution,
     LexicalCallableValueResolution, LexicalTypeResolution, OrdinaryMacroReferenceResolution,
     OrdinaryTypeImportCell, TargetKind, VisibilityIndex, VisibleMemberResolution,
-    canonical_cpp_scope_components, constructor_style_local_declaration, cpp_callable_arity,
+    anonymous_aggregate_owner, c_offsetof_member_parts, canonical_cpp_scope_components,
+    cast_expression_type_node, constructor_style_local_declaration, cpp_callable_arity,
     cpp_template_reference_arguments, cpp_type_name_components, declarator_name_node,
     designated_initializer_owner, extract_variable_name, first_type_child, function_terminal_node,
     has_ancestor_kind, infer_cpp_initializer_binding, infer_cpp_initializer_type,
-    initialized_type_declaration_with_cast, is_c_sizeof_expression_type_candidate,
-    is_cpp_template_argument_type_leaf, is_declaration_name, is_declarator_node,
-    is_globally_qualified_cpp_name, is_nested_type_node,
+    initialized_type_declaration_with_cast, is_c_offsetof_member_node,
+    is_c_sizeof_expression_type_candidate, is_cpp_template_argument_type_leaf, is_declaration_name,
+    is_declarator_node, is_globally_qualified_cpp_name, is_nested_type_node,
     is_recovered_qualified_friend_class_type_reference, normalize_type_text,
     out_of_line_member_definition_owner, parameter_belongs_to_callable_scope,
     qualified_alias_reference_preserves_target, qualified_alias_reference_requires_terminal,
-    qualified_owner_components, recovered_macro_decorated_type_node,
-    recovered_relational_template_member_call, resolve_declaring_callable_owner,
-    resolve_declaring_member_owner, same_logical_symbol, same_visible_symbol,
-    type_reference_hit_node, unique_macro_replacement_type_candidate,
+    qualified_owner_components, recovered_c_new_expression_argument_at,
+    recovered_macro_decorated_type_node, recovered_relational_template_member_call,
+    resolve_declaring_callable_owner, resolve_declaring_member_owner, same_logical_symbol,
+    same_visible_global_field_symbol, same_visible_symbol, type_reference_hit_node,
+    unique_macro_replacement_type_candidate,
 };
 use crate::graph::syntax::{object_macro_replacement_type_references, qualified_callable_value};
 use brokk_bifrost_core::analyzer::tree_walk::{TreeWalkAction, walk_tree_iterative};
@@ -214,6 +218,16 @@ fn record_reference(
     ctx: &mut CppScan<'_>,
     bindings: &LocalInferenceEngine<CodeUnit>,
 ) {
+    if recovered_c_new_expression_argument_at(
+        node,
+        node.start_byte(),
+        node.end_byte(),
+        ctx.analyzer.reference_uses_c_semantics(ctx.file),
+    )
+    .is_some()
+    {
+        return;
+    }
     if node.kind() == "preproc_arg" {
         record_object_macro_replacement_type_references(node, ctx);
     }
@@ -284,6 +298,20 @@ fn record_reference(
     if has_ancestor_kind(node, "using_declaration") {
         return;
     }
+    if is_c_offsetof_member_node(node) {
+        record_c_offsetof_field_reference(node, ctx);
+        return;
+    }
+    if ctx.analyzer.reference_uses_c_semantics(ctx.file)
+        && node.kind() == "field_expression"
+        && !node.parent().is_some_and(|parent| {
+            parent.kind() == "call_expression"
+                && parent.child_by_field_name("function") == Some(node)
+        })
+    {
+        record_c_field_reference(node, ctx, bindings);
+        return;
+    }
     if is_c_sizeof_expression_type_candidate(ctx.file, node) {
         let name = node_text(node, ctx.source);
         if bindings.is_shadowed(name) {
@@ -339,6 +367,20 @@ fn record_reference(
             }
             DesignatedInitializerOwner::Unresolved => ctx.record_unproven(name, node),
         }
+        return;
+    }
+    // C field reads are value references, not callable edges.  The C++ graph
+    // deliberately omits ordinary data-member edges, but C census sites need
+    // the same structured field identity that the forward resolver exposes.
+    // Let `record_call` own a field expression used as a call callee.
+    if ctx.analyzer.reference_uses_c_semantics(ctx.file)
+        && node.kind() == "field_expression"
+        && !node.parent().is_some_and(|parent| {
+            parent.kind() == "call_expression"
+                && parent.child_by_field_name("function") == Some(node)
+        })
+    {
+        record_c_field_reference(node, ctx, bindings);
         return;
     }
     match node.kind() {
@@ -420,6 +462,103 @@ fn record_reference(
         }
         "call_expression" => record_call(node, ctx, bindings),
         _ => {}
+    }
+}
+
+fn record_c_offsetof_field_reference(node: Node<'_>, ctx: &mut CppScan<'_>) {
+    let name = node_text(node, ctx.source);
+    let Some((type_reference, member)) = c_offsetof_member_parts(node) else {
+        ctx.record_unproven(name, node);
+        return;
+    };
+    let owner = match resolve_type_node_lexically(
+        type_reference,
+        &ctx.analyzer,
+        ctx.visibility,
+        &ctx.ordinary_type_imports,
+        ctx.file,
+        ctx.source,
+    ) {
+        LexicalTypeResolution::Resolved { unit, .. } if unit.is_class() => unit,
+        LexicalTypeResolution::Resolved { .. }
+        | LexicalTypeResolution::Ambiguous
+        | LexicalTypeResolution::Missing => {
+            ctx.record_unproven(name, member);
+            return;
+        }
+    };
+    let candidates = ctx
+        .visibility
+        .visible_members_for_owner_name(ctx.file, &owner, name)
+        .into_iter()
+        .filter(|candidate| candidate.is_field())
+        .collect::<Vec<_>>();
+    if candidates.len() == 1 {
+        ctx.record(candidates[0].fq_name(), member);
+    } else if candidates.len() > 1 {
+        ctx.record_unproven(name, member);
+    }
+}
+fn record_c_field_reference(
+    node: Node<'_>,
+    ctx: &mut CppScan<'_>,
+    bindings: &LocalInferenceEngine<CodeUnit>,
+) {
+    let Some(field) = node.child_by_field_name("field") else {
+        return;
+    };
+    let name = node_text(field, ctx.source);
+    if name.is_empty() {
+        return;
+    }
+    let Some(receiver) = node
+        .child_by_field_name("argument")
+        .or_else(|| node.child_by_field_name("object"))
+        .or_else(|| node.named_child(0))
+    else {
+        ctx.record_unproven(name, field);
+        return;
+    };
+    let Some(receiver_owner) = receiver_type_unit(receiver, ctx, bindings, 32) else {
+        ctx.record_unproven(name, field);
+        return;
+    };
+    let owner = match resolve_declaring_member_owner_cached(ctx, &receiver_owner, name) {
+        EnclosingMemberOwnerResolution::Owner(owner) => owner,
+        EnclosingMemberOwnerResolution::Ambiguous => {
+            ctx.record_unproven(name, field);
+            return;
+        }
+        EnclosingMemberOwnerResolution::Missing => return,
+    };
+    let fields = ctx
+        .visibility
+        .visible_members_for_owner_name(ctx.file, &owner, name)
+        .into_iter()
+        .filter(|candidate| {
+            candidate.is_field()
+                && ctx.visibility.declaration_visible_at_reference(
+                    &ctx.analyzer,
+                    ctx.file,
+                    candidate,
+                    field,
+                )
+        })
+        .collect::<Vec<_>>();
+    match fields.as_slice() {
+        [candidate] => ctx.record(candidate.fq_name(), field),
+        [] => {}
+        _ => {
+            if fields
+                .iter()
+                .skip(1)
+                .all(|candidate| same_visible_symbol(candidate, fields[0]))
+            {
+                ctx.record(fields[0].fq_name(), field);
+            } else {
+                ctx.record_unproven(name, field);
+            }
+        }
     }
 }
 
@@ -1225,6 +1364,11 @@ fn receiver_type_unit(
             // type, unless it is a known (shadowed) untyped local — never reinterpret
             // a value as a static type.
             first_precise(bindings, name).or_else(|| {
+                if !bindings.is_shadowed(name)
+                    && let Some(unit) = global_receiver_type_unit(ctx, name)
+                {
+                    return Some(unit);
+                }
                 (!bindings.is_shadowed(name))
                     .then(|| resolve_type_node_with_recovered_scope(receiver, ctx))
                     .flatten()
@@ -1261,6 +1405,78 @@ fn receiver_type_unit(
             }),
         )
         .and_then(|binding| binding.unit),
+        // A nested C selector carries the declared type of its selected
+        // field. Resolve that field through the same owner/hierarchy lookup
+        // used by ordinary field references; this preserves synthetic owners
+        // for named anonymous aggregates without parsing type text.
+        "field_expression" => {
+            let field = receiver.child_by_field_name("field")?;
+            let name = node_text(field, ctx.source);
+            let inner = receiver
+                .child_by_field_name("argument")
+                .or_else(|| receiver.child_by_field_name("object"))
+                .or_else(|| receiver.named_child(0))?;
+            let receiver_owner = receiver_type_unit(inner, ctx, bindings, remaining_call_depth)?;
+            let owner = match resolve_declaring_member_owner(
+                &ctx.analyzer,
+                ctx.visibility,
+                ctx.file,
+                &receiver_owner,
+                name,
+            ) {
+                EnclosingMemberOwnerResolution::Owner(owner) => owner,
+                EnclosingMemberOwnerResolution::Ambiguous
+                | EnclosingMemberOwnerResolution::Missing => return None,
+            };
+            let fields = ctx
+                .visibility
+                .visible_members_for_owner_name(ctx.file, &owner, name)
+                .into_iter()
+                .filter(|candidate| candidate.is_field())
+                .collect::<Vec<_>>();
+            let [field_unit] = fields.as_slice() else {
+                return None;
+            };
+            field_declared_binding(&ctx.analyzer, ctx.visibility, ctx.file, field_unit)
+                .and_then(|binding| binding.unit)
+        }
+        "cast_expression" => cast_expression_type_node(receiver).and_then(|type_node| {
+            resolve_type_node_with_recovered_scope(type_node, ctx).or_else(|| {
+                match ctx.resolve_type_node_result(type_node) {
+                    Ok(Some(unit)) => Some(unit),
+                    Ok(None) => ctx.resolve_type(node_text(type_node, ctx.source)),
+                    Err(_) => None,
+                }
+            })
+        }),
+        _ => None,
+    }
+}
+
+fn global_receiver_type_unit(ctx: &CppScan<'_>, name: &str) -> Option<CodeUnit> {
+    let fields = ctx
+        .visibility
+        .named_candidates(ctx.file, name, TargetKind::GlobalField)
+        .into_iter()
+        .filter(has_persisted_global_field_identity)
+        .collect::<Vec<_>>();
+    let first = fields.first()?;
+    let mut linkage_cache = HashMap::default();
+    if fields.iter().skip(1).any(|field| {
+        !same_visible_global_field_symbol(&ctx.analyzer, &mut linkage_cache, first, field)
+    }) {
+        return None;
+    }
+    let mut units = fields
+        .into_iter()
+        .filter_map(|field| {
+            field_declared_binding(&ctx.analyzer, ctx.visibility, ctx.file, &field)
+                .and_then(|binding| binding.unit)
+        })
+        .collect::<Vec<_>>();
+    units.dedup_by(|left, right| same_visible_symbol(left, right));
+    match units.as_slice() {
+        [unit] => Some(unit.clone()),
         _ => None,
     }
 }
@@ -1284,6 +1500,7 @@ fn seed_declaration(
         "declaration" | "field_declaration" => seed_variable_declaration(node, ctx, bindings),
         "for_range_loop" => seed_range_binding(node, ctx, bindings),
         "expression_statement" => seed_function_macro_local_binding(node, ctx, bindings),
+        "assignment_expression" => seed_function_macro_container_binding(node, ctx, bindings),
         _ => {}
     }
 }
@@ -1308,6 +1525,34 @@ fn seed_function_macro_local_binding(
                 .and_then(|type_node| ctx.resolve_type_node_result(type_node).ok().flatten())
         })
         .or_else(|| ctx.resolve_type(&binding.type_name));
+    match unit {
+        Some(unit) => bindings.seed_symbol(binding.name, unit),
+        None => bindings.declare_shadow(binding.name),
+    }
+}
+
+fn seed_function_macro_container_binding(
+    node: Node<'_>,
+    ctx: &CppScan<'_>,
+    bindings: &mut LocalInferenceEngine<CodeUnit>,
+) {
+    let Some(binding) =
+        ctx.visibility
+            .function_macro_container_binding(&ctx.analyzer, ctx.file, node, ctx.source)
+    else {
+        return;
+    };
+    let unit = binding.proven_unit.or_else(|| {
+        binding
+            .type_node
+            .and_then(|type_node| resolve_type_node_with_recovered_scope(type_node, ctx))
+            .or_else(|| {
+                binding
+                    .type_node
+                    .and_then(|type_node| ctx.resolve_type_node_result(type_node).ok().flatten())
+            })
+            .or_else(|| ctx.resolve_type(&binding.type_name))
+    });
     match unit {
         Some(unit) => bindings.seed_symbol(binding.name, unit),
         None => bindings.declare_shadow(binding.name),
@@ -1441,6 +1686,9 @@ fn seed_binding(
 }
 
 fn resolve_type_node_with_recovered_scope(node: Node<'_>, ctx: &CppScan<'_>) -> Option<CodeUnit> {
+    if let Some(owner) = anonymous_aggregate_owner(&ctx.analyzer, ctx.file, node) {
+        return Some(owner);
+    }
     let scope = recovered_or_indexed_lexical_scope(node, ctx)?;
     let components = cpp_type_name_components(node, ctx.source)?;
     let global = is_globally_qualified_cpp_name(node);

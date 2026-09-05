@@ -7,6 +7,7 @@ use crate::analyzer::languages::{ExternalCalleeSite, language_support};
 use crate::analyzer::lexical_definitions::{
     FormalParameterLayout, PythonMethodBinding, formal_parameter_slots,
 };
+use crate::analyzer::semantic::ResolverOwnedExternalCalleeIdentity;
 use crate::analyzer::structural::FileFacts;
 use crate::analyzer::structural::resolution::BoundaryStatus;
 use crate::analyzer::usages::call_binding::{OrdinaryFormalSlots, canonical_parameter_name};
@@ -98,6 +99,9 @@ pub(crate) enum CallDispatchBoundaryKind {
         /// call's type qualifier rather than a runtime receiver. Other
         /// languages and value receivers leave this absent.
         normalized_static_owner: Option<Box<str>>,
+        /// Resolver-owned external owner/member identity. This is weaker than
+        /// an exact call-shape proof and never mints a semantic target.
+        external_callee_identity: Option<ResolverOwnedExternalCalleeIdentity>,
     },
     /// The exact resolver status is retained rather than collapsed into an
     /// empty target list.
@@ -1525,6 +1529,7 @@ fn apply_dispatch_outcome(
         language,
         None,
         None,
+        None,
         false,
         false,
         false,
@@ -1635,6 +1640,7 @@ fn apply_call_target_outcome(
         call_application,
         dispatch_extensibility,
         exact_external_call,
+        external_callee_identity,
         structure_unavailable,
         unproven_link_unit,
         truncated,
@@ -1659,12 +1665,23 @@ fn apply_call_target_outcome(
         ExactExternalCallProof::dispatch_extensibility,
     );
     lookup.exact_external_call = exact_external_call;
+    if let Some(identity) = &external_callee_identity {
+        debug_assert_eq!(identity.language(), language);
+        if let Some(proof) = &lookup.exact_external_call {
+            debug_assert_eq!(
+                format!("{}.{}", identity.owner_fqn(), identity.member()),
+                proof.canonical_callee(),
+                "external identity and exact proof must describe one callee"
+            );
+        }
+    }
     apply_dispatch_outcome_with_flags(
         lookup,
         outcome,
         max_targets,
         language,
         exact_external_callee,
+        external_callee_identity,
         site,
         resolver_proven_identity,
         structure_unavailable,
@@ -1682,6 +1699,7 @@ fn apply_dispatch_outcome_with_flags(
     max_targets: usize,
     language: Language,
     exact_external_callee: Option<Box<str>>,
+    external_callee_identity: Option<ResolverOwnedExternalCalleeIdentity>,
     site: Option<&ExternalCalleeSite<'_>>,
     resolver_proven_external_identity: bool,
     structure_unavailable: bool,
@@ -1749,6 +1767,7 @@ fn apply_dispatch_outcome_with_flags(
         lookup.boundaries.push(CallDispatchBoundaryKind::External {
             callee_text: external_callee_text.clone(),
             normalized_static_owner: normalized_static_owner.clone(),
+            external_callee_identity: external_callee_identity.clone(),
         });
     }
     if partial_unresolved_import {
@@ -1813,6 +1832,7 @@ fn apply_dispatch_outcome_with_flags(
             lookup.boundaries.push(CallDispatchBoundaryKind::External {
                 callee_text: external_callee_text,
                 normalized_static_owner,
+                external_callee_identity,
             })
         }
         // #1978: a fully-qualified callee with no workspace or classpath
@@ -1835,6 +1855,7 @@ fn apply_dispatch_outcome_with_flags(
             Some(text) => lookup.boundaries.push(CallDispatchBoundaryKind::External {
                 callee_text: Some(text),
                 normalized_static_owner,
+                external_callee_identity: None,
             }),
             None => lookup.boundaries.push(unresolved_call_boundary(
                 status,
@@ -2788,6 +2809,11 @@ export function caller(): void { moduleFunction(); }
                 vec![CallDispatchBoundaryKind::External {
                     callee_text: Some("os.Open".into()),
                     normalized_static_owner: None,
+                    external_callee_identity: Some(ResolverOwnedExternalCalleeIdentity::new(
+                        Language::Go,
+                        "os",
+                        "Open",
+                    )),
                 }],
                 "{lookup:#?}"
             );
@@ -2858,6 +2884,7 @@ export function caller(): void { moduleFunction(); }
                 vec![CallDispatchBoundaryKind::External {
                     callee_text: Some(expected_target.into()),
                     normalized_static_owner: None,
+                    external_callee_identity: None,
                 }],
                 "{lookup:#?}"
             );
@@ -2913,6 +2940,7 @@ func caller() { Open() }
             vec![CallDispatchBoundaryKind::External {
                 callee_text: Some("example.com/model.Open".into()),
                 normalized_static_owner: None,
+                external_callee_identity: None,
             }],
             "{lookup:#?}"
         );
@@ -2963,14 +2991,110 @@ func caller() { Open() }
         );
         assert!(lookup.targets.is_empty(), "{lookup:#?}");
         assert!(
-            lookup.boundaries.iter().all(|boundary| !matches!(
-                boundary,
+            lookup.boundaries.iter().all(|boundary| match boundary {
                 CallDispatchBoundaryKind::External {
-                    callee_text: Some(_),
+                    callee_text,
+                    external_callee_identity,
                     ..
-                }
-            )),
+                } => callee_text.is_none() && external_callee_identity.is_none(),
+                _ => true,
+            }),
             "{lookup:#?}"
+        );
+    }
+
+    #[test]
+    fn go_external_identity_requires_proven_absent_workspace_package() {
+        let workspace_source = r#"package main
+
+import "example.com/app/library"
+
+func caller() { library.Open() }
+"#;
+        let workspace = AnalyzerFixture::new_for_language(
+            Language::Go,
+            &[
+                ("go.mod", "module example.com/app\n"),
+                ("library/library.go", "package library\n\nfunc Open() {}\n"),
+                ("main.go", workspace_source),
+            ],
+        );
+        let workspace_lookup = CallRelationService::dispatch_at_bounded(
+            workspace.analyzer.analyzer(),
+            AnalyzerQueryScope::new(workspace.analyzer.analyzer()).token(),
+            &ExactCallLocation {
+                file: ProjectFile::new(workspace.project_root(), "main.go"),
+                call_span: call_span(workspace_source, "library.Open()"),
+            },
+            Arc::from(workspace_source),
+            generous_limits(),
+            None,
+        );
+        assert_eq!(
+            workspace_lookup.status,
+            Some(DefinitionLookupStatus::Resolved),
+            "{workspace_lookup:#?}"
+        );
+        assert_eq!(workspace_lookup.targets.len(), 1, "{workspace_lookup:#?}");
+        assert!(
+            workspace_lookup.boundaries.is_empty(),
+            "{workspace_lookup:#?}"
+        );
+
+        let incomplete_source = r#"package main
+
+import "os"
+
+func caller() { _, _ = os.Open("book.xlsx") }
+"#;
+        let incomplete = AnalyzerFixture::new_for_language(
+            Language::Go,
+            &[
+                ("go.mod", "module example.com/app\n"),
+                ("main.go", incomplete_source),
+            ],
+        );
+        let go = crate::analyzer::resolve_analyzer::<crate::analyzer::GoAnalyzer>(
+            incomplete.analyzer.analyzer(),
+        )
+        .expect("fixture Go analyzer");
+        let overlay = Arc::new(crate::analyzer::OverlayProject::new(Arc::new(
+            incomplete.test_project().clone(),
+        )));
+        let incomplete_file = ProjectFile::new(incomplete.project_root(), "main.go");
+        assert!(overlay.set(
+            incomplete_file.abs_path().to_path_buf(),
+            incomplete_source.to_owned(),
+        ));
+        let request_snapshot = go.clone_with_project(overlay as Arc<dyn crate::analyzer::Project>);
+        let incomplete_lookup = CallRelationService::dispatch_at_bounded(
+            &request_snapshot,
+            AnalyzerQueryScope::new(&request_snapshot).token(),
+            &ExactCallLocation {
+                file: incomplete_file,
+                call_span: call_span(incomplete_source, "os.Open(\"book.xlsx\")"),
+            },
+            Arc::from(incomplete_source),
+            generous_limits(),
+            None,
+        );
+        assert_ne!(
+            incomplete_lookup.status,
+            Some(DefinitionLookupStatus::UnresolvableImportBoundary),
+            "an incomplete package inventory cannot prove absence: {incomplete_lookup:#?}"
+        );
+        assert!(
+            incomplete_lookup
+                .boundaries
+                .iter()
+                .all(|boundary| match boundary {
+                    CallDispatchBoundaryKind::External {
+                        external_callee_identity,
+                        ..
+                    } => external_callee_identity.is_none(),
+                    _ => true,
+                }),
+            "an incomplete package inventory must not mint external identity: {incomplete_lookup:#?}"
         );
     }
 
@@ -3192,6 +3316,7 @@ func caller() {
                 vec![CallDispatchBoundaryKind::External {
                     callee_text: Some(canonical.into()),
                     normalized_static_owner: None,
+                    external_callee_identity: None,
                 }],
                 "{call}: {exact:#?}"
             );
@@ -3524,6 +3649,7 @@ func caller(os opener) { os.Open("book.xlsx") }
             vec![CallDispatchBoundaryKind::External {
                 callee_text: Some("third-party.work".into()),
                 normalized_static_owner: None,
+                external_callee_identity: None,
             }],
             "{lookup:#?}"
         );
@@ -3568,6 +3694,7 @@ func caller(os opener) { os.Open("book.xlsx") }
             vec![CallDispatchBoundaryKind::External {
                 callee_text: Some("subprocess.run".into()),
                 normalized_static_owner: None,
+                external_callee_identity: None,
             }]
         );
         let proof = lookup
@@ -3772,6 +3899,7 @@ int caller() { return local_target(1); }
             call_application: CallApplicationKind::Unknown,
             dispatch_extensibility: None,
             exact_external_call: None,
+            external_callee_identity: None,
             structure_unavailable,
             unproven_link_unit: false,
             truncated,
@@ -4428,6 +4556,7 @@ object Calls {
                 CallDispatchBoundaryKind::External {
                     callee_text: None,
                     normalized_static_owner: None,
+                    external_callee_identity: None,
                 },
                 CallDispatchBoundaryKind::Unresolved(DefinitionLookupStatus::NoDefinition),
             ]
@@ -4474,6 +4603,7 @@ object Calls {
             vec![CallDispatchBoundaryKind::External {
                 callee_text: None,
                 normalized_static_owner: None,
+                external_callee_identity: None,
             }]
         );
 
@@ -4886,6 +5016,7 @@ fun caller(holder: Holder): String = holder.value.toString()
             vec![CallDispatchBoundaryKind::External {
                 callee_text: Some("com.example.ext.Ext.wrap".into()),
                 normalized_static_owner: None,
+                external_callee_identity: None,
             }],
             "the resolver-proven external member must retain its package-rooted identity: {lookup:#?}"
         );

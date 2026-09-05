@@ -304,7 +304,7 @@ SELECT names.lang, names.generation, names.rel_path, names.blob_oid,
        metadata.callable_modifiers_recorded,
        metadata.callable_parameter_types, metadata.callable_is_native,
        metadata.class_like_is_interface, metadata.class_like_is_static,
-       metadata.type_parameters_recorded
+       metadata.type_parameters_recorded, metadata.result_type_identities
 FROM live_definition_exact_names AS names
 JOIN main.unit_signatures AS signatures
   ON signatures.blob_id = names.blob_id

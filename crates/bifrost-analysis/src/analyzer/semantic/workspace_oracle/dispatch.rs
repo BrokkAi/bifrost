@@ -591,6 +591,7 @@ impl<'a> WorkspaceSemanticOracle<'a> {
                                 kind: DispatchBoundaryKind::External(Some(
                                     target.locator().clone(),
                                 )),
+                                external_callee_identity: None,
                                 exact_external_target: None,
                                 unmaterialized_external_target: Some(target),
                                 proof: proof.clone(),
@@ -948,6 +949,7 @@ impl<'a> WorkspaceSemanticOracle<'a> {
                     locator_for_definition(self.workspace.analyzer(), &group.representative)?;
                 boundaries.push(DispatchBoundary {
                     kind: DispatchBoundaryKind::Unmaterialized(target.clone()),
+                    external_callee_identity: None,
                     exact_external_target: exact_external_artifact.as_ref().and_then(|artifact| {
                         exact_external_procedure_target(
                             self.workspace.analyzer(),
@@ -1581,6 +1583,7 @@ fn external_member_workspace_override_proven_absent(
 fn workspace_hierarchy_unenumerated_boundary() -> DispatchBoundary {
     DispatchBoundary {
         kind: DispatchBoundaryKind::Truncated,
+        external_callee_identity: None,
         exact_external_target: None,
         unmaterialized_external_target: None,
         proof: ProofStatus::Unproven(
@@ -2074,7 +2077,9 @@ fn attach_dispatch_provenance(
         boundaries
             .iter()
             .map(|boundary| {
-                let evidence = if boundary.target_locator().is_some() {
+                let evidence = if boundary.target_locator().is_some()
+                    || boundary.external_callee_identity().is_some()
+                {
                     vec![target_evidence.clone()]
                 } else {
                     let expected_gap_kind = match &boundary.kind {
@@ -2288,6 +2293,7 @@ fn unmaterialized_target_boundary(
             analyzer,
             &target.representative,
         )?),
+        external_callee_identity: None,
         exact_external_target: None,
         unmaterialized_external_target: None,
         proof: target.proof.clone(),
@@ -2516,6 +2522,13 @@ fn dispatch_boundary_locator_work(boundary: &DispatchBoundary) -> SemanticWork {
             .saturating_add(target.owner_fqn().len())
             .saturating_add(target.member().len());
     }
+    if let Some(identity) = boundary.external_callee_identity() {
+        work.nested_entries = work.nested_entries.saturating_add(1);
+        work.owned_text_bytes = work
+            .owned_text_bytes
+            .saturating_add(identity.owner_fqn().len())
+            .saturating_add(identity.member().len());
+    }
     work
 }
 
@@ -2683,6 +2696,7 @@ fn low_level_boundary(
         CallDispatchBoundaryKind::External {
             callee_text,
             normalized_static_owner,
+            external_callee_identity,
         } => {
             match callee_text.as_deref().zip(semantic_call).and_then(
                 |(text, semantic_call)| {
@@ -2697,6 +2711,10 @@ fn low_level_boundary(
             ) {
                 Some(target) => DispatchBoundary {
                     kind: DispatchBoundaryKind::External(Some(target.locator().clone())),
+                    external_callee_identity: external_identity_for_target(
+                        external_callee_identity.as_ref(),
+                        &target,
+                    ),
                     exact_external_target: None,
                     unmaterialized_external_target: Some(target),
                     proof: ProofStatus::Proven,
@@ -2708,6 +2726,10 @@ fn low_level_boundary(
                 },
                 None => DispatchBoundary {
                     kind: DispatchBoundaryKind::External(None),
+                    external_callee_identity: external_identity_for_language(
+                        external_callee_identity.as_ref(),
+                        language,
+                    ),
                     exact_external_target: None,
                     unmaterialized_external_target: None,
                     proof: ProofStatus::Proven,
@@ -2734,6 +2756,7 @@ fn low_level_boundary(
         }) {
             Some(target) => DispatchBoundary {
                 kind: DispatchBoundaryKind::External(Some(target.locator().clone())),
+                external_callee_identity: None,
                 exact_external_target: None,
                 unmaterialized_external_target: Some(target),
                 proof: ProofStatus::Unproven(
@@ -2749,6 +2772,7 @@ fn low_level_boundary(
         },
         CallDispatchBoundaryKind::UnprovenTargetIdentity => DispatchBoundary {
             kind: DispatchBoundaryKind::Unresolved,
+            external_callee_identity: None,
             exact_external_target: None,
             unmaterialized_external_target: None,
             proof: ProofStatus::Unproven(
@@ -2761,6 +2785,32 @@ fn low_level_boundary(
         },
         CallDispatchBoundaryKind::Truncated => truncated_dispatch_boundary(),
     }
+}
+
+fn external_identity_for_language(
+    identity: Option<&crate::analyzer::semantic::ResolverOwnedExternalCalleeIdentity>,
+    language: SemanticLanguage,
+) -> Option<crate::analyzer::semantic::ResolverOwnedExternalCalleeIdentity> {
+    let identity = identity?;
+    let matches_language = identity.language() == language.language();
+    debug_assert!(
+        matches_language,
+        "resolver-owned external identity language must match its call boundary"
+    );
+    matches_language.then(|| identity.clone())
+}
+
+fn external_identity_for_target(
+    identity: Option<&crate::analyzer::semantic::ResolverOwnedExternalCalleeIdentity>,
+    target: &UnmaterializedExternalTarget,
+) -> Option<crate::analyzer::semantic::ResolverOwnedExternalCalleeIdentity> {
+    let identity = identity?;
+    let matches_target = identity.matches_unmaterialized_external_target(target);
+    debug_assert!(
+        matches_target,
+        "resolver-owned external identity must match its unmaterialized target"
+    );
+    matches_target.then(|| identity.clone())
 }
 
 fn hinted_external_member_targets(
@@ -2862,6 +2912,7 @@ fn external_flow_claims_agree(
 fn unresolved_dispatch_boundary(status: DefinitionLookupStatus) -> DispatchBoundary {
     DispatchBoundary {
         kind: DispatchBoundaryKind::Unresolved,
+        external_callee_identity: None,
         exact_external_target: None,
         unmaterialized_external_target: None,
         proof: ProofStatus::Unproven(
@@ -3045,6 +3096,7 @@ fn zero_source_anchor() -> SourceAnchor {
 fn truncated_dispatch_boundary() -> DispatchBoundary {
     DispatchBoundary {
         kind: DispatchBoundaryKind::Truncated,
+        external_callee_identity: None,
         exact_external_target: None,
         unmaterialized_external_target: None,
         proof: ProofStatus::Unproven("dispatch candidate set was truncated".into()),
@@ -3179,6 +3231,7 @@ fn apply_dynamic_dispatch_gap(
     {
         boundaries.push(DispatchBoundary {
             kind: boundary_kind,
+            external_callee_identity: None,
             exact_external_target: None,
             unmaterialized_external_target: None,
             proof: ProofStatus::Unproven(proof_reason.into()),
@@ -3214,6 +3267,7 @@ fn apply_procedure_call_gap(
     {
         boundaries.push(DispatchBoundary {
             kind: boundary_kind,
+            external_callee_identity: None,
             exact_external_target: None,
             unmaterialized_external_target: None,
             proof: ProofStatus::Unproven(proof_reason.into()),
@@ -3868,6 +3922,10 @@ fn compare_dispatch_boundaries(left: &DispatchBoundary, right: &DispatchBoundary
             | (DispatchBoundaryKind::Truncated, DispatchBoundaryKind::Truncated) => Ordering::Equal,
             _ => unreachable!("matching boundary ranks must identify the same variant"),
         })
+        .then_with(|| {
+            left.external_callee_identity
+                .cmp(&right.external_callee_identity)
+        })
 }
 
 const fn dispatch_boundary_rank(kind: &DispatchBoundaryKind) -> u8 {
@@ -3912,9 +3970,10 @@ mod tests {
     use super::*;
     use crate::analyzer::semantic::{
         ClassIdentity, DispatchHint, DispatchHintCallSiteKey, DispatchHintSet, DispatchHints,
-        MemberDeclaration, OracleLimitValues, OracleRelationKind, SemanticBudget,
-        SemanticBudgetDimension, SemanticGapDischarge, SemanticGapId, SemanticGapImpact,
-        SemanticGapImpacts, SourceSite, SourceSiteKind, WorkspaceIcfgProvider,
+        MemberDeclaration, OracleLimitValues, OracleRelationKind,
+        ResolverOwnedExternalCalleeIdentity, SemanticBudget, SemanticBudgetDimension,
+        SemanticGapDischarge, SemanticGapId, SemanticGapImpact, SemanticGapImpacts, SourceSite,
+        SourceSiteKind, WorkspaceIcfgProvider,
     };
     use crate::analyzer::{
         AnalyzerConfig, CallableArity, Language, OverlayProject, ParameterMetadata, Project,
@@ -4724,6 +4783,7 @@ func caller() { db.Open() }
                         boundaries: vec![CallDispatchBoundaryKind::External {
                             callee_text: Some("example.com/driver.Open".into()),
                             normalized_static_owner: None,
+                            external_callee_identity: None,
                         }],
                         call_application: CallApplicationKind::PackageFunction,
                         exact_external_call: Some(proof),
@@ -4822,6 +4882,7 @@ func caller(t *testing.T) { t.Fatal("stop") }
             boundaries: vec![CallDispatchBoundaryKind::External {
                 callee_text: Some("testing.T.Fatal".into()),
                 normalized_static_owner: None,
+                external_callee_identity: None,
             }],
             call_application:
                 crate::analyzer::usages::get_definition::CallApplicationKind::BoundReceiver,
@@ -5391,6 +5452,20 @@ func caller(t *testing.T) { t.Fatal("stop") }
 
         let boundary = |kind| DispatchBoundary {
             kind,
+            external_callee_identity: None,
+            exact_external_target: None,
+            unmaterialized_external_target: None,
+            proof: ProofStatus::Proven,
+            completeness: EvidenceCompleteness::Complete,
+            provenance: Box::new([]),
+        };
+        let identity_only = |owner| DispatchBoundary {
+            kind: DispatchBoundaryKind::External(None),
+            external_callee_identity: Some(ResolverOwnedExternalCalleeIdentity::new(
+                Language::Go,
+                owner,
+                "Open",
+            )),
             exact_external_target: None,
             unmaterialized_external_target: None,
             proof: ProofStatus::Proven,
@@ -5406,13 +5481,38 @@ func caller(t *testing.T) { t.Fatal("stop") }
             boundary(DispatchBoundaryKind::Unresolved),
             boundary(DispatchBoundaryKind::Unmaterialized(early.clone())),
             boundary(DispatchBoundaryKind::External(Some(early))),
+            identity_only("z.example/package"),
+            identity_only("a.example/package"),
             boundary(DispatchBoundaryKind::External(None)),
         ];
         boundaries.sort_by(compare_dispatch_boundaries);
 
+        assert_eq!(
+            boundaries[1]
+                .external_callee_identity()
+                .expect("first identity-only boundary")
+                .owner_fqn(),
+            "a.example/package"
+        );
+        assert_eq!(
+            boundaries[2]
+                .external_callee_identity()
+                .expect("second identity-only boundary")
+                .owner_fqn(),
+            "z.example/package"
+        );
+
         assert!(matches!(
             boundaries.as_slice(),
             [
+                DispatchBoundary {
+                    kind: DispatchBoundaryKind::External(None),
+                    ..
+                },
+                DispatchBoundary {
+                    kind: DispatchBoundaryKind::External(None),
+                    ..
+                },
                 DispatchBoundary {
                     kind: DispatchBoundaryKind::External(None),
                     ..
@@ -5513,6 +5613,7 @@ func caller(t *testing.T) { t.Fatal("stop") }
                     CallDispatchBoundaryKind::External {
                         callee_text: None,
                         normalized_static_owner: None,
+                        external_callee_identity: None,
                     },
                     CallDispatchBoundaryKind::Unresolved(DefinitionLookupStatus::NotFound),
                 ],
@@ -5796,6 +5897,7 @@ func caller(t *testing.T) { t.Fatal("stop") }
         let mut candidates = Vec::new();
         let mut boundaries = vec![DispatchBoundary {
             kind: DispatchBoundaryKind::Unresolved,
+            external_callee_identity: None,
             exact_external_target: None,
             unmaterialized_external_target: None,
             proof: ProofStatus::Unproven("unresolved dispatch arm".into()),
@@ -5860,6 +5962,7 @@ func caller(t *testing.T) { t.Fatal("stop") }
                     CallDispatchBoundaryKind::External {
                         callee_text: None,
                         normalized_static_owner: None,
+                        external_callee_identity: None,
                     },
                     CallDispatchBoundaryKind::Unresolved(DefinitionLookupStatus::NotFound),
                 ],
@@ -6023,6 +6126,7 @@ func caller(t *testing.T) { t.Fatal("stop") }
         let mut boundaries = vec![
             DispatchBoundary {
                 kind: DispatchBoundaryKind::Unresolved,
+                external_callee_identity: None,
                 exact_external_target: None,
                 unmaterialized_external_target: None,
                 proof: ProofStatus::Unproven("unresolved dispatch arm".into()),
@@ -6031,6 +6135,7 @@ func caller(t *testing.T) { t.Fatal("stop") }
             },
             DispatchBoundary {
                 kind: DispatchBoundaryKind::Truncated,
+                external_callee_identity: None,
                 exact_external_target: None,
                 unmaterialized_external_target: None,
                 proof: ProofStatus::Unproven("dispatch limit reached".into()),
@@ -6094,6 +6199,7 @@ func caller(t *testing.T) { t.Fatal("stop") }
             &call,
             DispatchBoundary {
                 kind: DispatchBoundaryKind::Unmaterialized(locator),
+                external_callee_identity: None,
                 exact_external_target: None,
                 unmaterialized_external_target: None,
                 proof: ProofStatus::Proven,
@@ -6152,6 +6258,7 @@ func caller(t *testing.T) { t.Fatal("stop") }
         .expect("exact external target");
         let boundary = DispatchBoundary {
             kind: DispatchBoundaryKind::Unmaterialized(locator),
+            external_callee_identity: None,
             exact_external_target: Some(target),
             unmaterialized_external_target: None,
             proof: ProofStatus::Proven,
@@ -6212,6 +6319,7 @@ func caller(t *testing.T) { t.Fatal("stop") }
             &call,
             DispatchBoundary {
                 kind: DispatchBoundaryKind::External(Some(locator)),
+                external_callee_identity: None,
                 exact_external_target: None,
                 unmaterialized_external_target: Some(target),
                 proof: ProofStatus::Proven,
@@ -6232,6 +6340,39 @@ func caller(t *testing.T) { t.Fatal("stop") }
                 .saturating_mul(3)
                 .saturating_add(identity_text_bytes),
             "the budget owns the target locator, owner, and member strings"
+        );
+    }
+
+    #[test]
+    fn retained_identity_only_external_boundary_work_includes_owner_and_member() {
+        let call = semantic_call_handle();
+        let owner = "os";
+        let member = "Open";
+        let work = retained_boundary_work(
+            &call,
+            DispatchBoundary {
+                kind: DispatchBoundaryKind::External(None),
+                external_callee_identity: Some(ResolverOwnedExternalCalleeIdentity::new(
+                    Language::Go,
+                    owner,
+                    member,
+                )),
+                exact_external_target: None,
+                unmaterialized_external_target: None,
+                proof: ProofStatus::Proven,
+                completeness: EvidenceCompleteness::Complete,
+                provenance: Box::new([]),
+            },
+        );
+
+        assert_eq!(
+            work.nested_entries, 5,
+            "boundary, external identity, provenance handle, relation record, and evidence are retained"
+        );
+        assert_eq!(
+            work.owned_text_bytes,
+            owner.len().saturating_add(member.len()),
+            "the budget owns the resolver-retained owner and member strings"
         );
     }
 

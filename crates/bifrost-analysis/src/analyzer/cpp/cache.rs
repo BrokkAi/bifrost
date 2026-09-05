@@ -7,6 +7,24 @@ use brokk_bifrost_cpp::graph::resolver::{
 use std::mem::size_of;
 use std::sync::Arc;
 
+pub(super) fn weight_macro_composed_field_vec_by_file(
+    _key: &ProjectFile,
+    value: &Arc<Vec<super::MacroComposedField>>,
+) -> u32 {
+    let size = value
+        .iter()
+        .fold(size_of::<Vec<super::MacroComposedField>>(), |acc, field| {
+            acc.saturating_add(size_of::<super::MacroComposedField>())
+                .saturating_add(weight_code_unit(&field.owner))
+                .saturating_add(field.unit.fq_name().len())
+                .saturating_add(field.unit.short_name().len())
+                .saturating_add(field.unit.package_name().len())
+                .saturating_add(field.unit.signature().map_or(0, str::len))
+                .saturating_add(field.ranges.len().saturating_mul(size_of::<Range>()))
+        });
+    size.min(u32::MAX as usize) as u32
+}
+
 pub(super) fn weight_code_unit_set_by_file(
     _key: &ProjectFile,
     value: &Arc<HashSet<CodeUnit>>,

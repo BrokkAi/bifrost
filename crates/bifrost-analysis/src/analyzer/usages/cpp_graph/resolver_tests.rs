@@ -94,6 +94,54 @@ mod tests {
     }
 
     #[test]
+    fn repeated_small_macro_frontier_requests_need_no_replay() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        let source = "#define S(value) value\nint values[] = { S(1), S(2) };\n#undef S\n";
+        fs::write(root.join("table.c"), source).expect("write macro table fixture");
+        let file = ProjectFile::new(root.clone(), "table.c");
+        let cpp = CppAnalyzer::from_project(crate::analyzer::TestProject::new(
+            root,
+            crate::analyzer::Language::Cpp,
+        ));
+        let query_scope = crate::analyzer::AnalyzerQueryScope::new(&cpp);
+        let token = query_scope.token();
+        let graph = CppGraphSource::from_source(&cpp, token);
+        let visibility =
+            VisibilityIndex::build(&cpp, token, &graph, &HashSet::from_iter([file.clone()]));
+        let frontiers = [
+            source.find("S(1)").expect("first macro use"),
+            source.find("S(2)").expect("second macro use"),
+        ];
+
+        for frontier in frontiers.into_iter().cycle().take(1_000) {
+            drop(visibility.macro_environment(&file, frontier));
+        }
+
+        assert_eq!(
+            visibility
+                .macro_environment_checkpoint_build_count
+                .load(Ordering::Relaxed),
+            1,
+            "one file builds one shared checkpoint vector"
+        );
+        assert_eq!(
+            visibility
+                .macro_environment_copy_count
+                .load(Ordering::Relaxed),
+            0,
+            "references sharing a frontier in a small event set must reuse its checkpoint"
+        );
+        assert_eq!(
+            visibility
+                .macro_event_application_count
+                .load(Ordering::Relaxed),
+            2,
+            "the define and undef are applied once while checkpoints are built"
+        );
+    }
+
+    #[test]
     fn ordinary_macro_resolution_evaluates_exact_integer_conditions() {
         let temp = tempfile::tempdir().expect("temp dir");
         let root = temp.path().canonicalize().expect("canonical temp dir");
@@ -2886,6 +2934,11 @@ ABSL_NAMESPACE_END
     fn recovered_c_precision_membership_keeps_roles_bounded_and_structured() {
         let source = r#"typedef struct Widget Widget;
 struct Widget { int field; };
+#define C16N 1
+#define MACRO_ALIAS C16N
+#define TYPE_USE ((Widget *)0)
+#define FUNCTION_MACRO(parameter) C16N
+#define STRING_LITERAL "C16N"
 #define THIS(type) type *self
 
 int trigger(Widget *value) { return value->field; }
@@ -2893,9 +2946,24 @@ int recovered(void) { THIS(const Widget); return 0; }
 
 struct Stamp { int sec; };
 struct State { struct Stamp timestamp; };
+enum Status { I_NULL };
 #define DISCARD(value) 0
 int recovered_member(struct State *state) {
     DISCARD(const int = state->timestamp);
+    return 0;
+}
+int recovered_enum(void) {
+    DISCARD(const int = I_NULL);
+    return 0;
+}
+STATIC
+EFI_STATUS
+Encode (
+  );
+STATIC
+EFI_STATUS
+Encode ()
+{
     return 0;
 }
 
@@ -2942,6 +3010,30 @@ int recovered_explicit_assignment(void) {
 
         let recovered_type = source.rfind("Widget").expect("recovered Widget");
         let recovered_member = source.rfind("timestamp").expect("recovered timestamp");
+        let recovered_macro_alias = source
+            .find("MACRO_ALIAS C16N")
+            .expect("macro alias replacement")
+            + "MACRO_ALIAS ".len();
+        let recovered_macro_type = source
+            .find("TYPE_USE ((Widget *)0)")
+            .expect("macro type replacement")
+            + "TYPE_USE ((".len();
+        let function_macro_replacement = source
+            .find("FUNCTION_MACRO(parameter) C16N")
+            .expect("function-like macro replacement")
+            + "FUNCTION_MACRO(parameter) ".len();
+        let function_macro_parameter = source
+            .find("parameter")
+            .expect("function-like macro parameter");
+        let string_literal_replacement = source
+            .find("STRING_LITERAL \"C16N\"")
+            .expect("string macro replacement")
+            + "STRING_LITERAL ".len();
+        let recovered_enum = source.rfind("I_NULL").expect("recovered enum value");
+        let recovered_prototype = source.find("Encode (").expect("recovered prototype name");
+        let recovered_definition = source
+            .rfind("Encode ()")
+            .expect("recovered definition name");
         let recovered_callee = source
             .find("recovered_call_target(1)")
             .expect("recovered call target");
@@ -2955,6 +3047,47 @@ int recovered_explicit_assignment(void) {
         assert!(
             ranges.contains(&(recovered_member, recovered_member + "timestamp".len())),
             "the recovered selected member remains a structured reference: {ranges:?}"
+        );
+        assert!(
+            ranges.contains(&(recovered_macro_alias, recovered_macro_alias + "C16N".len())),
+            "an object-macro alias replacement remains an exact reference: {ranges:?}"
+        );
+        assert!(
+            ranges.contains(&(recovered_macro_type, recovered_macro_type + "Widget".len())),
+            "an object-macro type replacement remains an exact reference: {ranges:?}"
+        );
+        assert!(
+            ranges.contains(&(
+                function_macro_replacement,
+                function_macro_replacement + "C16N".len()
+            )),
+            "function-like macro replacement values remain exact references: {ranges:?}"
+        );
+        assert!(
+            !ranges.contains(&(
+                function_macro_parameter,
+                function_macro_parameter + "parameter".len()
+            )),
+            "function-like macro formal parameters are not references: {ranges:?}"
+        );
+        assert!(
+            !ranges.contains(&(
+                string_literal_replacement,
+                string_literal_replacement + "\"C16N\"".len()
+            )),
+            "literal object-macro replacements are not parsed identifier references: {ranges:?}"
+        );
+        assert!(
+            ranges.contains(&(recovered_enum, recovered_enum + "I_NULL".len())),
+            "a visible enum value under expression recovery remains a reference: {ranges:?}"
+        );
+        assert!(
+            !ranges.contains(&(recovered_prototype, recovered_prototype + "Encode".len())),
+            "a recovered prototype binder is not a precision membership reference: {ranges:?}"
+        );
+        assert!(
+            !ranges.contains(&(recovered_definition, recovered_definition + "Encode".len())),
+            "a recovered definition binder is not a precision membership reference: {ranges:?}"
         );
         assert!(
             ranges.contains(&(

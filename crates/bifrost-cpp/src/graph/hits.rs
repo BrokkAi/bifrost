@@ -14,7 +14,7 @@ pub fn push_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
 }
 
 pub fn push_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
-    if ctx.has_physically_visible_type_target {
+    if ctx.has_proven_visible_type_target {
         push_hit_with_options(node, ctx, false, UsageHitKind::Reference, true);
     } else {
         push_unproven_hit(node, ctx);
@@ -22,7 +22,7 @@ pub fn push_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
 }
 
 pub fn push_type_hit_range(anchor: Node<'_>, start: usize, end: usize, ctx: &mut ScanCtx<'_>) {
-    if ctx.has_physically_visible_type_target {
+    if ctx.has_proven_visible_type_target {
         push_hit_range_with_options(
             anchor,
             start,
@@ -113,6 +113,48 @@ pub fn push_declaration_reference_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         line_idx,
         UsageHitKind::Reference,
     );
+}
+
+/// Record a recovered callable prototype name as an editor-only declaration
+/// binding. It is not a source reference and must not be converted into a
+/// self-receiver hit merely because the declaration belongs to the queried
+/// target.
+pub fn push_declared_reference_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    if *ctx.limit_exceeded {
+        return;
+    }
+    let line_idx = find_line_index_for_offset(ctx.line_starts, node.start_byte());
+    let hit = usage_hit(
+        ctx.file,
+        line_idx,
+        node.start_byte(),
+        node.end_byte(),
+        ctx.spec.target.clone(),
+        snippet_around_line(ctx.source, ctx.line_starts, line_idx, SNIPPET_CONTEXT_LINES),
+    )
+    .into_declared_reference();
+    ctx.hits.insert(hit);
+}
+
+/// Record a recovered callable definition name as an editor-only definition
+/// site. The ordinary definition helper suppresses a target's own enclosing
+/// declaration, but this recovery path needs the exact source range to bridge
+/// the inverse edge without exposing it as a runtime reference.
+pub fn push_recovered_definition_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    if *ctx.limit_exceeded {
+        return;
+    }
+    let line_idx = find_line_index_for_offset(ctx.line_starts, node.start_byte());
+    let hit = usage_hit(
+        ctx.file,
+        line_idx,
+        node.start_byte(),
+        node.end_byte(),
+        ctx.spec.target.clone(),
+        snippet_around_line(ctx.source, ctx.line_starts, line_idx, SNIPPET_CONTEXT_LINES),
+    )
+    .into_definition();
+    ctx.hits.insert(hit);
 }
 
 pub fn push_unproven_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
@@ -283,23 +325,16 @@ fn insert_hit_range(
         UsageHitKind::Reference => hit,
         UsageHitKind::SelfReceiver => hit.into_self_receiver(),
         UsageHitKind::Definition => hit.into_definition(),
-        UsageHitKind::Import
-        | UsageHitKind::Reexport
-        | UsageHitKind::DeclaredReference
-        | UsageHitKind::OverrideDeclaration => {
+        UsageHitKind::Import | UsageHitKind::Reexport | UsageHitKind::OverrideDeclaration => {
             unreachable!("unsupported C++ hit emission kind: {kind:?}")
         }
+        UsageHitKind::DeclaredReference => hit.into_declared_reference(),
     };
-    ctx.hits.insert(hit);
-    if kind.included_in(UsageHitSurface::ExternalUsages)
-        && ctx
-            .hits
-            .iter()
-            .filter(|hit| hit.kind.included_in(UsageHitSurface::ExternalUsages))
-            .count()
-            > ctx.max_usages
-    {
-        *ctx.limit_exceeded = true;
+    if ctx.hits.insert(hit) && kind.included_in(UsageHitSurface::ExternalUsages) {
+        ctx.external_hit_count += 1;
+        if ctx.external_hit_count > ctx.max_usages {
+            *ctx.limit_exceeded = true;
+        }
     }
 }
 

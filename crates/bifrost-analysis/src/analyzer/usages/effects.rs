@@ -1980,6 +1980,7 @@ func caller() { _, _ = missing.Open("book.xlsx") }
                     CallDispatchBoundaryKind::External {
                         callee_text: Some("os.Open".into()),
                         normalized_static_owner: None,
+                        external_callee_identity: None,
                     },
                     CallDispatchBoundaryKind::Unresolved(DefinitionLookupStatus::NoDefinition),
                 ],
@@ -2061,6 +2062,7 @@ func caller(t *testing.T) { t.Fatal("stop") }
             boundaries: vec![CallDispatchBoundaryKind::External {
                 callee_text: Some("testing.T.Fatal".into()),
                 normalized_static_owner: None,
+                external_callee_identity: None,
             }],
             ..CallDispatchLookup::default()
         };
@@ -2155,6 +2157,7 @@ func caller() { model.Binary(model.Pair()) }
                 boundaries: vec![CallDispatchBoundaryKind::External {
                     callee_text: Some("example.com/model.Binary".into()),
                     normalized_static_owner: None,
+                    external_callee_identity: None,
                 }],
                 ..CallDispatchLookup::default()
             },

@@ -5,6 +5,9 @@
 //! symbol graph.  Resolving them from the current syntax tree keeps overlays
 //! authoritative and avoids adding short-lived lexical facts to the store.
 
+use brokk_bifrost_cpp::graph::resolver::{
+    guard_requirements_hold_at_reference, preprocessor_guard_environment,
+};
 use tree_sitter::Node;
 
 use super::languages::{LocalDeclarationVisibility, language_support};
@@ -367,6 +370,20 @@ pub(crate) fn resolve_lexical_binding(
     }
 
     let focus = smallest_named_node(root, focus_start, focus_end)?;
+    resolve_lexical_binding_from_focus(language, focus, source, focus_start, identifier)
+}
+
+/// Resolve a lexical binding when a language adapter has structurally proven
+/// that a grammar recovery node, rather than the smallest named leaf, carries
+/// the value role at `focus_start`.
+pub(crate) fn resolve_lexical_binding_from_focus(
+    language: Language,
+    focus: Node<'_>,
+    source: &str,
+    focus_start: usize,
+    identifier: &str,
+) -> Option<LexicalBindingResolution> {
+    debug_assert!(focus.start_byte() <= focus_start && focus_start < focus.end_byte());
     if !focus_can_resolve_lexical(language, focus) {
         return None;
     }
@@ -756,6 +773,13 @@ fn scope_matching_local(
     focus_start: usize,
     identifier: &str,
 ) -> Option<LexicalDefinition> {
+    let reference_guards = (language == Language::Cpp)
+        .then(|| {
+            scope
+                .descendant_for_byte_range(focus_start, focus_start.saturating_add(1))
+                .and_then(|focus| preprocessor_guard_environment(focus, source))
+        })
+        .flatten();
     let mut nearest_before: Option<(Node<'_>, Node<'_>)> = None;
     let mut first_any: Option<(Node<'_>, Node<'_>)> = None;
     let mut hoisted: Option<(Node<'_>, Node<'_>)> = None;
@@ -798,6 +822,15 @@ fn scope_matching_local(
             }
             if language_support(language)
                 .is_some_and(|support| support.skips_local_declaration(node, source))
+            {
+                continue;
+            }
+            if language == Language::Cpp
+                && reference_guards.as_ref().is_some_and(|reference| {
+                    !preprocessor_guard_environment(node, source).is_some_and(|required| {
+                        guard_requirements_hold_at_reference(&required, Some(reference))
+                    })
+                })
             {
                 continue;
             }
@@ -1468,7 +1501,7 @@ fn is_local_declaration(language: Language, kind: &str) -> bool {
                 | "type_pattern"
         ),
         Language::Go => matches!(kind, "var_spec" | "short_var_declaration" | "range_clause"),
-        Language::Cpp => matches!(kind, "init_declarator" | "condition_clause"),
+        Language::Cpp => matches!(kind, "declaration" | "init_declarator" | "condition_clause"),
         Language::JavaScript | Language::TypeScript => matches!(
             kind,
             "variable_declarator" | "catch_clause" | "for_in_statement"

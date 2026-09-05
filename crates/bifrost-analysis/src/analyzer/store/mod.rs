@@ -85,35 +85,57 @@ pub fn analyzer_db_path(workspace_root: &Path) -> PathBuf {
     gitblob::cache_db_path(workspace_root)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StoreErrorKind {
+    Generic,
+    StaleGeneration,
+    ResourceBound,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoreError {
     message: String,
-    stale_generation: bool,
+    kind: StoreErrorKind,
 }
 
 impl StoreError {
     pub fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
-            stale_generation: false,
+            kind: StoreErrorKind::Generic,
         }
     }
 
     fn stale_generation(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
-            stale_generation: true,
+            kind: StoreErrorKind::StaleGeneration,
         }
     }
 
+    fn resource_bound(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            kind: StoreErrorKind::ResourceBound,
+        }
+    }
+
+    pub fn kind(&self) -> StoreErrorKind {
+        self.kind
+    }
+
     pub fn is_stale_generation(&self) -> bool {
-        self.stale_generation
+        self.kind == StoreErrorKind::StaleGeneration
+    }
+
+    pub fn is_resource_bound(&self) -> bool {
+        self.kind == StoreErrorKind::ResourceBound
     }
 
     pub(crate) fn context(self, context: impl fmt::Display) -> Self {
         Self {
             message: format!("{context}: {}", self.message),
-            stale_generation: self.stale_generation,
+            kind: self.kind,
         }
     }
 }
@@ -3179,6 +3201,12 @@ impl AnalyzerStore {
     #[cfg(test)]
     pub(crate) fn parsed_blob_transaction_starts_for_test(&self) -> usize {
         self.parsed_blob_transaction_starts.load(Ordering::SeqCst)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reset_parsed_blob_transaction_starts_for_test(&self) {
+        self.parsed_blob_transaction_starts
+            .store(0, Ordering::SeqCst);
     }
 
     pub(crate) fn prepare_parsed_blob<A: LanguageAdapter>(
@@ -8042,6 +8070,23 @@ impl<'a> PreparedPersistenceWriter<'a> {
                     },
                 )
             }
+            Err(error) if error.is_resource_bound() && prepared.len() == 1 => (
+                vec![PersistBlobOutcome {
+                    prepared: prepared
+                        .into_iter()
+                        .next()
+                        .expect("single resource-bound prepared blob"),
+                    error: Some(error),
+                }],
+                PersistBatchStats {
+                    failed_transaction_attempts: 1,
+                    failed_blobs: 1,
+                    peak_batch_blobs: batch_blobs,
+                    peak_batch_rows: batch_rows,
+                    peak_batch_payload_bytes: batch_bytes,
+                    ..PersistBatchStats::default()
+                },
+            ),
             Err(mut error) if prepared.len() == 1 => {
                 let mut failed_attempts = 1;
                 for retry in 1..=PREPARED_WRITE_IMMEDIATE_RETRIES {
@@ -8174,7 +8219,7 @@ impl<'a> PreparedPersistenceWriter<'a> {
             || cost.logical_rows > limits.max_rows
             || cost.payload_bytes > limits.max_payload_bytes
         {
-            return Err(StoreError::new(format!(
+            return Err(StoreError::resource_bound(format!(
                 "prepared replacement mutation batch exceeds limits: blobs={}, rows={}, bytes={}",
                 prepared.len(),
                 cost.logical_rows,
@@ -13735,7 +13780,7 @@ pub(crate) fn hydrate_unit_fq<A: LanguageAdapter>(
 /// makes positional decoding safe among them: a column added to the schema is
 /// added to this list once, and the encoder and decoder beside it are the only
 /// two places that have to agree about what index it lands on.
-const SIGNATURE_METADATA_VALUE_COLUMNS: [&str; 30] = [
+const SIGNATURE_METADATA_VALUE_COLUMNS: [&str; 31] = [
     "label",
     "parameters",
     "return_type_text",
@@ -13766,6 +13811,7 @@ const SIGNATURE_METADATA_VALUE_COLUMNS: [&str; 30] = [
     "class_like_is_interface",
     "class_like_is_static",
     "type_parameters_recorded",
+    "result_type_identities",
 ];
 
 /// The variable-length subset of the columns above.
@@ -13775,7 +13821,7 @@ const SIGNATURE_METADATA_VALUE_COLUMNS: [&str; 30] = [
 /// spellings are bounded by their own CHECK constraints and are not worth
 /// summing. The Rust accounting in [`SignatureMetadataColumns::stored_text_bytes`]
 /// must sum exactly this set, because a test compares it against the SQL sum.
-const SIGNATURE_METADATA_TEXT_COLUMNS: [&str; 10] = [
+const SIGNATURE_METADATA_TEXT_COLUMNS: [&str; 11] = [
     "label",
     "parameters",
     "return_type_text",
@@ -13786,6 +13832,7 @@ const SIGNATURE_METADATA_TEXT_COLUMNS: [&str; 10] = [
     "extension_receiver_type",
     "extension_receiver_type_identity",
     "callable_parameter_types",
+    "result_type_identities",
 ];
 
 /// The value columns as a SELECT list, each qualified by `qualifier`, which is
@@ -13876,6 +13923,7 @@ struct SignatureMetadataColumns {
     class_like_is_interface: i64,
     class_like_is_static: i64,
     type_parameters_recorded: i64,
+    result_type_identities: String,
 }
 
 impl SignatureMetadataColumns {
@@ -13940,6 +13988,10 @@ impl SignatureMetadataColumns {
             class_like_is_interface: bool_to_i64(value.class_like_is_interface()),
             class_like_is_static: bool_to_i64(value.class_like_is_static()),
             type_parameters_recorded: bool_to_i64(value.type_parameters_recorded()),
+            result_type_identities: encode_signature_metadata_json(
+                "result_type_identities",
+                value.result_type_identities(),
+            )?,
         })
     }
 
@@ -13965,6 +14017,7 @@ impl SignatureMetadataColumns {
             self.callable_parameter_types
                 .as_ref()
                 .map_or(0, String::len),
+            self.result_type_identities.len(),
         ])
     }
 
@@ -14011,6 +14064,7 @@ impl SignatureMetadataColumns {
             self.class_like_is_interface,
             self.class_like_is_static,
             self.type_parameters_recorded,
+            self.result_type_identities,
         ])?;
         Ok(())
     }
@@ -14185,6 +14239,10 @@ fn signature_metadata_from_row(
             &types,
         )?);
     }
+    metadata = metadata.with_result_type_identities(decode_signature_metadata_json(
+        "result_type_identities",
+        &row.get::<_, String>(base + 30)?,
+    )?);
     Ok(metadata)
 }
 
@@ -14374,6 +14432,15 @@ mod tests {
     use tree_sitter::Parser;
 
     #[test]
+    fn store_error_context_preserves_resource_bound_kind() {
+        let error = StoreError::resource_bound("over budget").context("repairing blob");
+
+        assert_eq!(error.kind(), StoreErrorKind::ResourceBound);
+        assert!(error.is_resource_bound());
+        assert_eq!(error.to_string(), "repairing blob: over budget");
+    }
+
+    #[test]
     fn explicit_root_rust_unit_persists_full_identity_despite_empty_qualifier() {
         let temp = tempfile::TempDir::new().unwrap();
         let file = write_file(
@@ -14453,6 +14520,18 @@ mod tests {
         let receiver_slice = receiver.slice(receiver_named).unwrap();
         let extension_receiver_type_identity = receiver.finish(receiver_slice).expect("receiver");
 
+        // Two declared results, so the round trip pins the positional column
+        // rather than only the single `return_type_identity` beside it. A
+        // reader that dropped this column would still decode every other
+        // field, which is exactly how it went unnoticed the first time.
+        let mut first_result = StructuredTypeIdentityBuilder::default();
+        let first_named = first_result.named(named("Tx")).unwrap();
+        let first_pointer = first_result.pointer(first_named).unwrap();
+        let first_result_identity = first_result.finish(first_pointer).expect("first result");
+        let mut second_result = StructuredTypeIdentityBuilder::default();
+        let second_named = second_result.named(named("error")).unwrap();
+        let second_result_identity = second_result.finish(second_named).expect("second result");
+
         SignatureMetadata::new(
             "fn build(first: String, second: Widget) -> Registry<Map<String, Widget>>",
             vec![
@@ -14462,6 +14541,7 @@ mod tests {
         )
         .with_return_type_text(Some("Registry<Map<String, Widget>>"))
         .with_return_type_identity(Some(return_type_identity))
+        .with_result_type_identities(vec![first_result_identity, second_result_identity])
         .with_underlying_type_identity(Some(underlying_type_identity))
         .with_declaration_only(true)
         .with_callable_arity(CallableArity::new(2, 3, true))
@@ -21794,6 +21874,42 @@ mod tests {
     }
 
     #[test]
+    fn oversized_singleton_prepared_blob_is_resource_bound_without_immediate_retry() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let file = write_file(temp.path(), "Model.java", "class Model { int value; }\n");
+        let state = Arc::new(parse_state(&JavaAdapter, &file));
+        let oid = oid_for(b"oversized singleton");
+        let store = AnalyzerStore::open_ephemeral().unwrap();
+        let prepared = AnalyzerStore::prepare_parsed_blob(
+            oid,
+            "java",
+            GenerationId::BOOTSTRAP,
+            &JavaAdapter,
+            state,
+        )
+        .unwrap();
+        store.reset_parsed_blob_transaction_starts_for_test();
+
+        let (outcomes, stats) = store.persist_prepared_blobs(
+            vec![prepared],
+            PersistBatchLimits {
+                max_blobs: 1,
+                max_rows: 0,
+                max_payload_bytes: usize::MAX,
+            },
+        );
+
+        let error = outcomes[0]
+            .error
+            .as_ref()
+            .expect("the singleton must remain dirty");
+        assert_eq!(error.kind(), StoreErrorKind::ResourceBound);
+        assert!(error.is_resource_bound());
+        assert_eq!(stats.failed_transaction_attempts, 1);
+        assert_eq!(store.parsed_blob_transaction_starts_for_test(), 1);
+    }
+
+    #[test]
     fn oversized_prepared_replacement_is_not_persisted_past_the_resource_bound() {
         let temp = tempfile::TempDir::new().unwrap();
         let old_file = write_file(
@@ -21861,6 +21977,12 @@ mod tests {
         assert!(
             replacement_outcome.error.is_some(),
             "an oversized replacement must remain an in-memory analysis result instead of starting an unbounded cache transaction"
+        );
+        assert!(
+            replacement_outcome
+                .error
+                .as_ref()
+                .is_some_and(StoreError::is_resource_bound)
         );
         let peer_outcome = outcomes
             .iter()

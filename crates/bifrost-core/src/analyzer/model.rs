@@ -622,6 +622,17 @@ pub struct SignatureMetadata {
     return_type_text: Option<String>,
     #[serde(default)]
     return_type_identity: Option<StructuredTypeIdentity>,
+    /// One structured identity per declared result, for a callable that
+    /// declares more than one.
+    ///
+    /// `return_type_identity` holds a single identity and therefore cannot
+    /// describe `func f() (T, error)`. Languages that can declare several
+    /// results publish them here in declaration order; everything else leaves
+    /// it empty and keeps using the single field. Read it through
+    /// [`Self::result_type_identity`], which falls back so that ordinal zero
+    /// answers the same for both shapes.
+    #[serde(default)]
+    result_type_identities: Vec<StructuredTypeIdentity>,
     /// The declared type's structured right-hand side, such as the
     /// `[256]*operation` in `type JumpTable [256]*operation`.
     ///
@@ -2032,6 +2043,7 @@ impl SignatureMetadata {
             parameters,
             return_type_text: None,
             return_type_identity: None,
+            result_type_identities: Vec::new(),
             underlying_type_identity: None,
             declaration_only: false,
             callable_arity: None,
@@ -2227,6 +2239,14 @@ impl SignatureMetadata {
         self
     }
 
+    pub fn with_result_type_identities(
+        mut self,
+        result_type_identities: Vec<StructuredTypeIdentity>,
+    ) -> Self {
+        self.result_type_identities = result_type_identities;
+        self
+    }
+
     pub fn with_underlying_type_identity(
         mut self,
         underlying_type_identity: Option<StructuredTypeIdentity>,
@@ -2360,6 +2380,25 @@ impl SignatureMetadata {
 
     pub fn return_type_identity(&self) -> Option<&StructuredTypeIdentity> {
         self.return_type_identity.as_ref()
+    }
+
+    /// The structured identity of one declared result, by position.
+    ///
+    /// A callable with several declared results answers from
+    /// `result_type_identities`. One with a single result has nothing there
+    /// and answers ordinal zero from `return_type_identity`, so a caller that
+    /// only ever asks for ordinal zero sees no difference between the two.
+    pub fn result_type_identities(&self) -> &[StructuredTypeIdentity] {
+        &self.result_type_identities
+    }
+
+    pub fn result_type_identity(&self, ordinal: usize) -> Option<&StructuredTypeIdentity> {
+        if self.result_type_identities.is_empty() {
+            return (ordinal == 0)
+                .then_some(self.return_type_identity.as_ref())
+                .flatten();
+        }
+        self.result_type_identities.get(ordinal)
     }
 
     pub fn into_return_type_identity(self) -> Option<StructuredTypeIdentity> {

@@ -5,6 +5,7 @@
 //! [`CppVisitor`] out of `LanguageAdapter::parse_file`.
 
 use crate::graph::resolver::OrphanedNamespaceScopeIndex;
+use crate::graph::syntax::MacroReplacementField;
 use brokk_bifrost_core::analyzer::common::{
     node_source_text, parse_source_ranges_with_cancellation, parse_source_region,
 };
@@ -3352,6 +3353,140 @@ pub struct CppVisitor<'a> {
     /// happen to the declaration set, innermost last. Empty outside a recovery
     /// reparse, which is almost always (#2787).
     pub recovery_captures: Vec<CppRecoveryCapture>,
+    /// Object-like field-list macros defined earlier in this source. Their
+    /// replacements are parsed structurally and materialized under each
+    /// invoking aggregate; no source-text expansion is used.
+    pub object_macro_fields: HashMap<String, Vec<MacroReplacementField>>,
+    /// Names whose active replacement is not a unique structured field list.
+    /// A later `#undef` resets the ambiguity; another `#define` does not.
+    pub ambiguous_object_macro_fields: HashSet<String>,
+}
+
+/// One source-order event from an object-like field-list macro environment.
+///
+/// The event stream lets an include-closure consumer preserve preprocessor
+/// invalidation without guessing which parsed header happened to be visited
+/// first. A conservative consumer may permanently block a name after an
+/// `undef` when conditional include order is not provable.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ObjectMacroFieldEvent {
+    Define {
+        name: String,
+        fields: Vec<MacroReplacementField>,
+        conditional: bool,
+    },
+    Undef {
+        name: String,
+        conditional: bool,
+    },
+}
+
+/// Collect object-like field-list macros from a parsed source in source order.
+/// Macros with conflicting active replacements are omitted so an include
+/// closure cannot silently choose one guarded definition over another.
+pub fn collect_cpp_object_macro_fields<'tree>(
+    root: Node<'tree>,
+    source: &str,
+) -> HashMap<String, Vec<MacroReplacementField>> {
+    let mut fields = HashMap::default();
+    let mut ambiguous = HashSet::default();
+    for event in collect_cpp_object_macro_field_events(root, source) {
+        match event {
+            ObjectMacroFieldEvent::Define {
+                name,
+                fields: value,
+                conditional,
+            } => {
+                if value.is_empty() {
+                    fields.remove(&name);
+                    if conditional {
+                        ambiguous.insert(name);
+                    } else {
+                        ambiguous.remove(&name);
+                    }
+                } else if ambiguous.contains(&name) {
+                    // Keep the name blocked until an explicit undef resets it.
+                } else if let Some(previous) = fields.get(&name) {
+                    if previous != &value {
+                        fields.remove(&name);
+                        ambiguous.insert(name);
+                    }
+                } else {
+                    fields.insert(name, value);
+                }
+            }
+            ObjectMacroFieldEvent::Undef { name, conditional } => {
+                fields.remove(&name);
+                if conditional {
+                    ambiguous.insert(name);
+                } else {
+                    ambiguous.remove(&name);
+                }
+            }
+        }
+    }
+    fields
+}
+
+/// Collect object-like field-list macro events in source order. Conditional
+/// branches remain visible in the event stream: callers that cannot prove
+/// branch selection can invalidate names conservatively instead of inventing
+/// a replacement from one branch.
+pub fn collect_cpp_object_macro_field_events<'tree>(
+    root: Node<'tree>,
+    source: &str,
+) -> Vec<ObjectMacroFieldEvent> {
+    let mut events = Vec::new();
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "preproc_def"
+            && let Some(name) = extract_macro_name(node, source)
+        {
+            let fields = node
+                .child_by_field_name("value")
+                .map(|value| {
+                    crate::graph::syntax::object_macro_replacement_fields(node_text(value, source))
+                })
+                .unwrap_or_default();
+            events.push(ObjectMacroFieldEvent::Define {
+                name,
+                fields,
+                conditional: inside_preprocessor_conditional(node),
+            });
+        } else if is_cpp_undef_directive(node, source)
+            && let Some(argument) = node.child_by_field_name("argument")
+        {
+            events.push(ObjectMacroFieldEvent::Undef {
+                name: node_text(argument, source).trim().to_string(),
+                conditional: inside_preprocessor_conditional(node),
+            });
+        }
+        let mut cursor = node.walk();
+        let children = node.named_children(&mut cursor).collect::<Vec<_>>();
+        stack.extend(children.into_iter().rev());
+    }
+    events
+}
+
+fn inside_preprocessor_conditional(node: Node<'_>) -> bool {
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        if matches!(
+            parent.kind(),
+            "preproc_if" | "preproc_ifdef" | "preproc_ifndef" | "preproc_elif"
+        ) {
+            return true;
+        }
+        current = parent.parent();
+    }
+    false
+}
+
+fn is_cpp_undef_directive(node: Node<'_>, source: &str) -> bool {
+    node.kind() == "preproc_call"
+        && node
+            .child_by_field_name("directive")
+            .is_some_and(|directive| node_text(directive, source).trim() == "#undef")
 }
 
 impl<'a> CppVisitor<'a> {
@@ -4187,6 +4322,7 @@ impl<'a> CppVisitor<'a> {
             // retain their declaration-preserving wrapper traversal when the
             // sentinel predicate does not match.
             "ERROR" => {
+                self.visit_object_macro_error_classes(node, scope);
                 if !self.visit_function_like_export_class_pair(node, scope, stack, ancestry) {
                     self.visit_embedded_function_like_export_classes(node, scope, stack, ancestry);
                     if self.visit_collapsed_macro_declaration_run(node, scope) {
@@ -4253,6 +4389,7 @@ impl<'a> CppVisitor<'a> {
                 }
             }
             "field_declaration" => self.visit_declaration(node, scope, true, stack, ancestry),
+            "preproc_call" => self.visit_preproc_call(node, scope),
             "type_definition" | "alias_declaration" => {
                 self.visit_type_declaration(node, scope, stack, ancestry)
             }
@@ -4751,7 +4888,16 @@ impl<'a> CppVisitor<'a> {
         Some(ScopeInfo {
             package_name,
             module,
-            ..scope.clone()
+            // A recovered namespace body is no longer inside the class (or
+            // function) that tree-sitter accidentally used as its wrapper.
+            // Keep namespace/module context, but never carry that owner into
+            // declarations published from the recovered region.
+            class_unit: None,
+            template_signature: None,
+            template_metadata: None,
+            declarations_are_fields: false,
+            recovered_specialization_member_scope: false,
+            visible_using_namespaces: scope.visible_using_namespaces.clone(),
         })
     }
 
@@ -5996,6 +6142,9 @@ impl<'a> CppVisitor<'a> {
         if self.visit_sentinel_macro_region(node, scope, stack, ancestry) {
             return;
         }
+        if in_class_body && self.visit_bare_object_macro_fields(node, scope) {
+            return;
+        }
         if recovered_macro_return_type_node(node, self.source).is_some_and(|declarator| {
             !cpp_active_template_type_parameter(
                 node,
@@ -6004,6 +6153,15 @@ impl<'a> CppVisitor<'a> {
                 ancestry,
             )
         }) {
+            return;
+        }
+        if in_class_body && let Some(recovered) = recovered_pyobject_head_field(node, self.source) {
+            // `PyObject_HEAD` is an object-like macro, so tree-sitter folds
+            // the following `Imaging image` member into one malformed field.
+            // The ERROR's identifier is the actual declarator; route it
+            // through the ordinary field path so its parent, range, and
+            // signature metadata remain consistent with every other member.
+            self.visit_variable_declaration(node, recovered.declarator, scope, true, ancestry);
             return;
         }
         if in_class_body
@@ -6046,6 +6204,9 @@ impl<'a> CppVisitor<'a> {
         }
         if self.visit_c_anonymous_aggregate_declaration(node, scope, in_class_body, stack, ancestry)
         {
+            return;
+        }
+        if self.visit_c_anonymous_local_aggregate_declaration(node, scope, stack, ancestry) {
             return;
         }
 
@@ -6142,6 +6303,13 @@ impl<'a> CppVisitor<'a> {
         for child in node.children_by_field_name("declarator", &mut cursor) {
             if crate::structural::is_recovered_designator_init_declarator(child) {
                 handled_declarator = true;
+                continue;
+            }
+            if in_class_body
+                && let Some(field) = recovered_function_like_field_declarator(node, self.source)
+            {
+                handled_declarator = true;
+                self.visit_variable_declaration(node, field.name, scope, true, ancestry);
                 continue;
             }
             if let Some(kind) = classify_declarator(child) {
@@ -6273,6 +6441,66 @@ impl<'a> CppVisitor<'a> {
                 ancestry,
             );
         }
+        true
+    }
+
+    /// Give a function-local anonymous C aggregate a structured owner so its
+    /// direct pointer bindings can be typed by the usage graph.  Unlike an
+    /// anonymous aggregate in a class body, there is no source-level tag or
+    /// typedef to supply an identity.  The aggregate's CST range is therefore
+    /// part of a generated, collision-resistant identity; no source spelling
+    /// is consulted.  The declaration's own variable remains a file-level
+    /// field projection, while the aggregate body is visited as the generated
+    /// class's field list.
+    fn visit_c_anonymous_local_aggregate_declaration<'tree>(
+        &mut self,
+        node: Node<'tree>,
+        scope: &ScopeInfo,
+        stack: &mut Vec<CppWork<'tree>>,
+        ancestry: &ParentIndex<'tree>,
+    ) -> bool {
+        if !self.c_tag_semantics || scope.class_unit.is_some() || !has_function_scope_ancestor(node)
+        {
+            return false;
+        }
+        let Some(aggregate) = node.child_by_field_name("type") else {
+            return false;
+        };
+        if !matches!(aggregate.kind(), "struct_specifier" | "union_specifier")
+            || aggregate.child_by_field_name("name").is_some()
+        {
+            return false;
+        }
+        let Some(body) = cpp_body_node(aggregate) else {
+            return false;
+        };
+        let mut cursor = node.walk();
+        let declarators = node
+            .children_by_field_name("declarator", &mut cursor)
+            .filter_map(|declarator| match classify_declarator(declarator) {
+                Some(DeclaratorKind::Variable(variable)) => Some(variable),
+                Some(DeclaratorKind::Function(_)) | None => None,
+            })
+            .collect::<Vec<_>>();
+        if declarators.is_empty() {
+            return false;
+        }
+
+        for declarator in &declarators {
+            self.visit_variable_declaration(node, *declarator, scope, false, ancestry);
+        }
+        let name = format!("<anonymous:{}>", aggregate.start_byte());
+        self.visit_named_class_like_shape(
+            aggregate,
+            name,
+            Some(body),
+            true,
+            None,
+            None,
+            scope,
+            stack,
+            ancestry,
+        );
         true
     }
 
@@ -6488,7 +6716,9 @@ impl<'a> CppVisitor<'a> {
     ) {
         let mut cursor = node.walk();
         for child in node.named_children(&mut cursor) {
-            if child.kind() == "init_declarator"
+            if let Some(declarator) = recovered_function_like_field_declarator(child, self.source) {
+                self.visit_variable_declaration(node, declarator.name, scope, true, ancestry);
+            } else if child.kind() == "init_declarator"
                 && let Some(inner) = child.child_by_field_name("declarator")
             {
                 self.visit_variable_declaration(node, inner, scope, true, ancestry);
@@ -6725,28 +6955,363 @@ impl<'a> CppVisitor<'a> {
             self.file.clone(),
             CodeUnitType::Macro,
             "",
-            name,
+            name.clone(),
             Some(signature.clone()),
             false,
             fq,
         );
-        if self.parsed.contains_declaration(&code_unit) {
+        if !self.parsed.contains_declaration(&code_unit) {
+            self.add_declaration(code_unit.clone(), node, None, None);
+            let name_range = node
+                .child_by_field_name("name")
+                .map(cpp_declaration_range)
+                .unwrap_or_else(|| cpp_declaration_range(node));
+            self.parsed
+                .record_materialization(MaterializationRecord::GeneratedDeclaration {
+                    site: cpp_declaration_range(node),
+                    argument: name_range,
+                    kind: GenerationKind::PreprocessorDefinition,
+                    unit: code_unit.clone(),
+                });
+            self.parsed.add_signature(code_unit, signature);
+        }
+        if node.kind() == "preproc_def" {
+            update_object_macro_field_environment(
+                node,
+                self.source,
+                &mut self.object_macro_fields,
+                &mut self.ambiguous_object_macro_fields,
+            );
+        } else {
+            self.object_macro_fields.remove(&name);
+            self.ambiguous_object_macro_fields.remove(&name);
+        }
+    }
+
+    fn visit_object_macro_fields(&mut self, node: Node<'_>, scope: &ScopeInfo) {
+        let Some(directive) = node.child_by_field_name("directive") else {
+            return;
+        };
+        let name = node_text(directive, self.source).trim();
+        let range = cpp_declaration_range(node);
+        self.materialize_object_macro_fields(name, range, scope);
+    }
+
+    /// Bare object-like field-list macros inside an otherwise well-formed
+    /// aggregate remain identifier nodes in a field declaration. More than
+    /// one adjacent invocation can be folded into the same declaration, so
+    /// inspect all of its structured identifier nodes.
+    fn visit_bare_object_macro_fields(&mut self, node: Node<'_>, scope: &ScopeInfo) -> bool {
+        if !matches!(node.kind(), "declaration" | "field_declaration") {
+            return false;
+        }
+        let macro_nodes =
+            object_macro_identifier_nodes(node, self.source, &self.object_macro_fields);
+        for macro_node in &macro_nodes {
+            let name = node_text(*macro_node, self.source).trim();
+            self.materialize_object_macro_fields(name, cpp_declaration_range(*macro_node), scope);
+        }
+        !macro_nodes.is_empty()
+    }
+
+    fn materialize_object_macro_fields(&mut self, name: &str, range: Range, scope: &ScopeInfo) {
+        let Some(fields) = self.object_macro_fields.get(name).cloned() else {
+            return;
+        };
+        let Some(owner) = scope.class_unit.as_ref() else {
+            return;
+        };
+        for field in fields {
+            let signature = field.declaration.clone();
+            let mut fq = owner.fq().clone();
+            fq.push(segment_interner().intern(&field.name, SegmentKind::Member));
+            let short_name = if owner.short_name().is_empty() {
+                field.name.clone()
+            } else {
+                format!("{}.{}", owner.short_name(), field.name)
+            };
+            let code_unit = CodeUnit::with_signature_and_fq(
+                self.file.clone(),
+                CodeUnitType::Field,
+                owner.package_name().to_string(),
+                short_name,
+                Some(field.declaration),
+                true,
+                fq,
+            );
+            if self.parsed.contains_declaration(&code_unit) {
+                continue;
+            }
+            self.add_declaration_with_range(code_unit.clone(), range, Some(owner.clone()), None);
+            self.parsed.add_signature(code_unit, signature);
+        }
+    }
+
+    /// Recover ordinary aggregates whose field-list macro invocations made
+    /// tree-sitter collapse the class heads and bodies into one `ERROR` node.
+    /// The class markers, aggregate braces, field nodes, and macro identifier
+    /// nodes are all read from the AST; no source delimiter or token scan is
+    /// used. A close-brace node inside a malformed field closes the innermost
+    /// recovered aggregate, preserving nested-owner identity.
+    fn visit_object_macro_error_classes(&mut self, node: Node<'_>, scope: &ScopeInfo) {
+        let mut cursor = node.walk();
+        let children = node.children(&mut cursor).collect::<Vec<_>>();
+        let mut recovered = Vec::<(CodeUnit, usize, usize, Vec<Node<'_>>)>::new();
+        let mut object_macro_fields = self.object_macro_fields.clone();
+        let mut ambiguous_object_macro_fields = self.ambiguous_object_macro_fields.clone();
+        let mut open = Vec::<usize>::new();
+        let mut index = 0;
+        while index < children.len() {
+            let keyword = children[index];
+            if update_object_macro_field_environment(
+                keyword,
+                self.source,
+                &mut object_macro_fields,
+                &mut ambiguous_object_macro_fields,
+            ) {
+                index += 1;
+                continue;
+            }
+            if index + 2 < children.len()
+                && matches!(keyword.kind(), "struct" | "class" | "union")
+                && matches!(children[index + 1].kind(), "type_identifier" | "identifier")
+                && children[index + 2].kind() == "{"
+            {
+                let name_node = children[index + 1];
+                let opening = children[index + 2];
+                let name = normalize_cpp_whitespace(node_text(name_node, self.source));
+                if !name.is_empty() {
+                    let parent = open
+                        .last()
+                        .and_then(|class| recovered.get(*class))
+                        .map(|(owner, _, _, _)| owner.clone())
+                        .or_else(|| scope.class_unit.clone());
+                    let short_name = parent.as_ref().map_or_else(
+                        || name.clone(),
+                        |parent| cpp_join_nested_short(parent.short_name(), &name),
+                    );
+                    let fq = cpp_leaf_fq(
+                        &scope.package_name,
+                        parent.as_ref(),
+                        &name,
+                        SegmentKind::Nested,
+                        SegmentKind::Type,
+                    );
+                    let owner = CodeUnit::with_signature_and_fq(
+                        self.file.clone(),
+                        CodeUnitType::Class,
+                        scope.package_name.clone(),
+                        short_name,
+                        None,
+                        false,
+                        fq,
+                    );
+                    recovered.push((owner, keyword.start_byte(), opening.end_byte(), Vec::new()));
+                    open.push(recovered.len() - 1);
+                    index += 3;
+                    continue;
+                }
+            }
+            if let Some(&class_index) = open.last()
+                && children[index].kind() == "field_declaration"
+            {
+                let field = children[index];
+                recovered[class_index]
+                    .3
+                    .extend(object_macro_identifier_nodes_with_environment(
+                        field,
+                        self.source,
+                        &mut object_macro_fields,
+                        &mut ambiguous_object_macro_fields,
+                    ));
+                let end = field.end_byte();
+                for &open_class in &open {
+                    recovered[open_class].2 = recovered[open_class].2.max(end);
+                }
+                let closes = count_close_brace_nodes(field);
+                for _ in 0..closes {
+                    if let Some(closed) = open.pop() {
+                        recovered[closed].2 = end;
+                    }
+                }
+            }
+            index += 1;
+        }
+
+        let mut owners = Vec::with_capacity(recovered.len());
+        for (owner, start, end, macro_nodes) in recovered {
+            let range = Range {
+                start_byte: start,
+                end_byte: end,
+                start_line: self.source.get(..start).map_or(1, |source| {
+                    source.bytes().filter(|byte| *byte == b'\n').count() + 1
+                }),
+                end_line: self.source.get(..end).map_or(1, |source| {
+                    source.bytes().filter(|byte| *byte == b'\n').count() + 1
+                }),
+            };
+            if !self.parsed.contains_declaration(&owner) {
+                let parent = owners
+                    .iter()
+                    .find(|parent: &&CodeUnit| owner.fq().parent().as_ref() == Some(parent.fq()))
+                    .cloned()
+                    .or_else(|| scope.class_unit.clone());
+                self.add_declaration_with_range(owner.clone(), range, parent, None);
+            }
+            let owner_scope = ScopeInfo {
+                class_unit: Some(owner.clone()),
+                declarations_are_fields: true,
+                ..scope.clone()
+            };
+            for macro_node in macro_nodes {
+                let name = normalize_cpp_whitespace(node_text(macro_node, self.source));
+                self.materialize_object_macro_fields(
+                    &name,
+                    cpp_declaration_range(macro_node),
+                    &owner_scope,
+                );
+            }
+            owners.push(owner);
+        }
+    }
+
+    fn visit_preproc_call(&mut self, node: Node<'_>, scope: &ScopeInfo) {
+        let Some(_directive) = node.child_by_field_name("directive") else {
+            return;
+        };
+        if is_cpp_undef_directive(node, self.source) {
+            update_object_macro_field_environment(
+                node,
+                self.source,
+                &mut self.object_macro_fields,
+                &mut self.ambiguous_object_macro_fields,
+            );
             return;
         }
-        self.add_declaration(code_unit.clone(), node, None, None);
-        let name_range = node
-            .child_by_field_name("name")
-            .map(cpp_declaration_range)
-            .unwrap_or_else(|| cpp_declaration_range(node));
-        self.parsed
-            .record_materialization(MaterializationRecord::GeneratedDeclaration {
-                site: cpp_declaration_range(node),
-                argument: name_range,
-                kind: GenerationKind::PreprocessorDefinition,
-                unit: code_unit.clone(),
-            });
-        self.parsed.add_signature(code_unit, signature);
+        let directly_in_field_list = node
+            .parent()
+            .is_some_and(|parent| parent.kind() == "field_declaration_list");
+        if scope.class_unit.is_some() && (scope.declarations_are_fields || directly_in_field_list) {
+            self.visit_object_macro_fields(node, scope);
+        }
     }
+}
+
+/// Apply one preprocessor directive to an object-like field-list environment.
+/// The environment is intentionally separate from the declaration visitor so
+/// malformed parser regions can replay directives in source order without
+/// mutating the live walk's state ahead of those directives.
+fn update_object_macro_field_environment(
+    node: Node<'_>,
+    source: &str,
+    fields: &mut HashMap<String, Vec<MacroReplacementField>>,
+    ambiguous: &mut HashSet<String>,
+) -> bool {
+    match node.kind() {
+        "preproc_def" => {
+            let Some(name) = extract_macro_name(node, source) else {
+                return false;
+            };
+            let replacement = node
+                .child_by_field_name("value")
+                .map(|value| {
+                    crate::graph::syntax::object_macro_replacement_fields(node_text(value, source))
+                })
+                .unwrap_or_default();
+            if replacement.is_empty() || ambiguous.contains(&name) {
+                fields.remove(&name);
+                ambiguous.insert(name);
+            } else if let Some(previous) = fields.get(&name) {
+                if previous != &replacement {
+                    fields.remove(&name);
+                    ambiguous.insert(name);
+                }
+            } else {
+                fields.insert(name, replacement);
+            }
+            true
+        }
+        "preproc_call" if is_cpp_undef_directive(node, source) => {
+            if let Some(argument) = node.child_by_field_name("argument") {
+                let name = node_text(argument, source).trim();
+                fields.remove(name);
+                if inside_preprocessor_conditional(node) {
+                    ambiguous.insert(name.to_string());
+                } else {
+                    ambiguous.remove(name);
+                }
+            }
+            true
+        }
+        _ => false,
+    }
+}
+
+fn object_macro_identifier_nodes<'tree>(
+    node: Node<'tree>,
+    source: &str,
+    fields: &HashMap<String, Vec<MacroReplacementField>>,
+) -> Vec<Node<'tree>> {
+    let mut result = Vec::new();
+    let mut stack = vec![node];
+    while let Some(current) = stack.pop() {
+        if matches!(
+            current.kind(),
+            "identifier" | "field_identifier" | "type_identifier"
+        ) && fields.contains_key(node_text(current, source).trim())
+        {
+            result.push(current);
+        }
+        let mut cursor = current.walk();
+        let children = current.children(&mut cursor).collect::<Vec<_>>();
+        stack.extend(children.into_iter().rev());
+    }
+    result.sort_by_key(|node| node.start_byte());
+    result
+}
+
+/// Collect macro identifiers while replaying any nested preprocessor
+/// directives in source order. Recovery regions can contain a later `#undef`
+/// in the same parser error envelope; using the live visitor map for the
+/// entire envelope would incorrectly materialize invocations after it.
+fn object_macro_identifier_nodes_with_environment<'tree>(
+    node: Node<'tree>,
+    source: &str,
+    fields: &mut HashMap<String, Vec<MacroReplacementField>>,
+    ambiguous: &mut HashSet<String>,
+) -> Vec<Node<'tree>> {
+    let mut result = Vec::new();
+    let mut stack = vec![node];
+    while let Some(current) = stack.pop() {
+        if update_object_macro_field_environment(current, source, fields, ambiguous) {
+            continue;
+        }
+        if matches!(
+            current.kind(),
+            "identifier" | "field_identifier" | "type_identifier"
+        ) && fields.contains_key(node_text(current, source).trim())
+        {
+            result.push(current);
+        }
+        let mut cursor = current.walk();
+        let children = current.children(&mut cursor).collect::<Vec<_>>();
+        stack.extend(children.into_iter().rev());
+    }
+    result.sort_by_key(|node| node.start_byte());
+    result
+}
+
+fn count_close_brace_nodes(node: Node<'_>) -> usize {
+    let mut count = 0;
+    let mut stack = vec![node];
+    while let Some(current) = stack.pop() {
+        if current.kind() == "}" && !current.is_missing() {
+            count += 1;
+        }
+        let mut cursor = current.walk();
+        stack.extend(current.children(&mut cursor));
+    }
+    count
 }
 
 /// Classify a C++ field while its declaration syntax is already available.
@@ -8218,6 +8783,78 @@ fn extract_variable_name(node: Node<'_>, source: &str) -> Option<String> {
     }
 }
 
+/// Recover a C field whose name is wrapped in the function-like
+/// `MBEDTLS_PRIVATE(name)` macro. Tree-sitter represents this invocation as a
+/// function declarator, while retaining its argument as a structured child.
+/// The exact macro name and one-argument shape keep ordinary function-pointer
+/// fields and unknown malformed declarators fail-closed.
+#[derive(Clone, Copy)]
+pub(crate) struct RecoveredFunctionLikeFieldDeclarator<'tree> {
+    pub(crate) name: Node<'tree>,
+    pub(crate) declarator: Node<'tree>,
+}
+
+impl RecoveredFunctionLikeFieldDeclarator<'_> {
+    pub(crate) fn pointer_depth(self) -> i32 {
+        let mut depth = 0;
+        let mut current = self.declarator;
+        while current.kind() != "function_declarator" {
+            if current.kind() == "pointer_declarator" {
+                depth += 1;
+            }
+            current = current
+                .child_by_field_name("declarator")
+                .expect("recovered field wrapper has an inner declarator");
+        }
+        depth
+    }
+}
+
+pub(crate) fn recovered_function_like_field_declarator<'tree>(
+    node: Node<'tree>,
+    source: &str,
+) -> Option<RecoveredFunctionLikeFieldDeclarator<'tree>> {
+    if node.kind() != "field_declaration" {
+        return None;
+    }
+    let outer_declarator = node.child_by_field_name("declarator")?;
+    let mut declarator = outer_declarator;
+    while matches!(
+        declarator.kind(),
+        "pointer_declarator"
+            | "reference_declarator"
+            | "array_declarator"
+            | "parenthesized_declarator"
+    ) {
+        declarator = declarator.child_by_field_name("declarator")?;
+    }
+    if declarator.kind() != "function_declarator" {
+        return None;
+    }
+    let macro_name = declarator.child_by_field_name("declarator")?;
+    if macro_name.kind() != "field_identifier" || node_text(macro_name, source) != "MBEDTLS_PRIVATE"
+    {
+        return None;
+    }
+    let parameters = declarator.child_by_field_name("parameters")?;
+    let mut cursor = parameters.walk();
+    let mut arguments = parameters.named_children(&mut cursor);
+    let parameter = arguments.next()?;
+    if arguments.next().is_some() || parameter.kind() != "parameter_declaration" {
+        return None;
+    }
+    let name = parameter.child_by_field_name("type").filter(|argument| {
+        matches!(
+            argument.kind(),
+            "identifier" | "field_identifier" | "type_identifier"
+        )
+    })?;
+    Some(RecoveredFunctionLikeFieldDeclarator {
+        name,
+        declarator: outer_declarator,
+    })
+}
+
 fn last_named_child(node: Node<'_>) -> Option<Node<'_>> {
     let count = node.named_child_count();
     if count == 0 {
@@ -8442,6 +9079,47 @@ fn render_cpp_type_signature(
 }
 
 fn render_cpp_field_signature(node: Node<'_>, declarator: Node<'_>, source: &str) -> String {
+    if let Some(recovered) = recovered_pyobject_head_field(node, source)
+        && recovered.declarator == declarator
+    {
+        let type_text = normalize_cpp_whitespace(node_text(recovered.type_node, source));
+        let name = normalize_cpp_whitespace(node_text(recovered.declarator, source));
+        return format!("{type_text} {name};");
+    }
+    if let Some(recovered) = recovered_function_like_field_declarator(node, source)
+        && recovered.name == declarator
+    {
+        let type_text = node
+            .child_by_field_name("type")
+            .map(|type_node| normalize_cpp_whitespace(node_text(type_node, source)))
+            .unwrap_or_default();
+        let name = normalize_cpp_whitespace(node_text(recovered.name, source));
+        let mut prefix = String::new();
+        let mut suffix = String::new();
+        let mut current = recovered.declarator;
+        while current.kind() != "function_declarator" {
+            match current.kind() {
+                "pointer_declarator" => prefix.push('*'),
+                "reference_declarator" => prefix.push('&'),
+                "array_declarator" => {
+                    let size = current
+                        .child_by_field_name("size")
+                        .map(|size| normalize_cpp_whitespace(node_text(size, source)))
+                        .unwrap_or_default();
+                    suffix.push('[');
+                    suffix.push_str(&size);
+                    suffix.push(']');
+                }
+                "parenthesized_declarator" => {}
+                _ => unreachable!("validated recovered field declarator wrapper"),
+            }
+            current = current
+                .child_by_field_name("declarator")
+                .expect("recovered field wrapper has an inner declarator");
+        }
+        let separator = if prefix.is_empty() { "" } else { " " };
+        return format!("{type_text} {prefix}{separator}{name}{suffix};");
+    }
     if let Some(signature) =
         render_recovered_macro_qualified_field_signature(node, declarator, source)
     {
@@ -9371,6 +10049,16 @@ fn recovered_using_declaration_alias_name(node: Node<'_>, source: &str) -> Optio
         .then(|| node.child_by_field_name("declarator"))
         .flatten()
         .and_then(|declarator| extract_variable_name(declarator, source))
+}
+
+fn has_function_scope_ancestor(mut node: Node<'_>) -> bool {
+    while let Some(parent) = node.parent() {
+        if matches!(parent.kind(), "function_definition" | "lambda_expression") {
+            return true;
+        }
+        node = parent;
+    }
+    false
 }
 
 fn cpp_template_metadata<'tree>(
@@ -13140,6 +13828,55 @@ fn cpp_is_stray_semicolon(node: Node<'_>, source: &str) -> bool {
         && node_text(node, source).trim() == ";"
 }
 
+/// Recover the member that follows CPython's object header macro when
+/// tree-sitter folds both declarations into one malformed field.
+///
+/// For `PyObject_HEAD Imaging image;`, the CST has `PyObject_HEAD` as the
+/// field type, `Imaging` as the field declarator, and a trailing ERROR whose
+/// sole child is the real field identifier. The shape is intentionally exact:
+/// a pointer declarator and similarly malformed fields do not provide the
+/// same evidence that this is the CPython macro boundary.
+#[derive(Clone, Copy)]
+pub(crate) struct RecoveredPyObjectHeadField<'tree> {
+    pub(crate) type_node: Node<'tree>,
+    pub(crate) declarator: Node<'tree>,
+}
+
+pub(crate) fn recovered_pyobject_head_field<'tree>(
+    node: Node<'tree>,
+    source: &str,
+) -> Option<RecoveredPyObjectHeadField<'tree>> {
+    if node.kind() != "field_declaration" {
+        return None;
+    }
+    let type_node = node.child_by_field_name("type")?;
+    if type_node.kind() != "type_identifier"
+        || node_text(type_node, source).trim() != "PyObject_HEAD"
+    {
+        return None;
+    }
+    let pseudo_declarator = node.child_by_field_name("declarator")?;
+    if pseudo_declarator.kind() != "field_identifier" {
+        return None;
+    }
+    let mut cursor = node.walk();
+    let errors = node
+        .named_children(&mut cursor)
+        .filter(|child| child.kind() == "ERROR")
+        .collect::<Vec<_>>();
+    let [error] = errors.as_slice() else {
+        return None;
+    };
+    if error.start_byte() < pseudo_declarator.end_byte() || error.named_child_count() != 1 {
+        return None;
+    }
+    let declarator = error.named_child(0)?;
+    (declarator.kind() == "identifier").then_some(RecoveredPyObjectHeadField {
+        type_node: pseudo_declarator,
+        declarator,
+    })
+}
+
 /// Recover the real field name when a leading object-like annotation macro
 /// displaces a qualified type into tree-sitter's bit-field recovery shape.
 ///
@@ -15153,6 +15890,237 @@ mod tests {
         let tree = parser.parse(source, None).unwrap();
         let file = ProjectFile::new(std::env::temp_dir(), name);
         parse_cpp_file(&file, source, &tree)
+    }
+
+    #[test]
+    fn pyobject_head_field_recovery_publishes_only_the_real_member() {
+        let source = "struct Image { PyObject_HEAD Imaging image; };";
+        let parsed = parse_cpp_declarations(source, "image.h");
+        let names = parsed
+            .declarations()
+            .iter()
+            .map(|unit| unit.fq_name())
+            .collect::<Vec<_>>();
+
+        assert!(names.iter().any(|name| name == "Image.image"), "{names:#?}");
+        assert!(
+            names.iter().all(|name| name != "Image.Imaging"),
+            "the pseudo-declarator must not become a field: {names:#?}"
+        );
+
+        let pointer = parse_cpp_declarations(
+            "struct Image { PyObject_HEAD Imaging *image; };",
+            "image-pointer.h",
+        );
+        let pointer_names = pointer
+            .declarations()
+            .iter()
+            .map(|unit| unit.fq_name())
+            .collect::<Vec<_>>();
+        assert!(
+            pointer_names.iter().any(|name| name == "Image.image"),
+            "the pointer-shaped declaration keeps its ordinary declarator path: {pointer_names:#?}"
+        );
+        assert!(
+            pointer_names.iter().all(|name| name != "Image.Imaging"),
+            "the pointer recovery error must not become a field: {pointer_names:#?}"
+        );
+
+        let unrelated_macro = parse_cpp_declarations(
+            "struct Image { OTHER_HEAD Imaging other; };",
+            "image-near-miss.h",
+        );
+        let unrelated_names = unrelated_macro
+            .declarations()
+            .iter()
+            .map(|unit| unit.fq_name())
+            .collect::<Vec<_>>();
+        assert!(
+            unrelated_names.iter().all(|name| name != "Image.other"),
+            "an unrelated macro with the same malformed CST shape must fail closed: {unrelated_names:#?}"
+        );
+    }
+
+    #[test]
+    fn gtest_style_stolen_namespace_recovery_never_retains_class_owner() {
+        let source = r#"namespace testing {
+namespace internal {
+    namespace detail {
+        class GTEST_API_ [[nodiscard]] ScopedFakeTestPartResultReporter {
+        public:
+            int value() const { return count_ + 1; }
+        private:
+            int count_;
+        };
+        class GTEST_API_ [[nodiscard]] OtherReporter {
+        public:
+            int value() const { return count_ + 2; }
+        private:
+            int count_;
+        };
+    }
+
+    template <typename T>
+    void CmpHelperSTRNE(ScopedFakeTestPartResultReporter<T> const& value);
+
+    class TailReporter {};
+}
+}
+"#;
+        let parsed = parse_cpp_declarations(source, "gtest-recovery.h");
+        let declarations = parsed.declarations();
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_cpp::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let tail_start = source.find("TailReporter").expect("tail class");
+        let tail_node = tree
+            .root_node()
+            .named_descendant_for_byte_range(tail_start, tail_start + "TailReporter".len())
+            .expect("tail class AST node");
+        let index = OrphanedNamespaceScopeIndex::build(tree.root_node(), source);
+        assert!(
+            tree.root_node().has_error(),
+            "the malformed class must exercise recovery"
+        );
+        assert!(index.region_at(tail_start).is_some());
+        assert_eq!(
+            index.enclosing_namespace_components(tail_node, source),
+            ["testing", "internal"]
+        );
+        let file = ProjectFile::new(std::env::temp_dir(), "gtest-recovery.h");
+        let mut recovered_parsed = ParsedFile::new(String::new());
+        let class_unit = CodeUnit::new_fq(
+            file.clone(),
+            CodeUnitType::Class,
+            "testing",
+            "ScopedFakeTestPartResultReporter",
+            cpp_member_fq("testing", "ScopedFakeTestPartResultReporter"),
+        );
+        let scope = ScopeInfo {
+            package_name: "testing".to_string(),
+            module: None,
+            class_unit: Some(class_unit),
+            template_signature: Some("<typename T>".to_string()),
+            template_metadata: Some(CppTemplateMetadata {
+                primary_name: "ScopedFakeTestPartResultReporter".to_string(),
+                primary_fq_name: String::new(),
+                parameters: Vec::new(),
+                specialization_arguments: Vec::new(),
+                alias_target: None,
+            }),
+            declarations_are_fields: true,
+            recovered_specialization_member_scope: true,
+            visible_using_namespaces: Vec::new(),
+        };
+        let mut visitor = CppVisitor {
+            file: &file,
+            source,
+            parsed: &mut recovered_parsed,
+            c_tag_semantics: false,
+            recovered_class_sibling_scopes: HashMap::default(),
+            consumed_fragment_regions: Vec::new(),
+            orphaned_namespaces: index,
+            namespace_forward_scans: HashMap::default(),
+            field_owners: None,
+            recovery_captures: Vec::new(),
+            object_macro_fields: HashMap::default(),
+            ambiguous_object_macro_fields: HashSet::default(),
+        };
+        let recovered = visitor
+            .recovered_namespace_scope(tail_node, &scope)
+            .expect("the tail must use the stolen namespace scope");
+        assert_eq!(recovered.package_name, "testing::internal");
+        assert!(
+            recovered.class_unit.is_none(),
+            "recovered namespace declarations cannot retain the malformed class owner"
+        );
+        assert!(recovered.template_signature.is_none());
+        assert!(recovered.template_metadata.is_none());
+        assert!(!recovered.declarations_are_fields);
+        assert!(!recovered.recovered_specialization_member_scope);
+        assert!(
+            declarations
+                .iter()
+                .any(|unit| unit.fq_name() == "testing::internal.TailReporter"),
+            "the stolen namespace tail remains in its recovered namespace: {declarations:#?}"
+        );
+        assert!(
+            declarations
+                .iter()
+                .any(|unit| unit.fq_name() == "testing::internal.CmpHelperSTRNE"),
+            "the recovered free function remains in its namespace: {declarations:#?}"
+        );
+        assert!(
+            declarations
+                .iter()
+                .any(|unit| { unit.fq_name() == "testing::internal::detail.OtherReporter.value" }),
+            "the independent nested class keeps its ordinary class owner: {declarations:#?}"
+        );
+        assert!(
+            declarations.iter().all(|unit| {
+                !unit
+                    .short_name()
+                    .contains("ScopedFakeTestPartResultReporter.CmpHelperSTRNE")
+            }),
+            "recovered namespace declarations must not retain a class owner: {declarations:#?}"
+        );
+        assert!(
+            declarations
+                .iter()
+                .all(|unit| !unit.identifier().is_empty()),
+            "the minimized gtest recovery must never mint an empty FqName segment: {declarations:#?}"
+        );
+    }
+
+    #[test]
+    fn object_like_field_macros_materialize_owner_specific_declarations() {
+        let source = r#"#define PUBLIC_FIELDS int public_value;
+#define PRIVATE_FIELDS int private_value;
+#define NOT_A_FIELD_LIST not a declaration
+
+struct First {
+  PUBLIC_FIELDS
+  PRIVATE_FIELDS
+};
+struct Second {
+  PUBLIC_FIELDS
+  NOT_A_FIELD_LIST
+};
+#undef PUBLIC_FIELDS
+struct Third {
+  PUBLIC_FIELDS
+};
+"#;
+        let parsed = parse_cpp_declarations(source, "macro-fields.c");
+        let fields = parsed
+            .declarations()
+            .iter()
+            .filter(|unit| unit.is_field())
+            .map(|unit| unit.fq_name())
+            .collect::<Vec<_>>();
+
+        assert!(
+            fields.contains(&"First.public_value".to_string()),
+            "{fields:?}"
+        );
+        assert!(
+            fields.contains(&"First.private_value".to_string()),
+            "{fields:?}"
+        );
+        assert!(
+            fields.contains(&"Second.public_value".to_string()),
+            "{fields:?}"
+        );
+        assert!(
+            !fields.iter().any(|field| field.contains("not_a_field")),
+            "malformed macro must fail closed: {fields:?}"
+        );
+        assert!(
+            !fields.iter().any(|field| field.starts_with("Third.")),
+            "undefined macro must fail closed: {fields:?}"
+        );
     }
 
     #[test]
@@ -19688,6 +20656,42 @@ public:
             visits[1] * 20 < node_counts[1],
             "the walk must stay far below one pass over the tree: {visits:?} over \
              trees of {node_counts:?} nodes"
+        );
+    }
+
+    #[test]
+    fn mbedtls_private_pointer_field_keeps_its_structured_name_and_type() {
+        let source = "struct ssl { struct handshake *MBEDTLS_PRIVATE(handshake); };";
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_cpp::LANGUAGE.into())
+            .expect("C++ grammar");
+        let tree = parser.parse(source, None).expect("fixture tree");
+        let mut stack = vec![tree.root_node()];
+        let mut recovered = None;
+        while let Some(node) = stack.pop() {
+            if node.kind() == "field_declaration"
+                && let Some(field) = recovered_function_like_field_declarator(node, source)
+            {
+                recovered = Some((node, field.name));
+                break;
+            }
+            let mut cursor = node.walk();
+            stack.extend(node.named_children(&mut cursor));
+        }
+        let (declaration, name) = recovered.unwrap_or_else(|| {
+            panic!(
+                "pointer-wrapped macro field was not recovered: {}",
+                tree.root_node().to_sexp()
+            )
+        });
+        assert_eq!(node_text(name, source), "handshake");
+        let recovered =
+            recovered_function_like_field_declarator(declaration, source).expect("recovered field");
+        assert_eq!(recovered.pointer_depth(), 1);
+        assert_eq!(
+            render_cpp_field_signature(declaration, name, source),
+            "struct handshake * handshake;"
         );
     }
 }
