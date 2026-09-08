@@ -1486,9 +1486,12 @@ fn direct_concurrency_path_from(
                         ));
                     }
                     MemoryLocationKind::LexicalCell { binding } => {
-                        if !selectors.iter().any(|selector| {
-                            matches!(selector, SummaryConcurrencyAccessSelector::Aggregate)
-                        }) {
+                        // The cell itself is procedure-local, but a field or
+                        // index reached through its stored value may name a
+                        // formal pointer actual. Follow projected accesses so
+                        // that a captured formal contributes a boundary
+                        // effect; keep direct cell storage local.
+                        if selectors.is_empty() {
                             return DirectConcurrencyPath::Local;
                         }
                         let mut stored_values = Vec::new();

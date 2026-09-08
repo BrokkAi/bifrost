@@ -24,7 +24,7 @@ use crate::analyzer::tree_sitter_analyzer::{
 use crate::analyzer::{GoAnalyzer, Language, ProjectFile};
 use crate::hash::{HashMap, HashSet};
 
-const ADAPTER_VERSION: &[u8] = b"go-value-semantics-v48";
+const ADAPTER_VERSION: &[u8] = b"go-value-semantics-v49";
 
 impl_program_semantics_provider!(GoAnalyzer, GoSemanticLowerer);
 
@@ -1186,16 +1186,22 @@ fn resolved_binding_procedure(binding: GoResolvedBinding) -> ProcedureId {
 fn resolved_binding_sort_key(binding: GoResolvedBinding) -> (usize, usize, usize) {
     match binding {
         GoResolvedBinding::Formal(identity) => {
-            (identity.procedure.index(), 0, identity.declaration)
+            (identity.procedure.index(), 0, identity.declaration_start)
         }
-        GoResolvedBinding::Local(identity) => (identity.procedure.index(), 1, identity.declaration),
+        GoResolvedBinding::Local(identity) => {
+            (identity.procedure.index(), 1, identity.declaration_start)
+        }
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct GoBindingIdentity {
     procedure: ProcedureId,
+    /// Tree-sitter's node ID remains the exact same-tree lookup identity.
+    /// Source order is separate because a fresh tree may assign different node
+    /// IDs to unchanged declarations.
     declaration: usize,
+    declaration_start: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1543,14 +1549,14 @@ fn go_callable_lexical_bindings(
                 if name == "_" {
                     continue;
                 }
-                let declaration = children_by_field_name(declaration, "name")
+                let declaration_node = children_by_field_name(declaration, "name")
                     .into_iter()
                     .find(|name_node| node_text(source, *name_node) == Some(name.as_str()))
-                    .map(|name_node| name_node.id())
-                    .unwrap_or_else(|| declaration.id());
+                    .unwrap_or(declaration);
                 let identity = GoBindingIdentity {
                     procedure: spec.id,
-                    declaration,
+                    declaration: declaration_node.id(),
+                    declaration_start: declaration_node.start_byte(),
                 };
                 bindings.formals.insert(name.into_boxed_str(), identity);
                 if let Some(storage) = storage {
@@ -1585,6 +1591,7 @@ fn go_callable_lexical_bindings(
                     let identity = GoBindingIdentity {
                         procedure: spec.id,
                         declaration: name_node.id(),
+                        declaration_start: name_node.start_byte(),
                     };
                     bindings.formals.insert(name.into(), identity);
                     if let Some(storage) = storage {
@@ -1668,6 +1675,7 @@ fn go_callable_lexical_bindings(
                     GoResolvedBinding::Local(GoBindingIdentity {
                         procedure: spec.id,
                         declaration: name_node.id(),
+                        declaration_start: name_node.start_byte(),
                     })
                 });
             if let GoResolvedBinding::Local(identity) = resolved

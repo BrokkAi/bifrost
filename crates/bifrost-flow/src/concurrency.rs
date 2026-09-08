@@ -29,6 +29,16 @@ impl TaskId {
     }
 }
 
+/// One procedure activation in this bounded solve, independently of its task.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct InvocationId(u32);
+
+impl InvocationId {
+    pub const fn get(self) -> u32 {
+        self.0
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct CanonicalConcurrencyLocation {
     pub identity: Box<str>,
@@ -65,12 +75,31 @@ pub enum ConcurrencyOwnership {
     Unknown,
 }
 
+/// Creation evidence for a storage family within one bounded solve. An
+/// invocation ID uniquely scopes its procedure-local allocation and cell IDs.
+/// Repetition changes the number of objects, not the family that creates them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ConcurrencyStorageFamily {
+    Allocation {
+        invocation: InvocationId,
+        allocation: AllocationId,
+    },
+    LexicalCell {
+        invocation: InvocationId,
+        location: MemoryLocationId,
+    },
+    Static(CanonicalConcurrencyLocation),
+}
+
 /// A bounded heap answer for one source access.
 ///
 /// `exhaustive` says that no unlisted runtime object can be reached. A single
 /// candidate is exact only when it is exhaustive and its runtime object has
 /// singleton cardinality. Escape and ownership are carried independently:
 /// exact object identity does not by itself prove that an object is shared.
+/// Distinct candidate names do not establish disjointness. That additionally
+/// requires independently created storage roots, or a structural field/index
+/// separation at the access comparison boundary.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedConcurrencyLocation {
     candidates: Vec<CanonicalConcurrencyLocation>,
@@ -78,6 +107,10 @@ pub struct ResolvedConcurrencyLocation {
     cardinality: ConcurrencyObjectCardinality,
     escape: ConcurrencyEscape,
     ownership: ConcurrencyOwnership,
+    /// Independently created storage containing these locations. Symbolic
+    /// referent names can prove equality without proving distinct storage.
+    independent_storage: Option<ConcurrencyStorageFamily>,
+    storage_path: Vec<SummaryConcurrencyAccessSelector>,
 }
 
 impl ResolvedConcurrencyLocation {
@@ -96,6 +129,8 @@ impl ResolvedConcurrencyLocation {
             cardinality,
             escape,
             ownership,
+            independent_storage: None,
+            storage_path: Vec::new(),
         }
     }
 
@@ -107,6 +142,45 @@ impl ResolvedConcurrencyLocation {
             ConcurrencyEscape::Unknown,
             ConcurrencyOwnership::Unknown,
         )
+    }
+
+    /// Name storage whose creation proves it independent of other roots.
+    /// This must not be used for an unbound reference or a loaded payload.
+    fn independent(
+        location: CanonicalConcurrencyLocation,
+        family: ConcurrencyStorageFamily,
+    ) -> Self {
+        let mut resolved = Self::exact(location);
+        resolved.independent_storage = Some(family);
+        resolved
+    }
+
+    fn storage_is_disjoint(&self, other: &Self) -> bool {
+        let (Some(first), Some(second)) = (&self.independent_storage, &other.independent_storage)
+        else {
+            return false;
+        };
+        if first != second {
+            return true;
+        }
+        for (first, second) in self.storage_path.iter().zip(&other.storage_path) {
+            if first == second {
+                continue;
+            }
+            // A prefix can contain its sublocation. Only the first differing
+            // pair of known field or element selectors proves separation.
+            return matches!(
+                (first, second),
+                (
+                    SummaryConcurrencyAccessSelector::Field(_),
+                    SummaryConcurrencyAccessSelector::Field(_)
+                ) | (
+                    SummaryConcurrencyAccessSelector::ConstantIndex(_),
+                    SummaryConcurrencyAccessSelector::ConstantIndex(_)
+                )
+            );
+        }
+        false
     }
 
     pub fn unknown() -> Self {
@@ -147,18 +221,16 @@ impl ResolvedConcurrencyLocation {
     }
 
     pub fn overlap(&self, other: &Self) -> AccessOverlap {
-        if let (Some(first), Some(second)) = (self.exact_candidate(), other.exact_candidate()) {
-            return if first == second {
-                AccessOverlap::Same(first.clone())
-            } else {
-                AccessOverlap::Disjoint
-            };
+        if let (Some(first), Some(second)) = (self.exact_candidate(), other.exact_candidate())
+            && first == second
+        {
+            return AccessOverlap::Same(first.clone());
         }
         let shared = self
             .candidates
             .iter()
             .find(|candidate| other.candidates.contains(candidate));
-        if self.exhaustive && other.exhaustive && shared.is_none() {
+        if shared.is_none() && self.storage_is_disjoint(other) {
             return AccessOverlap::Disjoint;
         }
         AccessOverlap::MayAlias(shared.cloned())
@@ -277,28 +349,29 @@ pub fn instantiate_summary_access_path(
             SummaryConcurrencyAccessSelector::AnyIndex => (None, "index"),
         };
         let selector_is_exact = exact_selector.is_some();
-        let selector = exact_selector.unwrap_or_else(|| "index:any".to_owned());
+        let rendered_selector = exact_selector.unwrap_or_else(|| "index:any".to_owned());
         let candidates = resolved
             .candidates()
             .iter()
             .map(|candidate| {
                 CanonicalConcurrencyLocation::new(
-                    format!("{}/{selector}", candidate.identity),
+                    format!("{}/{rendered_selector}", candidate.identity),
                     kind,
                 )
             })
             .collect();
-        resolved = ResolvedConcurrencyLocation::new(
-            candidates,
-            resolved.is_exhaustive() && selector_is_exact,
-            if selector_is_exact {
-                resolved.cardinality()
-            } else {
-                ConcurrencyObjectCardinality::Multiple
-            },
-            resolved.escape(),
-            resolved.ownership(),
-        );
+        resolved.storage_path.push(match selector {
+            SummaryConcurrencyAccessSelector::Index(port) => binding.integer(port).map_or(
+                SummaryConcurrencyAccessSelector::AnyIndex,
+                SummaryConcurrencyAccessSelector::ConstantIndex,
+            ),
+            selector => selector.clone(),
+        });
+        resolved.candidates = candidates;
+        resolved.exhaustive &= selector_is_exact;
+        if !selector_is_exact {
+            resolved.cardinality = ConcurrencyObjectCardinality::Multiple;
+        }
         if !selector_is_exact {
             reasons.push(ConcurrencyOpenReason::UnknownLocation);
         }
@@ -412,10 +485,25 @@ pub struct ResolvedMemberDeclaration {
     /// of it. Only a declaration-anchored locator can stand for the field
     /// wherever it is reached.
     pub is_declaration_site: bool,
+    /// The selected declaration is a function or method, rather than storage
+    /// holding a callable value. Only exact declaration evidence may set this.
+    pub is_callable: bool,
 }
 
 /// Exact workspace answers consumed by the task-slice solver.
 pub trait ConcurrencyProvider {
+    /// Number of storage instances a lexical binding can create within one
+    /// procedure invocation. This describes the cell, not a pointer it holds.
+    /// A loop-body declaration can create multiple cells even though the IR
+    /// gives the declaration one identity. Missing lifetime facts stay open.
+    fn lexical_cell_cardinality(
+        &self,
+        _procedure: &ProcedureHandle,
+        _binding: ValueId,
+    ) -> ConcurrencyObjectCardinality {
+        ConcurrencyObjectCardinality::Unknown
+    }
+
     /// The field declaration one member locator stands for, when the consumer
     /// can name it.
     ///
@@ -433,29 +521,30 @@ pub trait ConcurrencyProvider {
         None
     }
 
-    /// Whether this allocation yields a reference to the object it creates
-    /// rather than the object itself.
-    ///
-    /// `&T{}` yields a pointer, so a local bound to it names one object
-    /// wherever it is copied; `T{}` yields a value, and `a := b` on one copies
-    /// the object. A consumer may only carry an allocation's identity onto the
-    /// cell that stores it when the first is true.
-    fn allocation_yields_reference(
+    /// Positive value/reference semantics of a producer allocation. Unknown
+    /// metadata must not be interpreted as evidence of inline storage.
+    /// Only a reference result may retain the allocation's identity when
+    /// stored in a local; an inline value copy creates distinct storage.
+    fn allocation_binds_by_reference(
         &self,
         _procedure: &ProcedureHandle,
-        _allocation: crate::analyzer::semantic::AllocationId,
-    ) -> bool {
-        false
+        _allocation: AllocationId,
+    ) -> Option<bool> {
+        None
     }
 
-    /// Whether the field a member locator names is declared as a pointer.
+    /// Whether a loaded field carries a reference to separate storage.
+    /// `Some(false)` proves inline value storage; absent metadata stays unknown.
     ///
     /// A copy of a struct copies its direct fields, so a write to one cannot
     /// reach the original. A pointer field inside that copy still addresses
     /// one object, so a write through it does, and refusing both alike turns
     /// a real race into silence.
-    fn member_is_pointer(&self, _member: &crate::analyzer::semantic::SemanticLocator) -> bool {
-        false
+    fn member_binds_by_reference(
+        &self,
+        _member: &crate::analyzer::semantic::SemanticLocator,
+    ) -> Option<bool> {
+        None
     }
 
     /// Whether binding this callee's receiver preserves the caller's object
@@ -483,6 +572,17 @@ pub trait ConcurrencyProvider {
     /// caller's object must not cross, and `Some(true)` names the caller's
     /// object the way the caller's own accesses name it.
     fn parameter_binding(&self, _procedure: &ProcedureHandle, _ordinal: u32) -> Option<bool> {
+        None
+    }
+
+    /// Whether one declared normal result preserves the returned object's
+    /// identity. Only positive reference evidence permits result binding;
+    /// inline copies and unavailable metadata never imply an alias.
+    fn result_binds_by_reference(
+        &self,
+        _procedure: &ProcedureHandle,
+        _ordinal: u32,
+    ) -> Option<bool> {
         None
     }
 
@@ -647,6 +747,7 @@ pub enum ConcurrentProtection {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConcurrentAccessSite {
     pub task: TaskId,
+    pub invocation: InvocationId,
     pub procedure: ProcedureHandle,
     pub point: ProgramPointId,
     pub source: SourceMappingId,
@@ -677,17 +778,239 @@ pub struct ConcurrentAccessReport {
 struct Task {
     parent: Option<TaskId>,
     entry_procedure: Option<ProcedureHandle>,
+    entry_invocation: InvocationId,
     spawn_procedure: Option<ProcedureHandle>,
+    spawn_invocation: Option<InvocationId>,
     spawn_call: Option<CallSiteId>,
     group: Option<ResolvedConcurrencySubject>,
-    repeated: bool,
+    // Manual Done orders only effects before this event, unlike a reviewed
+    // task join whose completion is the child's return.
+    completion: Option<(InvocationId, ProgramPointId)>,
+    repetition: Option<InvocationId>,
     repetitions_serialized: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct ContextKey {
     task: TaskId,
+    invocation: InvocationId,
     procedure: ProcedureHandle,
+}
+
+#[derive(Debug)]
+struct Invocation {
+    context: ContextKey,
+    caller: Option<(InvocationId, CallSiteId)>,
+    // The innermost repeating call that produces this activation. Keeping
+    // its scope distinguishes fresh objects per call from shared inputs.
+    repetition: Option<InvocationId>,
+}
+
+#[derive(Debug, Default)]
+struct Invocations {
+    entries: Vec<Invocation>,
+}
+
+impl Invocations {
+    fn push(
+        &mut self,
+        task: TaskId,
+        procedure: ProcedureHandle,
+        caller: Option<(InvocationId, CallSiteId)>,
+    ) -> ContextKey {
+        let invocation = InvocationId(
+            u32::try_from(self.entries.len()).expect("bounded invocation IDs fit u32"),
+        );
+        let context = ContextKey {
+            task,
+            invocation,
+            procedure,
+        };
+        let repetition = caller.and_then(|(parent, call)| {
+            let parent = &self.entries[parent.0 as usize];
+            let semantics = parent.context.procedure.semantics();
+            let point = semantics
+                .call_site(call)
+                .expect("invocation caller owns its call site")
+                .point;
+            if point_is_cyclic(semantics, point) {
+                Some(invocation)
+            } else {
+                parent.repetition
+            }
+        });
+        self.entries.push(Invocation {
+            context: context.clone(),
+            caller,
+            repetition,
+        });
+        context
+    }
+
+    fn contains(&self, ancestor: InvocationId, mut descendant: InvocationId) -> bool {
+        loop {
+            if ancestor == descendant {
+                return true;
+            }
+            let Some((parent, _)) = self.entries[descendant.0 as usize].caller else {
+                return false;
+            };
+            descendant = parent;
+        }
+    }
+
+    fn recursively_calls(&self, caller: InvocationId, target: &ProcedureHandle) -> bool {
+        let task = self.entries[caller.0 as usize].context.task;
+        let mut current = caller;
+        loop {
+            let entry = &self.entries[current.0 as usize];
+            if entry.context.task != task {
+                return false;
+            }
+            if entry.context.procedure == *target {
+                return true;
+            }
+            let Some((parent, _)) = entry.caller else {
+                return false;
+            };
+            current = parent;
+        }
+    }
+
+    fn ancestry_points(
+        &self,
+        origin: InvocationId,
+        origin_point: ProgramPointId,
+    ) -> HashMap<InvocationId, ProgramPointId> {
+        let task = self.entries[origin.0 as usize].context.task;
+        let mut ancestors = HashMap::default();
+        let mut current = origin;
+        let mut point = origin_point;
+        loop {
+            let entry = &self.entries[current.0 as usize];
+            ancestors.insert(current, point);
+            let Some((parent, call)) = entry.caller else {
+                break;
+            };
+            let caller = &self.entries[parent.0 as usize].context;
+            if caller.task != task {
+                break;
+            }
+            point = caller
+                .procedure
+                .semantics()
+                .call_site(call)
+                .expect("invocation caller owns its call site")
+                .point;
+            current = parent;
+        }
+        ancestors
+    }
+
+    /// Project two sites onto their common synchronous caller. Distinct
+    /// activations of the same procedure meet at their caller's call sites.
+    fn common_points(
+        &self,
+        first: InvocationId,
+        first_point: ProgramPointId,
+        second: InvocationId,
+        second_point: ProgramPointId,
+    ) -> Option<(&ContextKey, ProgramPointId, ProgramPointId)> {
+        let task = self.entries[first.0 as usize].context.task;
+        if self.entries[second.0 as usize].context.task != task {
+            return None;
+        }
+        let ancestors = self.ancestry_points(first, first_point);
+        let mut current = second;
+        let mut point = second_point;
+        loop {
+            let entry = &self.entries[current.0 as usize];
+            if let Some(first_point) = ancestors.get(&current) {
+                return Some((&entry.context, *first_point, point));
+            }
+            let (parent, call) = entry.caller?;
+            let caller = &self.entries[parent.0 as usize].context;
+            if caller.task != task {
+                return None;
+            }
+            point = caller
+                .procedure
+                .semantics()
+                .call_site(call)
+                .expect("invocation caller owns its call site")
+                .point;
+            current = parent;
+        }
+    }
+
+    /// A synchronization inside a callee can order later caller work only
+    /// when every returning path passes through it. Lift that obligation
+    /// through each synchronous call until reaching the target's ancestry.
+    fn required_points_before(
+        &self,
+        source: InvocationId,
+        required: HashSet<ProgramPointId>,
+        target: InvocationId,
+        target_point: ProgramPointId,
+    ) -> bool {
+        let ancestors = self.ancestry_points(target, target_point);
+        let mut common = source;
+        loop {
+            if let Some(target) = ancestors.get(&common) {
+                return self
+                    .required_points_in(source, required, common)
+                    .is_some_and(|required| {
+                        !required.contains(target)
+                            && all_paths_cross_points(
+                                &self.entries[common.0 as usize].context.procedure,
+                                *target,
+                                &required,
+                            )
+                    });
+            }
+            let Some((parent, _)) = self.entries[common.0 as usize].caller else {
+                return false;
+            };
+            common = parent;
+        }
+    }
+
+    /// Lift a mandatory event to a particular synchronous caller. A call
+    /// point represents the event only if every normal return crosses it.
+    fn required_points_in(
+        &self,
+        mut source: InvocationId,
+        mut required: HashSet<ProgramPointId>,
+        target: InvocationId,
+    ) -> Option<HashSet<ProgramPointId>> {
+        let task = self.entries[target.0 as usize].context.task;
+        loop {
+            let entry = &self.entries[source.0 as usize];
+            if entry.context.task != task || required.is_empty() {
+                return None;
+            }
+            if source == target {
+                return Some(required);
+            }
+            if !all_paths_cross_points(
+                &entry.context.procedure,
+                entry.context.procedure.semantics().normal_exit_point(),
+                &required,
+            ) {
+                return None;
+            }
+            let (parent, call) = entry.caller?;
+            let caller = &self.entries[parent.0 as usize].context;
+            let point = caller
+                .procedure
+                .semantics()
+                .call_site(call)
+                .expect("invocation caller owns its call site")
+                .point;
+            required = HashSet::from_iter([point]);
+            source = parent;
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -708,6 +1031,7 @@ struct Access {
     local_identity: bool,
     reasons: Vec<ConcurrencyOpenReason>,
     atomic: bool,
+    storage_origin: Option<CanonicalConcurrencyLocation>,
 }
 
 #[derive(Debug, Clone)]
@@ -745,6 +1069,7 @@ struct CanonicalizedAccess {
 #[derive(Debug, Clone)]
 struct PendingIntrinsicSynchronization {
     task: TaskId,
+    invocation: InvocationId,
     procedure: ProcedureHandle,
     point: ProgramPointId,
     operation: crate::analyzer::semantic::SynchronizationOperation,
@@ -754,6 +1079,7 @@ struct PendingIntrinsicSynchronization {
 #[derive(Debug, Clone)]
 struct IntrinsicSynchronization {
     task: TaskId,
+    invocation: InvocationId,
     procedure: ProcedureHandle,
     point: ProgramPointId,
     operation: crate::analyzer::semantic::SynchronizationOperation,
@@ -766,6 +1092,7 @@ struct IntrinsicSynchronization {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct LocalLocation {
     task: TaskId,
+    invocation: InvocationId,
     procedure: ProcedureHandle,
     location: MemoryLocationId,
 }
@@ -790,10 +1117,68 @@ struct CanonicalMember {
 enum LocalSynchronizationSubject {
     Value {
         task: TaskId,
+        invocation: InvocationId,
         procedure: ProcedureHandle,
         value: ValueId,
     },
     Location(LocalLocation),
+}
+
+/// Identity projection retains the bounded object answer and the allocation
+/// whose inline storage it addresses. Following a reference payload discards
+/// the container's lifetime; the payload needs its own allocation evidence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ConcurrencyIdentityFact {
+    resolved: ResolvedConcurrencyLocation,
+    storage_origin: Option<CanonicalConcurrencyLocation>,
+}
+
+impl ConcurrencyIdentityFact {
+    fn allocation(
+        canonical: CanonicalConcurrencyLocation,
+        invocation: InvocationId,
+        allocation: AllocationId,
+    ) -> Self {
+        Self {
+            resolved: ResolvedConcurrencyLocation::independent(
+                canonical.clone(),
+                ConcurrencyStorageFamily::Allocation {
+                    invocation,
+                    allocation,
+                },
+            ),
+            storage_origin: Some(canonical),
+        }
+    }
+
+    fn canonical(&self) -> &CanonicalConcurrencyLocation {
+        assert_eq!(self.resolved.candidates.len(), 1);
+        &self.resolved.candidates[0]
+    }
+
+    fn project(&mut self, selector: SummaryConcurrencyAccessSelector, kind: &str) {
+        let rendered = match &selector {
+            SummaryConcurrencyAccessSelector::Field(field) => format!("field:{field}"),
+            SummaryConcurrencyAccessSelector::Aggregate => "index:aggregate".to_owned(),
+            SummaryConcurrencyAccessSelector::ConstantIndex(index) => format!("index:{index}"),
+            _ => unreachable!("an exact projection requires a resolved selector"),
+        };
+        self.resolved.storage_path.push(selector);
+        for candidate in &mut self.resolved.candidates {
+            *candidate = CanonicalConcurrencyLocation::new(
+                format!("{}/{rendered}", candidate.identity),
+                kind,
+            );
+        }
+    }
+
+    fn reasons(&self) -> Vec<ConcurrencyOpenReason> {
+        if self.resolved.exact_candidate().is_some() {
+            Vec::new()
+        } else {
+            vec![ConcurrencyOpenReason::UnknownLocation]
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -805,14 +1190,22 @@ struct SynchronizationSubjectClasses {
     backing_formal_bindings: HashMap<LocalSynchronizationSubject, LocalSynchronizationSubject>,
     backing_ambiguous: Vec<(LocalSynchronizationSubject, LocalSynchronizationSubject)>,
     backing_field_origins: Vec<BackingFieldOrigin>,
-    canonical_values: HashMap<LocalSynchronizationSubject, CanonicalConcurrencyLocation>,
+    canonical_values: HashMap<LocalSynchronizationSubject, ConcurrencyIdentityFact>,
+    identity_reasons: Vec<ConcurrencyOpenReason>,
     ambiguous: Vec<LocalSynchronizationSubject>,
     captured_values: Vec<LocalSynchronizationSubject>,
     captured_locations: Vec<LocalSynchronizationSubject>,
     modeled_values: Vec<LocalSynchronizationSubject>,
     /// Member locators whose field is declared as a pointer, so a chain
     /// through them survives a copy of the struct that holds them.
-    pointer_members: HashSet<(String, u32, u32)>,
+    reference_members: HashMap<(String, u32, u32), bool>,
+    callable_members: HashSet<(String, u32, u32)>,
+    cell_cardinalities: HashMap<LocalSynchronizationSubject, ConcurrencyObjectCardinality>,
+    inline_cells: HashSet<LocalLocation>,
+    /// Allocations are singleton within one activation, but a repeated
+    /// activation can produce distinct containers holding shared or fresh
+    /// reference payloads. A payload cannot inherit either lifetime claim.
+    repeated_allocations: HashSet<CanonicalConcurrencyLocation>,
     /// The declaration each member locator names.
     member_declarations: HashMap<(String, u32, u32), String>,
     /// The one locator chosen to stand for each named field.
@@ -827,6 +1220,7 @@ struct SynchronizationSubjectClasses {
     /// one field one name.
     declaration_locators: HashMap<String, CanonicalMember>,
     fresh_allocations: Vec<LocalSynchronizationSubject>,
+    multiple_allocations: Vec<LocalSynchronizationSubject>,
     value_assignments: HashMap<LocalSynchronizationSubject, usize>,
     location_stores: HashMap<LocalLocation, usize>,
     backing_location_stores: HashMap<LocalLocation, Vec<LocalSynchronizationSubject>>,
@@ -996,7 +1390,7 @@ impl SynchronizationSubjectClasses {
     fn bind_canonical_value(
         &mut self,
         subject: LocalSynchronizationSubject,
-        canonical: CanonicalConcurrencyLocation,
+        canonical: ConcurrencyIdentityFact,
     ) {
         if let Some(previous) = self.canonical_values.get(&subject)
             && previous != &canonical
@@ -1010,7 +1404,7 @@ impl SynchronizationSubjectClasses {
     fn equivalent_values(
         &mut self,
         subject: LocalSynchronizationSubject,
-    ) -> Vec<(TaskId, ProcedureHandle, ValueId)> {
+    ) -> Vec<(TaskId, InvocationId, ProcedureHandle, ValueId)> {
         let root = self.root(subject.clone());
         let candidates = self
             .parent
@@ -1025,9 +1419,10 @@ impl SynchronizationSubjectClasses {
             .filter_map(|candidate| match candidate {
                 LocalSynchronizationSubject::Value {
                     task,
+                    invocation,
                     procedure,
                     value,
-                } => Some((task, procedure, value)),
+                } => Some((task, invocation, procedure, value)),
                 LocalSynchronizationSubject::Location(_) => None,
             })
             .collect()
@@ -1084,13 +1479,37 @@ impl SynchronizationSubjectClasses {
         }
     }
 
+    fn canonical_modeled_identity(
+        &mut self,
+        context: &ContextKey,
+        subject: &ResolvedConcurrencySubject,
+    ) -> Option<ConcurrencyIdentityFact> {
+        let local = LocalSynchronizationSubject::Value {
+            task: context.task,
+            invocation: context.invocation,
+            procedure: context.procedure.clone(),
+            value: subject.value,
+        };
+        match subject.identity {
+            ConcurrencySubjectIdentity::Value => self.canonical_capture_identity(local),
+            ConcurrencySubjectIdentity::Backing => self.canonical_backing_identity(local),
+        }
+    }
+
     fn canonical_capture_identity(
         &mut self,
         subject: LocalSynchronizationSubject,
-    ) -> Option<CanonicalConcurrencyLocation> {
+    ) -> Option<ConcurrencyIdentityFact> {
         let root = self.root(subject.clone());
-        if let Some(canonical) = self.bound_canonical_identity(subject) {
-            return Some(canonical);
+        match self.bound_canonical_identity(subject) {
+            ConcurrencyAnswer::Proven(Some(canonical)) => {
+                return Some(canonical);
+            }
+            ConcurrencyAnswer::Open { reasons, .. } => {
+                self.identity_reasons.extend(reasons);
+                return None;
+            }
+            ConcurrencyAnswer::Proven(None) => {}
         }
         let captured = self.captured_values.clone();
         let captured_value = captured
@@ -1111,13 +1530,125 @@ impl SynchronizationSubjectClasses {
         if !captured_value && !(captured_location && stores == 1) {
             return None;
         }
+        let cardinality = self.capture_cardinality(&root);
         if let LocalSynchronizationSubject::Location(location) = &root {
-            return Some(canonical_local_location(location));
+            let mut fact = Self::storage_identity(canonical_local_location(location), cardinality);
+            if self.inline_cells.contains(location) {
+                fact.resolved.independent_storage = Some(ConcurrencyStorageFamily::LexicalCell {
+                    invocation: location.invocation,
+                    location: location.location,
+                });
+            }
+            return Some(fact);
         }
-        Some(CanonicalConcurrencyLocation::new(
-            format!("captured-value:{root:?}"),
+        let canonical =
+            CanonicalConcurrencyLocation::new(format!("captured-value:{root:?}"), "object");
+        Some(Self::storage_identity(canonical, cardinality))
+    }
+
+    fn capture_cardinality(
+        &mut self,
+        root: &LocalSynchronizationSubject,
+    ) -> ConcurrencyObjectCardinality {
+        let mut facts = self
+            .cell_cardinalities
+            .clone()
+            .into_iter()
+            .collect::<Vec<_>>();
+        facts.extend(
+            self.multiple_allocations
+                .iter()
+                .cloned()
+                .map(|subject| (subject, ConcurrencyObjectCardinality::Multiple)),
+        );
+        facts
+            .into_iter()
+            .filter_map(|(subject, cardinality)| {
+                (self.root(subject) == *root).then_some(cardinality)
+            })
+            .max()
+            .unwrap_or(ConcurrencyObjectCardinality::Unknown)
+    }
+
+    fn backing_cardinality(
+        &mut self,
+        root: &LocalSynchronizationSubject,
+    ) -> ConcurrencyObjectCardinality {
+        let mut facts = self
+            .cell_cardinalities
+            .clone()
+            .into_iter()
+            .collect::<Vec<_>>();
+        facts.extend(
+            self.multiple_allocations
+                .iter()
+                .cloned()
+                .map(|subject| (subject, ConcurrencyObjectCardinality::Multiple)),
+        );
+        facts
+            .into_iter()
+            .filter_map(|(subject, cardinality)| {
+                (self.backing_root(subject) == *root).then_some(cardinality)
+            })
+            .max()
+            .unwrap_or(ConcurrencyObjectCardinality::Unknown)
+    }
+
+    fn storage_identity(
+        canonical: CanonicalConcurrencyLocation,
+        cardinality: ConcurrencyObjectCardinality,
+    ) -> ConcurrencyIdentityFact {
+        ConcurrencyIdentityFact {
+            resolved: ResolvedConcurrencyLocation::new(
+                vec![canonical],
+                cardinality != ConcurrencyObjectCardinality::Unknown,
+                cardinality,
+                ConcurrencyEscape::Unknown,
+                ConcurrencyOwnership::Unknown,
+            ),
+            storage_origin: None,
+        }
+    }
+
+    fn member_reference_binding(
+        &self,
+        member: &crate::analyzer::semantic::SemanticLocator,
+    ) -> Option<bool> {
+        self.reference_members
+            .get(&member_locator_key(self.canonical_member(member)))
+            .or_else(|| self.reference_members.get(&member_locator_key(member)))
+            .copied()
+    }
+
+    fn leave_inline_storage(&self, fact: &mut ConcurrencyIdentityFact) {
+        if fact
+            .storage_origin
+            .as_ref()
+            .is_some_and(|origin| self.repeated_allocations.contains(origin))
+        {
+            fact.resolved.cardinality = ConcurrencyObjectCardinality::Unknown;
+            fact.resolved.exhaustive = false;
+        }
+        fact.storage_origin = None;
+        fact.resolved.independent_storage = None;
+    }
+
+    fn project_loaded_field(
+        &self,
+        fact: &mut ConcurrencyIdentityFact,
+        member: &crate::analyzer::semantic::SemanticLocator,
+    ) {
+        // Only a proven inline field inherits the container's allocation
+        // lifetime. Unknown types are not evidence of inline storage.
+        if self.member_reference_binding(member) != Some(false) {
+            self.leave_inline_storage(fact);
+        }
+        fact.project(
+            SummaryConcurrencyAccessSelector::Field(SummaryLocationKey::from_locator(
+                self.canonical_member(member),
+            )),
             "object",
-        ))
+        );
     }
 
     /// The locator that stands for the field a member locator names.
@@ -1146,7 +1677,7 @@ impl SynchronizationSubjectClasses {
     fn canonical_backing_identity(
         &mut self,
         subject: LocalSynchronizationSubject,
-    ) -> Option<CanonicalConcurrencyLocation> {
+    ) -> Option<ConcurrencyIdentityFact> {
         let mut cursor = self.backing_root(subject);
         let mut fields = Vec::new();
         let mut visited = HashSet::default();
@@ -1184,7 +1715,7 @@ impl SynchronizationSubjectClasses {
                     .into_iter()
                     .any(|candidate| self.backing_root(candidate) == cursor);
                 if captured_value || captured_location {
-                    Some(match &cursor {
+                    let canonical = match &cursor {
                         LocalSynchronizationSubject::Location(location) => {
                             canonical_local_location(location)
                         }
@@ -1194,7 +1725,11 @@ impl SynchronizationSubjectClasses {
                                 "object",
                             )
                         }
-                    })
+                    };
+                    Some(Self::storage_identity(
+                        canonical,
+                        self.backing_cardinality(&cursor),
+                    ))
                 } else if self
                     .backing_formal_bindings
                     .keys()
@@ -1203,7 +1738,7 @@ impl SynchronizationSubjectClasses {
                     .into_iter()
                     .any(|formal| self.backing_root(formal) == cursor)
                 {
-                    Some(match &cursor {
+                    let canonical = match &cursor {
                         LocalSynchronizationSubject::Location(location) => {
                             canonical_local_location(location)
                         }
@@ -1213,18 +1748,18 @@ impl SynchronizationSubjectClasses {
                                 "object",
                             )
                         }
-                    })
+                    };
+                    Some(Self::storage_identity(
+                        canonical,
+                        self.backing_cardinality(&cursor),
+                    ))
                 } else {
                     None
                 }
             };
             if let Some(mut base) = base {
                 for member in fields.iter().rev() {
-                    let selector = field_step_selector(self.canonical_member(member));
-                    base = CanonicalConcurrencyLocation::new(
-                        format!("{}/{selector}", base.identity),
-                        "object",
-                    );
+                    self.project_loaded_field(&mut base, member);
                 }
                 return Some(base);
             }
@@ -1272,7 +1807,7 @@ impl SynchronizationSubjectClasses {
     fn canonical_field_chain_identity(
         &mut self,
         subject: LocalSynchronizationSubject,
-    ) -> Option<CanonicalConcurrencyLocation> {
+    ) -> Option<ConcurrencyIdentityFact> {
         let mut cursor = self.root(subject);
         let mut fields = Vec::new();
         let mut visited = HashSet::default();
@@ -1287,7 +1822,7 @@ impl SynchronizationSubjectClasses {
             // nothing, though it does race.
             let crossed_pointer = fields
                 .iter()
-                .any(|member| self.pointer_members.contains(&member_locator_key(member)));
+                .any(|member| self.member_reference_binding(member) == Some(true));
             let named = self.canonical_capture_identity(cursor.clone()).or_else(|| {
                 crossed_pointer
                     .then(|| self.canonical_backing_identity(cursor.clone()))
@@ -1301,11 +1836,7 @@ impl SynchronizationSubjectClasses {
                     // caller anchors at and the use the callee anchors at, so
                     // `b.tx.stats.CursorCount` agreed on its first and last
                     // steps and disagreed in the middle.
-                    let selector = field_step_selector(self.canonical_member(member));
-                    base = CanonicalConcurrencyLocation::new(
-                        format!("{}/{selector}", base.identity),
-                        "object",
-                    );
+                    self.project_loaded_field(&mut base, member);
                 }
                 return Some(base);
             }
@@ -1360,14 +1891,17 @@ impl SynchronizationSubjectClasses {
     fn bound_canonical_identity(
         &mut self,
         subject: LocalSynchronizationSubject,
-    ) -> Option<CanonicalConcurrencyLocation> {
+    ) -> ConcurrencyAnswer<Option<ConcurrencyIdentityFact>> {
         let root = self.root(subject);
         let ambiguous = self.ambiguous.clone();
         if ambiguous
             .into_iter()
             .any(|candidate| self.root(candidate) == root)
         {
-            return None;
+            return ConcurrencyAnswer::Open {
+                partial: None,
+                reasons: vec![ConcurrencyOpenReason::UnknownLocation],
+            };
         }
         let canonical_values = self.canonical_values.clone();
         let mut canonicals = canonical_values
@@ -1377,17 +1911,24 @@ impl SynchronizationSubjectClasses {
             });
         if let Some(canonical) = canonicals.next() {
             if canonicals.any(|candidate| candidate != canonical) {
-                return None;
+                return ConcurrencyAnswer::Open {
+                    partial: None,
+                    reasons: vec![ConcurrencyOpenReason::UnknownLocation],
+                };
             }
-            return Some(canonical);
+            return ConcurrencyAnswer::Proven(Some(canonical));
         }
-        None
+        ConcurrencyAnswer::Proven(None)
     }
 }
 
 #[derive(Debug, Default)]
 struct LocationClasses {
     parent: HashMap<LocalLocation, LocalLocation>,
+    /// Destinations populated by a value snapshot, rather than references to
+    /// an owner's lexical cell. Their environment instances are not modeled
+    /// as singleton storage, but their storage family is known.
+    value_captures: HashSet<LocalLocation>,
 }
 
 impl LocationClasses {
@@ -1422,19 +1963,21 @@ pub fn concurrent_access_conflicts(
     root: &ProcedureHandle,
     request: &mut SemanticRequest<'_>,
 ) -> Result<ConcurrentAccessReport, SemanticProviderError> {
+    let mut invocations = Invocations::default();
+    let root_context = invocations.push(TaskId(0), root.clone(), None);
     let mut tasks = vec![Task {
         parent: None,
         entry_procedure: Some(root.clone()),
+        entry_invocation: root_context.invocation,
         spawn_procedure: None,
+        spawn_invocation: None,
         spawn_call: None,
         group: None,
-        repeated: false,
+        completion: None,
+        repetition: None,
         repetitions_serialized: false,
     }];
-    let mut queue = VecDeque::from([ContextKey {
-        task: TaskId(0),
-        procedure: root.clone(),
-    }]);
+    let mut queue = VecDeque::from([root_context]);
     let mut visited = HashSet::default();
     let mut accesses = Vec::new();
     let mut pending_summary_accesses = Vec::new();
@@ -1448,10 +1991,13 @@ pub fn concurrent_access_conflicts(
     // these may be carried onto the cell that stores them, because copying a
     // reference keeps one object while copying a value makes a second.
     let mut reference_allocations = HashSet::<CanonicalConcurrencyLocation>::default();
+    let mut inline_allocations = HashSet::<CanonicalConcurrencyLocation>::default();
     let mut callable_values =
-        HashMap::<(TaskId, ProcedureHandle, ValueId), ProcedureHandle>::default();
+        HashMap::<(TaskId, InvocationId, ProcedureHandle, ValueId), ProcedureHandle>::default();
     let mut task_local_allocations =
         HashMap::<TaskId, HashSet<CanonicalConcurrencyLocation>>::default();
+    let mut allocation_origins =
+        HashMap::<CanonicalConcurrencyLocation, AllocationOrigin>::default();
     let mut classes = LocationClasses::default();
     // The formal each lexical cell was bound with, for the cells whose body
     // never assigns them. Kept apart from `location_stores` so that a cell the
@@ -1462,7 +2008,7 @@ pub fn concurrent_access_conflicts(
         HashMap::<ContextKey, Vec<(ProgramPointId, ResolvedConcurrencyEffect)>>::default();
     let mut model_reasons_by_context = HashMap::<ContextKey, Vec<ConcurrencyOpenReason>>::default();
     let mut synchronous_calls = Vec::new();
-    let mut synchronous_graph = HashMap::<ContextKey, Vec<ContextKey>>::default();
+    let mut binding_cardinalities = HashMap::default();
 
     while let Some(context) = queue.pop_front() {
         if !visited.insert(context.clone()) {
@@ -1473,6 +2019,26 @@ pub fn concurrent_access_conflicts(
             break;
         }
         let semantics = context.procedure.semantics();
+        // Materialization can be precharged, but activation-specific replay
+        // is new retained work even when the body or summary is reused.
+        if request
+            .budget
+            .charge(crate::analyzer::semantic::SemanticWork {
+                nested_entries: 1
+                    + semantics.values().len()
+                    + semantics.memory_locations().len()
+                    + semantics
+                        .points()
+                        .iter()
+                        .map(|point| point.events.len())
+                        .sum::<usize>(),
+                ..crate::analyzer::semantic::SemanticWork::default()
+            })
+            .is_err()
+        {
+            report.reasons.push(ConcurrencyOpenReason::BudgetExhausted);
+            break;
+        }
         // A closure that captures a parameter or receiver makes the producer
         // hold it in a lexical cell, and where the body never assigns that
         // formal the cell's only write is the call that bound it. A binding
@@ -1507,6 +2073,7 @@ pub fn concurrent_access_conflicts(
             }
             let cell = LocalLocation {
                 task: context.task,
+                invocation: context.invocation,
                 procedure: context.procedure.clone(),
                 location: location.id,
             };
@@ -1514,6 +2081,7 @@ pub fn concurrent_access_conflicts(
                 cell,
                 LocalSynchronizationSubject::Value {
                     task: context.task,
+                    invocation: context.invocation,
                     procedure: context.procedure.clone(),
                     value: binding,
                 },
@@ -1605,6 +2173,53 @@ pub fn concurrent_access_conflicts(
             }
         }
 
+        let allocation_cyclic_points = if semantics.allocations().is_empty() {
+            Some(HashSet::default())
+        } else if semantics.gaps().iter().any(|gap| {
+            gap.capability == crate::analyzer::semantic::SemanticCapability::NormalControlFlow
+        }) {
+            None
+        } else if request
+            .budget
+            .charge(crate::analyzer::semantic::SemanticWork {
+                program_points: semantics.points().len(),
+                control_edges: semantics.control_edges().len(),
+                ..crate::analyzer::semantic::SemanticWork::default()
+            })
+            .is_err()
+        {
+            report.reasons.push(ConcurrencyOpenReason::BudgetExhausted);
+            None
+        } else {
+            use crate::analyzer::semantic::cfg_algorithms::{
+                CfgAlgorithmBudget, CfgAlgorithmError, CfgAlgorithmRequest, loop_regions,
+            };
+            let mut budget = CfgAlgorithmBudget::default();
+            match loop_regions(
+                semantics,
+                &mut CfgAlgorithmRequest::new(&mut budget, request.cancellation),
+            ) {
+                Ok(regions) => Some(
+                    regions
+                        .regions
+                        .into_iter()
+                        .flat_map(|region| region.members)
+                        .collect::<HashSet<_>>(),
+                ),
+                Err(CfgAlgorithmError::Cancelled { .. }) => {
+                    report.reasons.push(ConcurrencyOpenReason::BudgetExhausted);
+                    None
+                }
+                Err(CfgAlgorithmError::ExceededBudget(_)) => {
+                    report.reasons.push(ConcurrencyOpenReason::BudgetExhausted);
+                    None
+                }
+                Err(CfgAlgorithmError::InvalidNode(_)) => {
+                    unreachable!("validated allocation CFG contains only owned points")
+                }
+            }
+        };
+
         let allocation_results = semantics
             .allocations()
             .iter()
@@ -1629,6 +2244,41 @@ pub fn concurrent_access_conflicts(
                 _ => None,
             })
             .collect::<HashSet<_>>();
+        let capture_bindings = semantics
+            .memory_locations()
+            .iter()
+            .filter_map(|location| match location.kind {
+                MemoryLocationKind::Capture { binding, .. } => binding,
+                _ => None,
+            })
+            .collect::<HashSet<_>>();
+        for value in semantics.values() {
+            // A capture proxy is a use of its owner's binding, not a fresh
+            // declaration whose lifetime the provider can classify here.
+            if capture_bindings.contains(&value.id) {
+                continue;
+            }
+            if !matches!(
+                value.kind,
+                crate::analyzer::semantic::SemanticValueKind::Local
+                    | crate::analyzer::semantic::SemanticValueKind::Parameter { .. }
+                    | crate::analyzer::semantic::SemanticValueKind::Receiver { .. }
+            ) {
+                continue;
+            }
+            let cardinality = *binding_cardinalities
+                .entry((context.procedure.clone(), value.id))
+                .or_insert_with(|| provider.lexical_cell_cardinality(&context.procedure, value.id));
+            synchronization_subjects.cell_cardinalities.insert(
+                LocalSynchronizationSubject::Value {
+                    task: context.task,
+                    invocation: context.invocation,
+                    procedure: context.procedure.clone(),
+                    value: value.id,
+                },
+                cardinality,
+            );
+        }
         for location in semantics.memory_locations() {
             let binding = match location.kind {
                 MemoryLocationKind::LexicalCell { binding }
@@ -1638,14 +2288,41 @@ pub fn concurrent_access_conflicts(
                 } => binding,
                 _ => continue,
             };
+            if matches!(location.kind, MemoryLocationKind::LexicalCell { .. }) {
+                let cardinality = *binding_cardinalities
+                    .entry((context.procedure.clone(), binding))
+                    .or_insert_with(|| {
+                        provider.lexical_cell_cardinality(&context.procedure, binding)
+                    });
+                for subject in [
+                    LocalSynchronizationSubject::Location(LocalLocation {
+                        task: context.task,
+                        invocation: context.invocation,
+                        procedure: context.procedure.clone(),
+                        location: location.id,
+                    }),
+                    LocalSynchronizationSubject::Value {
+                        task: context.task,
+                        invocation: context.invocation,
+                        procedure: context.procedure.clone(),
+                        value: binding,
+                    },
+                ] {
+                    synchronization_subjects
+                        .cell_cardinalities
+                        .insert(subject, cardinality);
+                }
+            }
             synchronization_subjects.note_backing_binding_location(
                 LocalLocation {
                     task: context.task,
+                    invocation: context.invocation,
                     procedure: context.procedure.clone(),
                     location: location.id,
                 },
                 LocalSynchronizationSubject::Value {
                     task: context.task,
+                    invocation: context.invocation,
                     procedure: context.procedure.clone(),
                     value: binding,
                 },
@@ -1667,42 +2344,109 @@ pub fn concurrent_access_conflicts(
                             && let Some(handle) =
                                 context.procedure.artifact().procedure_handle(target)
                         {
-                            callable_values
-                                .insert((context.task, context.procedure.clone(), result), handle);
+                            callable_values.insert(
+                                (
+                                    context.task,
+                                    context.invocation,
+                                    context.procedure.clone(),
+                                    result,
+                                ),
+                                handle,
+                            );
                         }
                     }
                     SemanticEffect::Allocation { allocation } => {
                         let allocation = semantics
                             .allocation(allocation)
                             .expect("validated allocation exists");
-                        let (resolved, reasons) = provider
-                            .resolved_allocation(&context.procedure, allocation.id, request)?
-                            .into_parts();
-                        if reasons.is_empty()
-                            && let Some(canonical) = resolved.exact_candidate().cloned()
-                        {
-                            let canonical = contextual_allocation_identity(context.task, canonical);
-                            if provider
-                                .allocation_yields_reference(&context.procedure, allocation.id)
-                            {
-                                reference_allocations.insert(canonical.clone());
-                            }
-                            task_local_allocations
-                                .entry(context.task)
-                                .or_default()
-                                .insert(canonical.clone());
-                            synchronization_subjects.bind_canonical_value(
+                        // Allocation is an explicit creation event, not a
+                        // pointee guess. Heap queries can be incomplete because
+                        // of unrelated accesses elsewhere in this procedure;
+                        // that does not erase this event's storage family.
+                        let canonical = contextual_allocation_identity(
+                            context.task,
+                            context.invocation,
+                            CanonicalConcurrencyLocation::new(
+                                format!(
+                                    "allocation:{}:{}",
+                                    crate::flow_state::procedure_wire_id(&context.procedure),
+                                    allocation.id.get()
+                                ),
+                                "object",
+                            ),
+                        );
+                        let cardinality = allocation_cyclic_points.as_ref().map_or(
+                            ConcurrencyObjectCardinality::Unknown,
+                            |points| {
+                                if points.contains(&allocation.point) {
+                                    ConcurrencyObjectCardinality::Multiple
+                                } else {
+                                    ConcurrencyObjectCardinality::Singleton
+                                }
+                            },
+                        );
+                        if cardinality == ConcurrencyObjectCardinality::Multiple {
+                            synchronization_subjects.multiple_allocations.push(
                                 LocalSynchronizationSubject::Value {
                                     task: context.task,
+                                    invocation: context.invocation,
                                     procedure: context.procedure.clone(),
                                     value: allocation.result,
                                 },
-                                canonical,
                             );
                         }
+                        if invocations.entries[context.invocation.0 as usize]
+                            .repetition
+                            .is_some()
+                            || cardinality != ConcurrencyObjectCardinality::Singleton
+                        {
+                            synchronization_subjects
+                                .repeated_allocations
+                                .insert(canonical.clone());
+                        }
+                        match provider
+                            .allocation_binds_by_reference(&context.procedure, allocation.id)
+                        {
+                            Some(true) => {
+                                reference_allocations.insert(canonical.clone());
+                            }
+                            Some(false) => {
+                                inline_allocations.insert(canonical.clone());
+                            }
+                            None => {}
+                        }
+                        task_local_allocations
+                            .entry(context.task)
+                            .or_default()
+                            .insert(canonical.clone());
+                        allocation_origins.insert(
+                            canonical.clone(),
+                            AllocationOrigin {
+                                invocation: context.invocation,
+                                point: point.id,
+                            },
+                        );
+                        let mut fact = ConcurrencyIdentityFact::allocation(
+                            canonical,
+                            context.invocation,
+                            allocation.id,
+                        );
+                        fact.resolved.cardinality = cardinality;
+                        fact.resolved.exhaustive =
+                            cardinality != ConcurrencyObjectCardinality::Unknown;
+                        synchronization_subjects.bind_canonical_value(
+                            LocalSynchronizationSubject::Value {
+                                task: context.task,
+                                invocation: context.invocation,
+                                procedure: context.procedure.clone(),
+                                value: allocation.result,
+                            },
+                            fact,
+                        );
                         synchronization_subjects.mark_fresh_allocation(
                             LocalSynchronizationSubject::Value {
                                 task: context.task,
+                                invocation: context.invocation,
                                 procedure: context.procedure.clone(),
                                 value: allocation.result,
                             },
@@ -1712,28 +2456,41 @@ pub fn concurrent_access_conflicts(
                     SemanticEffect::ValueFlow { source, target, .. } => {
                         let source_subject = LocalSynchronizationSubject::Value {
                             task: context.task,
+                            invocation: context.invocation,
                             procedure: context.procedure.clone(),
                             value: source,
                         };
                         let target_subject = LocalSynchronizationSubject::Value {
                             task: context.task,
+                            invocation: context.invocation,
                             procedure: context.procedure.clone(),
                             value: target,
                         };
                         if let Some(callable) = callable_values
-                            .get(&(context.task, context.procedure.clone(), source))
+                            .get(&(
+                                context.task,
+                                context.invocation,
+                                context.procedure.clone(),
+                                source,
+                            ))
                             .cloned()
                         {
                             callable_values.insert(
-                                (context.task, context.procedure.clone(), target),
+                                (
+                                    context.task,
+                                    context.invocation,
+                                    context.procedure.clone(),
+                                    target,
+                                ),
                                 callable,
                             );
                         }
                         if !aggregate_copies.contains(&(source, target)) {
                             synchronization_subjects
                                 .union_backing(source_subject.clone(), target_subject.clone());
-                            if let Some(canonical) = synchronization_subjects
-                                .canonical_capture_identity(source_subject.clone())
+                            if let ConcurrencyAnswer::Proven(Some(canonical)) =
+                                synchronization_subjects
+                                    .bound_canonical_identity(source_subject.clone())
                             {
                                 synchronization_subjects
                                     .bind_canonical_value(target_subject.clone(), canonical);
@@ -1750,11 +2507,13 @@ pub fn concurrent_access_conflicts(
                             synchronization_subjects.union_backing(
                                 LocalSynchronizationSubject::Value {
                                     task: context.task,
+                                    invocation: context.invocation,
                                     procedure: context.procedure.clone(),
                                     value,
                                 },
                                 LocalSynchronizationSubject::Value {
                                     task: context.task,
+                                    invocation: context.invocation,
                                     procedure: context.procedure.clone(),
                                     value: target,
                                 },
@@ -1763,6 +2522,7 @@ pub fn concurrent_access_conflicts(
                         synchronization_subjects.note_value_assignment(
                             LocalSynchronizationSubject::Value {
                                 task: context.task,
+                                invocation: context.invocation,
                                 procedure: context.procedure.clone(),
                                 value: target,
                             },
@@ -1771,11 +2531,13 @@ pub fn concurrent_access_conflicts(
                             synchronization_subjects.union(
                                 LocalSynchronizationSubject::Value {
                                     task: context.task,
+                                    invocation: context.invocation,
                                     procedure: context.procedure.clone(),
                                     value,
                                 },
                                 LocalSynchronizationSubject::Value {
                                     task: context.task,
+                                    invocation: context.invocation,
                                     procedure: context.procedure.clone(),
                                     value: target,
                                 },
@@ -1793,11 +2555,13 @@ pub fn concurrent_access_conflicts(
                         synchronization_subjects.union(
                             LocalSynchronizationSubject::Location(LocalLocation {
                                 task: context.task,
+                                invocation: context.invocation,
                                 procedure: context.procedure.clone(),
                                 location,
                             }),
                             LocalSynchronizationSubject::Value {
                                 task: context.task,
+                                invocation: context.invocation,
                                 procedure: context.procedure.clone(),
                                 value: target,
                             },
@@ -1809,6 +2573,7 @@ pub fn concurrent_access_conflicts(
                     } => {
                         let local_location = LocalLocation {
                             task: context.task,
+                            invocation: context.invocation,
                             procedure: context.procedure.clone(),
                             location,
                         };
@@ -1821,6 +2586,19 @@ pub fn concurrent_access_conflicts(
                         // and `b[0]` one location.
                         let stores_a_copy =
                             aggregate_copies.iter().any(|(source, _)| *source == value);
+                        if stores_a_copy
+                            && matches!(
+                                semantics
+                                    .memory_location(location)
+                                    .expect("validated store location exists")
+                                    .kind,
+                                MemoryLocationKind::LexicalCell { .. }
+                            )
+                        {
+                            synchronization_subjects
+                                .inline_cells
+                                .insert(local_location.clone());
+                        }
                         if !stores_a_copy
                             && !matches!(
                                 semantics
@@ -1834,6 +2612,7 @@ pub fn concurrent_access_conflicts(
                                 local_location,
                                 LocalSynchronizationSubject::Value {
                                     task: context.task,
+                                    invocation: context.invocation,
                                     procedure: context.procedure.clone(),
                                     value,
                                 },
@@ -1845,6 +2624,7 @@ pub fn concurrent_access_conflicts(
                 if let SemanticEffect::Synchronization { operation, subject } = event.effect {
                     pending_synchronizations.push(PendingIntrinsicSynchronization {
                         task: context.task,
+                        invocation: context.invocation,
                         procedure: context.procedure.clone(),
                         point: point.id,
                         operation,
@@ -1861,11 +2641,13 @@ pub fn concurrent_access_conflicts(
                         synchronization_subjects.union_backing(
                             LocalSynchronizationSubject::Location(LocalLocation {
                                 task: context.task,
+                                invocation: context.invocation,
                                 procedure: context.procedure.clone(),
                                 location,
                             }),
                             LocalSynchronizationSubject::Value {
                                 task: context.task,
+                                invocation: context.invocation,
                                 procedure: context.procedure.clone(),
                                 value: result,
                             },
@@ -1878,11 +2660,13 @@ pub fn concurrent_access_conflicts(
                             synchronization_subjects.note_backing_field_load(
                                 LocalSynchronizationSubject::Value {
                                     task: context.task,
+                                    invocation: context.invocation,
                                     procedure: context.procedure.clone(),
                                     value: result,
                                 },
                                 LocalSynchronizationSubject::Value {
                                     task: context.task,
+                                    invocation: context.invocation,
                                     procedure: context.procedure.clone(),
                                     value: *base,
                                 },
@@ -1892,11 +2676,13 @@ pub fn concurrent_access_conflicts(
                         synchronization_subjects.union(
                             LocalSynchronizationSubject::Location(LocalLocation {
                                 task: context.task,
+                                invocation: context.invocation,
                                 procedure: context.procedure.clone(),
                                 location,
                             }),
                             LocalSynchronizationSubject::Value {
                                 task: context.task,
+                                invocation: context.invocation,
                                 procedure: context.procedure.clone(),
                                 value: result,
                             },
@@ -1928,6 +2714,7 @@ pub fn concurrent_access_conflicts(
                 accesses.push(Access {
                     site: ConcurrentAccessSite {
                         task: context.task,
+                        invocation: context.invocation,
                         procedure: context.procedure.clone(),
                         point: point.id,
                         source: event.source,
@@ -1936,6 +2723,7 @@ pub fn concurrent_access_conflicts(
                     },
                     local_location: Some(LocalLocation {
                         task: context.task,
+                        invocation: context.invocation,
                         procedure: context.procedure.clone(),
                         location,
                     }),
@@ -1946,6 +2734,7 @@ pub fn concurrent_access_conflicts(
                     local_identity,
                     reasons,
                     atomic: false,
+                    storage_origin: None,
                 });
             }
         }
@@ -1997,6 +2786,7 @@ pub fn concurrent_access_conflicts(
                 let (targets, reasons) = resolve_targets(
                     provider,
                     context.task,
+                    context.invocation,
                     &context.procedure,
                     call.id,
                     &callable_values,
@@ -2025,15 +2815,22 @@ pub fn concurrent_access_conflicts(
                     // is reported as nothing at all -- silently, since a task
                     // that runs once has no gap to declare. This is bbolt's
                     // own shape.
-                    let repeated = point_is_cyclic(semantics, call.point)
-                        || tasks[context.task.0 as usize].repeated;
+                    let target_context = invocations.push(
+                        child,
+                        target.clone(),
+                        Some((context.invocation, call.id)),
+                    );
                     tasks.push(Task {
                         parent: Some(context.task),
                         entry_procedure: Some(target.clone()),
+                        entry_invocation: target_context.invocation,
                         spawn_procedure: Some(context.procedure.clone()),
+                        spawn_invocation: Some(context.invocation),
                         spawn_call: Some(call.id),
                         group: group.clone(),
-                        repeated,
+                        completion: None,
+                        repetition: invocations.entries[target_context.invocation.0 as usize]
+                            .repetition,
                         repetitions_serialized: false,
                     });
                     union_capture_locations(
@@ -2041,6 +2838,7 @@ pub fn concurrent_access_conflicts(
                         &mut synchronization_subjects,
                         &context,
                         child,
+                        target_context.invocation,
                         &target,
                         call.callee,
                     );
@@ -2051,16 +2849,14 @@ pub fn concurrent_access_conflicts(
                             &context,
                             call,
                             child,
+                            target_context.invocation,
                             &target,
                             true,
                             provider,
                             request,
                         )?;
                     }
-                    queue.push_back(ContextKey {
-                        task: child,
-                        procedure: target,
-                    });
+                    queue.push_back(target_context);
                 }
             }
             // A spawn always runs a body. Reaching none means the body was not
@@ -2078,6 +2874,7 @@ pub fn concurrent_access_conflicts(
                 let (targets, reasons) = resolve_targets(
                     provider,
                     context.task,
+                    context.invocation,
                     &context.procedure,
                     call.id,
                     &callable_values,
@@ -2087,10 +2884,6 @@ pub fn concurrent_access_conflicts(
                 let exact_target = reasons.is_empty() && targets.len() == 1;
                 report.reasons.extend(reasons);
                 for target in targets {
-                    let target_context = ContextKey {
-                        task: context.task,
-                        procedure: target.clone(),
-                    };
                     // Bind through an edge only where the edge is analyzed.
                     // A back edge is skipped just below, and binding through
                     // it first gave the callee's formal a second actual from
@@ -2106,10 +2899,10 @@ pub fn concurrent_access_conflicts(
                     // the deeper instantiation is not expanded either, so it
                     // contributes no accesses to misattribute, and
                     // `RecursiveExpansion` already says it was not analyzed.
-                    if context_reaches(&synchronous_graph, &target_context, &context) {
+                    if invocations.recursively_calls(context.invocation, &target) {
                         let summarized_cycle = provider
                             .complete_summary(&context.procedure)
-                            .zip(provider.complete_summary(&target_context.procedure))
+                            .zip(provider.complete_summary(&target))
                             .is_some_and(|(caller, callee)| {
                                 caller.recursive_group().is_some()
                                     && caller.recursive_group() == callee.recursive_group()
@@ -2121,11 +2914,17 @@ pub fn concurrent_access_conflicts(
                         }
                         continue;
                     }
+                    let target_context = invocations.push(
+                        context.task,
+                        target.clone(),
+                        Some((context.invocation, call.id)),
+                    );
                     union_capture_locations(
                         &mut classes,
                         &mut synchronization_subjects,
                         &context,
                         context.task,
+                        target_context.invocation,
                         &target,
                         call.callee,
                     );
@@ -2135,15 +2934,12 @@ pub fn concurrent_access_conflicts(
                         &context,
                         call,
                         context.task,
+                        target_context.invocation,
                         &target,
                         false,
                         provider,
                         request,
                     )?;
-                    synchronous_graph
-                        .entry(context.clone())
-                        .or_default()
-                        .push(target_context.clone());
                     if exact_target {
                         synchronous_calls.push(SynchronousCall {
                             caller: context.clone(),
@@ -2203,6 +2999,16 @@ pub fn concurrent_access_conflicts(
                 .map(|(cell, formal)| (cell.clone(), Some(formal.clone()))),
         )
         .collect::<Vec<_>>();
+    propagate_reference_results(
+        &mut synchronization_subjects,
+        &invocations,
+        &tasks,
+        &synchronous_calls,
+        &written_once,
+        &reference_allocations,
+        provider,
+        request,
+    );
     for (location, bound_formal) in written_once {
         let stored = match bound_formal {
             Some(formal) => Some(formal),
@@ -2217,10 +3023,16 @@ pub fn concurrent_access_conflicts(
         let Some(stored) = stored else {
             continue;
         };
-        let Some(canonical) = synchronization_subjects.bound_canonical_identity(stored) else {
+        let ConcurrencyAnswer::Proven(Some(canonical)) =
+            synchronization_subjects.bound_canonical_identity(stored)
+        else {
             continue;
         };
-        if !reference_allocations.contains(&canonical) {
+        if inline_allocations.contains(canonical.canonical()) {
+            synchronization_subjects.inline_cells.insert(location);
+            continue;
+        }
+        if !reference_allocations.contains(canonical.canonical()) {
             continue;
         }
         synchronization_subjects
@@ -2256,10 +3068,22 @@ pub fn concurrent_access_conflicts(
         })
         .collect::<Vec<_>>();
     name_member_declarations(&mut synchronization_subjects, provider, accessed_members);
+    // Selecting a proven method declaration evaluates its receiver, but does
+    // not read a field containing the method. Keep function-valued fields:
+    // their selected declaration is storage even if the value is a method.
+    accesses.retain(|access| {
+        access.site.mode != ConcurrentAccessMode::Read
+            || access.field_alias_domain.as_ref().is_none_or(|domain| {
+                !synchronization_subjects
+                    .callable_members
+                    .contains(&member_locator_key(&domain.member))
+            })
+    });
     canonicalize_bound_accesses(&mut synchronization_subjects, &mut accesses);
     for access in &mut accesses {
         let context = ContextKey {
             task: access.site.task,
+            invocation: access.site.invocation,
             procedure: access.site.procedure.clone(),
         };
         if let Some(reasons) = model_reasons_by_context.get(&context) {
@@ -2269,7 +3093,11 @@ pub fn concurrent_access_conflicts(
         }
     }
     associate_wait_group_tasks(&mut tasks, &modeled_by_context, &synchronous_calls);
-    append_atomic_accesses(&modeled_by_context, &mut accesses);
+    append_atomic_accesses(
+        &mut synchronization_subjects,
+        &modeled_by_context,
+        &mut accesses,
+    );
     let entry_locks = must_entry_locks(&modeled_by_context, &synchronous_calls);
     let lock_states = must_lock_states(&accesses, &modeled_by_context, &entry_locks);
     let synchronizations = resolve_intrinsic_synchronizations(
@@ -2281,41 +3109,28 @@ pub fn concurrent_access_conflicts(
     )?;
 
     compare_accesses(
+        provider,
         &tasks,
         &mut classes,
         AccessComparisonEvidence {
+            invocations: &invocations,
             modeled: &modeled_by_context,
             lock_states: &lock_states,
             synchronizations: &synchronizations,
             task_local_allocations: &task_local_allocations,
+            allocation_origins: &allocation_origins,
         },
         accesses,
         &mut report,
     );
+    // Conflicting identities cannot become a complete empty answer merely
+    // because no canonical location survived to produce a conflict pair.
+    report
+        .reasons
+        .extend(synchronization_subjects.identity_reasons);
     report.reasons.sort();
     report.reasons.dedup();
     Ok(report)
-}
-
-fn context_reaches(
-    graph: &HashMap<ContextKey, Vec<ContextKey>>,
-    origin: &ContextKey,
-    target: &ContextKey,
-) -> bool {
-    let mut queue = VecDeque::from([origin.clone()]);
-    let mut visited = HashSet::default();
-    visited.insert(origin.clone());
-    while let Some(context) = queue.pop_front() {
-        if &context == target {
-            return true;
-        }
-        for successor in graph.get(&context).into_iter().flatten() {
-            if visited.insert(successor.clone()) {
-                queue.push_back(successor.clone());
-            }
-        }
-    }
-    false
 }
 
 fn binding_location(
@@ -2341,6 +3156,693 @@ fn binding_location(
     Some(location)
 }
 
+#[derive(Debug, Clone)]
+struct ReferenceIdentityUse {
+    subject: LocalSynchronizationSubject,
+    invocation: InvocationId,
+    point: ProgramPointId,
+    event: usize,
+}
+
+/// A pending equation is not an alias edge. Every source must already have
+/// the same full creation fact before the destination receives a snapshot.
+/// None retains an unsupported producer as a dependency blocker.
+struct PendingReferenceIdentity {
+    destination: LocalSynchronizationSubject,
+    sources: Option<Vec<ReferenceIdentityUse>>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn propagate_reference_results(
+    classes: &mut SynchronizationSubjectClasses,
+    invocations: &Invocations,
+    tasks: &[Task],
+    calls: &[SynchronousCall],
+    cells: &[(LocalLocation, Option<LocalSynchronizationSubject>)],
+    reference_allocations: &HashSet<CanonicalConcurrencyLocation>,
+    provider: &impl ConcurrencyProvider,
+    request: &mut SemanticRequest<'_>,
+) {
+    let exact_calls = calls
+        .iter()
+        .map(|call| {
+            let (_, id) = invocations.entries[call.target.invocation.0 as usize]
+                .caller
+                .expect("synchronous activation has its caller");
+            ((call.caller.invocation, id), &call.target)
+        })
+        .collect::<HashMap<_, _>>();
+    let mut pending = Vec::new();
+    let mut has_reference_result = false;
+    for entry in &invocations.entries {
+        let context = &entry.context;
+        let semantics = context.procedure.semantics();
+        for call in semantics.call_sites() {
+            for (ordinal, value) in call.normal_result_values().enumerate() {
+                // Builtin allocations already have their own creation proof.
+                if semantics
+                    .allocations()
+                    .iter()
+                    .any(|allocation| allocation.result == value)
+                {
+                    continue;
+                }
+                let sources = exact_calls
+                    .get(&(context.invocation, call.id))
+                    .and_then(|target| {
+                        let ordinal =
+                            u32::try_from(ordinal).expect("semantic result ordinal fits u32");
+                        if provider.result_binds_by_reference(&target.procedure, ordinal)
+                            != Some(true)
+                            || call.normal_continuation.target().is_none()
+                            || !reference_evidence_is_complete(semantics, call.evidence)
+                            || !reference_control_is_complete(&context.procedure)
+                            || !matches!(
+                                call.execution_timing,
+                                ExecutionTiming::SameEvaluation | ExecutionTiming::SameInvocation
+                            )
+                        {
+                            return None;
+                        }
+                        has_reference_result = true;
+                        let body = target.procedure.semantics();
+                        if request.cancellation.is_cancelled()
+                            || request
+                                .budget
+                                .charge(crate::analyzer::semantic::SemanticWork {
+                                    program_points: body.points().len(),
+                                    control_edges: body.control_edges().len(),
+                                    nested_entries: body
+                                        .points()
+                                        .iter()
+                                        .map(|point| point.events.len())
+                                        .sum(),
+                                    ..crate::analyzer::semantic::SemanticWork::default()
+                                })
+                                .is_err()
+                        {
+                            classes
+                                .identity_reasons
+                                .push(ConcurrencyOpenReason::BudgetExhausted);
+                            return None;
+                        }
+                        reference_result_sources(target, ordinal)
+                    });
+                pending.push(PendingReferenceIdentity {
+                    destination: LocalSynchronizationSubject::Value {
+                        task: context.task,
+                        invocation: context.invocation,
+                        procedure: context.procedure.clone(),
+                        value,
+                    },
+                    sources,
+                });
+            }
+        }
+    }
+    if !has_reference_result {
+        return;
+    }
+    for (formal, actual) in &classes.backing_formal_bindings {
+        if classes.formal_bindings.contains_key(formal) {
+            continue;
+        }
+        let LocalSynchronizationSubject::Value {
+            invocation,
+            procedure,
+            value,
+            ..
+        } = formal
+        else {
+            unreachable!("a formal binding has a semantic value");
+        };
+        let reference = match procedure
+            .semantics()
+            .value(*value)
+            .expect("owned formal")
+            .kind
+        {
+            crate::analyzer::semantic::SemanticValueKind::Parameter { ordinal, .. } => {
+                provider.parameter_binding(procedure, ordinal) == Some(true)
+            }
+            crate::analyzer::semantic::SemanticValueKind::Receiver { dispatch: true } => {
+                provider.receiver_binds_by_reference(procedure)
+            }
+            _ => false,
+        };
+        if !reference {
+            continue;
+        }
+        let (caller, call) = invocations.entries[invocation.0 as usize]
+            .caller
+            .expect("bound formal has a caller");
+        let point = invocations.entries[caller.0 as usize]
+            .context
+            .procedure
+            .semantics()
+            .call_site(call)
+            .expect("owned call")
+            .point;
+        let event = invocations.entries[caller.0 as usize].context.procedure.semantics()
+            .point(point).expect("owned call point").events.iter()
+            .position(|event| matches!(event.effect, SemanticEffect::Invoke { call_site } if call_site == call))
+            .expect("validated call has its invocation event");
+        pending.push(PendingReferenceIdentity {
+            destination: formal.clone(),
+            sources: Some(vec![ReferenceIdentityUse {
+                subject: actual.clone(),
+                invocation: caller,
+                point,
+                event,
+            }]),
+        });
+    }
+    for (location, formal) in cells {
+        let semantics = location.procedure.semantics();
+        let stored = formal.clone().map(|formal| (formal, semantics.entry_point(), 0)).or_else(|| {
+            let [stored] = classes.backing_location_stores.get(location)?.as_slice() else { return None; };
+            let (point, event) = semantics.points().iter().find_map(|point| point.events.iter().position(|event| {
+                matches!(event.effect, SemanticEffect::MemoryStore { location: target, .. } if target == location.location)
+            }).map(|event| (point.id, event)))?;
+            Some((stored.clone(), point, event))
+        });
+        if let Some((stored, point, event)) = stored {
+            pending.push(PendingReferenceIdentity {
+                destination: LocalSynchronizationSubject::Location(location.clone()),
+                sources: Some(vec![ReferenceIdentityUse {
+                    subject: stored,
+                    invocation: location.invocation,
+                    point,
+                    event,
+                }]),
+            });
+        }
+    }
+    // No new equality edges are introduced here, so the dependency roots
+    // remain fixed throughout convergence. An unsupported producer remains
+    // pending and blocks any snapshot that could acquire its later value.
+    let roots = pending
+        .iter()
+        .map(|item| classes.root(item.destination.clone()))
+        .collect::<Vec<_>>();
+    let mut active = vec![true; pending.len()];
+    let mut stability = HashMap::default();
+    loop {
+        if request.cancellation.is_cancelled()
+            || request
+                .budget
+                .charge(crate::analyzer::semantic::SemanticWork {
+                    nested_entries: pending.len(),
+                    ..crate::analyzer::semantic::SemanticWork::default()
+                })
+                .is_err()
+        {
+            classes
+                .identity_reasons
+                .push(ConcurrencyOpenReason::BudgetExhausted);
+            return;
+        }
+        let mut changed = false;
+        for (index, item) in pending.iter().enumerate() {
+            if !active[index] {
+                continue;
+            }
+            let Some(sources) = &item.sources else {
+                continue;
+            };
+            if sources.is_empty() {
+                continue;
+            }
+            let mut facts = Vec::new();
+            for source in sources {
+                let root = classes.root(source.subject.clone());
+                if roots.iter().enumerate().any(|(other, destination)| {
+                    other != index && active[other] && *destination == root
+                }) {
+                    break;
+                }
+                let stable = *stability
+                    .entry((root, source.invocation, source.point, source.event))
+                    .or_insert_with(|| {
+                        reference_source_is_stable(classes, invocations, tasks, source, request)
+                    });
+                if !stable {
+                    break;
+                }
+                let ConcurrencyAnswer::Proven(Some(fact)) =
+                    classes.bound_canonical_identity(source.subject.clone())
+                else {
+                    break;
+                };
+                if !reference_allocations.contains(fact.canonical())
+                    || fact.storage_origin.as_ref() != Some(fact.canonical())
+                {
+                    break;
+                }
+                facts.push(fact);
+            }
+            if facts.len() != sources.len() || facts.iter().any(|fact| *fact != facts[0]) {
+                continue;
+            }
+            classes.bind_canonical_value(item.destination.clone(), facts.remove(0));
+            classes.formal_binding_reasons.remove(&item.destination);
+            active[index] = false;
+            changed = true;
+        }
+        if !changed {
+            break;
+        }
+    }
+}
+
+fn reference_result_sources(
+    context: &ContextKey,
+    ordinal: u32,
+) -> Option<Vec<ReferenceIdentityUse>> {
+    use crate::analyzer::semantic::{SemanticCapability, SemanticValueKind, ValueFlowKind};
+
+    let semantics = context.procedure.semantics();
+    if !reference_control_is_complete(&context.procedure)
+        || semantics
+            .gaps()
+            .iter()
+            .any(|gap| gap.capability == SemanticCapability::ReturnFlow)
+    {
+        return None;
+    }
+    let mut sources = Vec::new();
+    let mut terminals = HashSet::default();
+    for point in semantics.points() {
+        if !point
+            .events
+            .iter()
+            .any(|event| matches!(event.effect, SemanticEffect::ProcedureReturn { .. }))
+            || !point_reaches(&context.procedure, semantics.entry_point(), point.id)
+            || !point_reaches(&context.procedure, point.id, semantics.normal_exit_point())
+        {
+            continue;
+        }
+        // Named results are mutable storage observed after cleanup. Their
+        // pre-cleanup IndexedReturn operands are not the returned values.
+        if point.events.iter().any(|event| {
+            matches!(
+                event.effect,
+                SemanticEffect::Assignment { .. } | SemanticEffect::MemoryStore { .. }
+            ) || (matches!(event.effect, SemanticEffect::ProcedureReturn { .. })
+                && !reference_evidence_is_complete(semantics, event.evidence))
+        }) {
+            return None;
+        }
+        let mut matching = point.events.iter().enumerate().filter_map(|(position, event)| {
+            let SemanticEffect::ValueFlow { kind, source, target } = event.effect else {
+                return None;
+            };
+            if semantics.value(target).expect("owned return target").kind != SemanticValueKind::Return {
+                return None;
+            }
+            let matches_ordinal = match kind {
+                ValueFlowKind::Return => ordinal == 0 && point.events.iter().any(|event| {
+                    matches!(event.effect, SemanticEffect::ProcedureReturn { value: Some(value) } if value == target)
+                }),
+                ValueFlowKind::IndexedReturn { ordinal: index } => index == ordinal,
+                _ => false,
+            };
+            matches_ordinal.then_some((source, event.evidence, position))
+        });
+        let (source, evidence, event) = matching.next()?;
+        if matching.next().is_some() {
+            return None;
+        }
+        if !reference_evidence_is_complete(semantics, evidence) {
+            return None;
+        }
+        terminals.insert(point.id);
+        sources.push(ReferenceIdentityUse {
+            subject: LocalSynchronizationSubject::Value {
+                task: context.task,
+                invocation: context.invocation,
+                procedure: context.procedure.clone(),
+                value: source,
+            },
+            invocation: context.invocation,
+            point: point.id,
+            event,
+        });
+    }
+    all_paths_cross_points(
+        &context.procedure,
+        semantics.normal_exit_point(),
+        &terminals,
+    )
+    .then_some(sources)
+}
+
+fn reference_evidence_is_complete(
+    semantics: &crate::analyzer::semantic::ProcedureSemantics,
+    evidence: crate::analyzer::semantic::EvidenceId,
+) -> bool {
+    use crate::analyzer::semantic::{EvidenceCompleteness, ProofStatus};
+    let evidence = semantics
+        .evidence_row(evidence)
+        .expect("validated evidence exists");
+    evidence.proof == ProofStatus::Proven && evidence.completeness == EvidenceCompleteness::Complete
+}
+
+fn reference_control_is_complete(procedure: &ProcedureHandle) -> bool {
+    use crate::analyzer::semantic::{
+        SemanticCapability, SemanticGapDischarge, SemanticGapImpact, SemanticGapSubject,
+    };
+    let semantics = procedure.semantics();
+    !semantics.gaps().iter().any(|gap| {
+        matches!(
+            gap.capability,
+            SemanticCapability::NormalControlFlow
+                | SemanticCapability::NonLocalControl
+                | SemanticCapability::NormalCallContinuation
+                | SemanticCapability::CleanupControlFlow
+                | SemanticCapability::DeferredExecution
+                | SemanticCapability::AsyncSuspendResume
+                | SemanticCapability::GeneratorSuspension
+        ) || gap.discharge == SemanticGapDischarge::ExitOnlyProcedureCompletion
+            || (matches!(gap.capability,
+                SemanticCapability::ExceptionalControlFlow | SemanticCapability::ExceptionalCallContinuation)
+                && gap.discharge != SemanticGapDischarge::NonRejoiningExceptionalExit)
+            // A retained call can require workspace target refinement while
+            // its evaluation and continuation are already represented. The
+            // pending result equation separately requires that exact target;
+            // a dispatch-only gap does not invalidate the caller's CFG.
+            || (gap.capability == SemanticCapability::Calls
+                && (gap.impacts.contains(SemanticGapImpact::CallEvaluation)
+                    || !matches!(gap.subject, SemanticGapSubject::CallSite(_))))
+    }) && semantics
+        .control_edges()
+        .iter()
+        .all(|edge| reference_evidence_is_complete(semantics, edge.evidence))
+}
+
+/// A class used for a new result snapshot must describe an unchanged value,
+/// not merely the final contents of a mutable cell. This deliberately refuses
+/// mutable bindings until their individual reaching definitions are modeled.
+fn reference_source_is_stable(
+    classes: &mut SynchronizationSubjectClasses,
+    invocations: &Invocations,
+    tasks: &[Task],
+    source: &ReferenceIdentityUse,
+    request: &mut SemanticRequest<'_>,
+) -> bool {
+    use crate::analyzer::semantic::{SemanticCapability, SemanticGapImpact, SemanticValueKind};
+
+    let root = classes.root(source.subject.clone());
+    let mut definitions = Vec::new();
+    let mut reads = Vec::new();
+    let mut cell_stores = 0;
+    for entry in &invocations.entries {
+        let context = &entry.context;
+        let semantics = context.procedure.semantics();
+        let mut values = semantics
+            .values()
+            .iter()
+            .filter_map(|value| {
+                let subject = LocalSynchronizationSubject::Value {
+                    task: context.task,
+                    invocation: context.invocation,
+                    procedure: context.procedure.clone(),
+                    value: value.id,
+                };
+                (classes.root(subject) == root).then_some(value.id)
+            })
+            .collect::<HashSet<_>>();
+        let locations = semantics
+            .memory_locations()
+            .iter()
+            .filter_map(|location| {
+                let subject = LocalSynchronizationSubject::Location(LocalLocation {
+                    task: context.task,
+                    invocation: context.invocation,
+                    procedure: context.procedure.clone(),
+                    location: location.id,
+                });
+                (classes.root(subject) == root).then_some(location.id)
+            })
+            .collect::<HashSet<_>>();
+        if values.is_empty() && locations.is_empty() {
+            continue;
+        }
+        if request.cancellation.is_cancelled()
+            || request
+                .budget
+                .charge(crate::analyzer::semantic::SemanticWork {
+                    nested_entries: semantics.values().len()
+                        + semantics
+                            .points()
+                            .iter()
+                            .map(|point| point.events.len())
+                            .sum::<usize>(),
+                    ..crate::analyzer::semantic::SemanticWork::default()
+                })
+                .is_err()
+        {
+            classes
+                .identity_reasons
+                .push(ConcurrencyOpenReason::BudgetExhausted);
+            return false;
+        }
+        if !reference_control_is_complete(&context.procedure)
+            || semantics.gaps().iter().any(|gap| {
+                gap.capability == SemanticCapability::Captures
+                    || (gap.capability == SemanticCapability::Assignments
+                        && gap.impacts.contains(SemanticGapImpact::HeapWrite))
+            })
+        {
+            return false;
+        }
+        let bindings = values
+            .iter()
+            .copied()
+            .filter(|value| {
+                matches!(
+                    semantics.value(*value).expect("owned value").kind,
+                    SemanticValueKind::Local
+                        | SemanticValueKind::Parameter { .. }
+                        | SemanticValueKind::Receiver { .. }
+                )
+            })
+            // A load's ordinary class contains the cell and its result, but
+            // need not contain the declaration value naming that cell. Follow
+            // the structured cell binding before checking hidden capture writes.
+            .chain(locations.iter().filter_map(|location| {
+                match semantics
+                    .memory_location(*location)
+                    .expect("owned location")
+                    .kind
+                {
+                    MemoryLocationKind::LexicalCell { binding }
+                    | MemoryLocationKind::Capture {
+                        binding: Some(binding),
+                        ..
+                    } => Some(binding),
+                    _ => None,
+                }
+            }))
+            .collect::<HashSet<_>>();
+        values.extend(bindings.iter().copied());
+        if !crate::flow_state::address_alias_values(semantics, &bindings).is_empty() {
+            return false;
+        }
+        for location in &locations {
+            if !matches!(
+                semantics
+                    .memory_location(*location)
+                    .expect("owned location")
+                    .kind,
+                MemoryLocationKind::LexicalCell { .. } | MemoryLocationKind::Capture { .. }
+            ) {
+                return false;
+            }
+        }
+        for value in &bindings {
+            match reference_captures_are_read_only(&context.procedure, *value, request) {
+                Ok(true) => {}
+                Ok(false) => return false,
+                Err(reason) => {
+                    classes.identity_reasons.push(reason);
+                    return false;
+                }
+            }
+        }
+        let mut assignments = HashMap::<ValueId, usize>::default();
+        for point in semantics.points() {
+            for (position, event) in point.events.iter().enumerate() {
+                let relevant = match event.effect {
+                    SemanticEffect::Assignment { target, value } => {
+                        values.contains(&target) || values.contains(&value)
+                    }
+                    SemanticEffect::ValueFlow { source, .. } => values.contains(&source),
+                    SemanticEffect::MemoryLoad { location, .. }
+                    | SemanticEffect::MemoryStore { location, .. } => locations.contains(&location),
+                    _ => false,
+                };
+                if relevant && !reference_evidence_is_complete(semantics, event.evidence) {
+                    return false;
+                }
+                // A creation fact identifies backing storage, but carries no
+                // slice-view origin. Copying it across a result would make
+                // different views' element zero appear to be the same cell.
+                // Keep the route open until result binding retains offsets.
+                if relevant
+                    && matches!(event.effect,
+                    SemanticEffect::ValueFlow {
+                        kind: crate::analyzer::semantic::ValueFlowKind::BackingStore { offset }, ..
+                    } if !matches!(offset, crate::analyzer::semantic::BackingStoreOffset::Zero | crate::analyzer::semantic::BackingStoreOffset::Constant(0)))
+                {
+                    return false;
+                }
+                match event.effect {
+                    SemanticEffect::Assignment { target, value } => {
+                        if values.contains(&target) {
+                            *assignments.entry(target).or_default() += 1;
+                            if matches!(
+                                semantics.value(target).expect("owned target").kind,
+                                SemanticValueKind::Parameter { .. }
+                                    | SemanticValueKind::Receiver { .. }
+                            ) {
+                                return false;
+                            }
+                            definitions.push((context.invocation, point.id, position));
+                        }
+                        if values.contains(&value) {
+                            reads.push((context.invocation, point.id, position));
+                        }
+                    }
+                    SemanticEffect::MemoryStore { location, .. }
+                        if locations.contains(&location) =>
+                    {
+                        cell_stores += 1;
+                        definitions.push((context.invocation, point.id, position));
+                    }
+                    SemanticEffect::MemoryLoad { location, .. }
+                        if locations.contains(&location) =>
+                    {
+                        reads.push((context.invocation, point.id, position));
+                    }
+                    SemanticEffect::ValueFlow { source, .. } if values.contains(&source) => {
+                        reads.push((context.invocation, point.id, position));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if assignments.values().any(|count| *count > 1) || cell_stores > 1 {
+            return false;
+        }
+    }
+    reads.push((source.invocation, source.point, source.event));
+    definitions
+        .into_iter()
+        .all(|(definition, point, position)| {
+            let task = invocations.entries[definition.0 as usize].context.task;
+            reads.iter().all(|read| {
+                let Some((observer, observation)) =
+                    observation_in_task(tasks, invocations, task, (read.0, read.1))
+                else {
+                    return false;
+                };
+                (definition == read.0 && point == read.1 && position <= read.2)
+                    || invocations.required_points_before(
+                        definition,
+                        HashSet::from_iter([point]),
+                        observer,
+                        observation,
+                    )
+            })
+        })
+}
+
+/// Inspect lexical capture bodies even when they have not been expanded as
+/// calls. An escaped closure can replace its owner's cell without a retained
+/// invocation in the current task slice.
+fn reference_captures_are_read_only(
+    owner: &ProcedureHandle,
+    owner_binding: ValueId,
+    request: &mut SemanticRequest<'_>,
+) -> Result<bool, ConcurrencyOpenReason> {
+    use crate::analyzer::semantic::{SemanticCapability, SemanticGapImpact};
+    let mut pending = vec![(owner.clone(), owner_binding)];
+    let mut visited = HashSet::default();
+    while let Some((procedure, binding)) = pending.pop() {
+        if !visited.insert((procedure.clone(), binding)) {
+            continue;
+        }
+        let semantics = procedure.semantics();
+        if request.cancellation.is_cancelled()
+            || request
+                .budget
+                .charge(crate::analyzer::semantic::SemanticWork {
+                    nested_entries: semantics.values().len()
+                        + semantics
+                            .points()
+                            .iter()
+                            .map(|point| point.events.len())
+                            .sum::<usize>(),
+                    ..crate::analyzer::semantic::SemanticWork::default()
+                })
+                .is_err()
+        {
+            return Err(ConcurrencyOpenReason::BudgetExhausted);
+        }
+        let location = binding_location(semantics, binding);
+        if (procedure != *owner || binding != owner_binding)
+            && (!reference_control_is_complete(&procedure)
+                || semantics.gaps().iter().any(|gap| {
+                    gap.capability == SemanticCapability::Captures
+                        || (gap.capability == SemanticCapability::Assignments
+                            && gap.impacts.contains(SemanticGapImpact::HeapWrite))
+                })
+                || !crate::flow_state::address_alias_values(
+                    semantics,
+                    &HashSet::from_iter([binding]),
+                )
+                .is_empty()
+                || semantics
+                    .points()
+                    .iter()
+                    .flat_map(|point| &point.events)
+                    .any(|event| match event.effect {
+                        SemanticEffect::Assignment { target, .. } => target == binding,
+                        SemanticEffect::MemoryStore {
+                            location: target, ..
+                        } => Some(target) == location,
+                        _ => false,
+                    }))
+        {
+            return Ok(false);
+        }
+        for capture in semantics.captures() {
+            if !match capture.captured {
+                CaptureSource::Value(value) => value == binding,
+                CaptureSource::Location(source) => Some(source) == location,
+            } {
+                continue;
+            }
+            let Some(target) = procedure.artifact().procedure_handle(capture.target) else {
+                return Ok(false);
+            };
+            let Some(MemoryLocationKind::Capture {
+                binding: Some(binding),
+                ..
+            }) = target
+                .semantics()
+                .memory_location(capture.destination)
+                .map(|location| &location.kind)
+            else {
+                return Ok(false);
+            };
+            pending.push((target.clone(), *binding));
+        }
+    }
+    Ok(true)
+}
+
 fn associate_wait_group_tasks(
     tasks: &mut [Task],
     modeled: &HashMap<ContextKey, Vec<(ProgramPointId, ResolvedConcurrencyEffect)>>,
@@ -2351,7 +3853,9 @@ fn associate_wait_group_tasks(
         task: TaskId,
         parent: TaskId,
         spawn_procedure: ProcedureHandle,
+        spawn_invocation: InvocationId,
         spawn_point: ProgramPointId,
+        completion: (InvocationId, ProgramPointId),
         group: ResolvedConcurrencySubject,
     }
 
@@ -2371,6 +3875,7 @@ fn associate_wait_group_tasks(
         };
         let context = ContextKey {
             task: TaskId(u32::try_from(index).expect("task indices fit their validated IDs")),
+            invocation: task.entry_invocation,
             procedure: entry.clone(),
         };
         let Some(done) = completion_effects.get(&context) else {
@@ -2379,8 +3884,8 @@ fn associate_wait_group_tasks(
         if done.len() != 1 {
             continue;
         }
-        let group = done
-            .values()
+        let (completion, group) = done
+            .iter()
             .next()
             .expect("one completion effect was retained");
         let spawn_point = spawn_procedure
@@ -2392,7 +3897,11 @@ fn associate_wait_group_tasks(
             task: context.task,
             parent,
             spawn_procedure: spawn_procedure.clone(),
+            spawn_invocation: task
+                .spawn_invocation
+                .expect("spawned task retains its caller invocation"),
             spawn_point,
+            completion: *completion,
             group: (*group).clone(),
         });
     }
@@ -2411,11 +3920,15 @@ fn associate_wait_group_tasks(
     for (canonical, completions) in groups {
         let parent = completions[0].parent;
         let spawn_procedure = completions[0].spawn_procedure.clone();
+        let spawn_invocation = completions[0].spawn_invocation;
         let structurally_one_phase = completions.iter().all(|completion| {
-            completion.parent == parent && completion.spawn_procedure == spawn_procedure
+            completion.parent == parent
+                && completion.spawn_procedure == spawn_procedure
+                && completion.spawn_invocation == spawn_invocation
         });
         let context = ContextKey {
             task: parent,
+            invocation: spawn_invocation,
             procedure: spawn_procedure.clone(),
         };
         let effects = modeled.get(&context).map(Vec::as_slice).unwrap_or_default();
@@ -2456,8 +3969,11 @@ fn associate_wait_group_tasks(
                     && point_dominates(&spawn_procedure, completion.spawn_point, waits[0])
             });
         for completion in completions {
+            let parent_repeats = tasks[completion.parent.0 as usize].repetition.is_some();
             let task = &mut tasks[completion.task.0 as usize];
-            task.repetitions_serialized = task.repeated
+            task.repetitions_serialized = task.repetition.is_some()
+                && !parent_repeats
+                && point_is_cyclic(spawn_procedure.semantics(), completion.spawn_point)
                 && exact_phase
                 && all_recurrences_cross_points(
                     &spawn_procedure,
@@ -2473,6 +3989,7 @@ fn associate_wait_group_tasks(
                 group.reasons.dedup();
             }
             task.group = Some(group);
+            task.completion = Some(completion.completion);
         }
     }
 
@@ -2496,6 +4013,9 @@ fn associate_wait_group_tasks(
             .point;
         let context = ContextKey {
             task: parent,
+            invocation: task
+                .spawn_invocation
+                .expect("spawned task retains its caller invocation"),
             procedure: spawn_procedure.clone(),
         };
         let Some(effects) = modeled.get(&context) else {
@@ -2546,7 +4066,7 @@ fn associate_wait_group_tasks(
 fn must_completion_effects(
     modeled: &HashMap<ContextKey, Vec<(ProgramPointId, ResolvedConcurrencyEffect)>>,
     synchronous_calls: &[SynchronousCall],
-) -> HashMap<ContextKey, HashMap<(ProcedureHandle, ProgramPointId), ResolvedConcurrencySubject>> {
+) -> HashMap<ContextKey, HashMap<(InvocationId, ProgramPointId), ResolvedConcurrencySubject>> {
     let mut summaries = HashMap::default();
     for (context, effects) in modeled {
         let summary = summaries
@@ -2563,7 +4083,7 @@ fn must_completion_effects(
                     context.procedure.semantics().normal_exit_point(),
                 )
             {
-                summary.insert((context.procedure.clone(), *point), group.clone());
+                summary.insert((context.invocation, *point), group.clone());
             }
         }
     }
@@ -2602,6 +4122,7 @@ fn resolve_modeled_subjects(
             for subject in modeled_effect_subjects(effect) {
                 classes.mark_modeled_value(LocalSynchronizationSubject::Value {
                     task: context.task,
+                    invocation: context.invocation,
                     procedure: context.procedure.clone(),
                     value: subject.value,
                 });
@@ -2627,6 +4148,9 @@ fn resolve_modeled_subjects(
             classes,
             &ContextKey {
                 task: parent,
+                invocation: task
+                    .spawn_invocation
+                    .expect("spawned task retains its caller invocation"),
                 procedure,
             },
             group,
@@ -2667,21 +4191,14 @@ fn resolve_modeled_subject(
     context: &ContextKey,
     subject: &mut ResolvedConcurrencySubject,
 ) {
-    let local = LocalSynchronizationSubject::Value {
-        task: context.task,
-        procedure: context.procedure.clone(),
-        value: subject.value,
-    };
-    let canonical = match subject.identity {
-        ConcurrencySubjectIdentity::Value => classes.canonical_capture_identity(local.clone()),
-        ConcurrencySubjectIdentity::Backing => classes.canonical_backing_identity(local.clone()),
-    };
-    if let Some(canonical) = canonical {
-        subject.canonical = Some(canonical);
-        subject.reasons.clear();
+    let canonical = classes.canonical_modeled_identity(context, subject);
+    if let Some(fact) = canonical {
+        subject.reasons = fact.reasons();
+        subject.canonical = Some(fact.canonical().clone());
     } else if let Some(canonical) =
         classes.stable_modeled_identity(LocalSynchronizationSubject::Value {
             task: context.task,
+            invocation: context.invocation,
             procedure: context.procedure.clone(),
             value: subject.value,
         })
@@ -2694,6 +4211,7 @@ fn resolve_modeled_subject(
 }
 
 fn append_atomic_accesses(
+    classes: &mut SynchronizationSubjectClasses,
     modeled: &HashMap<ContextKey, Vec<(ProgramPointId, ResolvedConcurrencyEffect)>>,
     accesses: &mut Vec<Access>,
 ) {
@@ -2709,6 +4227,21 @@ fn append_atomic_accesses(
             let Some(canonical) = location.canonical.clone() else {
                 continue;
             };
+            let fact = classes.canonical_modeled_identity(context, location);
+            let storage_origin = fact.as_ref().and_then(|fact| fact.storage_origin.clone());
+            let resolved_location = if let Some(fact) = fact {
+                fact.resolved
+            } else if location.reasons.is_empty() {
+                ResolvedConcurrencyLocation::exact(canonical.clone())
+            } else {
+                ResolvedConcurrencyLocation::new(
+                    vec![canonical.clone()],
+                    false,
+                    ConcurrencyObjectCardinality::Unknown,
+                    ConcurrencyEscape::Unknown,
+                    ConcurrencyOwnership::Unknown,
+                )
+            };
             let call = context
                 .procedure
                 .semantics()
@@ -2719,6 +4252,7 @@ fn append_atomic_accesses(
             accesses.push(Access {
                 site: ConcurrentAccessSite {
                     task: context.task,
+                    invocation: context.invocation,
                     procedure: context.procedure.clone(),
                     point: *point,
                     source: call.source,
@@ -2733,16 +4267,18 @@ fn append_atomic_accesses(
                 },
                 local_location: Some(LocalLocation {
                     task: context.task,
+                    invocation: context.invocation,
                     procedure: context.procedure.clone(),
                     location: MemoryLocationId::new(u32::MAX),
                 }),
                 canonical: Some(canonical.clone()),
-                resolved_location: ResolvedConcurrencyLocation::exact(canonical),
+                resolved_location,
                 index_alias_domain: None,
                 field_alias_domain: None,
                 local_identity: false,
                 reasons: location.reasons.clone(),
                 atomic: true,
+                storage_origin,
             });
         }
     }
@@ -2751,9 +4287,10 @@ fn append_atomic_accesses(
 fn resolve_targets(
     provider: &impl ConcurrencyProvider,
     task: TaskId,
+    invocation: InvocationId,
     procedure: &ProcedureHandle,
     call: CallSiteId,
-    callable_values: &HashMap<(TaskId, ProcedureHandle, ValueId), ProcedureHandle>,
+    callable_values: &HashMap<(TaskId, InvocationId, ProcedureHandle, ValueId), ProcedureHandle>,
     request: &mut SemanticRequest<'_>,
 ) -> Result<ConcurrencyAnswer<Vec<ProcedureHandle>>, SemanticProviderError> {
     if let Some(targets) = provider.complete_call_targets(procedure, call) {
@@ -2774,7 +4311,7 @@ fn resolve_targets(
     // A callee the caller supplied resolves through the binding that supplied
     // it. Lowering cannot see that: the value is bound at the call site, one
     // procedure away from the call it decides.
-    if let Some(target) = callable_values.get(&(task, procedure.clone(), row.callee)) {
+    if let Some(target) = callable_values.get(&(task, invocation, procedure.clone(), row.callee)) {
         return Ok(ConcurrencyAnswer::Proven(vec![target.clone()]));
     }
     let handle = procedure
@@ -2814,6 +4351,7 @@ fn canonicalize_access(
             let _ = member;
             let answer =
                 provider.canonical_location(&context.procedure, point, location, request)?;
+            let proven = matches!(&answer, ConcurrencyAnswer::Proven(_));
             let (canonical, reasons) = match answer {
                 ConcurrencyAnswer::Proven(canonical) => (canonical, Vec::new()),
                 ConcurrencyAnswer::Open { partial, reasons } => (partial, reasons),
@@ -2821,7 +4359,20 @@ fn canonicalize_access(
             Ok(match canonical {
                 Some(canonical) => CanonicalizedAccess {
                     canonical: Some(canonical.clone()),
-                    resolved_location: ResolvedConcurrencyLocation::exact(canonical),
+                    resolved_location: if proven {
+                        ResolvedConcurrencyLocation::independent(
+                            canonical.clone(),
+                            ConcurrencyStorageFamily::Static(canonical),
+                        )
+                    } else {
+                        ResolvedConcurrencyLocation::new(
+                            vec![canonical],
+                            false,
+                            ConcurrencyObjectCardinality::Unknown,
+                            ConcurrencyEscape::Unknown,
+                            ConcurrencyOwnership::Unknown,
+                        )
+                    },
                     reasons,
                     index_alias_domain: None,
                     field_alias_domain: None,
@@ -2862,7 +4413,8 @@ fn canonicalize_access(
             {
                 let exact = exact_field_location(base, member);
                 canonical = Some(exact.clone());
-                resolved_location = ResolvedConcurrencyLocation::exact(exact);
+                resolved_location = base_location;
+                resolved_location.candidates = vec![exact];
                 reasons.clear();
             } else {
                 reasons.extend(base_reasons);
@@ -2906,7 +4458,8 @@ fn canonicalize_access(
             });
             if base_is_exact && let Some(exact) = domain.as_ref().and_then(exact_index_location) {
                 canonical = Some(exact.clone());
-                resolved_location = ResolvedConcurrencyLocation::exact(exact);
+                resolved_location = base_location;
+                resolved_location.candidates = vec![exact];
                 reasons.clear();
             } else {
                 reasons.extend(base_reasons);
@@ -2983,6 +4536,9 @@ fn name_member_declarations(
     for member in members {
         let key = member_locator_key(&member);
         if let Some(declaration) = provider.resolved_member_identity(&member) {
+            if declaration.is_callable {
+                classes.callable_members.insert(key.clone());
+            }
             let candidate = CanonicalMember {
                 rank: (!declaration.is_declaration_site, key.clone()),
                 locator: member.clone(),
@@ -3001,8 +4557,8 @@ fn name_member_declarations(
                 .member_declarations
                 .insert(key.clone(), declaration.name);
         }
-        if provider.member_is_pointer(&member) {
-            classes.pointer_members.insert(key);
+        if let Some(reference) = provider.member_binds_by_reference(&member) {
+            classes.reference_members.insert(key, reference);
         }
     }
 }
@@ -3032,7 +4588,9 @@ fn canonicalize_bound_accesses(
             MemoryLocationKind::Field { base, member } => {
                 // The selector buckets accesses before the overlap gate sees
                 // them, so it has to agree about one field too.
-                let selector = field_step_selector(classes.canonical_member(member));
+                let selector = SummaryConcurrencyAccessSelector::Field(
+                    SummaryLocationKey::from_locator(classes.canonical_member(member)),
+                );
                 (*base, Some(selector), None)
             }
             MemoryLocationKind::Index {
@@ -3042,10 +4600,12 @@ fn canonicalize_bound_accesses(
                 ..
             } => {
                 let selector = match (identity, constant_index) {
-                    (IndexedLocationIdentity::Aggregate, _) => Some("index:aggregate".to_owned()),
-                    (IndexedLocationIdentity::Element, Some(index)) => {
-                        Some(format!("index:{index}"))
+                    (IndexedLocationIdentity::Aggregate, _) => {
+                        Some(SummaryConcurrencyAccessSelector::Aggregate)
                     }
+                    (IndexedLocationIdentity::Element, Some(index)) => i128::try_from(*index)
+                        .ok()
+                        .map(SummaryConcurrencyAccessSelector::ConstantIndex),
                     (IndexedLocationIdentity::Element, None) => None,
                 };
                 (*base, selector, Some((*identity, *constant_index)))
@@ -3054,10 +4614,16 @@ fn canonicalize_bound_accesses(
         };
         let local_base = LocalSynchronizationSubject::Value {
             task: access.site.task,
+            invocation: access.site.invocation,
             procedure: access.site.procedure.clone(),
             value: base,
         };
         let contains_formal = classes.contains_formal_binding(local_base.clone());
+        let backing_root = classes.backing_root(local_base.clone());
+        let multiple_allocations = classes.multiple_allocations.clone();
+        let multiple_instances = multiple_allocations
+            .into_iter()
+            .any(|allocation| classes.backing_root(allocation) == backing_root);
         let base = match &row.kind {
             MemoryLocationKind::Index { .. } => classes
                 .canonical_backing_identity(local_base.clone())
@@ -3092,29 +4658,44 @@ fn canonicalize_bound_accesses(
         };
         if let MemoryLocationKind::Field { member, .. } = &row.kind {
             access.field_alias_domain = Some(FieldAliasDomain {
-                base: Some(base.clone()),
+                base: Some(base.canonical().clone()),
                 declaration: declaration.clone(),
                 member: classes.canonical_member(member).clone(),
             });
         }
         if let Some((identity, constant_index)) = indexed {
             access.index_alias_domain = Some(IndexAliasDomain {
-                base: base.clone(),
+                base: base.canonical().clone(),
                 identity,
                 constant_index,
             });
         }
         if let Some(selector) = selector {
-            let canonical = CanonicalConcurrencyLocation::new(
-                format!("{}/{selector}", base.identity),
-                row.kind.label(),
-            );
-            access.canonical = Some(canonical.clone());
-            access.resolved_location = ResolvedConcurrencyLocation::exact(canonical);
-            access.reasons.clear();
+            let mut fact = base;
+            fact.project(selector, row.kind.label());
+            access.canonical = Some(fact.canonical().clone());
+            access.reasons = fact.reasons();
+            access.storage_origin = fact.storage_origin;
+            access.resolved_location = fact.resolved;
+            if multiple_instances {
+                // A capture can name the stored pointer while the allocation
+                // producer explicitly reports multiple runtime objects. Keep
+                // that cardinality instead of upgrading the capture name to
+                // a singleton object shared by every iteration.
+                access.resolved_location.cardinality = ConcurrencyObjectCardinality::Multiple;
+                access.reasons.push(ConcurrencyOpenReason::UnknownLocation);
+            }
         } else {
             access.canonical = None;
-            access.resolved_location = ResolvedConcurrencyLocation::unknown();
+            access.storage_origin = base.storage_origin;
+            access.resolved_location = base.resolved;
+            access.resolved_location.candidates.clear();
+            access
+                .resolved_location
+                .storage_path
+                .push(SummaryConcurrencyAccessSelector::AnyIndex);
+            access.resolved_location.exhaustive = false;
+            access.resolved_location.cardinality = ConcurrencyObjectCardinality::Multiple;
             access.reasons = vec![ConcurrencyOpenReason::UnknownLocation];
         }
     }
@@ -3131,7 +4712,8 @@ fn append_summary_accesses(
             unreachable!("pending summary accesses contain only access effects");
         };
         let mut binding = SummaryConcurrencyBoundaryBinding::new();
-        bind_summary_access_root(classes, &pending.context, location, &mut binding);
+        let storage_origin =
+            bind_summary_access_root(classes, &pending.context, location, &mut binding);
         let (resolved_location, reasons) =
             instantiate_summary_access_path(location, &binding).into_parts();
         let witness = pending
@@ -3175,6 +4757,7 @@ fn append_summary_accesses(
             .expect("a complete summary witness names one live semantic event");
         let local_location = LocalLocation {
             task: pending.context.task,
+            invocation: pending.context.invocation,
             procedure: pending.context.procedure.clone(),
             location: memory_location,
         };
@@ -3236,6 +4819,7 @@ fn append_summary_accesses(
         accesses.push(Access {
             site: ConcurrentAccessSite {
                 task: pending.context.task,
+                invocation: pending.context.invocation,
                 procedure: pending.context.procedure,
                 point,
                 source,
@@ -3259,6 +4843,7 @@ fn append_summary_accesses(
             local_identity,
             reasons,
             atomic: false,
+            storage_origin,
         });
     }
 }
@@ -3268,7 +4853,7 @@ fn bind_summary_access_root(
     context: &ContextKey,
     path: &SummaryConcurrencyAccessPath,
     binding: &mut SummaryConcurrencyBoundaryBinding,
-) {
+) -> Option<CanonicalConcurrencyLocation> {
     let port = path.root();
     let subject = match port {
         SummaryPort::Receiver => context
@@ -3284,6 +4869,7 @@ fn bind_summary_access_root(
             })
             .map(|value| LocalSynchronizationSubject::Value {
                 task: context.task,
+                invocation: context.invocation,
                 procedure: context.procedure.clone(),
                 value: value.id,
             }),
@@ -3303,6 +4889,7 @@ fn bind_summary_access_root(
             })
             .map(|value| LocalSynchronizationSubject::Value {
                 task: context.task,
+                invocation: context.invocation,
                 procedure: context.procedure.clone(),
                 value: value.id,
             }),
@@ -3324,6 +4911,7 @@ fn bind_summary_access_root(
             .map(|location| {
                 LocalSynchronizationSubject::Location(LocalLocation {
                     task: context.task,
+                    invocation: context.invocation,
                     procedure: context.procedure.clone(),
                     location: location.id,
                 })
@@ -3335,7 +4923,7 @@ fn bind_summary_access_root(
                     CanonicalConcurrencyLocation::new(format!("heap:{key}"), "static"),
                 )),
             );
-            return;
+            return None;
         }
         SummaryPort::NormalReturn
         | SummaryPort::IndexedNormalReturn(_)
@@ -3354,7 +4942,7 @@ fn bind_summary_access_root(
         .as_ref()
         .map(|subject| classes.formal_binding_reasons(subject.clone()))
         .unwrap_or_default();
-    let location = subject.and_then(|subject| {
+    let mut location = subject.and_then(|subject| {
         if uses_backing_identity {
             classes
                 .canonical_backing_identity(subject.clone())
@@ -3363,8 +4951,33 @@ fn bind_summary_access_root(
             classes.canonical_capture_identity(subject)
         }
     });
+    if let Some(fact) = location.as_mut()
+        && !path
+            .selectors()
+            .iter()
+            .rev()
+            .skip(1)
+            .all(|selector| match selector {
+                // The last selector addresses storage itself. Earlier selectors
+                // load intermediate values, which need an inline-storage proof.
+                SummaryConcurrencyAccessSelector::Field(field) => {
+                    classes.backing_field_origins.iter().any(|origin| {
+                        SummaryLocationKey::from_locator(classes.canonical_member(&origin.member))
+                            == *field
+                            && classes.member_reference_binding(&origin.member) == Some(false)
+                    })
+                }
+                _ => false,
+            })
+    {
+        classes.leave_inline_storage(fact);
+    }
+    let storage_origin = location
+        .as_ref()
+        .and_then(|fact| fact.storage_origin.clone());
     let location = if let Some(location) = location {
-        let partial = ResolvedConcurrencyLocation::exact(location);
+        reasons.extend(location.reasons());
+        let partial = location.resolved;
         if reasons.is_empty() {
             ConcurrencyAnswer::Proven(partial)
         } else {
@@ -3380,6 +4993,7 @@ fn bind_summary_access_root(
         }
     };
     binding.bind_location(port.clone(), location);
+    storage_origin
 }
 
 fn union_capture_locations(
@@ -3387,6 +5001,7 @@ fn union_capture_locations(
     synchronization_subjects: &mut SynchronizationSubjectClasses,
     parent: &ContextKey,
     child_task: TaskId,
+    child_invocation: InvocationId,
     child: &ProcedureHandle,
     _callable: ValueId,
 ) {
@@ -3406,11 +5021,13 @@ fn union_capture_locations(
             CaptureSource::Location(source) => {
                 let parent_location = LocalLocation {
                     task: parent.task,
+                    invocation: parent.invocation,
                     procedure: parent.procedure.clone(),
                     location: source,
                 };
                 let child_location = LocalLocation {
                     task: child_task,
+                    invocation: child_invocation,
                     procedure: child.clone(),
                     location: capture.destination,
                 };
@@ -3424,6 +5041,7 @@ fn union_capture_locations(
                     parent_subject.clone(),
                     LocalSynchronizationSubject::Location(LocalLocation {
                         task: child_task,
+                        invocation: child_invocation,
                         procedure: child.clone(),
                         location: capture.destination,
                     }),
@@ -3431,8 +5049,22 @@ fn union_capture_locations(
                 synchronization_subjects.mark_captured_location(parent_subject);
             }
             CaptureSource::Value(source) => {
+                if matches!(
+                    capture.mode,
+                    crate::analyzer::semantic::CaptureMode::Value
+                        | crate::analyzer::semantic::CaptureMode::Move
+                        | crate::analyzer::semantic::CaptureMode::Receiver
+                ) {
+                    classes.value_captures.insert(LocalLocation {
+                        task: child_task,
+                        invocation: child_invocation,
+                        procedure: child.clone(),
+                        location: capture.destination,
+                    });
+                }
                 let source = LocalSynchronizationSubject::Value {
                     task: parent.task,
+                    invocation: parent.invocation,
                     procedure: parent.procedure.clone(),
                     value: source,
                 };
@@ -3440,6 +5072,7 @@ fn union_capture_locations(
                     source.clone(),
                     LocalSynchronizationSubject::Location(LocalLocation {
                         task: child_task,
+                        invocation: child_invocation,
                         procedure: child.clone(),
                         location: capture.destination,
                     }),
@@ -3448,6 +5081,7 @@ fn union_capture_locations(
                     source.clone(),
                     LocalSynchronizationSubject::Location(LocalLocation {
                         task: child_task,
+                        invocation: child_invocation,
                         procedure: child.clone(),
                         location: capture.destination,
                     }),
@@ -3461,10 +5095,14 @@ fn union_capture_locations(
 #[allow(clippy::too_many_arguments)]
 fn bind_call_inputs(
     classes: &mut SynchronizationSubjectClasses,
-    callable_values: &mut HashMap<(TaskId, ProcedureHandle, ValueId), ProcedureHandle>,
+    callable_values: &mut HashMap<
+        (TaskId, InvocationId, ProcedureHandle, ValueId),
+        ProcedureHandle,
+    >,
     caller: &ContextKey,
     call: &crate::analyzer::semantic::SemanticCallSite,
     target_task: TaskId,
+    target_invocation: InvocationId,
     target: &ProcedureHandle,
     task_transfer: bool,
     provider: &impl ConcurrencyProvider,
@@ -3496,6 +5134,7 @@ fn bind_call_inputs(
         };
         let actual = LocalSynchronizationSubject::Value {
             task: caller.task,
+            invocation: caller.invocation,
             procedure: caller.procedure.clone(),
             value: actual_value,
         };
@@ -3504,16 +5143,43 @@ fn bind_call_inputs(
         // resolve the body it reaches. This is the callable counterpart of the
         // object identity the rest of this loop carries.
         if let Some(callable) = callable_values
-            .get(&(caller.task, caller.procedure.clone(), actual_value))
+            .get(&(
+                caller.task,
+                caller.invocation,
+                caller.procedure.clone(),
+                actual_value,
+            ))
             .cloned()
         {
-            callable_values.insert((target_task, target.clone(), formal_value), callable);
+            callable_values.insert(
+                (target_task, target_invocation, target.clone(), formal_value),
+                callable,
+            );
         }
         let formal = LocalSynchronizationSubject::Value {
             task: target_task,
+            invocation: target_invocation,
             procedure: target.clone(),
             value: formal_value,
         };
+        let formal_cell = binding_location(target.semantics(), formal_value);
+        let reassigned = target.semantics().points().iter().any(|point| {
+            point.events.iter().any(|event| match event.effect {
+                SemanticEffect::Assignment { target, .. } => target == formal_value,
+                SemanticEffect::MemoryStore { location, .. } => Some(location) == formal_cell,
+                _ => false,
+            })
+        });
+        if reassigned {
+            // Entry identity cannot describe every use of a mutable formal.
+            // In particular, an unsupported replacement result contributes no
+            // competing identity to invalidate an eager or deferred binding.
+            // Keep the missing reaching-definition evidence explicit before
+            // either ordinary or backing-store equivalence can cross the call.
+            classes
+                .note_formal_binding_reasons(formal, vec![ConcurrencyOpenReason::UnknownLocation]);
+            continue;
+        }
         classes.bind_backing_formal(formal.clone(), actual.clone());
         // A pointer receiver copies the pointer, so the callee's field
         // accesses reach the caller's object. Name that object exactly as the
@@ -3543,19 +5209,16 @@ fn bind_call_inputs(
                     );
                     continue;
                 }
-                Some(true) => {
-                    if let Some(canonical) = classes.canonical_capture_identity(actual.clone()) {
-                        classes.bind_canonical_value(actual.clone(), canonical);
-                        if task_transfer {
-                            classes.mark_captured_value(actual.clone());
-                        }
-                        classes.bind_formal(formal, actual);
-                        continue;
+                Some(true) if classes.canonical_capture_identity(actual.clone()).is_some() => {
+                    if task_transfer {
+                        classes.mark_captured_value(actual.clone());
                     }
+                    classes.bind_formal(formal, actual);
+                    continue;
                 }
-                // No declared type was recorded, so the previous behavior
-                // stands: only a proven runtime identity crosses.
-                None => {}
+                // Missing type metadata or capture identity still requires a
+                // proven runtime identity before crossing the call boundary.
+                Some(true) | None => {}
             }
         }
         // A receiver that does bind by reference must name the caller's
@@ -3564,34 +5227,39 @@ fn bind_call_inputs(
         // prefers a proven runtime identity and otherwise issues a capture
         // identity, and it issues one only for a cell stored once, so the
         // name cannot outlive the binding it stands for.
-        if dispatch_receiver
-            && let Some(canonical) = classes.canonical_capture_identity(actual.clone())
-        {
-            classes.bind_canonical_value(actual.clone(), canonical);
+        if dispatch_receiver && classes.canonical_capture_identity(actual.clone()).is_some() {
             if task_transfer {
                 classes.mark_captured_value(actual.clone());
             }
             classes.bind_formal(formal, actual);
             continue;
         }
-        let mut binding_reasons = Vec::new();
-        let canonicals = if let Some(canonical) = classes.bound_canonical_identity(actual.clone()) {
+        let (bound, mut binding_reasons) = classes
+            .bound_canonical_identity(actual.clone())
+            .into_parts();
+        let canonicals = if let Some(canonical) = bound {
             vec![canonical]
         } else {
             let mut canonicals = Vec::new();
-            for (task, procedure, value) in classes.equivalent_values(actual.clone()) {
-                if task != caller.task || procedure != caller.procedure {
+            for (task, invocation, procedure, value) in classes.equivalent_values(actual.clone()) {
+                if task != caller.task
+                    || invocation != caller.invocation
+                    || procedure != caller.procedure
+                {
                     continue;
                 }
                 let (resolved, reasons) = provider
                     .resolved_value(&procedure, call.point, value, request)?
                     .into_parts();
                 binding_reasons.extend(reasons);
-                if binding_reasons.is_empty()
-                    && let Some(canonical) = resolved.exact_candidate().cloned()
-                    && !canonicals.contains(&canonical)
-                {
-                    canonicals.push(canonical);
+                if binding_reasons.is_empty() && resolved.exact_candidate().is_some() {
+                    let fact = ConcurrencyIdentityFact {
+                        resolved,
+                        storage_origin: None,
+                    };
+                    if !canonicals.contains(&fact) {
+                        canonicals.push(fact);
+                    }
                 }
             }
             canonicals
@@ -3631,12 +5299,13 @@ fn resolve_intrinsic_synchronizations(
     for event in pending {
         let local = LocalSynchronizationSubject::Value {
             task: event.task,
+            invocation: event.invocation,
             procedure: event.procedure.clone(),
             value: event.subject,
         };
         let (subject, reasons) =
             if let Some(subject) = classes.canonical_capture_identity(local.clone()) {
-                (Some(subject), Vec::new())
+                (Some(subject.canonical().clone()), subject.reasons())
             } else {
                 provider
                     .canonical_value(&event.procedure, event.point, event.subject, request)?
@@ -3652,7 +5321,7 @@ fn resolve_intrinsic_synchronizations(
             && classes
                 .equivalent_values(local)
                 .into_iter()
-                .any(|(task, procedure, value)| {
+                .any(|(task, _, procedure, value)| {
                     task == TaskId(0)
                         && procedure.semantics().value(value).is_some_and(|value| {
                             matches!(
@@ -3669,6 +5338,7 @@ fn resolve_intrinsic_synchronizations(
                 });
         resolved.push(IntrinsicSynchronization {
             task: event.task,
+            invocation: event.invocation,
             procedure: event.procedure,
             point: event.point,
             operation: event.operation,
@@ -3693,7 +5363,7 @@ fn point_is_cyclic(
                 semantics, current,
             )
         {
-            if successor == point && current != point {
+            if successor == point {
                 return true;
             }
             if visited.insert(successor) {
@@ -3743,14 +5413,23 @@ fn all_recurrences_cross_points(
     true
 }
 
+#[derive(Debug, Clone, Copy)]
+struct AllocationOrigin {
+    invocation: InvocationId,
+    point: ProgramPointId,
+}
+
 struct AccessComparisonEvidence<'a> {
+    invocations: &'a Invocations,
     modeled: &'a HashMap<ContextKey, Vec<(ProgramPointId, ResolvedConcurrencyEffect)>>,
     lock_states: &'a HashMap<ContextKey, HashMap<ProgramPointId, MustLockSet>>,
     synchronizations: &'a [IntrinsicSynchronization],
     task_local_allocations: &'a HashMap<TaskId, HashSet<CanonicalConcurrencyLocation>>,
+    allocation_origins: &'a HashMap<CanonicalConcurrencyLocation, AllocationOrigin>,
 }
 
 fn compare_accesses(
+    provider: &impl ConcurrencyProvider,
     tasks: &[Task],
     classes: &mut LocationClasses,
     evidence: AccessComparisonEvidence<'_>,
@@ -3758,27 +5437,94 @@ fn compare_accesses(
     report: &mut ConcurrentAccessReport,
 ) {
     let AccessComparisonEvidence {
+        invocations,
         modeled,
         lock_states,
         synchronizations,
         task_local_allocations,
+        allocation_origins,
     } = evidence;
+    let mut receivers = HashMap::<InvocationId, Vec<&IntrinsicSynchronization>>::default();
+    for event in synchronizations {
+        if event.operation == crate::analyzer::semantic::SynchronizationOperation::ChannelReceive {
+            receivers.entry(event.invocation).or_default().push(event);
+        }
+    }
+    let mut channel_barriers = ChannelCompletionBarriers {
+        synchronizations,
+        receivers,
+        sites: HashMap::default(),
+        remaining_entries: accesses.len() + synchronizations.len(),
+    };
+    let mut cell_cardinalities = HashMap::default();
     for access in &mut accesses {
-        if access.canonical.is_none()
-            && access.local_identity
-            && let Some(local_location) = access.local_location.as_ref()
-        {
-            let root = classes.root(local_location.clone());
-            let canonical = canonical_local_location(&root);
-            access.canonical = Some(canonical.clone());
-            access.resolved_location = ResolvedConcurrencyLocation::exact(canonical);
+        if let Some(local_location) = &mut access.local_location {
+            *local_location = classes.root(local_location.clone());
+            if access.canonical.is_none() && access.local_identity {
+                let canonical = canonical_local_location(local_location);
+                access.canonical = Some(canonical.clone());
+                access.resolved_location = ResolvedConcurrencyLocation::independent(
+                    canonical,
+                    ConcurrencyStorageFamily::LexicalCell {
+                        invocation: local_location.invocation,
+                        location: local_location.location,
+                    },
+                );
+            }
+            if access.local_identity {
+                let cardinality = *cell_cardinalities
+                    .entry(local_location.clone())
+                    .or_insert_with(|| {
+                        let semantics = local_location.procedure.semantics();
+                        match semantics
+                            .memory_location(local_location.location)
+                            .expect("validated lexical cell exists")
+                            .kind
+                        {
+                            MemoryLocationKind::LexicalCell { binding } => provider
+                                .lexical_cell_cardinality(&local_location.procedure, binding),
+                            MemoryLocationKind::Capture { .. }
+                                if classes.value_captures.contains(local_location) =>
+                            {
+                                ConcurrencyObjectCardinality::Multiple
+                            }
+                            // An unbound capture does not establish its owner's
+                            // cell lifetime merely by naming that capture.
+                            _ => ConcurrencyObjectCardinality::Unknown,
+                        }
+                    });
+                access.resolved_location.cardinality = cardinality;
+                if cardinality != ConcurrencyObjectCardinality::Singleton {
+                    access.reasons.push(ConcurrencyOpenReason::UnknownLocation);
+                }
+                if cardinality == ConcurrencyObjectCardinality::Unknown {
+                    access.resolved_location.exhaustive = false;
+                    // An unresolved capture owner may never obtain a common
+                    // candidate with another access. Preserve the gap even
+                    // when no conflict row can be constructed for it.
+                    report.reasons.push(ConcurrencyOpenReason::UnknownLocation);
+                }
+            }
         }
     }
     for first_index in 0..accesses.len() {
         for second_index in first_index + 1..accesses.len() {
             let first = &accesses[first_index];
             let second = &accesses[second_index];
-            if first.site.task == second.site.task
+            if (first.site.task == second.site.task
+                && !(shared_across_task_instances(
+                    tasks,
+                    invocations,
+                    first,
+                    task_local_allocations,
+                    allocation_origins,
+                ) || shared_across_task_instances(
+                    tasks,
+                    invocations,
+                    second,
+                    task_local_allocations,
+                    allocation_origins,
+                )))
                 || (first.site.mode == ConcurrentAccessMode::Read
                     && second.site.mode == ConcurrentAccessMode::Read)
             {
@@ -3788,22 +5534,55 @@ fn compare_accesses(
             if overlap == AccessOverlap::Disjoint {
                 continue;
             }
-            if !tasks_may_parallel(tasks, first, second) {
+            // An unnamed pair can only retain the report-level location gap;
+            // even a proven ordering cannot produce a named relation for it.
+            // Once that gap is retained, repeating this pair's ordering work
+            // cannot change the result. Named partial relations still follow
+            // the ordinary comparison below.
+            if overlap == AccessOverlap::MayAlias(None)
+                && report
+                    .reasons
+                    .contains(&ConcurrencyOpenReason::UnknownLocation)
+            {
                 continue;
             }
-            let (location, alias_open) = match overlap {
-                AccessOverlap::Same(location) => (location, false),
-                AccessOverlap::MayAlias(Some(location)) => (location, true),
-                AccessOverlap::MayAlias(None) => continue,
-                AccessOverlap::Disjoint => unreachable!("disjoint accesses were skipped"),
-            };
+            if !tasks_may_parallel(tasks, invocations, first, second, allocation_origins) {
+                continue;
+            }
             let relation = task_relation(tasks, first.site.task, second.site.task);
-            let (ordering, ordering_reasons) =
-                ordering(tasks, first, second, modeled, synchronizations);
+            let (ordering, ordering_reasons) = ordering(
+                tasks,
+                invocations,
+                first,
+                second,
+                modeled,
+                &mut channel_barriers,
+                allocation_origins,
+            );
             let protection = if first.atomic && second.atomic {
                 ConcurrentProtection::AtomicOnly
             } else {
                 compatible_lock_protection(first, second, lock_states)
+            };
+            let (location, alias_open) = match overlap {
+                AccessOverlap::Same(location) => (location, false),
+                AccessOverlap::MayAlias(Some(location)) => (location, true),
+                AccessOverlap::MayAlias(None) => {
+                    // A proven ordering or common protection makes this pair
+                    // safe regardless of whether the references alias.
+                    if (ordering == ConcurrentOrdering::HappensBefore
+                        && ordering_reasons.is_empty())
+                        || matches!(
+                            protection,
+                            ConcurrentProtection::CompatibleLock | ConcurrentProtection::AtomicOnly
+                        )
+                    {
+                        continue;
+                    }
+                    report.reasons.push(ConcurrencyOpenReason::UnknownLocation);
+                    continue;
+                }
+                AccessOverlap::Disjoint => unreachable!("disjoint accesses were skipped"),
             };
             let mut reasons = first.reasons.clone();
             reasons.extend(second.reasons.iter().cloned());
@@ -3833,34 +5612,26 @@ fn compare_accesses(
         }
     }
 
-    // One spawn in a loop represents distinct runtime child instances. Only a
-    // location rooted outside that child task (or a provider-canonical heap
-    // location) is shared across those instances.
+    // Compare one static access with itself across runtime task instances.
+    // Distinct static sites in the same repeated task are compared above.
     for access in &accesses {
-        if !tasks[access.site.task.0 as usize].repeated
-            || tasks[access.site.task.0 as usize].repetitions_serialized
-            || access.site.mode != ConcurrentAccessMode::Write
+        if access.site.mode != ConcurrentAccessMode::Write
             || access.atomic
+            || !shared_across_task_instances(
+                tasks,
+                invocations,
+                access,
+                task_local_allocations,
+                allocation_origins,
+            )
         {
             continue;
         }
-        let root = access
-            .local_location
-            .as_ref()
-            .map(|location| classes.root(location.clone()));
-        let task_local_allocation = access_base(access).is_some_and(|base| {
-            task_local_allocations
-                .get(&access.site.task)
-                .is_some_and(|allocations| allocations.contains(base))
-        });
-        if access.canonical.is_none()
-            || (access.local_identity
-                && root
-                    .as_ref()
-                    .is_some_and(|root| root.task == access.site.task))
-            || task_local_allocation
-        {
-            continue;
+        let mut reasons = access.reasons.clone();
+        match repetition_orders_access(tasks, invocations, access, modeled, &mut channel_barriers) {
+            ConcurrencyAnswer::Proven(true) => continue,
+            ConcurrencyAnswer::Open { reasons: open, .. } => reasons.extend(open),
+            ConcurrencyAnswer::Proven(false) => {}
         }
         // Two runtime instances of one repeated spawn reach this write holding
         // whatever locks the body holds there, so the access is compared
@@ -3872,17 +5643,26 @@ fn compare_accesses(
         } else {
             compatible_lock_protection(access, access, lock_states)
         };
-        let mut reasons = access.reasons.clone();
         if let Some(group) = &tasks[access.site.task.0 as usize].group {
             reasons.extend(group.reasons.iter().cloned());
         }
         if protection == ConcurrentProtection::Open {
             reasons.push(ConcurrencyOpenReason::AmbiguousSynchronization);
         }
+        let Some(location) = access.canonical.clone() else {
+            // An unresolved element still participates in repeated execution.
+            // Without ordering or common protection, retain the gap instead
+            // of inventing an element identity or silently dropping the write.
+            if protection != ConcurrentProtection::CompatibleLock {
+                report.reasons.extend(reasons);
+                report.reasons.push(ConcurrencyOpenReason::UnknownLocation);
+            }
+            continue;
+        };
         reasons.sort();
         reasons.dedup();
         report.conflicts.push(ConcurrentAccessConflict {
-            location: access.canonical.clone().expect("canonicalized above"),
+            location,
             first: access.site.clone(),
             second: access.site.clone(),
             task_relation: ConcurrentTaskRelation::Repeated,
@@ -3895,7 +5675,103 @@ fn compare_accesses(
     }
 }
 
+/// Whether this route can overlap itself across repeated task instances.
+/// Unknown identity remains eligible. A creation-local route can exclude its
+/// own repetition, but cannot exclude a pair with a different unresolved route
+/// that might reach a published object. Such a pair needs both routes local.
+fn shared_across_task_instances(
+    tasks: &[Task],
+    invocations: &Invocations,
+    access: &Access,
+    task_local_allocations: &HashMap<TaskId, HashSet<CanonicalConcurrencyLocation>>,
+    allocation_origins: &HashMap<CanonicalConcurrencyLocation, AllocationOrigin>,
+) -> bool {
+    let task = &tasks[access.site.task.0 as usize];
+    if task.repetition.is_none()
+        || (access.local_identity
+            && access
+                .local_location
+                .as_ref()
+                .is_some_and(|root| root.task == access.site.task))
+        || access_base(access).is_some_and(|base| {
+            task_local_allocations
+                .get(&access.site.task)
+                .is_some_and(|allocations| allocations.contains(base))
+        })
+    {
+        return false;
+    }
+    !access_base(access)
+        .and_then(|base| allocation_origins.get(base))
+        .is_some_and(|birth| {
+            let repetition = invocations.entries[birth.invocation.0 as usize].repetition;
+            repetition.is_some()
+                && repetition == task.repetition
+                && invocations.contains(birth.invocation, task.entry_invocation)
+        })
+}
+
+fn repetition_orders_access(
+    tasks: &[Task],
+    invocations: &Invocations,
+    access: &Access,
+    modeled: &HashMap<ContextKey, Vec<(ProgramPointId, ResolvedConcurrencyEffect)>>,
+    channel_barriers: &mut ChannelCompletionBarriers<'_>,
+) -> ConcurrencyAnswer<bool> {
+    let task = &tasks[access.site.task.0 as usize];
+    let mut reasons = Vec::new();
+    if task.repetitions_serialized {
+        match completion_orders_access(tasks, invocations, access) {
+            ConcurrencyAnswer::Proven(true) => return ConcurrencyAnswer::Proven(true),
+            ConcurrencyAnswer::Open { reasons: open, .. } => reasons.extend(open),
+            ConcurrencyAnswer::Proven(false) => {}
+        }
+    }
+    let repetition = task
+        .repetition
+        .expect("only repeated tasks have a repetition ordering obligation");
+    let repeated = &invocations.entries[repetition.0 as usize];
+    let synchronous_repetition = repeated.caller.is_some_and(|(caller, _)| {
+        invocations.entries[caller.0 as usize].context.task == repeated.context.task
+    });
+    if synchronous_repetition && tasks[repeated.context.task.0 as usize].repetition.is_none() {
+        let after = (
+            repetition,
+            repeated.context.procedure.semantics().normal_exit_point(),
+        );
+        let channel =
+            synchronized_before_point(tasks, invocations, access, after, channel_barriers);
+        let group = joined_before_point(tasks, invocations, access, after, modeled);
+        if matches!(channel, ConcurrencyAnswer::Proven(true))
+            || matches!(group, ConcurrencyAnswer::Proven(true))
+        {
+            return ConcurrencyAnswer::Proven(true);
+        }
+        for answer in [channel, group] {
+            if let ConcurrencyAnswer::Open { reasons: open, .. } = answer {
+                reasons.extend(open);
+            }
+        }
+    }
+    if let Some(group) = &task.group {
+        reasons.extend(group.reasons.iter().cloned());
+    }
+    if reasons.is_empty() {
+        ConcurrencyAnswer::Proven(false)
+    } else {
+        reasons.sort();
+        reasons.dedup();
+        ConcurrencyAnswer::Open {
+            partial: false,
+            reasons,
+        }
+    }
+}
+
 fn access_base(access: &Access) -> Option<&CanonicalConcurrencyLocation> {
+    if let Some(origin) = &access.storage_origin {
+        return Some(origin);
+    }
     access
         .field_alias_domain
         .as_ref()
@@ -3910,12 +5786,14 @@ fn access_base(access: &Access) -> Option<&CanonicalConcurrencyLocation> {
 
 fn contextual_allocation_identity(
     task: TaskId,
+    invocation: InvocationId,
     canonical: CanonicalConcurrencyLocation,
 ) -> CanonicalConcurrencyLocation {
     CanonicalConcurrencyLocation::new(
         format!(
-            "task:{}/{identity}",
+            "task:{}/invocation:{}/{identity}",
             task.get(),
+            invocation.get(),
             identity = canonical.identity
         ),
         canonical.kind,
@@ -3923,30 +5801,65 @@ fn contextual_allocation_identity(
 }
 
 fn access_location_overlap(first: &Access, second: &Access) -> AccessOverlap {
-    if let (Some(first), Some(second)) = (&first.canonical, &second.canonical)
-        && first == second
-    {
-        return AccessOverlap::Same(first.clone());
+    if first.local_identity && second.local_identity {
+        // A declaration shared by two captures can describe several runtime
+        // cells. Equal source identities alone do not prove the same storage.
+        return first.resolved_location.overlap(&second.resolved_location);
     }
+    if let (Some(first_location), Some(second_location)) = (&first.canonical, &second.canonical)
+        && first_location == second_location
+    {
+        return if first.resolved_location.exact_candidate() == Some(first_location)
+            && second.resolved_location.exact_candidate() == Some(second_location)
+        {
+            AccessOverlap::Same(first_location.clone())
+        } else {
+            AccessOverlap::MayAlias(Some(first_location.clone()))
+        };
+    }
+    if first
+        .resolved_location
+        .storage_is_disjoint(&second.resolved_location)
+    {
+        return AccessOverlap::Disjoint;
+    }
+    let exact = first.resolved_location.exact_candidate().is_some()
+        && second.resolved_location.exact_candidate().is_some();
     if let (Some(first), Some(second)) = (
         first.index_alias_domain.as_ref(),
         second.index_alias_domain.as_ref(),
     ) {
         if first.base != second.base {
-            return AccessOverlap::Disjoint;
+            return AccessOverlap::MayAlias(None);
         }
         match (first.identity, second.identity) {
             (IndexedLocationIdentity::Aggregate, IndexedLocationIdentity::Aggregate) => {
-                return exact_index_location(first)
-                    .map_or(AccessOverlap::Disjoint, AccessOverlap::Same);
+                return exact_index_location(first).map_or(
+                    AccessOverlap::MayAlias(None),
+                    |location| {
+                        if exact {
+                            AccessOverlap::Same(location)
+                        } else {
+                            AccessOverlap::MayAlias(Some(location))
+                        }
+                    },
+                );
             }
             (IndexedLocationIdentity::Element, IndexedLocationIdentity::Element) => {
                 if let (Some(first_index), Some(second_index)) =
                     (first.constant_index, second.constant_index)
                 {
                     return if first_index == second_index {
-                        exact_index_location(first)
-                            .map_or(AccessOverlap::Disjoint, AccessOverlap::Same)
+                        exact_index_location(first).map_or(
+                            AccessOverlap::MayAlias(None),
+                            |location| {
+                                if exact {
+                                    AccessOverlap::Same(location)
+                                } else {
+                                    AccessOverlap::MayAlias(Some(location))
+                                }
+                            },
+                        )
                     } else {
                         AccessOverlap::Disjoint
                     };
@@ -3984,9 +5897,14 @@ fn access_location_overlap(first: &Access, second: &Access) -> AccessOverlap {
     }
     match (&first.base, &second.base) {
         (Some(first_base), Some(second_base)) if first_base == second_base => {
-            AccessOverlap::Same(exact_field_location(first_base, &first.member))
+            let location = exact_field_location(first_base, &first.member);
+            if exact {
+                AccessOverlap::Same(location)
+            } else {
+                AccessOverlap::MayAlias(Some(location))
+            }
         }
-        (Some(_), Some(_)) => AccessOverlap::Disjoint,
+        (Some(_), Some(_)) => AccessOverlap::MayAlias(None),
         (None, None) | (None, Some(_)) | (Some(_), None) => {
             AccessOverlap::MayAlias(Some(CanonicalConcurrencyLocation::new(
                 format!(
@@ -4011,8 +5929,9 @@ fn access_location_overlap(first: &Access, second: &Access) -> AccessOverlap {
 fn canonical_local_location(location: &LocalLocation) -> CanonicalConcurrencyLocation {
     CanonicalConcurrencyLocation::new(
         format!(
-            "local:{}:{}:{}",
+            "local:{}:{}:{}:{}",
             location.task.get(),
+            location.invocation.get(),
             crate::flow_state::procedure_wire_id(&location.procedure),
             location.location.get()
         ),
@@ -4026,49 +5945,139 @@ fn canonical_local_location(location: &LocalLocation) -> CanonicalConcurrencyLoc
     )
 }
 
-fn tasks_may_parallel(tasks: &[Task], first: &Access, second: &Access) -> bool {
+fn access_is_local_to_invocation(
+    invocations: &Invocations,
+    allocation_origins: &HashMap<CanonicalConcurrencyLocation, AllocationOrigin>,
+    access: &Access,
+    ancestor: InvocationId,
+) -> bool {
+    let birth = if access.local_identity {
+        access.local_location.as_ref().and_then(|root| {
+            matches!(
+                root.procedure
+                    .semantics()
+                    .memory_location(root.location)
+                    .expect("local root belongs to its procedure")
+                    .kind,
+                MemoryLocationKind::LexicalCell { .. }
+            )
+            .then_some(root.invocation)
+        })
+    } else {
+        access_base(access)
+            .and_then(|base| allocation_origins.get(base))
+            .map(|origin| origin.invocation)
+    };
+    birth.is_some_and(|birth| {
+        invocations.contains(ancestor, birth) && invocations.contains(birth, access.site.invocation)
+    })
+}
+
+fn tasks_may_parallel(
+    tasks: &[Task],
+    invocations: &Invocations,
+    first: &Access,
+    second: &Access,
+    allocation_origins: &HashMap<CanonicalConcurrencyLocation, AllocationOrigin>,
+) -> bool {
     let first_task = &tasks[first.site.task.0 as usize];
     let second_task = &tasks[second.site.task.0 as usize];
-    let parent_child = |parent: &Access, child_task: &Task| {
-        if child_task.parent != Some(parent.site.task)
-            || child_task.spawn_procedure.as_ref() != Some(&parent.site.procedure)
-        {
+    let parent_child = |parent: &Access, child: &Access, child_task: &Task| {
+        if child_task.parent != Some(parent.site.task) {
             return None;
         }
+        let spawn_invocation = child_task.spawn_invocation?;
+        let spawn_procedure = child_task.spawn_procedure.as_ref()?;
         let spawn = child_task
             .spawn_call
-            .and_then(|call| parent.site.procedure.semantics().call_site(call))?
+            .and_then(|call| spawn_procedure.semantics().call_site(call))?
             .point;
+        let (context, parent_point, spawn) = invocations.common_points(
+            parent.site.invocation,
+            parent.site.point,
+            spawn_invocation,
+            spawn,
+        )?;
+        let procedure = &context.procedure;
+        let fresh_in_common = access_is_local_to_invocation(
+            invocations,
+            allocation_origins,
+            parent,
+            context.invocation,
+        ) && access_is_local_to_invocation(
+            invocations,
+            allocation_origins,
+            child,
+            context.invocation,
+        );
         Some(
-            point_dominates(&parent.site.procedure, parent.site.point, spawn)
-                || point_reaches(&parent.site.procedure, spawn, parent.site.point),
+            (invocations.entries[context.invocation.0 as usize]
+                .repetition
+                .is_some()
+                && !fresh_in_common)
+                || parent_point == spawn
+                || point_reaches(procedure, parent_point, spawn)
+                || point_reaches(procedure, spawn, parent_point),
         )
     };
-    if let Some(answer) = parent_child(first, second_task) {
+    if let Some(answer) = parent_child(first, second, second_task) {
         return answer;
     }
-    if let Some(answer) = parent_child(second, first_task) {
+    if let Some(answer) = parent_child(second, first, first_task) {
         return answer;
     }
     if first_task.parent == second_task.parent
-        && first_task.spawn_procedure == second_task.spawn_procedure
-        && let (Some(procedure), Some(first_call), Some(second_call)) = (
+        && let (
+            Some(first_procedure),
+            Some(second_procedure),
+            Some(first_call),
+            Some(second_call),
+            Some(first_invocation),
+            Some(second_invocation),
+        ) = (
             first_task.spawn_procedure.as_ref(),
+            second_task.spawn_procedure.as_ref(),
             first_task.spawn_call,
             second_task.spawn_call,
+            first_task.spawn_invocation,
+            second_task.spawn_invocation,
         )
     {
-        let first_spawn = procedure
+        let first_spawn = first_procedure
             .semantics()
             .call_site(first_call)
             .expect("spawn call belongs to its procedure")
             .point;
-        let second_spawn = procedure
+        let second_spawn = second_procedure
             .semantics()
             .call_site(second_call)
             .expect("spawn call belongs to its procedure")
             .point;
-        return first_spawn == second_spawn
+        let Some((context, first_spawn, second_spawn)) = invocations.common_points(
+            first_invocation,
+            first_spawn,
+            second_invocation,
+            second_spawn,
+        ) else {
+            return true;
+        };
+        let procedure = &context.procedure;
+        let fresh_in_common = access_is_local_to_invocation(
+            invocations,
+            allocation_origins,
+            first,
+            context.invocation,
+        ) && access_is_local_to_invocation(
+            invocations,
+            allocation_origins,
+            second,
+            context.invocation,
+        );
+        return (invocations.entries[context.invocation.0 as usize]
+            .repetition
+            .is_some()
+            && !fresh_in_common)
+            || first_spawn == second_spawn
             || point_reaches(procedure, first_spawn, second_spawn)
             || point_reaches(procedure, second_spawn, first_spawn);
     }
@@ -4076,7 +6085,8 @@ fn tasks_may_parallel(tasks: &[Task], first: &Access, second: &Access) -> bool {
 }
 
 fn task_relation(tasks: &[Task], first: TaskId, second: TaskId) -> ConcurrentTaskRelation {
-    if tasks[first.0 as usize].repeated || tasks[second.0 as usize].repeated {
+    if tasks[first.0 as usize].repetition.is_some() || tasks[second.0 as usize].repetition.is_some()
+    {
         return ConcurrentTaskRelation::Repeated;
     }
     if tasks[first.0 as usize].parent == Some(second)
@@ -4090,31 +6100,169 @@ fn task_relation(tasks: &[Task], first: TaskId, second: TaskId) -> ConcurrentTas
     ConcurrentTaskRelation::Nested
 }
 
+#[allow(clippy::too_many_arguments)]
 fn ordering(
     tasks: &[Task],
+    invocations: &Invocations,
     first: &Access,
     second: &Access,
     modeled: &HashMap<ContextKey, Vec<(ProgramPointId, ResolvedConcurrencyEffect)>>,
-    synchronizations: &[IntrinsicSynchronization],
+    channel_barriers: &mut ChannelCompletionBarriers<'_>,
+    allocation_origins: &HashMap<CanonicalConcurrencyLocation, AllocationOrigin>,
 ) -> (ConcurrentOrdering, Vec<ConcurrencyOpenReason>) {
-    if access_before_spawn(tasks, first, second) || access_before_spawn(tasks, second, first) {
-        return (ConcurrentOrdering::HappensBefore, Vec::new());
+    if first.site.task == second.site.task {
+        let first = repetition_orders_access(tasks, invocations, first, modeled, channel_barriers);
+        let second =
+            repetition_orders_access(tasks, invocations, second, modeled, channel_barriers);
+        if matches!(first, ConcurrencyAnswer::Proven(true))
+            && matches!(second, ConcurrencyAnswer::Proven(true))
+        {
+            return (ConcurrentOrdering::HappensBefore, Vec::new());
+        }
+        let mut reasons = Vec::new();
+        for answer in [first, second] {
+            if let ConcurrencyAnswer::Open { reasons: open, .. } = answer {
+                reasons.extend(open);
+            }
+        }
+        return if reasons.is_empty() {
+            (ConcurrentOrdering::Unordered, reasons)
+        } else {
+            reasons.sort();
+            reasons.dedup();
+            (ConcurrentOrdering::Open, reasons)
+        };
     }
-    let forward_join = joined_before_access(tasks, first, second, modeled);
-    let reverse_join = joined_before_access(tasks, second, first, modeled);
+    let mut ancestors = HashSet::default();
+    let mut current = Some(first.site.task);
+    while let Some(task) = current {
+        ancestors.insert(task);
+        current = tasks[task.0 as usize].parent;
+    }
+    let mut common = second.site.task;
+    while !ancestors.contains(&common) {
+        common = tasks[common.0 as usize]
+            .parent
+            .expect("tasks share the solve root");
+    }
+    let common = &tasks[common.0 as usize];
+    let ordered = if common.repetition.is_some()
+        && !(access_is_local_to_invocation(
+            invocations,
+            allocation_origins,
+            first,
+            common.entry_invocation,
+        ) && access_is_local_to_invocation(
+            invocations,
+            allocation_origins,
+            second,
+            common.entry_invocation,
+        )) {
+        // A local wait orders one parent activation. It does not join the
+        // other runtime parents represented by this same task. Keep an
+        // attempted local proof open until that outer boundary is covered.
+        (
+            ConcurrentOrdering::Open,
+            vec![ConcurrencyOpenReason::AmbiguousSynchronization],
+        )
+    } else {
+        (ConcurrentOrdering::HappensBefore, Vec::new())
+    };
+    let mut recurrence_reasons = Vec::new();
+    for (parent, child) in [(first, second), (second, first)] {
+        if let Some(recurrences) =
+            access_before_spawn(tasks, invocations, parent, child, allocation_origins)
+        {
+            let barriers = channel_barriers.for_access(child);
+            let joins = join_completion_barriers(tasks, invocations, child, modeled);
+            let mut complete = true;
+            for (invocation, point) in recurrences {
+                let matching = barriers
+                    .iter()
+                    .chain(&joins)
+                    .filter(|barrier| barrier.between_recurrences(invocations, invocation, point))
+                    .collect::<Vec<_>>();
+                if !matching.iter().any(|barrier| barrier.reasons.is_empty()) {
+                    complete = false;
+                    if parent.local_identity {
+                        // The retained lexical cell identifies a declaration,
+                        // but does not yet state whether its storage is created
+                        // anew by this loop (as with a loop-body declaration).
+                        recurrence_reasons.push(ConcurrencyOpenReason::UnknownLocation);
+                    }
+                    // One allocation site may denote a fresh object on each
+                    // recurrence. Until object-instance correspondence is
+                    // known, site equality cannot prove a cross-iteration race.
+                    if access_base(parent)
+                        .and_then(|base| allocation_origins.get(base))
+                        .is_some_and(|birth| {
+                            invocations
+                                .ancestry_points(birth.invocation, birth.point)
+                                .get(&invocation)
+                                .is_some_and(|birth_point| {
+                                    let procedure = &invocations.entries[invocation.0 as usize]
+                                        .context
+                                        .procedure;
+                                    point_is_cyclic(procedure.semantics(), *birth_point)
+                                        && (*birth_point == point
+                                            || (point_reaches(procedure, point, *birth_point)
+                                                && point_reaches(procedure, *birth_point, point)))
+                                })
+                        })
+                    {
+                        recurrence_reasons.push(ConcurrencyOpenReason::UnknownLocation);
+                    }
+                    recurrence_reasons.extend(
+                        matching
+                            .iter()
+                            .flat_map(|barrier| barrier.reasons.iter().cloned()),
+                    );
+                }
+            }
+            if complete {
+                return ordered;
+            }
+        }
+    }
+    let forward_join = joined_before_point(
+        tasks,
+        invocations,
+        first,
+        (second.site.invocation, second.site.point),
+        modeled,
+    );
+    let reverse_join = joined_before_point(
+        tasks,
+        invocations,
+        second,
+        (first.site.invocation, first.site.point),
+        modeled,
+    );
     if matches!(forward_join, ConcurrencyAnswer::Proven(true))
         || matches!(reverse_join, ConcurrencyAnswer::Proven(true))
     {
-        return (ConcurrentOrdering::HappensBefore, Vec::new());
+        return ordered;
     }
-    let forward = synchronized_before_access(first, second, synchronizations);
-    let reverse = synchronized_before_access(second, first, synchronizations);
+    let forward = synchronized_before_point(
+        tasks,
+        invocations,
+        first,
+        (second.site.invocation, second.site.point),
+        channel_barriers,
+    );
+    let reverse = synchronized_before_point(
+        tasks,
+        invocations,
+        second,
+        (first.site.invocation, first.site.point),
+        channel_barriers,
+    );
     if matches!(forward, ConcurrencyAnswer::Proven(true))
         || matches!(reverse, ConcurrencyAnswer::Proven(true))
     {
-        return (ConcurrentOrdering::HappensBefore, Vec::new());
+        return ordered;
     }
-    let mut reasons = Vec::new();
+    let mut reasons = recurrence_reasons;
     for answer in [forward_join, reverse_join] {
         if let ConcurrencyAnswer::Open {
             reasons: open_reasons,
@@ -4147,15 +6295,141 @@ fn ordering(
     }
 }
 
-fn synchronized_before_access(
-    before: &Access,
-    after: &Access,
-    synchronizations: &[IntrinsicSynchronization],
+/// Points at which an access has completed, as observed by one synchronous
+/// invocation. Uncertain identity or completion stays attached to the points.
+#[derive(Clone)]
+struct CompletionBarrier {
+    invocation: InvocationId,
+    points: HashSet<ProgramPointId>,
+    reasons: Vec<ConcurrencyOpenReason>,
+}
+
+impl CompletionBarrier {
+    fn before(
+        &self,
+        tasks: &[Task],
+        invocations: &Invocations,
+        after: (InvocationId, ProgramPointId),
+    ) -> bool {
+        let task = invocations.entries[self.invocation.0 as usize].context.task;
+        observation_in_task(tasks, invocations, task, after).is_some_and(|(target, point)| {
+            invocations.required_points_before(self.invocation, self.points.clone(), target, point)
+        })
+    }
+
+    fn between_recurrences(
+        &self,
+        invocations: &Invocations,
+        invocation: InvocationId,
+        point: ProgramPointId,
+    ) -> bool {
+        let procedure = &invocations.entries[invocation.0 as usize].context.procedure;
+        assert!(point_is_cyclic(procedure.semantics(), point));
+        invocations
+            .required_points_in(self.invocation, self.points.clone(), invocation)
+            .is_some_and(|points| {
+                // A lifted call point can itself contain the mandatory wait.
+                points.contains(&point)
+                    || all_recurrences_cross_points(
+                        procedure,
+                        point,
+                        &points.into_iter().collect::<Vec<_>>(),
+                    )
+            })
+    }
+}
+
+fn completed_before_point(
+    tasks: &[Task],
+    invocations: &Invocations,
+    barriers: &[CompletionBarrier],
+    after: (InvocationId, ProgramPointId),
 ) -> ConcurrencyAnswer<bool> {
+    let mut reasons = Vec::new();
+    for barrier in barriers {
+        if barrier.before(tasks, invocations, after) {
+            if barrier.reasons.is_empty() {
+                return ConcurrencyAnswer::Proven(true);
+            }
+            reasons.extend(barrier.reasons.iter().cloned());
+        }
+    }
+    if reasons.is_empty() {
+        ConcurrencyAnswer::Proven(false)
+    } else {
+        reasons.sort();
+        reasons.dedup();
+        ConcurrencyAnswer::Open {
+            partial: false,
+            reasons,
+        }
+    }
+}
+
+fn synchronized_before_point(
+    tasks: &[Task],
+    invocations: &Invocations,
+    before: &Access,
+    after: (InvocationId, ProgramPointId),
+    channel_barriers: &mut ChannelCompletionBarriers<'_>,
+) -> ConcurrencyAnswer<bool> {
+    completed_before_point(
+        tasks,
+        invocations,
+        channel_barriers.for_access(before).as_ref(),
+        after,
+    )
+}
+
+/// Channel completion depends on the access site and the solve's fixed
+/// synchronization inventory, independently of the access paired with it.
+/// Invocation IDs keep repeated calls to the same procedure separate. This
+/// cache is discarded with the solve, so no source or summary generation can
+/// reuse facts from an earlier query.
+struct ChannelCompletionBarriers<'a> {
+    synchronizations: &'a [IntrinsicSynchronization],
+    receivers: HashMap<InvocationId, Vec<&'a IntrinsicSynchronization>>,
+    sites: HashMap<(InvocationId, ProgramPointId), Vec<CompletionBarrier>>,
+    // Count keys, barriers, points and reasons. Retained cache entries stay
+    // linear in the already retained input. A miss recomputes the same answer;
+    // cache capacity never changes proof or coverage.
+    remaining_entries: usize,
+}
+
+impl ChannelCompletionBarriers<'_> {
+    fn for_access(&mut self, access: &Access) -> std::borrow::Cow<'_, [CompletionBarrier]> {
+        match self
+            .sites
+            .entry((access.site.invocation, access.site.point))
+        {
+            Entry::Occupied(entry) => std::borrow::Cow::Borrowed(entry.into_mut()),
+            Entry::Vacant(entry) => {
+                let barriers =
+                    channel_completion_barriers(access, self.synchronizations, &self.receivers);
+                let weight = 1 + barriers
+                    .iter()
+                    .map(|barrier| 1 + barrier.points.len() + barrier.reasons.len())
+                    .sum::<usize>();
+                if weight > self.remaining_entries {
+                    return std::borrow::Cow::Owned(barriers);
+                }
+                self.remaining_entries -= weight;
+                std::borrow::Cow::Borrowed(entry.insert(barriers))
+            }
+        }
+    }
+}
+
+fn channel_completion_barriers(
+    before: &Access,
+    synchronizations: &[IntrinsicSynchronization],
+    receivers: &HashMap<InvocationId, Vec<&IntrinsicSynchronization>>,
+) -> Vec<CompletionBarrier> {
     let senders = synchronizations
         .iter()
         .filter(|event| {
             event.task == before.site.task
+                && event.invocation == before.site.invocation
                 && event.procedure == before.site.procedure
                 && matches!(
                     event.operation,
@@ -4166,42 +6440,55 @@ fn synchronized_before_access(
                     || point_reaches(&before.site.procedure, before.site.point, event.point))
         })
         .collect::<Vec<_>>();
-    let receivers = synchronizations
-        .iter()
-        .filter(|event| {
-            event.task == after.site.task
-                && event.procedure == after.site.procedure
-                && event.operation
-                    == crate::analyzer::semantic::SynchronizationOperation::ChannelReceive
-        })
-        .collect::<Vec<_>>();
+    let mut barriers = Vec::new();
+    let mut represented_senders = HashSet::default();
     for sender in &senders {
-        let Some(subject) = sender.subject.as_ref() else {
-            continue;
-        };
-        let matching_sends = senders
-            .iter()
-            .filter_map(|send| (send.subject.as_ref() == Some(subject)).then_some(send.point))
-            .collect::<HashSet<_>>();
-        if !all_exit_paths_cross_points(&before.site.procedure, before.site.point, &matching_sends)
-        {
+        // Equal configurations produce equal barriers. Keep every original
+        // sender in the point-set computations below: dropping its point
+        // would change which paths prove mandatory completion.
+        if !represented_senders.insert((
+            sender.subject.as_ref(),
+            sender.point == before.site.point,
+            sender.fresh_allocation,
+            sender.root_input,
+            sender.reasons.as_slice(),
+        )) {
             continue;
         }
-        let matching_receives = receivers
-            .iter()
-            .filter_map(|receive| {
-                (receive.subject.as_ref() == Some(subject)).then_some(receive.point)
-            })
-            .collect::<HashSet<_>>();
-        if all_paths_cross_points(&after.site.procedure, after.site.point, &matching_receives) {
-            return ConcurrencyAnswer::Proven(true);
+        if let Some(subject) = sender.subject.as_ref() {
+            let matching_sends = senders
+                .iter()
+                .filter_map(|send| {
+                    (send.subject.as_ref() == Some(subject) && send.point != before.site.point)
+                        .then_some(send.point)
+                })
+                .collect::<HashSet<_>>();
+            if all_exit_paths_cross_points(
+                &before.site.procedure,
+                before.site.point,
+                &matching_sends,
+            ) {
+                for (invocation, receivers) in receivers {
+                    let points = receivers
+                        .iter()
+                        .filter_map(|receive| {
+                            (receive.subject.as_ref() == Some(subject)).then_some(receive.point)
+                        })
+                        .collect::<HashSet<_>>();
+                    if !points.is_empty() {
+                        barriers.push(CompletionBarrier {
+                            invocation: *invocation,
+                            points,
+                            reasons: Vec::new(),
+                        });
+                    }
+                }
+            }
         }
-    }
-    let possibly_ambiguous = senders.iter().any(|send| {
         let possibly_matching_sends = senders
             .iter()
             .filter_map(|candidate| {
-                synchronization_subjects_may_match(send, candidate).then_some(candidate.point)
+                synchronization_subjects_may_match(sender, candidate).then_some(candidate.point)
             })
             .collect::<HashSet<_>>();
         if !all_exit_paths_cross_points(
@@ -4209,37 +6496,69 @@ fn synchronized_before_access(
             before.site.point,
             &possibly_matching_sends,
         ) {
-            return false;
+            continue;
         }
-        let possibly_matching = receivers
-            .iter()
-            .filter_map(|receive| {
-                synchronization_subjects_may_match(send, receive).then_some(receive.point)
-            })
-            .collect::<HashSet<_>>();
-        let identity_is_ambiguous = receivers.iter().any(|receive| {
-            (send.subject.is_none() || receive.subject.is_none())
-                && possibly_matching.contains(&receive.point)
-        });
-        identity_is_ambiguous
-            && all_paths_cross_points(&after.site.procedure, after.site.point, &possibly_matching)
-    });
-    if !possibly_ambiguous {
-        return ConcurrencyAnswer::Proven(false);
+        for (invocation, receivers) in receivers {
+            let possible = receivers
+                .iter()
+                .filter(|receive| synchronization_subjects_may_match(sender, receive))
+                .collect::<Vec<_>>();
+            if possible.is_empty()
+                || (sender.point != before.site.point
+                    && !possible
+                        .iter()
+                        .any(|receive| sender.subject.is_none() || receive.subject.is_none()))
+            {
+                continue;
+            }
+            let mut reasons = sender.reasons.clone();
+            reasons.extend(
+                possible
+                    .iter()
+                    .flat_map(|receive| receive.reasons.iter().cloned()),
+            );
+            if reasons.is_empty() {
+                reasons.push(ConcurrencyOpenReason::AmbiguousSynchronization);
+            }
+            barriers.push(CompletionBarrier {
+                invocation: *invocation,
+                points: possible.iter().map(|receive| receive.point).collect(),
+                reasons,
+            });
+        }
     }
-    let mut reasons = senders
-        .iter()
-        .chain(&receivers)
-        .flat_map(|event| event.reasons.iter().cloned())
-        .collect::<Vec<_>>();
-    if reasons.is_empty() {
-        reasons.push(ConcurrencyOpenReason::AmbiguousSynchronization);
+    barriers
+}
+
+/// Observe an access in an ancestor task at the spawn that leads to it.
+/// Ordering before that spawn also orders before the descendant access.
+fn observation_in_task(
+    tasks: &[Task],
+    invocations: &Invocations,
+    observer: TaskId,
+    site: (InvocationId, ProgramPointId),
+) -> Option<(InvocationId, ProgramPointId)> {
+    let (invocation, _) = site;
+    let task = invocations.entries[invocation.0 as usize].context.task;
+    if observer == task {
+        return Some(site);
     }
-    reasons.sort();
-    reasons.dedup();
-    ConcurrencyAnswer::Open {
-        partial: false,
-        reasons,
+    let mut descendant = task;
+    loop {
+        let task = &tasks[descendant.0 as usize];
+        let parent = task.parent?;
+        if parent == observer {
+            let invocation = task.spawn_invocation?;
+            let point = task
+                .spawn_procedure
+                .as_ref()?
+                .semantics()
+                .call_site(task.spawn_call?)
+                .expect("spawn belongs to its caller")
+                .point;
+            return Some((invocation, point));
+        }
+        descendant = parent;
     }
 }
 
@@ -4330,99 +6649,218 @@ fn all_exit_paths_cross_points(
     true
 }
 
-fn access_before_spawn(tasks: &[Task], parent: &Access, child: &Access) -> bool {
+fn access_before_spawn(
+    tasks: &[Task],
+    invocations: &Invocations,
+    parent: &Access,
+    child: &Access,
+    allocation_origins: &HashMap<CanonicalConcurrencyLocation, AllocationOrigin>,
+) -> Option<Vec<(InvocationId, ProgramPointId)>> {
     let mut descendant = child.site.task;
     loop {
         let task = &tasks[descendant.0 as usize];
-        let Some(owner) = task.parent else {
-            return false;
-        };
+        let owner = task.parent?;
         if owner == parent.site.task {
-            if task.spawn_procedure.as_ref() != Some(&parent.site.procedure) {
-                return false;
-            }
-            let Some(spawn_call) = task.spawn_call else {
-                return false;
+            let (Some(spawn_call), Some(spawn_procedure), Some(spawn_invocation)) = (
+                task.spawn_call,
+                task.spawn_procedure.as_ref(),
+                task.spawn_invocation,
+            ) else {
+                return None;
             };
-            let spawn = parent
-                .site
-                .procedure
+            let spawn = spawn_procedure
                 .semantics()
                 .call_site(spawn_call)
                 .expect("task spawn call belongs to its procedure")
                 .point;
-            return point_dominates(&parent.site.procedure, parent.site.point, spawn);
+            let (context, parent_point, spawn) = invocations.common_points(
+                parent.site.invocation,
+                parent.site.point,
+                spawn_invocation,
+                spawn,
+            )?;
+            let procedure = &context.procedure;
+            if parent_point == spawn || !point_dominates(procedure, parent_point, spawn) {
+                return None;
+            }
+            // The parent itself can denote concurrent runtime tasks. Only
+            // storage born inside that parent can use its local precedence
+            // to order all accesses to the object.
+            let parent_task = &tasks[parent.site.task.0 as usize];
+            if parent_task.repetition.is_some()
+                && !(access_is_local_to_invocation(
+                    invocations,
+                    allocation_origins,
+                    parent,
+                    parent_task.entry_invocation,
+                ) && access_is_local_to_invocation(
+                    invocations,
+                    allocation_origins,
+                    child,
+                    parent_task.entry_invocation,
+                ))
+            {
+                return None;
+            }
+            let parent_points =
+                invocations.ancestry_points(parent.site.invocation, parent.site.point);
+            let spawn_points = invocations.ancestry_points(
+                spawn_invocation,
+                spawn_procedure
+                    .semantics()
+                    .call_site(spawn_call)
+                    .expect("spawn belongs to its caller")
+                    .point,
+            );
+            let mut recurrences = Vec::new();
+            for (invocation, parent_point) in parent_points {
+                let Some(spawn_point) = spawn_points.get(&invocation) else {
+                    continue;
+                };
+                let procedure = &invocations.entries[invocation.0 as usize].context.procedure;
+                if point_is_cyclic(procedure.semantics(), parent_point)
+                    && (parent_point == *spawn_point
+                        || point_reaches(procedure, *spawn_point, parent_point))
+                {
+                    recurrences.push((invocation, parent_point));
+                }
+            }
+            return Some(recurrences);
         }
         descendant = owner;
     }
 }
 
-fn joined_before_access(
+/// A manual completion event does not cover later writes in the same task.
+/// Require ordering within the shared synchronous caller; an unresolved
+/// position remains open instead of turning a possible join into a race.
+fn completion_orders_access(
     tasks: &[Task],
-    child: &Access,
-    parent: &Access,
-    modeled: &HashMap<ContextKey, Vec<(ProgramPointId, ResolvedConcurrencyEffect)>>,
+    invocations: &Invocations,
+    access: &Access,
 ) -> ConcurrencyAnswer<bool> {
-    let task = &tasks[child.site.task.0 as usize];
-    if task.parent != Some(parent.site.task) {
-        return ConcurrencyAnswer::Proven(false);
-    }
-    let Some(task_group) = task.group.as_ref() else {
-        return ConcurrencyAnswer::Proven(false);
-    };
-    let context = ContextKey {
-        task: parent.site.task,
-        procedure: parent.site.procedure.clone(),
-    };
-    let Some(effects) = modeled.get(&context) else {
-        return ConcurrencyAnswer::Proven(false);
-    };
-    let joins = effects
-        .iter()
-        .filter_map(|(point, effect)| {
-            let group = match effect {
-                ResolvedConcurrencyEffect::TaskJoin { group }
-                | ResolvedConcurrencyEffect::WaitGroupWait { group } => group,
-                _ => return None,
-            };
-            point_dominates(&parent.site.procedure, *point, parent.site.point).then_some(group)
-        })
-        .collect::<Vec<_>>();
-    if joins.iter().any(|group| {
-        group.canonical.is_some()
-            && group.canonical == task_group.canonical
-            && group
-                .reasons
-                .iter()
-                .all(|reason| *reason == ConcurrencyOpenReason::UnknownLocation)
-            && task_group
-                .reasons
-                .iter()
-                .all(|reason| *reason == ConcurrencyOpenReason::UnknownLocation)
-    }) {
+    let Some((completion, completion_point)) = tasks[access.site.task.0 as usize].completion else {
         return ConcurrencyAnswer::Proven(true);
+    };
+    if let Some((context, access_point, completion_point)) = invocations.common_points(
+        access.site.invocation,
+        access.site.point,
+        completion,
+        completion_point,
+    ) && access_point != completion_point
+    {
+        let procedure = &context.procedure;
+        if point_dominates(procedure, access_point, completion_point)
+            && !point_reaches(procedure, completion_point, access_point)
+        {
+            return ConcurrencyAnswer::Proven(true);
+        }
+        if point_dominates(procedure, completion_point, access_point)
+            && !point_reaches(procedure, access_point, completion_point)
+        {
+            return ConcurrencyAnswer::Proven(false);
+        }
     }
-    let possibly_matching = joins.iter().any(|group| {
-        !group.reasons.is_empty()
-            || !task_group.reasons.is_empty()
-            || group.canonical.is_none()
-            || task_group.canonical.is_none()
-            || group.canonical == task_group.canonical
-    });
-    if !possibly_matching {
-        return ConcurrencyAnswer::Proven(false);
-    }
-    let mut reasons = task_group.reasons.clone();
-    reasons.extend(joins.iter().flat_map(|group| group.reasons.iter().cloned()));
-    if reasons.is_empty() {
-        reasons.push(ConcurrencyOpenReason::AmbiguousSynchronization);
-    }
-    reasons.sort();
-    reasons.dedup();
     ConcurrencyAnswer::Open {
         partial: false,
-        reasons,
+        reasons: vec![ConcurrencyOpenReason::AmbiguousSynchronization],
     }
+}
+
+fn joined_before_point(
+    tasks: &[Task],
+    invocations: &Invocations,
+    child: &Access,
+    after: (InvocationId, ProgramPointId),
+    modeled: &HashMap<ContextKey, Vec<(ProgramPointId, ResolvedConcurrencyEffect)>>,
+) -> ConcurrencyAnswer<bool> {
+    completed_before_point(
+        tasks,
+        invocations,
+        &join_completion_barriers(tasks, invocations, child, modeled),
+        after,
+    )
+}
+
+fn join_completion_barriers(
+    tasks: &[Task],
+    invocations: &Invocations,
+    child: &Access,
+    modeled: &HashMap<ContextKey, Vec<(ProgramPointId, ResolvedConcurrencyEffect)>>,
+) -> Vec<CompletionBarrier> {
+    let task = &tasks[child.site.task.0 as usize];
+    let (Some(parent), Some(task_group)) = (task.parent, task.group.as_ref()) else {
+        return Vec::new();
+    };
+    let completion_reasons = match completion_orders_access(tasks, invocations, child) {
+        ConcurrencyAnswer::Proven(false) => return Vec::new(),
+        ConcurrencyAnswer::Proven(true) => Vec::new(),
+        ConcurrencyAnswer::Open { reasons, .. } => reasons,
+    };
+    let mut barriers = Vec::new();
+    for (context, effects) in modeled {
+        if context.task != parent {
+            continue;
+        }
+        let joins = effects
+            .iter()
+            .filter_map(|(point, effect)| {
+                let group = match effect {
+                    ResolvedConcurrencyEffect::TaskJoin { group }
+                    | ResolvedConcurrencyEffect::WaitGroupWait { group } => group,
+                    _ => return None,
+                };
+                Some((*point, group))
+            })
+            .collect::<Vec<_>>();
+        let exact = joins
+            .iter()
+            .filter_map(|(point, group)| {
+                (group.canonical.is_some()
+                    && group.canonical == task_group.canonical
+                    && group
+                        .reasons
+                        .iter()
+                        .chain(&task_group.reasons)
+                        .all(|reason| *reason == ConcurrencyOpenReason::UnknownLocation))
+                .then_some(*point)
+            })
+            .collect::<HashSet<_>>();
+        if !exact.is_empty() {
+            barriers.push(CompletionBarrier {
+                invocation: context.invocation,
+                points: exact,
+                reasons: completion_reasons.clone(),
+            });
+        }
+        let possible = joins
+            .iter()
+            .filter_map(|(point, group)| {
+                (!group.reasons.is_empty()
+                    || !task_group.reasons.is_empty()
+                    || group.canonical.is_none()
+                    || task_group.canonical.is_none()
+                    || group.canonical == task_group.canonical)
+                    .then_some(*point)
+            })
+            .collect::<HashSet<_>>();
+        if !possible.is_empty() {
+            let mut reasons = completion_reasons.clone();
+            reasons.extend(task_group.reasons.iter().cloned());
+            reasons.extend(
+                joins
+                    .iter()
+                    .flat_map(|(_, group)| group.reasons.iter().cloned()),
+            );
+            reasons.push(ConcurrencyOpenReason::AmbiguousSynchronization);
+            barriers.push(CompletionBarrier {
+                invocation: context.invocation,
+                points: possible,
+                reasons,
+            });
+        }
+    }
+    barriers
 }
 
 fn compatible_lock_protection(
@@ -4544,6 +6982,7 @@ fn must_lock_states(
         .iter()
         .map(|access| ContextKey {
             task: access.site.task,
+            invocation: access.site.invocation,
             procedure: access.site.procedure.clone(),
         })
         .collect::<HashSet<_>>()
@@ -4563,6 +7002,7 @@ fn must_locks_at<'a>(
 ) -> &'a MustLockSet {
     let context = ContextKey {
         task: access.site.task,
+        invocation: access.site.invocation,
         procedure: access.site.procedure.clone(),
     };
     lock_states
@@ -4729,9 +7169,17 @@ mod tests {
     use crate::analyzer::{AnalyzerConfig, Language, ProjectFile, WorkspaceAnalyzer};
     use crate::inline_project::{BuiltInlineTestProject, InlineTestProject};
 
-    fn exact_boundary_location(identity: &str) -> ConcurrencyAnswer<ResolvedConcurrencyLocation> {
-        ConcurrencyAnswer::Proven(ResolvedConcurrencyLocation::exact(
-            CanonicalConcurrencyLocation::new(identity, "object"),
+    fn exact_boundary_location(
+        identity: &str,
+        allocation: u32,
+    ) -> ConcurrencyAnswer<ResolvedConcurrencyLocation> {
+        let canonical = CanonicalConcurrencyLocation::new(identity, "object");
+        ConcurrencyAnswer::Proven(ResolvedConcurrencyLocation::independent(
+            canonical,
+            ConcurrencyStorageFamily::Allocation {
+                invocation: InvocationId(0),
+                allocation: AllocationId::new(allocation),
+            },
         ))
     }
 
@@ -4742,15 +7190,15 @@ mod tests {
         let mut first_call = SummaryConcurrencyBoundaryBinding::new();
         first_call.bind_location(
             parameter.clone(),
-            exact_boundary_location("allocation:first"),
+            exact_boundary_location("allocation:first", 0),
         );
         let mut second_call = SummaryConcurrencyBoundaryBinding::new();
         second_call.bind_location(
             parameter.clone(),
-            exact_boundary_location("allocation:second"),
+            exact_boundary_location("allocation:second", 1),
         );
         let mut shared_call = SummaryConcurrencyBoundaryBinding::new();
-        shared_call.bind_location(parameter, exact_boundary_location("allocation:first"));
+        shared_call.bind_location(parameter, exact_boundary_location("allocation:first", 0));
 
         let first = instantiate_summary_access_path(&path, &first_call)
             .into_parts()
@@ -4789,7 +7237,10 @@ mod tests {
             vec![SummaryConcurrencyAccessSelector::ConstantIndex(7)],
         );
         let mut exact = SummaryConcurrencyBoundaryBinding::new();
-        exact.bind_location(object.clone(), exact_boundary_location("allocation:shared"));
+        exact.bind_location(
+            object.clone(),
+            exact_boundary_location("allocation:shared", 0),
+        );
         exact.bind_integer(index, 7);
 
         let field_location = instantiate_summary_access_path(&field_path, &exact)
@@ -4814,7 +7265,7 @@ mod tests {
         ));
 
         let mut unknown = SummaryConcurrencyBoundaryBinding::new();
-        unknown.bind_location(object, exact_boundary_location("allocation:shared"));
+        unknown.bind_location(object, exact_boundary_location("allocation:shared", 0));
         let (partial, reasons) =
             instantiate_summary_access_path(&dynamic_index_path, &unknown).into_parts();
         assert!(!partial.is_exhaustive());
@@ -4828,6 +7279,17 @@ mod tests {
     struct LocalProvider;
 
     impl ConcurrencyProvider for LocalProvider {
+        fn lexical_cell_cardinality(
+            &self,
+            _procedure: &ProcedureHandle,
+            _binding: ValueId,
+        ) -> ConcurrencyObjectCardinality {
+            // These task-topology fixtures declare their captured cells once
+            // outside loops. The workspace provider's declaration facts are
+            // exercised by paired fresh/shared RQL integration tests.
+            ConcurrencyObjectCardinality::Singleton
+        }
+
         fn resolve_call(
             &self,
             _call: &CallSiteHandle,
@@ -4880,6 +7342,14 @@ mod tests {
     struct OpenModelProvider;
 
     impl ConcurrencyProvider for OpenModelProvider {
+        fn lexical_cell_cardinality(
+            &self,
+            procedure: &ProcedureHandle,
+            binding: ValueId,
+        ) -> ConcurrencyObjectCardinality {
+            LocalProvider.lexical_cell_cardinality(procedure, binding)
+        }
+
         fn resolve_call(
             &self,
             call: &CallSiteHandle,
@@ -5069,11 +7539,13 @@ func root() {}
             .expect("fixture root procedure");
         let first = LocalSynchronizationSubject::Value {
             task: TaskId(0),
+            invocation: InvocationId(0),
             procedure: procedure.clone(),
             value: ValueId::new(0),
         };
         let second = LocalSynchronizationSubject::Value {
             task: TaskId(0),
+            invocation: InvocationId(0),
             procedure,
             value: ValueId::new(1),
         };
@@ -5096,6 +7568,78 @@ func root() {}
     }
 
     #[test]
+    fn captured_identity_preserves_conflicting_binding_evidence() {
+        let fixture = Fixture::new("package sample\nfunc root() {}\n");
+        let artifact = fixture.artifact();
+        let procedure = artifact
+            .procedure_handle(ProcedureId::new(0))
+            .expect("fixture root procedure");
+        let subject = |value| LocalSynchronizationSubject::Value {
+            task: TaskId(0),
+            invocation: InvocationId(0),
+            procedure: procedure.clone(),
+            value: ValueId::new(value),
+        };
+        let first = subject(0);
+        let second = subject(1);
+        let allocation = CanonicalConcurrencyLocation::new("allocation:first", "object");
+        for reverse in [false, true] {
+            let mut classes = SynchronizationSubjectClasses::default();
+            classes.mark_captured_value(first.clone());
+            assert!(classes.canonical_capture_identity(first.clone()).is_some());
+            classes.bind_canonical_value(
+                first.clone(),
+                ConcurrencyIdentityFact::allocation(
+                    allocation.clone(),
+                    InvocationId(0),
+                    AllocationId::new(0),
+                ),
+            );
+            assert_eq!(
+                classes
+                    .canonical_capture_identity(first.clone())
+                    .map(|fact| fact.canonical().clone()),
+                Some(allocation.clone())
+            );
+            classes.bind_canonical_value(
+                second.clone(),
+                ConcurrencyIdentityFact::allocation(
+                    CanonicalConcurrencyLocation::new("allocation:second", "object"),
+                    InvocationId(0),
+                    AllocationId::new(1),
+                ),
+            );
+            if reverse {
+                classes.union(second.clone(), first.clone());
+            } else {
+                classes.union(first.clone(), second.clone());
+            }
+            assert!(
+                classes.canonical_capture_identity(first.clone()).is_none(),
+                "capture membership cannot override conflicting allocations"
+            );
+        }
+        let mut classes = SynchronizationSubjectClasses::default();
+        classes.mark_captured_value(first.clone());
+        classes.bind_canonical_value(
+            first.clone(),
+            ConcurrencyIdentityFact::allocation(allocation, InvocationId(0), AllocationId::new(0)),
+        );
+        classes.bind_canonical_value(
+            first.clone(),
+            ConcurrencyIdentityFact::allocation(
+                CanonicalConcurrencyLocation::new("allocation:replacement", "object"),
+                InvocationId(0),
+                AllocationId::new(1),
+            ),
+        );
+        assert!(
+            classes.canonical_capture_identity(first).is_none(),
+            "a conflicting rebinding cannot fall back to the retained old identity"
+        );
+    }
+
+    #[test]
     fn later_exact_backing_merge_discharges_earlier_formal_ambiguity() {
         let fixture = Fixture::new(
             r#"package sample
@@ -5109,6 +7653,7 @@ func root() {}
             .expect("fixture root procedure");
         let subject = |value| LocalSynchronizationSubject::Value {
             task: TaskId(0),
+            invocation: InvocationId(0),
             procedure: procedure.clone(),
             value: ValueId::new(value),
         };
@@ -5164,14 +7709,17 @@ func unlocked() { helper() }
         let unlocked = procedure("unlocked");
         let helper_context = ContextKey {
             task: TaskId(0),
+            invocation: InvocationId(0),
             procedure: helper,
         };
         let locked_context = ContextKey {
             task: TaskId(0),
+            invocation: InvocationId(0),
             procedure: locked.clone(),
         };
         let unlocked_context = ContextKey {
             task: TaskId(0),
+            invocation: InvocationId(0),
             procedure: unlocked.clone(),
         };
         let lock = CanonicalConcurrencyLocation::new("lock:shared", "object");
@@ -5419,8 +7967,20 @@ func exclusive(flag bool) {
     fn bounded_location_domain_distinguishes_same_disjoint_and_may_alias() {
         let first = CanonicalConcurrencyLocation::new("heap:first", "object");
         let second = CanonicalConcurrencyLocation::new("heap:second", "object");
-        let exact_first = ResolvedConcurrencyLocation::exact(first.clone());
-        let exact_second = ResolvedConcurrencyLocation::exact(second.clone());
+        let exact_first = ResolvedConcurrencyLocation::independent(
+            first.clone(),
+            ConcurrencyStorageFamily::Allocation {
+                invocation: InvocationId(0),
+                allocation: AllocationId::new(0),
+            },
+        );
+        let exact_second = ResolvedConcurrencyLocation::independent(
+            second.clone(),
+            ConcurrencyStorageFamily::Allocation {
+                invocation: InvocationId(0),
+                allocation: AllocationId::new(1),
+            },
+        );
         assert_eq!(
             exact_first.overlap(&ResolvedConcurrencyLocation::exact(first.clone())),
             AccessOverlap::Same(first.clone())
@@ -5438,6 +7998,28 @@ func exclusive(flag bool) {
             exact_first.overlap(&finite),
             AccessOverlap::MayAlias(Some(first))
         );
+    }
+
+    #[test]
+    fn symbolic_reference_names_prove_equality_but_not_disjointness() {
+        let first = CanonicalConcurrencyLocation::new("parameter:a", "object");
+        let second = CanonicalConcurrencyLocation::new("parameter:b", "object");
+        let a = ResolvedConcurrencyLocation::exact(first.clone());
+        let b = ResolvedConcurrencyLocation::exact(second.clone());
+        // Two pointer parameters can receive either one object or two objects.
+        // Reusing one stable parameter still proves the same referent.
+        assert_eq!(a.overlap(&a), AccessOverlap::Same(first));
+        assert_eq!(a.overlap(&b), AccessOverlap::MayAlias(None));
+        assert_eq!(b.overlap(&a), AccessOverlap::MayAlias(None));
+        let allocation = ResolvedConcurrencyLocation::independent(
+            second,
+            ConcurrencyStorageFamily::Allocation {
+                invocation: InvocationId(0),
+                allocation: AllocationId::new(0),
+            },
+        );
+        assert_eq!(a.overlap(&allocation), AccessOverlap::MayAlias(None));
+        assert_eq!(allocation.overlap(&a), AccessOverlap::MayAlias(None));
     }
 
     #[test]

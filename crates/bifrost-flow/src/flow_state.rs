@@ -2359,7 +2359,7 @@ fn address_escape_points(
     escape_points
 }
 
-fn address_alias_values(
+pub(crate) fn address_alias_values(
     semantics: &ProcedureSemantics,
     relevant_values: &HashSet<ValueId>,
 ) -> HashSet<ValueId> {

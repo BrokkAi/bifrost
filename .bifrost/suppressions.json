@@ -351,7 +351,7 @@
     },
     {
       "policy_id": "bifrost.performance.parsing-in-loop",
-      "finding_id": "b4ac1fc8feeb7cb819c91275213385d310160fd6de169dafb7e2f91532cb6c37",
+      "finding_id": "711698cb1d3fcd287aae559212725532468a05f3553b93c4b950222e74271d8a",
       "path": "src/bin/bifrost.rs",
       "identity_stability": "strong",
       "status": "accepted",
@@ -399,7 +399,7 @@
     },
     {
       "policy_id": "bifrost.performance.sleep-in-loop",
-      "finding_id": "3f31bf60d9edaed4af6f855a953fa1ae27bc908fab6bccd2e5fa7c85fe38c83a",
+      "finding_id": "bf8e46b8486e0584adcd60e005ddf0727e04b1cb3261cc48040003bb3c52a416",
       "path": "crates/bifrost-analysis/src/analyzer/store/mod.rs",
       "identity_stability": "strong",
       "status": "accepted",

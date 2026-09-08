@@ -4459,6 +4459,24 @@ fn assert_exact_safe_concurrent_relations(result: &CodeQueryResult, verdict: &st
     );
 }
 
+fn assert_open_loop_cell_relations(result: &CodeQueryResult) {
+    assert!(!result.results.is_empty(), "{result:#?}");
+    for item in &result.results {
+        let CodeQueryResultValue::ConcurrentAccessConflict { value } = &item.value else {
+            panic!("concurrent_access_conflicts returns its typed row: {item:#?}");
+        };
+        assert_eq!(
+            (value.location_kind.as_str(), value.proof, value.coverage),
+            ("lexical_cell", "open", "open"),
+            "loop-cell instance identity remains open: {result:#?}"
+        );
+        // The source joins each iteration's children, but a declaration-level
+        // WaitGroup name does not prove that iteration correspondence. Any
+        // retained relation stays unproven until those scoped facts exist.
+        assert_eq!(value.reasons, ["unknown_location"], "{result:#?}");
+    }
+}
+
 fn assert_no_concurrent_conflicts(result: &CodeQueryResult) {
     for item in &result.results {
         let CodeQueryResultValue::ConcurrentAccessConflict { value } = &item.value else {
@@ -6269,6 +6287,51 @@ type guardedFlag struct {
     flag bool
 }
 
+// Keep a nested imported method selector in a real synchronization proof. The
+// selector itself denotes the method, while the receiver field remains the
+// lock subject; treating the terminal `Lock`/`Unlock` names as field storage
+// introduces unrelated access rows.
+func methodSelectorNoFieldRead() int {
+    guarded := &guardedFlag{}
+    value := 0
+    go func() {
+        guarded.lock.Lock()
+        value = 1
+        guarded.lock.Unlock()
+    }()
+    guarded.lock.Lock()
+    result := value
+    guarded.lock.Unlock()
+    return result
+}
+
+type functionFieldHolder struct {
+    callback func()
+}
+
+// The callback field is itself shared storage. Calling through it must retain
+// the field load even when the stored value is a function.
+func functionValuedFieldLoadRace() {
+    holder := &functionFieldHolder{callback: func() {}}
+    go func() { holder.callback = func() {} }()
+    holder.callback()
+}
+
+type boundMethodFieldHolder struct {
+    callback func()
+}
+
+func (holder *boundMethodFieldHolder) callbackMethod() {}
+
+// A bound method stored in a function field still requires reading that field
+// at the call site. Target declaration kind must not suppress the field race.
+func boundMethodFieldLoadRace() {
+    holder := &boundMethodFieldHolder{}
+    holder.callback = holder.callbackMethod
+    go func() { holder.callback = holder.callbackMethod }()
+    holder.callback()
+}
+
 func (guarded *guardedFlag) set() {
     guarded.lock.Lock()
     defer guarded.lock.Unlock()
@@ -6280,6 +6343,64 @@ func repeatedFieldMutex() {
     for index := 0; index < 2; index++ {
         go guarded.set()
     }
+}
+
+type oppositeBranchGuard struct {
+    first sync.Mutex
+    second sync.Mutex
+    value int
+}
+
+func oppositeBranchWrite(guarded *oppositeBranchGuard, chooseFirst bool) {
+    if chooseFirst {
+        guarded.first.Lock()
+        guarded.value++
+        guarded.first.Unlock()
+    } else {
+        guarded.second.Lock()
+        guarded.value++
+        guarded.second.Unlock()
+    }
+}
+
+func repeatedOppositeBranchDistinctLocks() {
+    guarded := &oppositeBranchGuard{}
+    for index := 0; index < 2; index++ {
+        go oppositeBranchWrite(guarded, index == 0)
+    }
+}
+
+func nonrepeatedOppositeBranchDistinctLocks(chooseFirst bool) {
+    guarded := &oppositeBranchGuard{}
+    go oppositeBranchWrite(guarded, chooseFirst)
+}
+
+func oppositeBranchChild(guarded *oppositeBranchGuard, chooseFirst bool) {
+    if chooseFirst {
+        go func() {
+            guarded.first.Lock()
+            guarded.value++
+            guarded.first.Unlock()
+        }()
+    } else {
+        go func() {
+            guarded.second.Lock()
+            guarded.value++
+            guarded.second.Unlock()
+        }()
+    }
+}
+
+func repeatedOppositeBranchChildTasks() {
+    guarded := &oppositeBranchGuard{}
+    for index := 0; index < 2; index++ {
+        oppositeBranchChild(guarded, index == 0)
+    }
+}
+
+func nonrepeatedOppositeBranchChildTasks(chooseFirst bool) {
+    guarded := &oppositeBranchGuard{}
+    oppositeBranchChild(guarded, chooseFirst)
 }
 
 // One field mutex reached three ways: from a closure that captures the
@@ -6347,6 +6468,82 @@ func grouped() int {
     group.Go(func() { value = 1 })
     group.Wait()
     return value
+}
+
+type invocationCell struct {
+    n int
+}
+
+func launchWaitGroupAndWait(c *invocationCell) {
+    group := &sync.WaitGroup{}
+    group.Add(1)
+    go func() {
+        c.n++
+        group.Done()
+    }()
+    group.Wait()
+}
+
+func joinedWaitGroupInvocations() {
+    c := &invocationCell{}
+    launchWaitGroupAndWait(c)
+    launchWaitGroupAndWait(c)
+}
+
+func loopedWaitGroupInvocations() int {
+    c := &invocationCell{}
+    for index := 0; index < 2; index++ {
+        launchWaitGroupAndWait(c)
+    }
+    return c.n
+}
+
+func launchWaitGroupAndMaybeWait(c *invocationCell, wait bool) {
+    group := &sync.WaitGroup{}
+    group.Add(1)
+    go func() {
+        c.n++
+        group.Done()
+    }()
+    if wait {
+        group.Wait()
+    }
+}
+
+func conditionalWaitGroupInvocations(wait bool) {
+    c := &invocationCell{}
+    for index := 0; index < 2; index++ {
+        launchWaitGroupAndMaybeWait(c, wait)
+    }
+}
+
+func joinedWaitGroupParent(c *invocationCell) {
+    for index := 0; index < 2; index++ {
+        launchWaitGroupAndWait(c)
+    }
+}
+
+func parallelWaitGroupParentTasks() {
+    c := &invocationCell{}
+    for index := 0; index < 2; index++ {
+        go joinedWaitGroupParent(c)
+    }
+}
+
+func launchWaitGroupDoneBeforeWrite(c *invocationCell) {
+    group := &sync.WaitGroup{}
+    group.Add(1)
+    go func() {
+        group.Done()
+        c.n++
+    }()
+    group.Wait()
+}
+
+func doneBeforeWriteWaitGroupInvocations() {
+    c := &invocationCell{}
+    launchWaitGroupDoneBeforeWrite(c)
+    launchWaitGroupDoneBeforeWrite(c)
 }
 
 func classicGroup() int {
@@ -6843,6 +7040,144 @@ func unsupportedOnce() int {
     );
     assert_exact_safe_concurrent_relations(&result, "protected");
 
+    // Opposite branches are exclusive within one parent activation, but both
+    // branches can run across repeated parent tasks. Their distinct mutexes
+    // therefore leave the shared value unprotected across those activations.
+    let query = CodeQuery::from_json(&json!({
+        "languages": ["go"],
+        "match": { "kind": "function", "name": "repeatedOppositeBranchDistinctLocks" },
+        "steps": [
+            { "op": "procedure_of" },
+            { "op": "concurrent_access_conflicts" }
+        ],
+        "result_detail": "full"
+    }))
+    .expect("repeated opposite-branch distinct-lock query");
+    let result = execute_workspace(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &query,
+    );
+    assert_eq!(
+        result.completion(),
+        CodeQueryCompletion::Complete,
+        "repeated opposite branches: {result:#?}"
+    );
+    let value = find_concurrent_relation(&result, |value| value.verdict == "conflict");
+    assert_eq!(
+        (
+            value.task_relation,
+            value.ordering,
+            value.protection,
+            value.proof,
+            value.coverage
+        ),
+        (
+            "repeated",
+            "unordered",
+            "unprotected",
+            "proven",
+            "exhaustive"
+        ),
+        "distinct branch locks cannot protect repeated opposite branches: {result:#?}"
+    );
+
+    // With one nonrepeated parent activation, only one branch executes, so
+    // distinct branch locks do not create a cross-task conflict.
+    let query = CodeQuery::from_json(&json!({
+        "languages": ["go"],
+        "match": { "kind": "function", "name": "nonrepeatedOppositeBranchDistinctLocks" },
+        "steps": [
+            { "op": "procedure_of" },
+            { "op": "concurrent_access_conflicts" }
+        ],
+        "result_detail": "full"
+    }))
+    .expect("nonrepeated opposite-branch distinct-lock query");
+    let result = execute_workspace(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &query,
+    );
+    assert_eq!(
+        result.completion(),
+        CodeQueryCompletion::Complete,
+        "nonrepeated opposite branches: {result:#?}"
+    );
+    assert!(
+        result.diagnostics.is_empty(),
+        "nonrepeated opposite branches must resolve completely: {result:#?}"
+    );
+    assert_no_concurrent_conflicts(&result);
+
+    // Each branch now launches its own child task. The repeated parent still
+    // reaches opposite branches in separate activations, so the shared value
+    // must retain the unprotected cross-child conflict.
+    let query = CodeQuery::from_json(&json!({
+        "languages": ["go"],
+        "match": { "kind": "function", "name": "repeatedOppositeBranchChildTasks" },
+        "steps": [
+            { "op": "procedure_of" },
+            { "op": "concurrent_access_conflicts" }
+        ],
+        "result_detail": "full"
+    }))
+    .expect("repeated opposite-branch child-task query");
+    let result = execute_workspace(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &query,
+    );
+    assert_eq!(
+        result.completion(),
+        CodeQueryCompletion::Complete,
+        "repeated opposite-branch child tasks: {result:#?}"
+    );
+    let value = find_concurrent_relation(&result, |value| value.verdict == "conflict");
+    assert_eq!(
+        (
+            value.task_relation,
+            value.ordering,
+            value.protection,
+            value.proof,
+            value.coverage
+        ),
+        (
+            "repeated",
+            "unordered",
+            "unprotected",
+            "proven",
+            "exhaustive"
+        ),
+        "distinct branch locks cannot protect repeated opposite child tasks: {result:#?}"
+    );
+
+    let query = CodeQuery::from_json(&json!({
+        "languages": ["go"],
+        "match": { "kind": "function", "name": "nonrepeatedOppositeBranchChildTasks" },
+        "steps": [
+            { "op": "procedure_of" },
+            { "op": "concurrent_access_conflicts" }
+        ],
+        "result_detail": "full"
+    }))
+    .expect("nonrepeated opposite-branch child-task query");
+    let result = execute_workspace(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &query,
+    );
+    assert_eq!(
+        result.completion(),
+        CodeQueryCompletion::Complete,
+        "nonrepeated opposite-branch child tasks: {result:#?}"
+    );
+    assert!(
+        result.diagnostics.is_empty(),
+        "nonrepeated opposite child tasks must resolve completely: {result:#?}"
+    );
+    assert_no_concurrent_conflicts(&result);
+
     // A goroutine spawned inside a repeated task repeats with it, whatever
     // its own spawn site looks like. Without that, the grandchild believes it
     // runs once, its write is never compared against itself, and the race is
@@ -6900,6 +7235,88 @@ func unsupportedOnce() int {
             "{guarded}: {result:#?}"
         );
         assert_exact_safe_concurrent_relations(&result, "protected");
+    }
+
+    // A nested imported method selector contributes the receiver field used
+    // by the lock model, but the terminal method name is not another memory
+    // location. Keep this direct control separate from the closure-capture
+    // identity checks above so a phantom Lock/Unlock field load cannot hide in
+    // the broader protected fixture.
+    let query = CodeQuery::from_json(&json!({
+        "languages": ["go"],
+        "match": { "kind": "function", "name": "methodSelectorNoFieldRead" },
+        "steps": [
+            { "op": "procedure_of" },
+            { "op": "concurrent_access_conflicts" }
+        ],
+        "result_detail": "full"
+    }))
+    .expect("method-selector no-field-read concurrent access query");
+    let result = execute_workspace(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &query,
+    );
+    assert_eq!(
+        result.completion(),
+        CodeQueryCompletion::Complete,
+        "method selectors must not add unresolved field accesses: {result:#?}"
+    );
+    assert_exact_safe_concurrent_relations(&result, "protected");
+
+    // A function-valued field is different: evaluating the callee reads the
+    // field. The child store and parent call therefore retain a field conflict.
+    // Include a field initialized with a bound method as a near miss for any
+    // implementation that classifies the stored target as a method and drops
+    // the caller-side field load.
+    // The bound-method fixture also has unresolved callable/identity evidence;
+    // preserve that limitation while requiring the actual read/write pair.
+    for (field_call, proof, coverage) in [
+        ("functionValuedFieldLoadRace", "proven", "exhaustive"),
+        ("boundMethodFieldLoadRace", "open", "open"),
+    ] {
+        let query = CodeQuery::from_json(&json!({
+            "languages": ["go"],
+            "match": { "kind": "function", "name": field_call },
+            "steps": [
+                { "op": "procedure_of" },
+                { "op": "concurrent_access_conflicts" }
+            ],
+            "result_detail": "full"
+        }))
+        .expect("function-valued field-load concurrent access query");
+        let result = execute_workspace(
+            &workspace,
+            &brokk_bifrost_flow::FlowWorkspaceState::new(),
+            &query,
+        );
+        let value = find_concurrent_relation(&result, |value| {
+            value.verdict == "conflict"
+                && value.location_kind == "field"
+                && matches!(
+                    (value.first_access, value.second_access),
+                    ("read", "write") | ("write", "read")
+                )
+        });
+        assert_eq!(
+            (
+                value.ordering,
+                value.protection,
+                value.proof,
+                value.coverage,
+            ),
+            ("unordered", "unprotected", proof, coverage),
+            "{field_call}: a function-valued field load must remain a race: {result:#?}"
+        );
+        if proof == "open" {
+            assert!(
+                value
+                    .reasons
+                    .iter()
+                    .any(|reason| reason == "unknown_location"),
+                "{result:#?}"
+            );
+        }
     }
 
     let query = CodeQuery::from_json(&json!({
@@ -6966,7 +7383,9 @@ func unsupportedOnce() int {
         CodeQueryCompletion::Complete,
         "{result:#?}"
     );
-    assert_exact_safe_concurrent_relations(&result, "ordered");
+    // Each loop creates fresh first/second cells. The WaitGroup proves the
+    // ordering, but a declaration identity does not select one runtime cell.
+    assert_open_loop_cell_relations(&result);
 
     let query = CodeQuery::from_json(&json!({
         "languages": ["go"],
@@ -6988,7 +7407,7 @@ func unsupportedOnce() int {
         CodeQueryCompletion::Complete,
         "{result:#?}"
     );
-    assert_exact_safe_concurrent_relations(&result, "ordered");
+    assert_open_loop_cell_relations(&result);
 
     let query = CodeQuery::from_json(&json!({
         "languages": ["go"],
@@ -7244,6 +7663,56 @@ func unsupportedOnce() int {
         "{result:#?}"
     );
     assert_exact_safe_concurrent_relations(&result, "ordered");
+
+    // A local WaitGroup is fresh for every helper activation. Its mandatory
+    // Wait orders each child before the next invocation, including when the
+    // same helper is reached through a loop.
+    let waitgroup_results = [
+        ("joinedWaitGroupInvocations", true),
+        ("loopedWaitGroupInvocations", true),
+        ("conditionalWaitGroupInvocations", false),
+        ("parallelWaitGroupParentTasks", false),
+        ("doneBeforeWriteWaitGroupInvocations", false),
+    ]
+    .into_iter()
+    .map(|(name, safe)| {
+        let query = CodeQuery::from_json(&json!({
+            "languages": ["go"],
+            "match": { "kind": "function", "name": name },
+            "steps": [
+                { "op": "procedure_of" },
+                { "op": "concurrent_access_conflicts" }
+            ],
+            "result_detail": "full"
+        }))
+        .expect("WaitGroup invocation identity query");
+        let result = execute_workspace(
+            &workspace,
+            &brokk_bifrost_flow::FlowWorkspaceState::new(),
+            &query,
+        );
+        (name, safe, result)
+    })
+    .collect::<Vec<_>>();
+
+    // An unknown conditional Wait, parallel parent activations, and Done
+    // before the write all leave a real race or an explicit open result.
+    for (name, safe, result) in waitgroup_results {
+        if safe {
+            assert_eq!(
+                result.completion(),
+                CodeQueryCompletion::Complete,
+                "{name}: {result:#?}"
+            );
+            assert!(
+                result.diagnostics.is_empty(),
+                "{name} must use the structured WaitGroup model: {result:#?}"
+            );
+            assert_exact_safe_concurrent_relations(&result, "ordered");
+        } else {
+            assert_conflict_or_explicit_open(&result);
+        }
+    }
 }
 
 /// A closure that captures a parameter or receiver keeps the object that
@@ -7384,7 +7853,10 @@ func repeatedValueReceiver() {
 
     for root in ["repeatedCapturedReceiver", "repeatedNoClosure"] {
         let (reported, result) = conflicts(root);
-        assert_eq!(reported, 1, "{root} must report its race: {result:#?}");
+        // The increment has two access orientations at the same source site: the
+        // write/read pair and the write/write pair. Both are part of the
+        // exact result and must remain proven.
+        assert_eq!(reported, 2, "{root} must report its races: {result:#?}");
     }
     let (reported, result) = conflicts("repeatedValueReceiver");
     assert_eq!(
@@ -7508,9 +7980,11 @@ func repeatedCallbackRecursion() {
                 )
             })
             .count();
+        // The callee's `total++` yields one proven write/read relation and
+        // one proven write/write relation for the repeated child tasks.
         assert_eq!(
-            reported, 1,
-            "{root} must report the write in the callee: {result:#?}"
+            reported, 2,
+            "{root} must report both callee access orientations: {result:#?}"
         );
     }
 }
@@ -7612,30 +8086,392 @@ fn go_array_copy_is_distinct_storage() {
     );
 }
 
-/// One object stays one location through a call result and through an
-/// interface.
-///
-/// Both routes are listed in #2902's first acceptance criterion, alongside
-/// parameters, receivers, fields and closures, which do hold. Their negatives
-/// pass already, so neither is masked by a blanket refusal: `distinctResult`
-/// correctly reports nothing, and the positives report nothing too.
-///
-/// Owned by #2902.
+/// A pointer returned through `makeCell` and then copied through `identity`
+/// remains one location when both child tasks use it. The distinct factory
+/// result remains disjoint. This activates the result half of #2902's former
+/// combined ignored test; before result binding, `sharedResult` loses its race.
 #[test]
-#[ignore = "finds real bug: identity is lost through a result and through an interface (#2902)"]
-fn go_heap_identity_survives_result_and_interface_routes() {
+fn go_heap_identity_survives_result_routes() {
     let (_project, workspace) = heap_identity_workspace();
-    assert_eq!(
-        proven_conflicts(&workspace, "distinctResult"),
-        0,
-        "distinct results stay disjoint"
+    let shared = heap_identity_conflicts(&workspace, "sharedResult");
+    assert_proven_unordered_unprotected_conflict(
+        &shared,
+        "identity(c) must preserve the makeCell result's shared location",
     );
-    for route in ["sharedResult", "sharedInterface"] {
-        assert!(
-            proven_conflicts(&workspace, route) >= 1,
-            "{route}: one object reached from two tasks is one location"
-        );
+
+    let distinct = heap_identity_conflicts(&workspace, "distinctResult");
+    assert_no_proven_conflicts_with_explanation(&distinct);
+    assert_eq!(
+        distinct.completion(),
+        CodeQueryCompletion::Complete,
+        "{distinct:#?}"
+    );
+}
+
+/// A call result must follow the edited return semantics across analyzer
+/// generations while a caller-owned flow state remains alive. The unchanged
+/// allocator and root files make the update's content-keyed reuse boundary
+/// explicit; only choose.go changes between each revision.
+#[test]
+fn go_heap_identity_keeps_call_result_identity_stable_across_warm_and_incremental_updates() {
+    const ALLOC_SOURCE: &str = r#"package main
+
+type cell struct {
+    n int
+}
+
+func makeCell() *cell { return &cell{} }
+"#;
+    const ROOT_SOURCE: &str = r#"package main
+
+func callResultIdentity() {
+    c := makeCell()
+    returned := choose(c)
+    go func() { returned.n = 1 }()
+    go func() { c.n = 2 }()
+}
+"#;
+    const SAME_POINTER_SOURCE: &str = r#"package main
+
+func choose(c *cell) *cell { return c }
+"#;
+    const DISTINCT_ALLOCATION_SOURCE: &str = r#"package main
+
+func choose(c *cell) *cell { return makeCell() }
+"#;
+    const VALUE_COPY_SOURCE: &str = r#"package main
+
+func choose(c *cell) cell { return *c }
+"#;
+
+    let project = InlineTestProject::with_language(Language::Go)
+        .file("alloc.go", ALLOC_SOURCE)
+        .file("choose.go", SAME_POINTER_SOURCE)
+        .file("main.go", ROOT_SOURCE)
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let query = CodeQuery::from_json(&json!({
+        "languages": ["go"],
+        "match": { "kind": "function", "name": "callResultIdentity" },
+        "steps": [
+            { "op": "procedure_of" },
+            { "op": "concurrent_access_conflicts" }
+        ],
+        "result_detail": "full"
+    }))
+    .expect("incremental call-result concurrent access query");
+    let run = |workspace: &WorkspaceAnalyzer,
+               flow_state: &brokk_bifrost_flow::FlowWorkspaceState| {
+        execute_workspace(workspace, flow_state, &query)
+    };
+    let flow_state = brokk_bifrost_flow::FlowWorkspaceState::new();
+
+    let cold = run(&workspace, &flow_state);
+    assert_proven_unordered_unprotected_conflict(
+        &cold,
+        "the initial pointer result must alias its input",
+    );
+    let warm = run(&workspace, &flow_state);
+    assert_eq!(
+        serde_json::to_value(&cold).expect("cold result serializes"),
+        serde_json::to_value(&warm).expect("warm result serializes"),
+        "warm execution must preserve the initial result rows and evidence",
+    );
+
+    let choose = project.file("choose.go");
+    choose
+        .write(DISTINCT_ALLOCATION_SOURCE)
+        .expect("edit choose to return a fresh allocation");
+    let distinct_workspace = workspace.update(&BTreeSet::from([choose.clone()]));
+    let incremental_distinct = run(&distinct_workspace, &flow_state);
+    assert_no_proven_conflicts_with_explanation(&incremental_distinct);
+    let fresh_distinct_workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let fresh_distinct = run(
+        &fresh_distinct_workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+    );
+    assert_no_proven_conflicts_with_explanation(&fresh_distinct);
+    assert_eq!(
+        serde_json::to_value(&incremental_distinct).expect("incremental result serializes"),
+        serde_json::to_value(&fresh_distinct).expect("fresh result serializes"),
+        "incremental fresh-allocation identity must equal a fresh analysis",
+    );
+
+    choose
+        .write(VALUE_COPY_SOURCE)
+        .expect("edit choose to return a value copy");
+    let value_workspace = distinct_workspace.update(&BTreeSet::from([choose]));
+    let incremental_value = run(&value_workspace, &flow_state);
+    assert_no_proven_conflicts_with_explanation(&incremental_value);
+    let fresh_value_workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let fresh_value = run(
+        &fresh_value_workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+    );
+    assert_no_proven_conflicts_with_explanation(&fresh_value);
+    assert_eq!(
+        serde_json::to_value(&incremental_value).expect("incremental value result serializes"),
+        serde_json::to_value(&fresh_value).expect("fresh value result serializes"),
+        "incremental value-copy identity must equal a fresh analysis",
+    );
+}
+
+/// Interface dispatch remains isolated from the now-active call-result test.
+/// It still has the known #2902 identity gap and is intentionally ignored.
+#[test]
+#[ignore = "finds real bug: identity is lost through an interface (#2902)"]
+fn go_heap_identity_survives_interface_route() {
+    let (_project, workspace) = heap_identity_workspace();
+    assert!(
+        proven_conflicts(&workspace, "sharedInterface") >= 1,
+        "an interface carrying one pointer must preserve its shared location"
+    );
+}
+
+/// Returning a `cell` by value copies its inline field storage. A missing
+/// value-result model may leave this route empty or explicitly open, but it
+/// must never prove a race between the returned copy and the source pointer.
+#[test]
+fn go_heap_identity_value_result_copy_never_proves_a_race() {
+    let (_project, workspace) = heap_identity_workspace();
+    let result = heap_identity_conflicts(&workspace, "structValueResultCopy");
+    assert_no_proven_conflicts_with_explanation(&result);
+}
+
+/// The first and second pointer results must retain their exact ordinals when
+/// both results carry the same actual pointer. Before indexed result binding,
+/// this shared positive loses its proven conflict.
+#[test]
+fn go_heap_identity_preserves_same_pointer_result_ordinals() {
+    let (_project, workspace) = heap_identity_workspace();
+    let result = heap_identity_conflicts(&workspace, "samePointerResultOrdinals");
+    assert_proven_unordered_unprotected_conflict(
+        &result,
+        "the two pointer result ordinals must preserve one shared actual",
+    );
+}
+
+/// Distinct actual allocations returned in the two ordinals must not be
+/// collapsed into one pointer result location.
+#[test]
+fn go_heap_identity_keeps_distinct_pointer_result_ordinals_disjoint() {
+    let (_project, workspace) = heap_identity_workspace();
+    let result = heap_identity_conflicts(&workspace, "distinctPointerResultOrdinals");
+    assert_no_proven_conflicts_with_explanation(&result);
+    assert_eq!(
+        result.completion(),
+        CodeQueryCompletion::Complete,
+        "{result:#?}"
+    );
+}
+
+/// If either branch returns the same pointer actual, the alternative result is
+/// still one shared location. This is the positive control for branch binding.
+#[test]
+fn go_heap_identity_preserves_alternative_same_input_result() {
+    let (_project, workspace) = heap_identity_workspace();
+    let result = heap_identity_conflicts(&workspace, "alternativeSameInput");
+    assert_proven_unordered_unprotected_conflict(
+        &result,
+        "both alternative returns carry the same input pointer",
+    );
+}
+
+/// An unknown branch selecting between two distinct pointers cannot prove that
+/// the returned result aliases the first input. It may remain open, but must
+/// not fabricate a proven conflict.
+#[test]
+fn go_heap_identity_does_not_fabricate_alternative_distinct_input_race() {
+    let (_project, workspace) = heap_identity_workspace();
+    let result = heap_identity_conflicts(&workspace, "alternativeDistinctInputs");
+    assert_no_proven_conflicts_with_explanation(&result);
+}
+
+/// Unbound pointer inputs through the same alternative-return helper must keep
+/// their missing object identity explicit when the route cannot be resolved.
+#[test]
+fn go_heap_identity_keeps_alternative_unknown_inputs_open() {
+    let (_project, workspace) = heap_identity_workspace();
+    let result = heap_identity_conflicts(&workspace, "alternativeUnknownInputs");
+    assert_no_proven_conflicts_with_explicit_evidence(&result);
+}
+
+/// Each repeated child calls the factory for its own cell before writing it.
+/// The result allocations must stay disjoint; an unresolved result may remain
+/// open, but a result-identity mistake must not become a proven race.
+#[test]
+fn go_heap_identity_keeps_repeated_factory_results_fresh() {
+    let (_project, workspace) = heap_identity_workspace();
+    let result = heap_identity_conflicts(&workspace, "repeatedFactoryChildren");
+    assert_no_proven_conflicts_with_explanation(&result);
+}
+
+/// A factory result created outside the child tasks is captured by both of
+/// them, so its result identity must be preserved as one shared location.
+#[test]
+fn go_heap_identity_preserves_shared_factory_result_outside_children() {
+    let (_project, workspace) = heap_identity_workspace();
+    let result = heap_identity_conflicts(&workspace, "sharedFactoryResult");
+    assert_proven_unordered_unprotected_conflict(
+        &result,
+        "a factory result shared outside child tasks must retain its race",
+    );
+}
+
+/// The unnamed return evaluates the nil local before the defer assigns a fresh
+/// cell. The guarded caller must not be treated as writing that fresh cell.
+#[test]
+fn go_heap_identity_does_not_bind_return_before_defer_local_to_fresh_cell() {
+    let (_project, workspace) = heap_identity_workspace();
+    let result = heap_identity_conflicts(&workspace, "deferredLocalReturnUse");
+    assert_no_proven_conflicts_with_explanation(&result);
+}
+
+/// The return value is the nonnil incoming pointer, while the deferred
+/// parameter reassignment creates a separate cell for its spawned writer.
+#[test]
+fn go_heap_identity_does_not_bind_return_before_defer_parameter_to_fresh_cell() {
+    let (_project, workspace) = heap_identity_workspace();
+    let result = heap_identity_conflicts(&workspace, "deferredParameterReturnUse");
+    assert_no_proven_conflicts_with_explicit_evidence(&result);
+}
+
+/// An explicit IndexedReturn observes the pre-cleanup `input` value. The named
+/// result is replaced by a fresh cell in defer, so the two post-call writes are
+/// disjoint and must not become a fabricated proven race.
+#[test]
+fn go_heap_identity_does_not_use_pre_cleanup_named_result_identity() {
+    let (_project, workspace) = heap_identity_workspace();
+    let result = heap_identity_conflicts(&workspace, "deferredNamedResultUse");
+    assert_no_proven_conflicts_with_explanation(&result);
+}
+
+/// A defer that leaves the returned pointer unchanged must preserve its shared
+/// identity. This guards against treating every deferred result as unstable.
+#[test]
+fn go_heap_identity_preserves_stable_deferred_result_identity() {
+    let (_project, workspace) = heap_identity_workspace();
+    let result = heap_identity_conflicts(&workspace, "stableDeferredResultUse");
+    assert_proven_unordered_unprotected_conflict(
+        &result,
+        "an unchanged deferred result must preserve one shared pointer",
+    );
+}
+
+/// The returned pointer is evaluated before the escaped closure later
+/// reassigns its captured binding. The closure is returned as a function
+/// value, so its body is not necessarily expanded into the invocation graph.
+/// Its later write targets the fresh cell and must stay open rather than
+/// becoming a fabricated race with the returned old cell.
+#[test]
+fn go_heap_identity_keeps_escaped_result_mutation_open() {
+    let (_project, workspace) = heap_identity_workspace();
+    let result = heap_identity_conflicts(&workspace, "escapedClosureMutationUse");
+    assert_no_proven_conflicts_with_explanation(&result);
+    assert_conflict_or_explicit_open(&result);
+}
+
+/// The callback runs before the helper returns, while `run` is obtained from a
+/// function-valued result. This exercises the captured assignment on the
+/// pre-return path even when that indirect callee is unavailable for graph
+/// expansion. The returned `c` and original `first` are distinct allocations,
+/// so the result relation must retain explicit uncertainty.
+#[test]
+fn go_heap_identity_keeps_pre_return_hidden_capture_open() {
+    let (_project, workspace) = heap_identity_workspace();
+    let result = heap_identity_conflicts(&workspace, "preReturnHiddenCaptureUse");
+    assert_no_proven_conflicts_with_explanation(&result);
+    assert_conflict_or_explicit_open(&result);
+}
+
+/// `copied` reads the old pointer before `source` is assigned again.
+/// The two returned pointer ordinals therefore refer to distinct
+/// allocations; unresolved reaching-definition identity must not prove a race.
+#[test]
+fn go_heap_identity_keeps_copied_pointer_before_later_assignment_open() {
+    let (_project, workspace) = heap_identity_workspace();
+    let result = heap_identity_conflicts(&workspace, "copiedPointerReadBeforeLaterAssignmentUse");
+    assert_no_proven_conflicts_with_explicit_evidence(&result);
+}
+
+/// A zero-valued pointer is copied before its source's only explicit store.
+/// The guarded nil copy cannot race with the later fresh allocation.
+#[test]
+fn go_heap_identity_keeps_copy_before_sole_source_store_open() {
+    let (_project, workspace) = heap_identity_workspace();
+    let result = heap_identity_conflicts(&workspace, "copyBeforeSoleSourceStoreUse");
+    assert_no_proven_conflicts_with_explicit_evidence(&result);
+}
+
+/// The unmodeled goto reaches a different return. A cut in the retained CFG
+/// cannot prove that the first return is the only result at runtime.
+#[test]
+fn go_heap_identity_keeps_unmodeled_return_transfer_open() {
+    let (_project, workspace) = heap_identity_workspace();
+    let result = heap_identity_conflicts(&workspace, "unmodeledReturnTransferUse");
+    assert_no_proven_conflicts_with_explicit_evidence(&result);
+}
+
+#[test]
+fn go_heap_identity_keeps_returned_slice_offsets_distinct_or_open() {
+    let (_project, workspace) = heap_identity_workspace();
+    let result = heap_identity_conflicts(&workspace, "distinctReturnedSliceOffsets");
+    assert_no_proven_conflicts_with_explicit_evidence(&result);
+}
+
+#[test]
+fn go_heap_identity_preserves_returned_zero_offset_slices() {
+    let (_project, workspace) = heap_identity_workspace();
+    let result = heap_identity_conflicts(&workspace, "sameReturnedSliceOffsets");
+    assert_proven_unordered_unprotected_conflict(
+        &result,
+        "zero-offset returned slices share backing elements",
+    );
+}
+
+/// A same-file type alias deliberately leaves result storage metadata
+/// unavailable. The input and returned pointer are equal at runtime, but the
+/// analyzer must retain explicit uncertainty instead of proving a race from
+/// an unsupported result type shape.
+#[test]
+fn go_heap_identity_keeps_unavailable_result_type_metadata_open() {
+    let (_project, workspace) = heap_identity_workspace();
+    let result = heap_identity_conflicts(&workspace, "unavailableResultTypeMetadataUse");
+    assert_no_proven_conflicts_with_explicit_evidence(&result);
+}
+
+#[test]
+fn go_heap_identity_does_not_retain_reassigned_formal_entry_results() {
+    let (_project, workspace) = heap_identity_workspace();
+    for root in [
+        "reassignedDirectResultParameter",
+        "reassignedDirectResultReceiver",
+    ] {
+        let result = heap_identity_conflicts(&workspace, root);
+        assert_no_proven_conflicts_with_explicit_evidence(&result);
     }
+}
+
+#[test]
+fn go_heap_identity_does_not_retain_reassigned_formal_entry_allocations() {
+    let (_project, workspace) = heap_identity_workspace();
+    for root in [
+        "reassignedDirectLiteralParameter",
+        "reassignedDirectLiteralReceiver",
+    ] {
+        let result = heap_identity_conflicts(&workspace, root);
+        assert_no_proven_conflicts_with_explicit_evidence(&result);
+    }
+}
+
+#[test]
+fn go_heap_identity_preserves_stable_formal_entry_results() {
+    let (_project, workspace) = heap_identity_workspace();
+    let result = heap_identity_conflicts(&workspace, "stableDirectResultParameter");
+    assert_proven_unordered_unprotected_conflict(
+        &result,
+        "a named unchanged formal must retain the caller's allocation result",
+    );
 }
 
 /// A channel publishes one object to another task.
@@ -7659,22 +8495,7 @@ fn go_channel_transport_publishes_its_payload() {
 /// Count the proven conflicts a root reports, which is what every heap-identity
 /// route above is asking about.
 fn proven_conflicts(workspace: &WorkspaceAnalyzer, root: &str) -> usize {
-    let query = CodeQuery::from_json(&json!({
-        "languages": ["go"],
-        "match": { "kind": "function", "name": root },
-        "steps": [
-            { "op": "procedure_of" },
-            { "op": "concurrent_access_conflicts" }
-        ],
-        "result_detail": "full"
-    }))
-    .expect("heap identity concurrent access query");
-    let result = execute_workspace(
-        workspace,
-        &brokk_bifrost_flow::FlowWorkspaceState::new(),
-        &query,
-    );
-    result
+    heap_identity_conflicts(workspace, root)
         .results
         .iter()
         .filter(|item| {
@@ -7685,6 +8506,24 @@ fn proven_conflicts(workspace: &WorkspaceAnalyzer, root: &str) -> usize {
             )
         })
         .count()
+}
+
+fn heap_identity_conflicts(workspace: &WorkspaceAnalyzer, root: &str) -> CodeQueryResult {
+    let query = CodeQuery::from_json(&json!({
+        "languages": ["go"],
+        "match": { "kind": "function", "name": root },
+        "steps": [
+            { "op": "procedure_of" },
+            { "op": "concurrent_access_conflicts" }
+        ],
+        "result_detail": "full"
+    }))
+    .expect("heap identity concurrent access query");
+    execute_workspace(
+        workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &query,
+    )
 }
 
 /// The project owns the temporary directory the analyzer reads from, so it is
@@ -7788,6 +8627,292 @@ func distinctResult() {
     go func() { c.n = 2 }()
 }
 
+func copyCell(c *cell) cell { return *c }
+
+func structValueResultCopy() {
+    c := makeCell()
+    returned := copyCell(c)
+    go func() { returned.n = 1 }()
+    go func() { c.n = 2 }()
+}
+
+func pointerPair(first, second *cell) (*cell, *cell) {
+    return first, second
+}
+
+func samePointerResultOrdinals() {
+    c := makeCell()
+    first, second := pointerPair(c, c)
+    go func() { first.n = 1 }()
+    go func() { second.n = 2 }()
+}
+
+func distinctPointerResultOrdinals() {
+    first, second := pointerPair(makeCell(), makeCell())
+    go func() { first.n = 1 }()
+    go func() { second.n = 2 }()
+}
+
+func alternateCell(first, second *cell, chooseFirst bool) *cell {
+    if chooseFirst {
+        return first
+    }
+    return second
+}
+
+func alternativeSameInput(chooseFirst bool) {
+    c := makeCell()
+    returned := alternateCell(c, c, chooseFirst)
+    go func() { returned.n = 1 }()
+    go func() { c.n = 2 }()
+}
+
+func alternativeDistinctInputs(chooseFirst bool) {
+    first := makeCell()
+    second := makeCell()
+    returned := alternateCell(first, second, chooseFirst)
+    go func() { returned.n = 1 }()
+    go func() { first.n = 2 }()
+}
+
+func alternativeUnknownInputs(chooseFirst bool, first, second *cell) {
+    returned := alternateCell(first, second, chooseFirst)
+    go func() { returned.n = 1 }()
+    go func() { first.n = 2 }()
+}
+
+func repeatedFactoryChildren() {
+    for {
+        go func() {
+            local := makeCell()
+            local.n = 1
+        }()
+    }
+}
+
+func sharedFactoryResult() {
+    c := makeCell()
+    go func() { c.n = 1 }()
+    go func() { c.n = 2 }()
+}
+
+func returnBeforeDeferLocal() *cell {
+    var local *cell
+    defer func() {
+        local = &cell{}
+        go func() { local.n = 1 }()
+    }()
+    return local
+}
+
+func deferredLocalReturnUse() {
+    returned := returnBeforeDeferLocal()
+    if returned != nil {
+        go func() { returned.n = 2 }()
+    }
+}
+
+func returnBeforeDeferParameter(input *cell) *cell {
+    defer func() {
+        input = &cell{}
+        go func() { input.n = 1 }()
+    }()
+    return input
+}
+
+func deferredParameterReturnUse(input *cell) {
+    if input == nil {
+        return
+    }
+    returned := returnBeforeDeferParameter(input)
+    go func() { returned.n = 2 }()
+}
+
+func namedResultDeferredMutation(input *cell) (returned *cell, ok bool) {
+    defer func() {
+        returned = &cell{}
+    }()
+    return input, true
+}
+
+func deferredNamedResultUse() {
+    source := makeCell()
+    returned, _ := namedResultDeferredMutation(source)
+    go func() { returned.n = 1 }()
+    go func() { source.n = 2 }()
+}
+
+func stableDeferredResult(input *cell) *cell {
+    defer func() { _ = input }()
+    return input
+}
+
+func stableDeferredResultUse() {
+    c := makeCell()
+    returned := stableDeferredResult(c)
+    go func() { returned.n = 1 }()
+    go func() { c.n = 2 }()
+}
+
+func escapedClosureResult() (*cell, func()) {
+    c := makeCell()
+    mutate := func() {
+        c = makeCell()
+        c.n = 1
+    }
+    return c, mutate
+}
+
+func escapedClosureMutationUse() {
+    returned, mutate := escapedClosureResult()
+    go func() { returned.n = 2 }()
+    go mutate()
+}
+
+func callbackRunner() (int, func(func())) {
+    return 0, func(f func()) { f() }
+}
+
+func preReturnHiddenCapture() (*cell, *cell) {
+    _, run := callbackRunner()
+    first := makeCell()
+    c := first
+    run(func() { c = makeCell() })
+    return c, first
+}
+
+func preReturnHiddenCaptureUse() {
+    current, original := preReturnHiddenCapture()
+    go func() { current.n = 1 }()
+    go func() { original.n = 2 }()
+}
+
+func copiedBeforeSourceAssignment() (*cell, *cell) {
+    source := makeCell()
+    copied := source
+    source = makeCell()
+    return copied, source
+}
+
+func copiedPointerReadBeforeLaterAssignmentUse() {
+    copied, fresh := copiedBeforeSourceAssignment()
+    go func() { copied.n = 1 }()
+    go func() { fresh.n = 2 }()
+}
+
+func copyBeforeSoleSourceStore() (*cell, *cell) {
+    var source *cell
+    copied := source
+    source = makeCell()
+    return copied, source
+}
+
+func copyBeforeSoleSourceStoreUse() {
+    copied, fresh := copyBeforeSoleSourceStore()
+    if copied != nil {
+        go func() { copied.n = 1 }()
+    }
+    go func() { fresh.n = 2 }()
+}
+
+func resultAcrossGoto(first, second *cell, chooseSecond bool) *cell {
+    if chooseSecond {
+        goto alternate
+    }
+    return first
+alternate:
+    return second
+}
+
+func unmodeledReturnTransferUse() {
+    first := makeCell()
+    second := makeCell()
+    returned := resultAcrossGoto(first, second, true)
+    go func() { returned.n = 1 }()
+    go func() { first.n = 2 }()
+}
+
+func splitSliceResult() ([]int, []int) {
+    values := make([]int, 2)
+    return values[:1], values[1:]
+}
+
+func sameSliceResult() ([]int, []int) {
+    values := make([]int, 2)
+    return values[:1], values[:1]
+}
+
+func distinctReturnedSliceOffsets() {
+    first, second := splitSliceResult()
+    go func() { first[0] = 1 }()
+    go func() { second[0] = 2 }()
+}
+
+func sameReturnedSliceOffsets() {
+    first, second := sameSliceResult()
+    go func() { first[0] = 1 }()
+    go func() { second[0] = 2 }()
+}
+
+type opaquePointer = *cell
+
+func opaquePointerResult(input opaquePointer) opaquePointer {
+    return input
+}
+
+func replaceDirectResultParameter(p *cell) {
+    p = opaquePointerResult(makeCell())
+    p.n = 1
+}
+
+func (p *cell) replaceDirectResultReceiver() {
+    p = opaquePointerResult(makeCell())
+    p.n = 1
+}
+
+func writeStableResultParameter(p *cell) { p.n = 1 }
+
+func reassignedDirectResultParameter() {
+    original := makeCell()
+    go replaceDirectResultParameter(original)
+    go func() { original.n = 2 }()
+}
+
+func reassignedDirectResultReceiver() {
+    original := makeCell()
+    go original.replaceDirectResultReceiver()
+    go func() { original.n = 2 }()
+}
+
+func stableDirectResultParameter() {
+    original := makeCell()
+    go writeStableResultParameter(original)
+    go func() { original.n = 2 }()
+}
+
+func reassignedDirectLiteralParameter() {
+    original := &cell{}
+    go replaceDirectResultParameter(original)
+    go func() { original.n = 2 }()
+}
+
+func reassignedDirectLiteralReceiver() {
+    original := &cell{}
+    go original.replaceDirectResultReceiver()
+    go func() { original.n = 2 }()
+}
+
+func unavailableResultTypeMetadataUse() {
+    source := makeCell()
+    returned := opaquePointerResult(source)
+    go func() {
+        if returned != nil {
+            returned.n = 1
+        }
+    }()
+    go func() { source.n = 2 }()
+}
+
 func sharedInterface() {
     c := &cell{}
     var b bumper = c
@@ -7848,24 +8973,11 @@ func channelPublish() {
     (project, workspace)
 }
 
-/// A parameter the body reassigns is not the caller's object, and its write
-/// must not be reported against the caller's.
-///
-/// Each spawned instance allocates its own `&holder{}`, so the write reaches a
-/// task-local object and no two instances touch the same one. It is reported
-/// anyway, as a **proven, exhaustive** conflict with no open reason.
-///
-/// This is pre-existing and independent of the captured-formal fix beside it:
-/// it reproduces identically with that fix reverted, because the cell takes
-/// the ordinary written-once path on the body's own store and is named from
-/// the reassignment's fresh allocation rather than being recognised as
-/// task-local.
-///
-/// Found while building the copy-negatives for
-/// `go_closure_capture_of_a_formal_keeps_its_identity`. Owned by #2902.
+/// A reassigned formal must not manufacture shared storage from conflicting
+/// caller and callee allocation identities. Until assignment states are
+/// separated, this route is explicitly incomplete rather than a proven race.
 #[test]
-#[ignore = "finds real bug: a reassigned parameter's task-local write is reported as a race (#2902)"]
-fn go_reassigned_parameter_write_is_task_local() {
+fn go_reassigned_parameter_does_not_fabricate_shared_identity() {
     let project = InlineTestProject::with_language(Language::Go)
         .file(
             "main.go",
@@ -7928,6 +9040,1226 @@ func repeatedReassignedParameter() {
         reported, 0,
         "each instance allocates its own holder, so the write is task-local: {result:#?}"
     );
+    assert!(
+        result.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == CodeQueryDiagnosticCode::SemanticAnalysisPartial
+                && diagnostic.message.contains("UnknownLocation")
+        }),
+        "conflicting identity evidence must not become a complete empty answer: {result:#?}"
+    );
+}
+
+/// A direct sibling race is the control for invocation-sensitive task identity.
+#[test]
+fn go_concurrent_access_conflicts_preserve_direct_sibling_control() {
+    let (_project, workspace) = go_invocation_identity_workspace();
+    let result = go_invocation_conflicts(&workspace, "directSameCell");
+    assert_proven_exhaustive_sibling_conflicts(&result, 3);
+}
+
+/// A formal pair has no caller binding when the queried procedure is the root.
+/// The solver must retain that missing identity as explicit open evidence rather
+/// than silently returning a clean empty answer.
+#[test]
+fn go_concurrent_access_conflicts_keep_unbound_formals_open() {
+    let (_project, workspace) = go_invocation_identity_workspace();
+    let result = go_invocation_conflicts(&workspace, "inputs");
+    assert_no_proven_conflicts_with_explicit_evidence(&result);
+}
+
+/// Rebinding the same allocation to both pointer formals must preserve one
+/// proven location across the two sibling children.
+#[test]
+fn go_concurrent_access_conflicts_project_same_pointer_formals() {
+    let (_project, workspace) = go_invocation_identity_workspace();
+    let result = go_invocation_conflicts(&workspace, "sameInput");
+    assert_proven_unordered_unprotected_conflict(
+        &result,
+        "same pointer actuals must retain their proven race",
+    );
+}
+
+/// Distinct pointer actuals passed to one helper remain disjoint with complete
+/// coverage and no hidden identity diagnostic.
+#[test]
+fn go_concurrent_access_conflicts_keep_distinct_pointer_formals_disjoint() {
+    let (_project, workspace) = go_invocation_identity_workspace();
+    let result = go_invocation_conflicts(&workspace, "differentInput");
+    assert_eq!(
+        result.completion(),
+        CodeQueryCompletion::Complete,
+        "distinct pointer actuals must resolve completely: {result:#?}"
+    );
+    assert!(
+        result.diagnostics.is_empty(),
+        "distinct pointer actuals must not hide an identity diagnostic: {result:#?}"
+    );
+    assert_no_concurrent_conflicts(&result);
+}
+
+/// Holder payload identity is not modeled yet. Keep both the unbound formal
+/// route and same/different pointer initializers explicit and unproven rather
+/// than accepting a clean zero or manufacturing a race.
+#[test]
+fn go_concurrent_access_conflicts_keep_holder_payload_routes_open() {
+    let (_project, workspace) = go_invocation_identity_workspace();
+    for root in [
+        "holderInputs",
+        "samePointeeInDifferentHolders",
+        "distinctPointeesInDifferentHolders",
+    ] {
+        let result = go_invocation_conflicts(&workspace, root);
+        assert_no_proven_conflicts_with_explicit_evidence(&result);
+    }
+}
+
+/// Separate inline struct values have disjoint direct field storage, even
+/// though both accesses use the same field selector.
+#[test]
+fn go_concurrent_access_conflicts_keep_distinct_inline_struct_fields_disjoint() {
+    let (_project, workspace) = go_invocation_identity_workspace();
+    let result = go_invocation_conflicts(&workspace, "distinctInlineStructFields");
+    assert_eq!(
+        result.completion(),
+        CodeQueryCompletion::Complete,
+        "distinct inline struct fields must resolve completely: {result:#?}"
+    );
+    assert!(
+        result.diagnostics.is_empty(),
+        "distinct inline struct fields must not hide an identity diagnostic: {result:#?}"
+    );
+    assert_no_concurrent_conflicts(&result);
+}
+
+/// Two synchronous calls to one helper launch two children that receive the
+/// same pointer actual. Their accesses must retain the caller's allocation
+/// identity through each invocation boundary.
+#[test]
+fn go_concurrent_access_conflicts_project_same_pointer_through_helper_invocations() {
+    let (_project, workspace) = go_invocation_identity_workspace();
+    let result = go_invocation_conflicts(&workspace, "sameCellThroughHelperCalls");
+    // Both activations use the same source sites, so the two read/write
+    // orientations project to one row, alongside the write/write row.
+    assert_proven_exhaustive_sibling_conflicts(&result, 2);
+}
+
+/// Distinct pointer actuals passed through the same helper remain disjoint,
+/// and the complete answer has no hidden identity diagnostic.
+#[test]
+fn go_concurrent_access_conflicts_keep_distinct_helper_actuals_complete() {
+    let (_project, workspace) = go_invocation_identity_workspace();
+    let result = go_invocation_conflicts(&workspace, "distinctPointerActuals");
+    assert_eq!(
+        result.completion(),
+        CodeQueryCompletion::Complete,
+        "distinct helper actuals must resolve completely: {result:#?}"
+    );
+    assert!(
+        result.diagnostics.is_empty(),
+        "disjoint helper actuals must not hide an identity diagnostic: {result:#?}"
+    );
+    assert_no_concurrent_conflicts(&result);
+}
+
+/// A helper that calls the same launcher from mutually exclusive branches
+/// creates at most one child per invocation. Expanding both branch calls must
+/// not manufacture a proven sibling race. If the branch proof is incomplete,
+/// the result must say so explicitly.
+#[test]
+fn go_concurrent_access_conflicts_do_not_compare_mutually_exclusive_launcher_calls() {
+    let (_project, workspace) = go_invocation_identity_workspace();
+    let result = go_invocation_conflicts(&workspace, "conditionalAtMostOne");
+    for item in &result.results {
+        let CodeQueryResultValue::ConcurrentAccessConflict { value } = &item.value else {
+            panic!("concurrent_access_conflicts returns its typed row: {item:#?}");
+        };
+        assert!(
+            !(value.verdict == "conflict" && value.proof == "proven"),
+            "mutually exclusive launcher branches cannot prove a sibling race: {result:#?}"
+        );
+        if value.proof != "proven" {
+            assert!(
+                !value.reasons.is_empty(),
+                "an unproven conditional relation must retain an explicit reason: {result:#?}"
+            );
+        }
+    }
+    if result.results.is_empty() {
+        assert!(
+            result.completion() == CodeQueryCompletion::Complete || !result.diagnostics.is_empty(),
+            "an empty conditional result needs complete coverage or an explicit diagnostic: {result:#?}"
+        );
+    } else if result.completion() != CodeQueryCompletion::Complete {
+        assert!(
+            !result.diagnostics.is_empty(),
+            "an incomplete conditional result must retain its diagnostic: {result:#?}"
+        );
+    }
+}
+
+/// Calls with no shared input allocate their task-local object inside each
+/// helper activation. The two child tasks must remain disjoint.
+#[test]
+fn go_concurrent_access_conflicts_keep_helper_local_allocations_disjoint() {
+    let (_project, workspace) = go_invocation_identity_workspace();
+    let result = go_invocation_conflicts(&workspace, "independentLocalInvocations");
+    assert_eq!(
+        result.completion(),
+        CodeQueryCompletion::Complete,
+        "task-local helper allocations must resolve completely: {result:#?}"
+    );
+    assert!(
+        result.diagnostics.is_empty(),
+        "task-local helper allocations must not hide an identity diagnostic: {result:#?}"
+    );
+    assert_no_concurrent_conflicts(&result);
+}
+
+/// Two synchronous helper invocations each launch a child and wait for it to
+/// close its local channel. The shared pointer is reused safely because the
+/// first child completes before the second invocation starts.
+#[test]
+fn go_concurrent_access_conflicts_keep_joined_helper_invocations_ordered() {
+    let (_project, workspace) = go_invocation_identity_workspace();
+    let result = go_invocation_conflicts(&workspace, "joinedHelperInvocations");
+    assert_no_proven_unordered_unprotected_conflicts(&result);
+}
+
+/// Repeating the joined helper in a loop still completes each child before
+/// the next invocation, so the shared pointer must not be reported as a race.
+#[test]
+fn go_concurrent_access_conflicts_keep_looped_joined_helper_invocations_ordered() {
+    let (_project, workspace) = go_invocation_identity_workspace();
+    let result = go_invocation_conflicts(&workspace, "loopedJoinedHelperInvocations");
+    assert_no_proven_unordered_unprotected_conflicts(&result);
+}
+
+/// A conditional receive does not establish a mandatory join. With an
+/// unknown condition, the two helper invocations must retain a proven race.
+#[test]
+fn go_concurrent_access_conflicts_do_not_make_conditional_wait_mandatory() {
+    let (_project, workspace) = go_invocation_identity_workspace();
+    let result = go_invocation_conflicts(&workspace, "conditionalWaitHelperInvocations");
+    let value = find_concurrent_relation(&result, |value| {
+        value.verdict == "conflict" && value.proof == "proven"
+    });
+    assert_eq!(
+        (value.ordering, value.protection, value.proof),
+        ("unordered", "unprotected", "proven"),
+        "conditional wait must leave an unprotected race: {result:#?}"
+    );
+}
+
+/// Two parallel parent task activations each run joined children. The local
+/// joins order accesses within a parent, but cannot order the two parents.
+#[test]
+fn go_concurrent_access_conflicts_keep_parallel_joined_parent_race() {
+    let (_project, workspace) = go_invocation_identity_workspace();
+    let result = go_invocation_conflicts(&workspace, "parallelJoinedParentTasks");
+    let value = find_concurrent_relation(&result, |value| {
+        value.verdict == "conflict" && value.proof == "proven"
+    });
+    assert_eq!(
+        (value.ordering, value.protection, value.proof),
+        ("unordered", "unprotected", "proven"),
+        "parallel parent activations must retain their race: {result:#?}"
+    );
+}
+
+/// Repeating a helper that allocates its object inside the helper must not
+/// collapse those per-invocation allocations into one shared location.
+#[test]
+fn go_concurrent_access_conflicts_keep_looped_helper_locals_disjoint() {
+    let (_project, workspace) = go_invocation_identity_workspace();
+    let result = go_invocation_conflicts(&workspace, "loopedLocalHelperInvocations");
+    assert_no_proven_conflicts_with_explanation(&result);
+}
+
+/// Repeating a helper with one external pointer actual must keep that actual's
+/// identity across every invocation, so the repeated children still race.
+#[test]
+fn go_concurrent_access_conflicts_keep_looped_shared_helper_race() {
+    let (_project, workspace) = go_invocation_identity_workspace();
+    let result = go_invocation_conflicts(&workspace, "loopedSharedHelperInvocations");
+    assert_eq!(
+        result.completion(),
+        CodeQueryCompletion::Complete,
+        "repeated shared helper query must resolve completely: {result:#?}"
+    );
+    assert!(
+        result.diagnostics.is_empty(),
+        "repeated shared helper race must not retain identity diagnostics: {result:#?}"
+    );
+    let conflicts = result
+        .results
+        .iter()
+        .filter_map(|item| {
+            let CodeQueryResultValue::ConcurrentAccessConflict { value } = &item.value else {
+                panic!("concurrent_access_conflicts returns its typed row: {item:#?}");
+            };
+            (value.verdict == "conflict").then_some(value)
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        !conflicts.is_empty(),
+        "repeated shared helper calls must retain a proven race: {result:#?}"
+    );
+    for value in conflicts {
+        assert_eq!(
+            (
+                value.ordering,
+                value.protection,
+                value.proof,
+                value.coverage
+            ),
+            ("unordered", "unprotected", "proven", "exhaustive"),
+            "repeated shared helper conflicts must remain proven: {result:#?}"
+        );
+    }
+}
+
+/// A dynamic slice index has a known backing store but no exact element
+/// identity. Repetition must keep that uncertainty visible even for one static
+/// write, where only the self-comparison path can discover a repeated conflict.
+#[test]
+fn go_concurrent_access_conflicts_keep_repeated_unknown_index_routes_open() {
+    let (_project, workspace) = go_invocation_identity_workspace();
+    let result = go_invocation_conflicts(&workspace, "repeatedUnknownIndexOneWrite");
+    assert_no_proven_conflicts_with_explicit_evidence(&result);
+}
+
+#[test]
+fn go_concurrent_access_conflicts_keep_repeated_unknown_index_pairs_open() {
+    let (_project, workspace) = go_invocation_identity_workspace();
+    let result = go_invocation_conflicts(&workspace, "repeatedUnknownIndexTwoWrites");
+    assert_no_proven_conflicts_with_explicit_evidence(&result);
+    let value = find_concurrent_relation(&result, |value| {
+        value.location_kind == "index"
+            && value.first_point_id != value.second_point_id
+            && value.first_access == "write"
+            && value.second_access == "write"
+            && value.proof == "open"
+            && value.coverage == "open"
+    });
+    assert!(
+        value
+            .reasons
+            .iter()
+            .any(|reason| reason == "unknown_location")
+    );
+}
+
+/// A constant element of one slice remains one location across repeated child
+/// instances. This is the positive control for the open dynamic-index routes.
+#[test]
+fn go_concurrent_access_conflicts_prove_repeated_constant_index_shared_slice_race() {
+    let (_project, workspace) = go_invocation_identity_workspace();
+    let result = go_invocation_conflicts(&workspace, "repeatedConstantIndexSharedSlice");
+    assert_proven_unordered_unprotected_conflict(
+        &result,
+        "a repeated constant-index write to one shared slice must race",
+    );
+}
+
+/// A slice allocated inside each child has a distinct backing allocation,
+/// even when its selected index is unknown. Keep this negative
+/// complete so an allocation-context mistake cannot hide behind open evidence.
+#[test]
+fn go_concurrent_access_conflicts_keep_repeated_fresh_index_storage_complete() {
+    let (_project, workspace) = go_invocation_identity_workspace();
+    let result = go_invocation_conflicts(&workspace, "repeatedFreshIndexStorage");
+    assert_eq!(
+        result.completion(),
+        CodeQueryCompletion::Complete,
+        "fresh repeated slice allocations must resolve completely: {result:#?}"
+    );
+    assert!(
+        result.diagnostics.is_empty(),
+        "fresh repeated slice allocations must not hide an identity diagnostic: {result:#?}"
+    );
+    assert_no_concurrent_conflicts(&result);
+}
+
+/// A repeated worker sends its fresh cell before receiving from a two-slot
+/// channel. The receive may obtain another worker's published cell, but that
+/// payload identity is unresolved, so the local.n/got.n write pair stays open.
+#[test]
+fn go_concurrent_access_conflicts_keep_repeated_channel_publication_open() {
+    let (_project, workspace) = go_invocation_identity_workspace();
+    let result = go_invocation_conflicts(&workspace, "repeatedPublishedWorkers");
+    assert_no_proven_conflicts_with_explanation(&result);
+    let value = find_concurrent_relation(&result, |value| {
+        value.verdict == "conflict"
+            && value.task_relation == "repeated"
+            && value.first_procedure_id == value.second_procedure_id
+            && value.first_point_id != value.second_point_id
+            && value.first_access == "write"
+            && value.second_access == "write"
+            && value.location_kind == "field"
+            && value.proof == "open"
+            && value.coverage == "open"
+    });
+    assert!(
+        value
+            .reasons
+            .iter()
+            .any(|reason| reason == "unknown_location"),
+        "the local.n/got.n publication pair must retain unknown identity evidence: {result:#?}"
+    );
+}
+
+/// An unjoined child from an earlier helper invocation can overlap the next
+/// invocation's synchronous write through the shared pointer actual.
+#[test]
+fn go_concurrent_access_conflicts_keep_looped_unjoined_helper_race() {
+    let (_project, workspace) = go_invocation_identity_workspace();
+    let result =
+        go_invocation_conflicts(&workspace, "loopedUnjoinedWriteThenReadHelperInvocations");
+    assert_proven_unordered_unprotected_conflict(
+        &result,
+        "looped unjoined helper invocations must retain their race",
+    );
+}
+
+/// A mandatory receive completes each helper child before the next helper
+/// invocation writes through the shared pointer actual.
+#[test]
+fn go_concurrent_access_conflicts_keep_looped_joined_helper_safe() {
+    let (_project, workspace) = go_invocation_identity_workspace();
+    let result = go_invocation_conflicts(&workspace, "loopedJoinedWriteThenReadHelperInvocations");
+    assert_no_proven_unordered_unprotected_conflicts(&result);
+}
+
+/// The direct loop has the same unjoined ordering boundary without an
+/// invocation edge, so an earlier child can race with a later loop write.
+#[test]
+fn go_concurrent_access_conflicts_keep_looped_unjoined_direct_race() {
+    let (_project, workspace) = go_invocation_identity_workspace();
+    let result = go_invocation_conflicts(&workspace, "loopedUnjoinedWriteThenReadDirectly");
+    assert_proven_unordered_unprotected_conflict(
+        &result,
+        "looped unjoined direct accesses must retain their race",
+    );
+}
+
+/// A mandatory receive in each direct loop iteration orders the child read
+/// before the next write.
+#[test]
+fn go_concurrent_access_conflicts_keep_looped_joined_direct_safe() {
+    let (_project, workspace) = go_invocation_identity_workspace();
+    let result = go_invocation_conflicts(&workspace, "loopedJoinedWriteThenReadDirectly");
+    assert_no_proven_unordered_unprotected_conflicts(&result);
+}
+
+/// Parallel parents each allocate their own cell. Their unjoined children are
+/// therefore disjoint despite the repeated parent task shape.
+#[test]
+fn go_concurrent_access_conflicts_keep_parallel_fresh_parent_tasks_safe() {
+    let (_project, workspace) = go_invocation_identity_workspace();
+    let result = go_invocation_conflicts(&workspace, "parallelFreshReadParentTasks");
+    assert_no_proven_unordered_unprotected_conflicts(&result);
+}
+
+/// Each loop iteration allocates its own cell before launching its child. The
+/// repeated allocation site must not make those distinct cells appear shared.
+#[test]
+fn go_concurrent_access_conflicts_keep_looped_fresh_direct_allocations_safe() {
+    let (_project, workspace) = go_invocation_identity_workspace();
+    let result = go_invocation_conflicts(&workspace, "loopedFreshDirectAllocations");
+    assert_no_proven_unordered_unprotected_conflicts(&result);
+}
+
+/// Each repeated helper activation allocates its cell locally before launching
+/// its child. Per-activation allocations must remain disjoint.
+#[test]
+fn go_concurrent_access_conflicts_keep_looped_fresh_helper_allocations_safe() {
+    let (_project, workspace) = go_invocation_identity_workspace();
+    let result = go_invocation_conflicts(&workspace, "loopedFreshHelperAllocations");
+    assert_no_proven_unordered_unprotected_conflicts(&result);
+}
+
+/// Loop-declared lexical cells have one instance per iteration, while a
+/// lexical cell declared outside the loop is shared by every child closure.
+/// Keep the negative explicit when the distinct-cell proof is incomplete and
+/// keep both access orientations of the shared-cell race exact.
+#[test]
+fn go_concurrent_access_conflicts_distinguish_loop_lexical_cells() {
+    let (_project, workspace) = go_invocation_identity_workspace();
+    for root in [
+        "freshLexicalCells",
+        "freshVarLexicalCells",
+        "freshRangeCells",
+    ] {
+        let fresh = go_invocation_conflicts(&workspace, root);
+        assert_no_proven_conflicts_with_explanation(&fresh);
+        assert!(
+            fresh.results.iter().any(|item| matches!(
+                &item.value,
+                CodeQueryResultValue::ConcurrentAccessConflict { value }
+                    if value.proof == "open"
+                        && value.reasons.iter().any(|reason| reason == "unknown_location")
+            )),
+            "iteration-to-cell correspondence is still unresolved and must stay visible: {fresh:#?}"
+        );
+    }
+
+    let unknown = go_invocation_conflicts(&workspace, "gotoLexicalCells");
+    assert_no_proven_conflicts_with_explanation(&unknown);
+    assert!(
+        unknown
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("UnknownLocation")),
+        "unavailable cell lifetime must remain incomplete even without a repeated-task row: {unknown:#?}"
+    );
+
+    for root in ["sharedLexicalCell", "sharedRangeCell"] {
+        let shared = go_invocation_conflicts(&workspace, root);
+        let conflicts = shared
+            .results
+            .iter()
+            .filter_map(|item| {
+                let CodeQueryResultValue::ConcurrentAccessConflict { value } = &item.value else {
+                    panic!("concurrent_access_conflicts returns its typed row: {item:#?}");
+                };
+                (value.verdict == "conflict").then_some(value.as_ref())
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            conflicts.len(),
+            2,
+            "shared lexical cell must retain both access orientations: {shared:#?}"
+        );
+        for value in conflicts {
+            assert_eq!(
+                (
+                    value.task_relation,
+                    value.location_kind.as_str(),
+                    value.ordering,
+                    value.protection,
+                    value.proof,
+                    value.coverage,
+                ),
+                (
+                    "repeated",
+                    "lexical_cell",
+                    "unordered",
+                    "unprotected",
+                    "proven",
+                    "exhaustive",
+                ),
+                "shared lexical cell conflict must remain proven and exhaustive: {shared:#?}"
+            );
+        }
+    }
+}
+
+/// A holder value is recreated on every loop iteration. Its fresh pointer
+/// payload must not be promoted to a proven cross-iteration race, whether the
+/// holder is anonymous or named. If the analyzer cannot establish disjoint
+/// payloads, it must retain an open relation or diagnostic.
+#[test]
+fn go_concurrent_access_conflicts_keep_loop_holder_pointer_origins_precise() {
+    let (_project, workspace) = go_invocation_identity_workspace();
+    for root in ["freshAnonymousHolderPointer", "freshNamedHolderPointer"] {
+        let result = go_invocation_conflicts(&workspace, root);
+        assert_no_proven_conflicts_with_explanation(&result);
+        assert_conflict_or_explicit_open(&result);
+    }
+
+    // These controls use one external pointee through separately-created
+    // holder values. The composite initializer's payload identity is not yet
+    // modeled, so this accepts a retained proven conflict or explicit open
+    // evidence; a clean empty result would hide the unresolved route. Existing
+    // composed-path positives are not certification for this initializer path.
+    for root in ["sharedAnonymousHolderPointer", "sharedNamedHolderPointer"] {
+        let result = go_invocation_conflicts(&workspace, root);
+        assert_conflict_or_explicit_open(&result);
+    }
+}
+
+/// A reference payload of a fresh helper-local holder may itself be shared
+/// or fresh. Its unresolved origin cannot inherit the container's lifetime.
+#[test]
+fn go_concurrent_access_conflicts_keep_helper_holder_pointer_origins_precise() {
+    let (_project, workspace) = go_invocation_identity_workspace();
+    let fresh = go_invocation_conflicts(&workspace, "freshHelperHolderPointer");
+    assert_no_proven_conflicts_with_explanation(&fresh);
+    assert_conflict_or_explicit_open(&fresh);
+    let shared = go_invocation_conflicts(&workspace, "sharedHelperHolderPointer");
+    assert_conflict_or_explicit_open(&shared);
+}
+
+/// Nested value-field projection must preserve allocation origin through a
+/// helper boundary. Fresh helper allocations stay disjoint or explicitly
+/// open, while a shared nestedCell actual retains a proven conflict.
+#[test]
+fn go_concurrent_access_conflicts_keep_nested_helper_allocation_origins() {
+    let (_project, workspace) = go_invocation_identity_workspace();
+    let fresh = go_invocation_conflicts(&workspace, "loopedNestedLocalHelpers");
+    assert_no_proven_conflicts_with_explanation(&fresh);
+
+    let shared = go_invocation_conflicts(&workspace, "loopedNestedSharedHelpers");
+    assert_proven_unordered_unprotected_conflict(
+        &shared,
+        "a shared nestedCell actual must retain its helper race",
+    );
+}
+
+/// A channel receive joins one parent activation. With two repeated parents
+/// sharing the cell, a child read from one activation remains unordered with
+/// the post-wait write in the other activation.
+#[test]
+fn go_concurrent_access_conflicts_do_not_cross_activation_channel_join() {
+    let (_project, workspace) = go_invocation_identity_workspace();
+    let result = go_invocation_conflicts(&workspace, "loopedChannelJoinParentTasks");
+    assert_eq!(
+        result.completion(),
+        CodeQueryCompletion::Complete,
+        "repeated channel-join parents must resolve completely: {result:#?}"
+    );
+    let relation = result
+        .results
+        .iter()
+        .filter_map(|item| {
+            let CodeQueryResultValue::ConcurrentAccessConflict { value } = &item.value else {
+                panic!("concurrent_access_conflicts returns its typed row: {item:#?}");
+            };
+            let read_write = value.first_access != value.second_access
+                && matches!(value.first_access, "read" | "write")
+                && matches!(value.second_access, "read" | "write");
+            (read_write && value.task_relation == "repeated"
+                && value.first_procedure_id != value.second_procedure_id
+                && value.location_kind == "field").then_some(value.as_ref())
+        })
+        .find(|value| value.ordering != "happens_before")
+        .unwrap_or_else(|| {
+            panic!(
+                "a repeated cross-activation read/write relation must not be proven ordered: {result:#?}"
+            )
+        });
+    assert_ne!(
+        relation.ordering, "happens_before",
+        "a channel join cannot order two repeated parent activations: {result:#?}"
+    );
+    if relation.ordering == "open" {
+        assert!(
+            !relation.reasons.is_empty(),
+            "open ordering retains its reason: {result:#?}"
+        );
+    }
+    let fresh = go_invocation_conflicts(&workspace, "loopedFreshChannelJoinParentTasks");
+    assert_no_proven_unordered_unprotected_conflicts(&fresh);
+}
+
+fn assert_no_proven_unordered_unprotected_conflicts(result: &CodeQueryResult) {
+    for item in &result.results {
+        let CodeQueryResultValue::ConcurrentAccessConflict { value } = &item.value else {
+            panic!("concurrent_access_conflicts returns its typed row: {item:#?}");
+        };
+        if value.verdict == "conflict"
+            && value.ordering == "unordered"
+            && value.protection == "unprotected"
+        {
+            assert_ne!(
+                value.proof, "proven",
+                "joined helper calls must not prove an unordered unprotected conflict: {result:#?}"
+            );
+            assert!(
+                !value.reasons.is_empty(),
+                "an unresolved joined conflict must retain an explicit reason: {result:#?}"
+            );
+        }
+    }
+    if result.completion() != CodeQueryCompletion::Complete {
+        assert!(
+            !result.diagnostics.is_empty(),
+            "an incomplete joined helper result must retain its diagnostic: {result:#?}"
+        );
+    }
+}
+
+fn assert_proven_unordered_unprotected_conflict(result: &CodeQueryResult, message: &str) {
+    assert_eq!(
+        result.completion(),
+        CodeQueryCompletion::Complete,
+        "{message}: {result:#?}"
+    );
+    assert!(
+        result.diagnostics.is_empty(),
+        "{message} must not retain identity diagnostics: {result:#?}"
+    );
+    let value = find_concurrent_relation(result, |value| value.verdict == "conflict");
+    assert_eq!(
+        (value.ordering, value.protection, value.proof),
+        ("unordered", "unprotected", "proven"),
+        "{message}: {result:#?}"
+    );
+}
+
+fn assert_conflict_or_explicit_open(result: &CodeQueryResult) {
+    let retained = result.results.iter().any(|item| {
+        let CodeQueryResultValue::ConcurrentAccessConflict { value } = &item.value else {
+            panic!("concurrent_access_conflicts returns its typed row: {item:#?}");
+        };
+        value.verdict == "conflict" || (value.proof == "open" && !value.reasons.is_empty())
+    });
+    assert!(
+        retained || !result.diagnostics.is_empty(),
+        "a missed WaitGroup ordering must retain a conflict or explicit open evidence: {result:#?}"
+    );
+}
+
+fn assert_no_proven_conflicts_with_explanation(result: &CodeQueryResult) {
+    for item in &result.results {
+        let CodeQueryResultValue::ConcurrentAccessConflict { value } = &item.value else {
+            panic!("concurrent_access_conflicts returns its typed row: {item:#?}");
+        };
+        if value.verdict == "conflict" {
+            assert_ne!(
+                value.proof, "proven",
+                "per-invocation helper locals must not prove a conflict: {result:#?}"
+            );
+            assert!(
+                !value.reasons.is_empty(),
+                "an unresolved local-allocation relation must retain an explicit reason: {result:#?}"
+            );
+        }
+    }
+    if result.completion() != CodeQueryCompletion::Complete {
+        assert!(
+            !result.diagnostics.is_empty(),
+            "an incomplete local-allocation result must retain its diagnostic: {result:#?}"
+        );
+    }
+}
+
+fn assert_no_proven_conflicts_with_explicit_evidence(result: &CodeQueryResult) {
+    assert_no_proven_conflicts_with_explanation(result);
+    let open_result = result.results.iter().any(|item| {
+        let CodeQueryResultValue::ConcurrentAccessConflict { value } = &item.value else {
+            panic!("concurrent_access_conflicts returns its typed row: {item:#?}");
+        };
+        value.proof == "open" && !value.reasons.is_empty()
+    });
+    let unknown_diagnostic = result.diagnostics.iter().any(|diagnostic| {
+        diagnostic.message.contains("UnknownLocation")
+            || diagnostic.message.contains("unknown_location")
+    });
+    assert!(
+        open_result || unknown_diagnostic,
+        "an unresolved formal or payload route must retain explicit open evidence: {result:#?}"
+    );
+}
+
+fn assert_proven_exhaustive_sibling_conflicts(result: &CodeQueryResult, expected: usize) {
+    assert_eq!(
+        result.completion(),
+        CodeQueryCompletion::Complete,
+        "sibling identity query must resolve completely: {result:#?}"
+    );
+    assert!(
+        result.diagnostics.is_empty(),
+        "proven sibling conflicts must not retain identity diagnostics: {result:#?}"
+    );
+    let conflicts = result
+        .results
+        .iter()
+        .filter_map(|item| {
+            let CodeQueryResultValue::ConcurrentAccessConflict { value } = &item.value else {
+                panic!("concurrent_access_conflicts returns its typed row: {item:#?}");
+            };
+            (value.verdict == "conflict").then_some(value)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        conflicts.len(),
+        expected,
+        "expected the stable sibling conflict count: {result:#?}"
+    );
+    for value in conflicts {
+        assert_eq!(
+            (
+                value.task_relation,
+                value.ordering,
+                value.protection,
+                value.proof,
+                value.coverage,
+            ),
+            (
+                "siblings",
+                "unordered",
+                "unprotected",
+                "proven",
+                "exhaustive"
+            ),
+            "each sibling conflict must be proven and exhaustive: {result:#?}"
+        );
+    }
+}
+
+fn go_invocation_conflicts(workspace: &WorkspaceAnalyzer, root: &str) -> CodeQueryResult {
+    let query = CodeQuery::from_json(&json!({
+        "languages": ["go"],
+        "match": { "kind": "function", "name": root },
+        "steps": [
+            { "op": "procedure_of" },
+            { "op": "concurrent_access_conflicts" }
+        ],
+        "result_detail": "full"
+    }))
+    .expect("invocation identity concurrent access query");
+    execute_workspace(
+        workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &query,
+    )
+}
+
+fn go_invocation_identity_workspace() -> (inline_project::BuiltInlineTestProject, WorkspaceAnalyzer)
+{
+    let project = InlineTestProject::with_language(Language::Go)
+        .file(
+            "main.go",
+            r#"package main
+
+type cell struct {
+    n int
+}
+
+type holder struct {
+    p *cell
+}
+
+type nestedCell struct {
+    inner cell
+}
+
+func launch(c *cell) {
+    go func() { c.n++ }()
+}
+
+func inputs(a, b *cell) {
+    go func() { a.n = 1 }()
+    go func() { b.n = 2 }()
+}
+
+func sameInput() {
+    p := &cell{}
+    inputs(p, p)
+}
+
+func differentInput() {
+    inputs(&cell{}, &cell{})
+}
+
+func holderInputs(a, b *holder) {
+    go func() { a.p.n = 1 }()
+    go func() { b.p.n = 2 }()
+}
+
+func samePointeeInDifferentHolders() {
+    p := &cell{}
+    holderInputs(&holder{p: p}, &holder{p: p})
+}
+
+func distinctPointeesInDifferentHolders() {
+    holderInputs(&holder{p: &cell{}}, &holder{p: &cell{}})
+}
+
+func distinctInlineStructFields() {
+    first := struct{ n int }{}
+    second := struct{ n int }{}
+    go func() { first.n = 1 }()
+    go func() { second.n = 2 }()
+}
+
+func freshAnonymousHolderPointer() {
+    for index := 0; index < 2; index++ {
+        value := struct{ p *cell }{p: &cell{}}
+        go func() { value.p.n++ }()
+    }
+}
+
+func sharedAnonymousHolderPointer() {
+    shared := &cell{}
+    for index := 0; index < 2; index++ {
+        value := struct{ p *cell }{p: shared}
+        go func() { value.p.n++ }()
+    }
+}
+
+func freshNamedHolderPointer() {
+    for index := 0; index < 2; index++ {
+        value := holder{p: &cell{}}
+        go func() { value.p.n++ }()
+    }
+}
+
+func sharedNamedHolderPointer() {
+    shared := &cell{}
+    for index := 0; index < 2; index++ {
+        value := holder{p: shared}
+        go func() { value.p.n++ }()
+    }
+}
+
+func freshHolderHelper() {
+    value := &holder{p: &cell{}}
+    go func() { value.p.n++ }()
+}
+
+func freshHelperHolderPointer() {
+    for index := 0; index < 2; index++ { freshHolderHelper() }
+}
+
+func sharedHolderHelper(shared *cell) {
+    value := &holder{p: shared}
+    go func() { value.p.n++ }()
+}
+
+func sharedHelperHolderPointer() {
+    shared := &cell{}
+    for index := 0; index < 2; index++ { sharedHolderHelper(shared) }
+}
+
+func nestedLocalHelper() {
+    value := &nestedCell{}
+    go func() { value.inner.n++ }()
+}
+
+func loopedNestedLocalHelpers() {
+    for index := 0; index < 2; index++ {
+        nestedLocalHelper()
+    }
+}
+
+func nestedSharedHelper(value *nestedCell) {
+    go func() { value.inner.n++ }()
+}
+
+func loopedNestedSharedHelpers() {
+    value := &nestedCell{}
+    for index := 0; index < 2; index++ {
+        nestedSharedHelper(value)
+    }
+}
+
+func directSameCell() {
+    c := &cell{}
+    go func() { c.n++ }()
+    go func() { c.n++ }()
+}
+
+func sameCellThroughHelperCalls() {
+    c := &cell{}
+    launch(c)
+    launch(c)
+}
+
+func distinctPointerActuals() {
+    first := &cell{}
+    second := &cell{}
+    launch(first)
+    launch(second)
+}
+
+func conditional(c *cell, choose bool) {
+    if choose {
+        launch(c)
+    } else {
+        launch(c)
+    }
+}
+
+func conditionalAtMostOne(choose bool) {
+    c := &cell{}
+    conditional(c, choose)
+}
+
+func launchLocal() {
+    c := &cell{}
+    go func() { c.n++ }()
+}
+
+func independentLocalInvocations() {
+    launchLocal()
+    launchLocal()
+}
+
+func launchAndWait(c *cell) {
+    done := make(chan struct{})
+    go func() {
+        c.n++
+        close(done)
+    }()
+    <-done
+}
+
+func joinedHelperInvocations() {
+    c := &cell{}
+    launchAndWait(c)
+    launchAndWait(c)
+}
+
+func loopedJoinedHelperInvocations() {
+    c := &cell{}
+    for index := 0; index < 2; index++ {
+        launchAndWait(c)
+    }
+}
+
+func launchAndMaybeWait(c *cell, wait bool) {
+    done := make(chan struct{})
+    go func() {
+        c.n++
+        close(done)
+    }()
+    if wait {
+        <-done
+    }
+}
+
+func conditionalWaitHelperInvocations(wait bool) {
+    c := &cell{}
+    launchAndMaybeWait(c, wait)
+    launchAndMaybeWait(c, wait)
+}
+
+func joinedParent(c *cell) {
+    for index := 0; index < 2; index++ {
+        launchAndWait(c)
+    }
+}
+
+func parallelJoinedParentTasks() {
+    c := &cell{}
+    go joinedParent(c)
+    go joinedParent(c)
+}
+
+func loopedLocalHelperInvocations() {
+    for index := 0; index < 2; index++ {
+        launchLocal()
+    }
+}
+
+func loopedSharedHelperInvocations() {
+    c := &cell{}
+    for index := 0; index < 2; index++ {
+        launch(c)
+    }
+}
+
+// The backing slice is shared, but the element selected by index is unknown.
+func repeatedUnknownIndexOneWrite() {
+    values := make([]int, 2)
+    index := 0
+    for {
+        go func() { values[index] = 1 }()
+    }
+}
+
+func repeatedUnknownIndexTwoWrites() {
+    values := make([]int, 2)
+    index := 0
+    for {
+        go func() {
+            values[index] = 1
+            values[index] = 2
+        }()
+    }
+}
+
+func repeatedConstantIndexSharedSlice() {
+    values := make([]int, 1)
+    for {
+        go func() { values[0]++ }()
+    }
+}
+
+func repeatedFreshIndexStorage(index int) {
+    for {
+        go func() {
+            values := make([]int, 1)
+            values[index]++
+        }()
+    }
+}
+
+func publishedWorker(ch chan *cell) {
+    local := &cell{}
+    ch <- local
+    var got *cell
+    got = <-ch
+    local.n++
+    got.n++
+}
+
+func repeatedPublishedWorkers() {
+    ch := make(chan *cell, 2)
+    for {
+        go publishedWorker(ch)
+    }
+}
+
+func launchWriteThenRead(c *cell) {
+    c.n++
+    go func() { _ = c.n }()
+}
+
+func loopedUnjoinedWriteThenReadHelperInvocations() {
+    c := &cell{}
+    for index := 0; index < 2; index++ {
+        launchWriteThenRead(c)
+    }
+}
+
+func launchWriteThenReadAndWait(c *cell) {
+    c.n++
+    done := make(chan struct{})
+    go func() {
+        _ = c.n
+        close(done)
+    }()
+    <-done
+}
+
+func loopedJoinedWriteThenReadHelperInvocations() {
+    c := &cell{}
+    for index := 0; index < 2; index++ {
+        launchWriteThenReadAndWait(c)
+    }
+}
+
+func loopedUnjoinedWriteThenReadDirectly() {
+    c := &cell{}
+    for index := 0; index < 2; index++ {
+        c.n++
+        go func() { _ = c.n }()
+    }
+}
+
+func loopedJoinedWriteThenReadDirectly() {
+    c := &cell{}
+    for index := 0; index < 2; index++ {
+        c.n++
+        done := make(chan struct{})
+        go func() {
+            _ = c.n
+            close(done)
+        }()
+        <-done
+    }
+}
+
+func freshReadParentTask() {
+    c := &cell{}
+    c.n++
+    go func() { _ = c.n }()
+}
+
+func parallelFreshReadParentTasks() {
+    for index := 0; index < 2; index++ {
+        go freshReadParentTask()
+    }
+}
+
+func loopedFreshDirectAllocations() {
+    for index := 0; index < 2; index++ {
+        c := &cell{}
+        c.n++
+        go func() { _ = c.n }()
+    }
+}
+
+func freshWriteThenRead() {
+    c := &cell{}
+    c.n++
+    go func() { _ = c.n }()
+}
+
+func loopedFreshHelperAllocations() {
+    for index := 0; index < 2; index++ {
+        freshWriteThenRead()
+    }
+}
+
+func channelJoinParent(c *cell) {
+    done := make(chan struct{})
+    go func() {
+        _ = c.n
+        close(done)
+    }()
+    <-done
+    c.n++
+}
+
+func loopedChannelJoinParentTasks() {
+    c := &cell{}
+    for index := 0; index < 2; index++ {
+        go channelJoinParent(c)
+    }
+}
+
+func freshChannelJoinParent() {
+    c := &cell{}
+    channelJoinParent(c)
+}
+
+func loopedFreshChannelJoinParentTasks() {
+    for index := 0; index < 2; index++ {
+        go freshChannelJoinParent()
+    }
+}
+
+// Each iteration declares a new lexical cell for the child closure.
+func freshLexicalCells() {
+    for index := 0; index < 2; index++ {
+        x := 0
+        go func() { x++ }()
+    }
+}
+
+func freshVarLexicalCells() {
+    for index := 0; index < 2; index++ {
+        var x int
+        go func() { x++ }()
+    }
+}
+
+func freshRangeCells(values []int) {
+    for _, x := range values {
+        go func() { x++ }()
+    }
+}
+
+func sharedRangeCell(values []int) {
+    x := 0
+    for range values {
+        go func() { x++ }()
+    }
+}
+
+func gotoLexicalCells(again bool) {
+next:
+    x := 0
+    go func() { x++ }()
+    if again { goto next }
+}
+
+// Both child closures capture the lexical cell declared outside the loop.
+func sharedLexicalCell() {
+    x := 0
+    for index := 0; index < 2; index++ {
+        go func() { x++ }()
+    }
+}
+"#,
+        )
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    (project, workspace)
 }
 
 #[test]
@@ -8243,27 +10575,9 @@ func errgroupJoined() int {
     );
 }
 
-/// A conflict whose spawn root and whose written procedure are in two files of
-/// one package.
-///
-/// Every other concurrency fixture is one file (the survey behind Milestone 4
-/// of `.agents/plans/impact-sliced-diff-base.md` found none that crossed a file
-/// boundary), and the `--diff-base` case the plan is about is exactly the
-/// cross-file one: the edit is in the spawn root and the finding is anchored at
-/// the write, in a file the edit never touched.
-///
-/// The same content in one file produces exactly one proven, exhaustive
-/// conflict (`go_concurrent_access_conflict_identities_are_the_same_at_two_workspace_roots`
-/// asserts it). Split across two files of one package it produces no row at
-/// all -- and, worse, no open reason and no diagnostic, so a policy over it
-/// reports a clean, complete, exhaustive verdict about a race that exists. The
-/// same happens with the type in the spawn root's own file and only the
-/// spawned procedure elsewhere, so what does not cross the boundary is the
-/// spawn target's dispatch rather than the shared type. Fixing the concurrency
-/// engine's cross-file expansion is not this milestone's work, so the case is
-/// pinned here and reported.
+/// #2965: a spawned callee in another file of the same Go package retains
+/// exact shared storage and complete cross-file conflict evidence.
 #[test]
-#[ignore = "finds real bug: a spawned callee in another file of the same Go package yields no task slice and no open reason"]
 fn go_concurrent_access_conflicts_cross_a_file_boundary_in_one_package() {
     let project = InlineTestProject::with_language(Language::Go)
         .file(
@@ -8331,10 +10645,15 @@ func write(c *cell) { c.value = 1 }
         ),
         "{result:#?}"
     );
+    let mut endpoints = [
+        (value.first_path.as_str(), value.first_access),
+        (value.second_path.as_str(), value.second_access),
+    ];
+    endpoints.sort_unstable();
     assert_eq!(
-        (value.first_path.as_str(), value.second_path.as_str()),
-        ("b.go", "a.go"),
-        "the write and the read are in two files: {result:#?}"
+        endpoints,
+        [("a.go", "read"), ("b.go", "write")],
+        "the read and write retain their files regardless of pair ordering: {result:#?}"
     );
 }
 

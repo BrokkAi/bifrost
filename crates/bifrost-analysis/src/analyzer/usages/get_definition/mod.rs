@@ -1137,6 +1137,78 @@ pub fn navigation_declaration_site_targets(
     .targets
 }
 
+/// Whether the allocation expression at `offset` binds its result by
+/// reference (`Some(true)`) or creates an inline value (`Some(false)`).
+///
+/// `None` means that the source does not contain one of the exact structured
+/// Go forms supported by the producer, or that a named type's declaration is
+/// unavailable or ambiguous. The caller must hold a semantic Allocation row
+/// at this offset: the producer has already established that `new` or `make`
+/// denotes the builtin, rather than a shadowing callable.
+pub fn allocation_binds_by_reference_at_offset(
+    file: &ProjectFile,
+    source: &str,
+    offset: usize,
+) -> Option<bool> {
+    match language_for_file(file) {
+        Language::Go => go::allocation_binds_by_reference_at_offset(file, source, offset),
+        _ => None,
+    }
+}
+
+/// Whether one exact indexed Go callable result binds by reference.
+///
+/// The analyzer declaration range identifies the callable; the Go adapter then
+/// maps the requested result ordinal through the declaration's AST. Unsupported
+/// nominal, generic, alias, and recovery cases remain unknown.
+pub fn result_binds_by_reference_at_ordinal(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    source: &str,
+    declaration: &CodeUnit,
+    ordinal: usize,
+) -> Option<bool> {
+    match language_for_file(file) {
+        Language::Go => {
+            go::result_binds_by_reference_at_ordinal(analyzer, file, source, declaration, ordinal)
+        }
+        _ => None,
+    }
+}
+
+/// Prove that an exact selector occurrence names a modeled method declaration.
+/// This consumes resolver-owned selection evidence, not the receiver shape of
+/// a callable value that might have been loaded from a mutable field.
+pub fn modeled_method_selection_at_offset(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    source: &str,
+    offset: usize,
+) -> Option<String> {
+    match language_for_file(file) {
+        Language::Go => go::modeled_method_selection_at_offset(analyzer, file, source, offset),
+        _ => None,
+    }
+}
+
+/// Whether the Go lexical binding declared at `offset` may be created more
+/// than once during one procedure invocation.
+///
+/// `None` means the offset is not an exact supported binding identifier, the
+/// source could not be parsed, or recovery made the relevant AST path
+/// unreliable. Languages without this distinction remain unsupported rather
+/// than being classified as singleton storage.
+pub fn lexical_binding_repeats_at_offset(
+    file: &ProjectFile,
+    source: &str,
+    offset: usize,
+) -> Option<bool> {
+    match language_for_file(file) {
+        Language::Go => go::lexical_binding_repeats_at_offset(file, source, offset),
+        _ => None,
+    }
+}
+
 /// The declaration one offset falls inside, for a consumer holding an
 /// analyzer.
 ///
@@ -1144,22 +1216,6 @@ pub fn navigation_declaration_site_targets(
 /// declarations come from the analyzer, so this takes one. A caller asking
 /// what declaration an occurrence *is*, rather than what it refers to, needs
 /// this: a definition lookup at a declaration has no reference to follow.
-/// Whether the allocation expression at `offset` yields a reference.
-///
-/// Only Go answers today. A language that has no value/reference distinction
-/// at an allocation, or whose adapter does not record one, answers `false`,
-/// which keeps a consumer's previous behavior.
-pub fn allocation_yields_reference_at_offset(
-    file: &ProjectFile,
-    source: &str,
-    offset: usize,
-) -> bool {
-    match language_for_file(file) {
-        Language::Go => go::allocation_yields_reference_at_offset(file, source, offset),
-        _ => false,
-    }
-}
-
 pub fn declaration_site_at_offset(
     analyzer: &dyn IAnalyzer,
     file: &ProjectFile,

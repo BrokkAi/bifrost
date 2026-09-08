@@ -9,6 +9,7 @@ use crate::analyzer::{
     SignatureMetadata, StructuredTypeIdentity, go_internal_import_allowed,
 };
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
+use brokk_bifrost_core::analyzer::usages::common::same_node;
 use brokk_bifrost_core::analyzer::{
     PackageRelationKind, PackageRelationValue, RelationalName, model::StructuredTypeNodeView,
 };
@@ -2842,6 +2843,526 @@ fn go_range_binding<'tree>(
     (index == 1).then_some(GoLocalBinding::RangeElement(node))
 }
 
+/// An external method declaration selected directly at one Go call site.
+pub(super) fn modeled_method_selection_at_offset(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    source: &str,
+    offset: usize,
+) -> Option<String> {
+    let tree = parse_tree_for_language(file, Language::Go, source)?;
+    let field = tree
+        .root_node()
+        .named_descendant_for_byte_range(offset, offset)?;
+    let selector = field.parent()?;
+    if field.start_byte() != offset
+        || selector.kind() != "selector_expression"
+        || selector.child_by_field_name("field") != Some(field)
+        || selector.has_error()
+    {
+        return None;
+    }
+    let mut callee = selector;
+    while callee
+        .parent()
+        .is_some_and(|parent| parent.kind() == "parenthesized_expression")
+    {
+        callee = callee.parent()?;
+    }
+    let call = callee.parent()?;
+    if call.kind() != "call_expression"
+        || call.child_by_field_name("function") != Some(callee)
+        || call.has_error()
+    {
+        return None;
+    }
+    let scope = AnalyzerQueryScope::new(analyzer);
+    let outcome = resolve_call_target_batch_with_source(
+        analyzer,
+        scope.token(),
+        vec![DefinitionLookupRequest {
+            file: file.clone(),
+            line: None,
+            column: None,
+            start_byte: Some(field.start_byte()),
+            end_byte: Some(field.end_byte()),
+        }],
+        file.clone(),
+        Arc::from(source),
+        None,
+    )
+    .into_iter()
+    .next()?;
+    if outcome.truncated || outcome.structure_unavailable || outcome.unproven_link_unit {
+        return None;
+    }
+    // Go creates this proof only after selecting one modeled method on the
+    // concrete receiver. An indexed function-valued field wins member lookup
+    // before that path and cannot acquire this declaration proof.
+    let proof = outcome.exact_external_call?;
+    (proof.call_application() == CallApplicationKind::BoundReceiver
+        && proof.dispatch_extensibility() == Some(DispatchExtensibility::Closed))
+    .then(|| proof.canonical_callee().to_owned())
+}
+
+/// Whether the Go allocation at `offset` binds by reference or creates an
+/// inline value. A named type needs one direct, non-alias same-file shape.
+pub fn allocation_binds_by_reference_at_offset(
+    file: &ProjectFile,
+    source: &str,
+    offset: usize,
+) -> Option<bool> {
+    let tree = parse_tree_for_language(file, Language::Go, source)?;
+    let node = tree
+        .root_node()
+        .named_descendant_for_byte_range(offset, offset)?;
+    let allocation = go_allocation_expression_at_offset(node, offset)?;
+    if allocation.has_error() || allocation.is_missing() {
+        return None;
+    }
+    match allocation.kind() {
+        "unary_expression" => allocation
+            .child_by_field_name("operator")
+            .filter(|operator| go_node_text(*operator, source) == "&")
+            .map(|_| true),
+        "call_expression" => go_allocation_call_binding_mode(allocation, source),
+        "composite_literal" => {
+            if go_composite_literal_is_addressed(allocation) {
+                return Some(true);
+            }
+            let type_node = allocation.child_by_field_name("type")?;
+            go_type_binding_mode(tree.root_node(), type_node, source, allocation)
+        }
+        _ => None,
+    }
+}
+
+/// Prove the storage mode of one exact Go callable result declaration.
+///
+/// The declaration range comes from the analyzer, while the result ordinal and
+/// type shape come from the parsed callable AST. A nominal result is resolved
+/// only when its same-file declaration has one direct, non-alias shape; imports,
+/// aliases, generic result types, type parameters, and parser recovery remain
+/// unknown.
+pub fn result_binds_by_reference_at_ordinal(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    source: &str,
+    declaration: &CodeUnit,
+    ordinal: usize,
+) -> Option<bool> {
+    if !declaration.is_function()
+        || declaration.is_synthetic()
+        || declaration.source() != file
+        || language_for_file(file) != Language::Go
+    {
+        return None;
+    }
+
+    // One exact indexed signature is required. Its positional identity is
+    // useful for rejecting generic result identities, but a Named identity
+    // alone is not enough to decide storage mode; the AST resolver below must
+    // prove the named declaration's underlying shape.
+    let metadata = analyzer.signature_metadata(declaration);
+    let [metadata] = metadata.as_slice() else {
+        return None;
+    };
+
+    let tree = parse_tree_for_language(file, Language::Go, source)?;
+    let root = tree.root_node();
+    let callable = analyzer
+        .ranges_of(declaration)
+        .into_iter()
+        .find_map(|range| {
+            let node = root.named_descendant_for_byte_range(range.start_byte, range.end_byte)?;
+            (node.start_byte() == range.start_byte
+                && node.end_byte() == range.end_byte
+                && matches!(node.kind(), "function_declaration" | "method_declaration")
+                && !node.has_error()
+                && !node.is_missing())
+            .then_some(node)
+        })?;
+
+    let type_node = go_result_type_node_at_ordinal(callable, ordinal)?;
+    if type_node.has_error() || type_node.is_missing() {
+        return None;
+    }
+
+    // A generic identity is not a closed storage proof. Direct aggregate
+    // shapes such as []T remain classifiable by their outer representation;
+    // a type parameter or instantiated nominal reaches the AST path and stays
+    // unknown.
+    if metadata
+        .result_type_identity(ordinal)
+        .is_some_and(|identity| identity.generic_argument_count().is_some())
+    {
+        return None;
+    }
+
+    go_type_binding_mode(root, type_node, source, type_node)
+}
+
+fn go_result_type_node_at_ordinal(callable: Node<'_>, ordinal: usize) -> Option<Node<'_>> {
+    let result = callable.child_by_field_name("result")?;
+    if result.kind() != "parameter_list" {
+        return (ordinal == 0).then_some(result);
+    }
+
+    let mut cursor = result.walk();
+    let mut next_ordinal = 0usize;
+    for declaration in result.named_children(&mut cursor) {
+        if !matches!(
+            declaration.kind(),
+            "parameter_declaration" | "variadic_parameter_declaration"
+        ) {
+            return None;
+        }
+        let type_node = declaration.child_by_field_name("type")?;
+        let mut names = declaration.walk();
+        let width = declaration
+            .children_by_field_name("name", &mut names)
+            .count()
+            .max(1);
+        let end_ordinal = next_ordinal.checked_add(width)?;
+        if ordinal < end_ordinal {
+            return Some(type_node);
+        }
+        next_ordinal = end_ordinal;
+    }
+    None
+}
+
+/// Find the allocation expression whose AST start is the source-mapping
+/// offset. Some lowering paths retain an enclosing entry's mapping instead;
+/// those stay unknown. Requiring the exact expression prevents an inner value
+/// from inheriting an unrelated outer call or address-of expression.
+fn go_allocation_expression_at_offset<'tree>(
+    node: Node<'tree>,
+    offset: usize,
+) -> Option<Node<'tree>> {
+    let mut cursor = Some(node);
+    while let Some(current) = cursor {
+        if current.start_byte() == offset
+            && matches!(
+                current.kind(),
+                "unary_expression" | "call_expression" | "composite_literal"
+            )
+        {
+            return Some(current);
+        }
+        cursor = current.parent();
+    }
+    None
+}
+
+fn go_composite_literal_is_addressed(node: Node<'_>) -> bool {
+    let mut cursor = node.parent();
+    while cursor.is_some_and(|parent| parent.kind() == "parenthesized_expression") {
+        cursor = cursor.and_then(|parent| parent.parent());
+    }
+    cursor.is_some_and(|parent| {
+        parent.kind() == "unary_expression"
+            && parent
+                .child_by_field_name("operator")
+                .is_some_and(|operator| operator.kind() == "&")
+    })
+}
+
+fn go_allocation_call_binding_mode(node: Node<'_>, source: &str) -> Option<bool> {
+    let function = node.child_by_field_name("function")?;
+    let name = go_node_text(function, source);
+    match name {
+        // `new(T)` creates a pointer to newly allocated T storage. The
+        // semantic producer emits an Allocation row only for the builtin form.
+        "new" => Some(true),
+        // make's slice, map, and channel results are descriptors referring to
+        // fresh backing storage, so copying the result preserves that storage.
+        "make" => {
+            let arguments = node.child_by_field_name("arguments")?;
+            let type_node = arguments.named_child(0)?;
+            go_type_binding_mode(find_go_root(type_node), type_node, source, node)
+        }
+        _ => None,
+    }
+}
+
+fn find_go_root<'tree>(node: Node<'tree>) -> Node<'tree> {
+    let mut root = node;
+    while let Some(parent) = root.parent() {
+        root = parent;
+    }
+    root
+}
+
+fn go_type_binding_mode(
+    root: Node<'_>,
+    type_node: Node<'_>,
+    source: &str,
+    expression: Node<'_>,
+) -> Option<bool> {
+    match type_node.kind() {
+        // Direct aggregate literals own their element storage. A slice/map
+        // literal owns fresh backing storage whose descriptor is copied by
+        // reference, as does a channel value.
+        "struct_type" | "array_type" | "implicit_length_array_type" => Some(false),
+        "slice_type" | "map_type" | "channel_type" => Some(true),
+        // A pointer type is a reference-shaped result, although a direct
+        // pointer composite literal is uncommon; retaining this fact is safe.
+        "pointer_type" => Some(true),
+        "type_identifier" | "identifier" => {
+            let name = go_node_text(type_node, source);
+            go_named_type_binding_mode(root, name, source, expression)
+        }
+        // Qualified and generic names need package/type-argument resolution;
+        // the local AST alone cannot prove their storage mode.
+        _ => None,
+    }
+}
+
+fn go_named_type_binding_mode(
+    root: Node<'_>,
+    name: &str,
+    source: &str,
+    expression: Node<'_>,
+) -> Option<bool> {
+    if name.is_empty() {
+        return None;
+    }
+    match go_enclosing_type_parameter_status(expression, name, source) {
+        Some(true) | None => return None,
+        Some(false) => {}
+    }
+    let mut stack = vec![root];
+    let mut matches = Vec::new();
+    while let Some(node) = stack.pop() {
+        if matches!(node.kind(), "type_spec" | "type_alias")
+            && node
+                .parent()
+                .is_some_and(|parent| parent.kind() == "type_declaration")
+            && node
+                .child_by_field_name("name")
+                .is_some_and(|declared| go_node_text(declared, source) == name)
+        {
+            matches.push(node);
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.named_children(&mut cursor));
+    }
+    let [declaration] = matches.as_slice() else {
+        return None;
+    };
+    if declaration.kind() == "type_alias"
+        || declaration
+            .parent()
+            .and_then(|parent| parent.parent())
+            .is_none_or(|scope| scope.kind() != "source_file")
+        || declaration.child_by_field_name("type_parameters").is_some()
+        || declaration.has_error()
+        || declaration.is_missing()
+    {
+        return None;
+    }
+    let type_node = declaration.child_by_field_name("type")?;
+    if type_node.has_error() || type_node.is_missing() {
+        return None;
+    }
+    match type_node.kind() {
+        "struct_type" | "array_type" | "implicit_length_array_type" => Some(false),
+        "slice_type" | "map_type" | "channel_type" | "pointer_type" => Some(true),
+        _ => None,
+    }
+}
+
+/// Return whether `name` is supplied by a generic context enclosing the
+/// allocation expression. A receiver with a generic instantiation is kept
+/// conservative because its receiver type parameters are structured in the
+/// receiver list rather than in a method-level `type_parameters` field.
+fn go_enclosing_type_parameter_status(
+    expression: Node<'_>,
+    name: &str,
+    source: &str,
+) -> Option<bool> {
+    let mut cursor = expression.parent();
+    while let Some(current) = cursor {
+        if let Some(list) = current.child_by_field_name("type_parameters") {
+            if list.has_error() || list.is_missing() {
+                return None;
+            }
+            let mut list_cursor = list.walk();
+            for declaration in list
+                .named_children(&mut list_cursor)
+                .filter(|child| child.kind() == "type_parameter_declaration")
+            {
+                if declaration.has_error() || declaration.is_missing() {
+                    return None;
+                }
+                let mut names = declaration.walk();
+                if declaration
+                    .children_by_field_name("name", &mut names)
+                    .any(|parameter| go_node_text(parameter, source) == name)
+                {
+                    return Some(true);
+                }
+            }
+        }
+        if current.kind() == "method_declaration"
+            && let Some(receiver) = current.child_by_field_name("receiver")
+        {
+            if receiver.has_error() || receiver.is_missing() {
+                return None;
+            }
+            let mut stack = vec![receiver];
+            while let Some(node) = stack.pop() {
+                if node.kind() == "generic_type" {
+                    return Some(true);
+                }
+                let mut children = node.walk();
+                stack.extend(node.named_children(&mut children));
+            }
+        }
+        cursor = current.parent();
+    }
+    Some(false)
+}
+
+/// Whether the binding whose identifier starts at `offset` may be created on
+/// every pass through a loop in one procedure invocation.
+///
+/// This deliberately admits only declaration positions that the Go grammar
+/// identifies structurally. A reference with the same spelling, a malformed
+/// path, and a declaration form without an exact supported name all remain
+/// unresolved so callers do not infer singleton storage from missing syntax.
+pub fn lexical_binding_repeats_at_offset(
+    file: &ProjectFile,
+    source: &str,
+    offset: usize,
+) -> Option<bool> {
+    let tree = parse_tree_for_language(file, Language::Go, source)?;
+    let identifier = tree
+        .root_node()
+        .named_descendant_for_byte_range(offset, offset)
+        .filter(|node| {
+            node.kind() == "identifier"
+                && node.start_byte() == offset
+                && !node.is_error()
+                && !node.is_missing()
+        })?;
+    // `_` is an identifier-shaped grammar node, but it does not introduce
+    // storage. This is an exact token check, not a source-text declaration
+    // fallback.
+    if go_node_text(identifier, source) == "_" {
+        return None;
+    }
+    let declaration = go_binding_declaration_for_identifier(identifier)?;
+    if declaration.kind() == "parameter_declaration" {
+        // Named result variables are emitted as Local values, but their
+        // storage is created on entry, including in a body containing goto.
+        let parameters = declaration.parent()?;
+        let callable = parameters.parent()?;
+        return (matches!(
+            callable.kind(),
+            "function_declaration" | "method_declaration" | "func_literal"
+        ) && !callable.has_error())
+        .then_some(false);
+    }
+    go_binding_repeats_in_enclosing_scope(declaration)
+}
+
+fn go_binding_declaration_for_identifier<'tree>(identifier: Node<'tree>) -> Option<Node<'tree>> {
+    let mut current = identifier.parent();
+    while let Some(node) = current {
+        if node.is_error() || node.is_missing() || node.has_error() {
+            return None;
+        }
+        let is_exact_binding = match node.kind() {
+            "short_var_declaration" => node
+                .child_by_field_name("left")
+                .is_some_and(|left| go_lhs_contains_identifier(left, identifier)),
+            "var_spec" | "parameter_declaration" => {
+                let mut cursor = node.walk();
+                node.children_by_field_name("name", &mut cursor)
+                    .any(|name| same_node(name, identifier))
+            }
+            "range_clause" => {
+                brokk_bifrost_go::graph::ast::range_clause_is_short_declaration(node)
+                    && node
+                        .child_by_field_name("left")
+                        .is_some_and(|left| go_lhs_contains_identifier(left, identifier))
+            }
+            _ => false,
+        };
+        if is_exact_binding {
+            return Some(node);
+        }
+        if matches!(
+            node.kind(),
+            "function_declaration" | "method_declaration" | "func_literal"
+        ) {
+            return None;
+        }
+        current = node.parent();
+    }
+    None
+}
+
+fn go_binding_repeats_in_enclosing_scope(declaration: Node<'_>) -> Option<bool> {
+    let mut current = Some(declaration);
+    while let Some(node) = current {
+        if node.is_error() || node.is_missing() || node.has_error() {
+            return None;
+        }
+        match node.kind() {
+            "for_statement" => return Some(true),
+            "function_declaration" | "method_declaration" | "func_literal" => {
+                return match go_callable_contains_goto(node) {
+                    Some(false) => Some(false),
+                    Some(true) | None => None,
+                };
+            }
+            _ => current = node.parent(),
+        }
+    }
+    None
+}
+
+fn go_lhs_contains_identifier(left: Node<'_>, identifier: Node<'_>) -> bool {
+    if same_node(left, identifier) {
+        return true;
+    }
+    if left.kind() != "expression_list" {
+        return false;
+    }
+    let mut cursor = left.walk();
+    left.named_children(&mut cursor)
+        .any(|child| same_node(child, identifier))
+}
+
+/// A backward `goto` can revisit a declaration even when it is outside a
+/// syntactic loop. Keep that case unresolved, while excluding goto statements
+/// belonging to nested callables from the enclosing callable's cardinality.
+fn go_callable_contains_goto(callable: Node<'_>) -> Option<bool> {
+    let mut stack = vec![callable];
+    while let Some(node) = stack.pop() {
+        if node.is_error() || node.is_missing() {
+            return None;
+        }
+        if node.kind() == "goto_statement" {
+            return Some(true);
+        }
+        if node.id() != callable.id()
+            && matches!(
+                node.kind(),
+                "function_declaration" | "method_declaration" | "func_literal"
+            )
+        {
+            continue;
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.named_children(&mut cursor));
+    }
+    Some(false)
+}
+
 /// The struct field whose declaration one offset falls inside.
 ///
 /// A producer resolves a field only where it can type the receiver, so a
@@ -2854,53 +3375,6 @@ fn go_range_binding<'tree>(
 /// Returns nothing unless the offset is a field name inside a struct type and
 /// exactly one declared field of that struct carries the name. Merging
 /// distinct fields would turn a missed race into a reported one.
-/// Whether the Go expression at `offset` yields a reference to the object it
-/// creates rather than the object itself.
-///
-/// `&T{}` and `new(T)` produce a pointer, so a local bound to one names the
-/// same object wherever it is copied. `T{}` produces a value, and copying it
-/// copies the object, which is the difference a consumer must know before it
-/// may equate two locals. The semantic IR records both as one allocation
-/// kind, so the distinction is read from the declaration syntax.
-pub fn allocation_yields_reference_at_offset(
-    file: &ProjectFile,
-    source: &str,
-    offset: usize,
-) -> bool {
-    let Some(tree) = parse_tree_for_language(file, Language::Go, source) else {
-        return false;
-    };
-    let Some(node) = tree
-        .root_node()
-        .named_descendant_for_byte_range(offset, offset)
-    else {
-        return false;
-    };
-    let mut cursor = Some(node);
-    while let Some(current) = cursor {
-        if current.kind() == "unary_expression"
-            && current
-                .child_by_field_name("operator")
-                .is_none_or(|operator| go_node_text(operator, source) == "&")
-            && go_node_text(current, source).starts_with('&')
-        {
-            return true;
-        }
-        if current.kind() == "call_expression"
-            && current
-                .child_by_field_name("function")
-                .is_some_and(|function| go_node_text(function, source) == "new")
-        {
-            return true;
-        }
-        if current.start_byte() < offset {
-            break;
-        }
-        cursor = current.parent();
-    }
-    false
-}
-
 pub(super) fn field_declaration_at_offset(
     analyzer: &dyn IAnalyzer,
     file: &ProjectFile,
@@ -5277,6 +5751,26 @@ mod bounded_tests {
         (fixture, file, source, tree, site)
     }
 
+    fn indexed_go_function_at_start(
+        analyzer: &dyn IAnalyzer,
+        file: &ProjectFile,
+        source: &str,
+        marker: &str,
+    ) -> CodeUnit {
+        let start = source.find(marker).expect("Go function marker");
+        analyzer
+            .get_declarations(file)
+            .into_iter()
+            .find(|unit| {
+                unit.is_function()
+                    && analyzer
+                        .ranges_of(unit)
+                        .into_iter()
+                        .any(|range| range.start_byte == start)
+            })
+            .unwrap_or_else(|| panic!("indexed function starts at {start}: {marker}"))
+    }
+
     fn activate_selector_navigation_overlay(fixture: &AnalyzerFixture) {
         use crate::analyzer::semantic_model::{
             CatalogCoordinate, CatalogOptions, CompilerOptions, SemanticModelActivationControl,
@@ -7061,6 +7555,164 @@ func NewWorker() Worker { return Worker{} }
                 work: ReceiverAnalysisWork { scope_nodes: 1, .. },
             }
         ));
+    }
+
+    #[test]
+    fn go_result_binding_modes_follow_exact_result_ordinals() {
+        let source = r#"package main
+
+type NamedStruct struct{}
+
+func Shapes() (*NamedStruct, struct{}, [2]byte, []byte, map[string]int, chan int) {
+    return nil, struct{}{}, [2]byte{}, nil, nil, nil
+}
+func NamedValue() NamedStruct { return NamedStruct{} }
+func Scalar() int { return 0 }
+func Grouped() (first, second []byte, third [2]byte, fourth, fifth struct{}) {
+    return nil, nil, [2]byte{}, struct{}{}, struct{}{}
+}
+"#;
+        let fixture = AnalyzerFixture::new_for_language(Language::Go, &[("main.go", source)]);
+        let analyzer = fixture.analyzer.analyzer();
+        let file = ProjectFile::new(fixture.project_root(), "main.go");
+
+        let shapes = indexed_go_function_at_start(analyzer, &file, source, "func Shapes()");
+        for (ordinal, expected) in [
+            (0, Some(true)),  // pointer
+            (1, Some(false)), // struct
+            (2, Some(false)), // array
+            (3, Some(true)),  // slice
+            (4, Some(true)),  // map
+            (5, Some(true)),  // channel
+            (6, None),        // out of range
+        ] {
+            assert_eq!(
+                result_binds_by_reference_at_ordinal(analyzer, &file, source, &shapes, ordinal,),
+                expected,
+                "Shapes result ordinal {ordinal}",
+            );
+        }
+
+        let named = indexed_go_function_at_start(analyzer, &file, source, "func NamedValue()");
+        assert_eq!(
+            result_binds_by_reference_at_ordinal(analyzer, &file, source, &named, 0),
+            Some(false),
+            "a direct same-file named struct is inline",
+        );
+
+        let scalar = indexed_go_function_at_start(analyzer, &file, source, "func Scalar()");
+        assert_eq!(
+            result_binds_by_reference_at_ordinal(analyzer, &file, source, &scalar, 0),
+            None,
+            "a scalar result has no proven reference or inline aggregate shape",
+        );
+        assert_eq!(
+            result_binds_by_reference_at_ordinal(analyzer, &file, source, &scalar, 1),
+            None,
+            "a scalar result has no ordinal one",
+        );
+
+        let grouped = indexed_go_function_at_start(analyzer, &file, source, "func Grouped()");
+        for (ordinal, expected) in [
+            (0, Some(true)),  // first
+            (1, Some(true)),  // second, grouped with first
+            (2, Some(false)), // third
+            (3, Some(false)), // fourth
+            (4, Some(false)), // fifth, grouped with fourth
+            (5, None),        // out of range
+        ] {
+            assert_eq!(
+                result_binds_by_reference_at_ordinal(analyzer, &file, source, &grouped, ordinal,),
+                expected,
+                "Grouped result ordinal {ordinal}",
+            );
+        }
+    }
+
+    #[test]
+    fn go_result_binding_uses_exact_same_named_method_declaration() {
+        let source = r#"package main
+
+type Left struct{}
+type Right struct{}
+
+func (Left) Build() []byte { return nil }
+func (Right) Build() struct{} { return struct{}{} }
+"#;
+        let fixture = AnalyzerFixture::new_for_language(Language::Go, &[("main.go", source)]);
+        let analyzer = fixture.analyzer.analyzer();
+        let file = ProjectFile::new(fixture.project_root(), "main.go");
+        let left = indexed_go_function_at_start(analyzer, &file, source, "func (Left) Build()");
+        let right = indexed_go_function_at_start(analyzer, &file, source, "func (Right) Build()");
+
+        assert_eq!(
+            result_binds_by_reference_at_ordinal(analyzer, &file, source, &left, 0),
+            Some(true),
+            "the Left.Build declaration returns a slice",
+        );
+        assert_eq!(
+            result_binds_by_reference_at_ordinal(analyzer, &file, source, &right, 0),
+            Some(false),
+            "the Right.Build declaration returns a struct",
+        );
+    }
+
+    #[test]
+    fn go_result_binding_abstains_on_aliases_generics_type_parameters_and_recovery() {
+        let source = r#"package main
+
+type NamedSlice []byte
+type Alias = []byte
+type GenericBox[T any] struct{}
+
+func AliasResult() Alias { return nil }
+func NamedSliceResult() NamedSlice { return nil }
+func GenericResult() GenericBox[int] { return GenericBox[int]{} }
+func GenericPointer() *GenericBox[int] { return nil }
+func GenericSlice() []GenericBox[int] { return nil }
+func TypeParameterShadow[Shadow any]() Shadow {
+    var zero Shadow
+    return zero
+}
+func (box GenericBox[T]) GenericReceiver() NamedSlice { return nil }
+func Recovery() *NamedSlice {
+    @@@
+    return nil
+}
+"#;
+        let fixture = AnalyzerFixture::new_for_language(Language::Go, &[("main.go", source)]);
+        let analyzer = fixture.analyzer.analyzer();
+        let file = ProjectFile::new(fixture.project_root(), "main.go");
+
+        for (marker, expected, reason) in [
+            ("func AliasResult()", None, "type alias"),
+            ("func NamedSliceResult()", Some(true), "direct named slice"),
+            ("func GenericResult()", None, "instantiated generic nominal"),
+            (
+                "func GenericPointer()",
+                Some(true),
+                "pointer outer shape remains known with a generic element",
+            ),
+            (
+                "func GenericSlice()",
+                Some(true),
+                "slice outer shape remains known with a generic element",
+            ),
+            ("func TypeParameterShadow", None, "type parameter shadowing"),
+            (
+                "func (box GenericBox[T]) GenericReceiver()",
+                None,
+                "generic receiver",
+            ),
+            ("func Recovery()", None, "parser recovery"),
+        ] {
+            let function = indexed_go_function_at_start(analyzer, &file, source, marker);
+            assert_eq!(
+                result_binds_by_reference_at_ordinal(analyzer, &file, source, &function, 0),
+                expected,
+                "{reason}",
+            );
+        }
     }
 
     #[test]

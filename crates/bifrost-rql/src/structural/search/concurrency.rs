@@ -38,9 +38,11 @@ pub(super) struct WorkspaceConcurrencyProvider<'a> {
     /// Whether a callee's receiver binds by reference, keyed by its file and
     /// member name, so one declaration scan serves every call to it.
     receiver_bindings: std::cell::RefCell<crate::hash::HashMap<(String, String), bool>>,
-    /// Whether a member locator names a pointer-typed field, keyed by its file
-    /// and span, so one declaration lookup serves every access repeating it.
-    pointer_members: std::cell::RefCell<crate::hash::HashMap<(String, u32, u32), bool>>,
+    /// Whether a member locator names a field whose payload binds by reference,
+    /// keyed by its file and span, so one declaration lookup serves every access
+    /// repeating it. `None` is retained when the declaration's type shape is not
+    /// enough to prove either storage mode.
+    reference_members: std::cell::RefCell<crate::hash::HashMap<(String, u32, u32), Option<bool>>>,
 }
 
 impl<'a> WorkspaceConcurrencyProvider<'a> {
@@ -55,7 +57,7 @@ impl<'a> WorkspaceConcurrencyProvider<'a> {
             summaries,
             member_identities: std::cell::RefCell::default(),
             receiver_bindings: std::cell::RefCell::default(),
-            pointer_members: std::cell::RefCell::default(),
+            reference_members: std::cell::RefCell::default(),
         }
     }
 
@@ -725,41 +727,106 @@ impl ConcurrencyProvider for WorkspaceConcurrencyProvider<'_> {
         resolved
     }
 
-    fn allocation_yields_reference(
+    fn allocation_binds_by_reference(
         &self,
         procedure: &ProcedureHandle,
-        allocation: crate::analyzer::semantic::AllocationId,
-    ) -> bool {
+        allocation: AllocationId,
+    ) -> Option<bool> {
         let semantics = procedure.semantics();
-        let Some(site) = semantics.allocation(allocation) else {
-            return false;
-        };
-        let Some(mapping) = semantics.source_mapping(site.source) else {
-            return false;
-        };
+        let site = semantics.allocation(allocation)?;
+        let mapping = semantics.source_mapping(site.source)?;
         let file = super::witness_projection::locator_file(self.workspace, &mapping.locator);
-        let Some(source) = self.workspace.analyzer().indexed_source(&file) else {
-            return false;
-        };
-        crate::analyzer::usages::get_definition::allocation_yields_reference_at_offset(
+        let source = self.workspace.analyzer().indexed_source(&file)?;
+        crate::analyzer::usages::get_definition::allocation_binds_by_reference_at_offset(
             &file,
             &source,
             mapping.locator.anchor().span().start_byte() as usize,
         )
     }
 
-    fn member_is_pointer(&self, member: &crate::analyzer::semantic::SemanticLocator) -> bool {
+    fn result_binds_by_reference(&self, procedure: &ProcedureHandle, ordinal: u32) -> Option<bool> {
+        let locator = procedure.semantics().locator();
+        if locator.language() != LanguageDialect::Standard(Language::Go) {
+            return None;
+        }
+        let analyzer = self.workspace.analyzer();
+        let file = super::witness_projection::locator_file(self.workspace, locator);
+        let declaration = super::dispatch::declaration_at_locator(analyzer, locator, &file)?;
+        let span = locator.anchor().span();
+        if !declaration.is_function()
+            || declaration.is_synthetic()
+            || declaration.source() != &file
+            || !analyzer.ranges_of(&declaration).into_iter().any(|range| {
+                range.start_byte == span.start_byte() as usize
+                    && range.end_byte == span.end_byte() as usize
+            })
+        {
+            return None;
+        }
+        let source = analyzer.indexed_source(&file)?;
+        let ordinal = usize::try_from(ordinal).ok()?;
+        crate::analyzer::usages::get_definition::result_binds_by_reference_at_ordinal(
+            analyzer,
+            &file,
+            &source,
+            &declaration,
+            ordinal,
+        )
+    }
+
+    fn lexical_cell_cardinality(
+        &self,
+        procedure: &ProcedureHandle,
+        binding: ValueId,
+    ) -> ConcurrencyObjectCardinality {
+        use crate::analyzer::semantic::SemanticValueKind;
+
+        let semantics = procedure.semantics();
+        let value = semantics
+            .value(binding)
+            .expect("validated lexical cell binding exists");
+        if matches!(
+            value.kind,
+            SemanticValueKind::Parameter { .. } | SemanticValueKind::Receiver { .. }
+        ) {
+            return ConcurrencyObjectCardinality::Singleton;
+        }
+        if !matches!(value.kind, SemanticValueKind::Local) {
+            return ConcurrencyObjectCardinality::Unknown;
+        }
+        let Some(mapping) = semantics.source_mapping(value.source) else {
+            return ConcurrencyObjectCardinality::Unknown;
+        };
+        let file = super::witness_projection::locator_file(self.workspace, &mapping.locator);
+        let Some(source) = self.workspace.analyzer().indexed_source(&file) else {
+            return ConcurrencyObjectCardinality::Unknown;
+        };
+        match crate::analyzer::usages::get_definition::lexical_binding_repeats_at_offset(
+            &file,
+            &source,
+            mapping.locator.anchor().span().start_byte() as usize,
+        ) {
+            Some(false) => ConcurrencyObjectCardinality::Singleton,
+            Some(true) => ConcurrencyObjectCardinality::Multiple,
+            None => ConcurrencyObjectCardinality::Unknown,
+        }
+    }
+
+    fn member_binds_by_reference(
+        &self,
+        member: &crate::analyzer::semantic::SemanticLocator,
+    ) -> Option<bool> {
         let span = member.anchor().span();
         let key = (
             member.path().as_str().to_owned(),
             span.start_byte(),
             span.end_byte(),
         );
-        if let Some(cached) = self.pointer_members.borrow().get(&key) {
+        if let Some(cached) = self.reference_members.borrow().get(&key) {
             return *cached;
         }
-        let resolved = self.field_declares_a_pointer(member);
-        self.pointer_members.borrow_mut().insert(key, resolved);
+        let resolved = self.field_binding_mode(member);
+        self.reference_members.borrow_mut().insert(key, resolved);
         resolved
     }
 
@@ -1156,6 +1223,11 @@ fn resolved_static(
     let Some(outcome) = outcomes.into_iter().next() else {
         return fallback();
     };
+    if outcome.status != crate::analyzer::usages::get_definition::DefinitionLookupStatus::Resolved
+        || !outcome.diagnostics.is_empty()
+    {
+        return fallback();
+    }
     let [definition] = outcome.definitions.as_slice() else {
         return fallback();
     };
@@ -1215,36 +1287,229 @@ impl WorkspaceConcurrencyProvider<'_> {
         false
     }
 
-    /// Whether the field a member locator names is declared as a pointer.
+    /// Whether the field a member locator names carries a payload by reference.
     ///
     /// A copy of a struct copies its direct fields, so a write to one cannot
-    /// reach the original. A pointer field inside that copy still addresses
-    /// one object, so a write through it does. Telling the two apart is what
-    /// keeps a value receiver from being either a false positive or a silent
-    /// miss depending on which field it writes.
-    fn field_declares_a_pointer(
+    /// reach the original. A pointer or reference field inside that copy still
+    /// addresses one object, so a write through it does. Unknown named types
+    /// stay unresolved: a type alias may hide either storage mode.
+    fn field_binding_mode(
         &self,
         member: &crate::analyzer::semantic::SemanticLocator,
-    ) -> bool {
+    ) -> Option<bool> {
         let analyzer = self.workspace.analyzer();
         let file = super::witness_projection::locator_file(self.workspace, member);
-        let Some(source) = analyzer.indexed_source(&file) else {
-            return false;
-        };
+        let source = analyzer.indexed_source(&file)?;
         let span = member.anchor().span();
-        let Some(unit) = crate::analyzer::usages::get_definition::declaration_site_at_offset(
-            analyzer,
-            &file,
-            &source,
-            span.start_byte() as usize,
-        ) else {
-            return false;
+        let mut fields = self
+            .resolved_member_identity(member)
+            .into_iter()
+            .flat_map(|declaration| analyzer.get_definitions(&declaration.name))
+            .filter(|unit| unit.is_field())
+            .collect::<Vec<_>>();
+        if fields.is_empty()
+            && let Some(unit) = crate::analyzer::usages::get_definition::declaration_site_at_offset(
+                analyzer,
+                &file,
+                &source,
+                span.start_byte() as usize,
+            )
+        {
+            fields.push(unit);
+        }
+        fields.sort();
+        fields.dedup();
+        if fields.is_empty() {
+            return None;
+        }
+
+        let mut binding = None;
+        for field in fields {
+            let metadata = analyzer.signature_metadata(&field);
+            if metadata.is_empty() {
+                return None;
+            }
+            for metadata in metadata {
+                let identity = metadata.return_type_identity()?;
+                let mode =
+                    self.field_type_binding_mode(member.language().language(), &field, identity);
+                let mode = mode?;
+                if let Some(existing) = binding
+                    && existing != mode
+                {
+                    return None;
+                }
+                binding = Some(mode);
+            }
+        }
+        binding
+    }
+
+    fn field_type_binding_mode(
+        &self,
+        language: Language,
+        field: &crate::analyzer::CodeUnit,
+        identity: &brokk_bifrost_core::analyzer::model::StructuredTypeIdentity,
+    ) -> Option<bool> {
+        if identity.is_pointer() || identity.is_reference() {
+            return Some(true);
+        }
+        if language != Language::Go {
+            return None;
+        }
+        if identity.is_slice() || identity.is_map() {
+            return Some(true);
+        }
+        // A Go array owns its inline element storage.
+        if identity.is_array() {
+            return Some(false);
+        }
+
+        let nominal = identity.nominal_name()?;
+        let [name] = nominal.path() else {
+            return None;
         };
-        analyzer.signature_metadata(&unit).iter().any(|metadata| {
-            metadata
-                .return_type_identity()
-                .is_some_and(|declared| declared.is_pointer())
-        })
+        if !nominal.lexical_scope().is_empty() {
+            return None;
+        }
+
+        // A bare Go type parameter can shadow a same-file nominal type. Keep
+        // that field unresolved instead of proving the shadowed type inline.
+        match self.field_type_parameter_status(field, identity) {
+            Some(false) => {}
+            Some(true) | None => return None,
+        }
+
+        // A same-file type declaration with structured field children proves a
+        // concrete inline struct. A named alias with no such declaration is
+        // deliberately left open: its underlying type may be a pointer.
+        let analyzer = self.workspace.analyzer();
+        let mut candidates = analyzer
+            .get_declarations(field.source())
+            .into_iter()
+            .filter(|unit| unit.is_class() && unit.terminal_name() == name)
+            .collect::<Vec<_>>();
+        candidates.sort();
+        candidates.dedup();
+        let [candidate] = candidates.as_slice() else {
+            return None;
+        };
+        analyzer
+            .get_members_in_class(candidate)
+            .into_iter()
+            .any(|member| member.is_field())
+            .then_some(false)
+    }
+
+    /// Return whether a nominal Go field type is an enclosing type parameter.
+    ///
+    /// Go declarations currently do not persist their type-parameter list in
+    /// `SignatureMetadata`, so the AST path is the authoritative fallback.
+    fn field_type_parameter_status(
+        &self,
+        field: &crate::analyzer::CodeUnit,
+        identity: &brokk_bifrost_core::analyzer::model::StructuredTypeIdentity,
+    ) -> Option<bool> {
+        if identity.generic_argument_count().is_some() {
+            return Some(false);
+        }
+        let nominal = identity.nominal_name()?;
+        let [name] = nominal.path() else {
+            return Some(false);
+        };
+        if !nominal.lexical_scope().is_empty() {
+            return Some(false);
+        }
+
+        let analyzer = self.workspace.analyzer();
+        if let Some(owner) = analyzer
+            .parent_of(field)
+            .filter(crate::analyzer::CodeUnit::is_class)
+        {
+            let metadata = analyzer.signature_metadata(&owner);
+            if metadata.iter().any(|metadata| {
+                metadata.type_parameters_recorded()
+                    && metadata
+                        .type_parameters()
+                        .iter()
+                        .any(|parameter| parameter == name)
+            }) {
+                return Some(true);
+            }
+            if !metadata.is_empty()
+                && metadata
+                    .iter()
+                    .all(|metadata| metadata.type_parameters_recorded())
+            {
+                return Some(false);
+            }
+        }
+
+        let source = analyzer.indexed_source(field.source())?;
+        let tree = crate::analyzer::usages::get_definition::parse_tree_for_language(
+            field.source(),
+            Language::Go,
+            &source,
+        )?;
+        let field_declaration = analyzer.ranges_of(field).into_iter().find_map(|range| {
+            let mut node = tree
+                .root_node()
+                .named_descendant_for_byte_range(range.start_byte, range.end_byte)?;
+            loop {
+                if node.kind() == "field_declaration" {
+                    if node.has_error() || node.is_missing() {
+                        return None;
+                    }
+                    return Some(node);
+                }
+                node = node.parent()?;
+            }
+        })?;
+        let mut type_node = field_declaration.child_by_field_name("type")?;
+        loop {
+            match type_node.kind() {
+                "type_identifier" | "identifier" => break,
+                "parenthesized_type" | "type_elem" => {
+                    type_node = type_node
+                        .child_by_field_name("type")
+                        .or_else(|| type_node.named_child(0))?;
+                }
+                _ => return Some(false),
+            }
+        }
+        if type_node.utf8_text(source.as_bytes()).ok()? != name {
+            return Some(false);
+        }
+
+        let mut ancestor = Some(field_declaration);
+        while let Some(node) = ancestor {
+            if node.kind() == "type_spec" {
+                if node.has_error() || node.is_missing() {
+                    return None;
+                }
+                let Some(type_parameters) = node.child_by_field_name("type_parameters") else {
+                    return Some(false);
+                };
+                if type_parameters.has_error() || type_parameters.is_missing() {
+                    return None;
+                }
+                let mut parameters_cursor = type_parameters.walk();
+                let is_parameter = type_parameters
+                    .named_children(&mut parameters_cursor)
+                    .filter(|parameter| parameter.kind() == "type_parameter_declaration")
+                    .any(|parameter| {
+                        let mut names_cursor = parameter.walk();
+                        parameter
+                            .children_by_field_name("name", &mut names_cursor)
+                            .any(|name_node| {
+                                name_node.utf8_text(source.as_bytes()).ok() == Some(name)
+                            })
+                    });
+                return Some(is_parameter);
+            }
+            ancestor = node.parent();
+        }
+        None
     }
 
     /// Resolve the field declaration behind one member locator, and report
@@ -1279,16 +1544,37 @@ impl WorkspaceConcurrencyProvider<'_> {
                 Arc::from(source.clone()),
             );
         let referenced = outcomes.into_iter().next().and_then(|outcome| {
+            if outcome.status
+                != crate::analyzer::usages::get_definition::DefinitionLookupStatus::Resolved
+                || !outcome.diagnostics.is_empty()
+            {
+                return None;
+            }
             let [definition] = outcome.definitions.as_slice() else {
                 return None;
             };
-            (definition.kind() == crate::analyzer::CodeUnitType::Field)
-                .then(|| definition.fq_name().to_string())
+            (definition.is_field() || definition.is_function())
+                .then(|| (definition.fq_name().to_string(), definition.is_function()))
         });
-        if let Some(name) = referenced {
+        if let Some((name, is_callable)) = referenced {
             return Some(ResolvedMemberDeclaration {
                 name,
                 is_declaration_site: false,
+                is_callable,
+            });
+        }
+        if let Some(name) =
+            crate::analyzer::usages::get_definition::modeled_method_selection_at_offset(
+                analyzer,
+                &file,
+                &source,
+                span.start_byte() as usize,
+            )
+        {
+            return Some(ResolvedMemberDeclaration {
+                name,
+                is_declaration_site: false,
+                is_callable: true,
             });
         }
         crate::analyzer::usages::get_definition::declaration_site_at_offset(
@@ -1297,9 +1583,11 @@ impl WorkspaceConcurrencyProvider<'_> {
             &source,
             span.start_byte() as usize,
         )
+        .filter(|declaration| declaration.is_field() || declaration.is_function())
         .map(|declaration| ResolvedMemberDeclaration {
             name: declaration.fq_name().to_string(),
             is_declaration_site: true,
+            is_callable: declaration.is_function(),
         })
     }
 }
@@ -1490,4 +1778,166 @@ fn stable_site(site: &brokk_bifrost_flow::concurrency::ConcurrentAccessSite) -> 
         site.point.get(),
         site.source.get()
     )
+}
+
+#[cfg(test)]
+#[allow(clippy::duplicate_mod)]
+#[path = "../../../../../test-support/inline_project.rs"]
+mod inline_project;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::analyzer::{AnalyzerConfig, CodeUnit, Language};
+
+    use super::inline_project::InlineTestProject;
+
+    #[test]
+    fn go_type_parameter_does_not_use_shadowed_nominal_type_for_inline_proof() {
+        let project = InlineTestProject::with_language(Language::Go)
+            .file(
+                "main.go",
+                r#"package main
+
+type T struct { n int }
+
+type Box[T any] struct { value T }
+
+type Holder struct { value T }
+"#,
+            )
+            .build();
+        let workspace = project.workspace_analyzer(AnalyzerConfig {
+            parallelism: Some(1),
+            ..AnalyzerConfig::default()
+        });
+        let analyzer = workspace.analyzer();
+        let declarations = analyzer.get_declarations(&project.file("main.go"));
+        let field = |owner: &str| {
+            declarations
+                .iter()
+                .find(|unit| unit.is_field() && unit.short_name() == format!("{owner}.value"))
+                .cloned()
+                .unwrap_or_else(|| panic!("missing {owner}.value field"))
+        };
+        let field_identity = |field: &CodeUnit| {
+            analyzer
+                .signature_metadata(field)
+                .into_iter()
+                .find_map(|metadata| metadata.return_type_identity().cloned())
+                .unwrap_or_else(|| panic!("missing type identity for {}", field.short_name()))
+        };
+        let provider = WorkspaceConcurrencyProvider::new(&workspace, None, None);
+        let generic_field = field("Box");
+        let generic_identity = field_identity(&generic_field);
+        assert_eq!(
+            provider.field_type_binding_mode(Language::Go, &generic_field, &generic_identity),
+            None,
+            "Box.value uses its enclosing T parameter even though package T is a struct"
+        );
+
+        let concrete_field = field("Holder");
+        let concrete_identity = field_identity(&concrete_field);
+        assert_eq!(
+            provider.field_type_binding_mode(Language::Go, &concrete_field, &concrete_identity),
+            Some(false),
+            "Holder.value resolves the concrete package T struct"
+        );
+    }
+
+    #[test]
+    fn go_allocation_storage_mode_uses_exact_shapes_and_offsets() {
+        let project = InlineTestProject::with_language(Language::Go)
+            .file(
+                "main.go",
+                r#"package main
+
+type T struct { n int }
+type Alias = T
+type Array [2]int
+type InlineBeforeShadow struct{}
+type ReferenceBeforeShadow []int
+
+func localShadow() {
+    type InlineBeforeShadow []int
+    type ReferenceBeforeShadow struct{}
+    _ = InlineBeforeShadow{}
+    _ = ReferenceBeforeShadow{}
+}
+
+func generic[T ~map[int]int]() {
+    _ = T{}
+    _ = struct { n int }{}
+    _ = [2]int{}
+    _ = &T{}
+    _ = new(T)
+    _ = make([]int, 2)
+    _ = make(map[int]int)
+    _ = make(chan int)
+    _ = Alias{}
+    _ = struct { p *T }{p: &T{}}
+}
+
+func concrete() {
+    _ = T{}
+    _ = Array{}
+}
+"#,
+            )
+            .build();
+        let file = project.file("main.go");
+        let source = std::fs::read_to_string(project.root().join("main.go")).unwrap();
+        let mode = |expression: &str| {
+            let offset = source
+                .find(expression)
+                .unwrap_or_else(|| panic!("missing allocation expression {expression:?}"))
+                + if expression.starts_with("    _ = ") {
+                    "    _ = ".len()
+                } else {
+                    0
+                };
+            crate::analyzer::usages::get_definition::allocation_binds_by_reference_at_offset(
+                &file, &source, offset,
+            )
+        };
+
+        let whitespace = source.find("    _ = [2]int{}").unwrap();
+        assert_eq!(
+            crate::analyzer::usages::get_definition::allocation_binds_by_reference_at_offset(
+                &file, &source, whitespace
+            ),
+            None
+        );
+        assert_eq!(
+            mode("    _ = T{}"),
+            None,
+            "T is the generic function parameter"
+        );
+        assert_eq!(mode("    _ = struct { n int }{}"), Some(false));
+        assert_eq!(mode("    _ = [2]int{}"), Some(false));
+        assert_eq!(mode("    _ = &T{}"), Some(true));
+        assert_eq!(mode("    _ = new(T)"), Some(true));
+        assert_eq!(mode("    _ = make([]int, 2)"), Some(true));
+        assert_eq!(mode("    _ = make(map[int]int)"), Some(true));
+        assert_eq!(mode("    _ = make(chan int)"), Some(true));
+        assert_eq!(
+            mode("    _ = Alias{}"),
+            None,
+            "type aliases remain unresolved"
+        );
+        assert_eq!(mode("    _ = struct { p *T }{p: &T{}}"), Some(false));
+        assert_eq!(mode("    _ = T{}\n    _ = Array{}"), Some(false));
+        assert_eq!(mode("    _ = Array{}"), Some(false));
+        assert_eq!(mode("    _ = InlineBeforeShadow{}"), None);
+        assert_eq!(mode("    _ = ReferenceBeforeShadow{}"), None);
+        assert_eq!(
+            crate::analyzer::usages::get_definition::allocation_binds_by_reference_at_offset(
+                &file,
+                &source,
+                source.rfind("&T{}").unwrap(),
+            ),
+            Some(true),
+            "nested pointer allocation uses its own offset"
+        );
+    }
 }
