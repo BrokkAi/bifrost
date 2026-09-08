@@ -16,9 +16,11 @@
 mod extractor_tests;
 #[cfg(test)]
 mod inverted_tests;
+pub mod macro_lexical;
 #[cfg(test)]
 mod resolver_tests;
 mod shared;
+
 use crate::analyzer::usages::traits::GraphUsageAnalyzer;
 use crate::analyzer::{AnalyzerQueryScope, QueryScope, QueryToken};
 

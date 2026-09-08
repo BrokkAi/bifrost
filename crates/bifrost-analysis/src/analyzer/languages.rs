@@ -113,6 +113,14 @@ pub(crate) trait LanguageSupport: Send + Sync {
         analyzer: &'a dyn IAnalyzer,
     ) -> Option<&'a dyn ForwardQueryProvider>;
 
+    /// Whether this language's saved callable-default metadata is complete and
+    /// closed for the analyzer generation. `None` leaves default-argument
+    /// binding unproven because the language has no such capability or the
+    /// analyzer is absent, or the metadata scan is incomplete.
+    fn saved_default_arguments_available(&self, _analyzer: &dyn IAnalyzer) -> Option<bool> {
+        None
+    }
+
     /// Signature metadata this language's analyzer holds for `unit`, visiting at most
     /// `limit` rows. `None` means the workspace does not analyze this language, or the
     /// language keeps no signature metadata at all: Java, JavaScript and TypeScript

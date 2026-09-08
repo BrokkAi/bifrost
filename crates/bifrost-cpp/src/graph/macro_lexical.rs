@@ -69,7 +69,7 @@ pub(crate) fn binding(
     let mut found = Vec::new();
     let mut cancelled = || false;
     let result = references(
-        visibility,
+        || visibility,
         file,
         root,
         source,
@@ -144,14 +144,17 @@ pub(crate) fn binding(
     None
 }
 
-pub(crate) fn all_references(
-    visibility: &VisibilityIndex<'_>,
+pub(crate) fn all_references<'visibility, 'source: 'visibility, Factory>(
+    visibility: Factory,
     file: &ProjectFile,
     root: Node<'_>,
     source: &str,
     max_references: usize,
     mut cancelled: impl FnMut() -> bool,
-) -> MacroLexicalReferences {
+) -> MacroLexicalReferences
+where
+    Factory: FnOnce() -> &'visibility VisibilityIndex<'source>,
+{
     let mut records = Vec::new();
     let result = references(
         visibility,
@@ -181,8 +184,8 @@ struct ReferenceState {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn references(
-    visibility: &VisibilityIndex<'_>,
+fn references<'visibility, 'source: 'visibility>(
+    visibility: impl FnOnce() -> &'visibility VisibilityIndex<'source>,
     file: &ProjectFile,
     root: Node<'_>,
     source: &str,
@@ -223,6 +226,11 @@ fn references(
         }
         push_named_children_reversed(node, &mut stack);
     }
+
+    if definitions.is_empty() && calls.is_empty() {
+        return state;
+    }
+    let visibility = visibility();
 
     // A definition's formal references are source-backed even when no
     // invocation is present in this file.  This is intentionally restricted
@@ -920,4 +928,55 @@ pub(crate) fn typed_binding<'tree>(
         .into_iter()
         .max_by_key(|(byte, _)| *byte)
         .map(|(_, binding)| binding)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn candidate_free_scan_does_not_construct_visibility() {
+        let source = "struct Owner { int value; };";
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_cpp::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let root = std::env::current_dir().unwrap();
+        let file = ProjectFile::new(&root, "owner.cpp");
+        let result = all_references(
+            || panic!("candidate-free scan must not construct visibility"),
+            &file,
+            tree.root_node(),
+            source,
+            100,
+            || false,
+        );
+        assert!(result.references.is_empty());
+        assert!(!result.cancelled);
+        assert!(!result.truncated);
+    }
+
+    #[test]
+    fn cancelled_scan_does_not_construct_visibility() {
+        let source = "#define USE(value) value\nvoid caller() { USE(1); }";
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_cpp::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let root = std::env::current_dir().unwrap();
+        let file = ProjectFile::new(&root, "use.c");
+        let result = all_references(
+            || panic!("cancelled scan must not construct visibility"),
+            &file,
+            tree.root_node(),
+            source,
+            100,
+            || true,
+        );
+        assert!(result.references.is_empty());
+        assert!(result.cancelled);
+        assert!(!result.truncated);
+    }
 }

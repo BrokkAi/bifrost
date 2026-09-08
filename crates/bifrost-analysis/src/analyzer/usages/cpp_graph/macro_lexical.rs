@@ -1,13 +1,15 @@
 //! Query-local macro declarations shared by navigation and authoritative inverse.
 
-use super::cpp_graph::with_cpp_graph_source;
+use super::with_cpp_graph_source;
 use crate::analyzer::lexical_definitions::LexicalDefinition;
 use crate::analyzer::{DeclarationKind, IAnalyzer, ProjectFile, Range};
 use crate::hash::HashSet;
 use crate::text_utils::{compute_line_starts, line_column_for_offset};
 use brokk_bifrost_cpp::graph::resolver::{
     MacroLexicalBindingKind, MacroLexicalReferences, VisibilityIndex,
+    macro_lexical_references_with_visibility,
 };
+use std::cell::OnceCell;
 use tree_sitter::Node;
 
 /// Resolve a source token to the source-written macro formal or local.
@@ -68,8 +70,15 @@ pub fn macro_lexical_references(
             return MacroLexicalReferences::default();
         };
         let roots = HashSet::from_iter([file.clone()]);
-        let visibility = VisibilityIndex::build(cpp, graph.token, &graph, &roots);
-        visibility.macro_lexical_references(file, root, source, max_references, cancelled)
+        let visibility = OnceCell::new();
+        macro_lexical_references_with_visibility(
+            || visibility.get_or_init(|| VisibilityIndex::build(cpp, graph.token, &graph, &roots)),
+            file,
+            root,
+            source,
+            max_references,
+            cancelled,
+        )
     })
 }
 
@@ -87,13 +96,14 @@ pub fn macro_lexical_candidate_files(
     };
     let scope = AnalyzerQueryScope::new(analyzer);
     let seeds = HashSet::from_iter([definition_file.clone()]);
-    let mut candidates = super::candidates::find_transitive_importers_with_cancellation(
-        files,
-        imports,
-        scope.token(),
-        &seeds,
-        cancellation,
-    );
+    let mut candidates =
+        crate::analyzer::usages::candidates::find_transitive_importers_with_cancellation(
+            files,
+            imports,
+            scope.token(),
+            &seeds,
+            cancellation,
+        );
     candidates.insert(definition_file.clone());
     let mut candidates = candidates.into_iter().collect::<Vec<_>>();
     candidates.sort();

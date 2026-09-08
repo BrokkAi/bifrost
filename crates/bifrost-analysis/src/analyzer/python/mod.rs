@@ -1039,6 +1039,11 @@ impl LanguageSupport for PythonSupport {
         resolve_analyzer::<PythonAnalyzer>(analyzer).map(|value| value as _)
     }
 
+    fn saved_default_arguments_available(&self, analyzer: &dyn IAnalyzer) -> Option<bool> {
+        resolve_analyzer::<PythonAnalyzer>(analyzer)
+            .and_then(PythonAnalyzer::saved_default_arguments_available)
+    }
+
     fn ecosystem(&self) -> UsageEcosystem {
         UsageEcosystem::Python
     }

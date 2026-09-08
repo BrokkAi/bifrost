@@ -443,9 +443,31 @@ pub(crate) fn default_parallelism() -> usize {
         .unwrap_or(1)
 }
 
-/// Cap rayon's implicit global pool to [`default_parallelism`], so every unguarded
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn limit_glibc_malloc_arenas(parallelism: usize) {
+    const ARENA_CAP: libc::c_int = 32;
+
+    if parallelism <= ARENA_CAP as usize {
+        return;
+    }
+
+    // SAFETY: mallopt is glibc's process-wide, thread-safe allocator configuration
+    // entrypoint. M_ARENA_MAX accepts a positive c_int and does not retain a pointer.
+    let configured = unsafe { libc::mallopt(libc::M_ARENA_MAX, ARENA_CAP) };
+    debug_assert_eq!(configured, 1, "glibc rejected M_ARENA_MAX={ARENA_CAP}");
+}
+
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+fn limit_glibc_malloc_arenas(_parallelism: usize) {}
+
+/// Configure process-wide parallelism before any analyzer worker pool starts.
+///
+/// This caps rayon's implicit global pool to [`default_parallelism`], so every unguarded
 /// `.par_iter()` call across the analyzer honors `BIFROST_PARALLELISM` too, not just pools
-/// (like [`crate::analyzer::pool_memo::dedicated_build_pool`]) that read it explicitly.
+/// (like [`crate::analyzer::pool_memo::dedicated_build_pool`]) that read it explicitly. On
+/// glibc Linux hosts wider than 32 workers, it also caps malloc's arena count at 32. Without
+/// that cap, glibc can grow one arena from each worker in the analyzer's intentionally
+/// separate pools and serialize hundreds of threads in `mprotect`.
 ///
 /// Idempotent and safe to call from every process entry point (CLI, MCP/LSP server, Python
 /// module init): the first caller in the process wins, `rayon::ThreadPoolBuilder::build_global`
@@ -454,8 +476,10 @@ pub(crate) fn default_parallelism() -> usize {
 pub fn ensure_global_rayon_pool() {
     static DONE: OnceLock<()> = OnceLock::new();
     DONE.get_or_init(|| {
+        let parallelism = default_parallelism();
+        limit_glibc_malloc_arenas(parallelism);
         let _ = rayon::ThreadPoolBuilder::new()
-            .num_threads(default_parallelism())
+            .num_threads(parallelism)
             .build_global();
     });
 }

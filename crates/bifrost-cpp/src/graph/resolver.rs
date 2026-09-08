@@ -1778,6 +1778,29 @@ fn distinct_visible_symbols<'u>(units: impl Iterator<Item = &'u CodeUnit>) -> Ve
     distinct
 }
 
+/// Enumerate macro lexical references while constructing visibility only if
+/// the bounded source walk finds a definition or identifier call candidate.
+pub fn macro_lexical_references_with_visibility<'visibility, 'source: 'visibility, Factory>(
+    visibility: Factory,
+    file: &ProjectFile,
+    root: Node<'_>,
+    source: &str,
+    max_references: usize,
+    cancelled: impl FnMut() -> bool,
+) -> MacroLexicalReferences
+where
+    Factory: FnOnce() -> &'visibility VisibilityIndex<'source>,
+{
+    crate::graph::macro_lexical::all_references(
+        visibility,
+        file,
+        root,
+        source,
+        max_references,
+        cancelled,
+    )
+}
+
 impl<'a> VisibilityIndex<'a> {
     pub fn cpp(&self) -> &'a dyn CppSource {
         self.cpp
@@ -2636,7 +2659,7 @@ impl<'a> VisibilityIndex<'a> {
         cancelled: impl FnMut() -> bool,
     ) -> MacroLexicalReferences {
         crate::graph::macro_lexical::all_references(
-            self,
+            || self,
             file,
             root,
             source,

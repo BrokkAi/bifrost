@@ -8,11 +8,10 @@ use std::collections::VecDeque;
 use std::fmt;
 use std::sync::{Arc, Mutex};
 
+use crate::analyzer::languages::language_support;
 use crate::analyzer::read_ledger::{LookupKind, ReadKey};
 use crate::analyzer::semantic_model::{ActiveSemanticModelSnapshot, ProcedureSummaryMemberKey};
-use crate::analyzer::{
-    DispatchHierarchyExpansion, Language, PythonAnalyzer, WorkspaceAnalyzer, resolve_analyzer,
-};
+use crate::analyzer::{DispatchHierarchyExpansion, Language, WorkspaceAnalyzer};
 use crate::hash::{HashMap, HashSet};
 
 use super::cfg_algorithms::{
@@ -246,7 +245,11 @@ impl IcfgProviderBehaviorIdentity {
             // surface, not only on the callee file. Keep this small authority
             // fact in the replay identity too: an unrelated source edit need
             // not rotate it, but a newly observed metadata mutation must.
-            if resolve_analyzer::<PythonAnalyzer>(workspace.analyzer()).is_some() {
+            if language_support(Language::Python)
+                .expect("Python support is registered")
+                .forward_query_provider(workspace.analyzer())
+                .is_some()
+            {
                 digest.push(b"python-saved-default-availability");
                 digest.push(match python_saved_defaults_available {
                     Some(true) => b"closed",

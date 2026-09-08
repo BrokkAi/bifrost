@@ -43,12 +43,11 @@ pub use value_flow::{
 use std::fmt;
 use std::sync::Arc;
 
+use crate::analyzer::languages::language_support;
 use crate::analyzer::semantic_model::{
     ActiveSemanticModelSnapshot, ResolvedActiveSemanticModels, SemanticModelOverlay,
 };
-use crate::analyzer::{
-    DispatchHierarchyExpansion, PythonAnalyzer, WorkspaceAnalyzer, resolve_analyzer,
-};
+use crate::analyzer::{DispatchHierarchyExpansion, Language, WorkspaceAnalyzer};
 
 use super::{DispatchHints, OracleLimits};
 
@@ -138,10 +137,9 @@ impl<'a> WorkspaceSemanticOracle<'a> {
             semantic_model_overlay,
             active_semantic_models,
             dispatch_hints: Arc::new(dispatch_hints),
-            python_saved_defaults_available: resolve_analyzer::<PythonAnalyzer>(
-                workspace.analyzer(),
-            )
-            .and_then(PythonAnalyzer::saved_default_arguments_available),
+            python_saved_defaults_available: language_support(Language::Python)
+                .expect("Python support is registered")
+                .saved_default_arguments_available(workspace.analyzer()),
         }
     }
 

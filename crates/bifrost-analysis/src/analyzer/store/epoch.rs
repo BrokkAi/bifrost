@@ -1059,7 +1059,7 @@ lang_epoch!(
 // Candidate discovery consumes that fact to avoid the impossible polymorphic
 // descendant expansion for constructor usage scans, so warm rows with the
 // compatible false default must be re-extracted.
-// `brokk-tree-sitter-kotlin-0.4.3`: grammar changes can alter parse trees and
+// `brokk-tree-sitter-kotlin-0.4.6`: grammar changes can alter parse trees and
 // derived declarations, so persisted Kotlin rows from older parser releases
 // must be rebuilt.
 // Salt bumped again (#1651): a type declaration's signature metadata now
@@ -1077,7 +1077,7 @@ lang_epoch!(
     Kotlin,
     "kotlin",
     "treesitter/kotlin/",
-    "brokk-tree-sitter-kotlin-0.4.3-2026-09;kotlin-core-indexing-2026-07;kotlin-class-parameter-default-arity-2026-07;kotlin-backtick-identifier-names-2026-07;kotlin-jvm-realm-imports-supertypes-2026-07;kotlin-signature-returns-receivers-2026-07;kotlin-companion-object-marker-2026-07;kotlin-structured-signature-types-2026-08;jvm-query-assets-in-brokk-bifrost-jvm-2026-08;kotlin-constructor-callable-metadata-2026-08;declaration-type-parameter-arity-2026-09;kotlin-type-alias-type-identity-2026-09"
+    "brokk-tree-sitter-kotlin-0.4.6-2026-09;kotlin-core-indexing-2026-07;kotlin-class-parameter-default-arity-2026-07;kotlin-backtick-identifier-names-2026-07;kotlin-jvm-realm-imports-supertypes-2026-07;kotlin-signature-returns-receivers-2026-07;kotlin-companion-object-marker-2026-07;kotlin-structured-signature-types-2026-08;jvm-query-assets-in-brokk-bifrost-jvm-2026-08;kotlin-constructor-callable-metadata-2026-08;declaration-type-parameter-arity-2026-09;kotlin-type-alias-type-identity-2026-09"
 );
 
 #[cfg(test)]

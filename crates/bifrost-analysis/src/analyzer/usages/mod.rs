@@ -32,7 +32,7 @@ pub(crate) mod java_graph;
 pub(crate) mod java_usage_evidence_cache;
 pub(crate) mod js_ts_graph;
 pub(crate) mod kotlin_graph;
-pub mod macro_lexical;
+pub use cpp_graph::macro_lexical;
 pub mod member_family;
 pub mod overload_selection;
 pub(crate) mod parsed_tree;
